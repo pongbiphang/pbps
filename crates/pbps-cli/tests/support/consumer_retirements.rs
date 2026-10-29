@@ -6,11 +6,11 @@ const READS: &str =
     "consumers:\n  billing-v41: {uses: [app.t.old]}\n  unrelated: {uses: [app.t.kept]}\n";
 const WRITES: &str = "consumers:\n  writer: {writes: [app.t]}\n";
 
-fn ok(output: Output) -> String {
+pub(super) fn ok(output: Output) -> String {
     assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
     stdout(&output)
 }
-fn git(d: &Demo, args: &[&str]) -> String {
+pub(super) fn git(d: &Demo, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(&d.dir)
@@ -20,7 +20,7 @@ fn git(d: &Demo, args: &[&str]) -> String {
     assert!(out.status.success(), "{}", stderr(&out));
     stdout(&out).trim().into()
 }
-fn config(d: &Demo, contracts: &str) {
+pub(super) fn config(d: &Demo, contracts: &str) {
     let path = d.dir.join("pbps.yml");
     let old = std::fs::read_to_string(&path).unwrap();
     std::fs::write(
@@ -43,7 +43,7 @@ fn retire(d: &Demo) -> String {
     d.commit();
     git(d, &["rev-parse", "HEAD"])
 }
-fn plan(d: &Demo, baseline: &str) -> (PathBuf, serde_json::Value) {
+pub(super) fn plan(d: &Demo, baseline: &str) -> (PathBuf, serde_json::Value) {
     let path = d.dir.join("retirement.json");
     let json = ok(d.run(&[
         "plan",
@@ -57,7 +57,7 @@ fn plan(d: &Demo, baseline: &str) -> (PathBuf, serde_json::Value) {
     ]));
     (path, serde_json::from_str(&json).unwrap())
 }
-fn notes(value: &serde_json::Value, id: &str) -> Vec<String> {
+pub(super) fn notes(value: &serde_json::Value, id: &str) -> Vec<String> {
     value["findings"]
         .as_array()
         .unwrap()
@@ -374,6 +374,81 @@ fn consumer_retirements_name_snapshot_provenance_and_missing_revision_evidence()
             assert!(notes(&report, "consumer.retired").is_empty());
         }
     }
+}
+
+#[test]
+fn consumer_retirements_preserve_the_requested_revision_in_identity_diagnostics() {
+    let (d, _) = start("retirement-revision-label", "");
+    let ids = d.dir.join("schema.ids.json");
+    let valid = std::fs::read_to_string(&ids).unwrap();
+    std::fs::write(&ids, r#"{"version":1,"hostile\nfield":1}"#).unwrap();
+    d.commit();
+    let pinned = git(&d, &["rev-parse", "HEAD"]);
+    git(&d, &["tag", "identity-label"]);
+    std::fs::write(&ids, &valid).unwrap();
+    let out = d.run(&["plan", "--no-dev", "--since", "identity-label"]);
+    assert_eq!(code(&out), 1);
+    let message = stderr(&out);
+    assert!(
+        message.contains("the identity file at `identity-label` is malformed"),
+        "{message}"
+    );
+    assert!(message.contains(r"hostile\nfield"), "{message}");
+    assert!(!message.contains(&pinned), "{message}");
+    // Negative: pinning a readable revision retains ordinary successful planning.
+    d.commit();
+    ok(d.run(&["plan", "--no-dev"]));
+}
+
+#[test]
+fn consumer_retirements_do_not_attribute_through_a_shallow_merged_branch() {
+    let (d, baseline) = start("retirement-shallow-merge", READS);
+    let branch = git(&d, &["branch", "--show-current"]);
+    let left = retire(&d);
+    git(&d, &["checkout", "-qb", "right", &baseline]);
+    git(&d, &["commit", "--allow-empty", "-qm", "separate branch"]);
+    let right = retire(&d);
+    assert_ne!(left, right);
+    git(&d, &["checkout", &branch]);
+    git(
+        &d,
+        &["merge", "--no-ff", "-qm", "both parents retired", "right"],
+    );
+    let range = format!("{baseline}..HEAD");
+    let order = git(&d, &["rev-list", "--topo-order", &range]);
+    let first = order
+        .lines()
+        .find(|sha| *sha == left || *sha == right)
+        .unwrap();
+    drop_old(&d);
+    let (_, report) = plan(&d, &baseline);
+    assert!(
+        notes(&report, "consumer.retired")[0].contains(first),
+        "{report}"
+    );
+    let shallow = d.dir.join(".git/shallow");
+    std::fs::write(&shallow, format!("{first}\n")).unwrap();
+    // The other parent still proves ancestry; that alone cannot prove attribution.
+    git(&d, &["merge-base", "--is-ancestor", &baseline, "HEAD"]);
+    let (_, report) = plan(&d, &baseline);
+    let unavailable = notes(&report, "consumer.retirement-unavailable");
+    assert_eq!(unavailable.len(), 1, "{report}");
+    assert!(
+        unavailable[0].contains("shallow boundary"),
+        "{unavailable:?}"
+    );
+    assert!(notes(&report, "consumer.retired").is_empty(), "{report}");
+    // Negative: history before the excluded baseline cannot hide a removal in range.
+    std::fs::write(&shallow, format!("{baseline}\n")).unwrap();
+    let (_, report) = plan(&d, &baseline);
+    assert!(
+        notes(&report, "consumer.retirement-unavailable").is_empty(),
+        "{report}"
+    );
+    assert!(
+        notes(&report, "consumer.retired")[0].contains(first),
+        "{report}"
+    );
 }
 
 pub fn live(server: &str) {

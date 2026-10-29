@@ -1887,3 +1887,45 @@ fn retirement_membership_reuses_canonical_routine_binding() {
         Bindings::resolve(&consumers("app.f(text)", false), &[side; 2], &spell).unwrap();
     assert!(!different.contains(entry));
 }
+
+#[test]
+fn restored_partition_contracts_share_the_ordinary_two_sided_binding() {
+    let (attached, inherited, leaf) = partitioned();
+    let mut detached = attached.clone();
+    detached
+        .tables
+        .insert(leaf.clone(), schema().tables[&name()].clone());
+    let mut owned = inherited.clone();
+    owned.columns.insert(uid("c_bbbbbb"), leaf.column("old"));
+    let declared = consumers("app.leaf.old", false);
+    let spell = |id: &pbps_model::ModuleId| id.clone();
+    let standalone = Side {
+        schema: &detached,
+        ids: &owned,
+    };
+    let partition = Side {
+        schema: &attached,
+        ids: &inherited,
+    };
+    for sides in [[standalone, partition], [partition, standalone]] {
+        let old = Bindings::resolve(&declared, &[sides[0]; 2], &spell).unwrap();
+        let new = Bindings::resolve(&declared, &[sides[1]; 2], &spell).unwrap();
+        let entry = old.contracts().next().unwrap();
+        assert!(
+            !new.contains(entry),
+            "one-sided targets differ across the transition"
+        );
+        let restored = entry.resolve(&sides, &spell).unwrap();
+        let current = Bindings::resolve(&declared, &sides, &spell).unwrap();
+        assert!(current.contains(&restored));
+        // Negative: sharing an object does not retire another consumer's entry.
+        let mut other = declared.clone();
+        let declaration = other.pop_first().unwrap().1;
+        other.insert("another-consumer".into(), declaration);
+        assert!(
+            !Bindings::resolve(&other, &sides, &spell)
+                .unwrap()
+                .contains(&restored)
+        );
+    }
+}

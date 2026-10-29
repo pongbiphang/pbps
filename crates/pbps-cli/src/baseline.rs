@@ -412,7 +412,7 @@ fn load_from_git(
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.
                 anyhow::bail!(
-                    "`{path}` at `{rev}` does not parse (the baseline version itself is broken): {}",
+                    "`{path}` at `{revision_label}` does not parse (the baseline version itself is broken): {}",
                     errs.first().map(ToString::to_string).unwrap_or_default()
                 );
             }
@@ -429,7 +429,7 @@ fn load_from_git(
         crate::routine_ids_as_the_dialect_spells_them(&mut schema, &mut hints, dialect);
     if !collisions.is_empty() {
         anyhow::bail!(
-            "the declarations at `{rev}` name one routine twice (the baseline version itself is \
+            "the declarations at `{revision_label}` name one routine twice (the baseline version itself is \
              broken): {}",
             collisions.join("; ")
         );
@@ -442,7 +442,7 @@ fn load_from_git(
     // The identity file must come from the same revision: using the current one as
     // the baseline would hide renames. Under that revision's own path, for the
     // reason `paths_at` gives.
-    let ids = ids_from(&project.root, rev, &ids_rel)?;
+    let ids = ids_from(&project.root, rev, &ids_rel, revision_label)?;
 
     Ok(Baseline {
         schema,
@@ -461,22 +461,22 @@ fn load_from_git(
 /// answer rather than a failure: everything is new against it.
 pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
     let (_, ids_rel) = paths_at(project, rev)?;
-    ids_from(&project.root, rev, &ids_rel)
+    ids_from(&project.root, rev, &ids_rel, rev)
 }
 
 /// The identity file at `rev`, under a path already resolved for that
 /// revision.
-fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<ValidIds> {
+fn ids_from(root: &Path, rev: &str, ids_rel: &str, label: &str) -> anyhow::Result<ValidIds> {
     match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => {
             // The decoder's sentence repeats the file's text; `artifact::decode`
             // shows it escaped, like a plan's (DEC-2032.1, #2035).
             let ids: IdsFile = crate::artifact::decode(&text, serde_json::from_str)
-                .with_context(|| format!("the identity file at `{rev}` is malformed"))?;
+                .with_context(|| format!("the identity file at `{label}` is malformed"))?;
             // A committed declaration may be deleted before its uid is retired.
             // Internal validity is required here; schema membership is file-only.
             ids.validated()
-                .with_context(|| format!("the identity file at `{rev}` is inconsistent"))
+                .with_context(|| format!("the identity file at `{label}` is inconsistent"))
         }
         Err(_) => Ok(IdsFile::default().validated()?),
     }

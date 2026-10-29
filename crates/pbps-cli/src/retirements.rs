@@ -44,19 +44,20 @@ fn assess(
         matches!(evidence, Evidence::Contains),
         "baseline Git commit `{revision}` is unavailable: {evidence:?}; fetch readable complete history"
     );
-    let mut history = History {
-        project,
-        dialect,
-        bindings: BTreeMap::new(),
-    };
-    let old: Vec<_> = history.bindings(revision)?.contracts().cloned().collect();
-    if old.is_empty() {
-        return Ok(Vec::new());
-    }
     let policy_sides = sides.map(|s| pbps_policy::consumers::Side {
         schema: s.schema,
         ids: s.ids,
     });
+    let mut history = History {
+        project,
+        dialect,
+        anchor: policy_sides[0],
+        revisions: BTreeMap::new(),
+    };
+    let old: Vec<_> = history.bindings(revision)?.0.contracts().cloned().collect();
+    if old.is_empty() {
+        return Ok(Vec::new());
+    }
     let current = Bindings::resolve(&project.config.consumers, &policy_sides, &|id| {
         crate::policy_module_id(id, dialect)
     })
@@ -66,7 +67,13 @@ fn assess(
     let mut out = Vec::new();
     // Ask the existing rule, including its severity, suppression and restoration
     // decisions. A removal unrelated to an error in this plan is not evidence.
-    for contract in old.iter().filter(|entry| !current.contains(entry)) {
+    for contract in &old {
+        let contract = contract
+            .resolve(&policy_sides, &|id| crate::policy_module_id(id, dialect))
+            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        if current.contains(&contract) {
+            continue;
+        }
         let errors: Vec<_> = pbps_policy::consumers::plan(
             cs,
             &contract.bindings(),
@@ -90,12 +97,12 @@ fn assess(
             ),
             "Git history does not establish the baseline as an ancestor of the candidate; fetch the complete history"
         );
-        let source = if history.bindings(candidate)?.contains(contract) {
+        let source = if history.contains(candidate, &contract)? {
             "working tree, not committed".to_owned()
         } else {
             format!(
                 "commit `{}`",
-                history.retiring_commit(revision, candidate, contract)?
+                history.retiring_commit(revision, candidate, &contract)?
             )
         };
         for (index, finding) in errors {
@@ -118,39 +125,66 @@ fn assess(
     Ok(out)
 }
 
+struct Historical {
+    consumers: pbps_policy::consumers::Consumers,
+    baseline: baseline::Baseline,
+}
 struct History<'a> {
     project: &'a pbps_config::Project,
     dialect: &'a dyn pbps_dialect::Dialect,
-    bindings: BTreeMap<String, Bindings>,
+    anchor: pbps_policy::consumers::Side<'a>,
+    revisions: BTreeMap<String, Option<Historical>>,
 }
 impl History<'_> {
-    fn bindings(&mut self, revision: &str) -> anyhow::Result<&Bindings> {
-        if !self.bindings.contains_key(revision) {
-            let mut bound = Bindings::default();
-            if let Some(config) = baseline::config_at(self.project, revision)?
-                && !config.consumers.is_empty()
-            {
-                let base = baseline::load(
-                    self.project,
-                    &baseline::Source::Git {
-                        rev: revision.into(),
-                    },
-                    self.dialect,
-                )?;
-                let side = pbps_policy::consumers::Side {
-                    schema: &base.schema,
-                    ids: &base.ids,
-                };
-                bound = Bindings::resolve(&config.consumers, &[side; 2], &|id| {
-                    crate::policy_module_id(id, self.dialect)
-                })
-                .map_err(|errors| {
-                    anyhow::anyhow!("consumer contracts at `{revision}`: {}", errors.join("; "))
-                })?;
-            }
-            self.bindings.insert(revision.into(), bound);
+    fn bindings(
+        &mut self,
+        revision: &str,
+    ) -> anyhow::Result<(Bindings, [pbps_policy::consumers::Side<'_>; 2])> {
+        if !self.revisions.contains_key(revision) {
+            let historical = match baseline::config_at(self.project, revision)? {
+                Some(config) if !config.consumers.is_empty() => Some(Historical {
+                    consumers: config.consumers,
+                    baseline: baseline::load(
+                        self.project,
+                        &baseline::Source::Git {
+                            rev: revision.into(),
+                        },
+                        self.dialect,
+                    )?,
+                }),
+                _ => None,
+            };
+            self.revisions.insert(revision.into(), historical);
         }
-        Ok(&self.bindings[revision])
+        let Some(historical) = &self.revisions[revision] else {
+            return Ok((Bindings::default(), [self.anchor; 2]));
+        };
+        let sides = [
+            self.anchor,
+            pbps_policy::consumers::Side {
+                schema: &historical.baseline.schema,
+                ids: &historical.baseline.ids,
+            },
+        ];
+        let bound = Bindings::resolve(&historical.consumers, &sides, &|id| {
+            crate::policy_module_id(id, self.dialect)
+        })
+        .map_err(|errors| {
+            anyhow::anyhow!("consumer contracts at `{revision}`: {}", errors.join("; "))
+        })?;
+        Ok((bound, sides))
+    }
+
+    fn contains(&mut self, revision: &str, contract: &BoundContract) -> anyhow::Result<bool> {
+        let dialect = self.dialect;
+        let (bound, sides) = self.bindings(revision)?;
+        if bound.contracts().next().is_none() {
+            return Ok(false);
+        }
+        let restored = contract
+            .resolve(&sides, &|id| crate::policy_module_id(id, dialect))
+            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+        Ok(bound.contains(&restored))
     }
 
     fn retiring_commit(
@@ -170,14 +204,31 @@ impl History<'_> {
                 &format!("{baseline}..{candidate}"),
             ],
         )?;
+        // A visible baseline path does not prove a merged branch is complete.
+        // A shallow root inside the range can hide a more recent removal.
+        // Roots outside it (including the baseline) hide no part of this range.
+        let shallow_path =
+            baseline::git(&self.project.root, &["rev-parse", "--git-path", "shallow"])?;
+        let shallow_path = self.project.root.join(shallow_path.trim());
+        let shallow = match std::fs::read_to_string(&shallow_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error).context("the shallow history boundary is unreadable"),
+        };
+        anyhow::ensure!(
+            !revisions.lines().any(|row| shallow
+                .lines()
+                .any(|root| Some(root) == row.split_whitespace().next())),
+            "a shallow boundary could hide the retiring commit; fetch complete history (fetch-depth: 0)"
+        );
         for row in revisions.lines() {
             let mut ids = row.split_whitespace();
             let commit = ids.next().context("Git returned an empty revision")?;
-            if self.bindings(commit)?.contains(contract) {
+            if self.contains(commit, contract)? {
                 continue;
             }
             for parent in ids {
-                if self.bindings(parent)?.contains(contract) {
+                if self.contains(parent, contract)? {
                     return Ok(commit.into());
                 }
             }

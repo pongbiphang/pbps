@@ -59,6 +59,23 @@ impl Entry {
         Bindings(vec![self.clone()])
     }
 
+    /// Compare both declarations in the same identity context: attaching retires
+    /// a column UID, and detaching creates one. The ordinary resolver bridges it.
+    pub fn resolve(
+        &self,
+        sides: &[Side<'_>; 2],
+        spell: &dyn Fn(&pbps_model::ModuleId) -> pbps_model::ModuleId,
+    ) -> Result<Self, Vec<String>> {
+        let mut declaration = super::Consumer::default();
+        if self.writes {
+            declaration.writes.push(self.text.clone());
+        } else {
+            declaration.uses.push(self.text.clone());
+        }
+        Bindings::resolve(&[(self.consumer.clone(), declaration)].into(), sides, spell)
+            .map(|bound| bound.0.into_iter().next().expect("one restored contract"))
+    }
+
     pub(super) fn access(&self) -> &'static str {
         if self.writes { "writes" } else { "uses" }
     }

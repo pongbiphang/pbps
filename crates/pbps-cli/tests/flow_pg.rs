@@ -36324,3 +36324,81 @@ fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
         consumer_retirements::live(&std::env::var(variable).unwrap());
     }
 }
+
+#[test]
+fn consumer_retirements_do_not_mistake_partition_transitions_for_retirement() {
+    use consumer_retirements::{config, git, notes, ok, plan};
+    for attach in [true, false] {
+        let d = Demo::new("retirement-partition-identity");
+        let parent = "table: app.p\ncolumns:\n  old: {type: integer}\n  kept: {type: integer}\npartition_by: [old]\n";
+        let attached = format!("{parent}partitions:\n  t: default\n");
+        let detached = format!("{parent}partitions: {{}}\n");
+        let parent_path = d.dir.join("schema/app.p.yml");
+        let leaf_path = d.dir.join("schema/app.t.yml");
+        let standalone =
+            "table: app.t\ncolumns:\n  old: {type: integer}\n  kept: {type: integer}\n";
+        let contracts = "consumers:\n  writer: {writes: [app.t.old]}\n";
+        let write = |attached_now: bool| {
+            let text = if attached_now {
+                attached.clone()
+            } else {
+                detached.clone()
+            };
+            std::fs::write(&parent_path, text).unwrap();
+            if attached_now {
+                if leaf_path.exists() {
+                    std::fs::remove_file(&leaf_path).unwrap();
+                }
+            } else {
+                std::fs::write(&leaf_path, standalone).unwrap();
+            }
+        };
+        write(!attach);
+        config(&d, contracts);
+        ok(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let baseline = git(&d, &["rev-parse", "HEAD"]);
+        write(attach);
+        // Attaching is itself unproven for a writer; record the transition's
+        // identities under an explicit warning, then assess the current policy.
+        config(
+            &d,
+            &format!("{contracts}policies:\n  rules: {{consumer.unproven: warning}}\n"),
+        );
+        ok(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let transition = git(&d, &["rev-parse", "HEAD"]);
+        config(&d, contracts);
+        // The writer still exists: an ordinary refusal must not invent retirement.
+        // The transition itself is unproven for writes under the ordinary rule.
+        let out = d.run(&["plan", "--no-dev", "--since", &baseline, "--format", "json"]);
+        assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        assert!(notes(&report, "consumer.retired").is_empty(), "{report}");
+        assert!(
+            notes(&report, "consumer.retirement-unavailable").is_empty(),
+            "{report}"
+        );
+        config(&d, "");
+        let (_, report) = plan(&d, &baseline);
+        let note = notes(&report, "consumer.retired");
+        assert!(!note.is_empty(), "{report}");
+        assert!(
+            note.iter()
+                .all(|n| n.contains("working tree, not committed")),
+            "{note:?}"
+        );
+        assert!(!note[0].contains(&transition), "{note:?}");
+        // Commit only the real retirement, after the identity transition.
+        d.commit();
+        let retiring = git(&d, &["rev-parse", "HEAD"]);
+        let (_, report) = plan(&d, &baseline);
+        let note = notes(&report, "consumer.retired");
+        assert!(!note.is_empty(), "{report}");
+        assert!(
+            note.iter()
+                .all(|n| n.contains(&retiring) && !n.contains(&transition)),
+            "{note:?}"
+        );
+    }
+}
