@@ -103,7 +103,14 @@ pub fn load(
                 is_empty_fallback: false,
             })
         }
-        Source::Git { rev } => load_from_git(project, rev, dialect),
+        // Reads use a pinned commit, but every failure must retain the revision
+        // the caller named, including errors raised by the Git-object reader.
+        Source::Git { rev } => load_from_git(project, rev, dialect).with_context(|| {
+            format!(
+                "cannot read baseline at `{}`",
+                pbps_model::escape::Escaped(rev)
+            )
+        }),
         Source::Empty => Ok(Baseline {
             schema: Schema::default(),
             ids: IdsFile::default().validated()?,
