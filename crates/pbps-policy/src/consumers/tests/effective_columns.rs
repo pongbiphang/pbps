@@ -557,3 +557,95 @@ fn inherited_column_addresses_follow_the_source_uid_across_a_rename() {
         );
     }
 }
+
+#[test]
+fn ordinary_column_uids_do_not_follow_a_reused_name() {
+    for (changed_uid, changed_name, expected) in [("c_bbbbbb", "x", 0), ("c_aaaaaa", "z", 1)] {
+        let mut before = schema();
+        let mut required = Column::new(ColumnType::simple("integer"));
+        required.nullable = false;
+        before.tables.get_mut(&name()).unwrap().columns = [
+            ("x".into(), required.clone()),
+            ("y".into(), required.clone()),
+        ]
+        .into();
+        let mut old = ids();
+        old.columns = [
+            (uid("c_aaaaaa"), name().column("x")),
+            (uid("c_bbbbbb"), name().column("y")),
+        ]
+        .into();
+        let mut after = before.clone();
+        after.tables.get_mut(&name()).unwrap().columns =
+            [("z".into(), required.clone()), ("x".into(), required)].into();
+        after
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut(changed_name)
+            .unwrap()
+            .nullable = true;
+        let mut new = old.clone();
+        new.columns.insert(uid("c_aaaaaa"), name().column("z"));
+        new.columns.insert(uid("c_bbbbbb"), name().column("x"));
+        let changes = ChangeSet {
+            changes: vec![
+                Change::RenameColumn {
+                    uid: uid("c_aaaaaa"),
+                    table: name(),
+                    from: "x".into(),
+                    to: "z".into(),
+                    table_was: None,
+                },
+                Change::RenameColumn {
+                    uid: uid("c_bbbbbb"),
+                    table: name(),
+                    from: "y".into(),
+                    to: "x".into(),
+                    table_was: None,
+                },
+                Change::AlterColumnNullability {
+                    uid: uid(changed_uid),
+                    column: name().column(changed_name),
+                    ty: ColumnType::simple("integer"),
+                    to_nullable: true,
+                    collation: None,
+                    through_external_partitions: false,
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        let sides = [
+            Side {
+                schema: &before,
+                ids: &old,
+            },
+            Side {
+                schema: &after,
+                ids: &new,
+            },
+        ];
+        let bound = Bindings::resolve(&consumers("app.t.z", false), &sides, &Clone::clone).unwrap();
+        let mut policies = Policies::default();
+        policies.suppress.push(crate::Suppression {
+            rule: "consumer.breaking".into(),
+            on: Some("app.t.z".into()),
+            reason: "intentional rename reviewed".into(),
+            until: Some("2099-01-01".into()),
+        });
+        let found = plan(&changes, &bound, &sides, &policies, &context(), &unchanged);
+        assert_eq!(
+            found.len(),
+            expected,
+            "{changed_uid}/{changed_name}: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|(_, finding)| finding.id == "consumer.unproven")
+        );
+    }
+}

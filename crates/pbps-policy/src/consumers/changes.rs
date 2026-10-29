@@ -58,9 +58,11 @@ pub(super) fn classify(
     let pair_hit = |pair: ColumnPair<'_>| {
         Some(&pair.key.0) == entry.table()
             && (entry.column(&pair.key.1)
-                || pair
-                    .addresses()
-                    .any(|at| entry.named_column(&at.name, sides)))
+                // Names bridge inherited targets, never a different ordinary UID.
+                || (matches!(&entry.target, Target::NamedColumn { .. })
+                    && pair
+                        .addresses()
+                        .any(|at| entry.named_column(&at.name, sides))))
     };
     let written_pair = |pair: ColumnPair<'_>| written.is_some_and(|set| set.contains(&pair.key.0));
     let supplied = |uid: &Uid| {
