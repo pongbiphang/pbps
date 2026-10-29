@@ -727,6 +727,8 @@
         "domain_vet2309::domain2520_statement_tail_refuses_and_literal_semicolons_stay_valid",
         "rebuild2298b::rebuild2520_probe_cannot_execute_declared_expressions",
         "retained2354::retained2354_arrays_domains_chains_and_type_moves_preserve_bound_values",
+        "retained2354::retained2354_physical_column_order_keeps_logical_bindings",
+        "retained2354::retained2354_dropped_attribute_holes_keep_logical_bindings",
         "retained2354::retained2354_collations_floats_arguments_and_unavailable_scratch_rebuild",
         "retained2354::retained2354_staged_failures_keep_the_old_record_until_verified_closure",
         "retained2354::retained2354_relation_lock_allows_readers_and_writers_but_blocks_check_replacement",

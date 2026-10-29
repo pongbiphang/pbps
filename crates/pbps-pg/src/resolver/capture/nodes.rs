@@ -235,11 +235,21 @@ fn decode_values(text: &str, major: u32, values: bool) -> Result<Value, Uncovere
 
 /// Equality is a separate observation from binding coverage: every Datum is
 /// retained, and only a covered source-location field is discarded.
-pub(super) fn equal(left: &str, right: &str, major: u32) -> Result<bool, Uncovered> {
-    fn prepare(text: &str, major: u32) -> Result<Value, Uncovered> {
+pub(super) fn equal(
+    left: &str,
+    right: &str,
+    major: u32,
+    left_columns: &BTreeMap<u32, String>,
+    right_columns: &BTreeMap<u32, String>,
+) -> Result<bool, Uncovered> {
+    fn prepare(
+        text: &str,
+        major: u32,
+        columns: &BTreeMap<u32, String>,
+    ) -> Result<Value, Uncovered> {
         let mut value = decode_values(text, major, true)?;
         references(&value, major)?;
-        fn locations(value: &mut Value) -> Result<(), Uncovered> {
+        fn normalize(value: &mut Value, columns: &BTreeMap<u32, String>) -> Result<(), Uncovered> {
             match value {
                 Value::Node(node) => {
                     if node.tag == "CONST" {
@@ -261,24 +271,39 @@ pub(super) fn equal(left: &str, right: &str, major: u32) -> Result<bool, Uncover
                             return Err(Uncovered::Malformed);
                         }
                     }
+                    if node.tag == "VAR" {
+                        if node.number("varno")? != 1
+                            || node.number("varnosyn")? != 1
+                            || node.number("varlevelsup")? != 0
+                        {
+                            return Err(Uncovered::Reference);
+                        }
+                        for field in ["varattno", "varattnosyn"] {
+                            let column = columns
+                                .get(&node.number(field)?)
+                                .ok_or(Uncovered::Reference)?;
+                            node.fields
+                                .insert(field.into(), Value::Atom(column.clone()));
+                        }
+                    }
                     node.fields.remove("location");
                     for child in node.fields.values_mut() {
-                        locations(child)?;
+                        normalize(child, columns)?;
                     }
                 }
                 Value::List(values) => {
                     for child in values {
-                        locations(child)?;
+                        normalize(child, columns)?;
                     }
                 }
                 Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
             }
             Ok(())
         }
-        locations(&mut value)?;
+        normalize(&mut value, columns)?;
         Ok(value)
     }
-    Ok(prepare(left, major)? == prepare(right, major)?)
+    Ok(prepare(left, major, left_columns)? == prepare(right, major, right_columns)?)
 }
 
 impl Value {
@@ -915,6 +940,9 @@ mod tests {
     }
     #[test]
     fn retained2354_values_locations_and_unknown_coverage_are_distinct() {
+        let equal = |left: &str, right: &str, major| {
+            super::equal(left, right, major, &BTreeMap::new(), &BTreeMap::new())
+        };
         let left = "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location 5 :constvalue 7 [ 28 0 0 0 115 97 100 ]}";
         let changed = left.replace("115 97 100", "109 97 100");
         for major in [16, 18] {
@@ -941,5 +969,63 @@ mod tests {
         assert!(equal("{FUTURE :value 1}", left, 18).is_err());
         let collation = left.replace(":constcollid 100", ":constcollid 950");
         assert_eq!(equal(left, &collation, 18), Ok(false));
+    }
+    #[test]
+    fn retained2354_vars_keep_column_identity_across_physical_layouts() {
+        let left_columns = BTreeMap::from([(1, "m".into()), (3, "n".into())]);
+        let right_columns = BTreeMap::from([(2, "m".into()), (1, "n".into())]);
+        for major in [16, 18] {
+            let variable = |att| {
+                format!(
+                    "{{VAR :varno 1 :varattno {att} :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 {}:varnosyn 1 :varattnosyn {att} :location 0}}",
+                    if major == 18 {
+                        ":varreturningtype 0 "
+                    } else {
+                        ""
+                    }
+                )
+            };
+            let left = variable(1);
+            let right = variable(2);
+            let compare = |a: &str, b: &str| equal(a, b, major, &left_columns, &right_columns);
+            assert_eq!(compare(&left, &right), Ok(true));
+            assert_eq!(
+                compare(&left, &variable(1)),
+                Ok(false),
+                "m and n remain distinct"
+            );
+            for field in ["varattno", "varattnosyn"] {
+                for number in [-1, 0, 9] {
+                    assert!(
+                        compare(
+                            &left,
+                            &right.replace(&format!(":{field} 2"), &format!(":{field} {number}"))
+                        )
+                        .is_err()
+                    );
+                }
+                assert_eq!(
+                    compare(
+                        &left,
+                        &right.replace(&format!(":{field} 2"), &format!(":{field} 1"))
+                    ),
+                    Ok(false)
+                );
+            }
+            for (field, old, new) in [("varno", 1, 2), ("varnosyn", 1, 2), ("varlevelsup", 0, 1)] {
+                assert!(
+                    compare(
+                        &left,
+                        &right.replace(&format!(":{field} {old}"), &format!(":{field} {new}"))
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                compare(&left, &right.replace(":vartype 23", ":vartype 25")),
+                Ok(false)
+            );
+            assert!(equal(&left, &left, major, &BTreeMap::new(), &BTreeMap::new()).is_err());
+        }
     }
 }
