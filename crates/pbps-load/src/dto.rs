@@ -24,6 +24,8 @@ use pbps_model::{ColumnName, ReferentialAction};
 #[derive(Debug, serde::Deserialize)]
 pub struct KindProbe {
     #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
     pub dependency: Option<String>,
     #[serde(default, rename = "enum")]
     pub enumeration: Option<String>,
@@ -1459,6 +1461,7 @@ pub enum IndexOrder {
 #[serde(untagged)]
 #[schemars(title = "pbps declaration")]
 pub enum DeclarationFile {
+    Extension(Box<ExtensionDto>),
     Dependency(Box<DependencyDto>),
     // Boxed for their sizes: the enum is only ever a schema, and a box is
     // transparent to it.
@@ -1545,4 +1548,14 @@ mod tests {
             "[Vv][Ii][Ee][Ww][-_ ][Dd][Ee][Ff][Ii][Nn][Ii][Tt][Ii][Oo][Nn]"
         );
     }
+}
+
+/// Exact PostgreSQL package declaration. Rename is deliberately not a field.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionDto {
+    pub extension: pbps_model::ObjectLocalName,
+    pub schema: String,
+    #[schemars(with = "String", extend("minLength" = 1))]
+    pub version: serde_saphyr::Spanned<String>,
 }

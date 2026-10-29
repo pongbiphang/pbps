@@ -44,6 +44,8 @@ pub struct Pulled {
     /// Unheld catalog objects, named for adoption and connected-plan reports
     /// only. Never schema, managed limitations or recording evidence (DEC-2444.1).
     pub catalog_notices: Vec<String>,
+    /// Extension census objects, classified against managed ids by the caller.
+    pub extension_notices: std::collections::BTreeMap<pbps_model::ObjectLocalName, String>,
     /// Permissions the model cannot hold and a drift check must not call
     /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
     /// permission outside the closed set, a grant on an object the model does

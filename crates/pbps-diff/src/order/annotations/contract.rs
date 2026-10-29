@@ -47,17 +47,24 @@ pub struct Contract {
     pub(crate) extended: bool,
 }
 
-fn containing(declaration: &Declaration) -> ObjectRef {
+fn containing(declaration: &Declaration) -> Result<ObjectRef, String> {
     let root = match declaration {
+        // PR A has no executable extension root or dependency annotation.
+        Declaration::Extension(name) => {
+            return Err(format!(
+                "extension `{}` has no dependency annotation address in the read-only extension phase",
+                name.shown()
+            ));
+        }
         Declaration::Table(n) => Root::Table(n.clone()),
         Declaration::Module(n) => Root::Module(n.clone()),
         Declaration::Type(n) => Root::Type(n.clone()),
         Declaration::Role(n) => Root::Role(n.clone()),
     };
-    ObjectRef {
+    Ok(ObjectRef {
         root,
         part: Selector::Whole,
-    }
+    })
 }
 
 impl Side {
@@ -75,7 +82,7 @@ impl Side {
                 .bind(reference, owners, spelling)
                 .map_err(|e| e.to_string())?;
             let declaration =
-                containing(registry.declaration(reference).map_err(|e| e.to_string())?);
+                containing(registry.declaration(reference).map_err(|e| e.to_string())?)?;
             let container = registry
                 .bind(&declaration, owners, spelling)
                 .map_err(|e| e.to_string())?;
@@ -164,7 +171,7 @@ impl Contract {
         {
             if reference.part != Selector::Whole || matches!(reference.root, Root::Column(_)) {
                 let root =
-                    containing(registry.declaration(reference).map_err(|e| e.to_string())?).root;
+                    containing(registry.declaration(reference).map_err(|e| e.to_string())?)?.root;
                 demanded.entry(root).or_default().insert(reference.clone());
             }
         }
@@ -687,7 +694,7 @@ impl Contract {
         let registry = Registry::new(&schema);
         for reference in registry.references() {
             let declaration =
-                containing(registry.declaration(reference).map_err(|e| e.to_string())?);
+                containing(registry.declaration(reference).map_err(|e| e.to_string())?)?;
             if reference.root != root && declaration.root != root {
                 continue;
             }
@@ -819,5 +826,24 @@ impl Contract {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_extensions_do_not_acquire_executable_annotation_roots() {
+        let error = containing(&Declaration::Extension("package".into())).unwrap_err();
+        assert!(
+            error.contains("extension `package`") && error.contains("read-only"),
+            "{error}"
+        );
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        assert_eq!(
+            containing(&Declaration::Table(name.clone())).unwrap().root,
+            Root::Table(name)
+        );
     }
 }

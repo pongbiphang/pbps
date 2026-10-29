@@ -119,7 +119,15 @@ pub fn scope(
 ) -> Scoped {
     let managed: BTreeSet<&TableName> = ids.tables.values().collect();
 
-    let mut scoped = Schema::default();
+    let mut scoped = Schema {
+        extensions: schema
+            .extensions
+            .iter()
+            .filter(|(name, _)| ids.extension_uid(name).is_some())
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect(),
+        ..Default::default()
+    };
     let mut unmanaged_types = Vec::new();
     for (name, definition) in &schema.types {
         if ids.type_uid(name).is_some() {
@@ -392,6 +400,7 @@ pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsF
         .chain(reserved.columns.keys())
         .chain(reserved.roles.keys())
         .chain(reserved.types.keys())
+        .chain(reserved.extensions.keys())
         .chain(reserved.tombstones.keys())
         .cloned()
         .collect();
@@ -428,6 +437,7 @@ fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<
             .chain(recorded.columns.keys())
             .chain(recorded.roles.keys())
             .chain(recorded.types.keys())
+            .chain(recorded.extensions.keys())
             .chain(recorded.tombstones.keys())
             .cloned(),
     );
@@ -455,6 +465,13 @@ fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<
             None => free_uid(UidKind::Role, name.raw(), &mut taken),
         };
         observed.roles.insert(uid, name.clone());
+    }
+    for name in live.extensions.keys() {
+        let uid = recorded
+            .extension_uid(name)
+            .cloned()
+            .unwrap_or_else(|| free_uid(UidKind::Extension, name.raw(), &mut taken));
+        observed.extensions.insert(uid, name.clone());
     }
     for name in live.types.keys() {
         let uid = recorded

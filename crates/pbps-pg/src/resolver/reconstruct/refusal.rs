@@ -202,6 +202,7 @@ pub fn declaration(owner: &Declaration) -> String {
     match owner {
         Declaration::Table(t) => format!("table {}", t.shown()),
         Declaration::Module(m) => format!("module {}", m.shown()),
+        Declaration::Extension(e) => format!("extension {}", e.shown()),
         Declaration::Type(t) => format!("type {}", t.shown()),
         Declaration::Role(r) => format!("role {}", r.shown()),
     }

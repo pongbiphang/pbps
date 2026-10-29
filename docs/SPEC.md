@@ -1135,6 +1135,37 @@ adds no Schema member or apply query. The resolver still refuses undeclared
 managed three-part references, and DEC-619.3's sandbox boundary is unchanged.
 Apply continues to bind the real objects in its transaction.
 
+### 4.10 PostgreSQL extensions (read-only adoption)
+
+One package per `schema/extensions/<name>.yml` file (DEC-2447.1):
+
+```yaml
+extension: citext
+schema: extensions
+version: "1.6"
+```
+
+The name is one immutable, database-global identifier, not a qualified type
+name. `schema` is explicit. `version` is required, nonempty, quoted text and
+compared exactly; it is neither SemVer nor a request for a server default.
+`renamed_from` is refused. SQL Server refuses extension declarations by name.
+
+A full pull includes installed packages, including bootstrap `plpgsql`, with
+an `e_` identity and their exact schema/version. Extension members and their
+internal/automatic subsidiaries remain outside independent declarations;
+ordinary user objects in the same schema remain visible. A managed extension
+ceases to produce `plan.unheld-object`; unsupported comments on it still do.
+The census continues to omit system objects such as bootstrap `plpgsql`.
+
+Baseline and verify compare extensions only inside the recorded identity
+scope. Old snapshots and ids without `extensions` own none. Declaring an
+already installed but unheld package does not adopt it: use pull and an
+explicit baseline. A no-op plan is supported. CREATE EXTENSION, DROP
+EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET SCHEMA differences
+are named refusals and named drift, with no partial executable plan. No
+extension installation, code execution, provider-type admission or lifecycle
+approval is implemented in this phase.
+
 ## 5. The identity file (`schema.ids.json`)
 
 ### 5.1 Format
@@ -1171,6 +1202,12 @@ Apply continues to bind the real objects in its transaction.
   }
 }
 ```
+
+The optional `extensions` section maps `e_` UIDs to database-global package
+names. It defaults to empty and is omitted when empty under ids version 1.
+State snapshots record extension definitions from version 36; supported older
+snapshots read as owning no extensions. This read-only addition does not
+change the executable plan format.
 
 It stores only **what cannot be derived from the YAML**: the identity mapping,
 the tombstones, and the moves a human allowed (6.5). Column types, nullability and index definitions are never stored — the

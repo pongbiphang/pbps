@@ -23,6 +23,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut s = String::new();
     let _ = writeln!(s, "# {title}\n");
@@ -46,6 +47,18 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    if !extensions.is_empty() {
+        s.push_str("\n## Extensions\n\n| Name | Schema | Exact version |\n|---|---|---|\n");
+        for (name, definition) in extensions {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} |",
+                code_cell(name.raw()),
+                code_cell(&definition.schema),
+                code_cell(&definition.version)
+            );
+        }
+    }
     types_section(&mut s, types);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);

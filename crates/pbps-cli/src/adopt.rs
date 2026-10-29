@@ -521,6 +521,15 @@ pub(crate) fn write_declarations_with_deps(
     // the first, with the identity file naming both (DECISIONS 135).
     declaration_file::refuse_folded_paths(&declaration_file::paths_of(dir, schema)?)?;
     let mut written = BTreeSet::new();
+    if !schema.extensions.is_empty() {
+        std::fs::create_dir_all(dir.join("extensions"))?;
+    }
+    for (name, definition) in &schema.extensions {
+        let path = declaration_file::extension_path(dir, name);
+        std::fs::write(&path, pbps_load::render_extension(name, definition))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
     for (name, definition) in &schema.types {
         let path = declaration_file::type_path(dir, name)?;
         std::fs::write(&path, pbps_load::render_type(name, definition))

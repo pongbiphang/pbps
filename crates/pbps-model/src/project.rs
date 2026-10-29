@@ -204,12 +204,47 @@ fn ids_uids(ids: &IdsFile) -> impl Iterator<Item = &Uid> {
         .chain(ids.columns.keys())
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
+        .chain(ids.extensions.keys())
         .chain(ids.tombstones.keys())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extension_reservations_include_recorded_and_new_identity_files() {
+        let file = |uid: &str| IdsFile {
+            extensions: [(uid.parse().unwrap(), "package".into())].into(),
+            ..Default::default()
+        };
+        let files = DatabaseMap::new([
+            ("alpha".parse().unwrap(), file("e_aaaaaa")),
+            ("beta".parse().unwrap(), file("e_bbbbbb")),
+        ])
+        .unwrap();
+        let mut pool = UidReservations::from_files(&files).unwrap();
+        for uid in ["e_aaaaaa", "e_bbbbbb"] {
+            assert!(pool.contains(&uid.parse().unwrap()));
+        }
+        pool.reserve_file(&file("e_cccccc"));
+        let mut draws = ["e_aaaaaa", "e_cccccc", "e_dddddd"]
+            .map(|uid| uid.parse().unwrap())
+            .into_iter();
+        assert_eq!(
+            pool.allocate_with(|| draws.next().unwrap()),
+            "e_dddddd".parse().unwrap()
+        );
+        let duplicate = DatabaseMap::new([
+            ("alpha".parse().unwrap(), file("e_aaaaaa")),
+            ("beta".parse().unwrap(), file("e_aaaaaa")),
+        ])
+        .unwrap();
+        let error = UidReservations::from_files(&duplicate).unwrap_err();
+        for name in ["alpha", "beta", "e_aaaaaa"] {
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
     #[test]
     fn allocation_redraws_a_foreign_database_uid_and_reserves_the_result() {
         let held: Uid = "t_aaaaaa".parse().unwrap();

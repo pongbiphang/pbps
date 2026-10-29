@@ -2733,7 +2733,18 @@ async fn managed_state_full(
         scoped,
         limitations,
         permission_advisories,
-        catalog_notices: pulled.catalog_notices.clone(),
+        catalog_notices: pulled
+            .catalog_notices
+            .iter()
+            .cloned()
+            .chain(
+                pulled
+                    .extension_notices
+                    .iter()
+                    .filter(|(name, _)| ids.extension_uid(name).is_none())
+                    .map(|(_, message)| message.clone()),
+            )
+            .collect(),
         unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
@@ -3648,8 +3659,13 @@ pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (name, definition) in extensions {
+        out.entry(definition.schema.clone())
+            .or_insert_with(|| format!("the schema of extension `{}`", name.shown()));
+    }
     for (name, role) in roles {
         for target in role.grants.keys() {
             if let pbps_model::GrantTarget::Schema(s) = target {
@@ -6522,11 +6538,18 @@ fn refuse_unidentified_bootstrap_objects(schema: &Schema, ids: &IdsFile) -> anyh
         types,
         modules: _,
         roles,
+        extensions,
     } = schema;
-    let unidentified: Vec<String> = tables
+    let unidentified: Vec<String> = extensions
         .keys()
-        .filter(|name| ids.table_uid(name).is_none())
-        .map(|name| name.shown().to_string())
+        .filter(|name| ids.extension_uid(name).is_none())
+        .map(|name| format!("extension {}", name.shown()))
+        .chain(
+            tables
+                .keys()
+                .filter(|name| ids.table_uid(name).is_none())
+                .map(|name| name.shown().to_string()),
+        )
         .chain(
             roles
                 .keys()
@@ -6574,6 +6597,7 @@ fn refuse_nonempty_bootstrap(
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let names: Vec<String> = tables
         .keys()
@@ -6588,6 +6612,11 @@ fn refuse_nonempty_bootstrap(
                 .map(|(name, _)| format!("role {}", name.shown())),
         )
         .chain(types.keys().map(|name| format!("type {}", name.shown())))
+        .chain(
+            extensions
+                .keys()
+                .map(|name| format!("extension {}", name.shown())),
+        )
         // Omitted definitions still occupy names in the managed set.
         .chain(limitations.iter().cloned())
         .collect();
@@ -7379,6 +7408,31 @@ async fn plan_db_async(
         // identity, and this plan must be computed against what was reviewed
         // (DEC-2331.1).
         pbps_diff::conversion::prune(&mut resolved.ids, &loaded.schema, dialect.as_ref());
+        // Diagnose an unsupported package action before the generic stale-ids
+        // gate: CREATE/DROP themselves change the tentative identity section.
+        if let Ok((_, entry)) = &checked_target {
+            let errors = pbps_diff::extension_differences(
+                pbps_diff::Side {
+                    schema: &entry.snapshot.schema,
+                    ids: &entry.snapshot.ids,
+                },
+                pbps_diff::Side {
+                    schema: &loaded.schema,
+                    ids: &resolved.ids,
+                },
+                dialect.name(),
+            );
+            if !errors.is_empty() {
+                bail!(
+                    "{}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
         if resolved.ids != ids {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
@@ -9136,6 +9190,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     if plan.changes.is_empty()
         && original_ids.roles == plan.ids.roles
         && original_ids.types == plan.ids.types
+        && original_ids.extensions == plan.ids.extensions
     {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
@@ -17034,6 +17089,7 @@ mod tests {
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
+            extension_notices: BTreeMap::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -23113,6 +23169,7 @@ mod tests {
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
+            extension_notices: BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![

@@ -12,6 +12,7 @@ pub type SourceConflicts = BTreeMap<TableName, BTreeMap<ColumnName, Vec<ValueSou
 /// A declaration owner, outside semantic equality and saved artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Declaration {
+    Extension(crate::ObjectLocalName),
     Table(TableName),
     Module(crate::ModuleId),
     Type(crate::TypeRef),

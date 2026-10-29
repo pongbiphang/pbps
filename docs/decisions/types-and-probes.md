@@ -4421,3 +4421,39 @@ Plan 59 adds the column-default target. Schema set 84 archives the complete
 published set over PR 1's set 83. Existing archives remain unchanged. The state
 format stays unchanged because declared defaults already have their own
 expression and binding maps.
+
+<a id="dec-2447-1"></a>
+
+**DEC-2447.1. Exact installed extensions are read-only managed state.**
+
+PR A adopts a database-global immutable extension name with an `e_` UID,
+explicit schema and required nonempty quoted version. Version text is opaque
+and exact. Rename annotations are refused. The neutral Schema owns definitions;
+ids version 1 adds a default-empty, skip-empty extensions map. State version 36
+records it, and supported older snapshots own none. Empty maps preserve older
+serialized state/checksum shapes. Published schemas advance as a complete set;
+this slice adds no executable Change and does not advance the plan format.
+
+PostgreSQL reads every installed package, including system bootstrap plpgsql,
+in the same catalog snapshot. Missing, malformed, duplicate and empty required
+fields refuse; a read failure never becomes an absent package. Full pull writes
+all installed packages and preserves existing identities. Connected comparison
+and verify keep the recorded managed scope. An installed unheld package requires
+explicit pull/baseline adoption; declaring it alone cannot claim ownership.
+
+CREATE, DROP, UPDATE and SET SCHEMA differences use the differ's existing named
+unexpressible-drift/refusal channel. No successful executable plan can discard
+one of these differences. Extension code risk, required rehearsal, drop intent,
+member evidence, lifecycle operations and provider-type support belong to the
+remaining approved #2447 slices rather than placeholder executable operations.
+
+The census carries extension notices by raw package identity beside ordinary
+unheld notices. Full pull represents them as declarations; connected planning
+reports packages outside recorded extension ids. Unsupported extension comments
+remain notices. The existing system-OID and direct-e plus internal/automatic
+member projection rules remain in force: plpgsql is pulled but does not become
+an unheld-system advisory, while unrelated objects sharing a package schema
+stay visible. Real PostgreSQL 16/18 tests pin adoption, no-op comparison, native
+version/schema/missing-package drift, lifecycle refusals, old scope, members
+and comments. Type-provider acceptance and executable extension transitions
+are deliberately not claimed by this read-only contract.
