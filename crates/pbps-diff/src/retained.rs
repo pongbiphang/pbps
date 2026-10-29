@@ -55,13 +55,9 @@ pub fn candidates(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Vec<Retai
                     .iter()
                     .filter(|(_, c)| &c.table == table))
             || old.columns.len() != new.columns.len()
-            || old
-                .columns
-                .iter()
-                .zip(&new.columns)
-                .any(|((a, x), (b, y))| {
-                    a != b
-                        || x.ty.is_array() != y.ty.is_array()
+            || old.columns.iter().any(|(name, x)| {
+                new.columns.get(name).is_none_or(|y| {
+                    x.ty.is_array() != y.ty.is_array()
                         || x.collation != y.collation
                         || matches!(x.value_source, pbps_model::ValueSource::Generated(_))
                         || matches!(y.value_source, pbps_model::ValueSource::Generated(_))
@@ -71,6 +67,7 @@ pub fn candidates(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Vec<Retai
                                 .zip(y.ty.type_ref())
                                 .is_some_and(|(x, y)| types.same_declared(x, y)))
                 })
+            })
         {
             continue;
         }

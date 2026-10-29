@@ -683,6 +683,8 @@
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "retained2354::retained2354_arrays_domains_chains_and_type_moves_preserve_bound_values",
+        "retained2354::retained2354_physical_column_order_keeps_logical_bindings",
+        "retained2354::retained2354_dropped_attribute_holes_keep_logical_bindings",
         "retained2354::retained2354_collations_floats_arguments_and_unavailable_scratch_rebuild",
         "retained2354::retained2354_staged_failures_keep_the_old_record_until_verified_closure",
         "retained2354::retained2354_relation_lock_allows_readers_and_writers_but_blocks_check_replacement",

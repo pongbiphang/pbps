@@ -55,6 +55,9 @@ impl Fixture {
         Self::typed(server, tag, before, default, "app.mood", "[sad, ok]")
     }
     fn typed(server: &str, tag: &str, before: &str, default: bool, ty: &str, values: &str) -> Self {
+        Self::declared(server, tag, &table(before, default, false), ty, values)
+    }
+    fn declared(server: &str, tag: &str, declaration: &str, ty: &str, values: &str) -> Self {
         let own = OwnDatabase::new(server, "retained2354target");
         on_server(own.connection(), "CREATE SCHEMA app");
         let d = Demo::new(tag);
@@ -70,7 +73,7 @@ impl Fixture {
             )
             .unwrap();
         }
-        d.table(&table(before, default, false).replace("type: app.mood", &format!("type: {ty:?}")));
+        d.table(&declaration.replace("type: app.mood", &format!("type: {ty:?}")));
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", own.connection()]));
@@ -694,5 +697,100 @@ fn retained2354_replaced_function_bodies_still_refuse_through_existing_pins() {
             ),
             "sad"
         );
+    }
+}
+
+fn layout_schema(expression: &str, renamed: bool) -> String {
+    table(expression, false, renamed).replace("primary_key:", "  n: {type: app.mood}\nprimary_key:")
+}
+fn layout_retention(server: &str, hole: bool) {
+    let f = Fixture::declared(
+        server,
+        "retained2354layout",
+        &layout_schema("m <> 'sad'", false),
+        "app.mood",
+        "[sad, ok]",
+    );
+    // Rebuild the physical fixture without changing its logical declaration.
+    // A second enum column makes an incorrect identity mapping observable.
+    on_server(
+        f.own.connection(),
+        &format!(
+            "DROP TABLE app.t; CREATE TABLE app.t ({}m app.mood); \
+             ALTER TABLE app.t ADD COLUMN id integer NOT NULL; \
+             ALTER TABLE app.t ADD COLUMN n app.mood; {} \
+             ALTER TABLE app.t ADD PRIMARY KEY (id); \
+             ALTER TABLE app.t ADD CONSTRAINT allowed CHECK (m <> 'sad'); \
+             INSERT INTO app.t (id,m,n) VALUES (1,'ok','ok')",
+            if hole { "removed integer, " } else { "" },
+            if hole {
+                "ALTER TABLE app.t DROP COLUMN removed;"
+            } else {
+                ""
+            },
+        ),
+    );
+    let layout = text_of(
+        f.own.connection(),
+        "SELECT string_agg(attnum::text || ':' || attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid='app.t'::regclass AND attnum>0 AND NOT attisdropped",
+    );
+    assert_eq!(layout, if hole { "2:m,3:id,4:n" } else { "1:m,2:id,3:n" });
+    f.rename("m <> 'blue'", false);
+    f.d.table(&layout_schema("m <> 'blue'", true));
+    f.d.commit();
+    let before = f.identity();
+    let plan = f.plan(true, false);
+    assert_eq!(
+        retained(&plan),
+        1,
+        "physical layout {layout} must retain the CHECK"
+    );
+    assert!(!rebuilt(&plan));
+    let mut tampered = plan.clone();
+    for step in &mut tampered.changes.changes {
+        if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut step.change {
+            retained[0].after = "n <> 'blue'".into();
+        }
+    }
+    std::fs::write(&f.path, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+    let out = f.apply(false, false);
+    assert_ne!(code(&out), 0, "a different column cannot prove retention");
+    assert!(stderr(&out).contains("retained CHECK"), "{}", stderr(&out));
+    assert_eq!(f.identity(), before);
+    // Scratch must preserve the same distinction, even though it binds both
+    // expressions on one carrier rather than reading the real table's tree.
+    f.d.table(&layout_schema("n <> 'blue'", true));
+    f.d.commit();
+    let different = f.plan(true, false);
+    assert_eq!(retained(&different), 0);
+    assert!(rebuilt(&different));
+    f.d.table(&layout_schema("m <> 'blue'", true));
+    f.d.commit();
+    f.plan(true, false);
+    succeeds(f.apply(false, false));
+    assert_eq!(f.identity(), before);
+    assert_eq!(
+        latest_snapshot(f.own.connection())
+            .declared
+            .expressions
+            .checks[&"app.t".parse().unwrap()]["allowed"],
+        "m <> 'blue'"
+    );
+    assert!(f.plan(true, false).changes.is_empty());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_physical_column_order_keeps_logical_bindings() {
+    for server in servers() {
+        layout_retention(&server, false);
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_dropped_attribute_holes_keep_logical_bindings() {
+    for server in servers() {
+        layout_retention(&server, true);
     }
 }

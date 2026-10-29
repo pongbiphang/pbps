@@ -4144,3 +4144,20 @@ This first part retains CHECKs only. Defaults keep AlterColumnDefault and its
 ordinary table lock. Offline and unproved plans keep DropCheck/AddCheck.
 The ledger stores the actual read-back and advances only the approved
 expression payload, so applying a saved plan needs no checkout or resolver.
+
+
+<a id="dec-2354-2"></a>
+
+**DEC-2354.2. Retention compares logical column identities across physical attribute layouts.**
+A real table and an empty carrier assign attribute numbers independently.
+Reordering and dropped-column holes must not turn a valid CHECK retention into
+an apply refusal. Candidate admission matches the existing column names and
+UIDs without requiring physical order. Each bound expression carries its
+logical table and the live catalog's positive, non-dropped attribute-to-name
+map. Equality maps both `varattno` and `varattnosyn` through these identities;
+it never discards either field. Missing attributes, system/whole-row variables,
+or another relation/query level cannot prove equality. Type, collation, value
+and all other covered fields remain significant. Scratch rebinding and fresh
+target verification share this mapping; the latter still pins the same CHECK
+OID and raw tree while holding its relation lock. These transient observations
+change neither the saved plan nor the authored record format.
