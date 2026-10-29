@@ -88,6 +88,7 @@ pub(crate) fn differ(plan: PlanningPlan) -> DiffPlan {
 pub(super) fn state<S, T>(plan: PlanningPlan<S>) -> PlanningPlan<T> {
     let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
     done.identities = plan.identities;
+    done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
     done
 }
@@ -140,6 +141,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     });
     let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
     done.identities = identities;
+    done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
     Ok(done)
 }
@@ -165,6 +167,7 @@ pub struct PlanningPlan<S = Draft> {
     pub(super) logical: usize,
     pub(super) proof: OrderingProof,
     pub(super) identities: Option<pbps_model::operation::Operations>,
+    pub(super) allocator: pbps_model::operation::IdAllocator,
     pub(super) boundaries: super::boundaries::Obligations,
 }
 
@@ -183,6 +186,7 @@ impl<S> PlanningPlan<S> {
             logical,
             proof,
             identities: None,
+            allocator: pbps_model::operation::IdAllocator::logical(logical),
             boundaries: Default::default(),
         }
     }
@@ -201,6 +205,7 @@ impl<S> PlanningPlan<S> {
                     .zip(self.payload.changes.iter().cloned()),
                 modules,
             ));
+            self.allocator.reserve(self.identities.as_ref().unwrap());
         }
     }
     pub fn changes(&self) -> &ChangeSet {

@@ -97,7 +97,9 @@ pub fn finish<S, T>(
                 .expect("the proof remap already matched every operation");
             matched[found] = Some(position);
         }
-        let extras = identities.additional(
+        after.allocator = before.allocator.clone();
+        after.allocator.reserve(identities);
+        let extras = after.allocator.allocate(
             matched
                 .iter()
                 .enumerate()

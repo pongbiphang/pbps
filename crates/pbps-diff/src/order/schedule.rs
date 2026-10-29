@@ -334,6 +334,7 @@ impl Schedule {
             settled.proof.clone(),
         );
         changes.identities = identities;
+        changes.allocator = plan.allocator;
         changes.boundaries = plan.boundaries;
         Ok(Settled {
             changes,

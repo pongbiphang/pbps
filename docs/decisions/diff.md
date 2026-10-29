@@ -9201,3 +9201,43 @@ its lock-note assertion and the physical-list/order/remedy oracle still
 require PR 6 and PR 7 as specified in DEC-2296.5. Every production guard and
 pending-boundary discharge check remains in force. No positional replay,
 rank, tie-break, settlement stage or format changes.
+
+<a id="dec-2296-9"></a>
+
+**DEC-2296.9. A planning input consumes a shared address version without
+changing its logical origin.** A woven teardown can name a retained table
+after a rename, although its role still removes a base object. One spelling
+override per operation cannot express an intermediate address, a returned
+name, or a reused name safely. `AddressChain` binds input reads to the existing
+`Property::Address` and column-name chains, with `Version::After(OperationId)`
+identifying events. It captures only the name projection already selected by
+weave; it neither orders operations nor replays membership. Immutable read
+snapshots are shared between consumers. Excluded pending families retain
+their endpoint templates and ordinary inputs retain their existing role rule.
+
+`OriginView` borrows the unchanged logical origin and derives input spelling
+from that chain. Matching endpoint/logical versions retain Base, Final or At;
+an intermediate version set uses a typed Input reference. Scoped input owners
+resolve that reference, while explicit baseline/final snapshot queries still
+use the original owners. They cannot be redirected together: after u2 becomes
+v and u becomes mid, a DROP FK on mid belongs to u's UID while its baseline FK
+target named u2 still belongs to v's UID. Missing context, unknown names and
+known vacancy remain distinct. Portable effects and slots bind that read-only
+view at their existing entry points; the effects implementation is unchanged.
+Rename dependencies consume event versions rather than equal endpoint text.
+No mutable per-operation spelling field or override setter is introduced.
+
+A single reservation ledger on `PlanningPlan` allocates subsequent source and
+part numbers. Holding PUBLIC companions removes their visible steps, not their
+reserved events. Companion restoration returns the exact events; split parts,
+resolver remaps and appended scope tails use the same ledger, which survives
+existing state transitions and settlement. No visible-list maximum or
+`additional_after` reservation workaround is needed.
+
+The dependent-bearing reference scenes now compare their complete pending-stage
+spelling vectors as well as their exact DEFAULT templates. This is PR 5's share
+of DEC-2296.5 and DEC-2296.8. Their full canonical changes/order/spellings oracle,
+successful diff/schedule and nonempty certified result remain PR 7 gates; the
+physical-boundary replay and lock annotation still require PR 6. Every guard
+remains. No format, pass, rank, tie-break, positional replay or engine boundary
+changes; no scratch/fill or annotation-projection changes.

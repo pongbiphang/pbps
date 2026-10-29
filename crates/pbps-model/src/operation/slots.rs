@@ -262,6 +262,8 @@ pub fn names(
     owners: &dyn Owners,
     before: super::Snapshot<'_>,
 ) -> Result<Names, OwnerError> {
+    let input_owners = op.input_owners(owners);
+    let owners: &dyn Owners = &input_owners;
     let mut nx = Nx {
         op,
         owners,
@@ -685,6 +687,8 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
 /// Shared input addresses for explicit intermediate operations. Ordinary plans
 /// keep their origin-based fallback; no origin splitting is needed (DEC-2298.9).
 pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Named>, OwnerError> {
+    let input_owners = op.input_owners(owners);
+    let owners: &dyn Owners = &input_owners;
     let change = op.change();
     if !owners.address_qualified()
         && !matches!(

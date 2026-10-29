@@ -126,7 +126,9 @@ impl Rule<'_> {
         let origin = match spelling {
             Spelling::Base => Origin::Teardown(OriginSource::Change(0)),
             Spelling::Final => Origin::Restoration(OriginSource::Change(0)),
-            Spelling::At(_) => return Err("catalog surface needs an endpoint".into()),
+            Spelling::At(_) | Spelling::Input(_) => {
+                return Err("catalog surface needs an endpoint".into());
+            }
         };
         let prototype = Operations::expanded(
             1,

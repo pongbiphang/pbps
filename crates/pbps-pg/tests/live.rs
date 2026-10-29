@@ -52,6 +52,9 @@ mod plan_names_tests;
 #[path = "support/physical_sources.rs"]
 mod physical_sources;
 
+#[path = "support/address_chain2296.rs"]
+mod address_chain2296;
+
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 

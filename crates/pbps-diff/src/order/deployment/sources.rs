@@ -69,7 +69,7 @@ impl<'p> Projection<'p> {
     /// Bind the already selected physical address to its recorded endpoint.
     /// It must not inherit an added teardown's Base spelling merely because
     /// that is its logical role. Active families keep their pending templates.
-    #[allow(dead_code)] // PR 5 applies this qualification through the address chain.
+    #[allow(dead_code)] // Retained endpoint oracle; execution inputs consume shared versions.
     pub(super) fn spelling(
         &self,
         table: Option<&TableName>,
@@ -107,6 +107,45 @@ impl<'p> Projection<'p> {
         Err(format!(
             "the projected table address is not a recorded endpoint; {}",
             crate::order::membership::REMEDY
+        ))
+    }
+
+    pub(super) fn bind_inputs(
+        &self,
+        operations: &pbps_model::operation::Operations,
+    ) -> pbps_model::operation::Operations {
+        let Self::Pending(pending) = self else {
+            return operations.clone();
+        };
+        let readers = operations
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| {
+                if !op
+                    .planned()
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.rule == "weave")
+                {
+                    return None;
+                }
+                let table = op.change().table()?;
+                let pbps_model::physical_sources::Source::Stored(source) =
+                    pending.known.table_source(table, At::Before(at))
+                else {
+                    return None;
+                };
+                let uid = pending.before.ids.table_uid(&source)?;
+                (!pending.family.contains(uid)).then_some(op.id())
+            })
+            .collect();
+        operations.with_address_chain(pbps_model::operation::AddressChain::bind(
+            self.names(),
+            operations,
+            pending.before.ids,
+            pending.after,
+            &pending.family,
+            &readers,
         ))
     }
 

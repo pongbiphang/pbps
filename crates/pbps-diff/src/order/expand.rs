@@ -131,6 +131,15 @@ pub trait Expansion {
         obligation: &Self::Obligation,
     ) -> Result<Rewrite, String>;
 
+    /// Bind input address versions after this rewrite's names are selected.
+    /// This grants no ordering or execution authority.
+    fn bind_inputs(
+        &self,
+        operations: &pbps_model::operation::Operations,
+    ) -> Result<pbps_model::operation::Operations, String> {
+        Ok(operations.clone())
+    }
+
     /// The edges the finished plan is settled over, from scratch.
     fn order(&self, plan: &[PlannedChange]) -> Result<Vec<Order>, String>;
 }
@@ -149,7 +158,7 @@ pub fn expand<E: Expansion>(
     expansion: &E,
     factor: usize,
 ) -> Result<Expanded, String> {
-    let input = plan.clone();
+    let mut input = plan.clone();
     let logical: Vec<String> = plan.changes.iter().map(|p| p.change.subject()).collect();
     let mut state = State {
         origins: (0..plan.changes.len()).map(Origin::Whole).collect(),
@@ -209,7 +218,7 @@ pub fn expand<E: Expansion>(
             list(&left)
         ));
     }
-    let retained: Vec<_> = if input.boundaries.is_empty() {
+    let retained: Vec<_> = if input.identities.is_none() {
         Vec::new()
     } else {
         state
@@ -250,10 +259,9 @@ pub fn expand<E: Expansion>(
         input.logical,
         state.proof,
     );
-    if !input.boundaries.is_empty()
-        && let Some(identities) = &input.identities
-    {
-        let added = identities.additional(
+    if let Some(identities) = &input.identities {
+        input.allocator.reserve(identities);
+        let added = input.allocator.allocate(
             retained
                 .iter()
                 .enumerate()
@@ -264,7 +272,11 @@ pub fn expand<E: Expansion>(
                         changes.payload.changes[at].clone(),
                     )
                 }),
-            input.boundaries.module_edits(),
+            if input.boundaries.is_empty() {
+                pbps_model::operation::ModuleEdits::InPlace
+            } else {
+                input.boundaries.module_edits()
+            },
         );
         let mut added = added.iter().cloned();
         let operations =
@@ -274,9 +286,11 @@ pub fn expand<E: Expansion>(
                     |at| identities.as_slice()[at].clone(),
                 )
             }));
-        changes.identities = Some(operations.with_steps(&changes.payload.changes));
+        changes.identities =
+            Some(expansion.bind_inputs(&operations.with_steps(&changes.payload.changes))?);
     }
     changes.boundaries = input.boundaries;
+    changes.allocator = input.allocator;
     Ok(Expanded { changes, rewrites })
 }
 

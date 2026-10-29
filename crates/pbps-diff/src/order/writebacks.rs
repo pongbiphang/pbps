@@ -115,12 +115,13 @@ impl PlanningInput {
         Self { changes }
     }
     pub fn append_to<S>(&self, draft: super::PlanningPlan<S>) -> super::PlanningPlan {
-        let mut draft: super::PlanningPlan = if draft.boundaries.is_empty() {
-            // Preserve the existing re-proposal route for ordinary inputs.
-            super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
-        } else {
-            super::plan::state(draft)
-        };
+        let mut draft: super::PlanningPlan =
+            if draft.boundaries.is_empty() && draft.identities.is_none() {
+                // Untracked inputs retain the existing re-proposal route.
+                super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
+            } else {
+                super::plan::state(draft)
+            };
         let prior = draft.payload.changes.len();
         for part in &self.changes {
             draft
@@ -130,12 +131,17 @@ impl PlanningInput {
             draft.payload.changes.push(part.clone());
         }
         if let Some(identities) = &draft.identities {
-            let added = identities.additional(
+            draft.allocator.reserve(identities);
+            let added = draft.allocator.allocate(
                 draft.origins[prior..]
                     .iter()
                     .cloned()
                     .zip(draft.payload.changes[prior..].iter().cloned()),
-                draft.boundaries.module_edits(),
+                if draft.boundaries.is_empty() {
+                    pbps_model::operation::ModuleEdits::InPlace
+                } else {
+                    draft.boundaries.module_edits()
+                },
             );
             draft.identities = Some(pbps_model::operation::Operations::from_operations(
                 identities.iter().chain(added.iter()).cloned(),

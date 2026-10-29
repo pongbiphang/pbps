@@ -126,7 +126,7 @@ impl Bindings {
         let side = match spelling {
             Spelling::Base => &self.source,
             Spelling::Final => &self.replacement,
-            Spelling::At(_) => {
+            Spelling::At(_) | Spelling::Input(_) => {
                 if self.covered(name) {
                     return Some(Err(OwnerError::Rebuild {
                         name: name.shown().to_string(),
@@ -173,7 +173,7 @@ impl Bindings {
             let side = match spelling {
                 Spelling::Base => &self.source,
                 Spelling::Final => &self.replacement,
-                Spelling::At(_) => {
+                Spelling::At(_) | Spelling::Input(_) => {
                     if self.covered(&column.table) {
                         return Some(Err(OwnerError::Rebuild {
                             name: column.shown().to_string(),

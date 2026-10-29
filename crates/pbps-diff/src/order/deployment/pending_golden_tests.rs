@@ -19,6 +19,13 @@ fn dependent_meetings_keep_the_reference_pending_default_templates() {
             (label, serde_json::from_str(value).unwrap())
         })
         .collect();
+    let spelling_oracle: BTreeMap<_, Vec<String>> = include_str!("pending_spellings.golden")
+        .lines()
+        .map(|line| {
+            let (label, value) = line.split_once('\t').unwrap();
+            (label, serde_json::from_str(value).unwrap())
+        })
+        .collect();
     let mut seen = BTreeSet::new();
     let id: ModuleId = "app.f(integer)".parse().unwrap();
     let module = |v| Module {
@@ -131,10 +138,19 @@ fn dependent_meetings_keep_the_reference_pending_default_templates() {
                         .collect();
                     defaults.sort();
                     assert_eq!(&defaults, &expected[label.as_str()], "{label}");
+                    let spellings: Vec<_> = plan
+                        .identities
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .map(|op| format!("{:?}", op.origin().spelling()))
+                        .collect();
+                    assert_eq!(&spellings, &spelling_oracle[label.as_str()], "{label}");
                     assert!(seen.insert(label));
                 }
             }
         }
     }
     assert_eq!(seen.len(), expected.len());
+    assert_eq!(seen.len(), spelling_oracle.len());
 }

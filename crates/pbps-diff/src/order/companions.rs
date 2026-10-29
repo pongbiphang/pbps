@@ -5,21 +5,50 @@ use pbps_model::{Change, ColumnRef, ModuleId, PlannedChange, Schema, TableName, 
 use std::collections::BTreeSet;
 
 /// Removed companions retain their exact source mapping until restoration.
-pub struct PublicDecisions(Vec<(PlannedChange, pbps_model::operation::Origin)>);
+pub struct PublicDecisions(
+    Vec<(
+        PlannedChange,
+        pbps_model::operation::Origin,
+        Option<pbps_model::operation::Operation>,
+    )>,
+);
 
 pub fn take_public_execution(cs: &mut super::PlanningPlan) -> PublicDecisions {
+    if let Some(identities) = &cs.identities {
+        cs.allocator.reserve(identities);
+    }
+    let tracked = cs.identities.is_some();
+    let identities = cs
+        .identities
+        .take()
+        .map(|ops| ops.iter().cloned().map(Some).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![None; cs.changes.len()]);
+    assert_eq!(identities.len(), cs.changes.len());
     let (decisions, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut cs.payload.changes)
         .into_iter()
         .zip(std::mem::take(&mut cs.origins))
-        .partition(|(p, _)| matches!(p.change, Change::PublicExecution { .. }));
-    (cs.payload.changes, cs.origins) = rest.into_iter().unzip();
+        .zip(identities)
+        .map(|((p, origin), identity)| (p, origin, identity))
+        .partition(|(p, _, _)| matches!(p.change, Change::PublicExecution { .. }));
+    let mut retained = Vec::new();
+    for (step, origin, identity) in rest {
+        cs.payload.changes.push(step);
+        cs.origins.push(origin);
+        if tracked {
+            retained.push(identity.expect("tracked step retains its event"));
+        }
+    }
+    if tracked {
+        cs.identities = Some(pbps_model::operation::Operations::from_operations(retained));
+    }
     cs.invalidate();
     PublicDecisions(decisions)
 }
 
 pub fn settle_public_execution(cs: &mut super::PlanningPlan, decisions: PublicDecisions) {
-    for (decision, origin) in decisions.0 {
+    for (decision, origin, identity) in decisions.0 {
         let Change::PublicExecution { routine, .. } = &decision.change else {
+            insert_identity(cs, cs.changes.len(), identity);
             cs.payload.changes.push(decision);
             cs.origins.push(origin);
             continue;
@@ -43,10 +72,26 @@ pub fn settle_public_execution(cs: &mut super::PlanningPlan, decisions: PublicDe
                 })
             })
             .unwrap_or(cs.changes.len());
+        insert_identity(cs, at, identity);
         cs.payload.changes.insert(at, decision);
         cs.origins.insert(at, origin);
     }
     cs.invalidate();
+}
+
+fn insert_identity(
+    cs: &mut super::PlanningPlan,
+    at: usize,
+    identity: Option<pbps_model::operation::Operation>,
+) {
+    if let Some(operations) = &cs.identities {
+        let mut retained = operations.iter().cloned().collect::<Vec<_>>();
+        retained.insert(
+            at,
+            identity.expect("a held tracked step returns with its event"),
+        );
+        cs.identities = Some(pbps_model::operation::Operations::from_operations(retained));
+    }
 }
 
 pub fn split_moving_defaults(
@@ -145,10 +190,30 @@ pub fn split_moving_defaults(
     // One split off for a column the parent adds names that column, so the
     // reorder holds it behind the column as it would have held the create.
     sets.sort_by_key(|(after, _, _)| *after);
-    for (after, change, origin) in sets.into_iter().rev() {
-        cs.payload
-            .changes
-            .insert(after + 1, planned(change, dialect));
+    let sets: Vec<_> = sets
+        .into_iter()
+        .rev()
+        .map(|(at, change, origin)| (at, planned(change, dialect), origin))
+        .collect();
+    if let Some(identities) = &cs.identities {
+        let prior = identities.with_steps(&cs.payload.changes);
+        cs.allocator.reserve(&prior);
+        let added = cs.allocator.allocate(
+            sets.iter()
+                .map(|(_, p, origin)| (origin.clone(), p.clone())),
+            if cs.boundaries.is_empty() {
+                pbps_model::operation::ModuleEdits::InPlace
+            } else {
+                cs.boundaries.module_edits()
+            },
+        );
+        cs.identities = Some(prior);
+        for ((after, _, _), identity) in sets.iter().zip(added.iter()) {
+            insert_identity(cs, after + 1, Some(identity.clone()));
+        }
+    }
+    for (after, part, origin) in sets {
+        cs.payload.changes.insert(after + 1, part);
         cs.origins.insert(after + 1, origin);
     }
     cs.invalidate();
@@ -190,4 +255,89 @@ fn planned(change: Change, dialect: &(impl Dialect + ?Sized)) -> PlannedChange {
     let mut part = PlannedChange::new(change);
     part.risks = dialect.change_risks(&part.change);
     part
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use pbps_model::operation::{ModuleEdits, Operations, Origin, Source};
+    use pbps_model::{ChangeSet, PublicAccess, RoutineOrigin};
+    fn public(name: &str) -> PlannedChange {
+        let ModuleId::Routine(routine) = format!("app.{name}()").parse().unwrap() else {
+            panic!()
+        };
+        PlannedChange::new(Change::PublicExecution {
+            routine,
+            access: PublicAccess::Revoked,
+            origin: RoutineOrigin::Rebuilt,
+        })
+    }
+    #[test]
+    fn held_public_events_reserve_ids_even_when_no_operations_remain_visible() {
+        let rebinding = Source::Rebinding(pbps_model::resolver::Surface::Module(
+            "app.g()".parse().unwrap(),
+        ));
+        let origins = vec![Origin::Whole(0), Origin::Restoration(rebinding.clone())];
+        let mut plan = crate::order::propose(ChangeSet {
+            changes: vec![public("f"), public("g")],
+        });
+        plan.origins = origins;
+        let original = Operations::expanded(
+            plan.logical,
+            plan.origins
+                .iter()
+                .cloned()
+                .zip(plan.changes.iter().cloned()),
+            ModuleEdits::Rebuilt,
+        );
+        plan.identities = Some(original.clone());
+        let held = take_public_execution(&mut plan);
+        assert!(plan.changes.is_empty());
+        assert!(plan.identities.as_ref().unwrap().is_empty());
+        let settled = crate::order::Schedule::new(0).settle(plan).unwrap();
+        let plan: crate::order::PlanningPlan = crate::order::plan::state(settled.changes);
+        let mut plan =
+            crate::order::writebacks::PlanningInput::new(vec![public("h")]).append_to(plan);
+        let first = plan.identities.as_ref().unwrap().as_slice()[0].clone();
+        let extra = plan.allocator.allocate(
+            [(Origin::Restoration(rebinding), public("i"))],
+            ModuleEdits::Rebuilt,
+        );
+        let added =
+            Operations::from_operations(std::iter::once(first).chain(extra.iter().cloned()));
+        plan.payload.changes = added.iter().map(|o| o.planned().clone()).collect();
+        plan.origins = added.iter().map(|o| o.origin().clone()).collect();
+        plan.identities = Some(added.clone());
+        settle_public_execution(&mut plan, held);
+        let done = plan.identities.as_ref().unwrap();
+        let ids: BTreeSet<_> = done.iter().map(|o| o.id()).collect();
+        assert_eq!(ids.len(), 4, "held and new events must never share an ID");
+        for op in original.iter() {
+            let retained = done
+                .iter()
+                .find(|candidate| candidate.id() == op.id())
+                .unwrap();
+            assert_eq!(retained.planned(), op.planned());
+            assert_eq!(retained.logical_origin(), op.logical_origin());
+        }
+        assert!(added.as_slice()[0].id().source() > original.as_slice()[1].id().source());
+        assert_eq!(
+            added.as_slice()[1].id().source(),
+            original.as_slice()[1].id().source()
+        );
+        assert!(added.as_slice()[1].id().part() > original.as_slice()[1].id().part());
+        assert_eq!(done.len(), plan.changes.len());
+    }
+    #[test]
+    fn untracked_public_companions_keep_the_existing_untracked_route() {
+        let mut plan = crate::order::propose(ChangeSet {
+            changes: vec![public("f")],
+        });
+        let expected = plan.changes().clone();
+        let held = take_public_execution(&mut plan);
+        assert!(plan.identities.is_none());
+        settle_public_execution(&mut plan, held);
+        assert_eq!(plan.changes(), &expected);
+        assert!(plan.identities.is_none());
+    }
 }

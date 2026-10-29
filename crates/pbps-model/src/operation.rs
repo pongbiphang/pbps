@@ -27,8 +27,9 @@
 //! keys, and a dropped table's check and the check of the table renamed into
 //! its name one. [`ObjectKey`] therefore holds the uid each object, or its
 //! table, was recorded under. Which name a step spells by — the name in force
-//! at its position, the base name or the final one — follows from its role
-//! ([`Spelling`]), and the models answer it through [`Owners`]: they supply
+//! at its position, an endpoint or an explicitly bound address version —
+//! derives from its role and shared input chain ([`Spelling`], DEC-2296.9).
+//! The models answer it through [`Owners`]: they supply
 //! ownership and nothing about what the step does.
 //!
 //! An object the model gives no uid — a check, an index, a module, a reference
@@ -187,6 +188,8 @@ impl Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spelling {
     At(At),
+    /// An immutable input binding into the shared address chain.
+    Input(OperationId),
     Base,
     Final,
 }
@@ -197,9 +200,10 @@ impl Spelling {
     fn produced(self) -> Self {
         match self {
             Spelling::At(At::Before(i)) => Spelling::At(At::After(i)),
-            Spelling::At(At::Start | At::End | At::After(_)) | Spelling::Base | Spelling::Final => {
-                self
-            }
+            Spelling::At(At::Start | At::End | At::After(_))
+            | Spelling::Base
+            | Spelling::Final
+            | Spelling::Input(_) => self,
         }
     }
 }
@@ -488,6 +492,7 @@ impl Owners for PlanOwners<'_> {
                         spelling,
                     })
             }
+            Spelling::Input(_) => Err(OwnerError::Outside { spelling }),
             Spelling::At(_) => Err(OwnerError::Unmanaged {
                 name: name.shown().to_string(),
                 spelling,
@@ -517,6 +522,7 @@ impl Owners for PlanOwners<'_> {
                 })
         };
         match spelling {
+            Spelling::Input(_) => Err(OwnerError::Outside { spelling }),
             Spelling::Base => recorded(&self.base),
             Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
@@ -548,6 +554,7 @@ impl Owners for PlanOwners<'_> {
                 })
         };
         match spelling {
+            Spelling::Input(_) => Err(OwnerError::Outside { spelling }),
             Spelling::Base => recorded(&self.base),
             Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
@@ -571,6 +578,7 @@ impl Owners for PlanOwners<'_> {
                 })
         };
         match spelling {
+            Spelling::Input(_) => Err(OwnerError::Outside { spelling }),
             Spelling::Base => recorded(&self.base),
             Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
@@ -594,6 +602,7 @@ pub struct Operation {
     origin: Origin,
     step: PlannedChange,
     modules: ModuleEdits,
+    addresses: std::sync::Arc<AddressChain>,
 }
 
 impl Operation {
@@ -601,8 +610,10 @@ impl Operation {
         self.id
     }
 
-    pub fn origin(&self) -> &Origin {
-        &self.origin
+    /// Borrow logical provenance with a derived, immutable input-name view.
+    /// `logical_origin` retains the role-only provenance for audit records.
+    pub fn origin(&self) -> OriginView<'_> {
+        address::OriginView(self)
     }
 
     pub fn source(&self) -> Source {
@@ -625,7 +636,9 @@ impl Operation {
 
     /// The object this step acts on.
     pub fn key(&self, owners: &dyn Owners) -> Result<ObjectKey, OwnerError> {
-        let spelling = self.origin.spelling();
+        let input_owners = self.input_owners(owners);
+        let owners: &dyn Owners = &input_owners;
+        let spelling = self.origin().spelling();
         let table = |name: &TableName| owners.table(name, spelling).map(Recorded);
         let part = |name: &TableName, part: PartKey| {
             Ok(ObjectKey::Part {
@@ -764,7 +777,9 @@ impl Operation {
     /// default, because its payload holds none (#1961).
     pub fn defines(&self, owners: &dyn Owners) -> Result<Vec<Definition>, OwnerError> {
         use Transition::{Ends, Produces};
-        let spelling = self.origin.spelling();
+        let input_owners = self.input_owners(owners);
+        let owners: &dyn Owners = &input_owners;
+        let spelling = self.origin().spelling();
         let key = || self.key(owners);
         let ends = |key| Definition {
             key,
@@ -938,6 +953,78 @@ fn column_has_expression(column: &crate::Column) -> bool {
     }
 }
 
+/// A plan's reservation ledger survives removal, holding and permutation.
+/// Sources and parts are never recovered from only the currently visible list.
+#[derive(Debug, Clone, Default)]
+pub struct IdAllocator {
+    sources: BTreeMap<Source, (u32, u32)>,
+    next: u32,
+    modules: Option<ModuleEdits>,
+}
+impl IdAllocator {
+    pub fn logical(count: usize) -> Self {
+        Self {
+            next: u32::try_from(count).expect("logical source count fits operation IDs"),
+            ..Self::default()
+        }
+    }
+    pub fn reserve(&mut self, operations: &Operations) {
+        for op in operations.iter() {
+            self.modules.get_or_insert(op.modules);
+            self.next = self.next.max(
+                op.id
+                    .source
+                    .checked_add(1)
+                    .expect("operation source space exhausted"),
+            );
+            let part = op
+                .id
+                .part
+                .checked_add(1)
+                .expect("operation part space exhausted");
+            let slot = self.sources.entry(op.source()).or_insert((op.id.source, 0));
+            assert_eq!(
+                slot.0, op.id.source,
+                "one logical source retains its allocated identity"
+            );
+            slot.1 = slot.1.max(part);
+        }
+    }
+    pub fn allocate(
+        &mut self,
+        steps: impl IntoIterator<Item = (Origin, PlannedChange)>,
+        modules: ModuleEdits,
+    ) -> Operations {
+        let modules = *self.modules.get_or_insert(modules);
+        let addresses = std::sync::Arc::default();
+        Operations::from_operations(steps.into_iter().map(|(origin, step)| {
+            let slot = self.sources.entry(origin.source()).or_insert_with(|| {
+                let source = self.next;
+                self.next = self
+                    .next
+                    .checked_add(1)
+                    .expect("operation source space exhausted");
+                (source, 0)
+            });
+            let id = OperationId {
+                source: slot.0,
+                part: slot.1,
+            };
+            slot.1 = slot
+                .1
+                .checked_add(1)
+                .expect("operation part space exhausted");
+            Operation {
+                id,
+                origin,
+                step,
+                modules,
+                addresses: std::sync::Arc::clone(&addresses),
+            }
+        }))
+    }
+}
+
 /// A plan's operations, in the order given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Operations {
@@ -991,6 +1078,7 @@ impl Operations {
                 .collect()
         };
         let mut parts: BTreeMap<u32, u32> = BTreeMap::new();
+        let addresses = std::sync::Arc::default();
         let operations = steps
             .iter()
             .map(|(origin, step)| {
@@ -1013,6 +1101,7 @@ impl Operations {
                     origin: origin.clone(),
                     step: step.clone(),
                     modules,
+                    addresses: std::sync::Arc::clone(&addresses),
                 }
             })
             .collect();
@@ -1039,45 +1128,16 @@ impl Operations {
         }))
     }
 
-    /// Allocate identities for later observations beside an existing plan.
-    /// Existing source/part numbers remain reserved, including rebindings
-    /// before a later scope tail adds logical changes (DEC-1959.5).
+    /// Detached observations may extend this visible snapshot. Planning uses
+    /// its persistent IdAllocator so temporarily held events remain reserved.
     pub fn additional(
         &self,
         steps: impl IntoIterator<Item = (Origin, PlannedChange)>,
         modules: ModuleEdits,
     ) -> Self {
-        let mut sources: BTreeMap<Source, (u32, u32)> = BTreeMap::new();
-        let mut next = 0;
-        for operation in &self.operations {
-            next = next.max(operation.id.source + 1);
-            let source = sources
-                .entry(operation.source())
-                .or_insert((operation.id.source, 0));
-            source.1 = source.1.max(operation.id.part + 1);
-        }
-        let modules = self
-            .operations
-            .first()
-            .map_or(modules, |operation| operation.modules);
-        Self::from_operations(steps.into_iter().map(|(origin, step)| {
-            let source = sources.entry(origin.source()).or_insert_with(|| {
-                let source = next;
-                next += 1;
-                (source, 0)
-            });
-            let id = OperationId {
-                source: source.0,
-                part: source.1,
-            };
-            source.1 += 1;
-            Operation {
-                id,
-                origin,
-                step,
-                modules,
-            }
-        }))
+        let mut allocator = IdAllocator::default();
+        allocator.reserve(self);
+        allocator.allocate(steps, modules)
     }
 
     /// The same operations, keeping their ids, in the order `sequence` gives.
@@ -1241,9 +1301,9 @@ mod stored;
 pub use stored::{MembershipCatalog, StoredColumn};
 pub mod symbolic;
 pub use effects::{
-    BaseTable, BoundInput, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot, base_table,
-    base_table_named, baseline_bindings, baseline_keys, column_key, column_types, effects,
-    final_table, holds_unknown, module_key,
+    BaseTable, BoundInput, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot,
+    base_table_named, baseline_bindings, baseline_keys, column_key, column_types, final_table,
+    holds_unknown, module_key,
 };
 
 #[cfg(test)]
@@ -1265,3 +1325,6 @@ fn checked_relation(
     }
     Ok(Recorded(uid))
 }
+
+mod address;
+pub use address::{AddressChain, InputOwners, OriginView, base_table, effects};
