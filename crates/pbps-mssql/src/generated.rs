@@ -39,6 +39,25 @@ pub(crate) fn parts(
     ids: &IdsFile,
     functions: &[ModuleId],
 ) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(dialect, change, ids, functions, &Default::default())
+}
+
+pub(crate) fn demanded(
+    dialect: &Mssql,
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    demand: &pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(dialect, change, ids, functions, demand)
+}
+fn parts_in(
+    dialect: &Mssql,
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    demand: &pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
         name,
@@ -50,7 +69,10 @@ pub(crate) fn parts(
         return Ok(None);
     };
     let calling = |text: &str| functions.iter().any(|id| calls(dialect, text, id));
-    let cut = table.computed.values().position(|c| calling(&c.expression));
+    let cut = table
+        .computed
+        .iter()
+        .position(|(column, c)| calling(&c.expression) || demand.generation(column));
     let default_calls = table
         .columns
         .values()

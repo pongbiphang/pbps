@@ -1426,6 +1426,8 @@
         "darwin"
       ],
       "cases": [
+        "creation2469::demanded_facets_preserve_native_values_and_declared_column_order",
+        "creation2469::scratch_creation_facets_keep_auxiliary_setup_boundaries",
         "role_names_refuse_backslash_and_ffff_but_preserve_controls_unicode_and_width",
         "reconstruct2374::a_computed_column_over_a_declared_function_and_a_view_reading_it_compile",
         "reconstruct2374::a_schema_bound_function_over_the_table_compiles_before_the_column_it_serves",
@@ -1884,6 +1886,9 @@
         "darwin"
       ],
       "cases": [
+        "creation2469::demanded_facets_preserve_native_values_and_declared_column_order",
+        "creation2469::scratch_facets_keep_zero_sql_paths_and_require_actual_role_setup",
+        "creation2469::generated_complete_shape_is_version_gated_before_any_sql",
         "column_meetings::default_transfers_and_restorations_match_both_native_cuts",
         "column_meetings::not_null_transfer_ownership_matches_the_versioned_policy",
         "column_policy::column_statement_policies_match_native_recursion",
@@ -2765,6 +2770,7 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "engine::mssql_live_tests::creation2469::checked_generation_edges_use_complete_catalog_collation_facts",
         "engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused"
       ]
     },

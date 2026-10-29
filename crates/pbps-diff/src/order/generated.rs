@@ -285,13 +285,21 @@ pub fn parts(
         dialect,
         false,
         &BTreeSet::new(),
+        &Default::default(),
     )
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CreationNeed {
+    Module(usize),
+    Reference(pbps_model::object_ref::ObjectRef),
 }
 
 /// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
 /// engine splits every new table, not only one whose generation needs a
 /// planned function (DEC-2389.1).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[allow(clippy::too_many_arguments)]
 fn parts_in(
     planned: &PlannedChange,
     ids: &IdsFile,
@@ -300,51 +308,115 @@ fn parts_in(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
     demanded: &BTreeSet<pbps_model::object_ref::ObjectRef>,
+    prerequisites: &super::annotations::Creation,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
     // settlement uses rather than predicting a different call graph here.
-    let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
+    let (table_reader, required_columns) = if let Change::CreateTable { name, table, .. } =
+        &planned.change
+    {
         let modules = modules(changes);
         let edges = module_dependencies(&modules, deps, dialect, scratch);
+        let mut providers: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (provider, consumer, _) in &edges {
+            providers.entry(*consumer).or_default().push(*provider);
+        }
         let mut pending: Vec<_> = modules
+                .iter()
+                .filter(|(_,id,module)| module.kind==ModuleKind::Function && table.columns.values().any(|c|matches!(&c.value_source,ValueSource::Generated(g) if dialect.generation_may_call(&g.expression,id.name()))))
+                .map(|(at, _, _)| CreationNeed::Module(*at))
+                .collect();
+        pending.extend(
+            prerequisites
+                .references
+                .iter()
+                .cloned()
+                .map(CreationNeed::Reference),
+        );
+        let by_at: BTreeMap<_, _> = modules
             .iter()
-            .filter(|(_, id, module)| {
-                module.kind == ModuleKind::Function
-                    && table.columns.values().any(|c| {
-                        matches!(&c.value_source,
-                ValueSource::Generated(g) if dialect.generation_may_call(
-                    &g.expression, id.name()))
-                    })
-            })
-            .map(|(i, _, _)| *i)
+            .map(|(at, id, module)| (*at, (*id, *module)))
             .collect();
+        let mut by_id: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (at, id, _) in &modules {
+            by_id.entry((*id).clone()).or_default().push(*at);
+        }
         let mut reached = BTreeSet::new();
-        while let Some(at) = pending.pop() {
-            if reached.insert(at) {
-                pending.extend(
-                    edges
-                        .iter()
-                        .filter(|(_, consumer, _)| *consumer == at)
-                        .map(|(provider, _, _)| *provider),
-                );
+        let mut required = BTreeSet::new();
+        let mut reader = false;
+        while let Some(need) = pending.pop() {
+            if !reached.insert(need.clone()) {
+                continue;
+            }
+            match need {
+                CreationNeed::Module(at) => {
+                    let (id, module) = by_at[&at];
+                    pending.extend(
+                        providers
+                            .get(&at)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .map(CreationNeed::Module),
+                    );
+                    let reference = pbps_model::object_ref::ObjectRef {
+                        root: pbps_model::object_ref::Root::Module(id.clone()),
+                        part: pbps_model::object_ref::Selector::Whole,
+                    };
+                    // Without typed edges, retain each legacy transition's body.
+                    if prerequisites
+                        .dependencies
+                        .get(&reference)
+                        .is_some_and(|p| !p.is_empty())
+                    {
+                        pending.push(CreationNeed::Reference(reference));
+                    }
+                    let text = named_text(module, dialect, scratch);
+                    reader |= dialect.generation_names_table(&text, name)
+                        && !dialect.generation_table_name_only(&text, name);
+                }
+                CreationNeed::Reference(reference) => {
+                    if let Some(column) = prerequisites.columns.get(&reference) {
+                        required.insert(column.clone());
+                    }
+                    if let pbps_model::object_ref::Root::Module(id) = &reference.root {
+                        pending.extend(
+                            by_id
+                                .get(id)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .map(CreationNeed::Module),
+                        );
+                    }
+                    pending.extend(
+                        prerequisites
+                            .dependencies
+                            .get(&reference)
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(CreationNeed::Reference),
+                    );
+                }
             }
         }
-        modules
-            .iter()
-            .filter(|(i, _, _)| reached.contains(i))
-            .any(|(_, _, module)| {
-                let text = named_text(module, dialect, scratch);
-                dialect.generation_names_table(&text, name)
-                    && !dialect.generation_table_name_only(&text, name)
-            })
+        (reader, required)
     } else {
-        false
+        (false, BTreeSet::new())
     };
-    let split = if scratch {
+    let split = if !demanded.is_empty() || !required_columns.is_empty() {
+        dialect.annotation_parts(
+            &planned.change,
+            ids,
+            &functions,
+            table_reader,
+            demanded,
+            &required_columns,
+        )
+    } else if scratch {
         dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
-    } else if !demanded.is_empty() {
-        dialect.annotation_parts(&planned.change, ids, &functions, table_reader, demanded)
     } else {
         dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
     };
@@ -386,6 +458,9 @@ fn parts_in(
     } else {
         parts
     };
+    if !scratch && !demanded.is_empty() && parts.len() == 1 && parts[0] == planned.change {
+        return Ok(None);
+    }
     Ok(Some(
         parts
             .into_iter()
@@ -542,10 +617,23 @@ pub fn risks(
         .iter()
         .enumerate()
         .map(|(at, part)| {
+            // NOT NULL finishes a column of this empty table without granting
+            // an exemption to any other generation installation.
+            let completes_nullability = matches!(
+                part.change,
+                Change::AlterColumnNullability {
+                    to_nullable: false,
+                    ..
+                }
+            );
             let source = || {
                 if !matches!(
                     &part.change,
                     Change::AddColumn { .. }
+                        | Change::AlterColumnNullability {
+                            to_nullable: false,
+                            ..
+                        }
                         | Change::AlterColumnExpression { .. }
                         | Change::AlterColumnDefault { from: None, .. }
                         | Change::SetPrimaryKey {
@@ -566,7 +654,7 @@ pub fn risks(
                 else {
                     return None;
                 };
-                if !installations.contains(owner)
+                if (!installations.contains(owner) && !completes_nullability)
                     || first_write.get(owner).is_some_and(|write| *write < at)
                 {
                     return None;
@@ -615,8 +703,21 @@ pub(super) fn expand_in(
         let demanded = plan
             .annotations
             .as_ref()
-            .map_or_else(BTreeSet::new, |a| a.demands(&p.change));
-        match parts_in(p, ids, &plan.changes, deps, dialect, scratch, &demanded)? {
+            .map_or_else(BTreeSet::new, |a| a.demands(&p.change, origin));
+        let prerequisites = plan
+            .annotations
+            .as_ref()
+            .map_or_else(Default::default, |a| a.prerequisites(origin));
+        match parts_in(
+            p,
+            ids,
+            &plan.changes,
+            deps,
+            dialect,
+            scratch,
+            &demanded,
+            &prerequisites,
+        )? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
@@ -949,6 +1050,19 @@ pub(super) fn constraints_in(
                 if matches!(&p.change, Change::AddComputedColumn { name, .. } if name == column) {
                     edge(&mut out, previous, *i);
                     previous = *i;
+                }
+            }
+        }
+        for (key_at, key) in &own {
+            if let Change::SetPrimaryKey {
+                to: Some(primary), ..
+            } = &key.change
+            {
+                for (at, part) in &own {
+                    if matches!(&part.change, Change::AlterColumnNullability { column, to_nullable: false, .. } if primary.columns.contains(&column.name))
+                    {
+                        edge(&mut out, *at, *key_at);
+                    }
                 }
             }
         }
@@ -1334,7 +1448,8 @@ pub fn settle(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), String> {
-    let edges = constraints(plan, declared, deps, dialect);
+    let mut edges = constraints(plan, declared, deps, dialect);
+    edges.extend(plan.annotation_edges()?);
     if edges.is_empty() {
         return Ok(());
     }

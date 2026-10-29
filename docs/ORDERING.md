@@ -957,3 +957,15 @@ The shadow verifier uses the same type resources, final-incarnation requirements
 slot claims and releases; pending Types handovers join the existing
 `after_the_rebuilds` slot settlement, which also carries their dependents.
 The release verifier remains unchanged.
+
+## Demanded portable creation facets
+
+Typed library annotations can select portable table creation boundaries through
+`Dialect::creation_parts` (DEC-2469.4). The shared identity wrapper remains above
+that hook. Existing recipes and typed Changes preserve column order and legal
+engine groups; the current settlement projects the resulting hard edges. A
+placeholder column supplies existence only until its final generation installer.
+Empty demand retains the prior expansion bytes. `schedule::diff_annotated`
+performs comparison, annotation validation and canonical scheduling atomically,
+so a computed-call class-order refusal can only yield to a completed hard order.
+Connected SQL Server calls still require catalog-collation capability checks.

@@ -2421,6 +2421,9 @@ pub fn after_the_rebuilds(
     }
     let last = last_function_create(cs);
     if last.is_none() && !has_handovers {
+        if cs.annotations.as_ref().is_some_and(|a| a.extended) {
+            crate::order::generated::settle(cs, declared, deps, dialect)?;
+        }
         return Ok(0);
     }
     let last = last.unwrap_or(0);
