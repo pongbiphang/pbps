@@ -2888,6 +2888,16 @@
       ]
     },
     {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg18",
+        "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg16"
+      ]
+    },
+    {
       "target": [
         "pbps-cli",
         "test",

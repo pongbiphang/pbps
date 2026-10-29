@@ -1949,3 +1949,6 @@ pub fn declared_types(server: &str) {
         assert_eq!(value["data"]["changes"], 0, "{name}: {value}");
     }
 }
+
+#[path = "trigger_when1907.rs"]
+mod trigger_when1907;

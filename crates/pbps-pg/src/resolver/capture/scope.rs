@@ -412,7 +412,11 @@ impl Builder<'_> {
                     .map(|field| logical::number(row, field))
                     .transpose()
                     .map_err(|_| fail())?
-                    .filter(|n| *n != 0);
+                    .filter(|n| *n != 0)
+                    .map(|oid| match (class, name) {
+                        ("pg_trigger", "tgqual") => bindings::Relation::Trigger(oid),
+                        _ => bindings::Relation::Table(oid),
+                    });
                     let mut extracted = bindings::extract(self.catalog, text, self.major, relation)
                         .map_err(|_| {
                             Uncovered::object(id, "creation-time binding surface is not qualified")
