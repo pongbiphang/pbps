@@ -9162,3 +9162,9 @@ activated contracts keep the resulting facts Unread and refuse them normally.
 The pending-boundary discharge and ensure checks, every schema-diff guard,
 all fact readers and all symbolic obligations remain in force. No comparison
 of expression text is used to infer catalog binding equality.
+
+<a id="dec-2296-7"></a>
+
+**DEC-2296.7. A partition restoration borrows goal ownership only after its emitted value agrees.** (#2296, #2504.) `SetPartitionDefault` writes `to`, otherwise `fallback`, otherwise DROP DEFAULT, including during teardown. Its normalized output must agree with the goal's definition and bindings before the symbolic producer may reuse that goal fact. Removing the declared own override can then use inherited ownership; a disagreeing payload retains its actual local value. An expression whose bindings cannot be modelled remains Unread, and a missing or Unread goal never supplies a Known fact. Teardown models its own payload without borrowing a future goal.
+
+The NOT NULL restoration applies the same output/goal comparison after the existing own-override and parent-requirement checks. ATTACH merges already compare complete definitions/bindings and preserve the actual candidate; standalone DEFAULT writes already qualify goal bindings by the emitted declaration expression. Neither may substitute an unrelated goal for an operation's payload. The regression tests in `crates/pbps-pg/src/engine_effects/production_tests/restoration_tests.rs` pin disagreement, normalized agreement, payload precedence, missing/Unread goals and binding disagreement, without changing the emitter, fact reader or membership activation boundary.

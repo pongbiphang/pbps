@@ -1166,3 +1166,5 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
             .any(|c| matches!(c, Clause::Recurse(w) if w.from == Fact::Unread))
     );
 }
+
+mod restoration_tests;

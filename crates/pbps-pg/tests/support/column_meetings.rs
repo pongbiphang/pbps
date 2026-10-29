@@ -33,6 +33,28 @@ async fn default_transfers_and_restorations_match_both_native_cuts() {
             .await,
             if parent_first { "9" } else { "7" }
         );
+        // A restoration's fallback is the value it writes, even when the
+        // parent's declared goal is already different (#2504).
+        db.conn
+            .execute("ALTER TABLE a ALTER COLUMN d SET DEFAULT 3")
+            .await
+            .unwrap();
+        assert_eq!(
+            text(
+                &mut db,
+                "SELECT pg_get_expr(adbin,adrelid) AS v FROM pg_attrdef WHERE adrelid='a'::regclass"
+            )
+            .await,
+            "3"
+        );
+        assert_eq!(
+            text(
+                &mut db,
+                "SELECT pg_get_expr(adbin,adrelid) AS v FROM pg_attrdef WHERE adrelid='p'::regclass"
+            )
+            .await,
+            "7"
+        );
         db.conn
             .execute("ALTER TABLE ONLY a ALTER COLUMN d SET DEFAULT 9")
             .await

@@ -11,6 +11,29 @@ fn require(reason: impl Into<String>) -> Vec<Clause> {
     vec![columns::unsupported(reason, None)]
 }
 
+// The goal describes intent, not what a restoration statement writes. Only
+// normalized definition/binding agreement can lend its ownership (DEC-2296.7).
+fn checked_goal(
+    output: Fact<Value>,
+    goal: Option<&Cell>,
+    ownership: Option<Ownership>,
+) -> Fact<Value> {
+    let Some(goal) = goal else {
+        return Fact::Unread;
+    };
+    match (&output, &goal.value) {
+        (_, Fact::Unread | Fact::Unsupported { .. }) => goal.value.clone(),
+        (Fact::Known(actual), Fact::Known(expected)) if actual.definition_eq(expected) => {
+            let mut value = expected.clone();
+            if let Some(ownership) = ownership {
+                value.ownership = ownership;
+            }
+            Fact::Known(value)
+        }
+        _ => output,
+    }
+}
+
 struct Context<'a> {
     pg: &'a Postgres,
     before: Snapshot<'a>,
@@ -223,10 +246,13 @@ impl Context<'_> {
                 let Some(goal) = self.facts.goal.cells.get(&(child.clone(), goal_property)) else {
                     return require("the NOT NULL restoration's goal is unavailable");
                 };
-                goal.value.clone()
+                checked_goal(
+                    facts::value(Datum::NotNull(*not_null), Ownership::Own),
+                    Some(goal),
+                    (!not_null).then_some(Ownership::Inherited),
+                )
             }
             (Change::SetPartitionDefault { to, fallback, .. }, Attribute::Default) => {
-                let inherited = to.is_none() && op.role() != Role::Teardown;
                 let Some(name) = self
                     .after
                     .ids
@@ -236,31 +262,32 @@ impl Context<'_> {
                 else {
                     return require("the restoration's recorded table is unavailable");
                 };
-                let mut value = if (to.as_ref() == own.and_then(|o| o.default.as_ref())
-                    && op.role() != Role::Teardown)
-                    || inherited
-                {
-                    self.facts
-                        .goal
-                        .cells
-                        .get(&(child.clone(), goal_property))
-                        .map(|c| c.value.clone())
-                        .unwrap_or(Fact::Unread)
+                // emit::SetPartitionDefault writes to, then fallback, or drops
+                // the default. A teardown has the same payload precedence.
+                let output = facts::default_value(
+                    self.pg,
+                    &to.as_ref()
+                        .or(fallback.as_ref())
+                        .cloned()
+                        .map_or(ValueSource::None, ValueSource::Default),
+                    name,
+                    slot.name.raw(),
+                );
+                if op.role() == Role::Teardown {
+                    output
                 } else {
-                    facts::default_value(
-                        self.pg,
-                        &to.as_ref()
-                            .or(fallback.as_ref())
-                            .cloned()
-                            .map_or(ValueSource::None, ValueSource::Default),
-                        name,
-                        slot.name.raw(),
+                    checked_goal(
+                        output,
+                        self.facts.goal.cells.get(&(child.clone(), goal_property)),
+                        Some(
+                            if to.is_none() && own.and_then(|o| o.default.as_ref()).is_none() {
+                                Ownership::Inherited
+                            } else {
+                                Ownership::Own
+                            },
+                        ),
                     )
-                };
-                if inherited && let Fact::Known(v) = &mut value {
-                    v.ownership = Ownership::Inherited;
                 }
-                value
             }
             _ => unreachable!(),
         };
