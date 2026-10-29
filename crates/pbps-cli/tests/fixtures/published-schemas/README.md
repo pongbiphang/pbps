@@ -68,4 +68,4 @@ DECISIONS 465).
 - `64/` adds the `state record-data-work` envelope and its typed self-reported work payload (#2402), ordered after #2432's version 63.
 - `67/` adds the configurable advisory domain-vet availability policy (#2309).
 - `68/` adds plain-string consumer declarations and the two built-in consumer rule IDs (DEC-2398.1).
-- `69/` adds recorded drop row requirements to plan explanations (#2400), ordered after #2451's version 68.
+- `74/` adds recorded drop row requirements to plan explanations (#2400).
