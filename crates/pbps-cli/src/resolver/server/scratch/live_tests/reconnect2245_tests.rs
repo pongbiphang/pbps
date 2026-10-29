@@ -76,14 +76,16 @@ async fn observation_reconnect_waits_for_the_old_backend_to_exit() {
         let mut admin = Conn::connect(Driver::Postgres, &fixture.on(&database))
             .await
             .unwrap();
-        let key = rand::random::<i64>();
+        // The database is private: a fixed key also exercises the signed
+        // literal boundary before its bigint cast.
+        let key = i64::MIN;
         admin
-            .execute(&format!("SELECT pg_advisory_lock({key}::bigint)"))
+            .execute(&format!("SELECT pg_advisory_lock(({key})::bigint)"))
             .await
             .unwrap();
         let task = tokio::spawn(async move {
             first
-                .execute(&format!("SELECT pg_advisory_lock({key}::bigint)"))
+                .execute(&format!("SELECT pg_advisory_lock(({key})::bigint)"))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -110,7 +112,7 @@ async fn observation_reconnect_waits_for_the_old_backend_to_exit() {
                 .expect("reconnect ended without observing the occupied role");
             assert!(backend_is_waiting(&mut admin, pid).await);
             admin
-                .execute(&format!("SELECT pg_advisory_unlock({key}::bigint)"))
+                .execute(&format!("SELECT pg_advisory_unlock(({key})::bigint)"))
                 .await
                 .unwrap();
         };
