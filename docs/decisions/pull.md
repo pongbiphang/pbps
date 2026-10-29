@@ -1086,8 +1086,10 @@ Extension membership follows `pg_depend`'s `e` entries and their internal or
 automatic dependents. Name the extension and any comment on it, including its
 installation comment, rather than listing its members. Column-owned sequences
 and types reached from live columns through type dependencies are model-owned
-for census purposes; implicit array companions stay unnamed too. This does
-not introduce declarations for any newly inventoried kind.
+for census purposes; implicit array companions stay unnamed too. Only the
+element type's reverse `typarray` link identifies an implicit array; an
+`ELEMENT` option alone does not. This does not introduce declarations for any
+newly inventoried kind.
 
 Pull and init show the census through their existing warning output. Connected
 plan uses `plan.unheld-object`, a registered connected-only policy with default

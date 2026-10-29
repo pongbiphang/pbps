@@ -645,6 +645,7 @@
         "census2444::census_names_type_r",
         "census2444::census_names_type_mr",
         "census2444::census_names_base_type",
+        "census2444::census_names_unused_element_base_types_but_not_used_types_or_array_companions",
         "census2444::census_names_transform",
         "census2444::census_names_large_object",
         "census2444::census_names_tablespace",

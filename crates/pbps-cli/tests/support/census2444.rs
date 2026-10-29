@@ -1,7 +1,7 @@
 //! #2441 SQL repros exercise the shared #2444 census through both CLI paths.
 use super::{
     ClusterRoles, Demo, OwnDatabase, approved_apply, as_role, code, json_output, on_server, scalar,
-    stderr, stdout, succeeds, try_on_server,
+    stderr, stdout, succeeds, text_of, try_on_server,
 };
 use serde_json::Value;
 use std::process::Command;
@@ -393,6 +393,101 @@ fn census_names_base_type() {
         "base type",
         "app.int42",
     );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn census_names_unused_element_base_types_but_not_used_types_or_array_companions() {
+    servers(|admin, _| {
+        let own = OwnDatabase::new(admin, "census2444-element");
+        let connection = own.connection();
+        let (base, candidate) = include_str!("../fixtures/census2444/base_type_element.sql")
+            .split_once("-- Candidate added after the ordinary-table baseline.")
+            .unwrap();
+        on_server(connection, base);
+        let d = demo(connection, "census2444-element", false);
+        on_server(connection, candidate);
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_type t JOIN pg_catalog.pg_type e ON e.oid=t.typelem WHERE t.oid='app.int42'::regtype AND t.typelem='int4'::regtype AND e.typarray<>t.oid"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_type t JOIN pg_catalog.pg_type e ON e.oid=t.typelem WHERE t.oid='app._int42'::regtype AND e.typarray=t.oid"
+            ),
+            1
+        );
+        let companion = text_of(
+            connection,
+            "SELECT identity FROM pg_catalog.pg_identify_object('pg_catalog.pg_type'::regclass,'app._int42'::regtype,0)",
+        );
+        let base_prefix = "base type `app.int42`";
+        let companion_prefix = format!("base type `{companion}`");
+        let found = both_paths(&d, connection);
+        assert!(
+            found.iter().any(|m| m.starts_with(base_prefix)),
+            "{found:?}"
+        );
+        assert!(
+            !found.iter().any(|m| m.starts_with(&companion_prefix)),
+            "{found:?}"
+        );
+
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            "dialect: postgres\npolicies:\n  rules:\n    plan.unheld-object: error\n",
+        )
+        .unwrap();
+        let path = d.dir.join("element-error.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+        let report = json_output(out);
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == ID
+                    && f["severity"] == "error"
+                    && f["message"].as_str().unwrap().starts_with(base_prefix)),
+            "{report}"
+        );
+        assert!(!path.exists());
+        std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+        // Use only the base type: seeding the array itself through a column
+        // would hide an incorrect companion predicate behind used_types.
+        on_server(
+            connection,
+            "CREATE TABLE app.element_holder(value app.int42)",
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_attribute WHERE atttypid='app._int42'::regtype AND attnum>0 AND NOT attisdropped"
+            ),
+            0
+        );
+        let found = both_paths(&d, connection);
+        for excluded in [base_prefix, companion_prefix.as_str()] {
+            assert!(
+                !found.iter().any(|m| m.starts_with(excluded)),
+                "{excluded}: {found:?}"
+            );
+        }
+    });
 }
 
 #[test]

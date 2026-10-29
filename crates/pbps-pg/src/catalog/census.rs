@@ -5,7 +5,8 @@ use serde_json::Value;
 // Object addresses let PostgreSQL render identities uniformly, including
 // operator signatures and objects without a namespace. Large objects use
 // pg_largeobject's address, although only its readable metadata is queried.
-pub(super) const QUERY: &str = r#"
+pub(super) const QUERY: &str = concat!(
+    r#"
 WITH RECURSIVE used_types(oid) AS (
     SELECT atttypid FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped
     UNION
@@ -49,7 +50,9 @@ WITH RECURSIVE used_types(oid) AS (
     UNION ALL
     SELECT 'pg_catalog.pg_type'::regclass, t.oid,
            CASE t.typtype WHEN 'r' THEN 'range type' WHEN 'm' THEN 'multirange type' ELSE 'base type' END,
-           t.typelem <> 0 OR EXISTS (SELECT 1 FROM used_types u WHERE u.oid = t.oid)
+           "#,
+    crate::user_types::array_companion_sql!(),
+    r#" OR EXISTS (SELECT 1 FROM used_types u WHERE u.oid = t.oid)
       FROM pg_catalog.pg_type t WHERE t.typtype IN ('r', 'm', 'b')
     UNION ALL
     SELECT 'pg_catalog.pg_transform'::regclass, oid, 'transform', false FROM pg_catalog.pg_transform
@@ -63,7 +66,8 @@ SELECT o.kind, i.identity,
        EXISTS (SELECT 1 FROM extension_members e WHERE e.classid = o.classid AND e.objid = o.oid) AS extension_member,
        o.model_owned
   FROM objects o CROSS JOIN LATERAL pg_catalog.pg_identify_object(o.classid, o.oid, 0) i
-"#;
+"#
+);
 
 pub(super) fn notices(rows: &[Value]) -> Result<Vec<String>, DbError> {
     let mut out = Vec::new();
