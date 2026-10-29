@@ -1201,9 +1201,29 @@ impl pbps_dialect::PlanDialect for Postgres {
 
     type Plan = dyn pbps_diff::order::PlanView<Self>;
 
+    fn prepare_emission<'a>(
+        &'a self,
+        plan: &'a Self::Plan,
+        mode: pbps_model::PlanMode,
+    ) -> pbps_dialect::lower::Emission<'a> {
+        let changes = pbps_dialect::PlanPayload::changes(plan);
+        let defaults = emit::RowDefaultIndex::new(changes);
+        Box::new(move |position| {
+            let planned = &changes.changes[position];
+            let context = defaults.at(position);
+            match mode {
+                pbps_model::PlanMode::Transactional => {
+                    emit::emit_in(self, &planned.change, planned.strategy, &context)
+                }
+                pbps_model::PlanMode::Staged => {
+                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)
+                }
+            }
+        })
+    }
+
     fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
-        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit(self, &planned.change, planned.strategy)
+        self.prepare_emission(plan, pbps_model::PlanMode::Transactional)(position)
     }
 
     fn emit_staged(
@@ -1211,8 +1231,7 @@ impl pbps_dialect::PlanDialect for Postgres {
         plan: &Self::Plan,
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
-        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit_staged(self, &planned.change, planned.strategy)
+        self.prepare_emission(plan, pbps_model::PlanMode::Staged)(position)
     }
 }
 

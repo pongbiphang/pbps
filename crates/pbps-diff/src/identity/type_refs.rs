@@ -225,8 +225,14 @@ pub fn before_changes(desired: &IdsFile, changes: &ChangeSet) -> IdsFile {
 
 #[allow(clippy::wildcard_enum_match_arm)] // Only type lifecycle operations change this map.
 pub fn after_changes(base: &IdsFile, changes: &ChangeSet) -> IdsFile {
+    after_steps(base, &changes.changes)
+}
+
+/// The same identity walk for an executed prefix, without copying row payloads.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn after_steps(base: &IdsFile, changes: &[pbps_model::PlannedChange]) -> IdsFile {
     let mut desired = base.clone();
-    for step in &changes.changes {
+    for step in changes {
         match &step.change {
             Change::DropType { uid, .. } => {
                 desired.types.remove(uid);

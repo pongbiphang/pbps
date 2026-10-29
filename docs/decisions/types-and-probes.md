@@ -3640,7 +3640,9 @@ keeps its cast). Sites: explicit cells carry no type text; default cells in
 guards and the postcondition are this rule; keys are compared with the declared
 `key_type`; `SET … = DEFAULT` is the keyword; the label-rename forwarding
 rewrites recorded values and casts nothing. A default naming a label the plan
-renames stays the limit above.
+renames stays the limit above. Mixed cast chains and historical authored type
+names use DEC-2456.1's catalog-backed guard expectations; they are no longer
+a type-name forwarding limit.
 `rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type`
 pins it on 16 and 18, including a row changed outside pbps still refused.
 
@@ -4025,3 +4027,37 @@ this census admits no shortcut around them. A module rebuild still requires a
 transaction and refuses staged planning. The declaration supplies the restored
 body and parameter defaults, so their values must remain valid under the
 replacement type.
+
+<a id="dec-2456-1"></a>
+
+**DEC-2456.1. Row guards use catalog defaults, forwarded through executed type renames, while the declaration record stays authored.**
+A defaulted cell's guard expectation is the base snapshot's catalog read-back
+spelling, not the authored expression installed over it for semantic diffing.
+Enrichment follows that comparison, resolves columns by UID, and reuses the
+existing `Cell::Default` and insert-default fields. A newly written default
+keeps its after-side text; a retained one supplies the base catalog expression
+for inserts, update before/unchanged cells and their postconditions, and deletes.
+The transient planning hints carry catalog defaults through ordinary and
+resolver re-derivations; neither Schema equality nor the authored record changes.
+
+PostgreSQL's row emitter receives an explicit execution-position context.
+Admitted lifecycle UIDs reconstruct the base and executed-prefix type maps;
+`TypeRenames::resolved` and `TypeResolver` then forward each original cast once
+through `TypeRenames::expression`. A new after-expression is not interpreted
+as a base binding when a name is reused. Built-in conversions stay intact,
+including mixed cast chains; quoted names and schema moves use the same adapter.
+The emission prepares this context once for its certified input. Lifecycle
+boundaries index the effective rename maps; first default-write positions
+preserve the before/after distinction without scanning row-filled prefixes.
+Transactional/staged lowering and staged statement-count loops reuse that
+prepared position function. No plan cache is serialized or kept on the engine.
+The literal-only gate remains: functions and other nonliteral defaults are
+never evaluated as guard expectations. Enum label renames retain DEC-2346.2's
+separate limit. The fields and loader shape are unchanged, so no format version
+changes. This supersedes the mixed-cast default limitation of DEC-2346.2.
+
+Live PG 16/18 tests cover rename/update/delete, a later row-only update/delete/
+insert retaining old authored names byte for byte, outside edits (including
+NULL) refusing and rolling back, changed/retained/unchanged defaults, quoted
+schema moves, rename chains and a reused old name. Unit cases cover prefix
+boundaries, built-in casts, source UID separation and nonliteral refusal.

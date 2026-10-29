@@ -3144,8 +3144,9 @@ fn role_name_expectations<D: crate::emission::Engine>(
     let mut wanted = Vec::new();
     let mut vacated = Vec::new();
     let mut at = 0usize;
+    let emit = crate::emitter(dialect, plan, mode);
     for (position, p) in cs.changes.iter().enumerate() {
-        let n = crate::emitted(dialect, plan, position, mode)?.len();
+        let n = emit(position)?.len();
         // A change is pending while any of its statements is: a half-done
         // role drop has removed members and still holds the name.
         if completed < at + n {
@@ -6598,6 +6599,7 @@ pub fn cmd_bootstrap(
             // bootstrap emit a dependent module first and fail on declarations that
             // plan perfectly well.
             &pbps_model::Hints {
+                row_guard_defaults: Default::default(),
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 enum_comments: Default::default(),
                 domain_array_holders: Default::default(),
@@ -7547,6 +7549,7 @@ pub fn cmd_plan_db(
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.
         let mut hints = loaded.hints.clone();
+        hints.record_row_defaults(&entry.snapshot.schema);
         for (name, dependencies) in &entry.snapshot.module_deps {
             if !loaded.schema.modules.contains_key(name) {
                 hints.module_deps.insert(name.clone(), dependencies.clone());
@@ -10576,8 +10579,9 @@ fn role_drop_expectations<D: crate::emission::Engine>(
     let cs = pbps_dialect::PlanPayload::changes(plan);
     let mut out = Vec::new();
     let mut at = 0usize;
+    let emit = crate::emitter(dialect, plan, mode);
     for (position, p) in cs.changes.iter().enumerate() {
-        let n = crate::emitted(dialect, plan, position, mode)?.len();
+        let n = emit(position)?.len();
         if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
             let done = completed.saturating_sub(at).min(n);
             if done <= members.len() {

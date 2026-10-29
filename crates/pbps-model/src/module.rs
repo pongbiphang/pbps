@@ -1065,6 +1065,11 @@ pub type PublicExecute = BTreeSet<ModuleId>;
 /// two states.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hints {
+    /// Catalog defaults from the approved base snapshot, keyed by its column
+    /// names. Row guards use these after semantic diffing; authored expression
+    /// comparisons and the declaration record remain untouched (DEC-2456.1).
+    pub row_guard_defaults: BTreeMap<crate::ColumnRef, String>,
+
     /// One-shot label intent, keyed by declared type and new label. It never
     /// participates in Schema equality; live definitions establish absorption.
     pub enum_value_renames: BTreeMap<crate::TypeRef, BTreeMap<String, String>>,
@@ -1092,6 +1097,31 @@ pub struct Hints {
     /// The routines whose declaration opts back in to `PUBLIC` execution
     /// (ADR-0010 §5).
     pub public_execute: PublicExecute,
+}
+
+impl Hints {
+    /// Carry approved catalog spelling beside the declaration overlay.
+    pub fn record_row_defaults(&mut self, catalog: &crate::Schema) {
+        self.row_guard_defaults = catalog
+            .tables
+            .iter()
+            .flat_map(|(table, definition)| {
+                definition.columns.iter().filter_map(move |(name, column)| {
+                    if let crate::ValueSource::Default(text) = &column.value_source {
+                        Some((
+                            crate::ColumnRef {
+                                table: table.clone(),
+                                name: name.clone(),
+                            },
+                            text.to_owned(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+    }
 }
 
 /// Whether `definition` mentions `name`, by a best-effort identifier scan.

@@ -4947,6 +4947,7 @@ fn cmd_plan(
         // stores; where the snapshot recorded what was declared, that is what the
         // declarations are compared against (ADR-0013 §4). A git baseline records
         // nothing and the overlay leaves it as it is.
+        hints.record_row_defaults(&base.schema);
         let mut base_schema = base.declared.overlay(&base.schema);
         // A snapshot is a read, which knows the sequence names it leaves out; a
         // git baseline is declarations, which do not (#1631).
@@ -5444,25 +5445,17 @@ pub(crate) fn statements<D: emission::Engine>(
         .map_err(|error| anyhow::anyhow!("cannot render a change as SQL: {error}"))
 }
 
-/// One planned change's statements in a plan of `mode`. A staged plan
-/// commits each statement on its own, and the dialect may write a change
-/// otherwise for it (#1638, DEC-1638.1), so everything that counts a staged
-/// plan's statements per change counts these.
-pub(crate) fn emitted<D: emission::Engine>(
-    dialect: &D,
-    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
-    position: usize,
+/// Prepare a plan's statement-count emission once. Staged resume checks keep
+/// this function across positions, so engine context is not rebuilt per row.
+pub(crate) fn emitter<'a, D: emission::Engine>(
+    dialect: &'a D,
+    plan: &'a (dyn pbps_diff::order::PlanView<D> + 'static),
     mode: pbps_model::PlanMode,
-) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
-    match mode {
-        pbps_model::PlanMode::Transactional => {
-            pbps_dialect::PlanDialect::emit(dialect, plan, position)
-        }
-        pbps_model::PlanMode::Staged => {
-            pbps_dialect::PlanDialect::emit_staged(dialect, plan, position)
-        }
+) -> impl Fn(usize) -> anyhow::Result<Vec<pbps_dialect::Statement>> + 'a {
+    let emit = pbps_dialect::PlanDialect::prepare_emission(dialect, plan, mode);
+    move |position| {
+        emit(position).map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))
     }
-    .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))
 }
 
 /// How many changes `--staged` sees, which is not how many entries the plan

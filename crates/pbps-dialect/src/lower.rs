@@ -179,11 +179,19 @@ fn frozen_lower_all(
         .collect()
 }
 
+/// A plan-local emission function. It returns SQL observations; only lowering
+/// can retain the emitter brand and operation identities as execution authority.
+pub type Emission<'a> = Box<dyn Fn(usize) -> Result<Vec<Statement>, DialectError> + 'a>;
+
 /// A pure emitter whose associated input is selected by its implementation.
 /// The resulting collection is branded by this emitter, so a caller-defined
 /// emitter or scratch engine cannot manufacture a real engine's lowered plan.
 pub trait Lowering: Sized {
     type Input: crate::PlanPayload + ?Sized;
+    /// Prepare once for a whole lowering, including zero-statement groups.
+    fn prepare_emission<'a>(&'a self, input: &'a Self::Input) -> Emission<'a> {
+        Box::new(move |position| self.emit_position(input, position))
+    }
     fn emit_position(
         &self,
         input: &Self::Input,
@@ -195,15 +203,15 @@ where
     D::Plan: crate::PlanPayload,
 {
     type Input = D::Plan;
+    fn prepare_emission<'a>(&'a self, input: &'a Self::Input) -> Emission<'a> {
+        PlanDialect::prepare_emission(self, input, crate::PlanPayload::mode(input))
+    }
     fn emit_position(
         &self,
         input: &Self::Input,
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
-        match crate::PlanPayload::mode(input) {
-            pbps_model::PlanMode::Transactional => self.emit(input, position),
-            pbps_model::PlanMode::Staged => self.emit_staged(input, position),
-        }
+        Lowering::prepare_emission(self, input)(position)
     }
 }
 
@@ -271,7 +279,7 @@ pub fn lower<E: Lowering>(
     Ok(Lowered {
         operation: operation.id(),
         origin: operation.origin().clone(),
-        statements: emitter.emit_position(plan, position)?,
+        statements: emitter.prepare_emission(plan)(position)?,
     })
 }
 
@@ -293,11 +301,12 @@ pub fn lower_all<E: Lowering>(
     let operations = crate::PlanPayload::operations(plan);
     let mut groups = Vec::with_capacity(operations.len());
     let mut statements = Vec::new();
+    let emit = emitter.prepare_emission(plan);
     for (position, operation) in operations.iter().enumerate() {
         let group = Lowered {
             operation: operation.id(),
             origin: operation.origin().clone(),
-            statements: emitter.emit_position(plan, position)?,
+            statements: emit(position)?,
         };
         statements.extend(group.statements.iter().cloned());
         groups.push(group);

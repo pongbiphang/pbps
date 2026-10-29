@@ -1749,6 +1749,8 @@ pub(crate) fn diff_partial_rebuilding(
         }
     }
 
+    crate::row_defaults::catalog(&mut planned, base, declared, &hints.row_guard_defaults);
+
     // Modules are ordered among themselves by dependency: a view over a view
     // has to be created second, and dropped first (ADR-0002).
     // Lexed by the dialect: where a literal ends is the engine's rule, and an
