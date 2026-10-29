@@ -70,3 +70,4 @@ DECISIONS 465).
 - `68/` adds plain-string consumer declarations and the two built-in consumer rule IDs (DEC-2398.1).
 - `74/` adds recorded drop row requirements to plan explanations (#2400).
 - `79/` adds retained CHECK writebacks to plan explanations (#2354 PR 1).
+- `80/` adds retained column DEFAULT writebacks to plan explanations (#2354 PR 2).

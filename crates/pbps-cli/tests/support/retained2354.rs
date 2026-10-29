@@ -1,4 +1,4 @@
-//! CHECK-only retention; defaults deliberately keep their ordinary ALTER.
+//! Shared CHECK/DEFAULT retention and conservative fallback across label renames.
 use super::*;
 
 struct Scratch {
@@ -161,7 +161,9 @@ fn table(expression: &str, default: bool, renamed: bool) -> String {
     )
 }
 fn retained(plan: &pbps_model::SavedPlan) -> usize {
-    pbps_model::retained::expressions(&plan.changes).count()
+    pbps_model::retained::expressions(&plan.changes)
+        .filter(|e| matches!(e.target, pbps_model::ExpressionTarget::Check { .. }))
+        .count()
 }
 fn rebuilt(plan: &pbps_model::SavedPlan) -> bool {
     plan.changes.changes.iter().any(|p| {
@@ -192,12 +194,8 @@ fn retained2354_million_rows_keep_the_check_and_advance_only_the_approved_record
         let plan = f.plan(true, false);
         assert_eq!(retained(&plan), 1, "{:?}", plan.changes);
         assert!(!rebuilt(&plan));
-        assert!(
-            plan.changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
-        );
+        assert_eq!(retained_defaults(&plan), 1);
+        assert!(!altered_default(&plan));
         // The default connected rehearsal must preserve the optimized plan too.
         succeeds(f.d.run_with_env(
             &[
@@ -792,6 +790,413 @@ fn retained2354_physical_column_order_keeps_logical_bindings() {
 fn retained2354_dropped_attribute_holes_keep_logical_bindings() {
     for server in servers() {
         layout_retention(&server, true);
+    }
+}
+
+fn retained_defaults(plan: &pbps_model::SavedPlan) -> usize {
+    pbps_model::retained::expressions(&plan.changes)
+        .filter(|e| matches!(e.target, pbps_model::ExpressionTarget::ColumnDefault { .. }))
+        .count()
+}
+fn altered_default(plan: &pbps_model::SavedPlan) -> bool {
+    plan.changes
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
+}
+fn default_identity(f: &Fixture) -> String {
+    text_of(
+        f.own.connection(),
+        "SELECT d.oid::text || '/' || d.adbin::text FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE d.adrelid='app.t'::regclass AND a.attname='m'",
+    )
+}
+fn authored_default(f: &Fixture) -> String {
+    latest_snapshot(f.own.connection())
+        .declared
+        .expressions
+        .defaults[&"app.t".parse().unwrap()]["m"]
+        .clone()
+}
+fn default_table(expression: &str) -> String {
+    table("true", false, false).replace(
+        "m: {type: app.mood}",
+        &format!("m: {{type: app.mood, default: {expression:?}}}"),
+    )
+}
+fn default_fixture(server: &str, tag: &str, before: &str, after: &str, ty: &str) -> Fixture {
+    let f = Fixture::declared(server, tag, &default_table(before), ty, "[sad, ok]");
+    f.rename("true", true);
+    let desired = default_table(after).replace("type: app.mood", &format!("type: {ty:?}"));
+    if std::fs::read_to_string(f.d.dir.join("schema/app.t.yml")).unwrap() != desired {
+        f.d.table(&desired);
+        f.d.commit();
+    }
+    f
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_defaults_keep_identity_and_advance_without_real_table_ddl() {
+    for server in servers() {
+        for (ty, before, after) in [
+            ("app.mood", "'sad'", "'blue'"),
+            ("app.mood[]", "'{sad}'", "'{blue}'"),
+            ("app.dm", "'sad'", "'blue'"),
+        ] {
+            let f = default_fixture(&server, "retained2354default", before, after, ty);
+            let identity = default_identity(&f);
+            let p = f.plan(true, false);
+            assert_eq!(p.version, pbps_model::plan::CURRENT_VERSION);
+            assert_eq!(retained_defaults(&p), 1, "{:?}", p.changes);
+            assert!(!altered_default(&p));
+            assert!(
+                p.changes
+                    .changes
+                    .iter()
+                    .all(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+            );
+            // Any real-table DDL, including a redundant SET DEFAULT, fails apply.
+            on_server(
+                f.own.connection(),
+                r#"
+CREATE FUNCTION public.refuse_real_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE objid='app.t'::regclass AND command_tag='ALTER TABLE') THEN
+    RAISE EXCEPTION 'retention must not alter the real table';
+  END IF;
+END $$;
+CREATE EVENT TRIGGER refuse_real_ddl ON ddl_command_end EXECUTE FUNCTION public.refuse_real_ddl();
+"#,
+            );
+            succeeds(f.apply(false, false));
+            assert_eq!(default_identity(&f), identity);
+            assert_eq!(authored_default(&f), after);
+            on_server(f.own.connection(), "INSERT INTO app.t (id) VALUES (1)");
+            assert_eq!(
+                text_of(f.own.connection(), "SELECT m::text FROM app.t WHERE id=1"),
+                if ty.ends_with("[]") { "{blue}" } else { "blue" }
+            );
+            assert!(f.plan(true, false).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_default_values_and_text_casts_keep_ordinary_alteration() {
+    for server in servers() {
+        for (before, after) in [
+            ("'sad'", "'ok'"),
+            ("('sad'::text)::app.mood", "('blue'::text)::app.mood"),
+        ] {
+            let f = default_fixture(
+                &server,
+                "retained2354differentdefault",
+                before,
+                after,
+                "app.mood",
+            );
+            let p = f.plan(true, false);
+            assert_eq!(retained_defaults(&p), 0);
+            assert!(altered_default(&p));
+            succeeds(f.apply(false, false));
+            assert_eq!(authored_default(&f), after);
+            on_server(f.own.connection(), "INSERT INTO app.t (id) VALUES (1)");
+            assert_eq!(
+                text_of(f.own.connection(), "SELECT m::text FROM app.t"),
+                if after == "'ok'" { "ok" } else { "blue" }
+            );
+            assert!(f.plan(true, false).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_defaults_offline_unavailable_and_unprovable_keep_alteration() {
+    for server in servers() {
+        let mut f = Fixture::new(&server, "retained2354defaultoffline", "true", true);
+        f.rename("true", true);
+        let p = f.plan(false, false);
+        assert_eq!(retained_defaults(&p), 0);
+        assert!(altered_default(&p));
+        succeeds(f.d.run(&[
+            "plan",
+            "--since",
+            "HEAD^",
+            "--out",
+            f.path.to_str().unwrap(),
+        ]));
+        let offline: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&f.path).unwrap()).unwrap();
+        assert_eq!(retained_defaults(&offline), 0);
+        assert!(altered_default(&offline));
+        f.scratch.connection =
+            "host=127.0.0.1 port=1 user=missing dbname=missing connect_timeout=1 sslmode=disable"
+                .into();
+        let p = f.plan(true, false);
+        assert_eq!(retained_defaults(&p), 0);
+        assert!(altered_default(&p));
+        drop(f);
+        // An unsupported carrier shape is advisory failure, never a proof.
+        let extra = |expr| {
+            default_table(expr).replace(
+                "primary_key:",
+                "  g: {type: integer, generated: {expression: 'id + 1', stored: true}}\nprimary_key:",
+            )
+        };
+        let f = Fixture::declared(
+            &server,
+            "retained2354unprovabledefault",
+            &extra("'sad'"),
+            "app.mood",
+            "[sad, ok]",
+        );
+        f.rename("true", true);
+        f.d.table(&extra("'blue'"));
+        f.d.commit();
+        let p = f.plan(true, false);
+        assert_eq!(retained_defaults(&p), 0);
+        assert!(altered_default(&p));
+        succeeds(f.apply(false, false));
+        assert_eq!(authored_default(&f), "'blue'");
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_defaults_ignore_physical_order_and_dropped_attribute_holes() {
+    for server in servers() {
+        for hole in [false, true] {
+            let f = Fixture::new(&server, "retained2354defaultlayout", "true", true);
+            on_server(
+                f.own.connection(),
+                &format!(
+                    "DROP TABLE app.t; CREATE TABLE app.t ({}m app.mood DEFAULT 'sad', id integer NOT NULL PRIMARY KEY, CONSTRAINT allowed CHECK (true)); {}",
+                    if hole { "removed integer," } else { "" },
+                    if hole {
+                        "ALTER TABLE app.t DROP COLUMN removed;"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            let layout = text_of(
+                f.own.connection(),
+                "SELECT string_agg(attnum::text || ':' || attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid='app.t'::regclass AND attnum>0 AND NOT attisdropped",
+            );
+            assert_eq!(layout, if hole { "2:m,3:id" } else { "1:m,2:id" });
+            let identity = default_identity(&f);
+            f.rename("true", true);
+            let p = f.plan(true, false);
+            assert_eq!(retained_defaults(&p), 1);
+            assert!(!altered_default(&p));
+            succeeds(f.apply(false, false));
+            assert_eq!(default_identity(&f), identity);
+            assert_eq!(authored_default(&f), "'blue'");
+            assert!(f.plan(true, false).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_default_drift_and_forged_proofs_never_record_falsely() {
+    for server in servers() {
+        let f = Fixture::new(&server, "retained2354defaultdrift", "true", true);
+        f.rename("true", true);
+        let original = f.plan(true, false);
+        assert_eq!(retained_defaults(&original), 1);
+        for identity in [true, false] {
+            let mut bad = original.clone();
+            for p in &mut bad.changes.changes {
+                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                    if identity {
+                        if let pbps_model::ExpressionTarget::ColumnDefault { column, .. } =
+                            &mut retained[0].target
+                        {
+                            column.name = "id".into();
+                        }
+                    } else {
+                        retained[0].after = "'ok'".into();
+                    }
+                }
+            }
+            assert_eq!(pbps_model::retained::validate(&bad).is_err(), identity);
+            std::fs::write(&f.path, serde_json::to_string_pretty(&bad).unwrap()).unwrap();
+            let out = f.apply(false, false);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            assert!(
+                stderr(&out).contains("retained DEFAULT"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(authored_default(&f), "'sad'");
+        }
+        std::fs::write(&f.path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        on_server(
+            f.own.connection(),
+            "ALTER TABLE app.t ALTER COLUMN m SET DEFAULT 'ok'",
+        );
+        let out = f.apply(false, false);
+        assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        assert_eq!(authored_default(&f), "'sad'");
+        assert_eq!(
+            text_of(
+                f.own.connection(),
+                "SELECT enumlabel FROM pg_enum WHERE enumtypid='app.mood'::regtype ORDER BY enumsortorder LIMIT 1"
+            ),
+            "sad"
+        );
+        on_server(
+            f.own.connection(),
+            "ALTER TABLE app.t ALTER COLUMN m SET DEFAULT 'sad'",
+        );
+        // Replaced catalog identity is observed freshly; no saved OID is authority.
+        f.plan(true, false);
+        succeeds(f.apply(false, false));
+        assert_eq!(authored_default(&f), "'blue'");
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_default_relation_lock_blocks_replacement_through_recording() {
+    for server in servers() {
+        let f = Fixture::new(&server, "retained2354defaultlock", "true", true);
+        f.rename("true", true);
+        let plan = f.plan(true, false);
+        assert_eq!(retained_defaults(&plan), 1);
+        let state = latest_snapshot(f.own.connection());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use pbps_dialect::Dialect;
+            let mut conn=pbps_db::Conn::connect(pbps_db::Driver::Postgres,f.own.connection()).await.unwrap();
+            let pg=pbps_pg::Postgres::new();
+            let framing=pg.transaction_framing(conn.session_zone().unwrap());
+            conn.begin(&framing).await.unwrap();
+            let held=pbps_pg::retained::hold(&mut conn,&plan.changes,Some(&state.declared.overlay(&state.schema))).await.unwrap();
+            let mut forged = plan.changes.clone();
+            for p in &mut forged.changes {
+                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                    retained[0].after = "'ok'".into();
+                }
+            }
+            let bad = pbps_pg::retained::hold(&mut conn,&forged,Some(&state.declared.overlay(&state.schema))).await.unwrap();
+            conn.execute("ALTER TYPE app.mood RENAME VALUE 'sad' TO 'blue'").await.unwrap();
+            assert!(bad.verify(&mut conn,&pg,&state.schema).await.is_err(), "fresh DEFAULT equality cannot be bypassed");
+            held.verify(&mut conn,&pg,&state.schema).await.unwrap();
+            let mut other=pbps_db::Conn::connect(pbps_db::Driver::Postgres,f.own.connection()).await.unwrap();
+            other.execute("SET lock_timeout='100ms'; SELECT * FROM app.t; INSERT INTO app.t(id) VALUES(1)").await.unwrap();
+            let error=other.execute("ALTER TABLE app.t ALTER COLUMN m SET DEFAULT 'ok'").await.unwrap_err();
+            assert_eq!(error.server_error_code().as_deref(),Some("55P03"));
+            pbps_pg::state::record(&mut conn,&state).await.unwrap();
+            assert!(other.execute("ALTER TABLE app.t ALTER COLUMN m SET DEFAULT 'ok'").await.is_err());
+            conn.rollback(&framing).await.unwrap();
+        });
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_default_staged_closure_and_resume_verify_before_recording() {
+    for server in servers() {
+        let f = Fixture::new(&server, "retained2354defaultstaged", "true", true);
+        f.rename("true", true);
+        let original = f.plan(true, true);
+        assert_eq!(retained_defaults(&original), 1);
+        let mut bad = original.clone();
+        for p in &mut bad.changes.changes {
+            if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut p.change {
+                retained[0].after = "'ok'".into();
+            }
+        }
+        std::fs::write(&f.path, serde_json::to_string_pretty(&bad).unwrap()).unwrap();
+        let out = f.apply(true, false);
+        assert_ne!(code(&out), 0);
+        assert_eq!(
+            latest_snapshot(f.own.connection())
+                .declared
+                .expressions
+                .defaults[&"app.t".parse().unwrap()]["m"],
+            "'sad'"
+        );
+        std::fs::write(&f.path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        // Sequence increments survive the carrier savepoint: stop only the closing proof.
+        on_server(
+            f.own.connection(),
+            r#"
+CREATE SCHEMA witness;
+CREATE SEQUENCE witness.proofs;
+CREATE FUNCTION witness.stop_closing() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_query() LIKE '%CREATE TEMP TABLE pg_temp.pbps_retained_%'
+     AND nextval('witness.proofs') > 1 THEN
+    RAISE EXCEPTION 'stop the closing proof';
+  END IF;
+END $$;
+CREATE EVENT TRIGGER stop_closing ON ddl_command_start WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION witness.stop_closing();
+"#,
+        );
+        let stopped = f.apply(true, false);
+        assert_ne!(
+            code(&stopped),
+            0,
+            "{}{}",
+            stdout(&stopped),
+            stderr(&stopped)
+        );
+        let checkpoint = latest_snapshot(f.own.connection());
+        assert_eq!(checkpoint.staged.as_ref().unwrap().completed, 1);
+        assert_eq!(
+            checkpoint.declared.expressions.defaults[&"app.t".parse().unwrap()]["m"],
+            "'sad'"
+        );
+        on_server(f.own.connection(), "DROP EVENT TRIGGER stop_closing");
+        succeeds(f.apply(true, true));
+        let state = latest_snapshot(f.own.connection());
+        assert!(state.staged.is_none());
+        assert_eq!(
+            state.declared.expressions.defaults[&"app.t".parse().unwrap()]["m"],
+            "'blue'"
+        );
+        assert!(f.plan(true, false).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_default_binding_rejects_trailing_statements_without_execution() {
+    for server in servers() {
+        let f = Fixture::new(&server, "retained2354defaultsingle", "true", true);
+        f.rename("true", true);
+        let plan = f.plan(true, false);
+        let e = pbps_model::retained::expressions(&plan.changes)
+            .find(|e| matches!(e.target, pbps_model::ExpressionTarget::ColumnDefault { .. }))
+            .unwrap();
+        let state = latest_snapshot(f.own.connection());
+        on_server(
+            f.own.connection(),
+            "CREATE SEQUENCE public.default_bind_attempts",
+        );
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use pbps_dialect::Dialect;
+            let mut conn=pbps_db::Conn::connect(pbps_db::Driver::Postgres,f.own.connection()).await.unwrap();
+            let pg=pbps_pg::Postgres::new();
+            let framing=pg.transaction_framing(conn.session_zone().unwrap());
+            conn.begin(&framing).await.unwrap();
+            let table=e.target.table();
+            let carrier=pbps_pg::retained::create_carrier(&mut conn,&pg,table,&state.schema.tables[table],0,true).await.unwrap();
+            pbps_pg::retained::bind(&mut conn,&pg,&e.target,"'sad'::app.mood /* ; stays one statement */",&carrier).await.unwrap();
+            conn.execute("SAVEPOINT malicious_default").await.unwrap();
+            let result=pbps_pg::retained::bind(&mut conn,&pg,&e.target,"'sad'); SELECT pg_catalog.nextval('public.default_bind_attempts'::pg_catalog.regclass); --",&carrier).await;
+            assert!(result.is_err(), "DEFAULT binding must parse exactly one statement");
+            conn.execute("ROLLBACK TO malicious_default; RELEASE malicious_default").await.unwrap();
+            // Sequence calls survive rollback, so partial execution cannot hide.
+            let rows=conn.query("SELECT NOT is_called AS absent FROM public.default_bind_attempts").await.unwrap();
+            assert_eq!(rows[0].try_get::<bool>("absent").unwrap(),Some(true));
+            conn.rollback(&framing).await.unwrap();
+        });
+        assert_eq!(authored_default(&f), "'sad'");
     }
 }
 
