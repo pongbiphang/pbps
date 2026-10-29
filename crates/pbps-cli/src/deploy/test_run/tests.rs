@@ -391,33 +391,48 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
         Box::pin(async {
             let fixture = Fixture::new()?;
             if routine_defaults {
-                for (name, dependencies, body) in [
-                    ("fixture_leaf()", "", "RETURN 41"),
+                for (name, dependencies, language, body) in [
+                    ("fixture_leaf()", "", "sql", "RETURN 41"),
                     (
                         "fixture_default()",
                         "depends_on: [app.fixture_leaf(), app.fixture_definer()]\n",
+                        "sql",
                         "RETURN app.fixture_leaf() + app.fixture_definer()",
                     ),
                     (
                         "fixture_definer()",
                         "depends_on: [app.private_leaf()]\n",
+                        "sql",
                         concat!(
                             "SECURITY DEFINER SET search_path = app, pg_temp ",
                             "RETURN app.private_leaf()"
                         ),
                     ),
-                    ("private_leaf()", "", "RETURN 1"),
-                    ("not_default()", "", "RETURN 99"),
+                    ("private_leaf()", "", "sql", "RETURN 1"),
+                    ("not_default()", "", "sql", "RETURN 99"),
+                    (
+                        "string_default()",
+                        "depends_on: [app.fixture_leaf()]\n",
+                        "sql",
+                        "AS $$ SELECT app.fixture_leaf() + 1 $$",
+                    ),
+                    (
+                        "plpgsql_default()",
+                        "depends_on: [app.fixture_leaf()]\n",
+                        "plpgsql",
+                        "AS $$ BEGIN RETURN app.fixture_leaf() + 1; END $$",
+                    ),
                 ] {
                     std::fs::write(
                         fixture.0.path().join("schema").join(format!("{name}.yml")),
                         format!(
                             concat!(
                                 "function: app.{name}\n{dependencies}",
-                                "definition: () RETURNS integer LANGUAGE sql IMMUTABLE {body}\n"
+                                "definition: () RETURNS integer LANGUAGE {language} IMMUTABLE {body}\n"
                             ),
                             name = name,
                             dependencies = dependencies,
+                            language = language,
                             body = body
                         ),
                     )?;
@@ -492,24 +507,41 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
                         .try_get::<i32>("amount")?
                         == Some(42)
                 );
-                let error = fixtures
-                    .execute("SELECT app.not_default()")
-                    .await
-                    .err()
-                    .context("unneeded routine was granted")?;
-                ensure!(error.server_error_code().as_deref() == Some("42501"));
-                let error = fixtures
-                    .execute("SELECT app.private_leaf()")
-                    .await
-                    .err()
-                    .context("definer callee was granted")?;
-                ensure!(error.server_error_code().as_deref() == Some("42501"));
-                let error = fixtures
-                    .execute("CALL app.not_default_proc()")
-                    .await
-                    .err()
-                    .context("unneeded procedure was granted")?;
-                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                for sql in [
+                    "SELECT app.not_default()",
+                    "SELECT app.private_leaf()",
+                    "CALL app.not_default_proc()",
+                ] {
+                    fixtures.execute(sql).await?;
+                }
+                // String and PLpgSQL bodies do not record their invoker callees
+                // in pg_depend; both remain valid defaults for an ordinary writer.
+                for routine in ["app.string_default()", "app.plpgsql_default()"] {
+                    candidate.loaded.schema.tables.get_mut(&TableName::new("app", "orders"))
+                        .unwrap().columns.get_mut("amount").unwrap().value_source =
+                        pbps_model::ValueSource::Default(routine.into());
+                    let mut phase = Phase::new("candidate_plan", "opaque default");
+                    let planned = plan(&session, &candidate, &mut phase).await?;
+                    apply(&session, &candidate, &planned, &mut phase,
+                        &planned.artifact.checksum(), &Progress::default()).await?;
+                    session.grants(&candidate.loaded.schema).await?;
+                    fixtures.execute(&format!(
+                        "INSERT INTO app.orders(code) VALUES ('{routine}')"
+                    )).await?;
+                }
+                // A domain's own default is not a column pg_attrdef at all.
+                let mut c = admin(&scratch).await?;
+                c.execute(concat!(
+                    "CREATE DOMAIN app.amount_type AS integer DEFAULT app.fixture_leaf() CHECK (VALUE > 0); ",
+                    "CREATE TABLE app.domain_default (amount app.amount_type)"
+                )).await?;
+                let fixture_role = format!("pbps_test_fixture_{}", scratch.run_id());
+                c.execute(&format!("GRANT INSERT, SELECT ON app.domain_default TO {fixture_role}")).await?;
+                fixtures.execute("INSERT INTO app.domain_default DEFAULT VALUES").await?;
+                ensure!(fixtures.query("SELECT amount::integer AS amount FROM app.domain_default").await?[0]
+                    .try_get::<i32>("amount")? == Some(41));
+                c.execute("DROP TABLE app.domain_default; DROP DOMAIN app.amount_type").await?;
+                ensure!(fixtures.query("SELECT amount FROM app.orders WHERE amount <> 42").await?.is_empty());
                 let mut assertions = Conn::connect(Driver::Postgres, session.assertion()).await?;
                 let error = assertions
                     .execute("SELECT app.fixture_default()")
@@ -549,19 +581,20 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
                 )
                 .await?;
                 session.grants(&candidate.loaded.schema).await?;
-                let error = fixtures
-                    .execute("SELECT app.fixture_default()")
-                    .await
-                    .err()
-                    .context("removed default retained fixture EXECUTE")?;
-                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                fixtures.execute("SELECT app.fixture_default()").await?;
             }
-            let error = fixtures
-                .execute("CREATE TABLE app.forbidden(n integer)")
-                .await
-                .err()
-                .context("fixture could create permanent objects")?;
-            ensure!(error.server_error_code().as_deref() == Some("42501"));
+            let assume_apply = format!("SET ROLE pbps_test_apply_{}", scratch.run_id());
+            for sql in [
+                "CREATE TABLE app.forbidden(n integer)",
+                "CREATE FUNCTION app.forbidden() RETURNS integer LANGUAGE sql RETURN 1",
+                "CREATE ROLE forbidden",
+                "CREATE DATABASE forbidden",
+                assume_apply.as_str(),
+            ] {
+                let error = fixtures.execute(sql).await.err()
+                    .with_context(|| format!("fixture could run {sql}"))?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"), "{sql}: {error}");
+            }
             let mut phase = Phase::new("candidate_plan", "clean");
             ensure!(plan(&session, &candidate, &mut phase).await?.data.changes == 0);
             Ok::<_, anyhow::Error>(())
@@ -592,14 +625,14 @@ async fn d2a1165_pg18_unmanaged_error_excludes_only_owned_run_roles() {
 }
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
-async fn d2a1165_pg16_fixture_defaults_receive_only_required_managed_execute() {
+async fn d2a1165_pg16_fixture_defaults_execute_managed_routines_as_an_ordinary_writer() {
     Box::pin(admission_case("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", true))
         .await
         .unwrap();
 }
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
-async fn d2a1165_pg18_fixture_defaults_receive_only_required_managed_execute() {
+async fn d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer() {
     Box::pin(admission_case("PBPS_TEST_PG_SCRATCH_IMAGE", true))
         .await
         .unwrap();

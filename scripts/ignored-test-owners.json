@@ -228,8 +228,8 @@
         "deploy::test_run::tests::d2a1165_pg18_owns_credentials_and_executes_only_accepted_sealed_plans",
         "deploy::test_run::tests::d2a1165_pg16_unmanaged_error_excludes_only_owned_run_roles",
         "deploy::test_run::tests::d2a1165_pg18_unmanaged_error_excludes_only_owned_run_roles",
-        "deploy::test_run::tests::d2a1165_pg16_fixture_defaults_receive_only_required_managed_execute",
-        "deploy::test_run::tests::d2a1165_pg18_fixture_defaults_receive_only_required_managed_execute"
+        "deploy::test_run::tests::d2a1165_pg16_fixture_defaults_execute_managed_routines_as_an_ordinary_writer",
+        "deploy::test_run::tests::d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer"
       ]
     },
     {

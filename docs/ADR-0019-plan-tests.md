@@ -354,7 +354,7 @@ hash sets, comparison results and the old/new pins; it exports no plan.
 |---|---|---|
 | Provision | Generated administrator, creates owned database/roles; never executes fixture/assertion text | Generated administrator, creates owned database/logins and changes database mode; never executes fixture/assertion text |
 | Apply | Ordinary deploy permissions in the owned database, including ledger/lock and declared object management | Ordinary deploy permissions in the owned database, including ledger/lock and declared object management |
-| Fixture | Non-superuser; schema USAGE; SELECT/INSERT/UPDATE/DELETE on managed tables except `data:`; SELECT only on `data:`; database TEMP for temporary helpers | Non-sysadmin; SELECT/INSERT/UPDATE/DELETE on managed tables except `data:`; SELECT only on `data:`; no permanent CREATE or ALTER |
+| Fixture | Non-superuser; schema USAGE; EXECUTE on managed routines; SELECT/INSERT/UPDATE/DELETE on managed tables except `data:`; SELECT only on `data:`; database TEMP for temporary helpers | Non-sysadmin; SELECT/INSERT/UPDATE/DELETE on managed tables except `data:`; SELECT only on `data:`; no permanent CREATE or ALTER |
 | Assertion | Separate non-superuser with SELECT on managed tables, no table DML or schema CREATE; runner-owned READ ONLY transaction (§7) | Separate least-privilege SELECT login, no DML/CREATE/ALTER, plus scratch database READ_ONLY (§7) |
 
 No fixture/assertion login owns managed objects or can assume the apply/admin

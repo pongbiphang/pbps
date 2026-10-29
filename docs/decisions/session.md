@@ -862,6 +862,7 @@ schema75; verified fixture re-pinning remains E. D2a changes no published format
 
 The owned run's exact provision and generated execution roles are infrastructure, excluded from the
 unmanaged-policy inventory without weakening that policy for other identities.
-Fixture EXECUTE is refreshed only for managed routines reached through stored
-column-default dependencies, stopping at definer ownership boundaries; PUBLIC
-and assertion privileges stay unchanged.
+Fixtures execute managed routines as an ordinary writer, including invoker callees
+whose dependencies PostgreSQL does not record; declared executable code is trusted
+under ADR-0019 §3/§6. PUBLIC and assertion EXECUTE stay unchanged; fixtures
+retain NOCREATEROLE and cannot assume the apply identity.
