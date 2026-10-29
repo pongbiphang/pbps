@@ -851,6 +851,9 @@ mod auth688 {
     }
 }
 
+#[path = "resolver/auth703.rs"]
+mod auth703;
+
 mod recon610 {
     use super::*;
     use pbps_pg::resolver::authorization::{
@@ -858,7 +861,7 @@ mod recon610 {
     };
 
     #[tokio::test]
-    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
     async fn scratch_reproduces_the_deployers_authorization_not_the_admins() {
         let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
         let pid = std::process::id();
@@ -1247,6 +1250,7 @@ mod recon610 {
         for role in [&run_login, &dep, &owner, &reader] {
             admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
         }
+        super::auth703::switchability_is_reproduced_independently().await;
     }
 }
 

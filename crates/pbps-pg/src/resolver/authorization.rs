@@ -266,9 +266,9 @@ async fn schema_privileges(
     Ok(privileges)
 }
 
-/// Every role the deployer inherits from or can switch to, with what a
-/// reproduction must mirror. `pg_has_role` gives the engine's own answer for
-/// inheritance (`USAGE`) and switching (`MEMBER`).
+/// Every role in the deployer's membership closure, including one that
+/// permits neither switching nor inheritance. The engine answers inheritance
+/// with `USAGE` and switching with `SET`; `MEMBER` is only the inventory.
 async fn role_attributes(
     conn: &mut impl QueryConnection,
 ) -> Result<BTreeMap<pbps_model::RoleName, RoleAttributes>, DbError> {
@@ -276,7 +276,7 @@ async fn role_attributes(
         .query(
             "SELECT r.rolname::text AS name, r.rolsuper::text AS superuser, r.rolinherit::text AS inherit, \
                     r.rolbypassrls::text AS bypass_rls, \
-                    pg_catalog.pg_has_role(r.oid, 'MEMBER')::text AS can_set, \
+                    pg_catalog.pg_has_role(r.oid, 'SET')::text AS can_set, \
                     pg_catalog.pg_has_role(r.oid, 'USAGE')::text AS inherits \
              FROM pg_catalog.pg_roles r \
              WHERE pg_catalog.pg_has_role(r.oid, 'MEMBER') OR pg_catalog.pg_has_role(r.oid, 'USAGE') \
