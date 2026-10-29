@@ -115,13 +115,15 @@ impl PlanningInput {
         Self { changes }
     }
     pub fn append_to<S>(&self, draft: super::PlanningPlan<S>) -> super::PlanningPlan {
-        let mut draft: super::PlanningPlan =
-            if draft.boundaries.is_empty() && draft.identities.is_none() {
-                // Untracked inputs retain the existing re-proposal route.
-                super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
-            } else {
-                super::plan::state(draft)
-            };
+        let plain = draft.boundaries.is_empty()
+            && draft.identities.is_none()
+            && draft.annotations.is_none();
+        let mut draft: super::PlanningPlan = if plain {
+            // Preserve the existing re-proposal route for untracked inputs.
+            super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
+        } else {
+            super::plan::state(draft)
+        };
         draft.boundaries.append_names(&self.changes);
         let prior = draft.payload.changes.len();
         for part in &self.changes {

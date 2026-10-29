@@ -232,16 +232,21 @@ fn module_dependencies(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
 ) -> Vec<(usize, usize, bool)> {
-    let mut edges = Vec::new();
+    let mut edges: Vec<_> =
+        super::annotations::modules(modules.iter().map(|(at, id, _)| (*at, *id)), deps)
+            .into_iter()
+            .map(|edge| (edge.before, edge.after, true))
+            .collect();
     for (i, id, module) in modules {
         let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
             if i == j || id.name() == provider.name() {
                 continue;
             }
-            let declared = deps.get(*id).is_some_and(|needs| needs.contains(*provider));
-            if declared || dialect.generation_may_call(&text, provider.name()) {
-                edges.push((*j, *i, declared));
+            if !edges.iter().any(|&(a, b, _)| a == *j && b == *i)
+                && dialect.generation_may_call(&text, provider.name())
+            {
+                edges.push((*j, *i, false));
             }
         }
     }
@@ -261,7 +266,15 @@ pub fn parts(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Option<Vec<PlannedChange>>, String> {
-    parts_in(planned, ids, changes, deps, dialect, false)
+    parts_in(
+        planned,
+        ids,
+        changes,
+        deps,
+        dialect,
+        false,
+        &BTreeSet::new(),
+    )
 }
 
 /// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
@@ -275,6 +288,7 @@ fn parts_in(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
+    demanded: &BTreeSet<pbps_model::object_ref::ObjectRef>,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
@@ -318,6 +332,8 @@ fn parts_in(
     };
     let split = if scratch {
         dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
+    } else if !demanded.is_empty() {
+        dialect.annotation_parts(&planned.change, ids, &functions, table_reader, demanded)
     } else {
         dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
     };
@@ -550,7 +566,11 @@ pub(super) fn expand_in(
     let mut origins = Vec::new();
     let mut added = 0;
     for (p, origin) in plan.changes.iter().zip(&plan.origins) {
-        match parts_in(p, ids, &plan.changes, deps, dialect, scratch)? {
+        let demanded = plan
+            .annotations
+            .as_ref()
+            .map_or_else(BTreeSet::new, |a| a.demands(&p.change));
+        match parts_in(p, ids, &plan.changes, deps, dialect, scratch, &demanded)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
@@ -840,8 +860,8 @@ pub(super) fn constraints_in(
             if a != b {
                 out.prefer(a, b, OrderReason::Structural);
             }
-        } else {
-            edge(out, a, b);
+        } else if a != b {
+            out.edge(a, b, Source::Inferred, OrderReason::Structural);
         }
     };
     let modules = modules(&cs.changes);
@@ -1050,15 +1070,18 @@ pub(super) fn constraints_in(
     if scratch {
         scratch_rules(cs, declared, dialect, guessed, &mut out);
     }
-    if out.constraints().is_empty() {
-        return Vec::new();
-    }
+    let infer_modules = !out.constraints().is_empty();
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
     for (provider, consumer, declared) in module_dependencies(&modules, deps, dialect, scratch) {
         if declared {
-            edge(&mut out, provider, consumer);
-        } else {
+            out.edge(
+                provider,
+                consumer,
+                Source::Annotation,
+                OrderReason::Structural,
+            );
+        } else if infer_modules {
             guess(&mut out, provider, consumer);
         }
     }

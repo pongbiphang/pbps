@@ -305,7 +305,14 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
     let settled = schedule.sequence();
     let settle = started.elapsed();
     let settle_edges = schedule.constraints().len();
-    assert!(settled.is_ok(), "{}: {settled:?}", shape.name);
+    if shape.name == "cycle" {
+        assert!(
+            matches!(settled, Err(super::Refusal::Cycle { .. })),
+            "{settled:?}"
+        );
+    } else {
+        assert!(settled.is_ok(), "{}: {settled:?}", shape.name);
+    }
     let started = Instant::now();
     let violations = verify_with(
         ops,

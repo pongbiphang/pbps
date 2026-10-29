@@ -22,7 +22,7 @@ use crate::{ColumnRef, Schema, Table, TableName, TypeRef};
 ///
 /// Like serial grant resolution (DEC-2202.1), this can run before partition
 /// validation: a missing ancestor or a cycle supplies no column ownership facts.
-pub(crate) fn ancestor_chain<'a>(
+pub fn ancestor_chain<'a>(
     table: &TableName,
     tables: &'a BTreeMap<TableName, Table>,
 ) -> Option<Vec<(&'a TableName, &'a Table)>> {

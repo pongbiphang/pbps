@@ -327,6 +327,11 @@ impl<'a> Registry<'a> {
     }
 
     /// Context can make otherwise valid shorthand collide with a legacy module.
+    /// The checked declaration vocabulary, including canonical facet aliases.
+    pub fn references(&self) -> impl Iterator<Item = &ObjectRef> {
+        self.entries.keys()
+    }
+
     pub fn render(&self, reference: &ObjectRef) -> Result<String, Problem> {
         self.entry(reference)?;
         let short = reference.raw();

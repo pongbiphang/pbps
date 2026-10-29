@@ -197,7 +197,7 @@ pub enum Spelling {
 impl Spelling {
     /// The spelling of what the step itself brings into being: after its
     /// own change, where a whole step is spelled before it.
-    fn produced(self) -> Self {
+    pub fn produced(self) -> Self {
         match self {
             Spelling::At(At::Before(i)) => Spelling::At(At::After(i)),
             Spelling::At(At::Start | At::End | At::After(_))

@@ -152,6 +152,29 @@ companions preserves their reserved operation IDs; subsequent parts use the
 same monotonic planning allocator. These are existing effect/name inputs, not
 a new ordering pass or membership replay.
 
+### Explicit object annotations
+
+`order::annotations` projects the registry's bound references onto installation
+and removal boundaries (DEC-2469.3). Baseline and final identities remain
+separate. The module compatibility adapters and scratch preparation use the
+same projector; an annotation edit alone adds no DDL. Each existing settlement
+reprojects the transient contract onto its current operation identities, and
+the generic verifier checks the resulting hard edges.
+
+Annotation edges cannot enter the legacy declared-edge cycle fallback. An
+extended annotation can displace only explicitly tagged textual or conservative
+inference through the existing Guess SCC policy. Typed, effect, catalog and
+binding facts remain hard. Plans without extended annotations retain the
+existing inference policy and serialized bytes.
+
+A demanded surface first asks for the dialect's existing legal creation recipe.
+Otherwise its indivisible group's boundary applies. An owner requiring its own
+contained surface before creation is a named internal cycle. The index describes
+actual operation payloads, so extracted facets are exposed only by their own
+operations. Missing recursive engine metadata is a named refusal pending the
+engine-facet work. No new pass, preference or public YAML follows from this
+library-only projection.
+
 ### Membership-scoped effect contract
 
 `operation::symbolic` declares recursive property writes, membership

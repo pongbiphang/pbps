@@ -318,7 +318,28 @@ impl Schedule {
 
     /// `changes`, which the schedule was built over, in its order.
     pub fn settle<S>(&self, plan: super::PlanningPlan<S>) -> Result<Settled<S>, Refusal> {
-        let settled = self.settle_raw(plan.payload)?;
+        let mut schedule = self.clone();
+        for edge in plan.annotation_edges().map_err(|refusal| {
+            Refusal::Unmet(vec![Obligation {
+                operation: 0,
+                refusal,
+            }])
+        })? {
+            schedule.edge(edge.before, edge.after, edge.source, edge.reason);
+        }
+        if plan.annotations.as_ref().is_some_and(|a| a.extended) {
+            schedule.constraints = schedule
+                .constraints
+                .into_iter()
+                .map(|mut edge| {
+                    if edge.source == Source::Inferred {
+                        edge.source = Source::Guess;
+                    }
+                    edge
+                })
+                .collect();
+        }
+        let settled = schedule.settle_raw(plan.payload)?;
         let origins = settled
             .sequence
             .iter()
@@ -336,6 +357,15 @@ impl Schedule {
         changes.identities = identities;
         changes.allocator = plan.allocator;
         changes.boundaries = plan.boundaries;
+        changes.annotations = plan.annotations;
+        #[cfg(any(test, debug_assertions))]
+        if changes.annotations.is_some() {
+            debug_assert!(
+                super::verify::annotations(&changes)
+                    .expect("checked annotation identities")
+                    .is_empty()
+            );
+        }
         Ok(Settled {
             changes,
             proof: settled.proof,
@@ -696,9 +726,16 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
     match edge.source {
         Source::Binding => OrderReason::Binding,
         Source::Execution => OrderReason::Authorization,
-        Source::Declared => OrderReason::Structural,
+        Source::Declared | Source::Annotation => OrderReason::Structural,
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,
+        Source::Inferred => reason(
+            &Edge {
+                source: Source::Lexical,
+                ..edge.clone()
+            },
+            operations,
+        ),
         Source::Effect | Source::Lexical | Source::Catalog | Source::Guess => match &edge.because {
             Because::Boundary(_) => OrderReason::Structural,
             Because::Restores(_) => OrderReason::Restoration,
