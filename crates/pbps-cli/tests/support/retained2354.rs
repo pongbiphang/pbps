@@ -794,3 +794,154 @@ fn retained2354_dropped_attribute_holes_keep_logical_bindings() {
         layout_retention(&server, true);
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_statement_tails_never_execute_at_scratch() {
+    for server in servers() {
+        for transaction_tail in [false, true] {
+            let f = Fixture::new(&server, "retained2354statementtail", "m <> 'sad'", false);
+            let tail = format!(
+                "m <> 'blue'); {} CREATE TABLE public.retained2354_marker(id integer); --",
+                if transaction_tail { "COMMIT;" } else { "" }
+            );
+            f.rename(&tail, false);
+            let out = f.d.run_with_env(
+                &[
+                    "plan",
+                    "--db",
+                    f.own.connection(),
+                    "--resolve-with",
+                    "scratch",
+                    "--no-rehearse",
+                    "--out",
+                    f.path.to_str().unwrap(),
+                ],
+                &[("PBPS_RETAINED2354_SCRATCH", &f.scratch.connection)],
+            );
+            if code(&out) == 0 {
+                let p: pbps_model::SavedPlan =
+                    serde_json::from_str(&std::fs::read_to_string(&f.path).unwrap()).unwrap();
+                assert_eq!(retained(&p), 0, "a statement tail is never retention proof");
+                assert!(rebuilt(&p));
+            } else {
+                assert!(
+                    format!("{}{}", stdout(&out), stderr(&out)).contains("app.t"),
+                    "{}{}",
+                    stdout(&out),
+                    stderr(&out)
+                );
+            }
+            for db in [f.own.connection(), f.scratch.database.connection()] {
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT (pg_catalog.to_regclass('public.retained2354_marker') IS NOT NULL)::integer::bigint"
+                    ),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_statement_tails_never_execute_at_apply() {
+    for server in servers() {
+        for transaction_tail in [false, true] {
+            let f = Fixture::new(&server, "retained2354applytail", "m <> 'sad'", false);
+            f.rename("m <> 'blue'", false);
+            let tail = format!(
+                "m <> 'blue'); {} CREATE TABLE public.retained2354_marker(id integer); --",
+                if transaction_tail { "COMMIT;" } else { "" }
+            );
+            // Saved proof is not authority to execute a tail during fresh binding.
+            let mut p = f.plan(true, false);
+            assert_eq!(retained(&p), 1);
+            for step in &mut p.changes.changes {
+                if let pbps_model::Change::RenameEnumValue { retained, .. } = &mut step.change {
+                    retained[0].after = tail.clone();
+                }
+            }
+            let identity = f.identity();
+            std::fs::write(&f.path, serde_json::to_string_pretty(&p).unwrap()).unwrap();
+            let out = f.apply(false, false);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            assert!(
+                stderr(&out).contains("retained CHECK app.t.allowed"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(
+                scalar(
+                    f.own.connection(),
+                    "SELECT (pg_catalog.to_regclass('public.retained2354_marker') IS NOT NULL)::integer::bigint"
+                ),
+                0
+            );
+            assert_eq!(f.identity(), identity);
+            assert_eq!(
+                text_of(
+                    f.own.connection(),
+                    "SELECT enumlabel FROM pg_enum WHERE enumtypid='app.mood'::regtype ORDER BY enumsortorder LIMIT 1"
+                ),
+                "sad"
+            );
+            assert_eq!(
+                latest_snapshot(f.own.connection())
+                    .declared
+                    .expressions
+                    .checks[&"app.t".parse().unwrap()]["allowed"],
+                "m <> 'sad'"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn retained2354_literals_and_complete_comment_tails_keep_one_statement() {
+    for server in servers() {
+        for (before, after) in [
+            ("m <> 'sad'", "m <> 'blue'"),
+            (
+                "m <> 'sad' AND '; COMMIT; --' = '; COMMIT; --'",
+                "m <> 'blue' AND '; COMMIT; --' = '; COMMIT; --'",
+            ),
+            (
+                "m <> 'sad' /* harmless ; COMMIT; */",
+                "m <> 'blue' /* harmless ; COMMIT; */",
+            ),
+            ("m <> 'sad' -- tail\n", "m <> 'blue' -- tail\n"),
+        ] {
+            let f = Fixture::new(&server, "retained2354statementtext", before, false);
+            f.rename(after, false);
+            let identity = f.identity();
+            let p = f.plan(true, false);
+            assert_eq!(retained(&p), 1, "{after}: {:?}", p.changes);
+            assert!(!rebuilt(&p));
+            succeeds(f.apply(false, false));
+            assert_eq!(f.identity(), identity);
+            assert_eq!(
+                latest_snapshot(f.own.connection())
+                    .declared
+                    .expressions
+                    .checks[&"app.t".parse().unwrap()]["allowed"],
+                after
+            );
+            assert!(f.plan(true, false).changes.is_empty());
+        }
+        // No newline: this comment consumes the wrapper's closing syntax.
+        let f = Fixture::new(
+            &server,
+            "retained2354incompletecomment",
+            "m <> 'sad'",
+            false,
+        );
+        f.rename("m <> 'blue' -- tail", false);
+        let p = f.plan(true, false);
+        assert_eq!(retained(&p), 0);
+        assert!(rebuilt(&p));
+    }
+}
