@@ -5062,3 +5062,42 @@ recovery: the former branch reported a Refused result containing recovery
 57P01. It must return Interrupted and publish no metadata. A P0001 raised by the
 trigger remains an engine refusal; during recovery it retains the original
 42601 and the later P0001 as context. Neither failure is retried again.
+
+<a id="dec-2134-1"></a>
+
+**DEC-2134.1. Chained Fill is scratch work, with its own identity and exact prerequisites.**
+The canonical SQL-free scratch route places each Fill after the complete
+managed relation shapes and other Fill entries it names, retaining managed
+source identities and immutable lowered groups. A generated suffix is part
+of relation readiness. Only proven unavailable prerequisites prune a Fill
+and its transitive dependants; independent Fill entries remain. A named cycle
+refuses the whole program. Fill never invents a deployment change or saved
+plan field. The PostgreSQL runner commits before setup, checks outside writes,
+restores the registered session and compares every created shape after
+compilation before accepting binding evidence; supplied sessions are borrowed sequentially.
+
+<a id="dec-2134-2"></a>
+
+**DEC-2134.2. Target recipes name roots and explicit parts; the existing inventory names engine-generated carried objects.**
+The maintainer chose option A on #2134 on 2026-10-29. PG16.15 and PG18.6
+produce array `_c_1` for `c` when `_c` is occupied, but `_c` without that
+collision, and refuse directly renaming the array type. Therefore target
+array names cannot stand for scratch's actual names. This narrow exception
+to target-derived names reads typed Nameable/schema/name fields in the
+existing per-Fill inventory query and publishes them as Fill step metadata;
+there is no separate nameables query or extra round trip. Only known engine-generated
+arrays and TOAST storage/indexes carried by an expected recipe object qualify.
+TOAST names also contain scratch OIDs: they cannot be copied from the target. Unknown carried
+creations or unreadable ownership fail closed, never seal incomplete names.
+
+A later explicit type can also displace an earlier implicit array. Its typed
+name delta belongs to the later Fill event; ownership must remain unchanged.
+Unexpected removals and changes to existing explicit names refuse. This
+preserves complete later-name checks across repeated Fill boundaries without
+parsing catalog descriptions or mutating immutable managed groups.
+
+The runner retains per-Fill inventory provenance and performs the existing
+staged comparison once after the complete program. Comparing immediately
+per Fill would let a later setup mutate an earlier accepted shape and seal
+against a stale comparison, as a real PG negative probe reproduced. The final
+comparison refuses that case and adds no catalog round trip.

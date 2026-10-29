@@ -30,7 +30,9 @@
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
-use pbps_diff::order::scratch::{Part, Progress, TrialProgram};
+use pbps_diff::order::scratch::{
+    FillDependency, FillNode, FillProgram, FillWork, Part, Progress, TrialProgram,
+};
 pub mod refusal;
 mod trial;
 use pbps_model::ValueSource;
@@ -162,9 +164,10 @@ pub struct Reconstruction {
     steps: Vec<Step>,
     trial: TrialProgram<crate::Postgres>,
     progress: Progress<crate::Postgres>,
-    committed: Vec<usize>,
+    committed: Vec<FillWork>,
+    program: FillProgram<crate::Postgres>,
+    fills: Vec<super::draft::FillStep>,
     failed: bool,
-    waiting_fill: Option<usize>,
     #[cfg(test)]
     fault: Option<(trial_tests::Point, usize)>,
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
@@ -172,9 +175,6 @@ pub struct Reconstruction {
     /// catalog identity each declared signature names in the target
     /// capture's snapshot: `None` where it names none (#1063, #1124, #1148).
     dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>,
-    /// Names something other than a step made resolvable just before the
-    /// step at each position: a fill's chained shapes (#1778).
-    between: Vec<(usize, Vec<Named>)>,
 }
 
 /// Completion proof for assessment; partial or failed execution grants none.
@@ -190,7 +190,7 @@ impl Observations<'_> {
 
 impl Reconstruction {
     pub fn observations(&self) -> Option<Observations<'_>> {
-        (!self.failed && self.waiting_fill.is_none() && self.committed.len() == self.steps.len())
+        (!self.failed && self.committed.len() == self.program.work().len())
             .then_some(Observations(self))
     }
 
@@ -217,15 +217,14 @@ impl Reconstruction {
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Self, ReconstructError> {
-        let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
-            .map_err(ReconstructError::Cycle)?;
-        Self::from_prepared(dialect, prepared)
+        Self::with_fills(dialect, bootstrap, ids, dependencies, Vec::new())
     }
 
     #[allow(clippy::wildcard_enum_match_arm)]
-    fn from_prepared(
+    fn from_prepared_with_fills(
         dialect: &crate::Postgres,
         prepared: pbps_diff::order::scratch::Prepared,
+        fills: Vec<super::draft::FillStep>,
     ) -> Result<Self, ReconstructError> {
         let expanded = prepared.changes();
         let mut steps = Vec::new();
@@ -459,6 +458,47 @@ impl Reconstruction {
         let input = ScratchBlueprint(pbps_diff::order::scratch::Input::new(prepared, steps));
         let ordered =
             pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle)?;
+        let mut completions = BTreeMap::new();
+        let mut relations = BTreeSet::new();
+        for part in ordered.parts() {
+            for (kind, schema, name) in &part.metadata.names {
+                if *kind == Nameable::Relation {
+                    let relation = (schema.clone(), name.clone());
+                    relations.insert(relation.clone());
+                    completions.insert(relation, part.operation);
+                }
+            }
+            if let Some(table) = &part.metadata.table_part {
+                completions.insert((table.schema.clone(), table.name.clone()), part.operation);
+            }
+        }
+        let nodes: Vec<_> = fills
+            .iter()
+            .map(|fill| {
+                let mut dependencies: Vec<_> = fill
+                    .after
+                    .iter()
+                    .map(|relation| {
+                        if relations.contains(relation) {
+                            FillDependency::Managed(completions[relation])
+                        } else {
+                            FillDependency::Unavailable(format!("{}.{}", relation.0, relation.1))
+                        }
+                    })
+                    .chain(fill.dependencies.iter().copied().map(FillDependency::Fill))
+                    .collect();
+                if fill.unavailable {
+                    dependencies.push(FillDependency::Unavailable(fill.name.clone()));
+                }
+                FillNode {
+                    name: fill.name.clone(),
+                    dependencies,
+                }
+            })
+            .collect();
+        let program = ordered
+            .fill_program(&nodes)
+            .map_err(ReconstructError::Cycle)?;
         let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter(dialect.clone()))
             .expect("the identical private probes already validated these lowering parts");
         let steps = ordered
@@ -482,26 +522,136 @@ impl Reconstruction {
         Ok(Self {
             progress: trial.begin(),
             trial,
-            committed: Vec::with_capacity(steps.len()),
+            committed: Vec::with_capacity(program.work().len()),
+            program,
+            fills,
             failed: false,
-            waiting_fill: None,
             #[cfg(test)]
             fault: None,
             steps,
             lowered,
             dropped: BTreeMap::new(),
-            between: Vec::new(),
         })
     }
 
+    pub fn with_fills<S: pbps_diff::order::RouteState<crate::Postgres>>(
+        dialect: &crate::Postgres,
+        bootstrap: &pbps_diff::order::PlanningPlan<S>,
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
+        fills: Vec<super::draft::FillStep>,
+    ) -> Result<Self, ReconstructError> {
+        let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
+            .map_err(ReconstructError::Cycle)?;
+        Self::from_prepared_with_fills(dialect, prepared, fills)
+    }
+    pub fn omitted_fills(&self) -> impl Iterator<Item = &str> {
+        self.program
+            .omitted()
+            .iter()
+            .map(|&i| self.fills[i].name.as_str())
+    }
+    pub fn next_fill(&self) -> Option<&super::draft::FillStep> {
+        match self.program.work().get(self.committed.len())? {
+            FillWork::Fill(i) => Some(&self.fills[*i]),
+            FillWork::Declared(_) => None,
+        }
+    }
+    fn next_range(&self) -> Option<std::ops::Range<usize>> {
+        let pending = &self.program.work()[self.committed.len()..];
+        let FillWork::Declared(start) = *pending.first()? else {
+            return None;
+        };
+        let count = pending
+            .iter()
+            .take_while(|w| matches!(w, FillWork::Declared(_)))
+            .count();
+        Some(start..start + count)
+    }
+    fn pending_fills(&self) -> impl Iterator<Item = &super::draft::FillStep> {
+        self.program.work()[self.committed.len()..]
+            .iter()
+            .filter_map(|work| match work {
+                FillWork::Fill(i) => Some(&self.fills[*i]),
+                FillWork::Declared(_) => None,
+            })
+    }
+    pub fn has_fill(&self) -> bool {
+        self.pending_fills().next().is_some()
+    }
+    pub fn waiting(&self) -> Option<String> {
+        let fills: Vec<_> = self.pending_fills().collect();
+        if fills.is_empty() {
+            return None;
+        }
+        let names = fills
+            .iter()
+            .map(|fill| pbps_model::escape::Escaped(&fill.name).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let relations: BTreeSet<_> = fills
+            .iter()
+            .flat_map(|fill| &fill.after)
+            .map(|(schema, name)| {
+                format!(
+                    "{}.{}",
+                    pbps_model::escape::Escaped(schema),
+                    pbps_model::escape::Escaped(name)
+                )
+            })
+            .collect();
+        Some(format!(
+            "fill creates {} only once scratch has created {}, and a declaration scratch compiles before that cannot read it: adopt the filled object into the managed set, or select no resolver and keep ADR-0013's conservative rebuild",
+            names,
+            relations.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+    pub fn finish_fill(
+        &mut self,
+        before: &super::externals::Inventory,
+        after: &super::externals::Inventory,
+    ) -> Result<(), ReconstructError> {
+        let Some(FillWork::Fill(i)) = self.program.work().get(self.committed.len()).copied() else {
+            self.failed = true;
+            return Err(ReconstructError::Transaction(
+                "publish an unexpected fill in",
+            ));
+        };
+        let names = self.fills[i]
+            .observed_names(before, after)
+            .map_err(|error| {
+                self.failed = true;
+                ReconstructError::Read {
+                    declaration: pbps_model::escape::Escaped(&self.fills[i].name).to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+        self.fills[i].names = names;
+        self.committed.push(FillWork::Fill(i));
+        Ok(())
+    }
+    fn work_names(&self, work: FillWork) -> &[Named] {
+        match work {
+            FillWork::Declared(i) => &self.steps[i].names,
+            FillWork::Fill(i) => &self.fills[i].names,
+        }
+    }
+    fn work_name(&self, work: FillWork) -> String {
+        match work {
+            FillWork::Declared(i) => self.steps[i].declaration.clone(),
+            FillWork::Fill(i) => format!(
+                "{} (fill)",
+                pbps_model::escape::Escaped(&self.fills[i].name)
+            ),
+        }
+    }
     /// The names made resolvable after the module that `owner` belongs to
     /// was compiled: later modules and every index. A binding of that module
     /// to an object of one of these names may have been made before a better
     /// candidate existed. A view is found by its name; a routine by the exact
     /// overload the engine created for its step, since overloads of one name
     /// are compiled at different steps. Names made resolvable between two
-    /// steps (see [`Self::created_before`]) count for every module compiled
-    /// before them. `None` for an object no compiled module is.
+    /// Fill entries count for every module compiled before them. `None` for an object no compiled module is.
     pub fn later_names(
         &self,
         owner: &ObjectIdentity,
@@ -526,17 +676,11 @@ impl Reconstruction {
         let rank = self
             .committed
             .iter()
-            .position(|&id| id == at)
+            .position(|&id| id == FillWork::Declared(at))
             .expect("completed step");
         self.committed[rank + 1..]
             .iter()
-            .map(|&id| &self.steps[id].names)
-            .chain(
-                self.between
-                    .iter()
-                    .filter(|(before, _)| rank < *before)
-                    .map(|(_, names)| names),
-            )
+            .map(|&work| self.work_names(work))
             .flat_map(|names| {
                 names
                     .iter()
@@ -573,36 +717,6 @@ impl Reconstruction {
                     }))
         })?;
         Some(self.names_after(at))
-    }
-
-    /// Records `names` as made resolvable just before the step at
-    /// `position`, by something no step compiles: a fill's chained shapes,
-    /// created between two parts of the compile (#1778, DEC-1778.2). A module
-    /// compiled earlier may have bound one of these names to another object,
-    /// and [`Self::later_names`] then says so.
-    /// Register the existing chained-fill cut before compiling its prefix.
-    /// Completion cannot be inferred from SQL alone when a fill is pending.
-    pub fn expect_fill_at(&mut self, position: usize) {
-        if position > self.steps.len() || !self.committed.is_empty() || self.waiting_fill.is_some()
-        {
-            self.failed = true;
-        } else {
-            self.waiting_fill = Some(position);
-        }
-    }
-
-    pub fn created_before(&mut self, position: usize, names: Vec<Named>) {
-        if self.failed
-            || self.committed.len() != position
-            || self
-                .waiting_fill
-                .is_some_and(|expected| expected != position)
-        {
-            self.failed = true;
-            return;
-        }
-        self.waiting_fill = None;
-        self.between.push((self.committed.len(), names));
     }
 
     /// The catalog identity of the routine compiled for `id`, once the
@@ -653,60 +767,36 @@ impl Reconstruction {
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
-        self.compile_steps_in(dialect, zone, conn, 0..self.steps.len())
-            .await
+        while self.next_range().is_some() {
+            self.compile_next(dialect, zone, conn).await?;
+        }
+        if self.next_fill().is_some() {
+            return Err(ReconstructError::Unsupported(
+                "fill requires the guarded setup route".into(),
+            ));
+        }
+        Ok(())
     }
 
-    /// The position just after the last step that creates one of
-    /// `relations`, by schema and name: where a fill's chained shapes, which
-    /// name those relations' row types, can be created (#1778,
-    /// DEC-1778.2). A table whose generated column calls a declared
-    /// function comes after that function, so the position is the step's,
-    /// not a phase's. `None` when one of them is created by no step.
-    pub fn after_creating(&self, relations: &BTreeSet<(String, String)>) -> Option<usize> {
-        relations
-            .iter()
-            .map(|(schema, name)| {
-                let created = self.steps.iter().any(|step| {
-                    step.names
-                        .iter()
-                        .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == name)
-                });
-                created
-                    .then(|| {
-                        self.steps.iter().rposition(|step| {
-                            step.table_part
-                                .as_ref()
-                                .is_some_and(|t| &t.schema == schema && &t.name == name)
-                                || step.names.iter().any(|(kind, s, n)| {
-                                    *kind == Nameable::Relation && s == schema && n == name
-                                })
-                        })
-                    })
-                    .flatten()
-            })
-            .try_fold(0, |last, position| Some(last.max(position? + 1)))
-    }
-
-    /// The number of steps, for [`Self::compile_steps_in`].
     pub fn len(&self) -> usize {
-        self.steps.len()
+        self.program.work().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
+        self.program.work().is_empty()
     }
 
-    /// [`Self::compile`] for the steps in `range` only, in a transaction of
-    /// its own: a fill's chained shapes are created between two of them,
-    /// outside the deployer's transaction (#1778, DEC-1778.2).
-    pub async fn compile_steps_in(
+    /// Execute the next declared segment issued by the canonical program.
+    /// Fill boundaries cannot be skipped, chosen or widened by the caller.
+    pub async fn compile_next(
         &mut self,
         dialect: &crate::Postgres,
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
-        range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
+        let range = self.next_range().ok_or(ReconstructError::Transaction(
+            "compile an unexpected segment in",
+        ))?;
         if self.failed {
             return Err(ReconstructError::Transaction("reuse a failed run of"));
         }
@@ -744,7 +834,7 @@ impl Reconstruction {
                         // or allocation occurs between this receipt and publication.
                         for (at, step) in delta {
                             self.steps[at] = step;
-                            self.committed.push(at);
+                            self.committed.push(FillWork::Declared(at));
                         }
                         self.progress = progress;
                         Ok(())
@@ -1153,7 +1243,7 @@ pub(crate) mod trial_tests;
 impl Reconstruction {
     // Explicit synthetic observations for metadata-only units, never compilation.
     pub(crate) fn observe_blueprint_fixture(&mut self) {
-        self.committed = (0..self.steps.len()).collect();
+        self.committed = self.program.work().to_vec();
     }
 }
 

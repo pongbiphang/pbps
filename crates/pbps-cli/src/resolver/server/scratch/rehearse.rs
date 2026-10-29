@@ -127,9 +127,15 @@ pub async fn with_session<T, E>(
         // managed, so a rehearsal with nothing staged never builds it.
         if externals.is_some() || prepared.has_filled() {
             let mut reconstruction = state
-                .reconstruction(&mut target, binding, desired.ids, &hints.module_deps)
+                .reconstruction(
+                    &mut target,
+                    binding,
+                    desired.ids,
+                    &hints.module_deps,
+                    &mut prepared,
+                )
                 .await?;
-            if prepared.split(&mut reconstruction).is_some() {
+            if reconstruction.has_fill() {
                 return Err(Error::Externals(vec![
                     "the externals fill reads managed relations, which a rehearsal cannot \
                      create between its statements; turn the rehearsal off with \

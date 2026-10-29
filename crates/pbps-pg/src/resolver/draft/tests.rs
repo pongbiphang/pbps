@@ -20,6 +20,7 @@ impl Target {
             Object {
                 schema: schema.to_owned(),
                 described: described.to_owned(),
+                name: None,
             },
         );
         key
@@ -548,7 +549,7 @@ fn fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds() {
         "CREATE SCHEMA IF NOT EXISTS ext;\n\
          CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false;\n"
     );
-    assert_eq!(staging.chained, "");
+    assert_eq!(chained_sql(&staging), "");
     assert_eq!(staging.filled, BTreeSet::from(["view ext.v".to_owned()]));
     assert!(staging.unfillable.is_empty(), "{:?}", staging.unfillable);
     // Negative: what the externals file created is the file's, never filled
@@ -578,11 +579,9 @@ fn a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist() {
     let staging = fill.staging(&BTreeSet::new());
     assert_eq!(staging.ahead, "CREATE SCHEMA IF NOT EXISTS ext;\n");
     assert!(
-        staging
-            .chained
-            .starts_with("CREATE TABLE ext.c (\n    m app.m"),
+        chained_sql(&staging).starts_with("CREATE TABLE ext.c (\n    m app.m"),
         "{}",
-        staging.chained
+        chained_sql(&staging)
     );
     assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
     // The draft still lists it: a file written before the managed objects
@@ -599,7 +598,7 @@ fn a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist() {
     // Negative: the externals file's own copy is not filled over, so nothing
     // is created between the compile's two parts.
     let held = fill.staging(&file_created(&[("pg_class", "table ext.c")]));
-    assert_eq!(held.chained, "");
+    assert_eq!(chained_sql(&held), "");
     assert!(held.filled.is_empty(), "{:?}", held.filled);
 }
 
@@ -769,7 +768,7 @@ fn a_chained_shape_waits_for_every_managed_relation_it_names() {
     let staging = target.fill().staging(&BTreeSet::new());
     assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
     assert_eq!(
-        staging.chained_after,
+        required_relations(&staging),
         BTreeSet::from([
             ("app".to_owned(), "m".to_owned()),
             ("app".to_owned(), "n".to_owned())
@@ -802,22 +801,22 @@ fn only_the_chains_waiting_for_an_absent_relation_are_dropped() {
     let mut staging = target.fill().staging(&BTreeSet::new());
     for table in ["ext.c", "ext.d", "ext.x"] {
         assert!(
-            staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            chained_sql(&staging).contains(&format!("CREATE TABLE {table} ")),
             "{table}"
         );
     }
     let absent = ("app".to_owned(), "n".to_owned());
-    staging.keep_chained(|after| !after.contains(&absent));
+    place(&mut staging, |after| !after.contains(&absent));
     assert!(
-        staging.chained.contains("CREATE TABLE ext.c "),
+        chained_sql(&staging).contains("CREATE TABLE ext.c "),
         "{}",
-        staging.chained
+        chained_sql(&staging)
     );
     for table in ["ext.d", "ext.x"] {
         assert!(
-            !staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            !chained_sql(&staging).contains(&format!("CREATE TABLE {table} ")),
             "{table}: {}",
-            staging.chained
+            chained_sql(&staging)
         );
         assert!(
             !staging.filled.contains(&format!("table {table}")),
@@ -836,7 +835,7 @@ fn only_the_chains_waiting_for_an_absent_relation_are_dropped() {
     }
     assert!(staging.filled.contains("table ext.c"));
     assert_eq!(
-        staging.chained_after,
+        required_relations(&staging),
         BTreeSet::from([("app".to_owned(), "m".to_owned())])
     );
 }
@@ -886,9 +885,9 @@ fn an_extension_never_waits_for_the_managed_tables() {
     );
     let named = staging(true);
     assert!(
-        !named.chained.contains("CREATE EXTENSION"),
+        !chained_sql(&named).contains("CREATE EXTENSION"),
         "{}",
-        named.chained
+        chained_sql(&named)
     );
     assert!(!named.ahead.contains("CREATE EXTENSION"), "{}", named.ahead);
     assert!(!named.filled.contains("extension inhouse"));
@@ -914,6 +913,7 @@ fn catalog_prose_staging_keeps_raw_identity_keys_and_shows_each_refusal_operand(
         how,
         names: vec![],
         after: BTreeSet::new(),
+        expected: BTreeMap::new(),
     };
     let fill = Fill {
         objects: vec![object("pg_class", How::Ahead("SELECT 1;".into()))],
@@ -969,18 +969,18 @@ fn catalog_prose_staging_keeps_raw_identity_keys_and_shows_each_refusal_operand(
             "{shown} cannot be filled: its shape names a managed relation, and an extension's script runs code and creates names fill cannot order between two parts of the compile; select no resolver and keep ADR-0013's conservative rebuild"
         )]
     );
+    let mut chained = object("pg_class", How::Chained("SELECT 4;".into()));
+    chained.after.insert(("app".into(), "managed".into()));
     let fill = Fill {
-        objects: vec![object("pg_class", How::Chained("SELECT 4;".into()))],
+        objects: vec![chained],
     };
     let mut staging = fill.staging(&BTreeSet::new());
-    staging.keep_chained(|_| true);
-    assert!(staging.filled.contains(raw) && staging.chained_objects.contains(raw));
+    place(&mut staging, |_| true);
+    assert!(staging.filled.contains(raw) && staging.steps.iter().any(|step| step.name == raw));
     assert!(!staging.filled.contains(shown));
-    staging.keep_chained(|_| false);
+    place(&mut staging, |_| false);
     assert!(
-        staging.filled.is_empty()
-            && staging.chained_objects.is_empty()
-            && staging.chained.is_empty()
+        staging.filled.is_empty() && staging.steps.is_empty() && chained_sql(&staging).is_empty()
     );
     assert_eq!(
         staging.unfillable,
@@ -1240,4 +1240,53 @@ fn a_declared_type_whose_name_needs_quotes_is_recognised_as_it_is_named() {
     for oid in [5, 6] {
         assert!(!declared_type(&facts, &oid, declares), "{oid}");
     }
+}
+
+fn chained_sql(staging: &Staging) -> String {
+    staging.steps.iter().map(|step| step.sql()).collect()
+}
+fn required_relations(staging: &Staging) -> BTreeSet<(String, String)> {
+    staging
+        .steps
+        .iter()
+        .flat_map(|step| step.after.iter().cloned())
+        .collect()
+}
+fn place(staging: &mut Staging, available: impl Fn(&BTreeSet<(String, String)>) -> bool) {
+    let changes: Vec<_> = required_relations(staging)
+        .into_iter()
+        .filter(|relation| available(&BTreeSet::from([relation.clone()])))
+        .map(|(schema, name)| pbps_model::Change::CreateTable {
+            uid: pbps_model::Uid::derived(
+                pbps_model::UidKind::Table,
+                &format!("{schema}.{name}"),
+                0,
+            ),
+            name: pbps_model::TableName::new(&schema, &name),
+            table: Box::new(pbps_model::Table {
+                columns: [(
+                    "id".into(),
+                    pbps_model::Column::new("integer".parse().unwrap()),
+                )]
+                .into(),
+                ..Default::default()
+            }),
+            beside_default: None,
+            moves_at_most: None,
+        })
+        .collect();
+    let r = super::super::reconstruct::Reconstruction::with_fills(
+        &crate::Postgres::new(),
+        &super::super::reconstruct::fixture_plan(&changes),
+        &super::super::reconstruct::fixture_ids(&changes),
+        &Default::default(),
+        staging.steps.clone(),
+    )
+    .unwrap();
+    let omitted: BTreeSet<_> = r.omitted_fills().map(str::to_owned).collect();
+    for name in &omitted {
+        staging.filled.remove(name);
+        staging.unfillable.push(format!("{} is not filled: its shape names a managed relation the scratch compile does not create", Escaped(name)));
+    }
+    staging.steps.retain(|step| !omitted.contains(&step.name));
 }

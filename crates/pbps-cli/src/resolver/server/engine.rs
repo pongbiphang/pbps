@@ -77,9 +77,6 @@ pub(super) enum Binding {
     Postgres(Box<postgres::Binding>),
     Mssql(mssql::Binding),
 }
-pub(super) enum Chained {
-    Postgres(pbps_pg::resolver::externals::Created),
-}
 pub(super) enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
     Mssql(pbps_mssql::resolver::capture::Staged),
@@ -263,15 +260,21 @@ impl Scratch<'_> {
         binding: &BindingRequest<'_>,
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
+        prepared: &mut Prepared,
     ) -> Result<Binding, Error> {
         match self {
             Self::Mssql(scratch) => scratch
                 .reconstruction(binding, ids, dependencies)
                 .map(Binding::Mssql),
-            Self::Postgres(scratch) => scratch
-                .reconstruction(target, binding, ids, dependencies)
-                .await
-                .map(|binding| Binding::Postgres(Box::new(binding))),
+            Self::Postgres(scratch) => {
+                let Prepared::Postgres(prepared) = prepared else {
+                    return Err(unsupported());
+                };
+                scratch
+                    .reconstruction(target, binding, ids, dependencies, prepared)
+                    .await
+                    .map(|binding| Binding::Postgres(Box::new(binding)))
+            }
         }
     }
 
@@ -370,12 +373,6 @@ impl Prepared {
             Self::Mssql(_) => false,
         }
     }
-    pub(super) fn split(&mut self, binding: &mut Binding) -> Option<usize> {
-        match (self, binding) {
-            (Self::Postgres(prepared), Binding::Postgres(binding)) => prepared.split(binding),
-            (Self::Mssql(_), _) | (Self::Postgres(_), Binding::Mssql(_)) => None,
-        }
-    }
     pub(super) fn has_filled(&self) -> bool {
         match self {
             Self::Postgres(prepared) => prepared.has_filled(),
@@ -388,15 +385,15 @@ impl Prepared {
             Self::Mssql(_) => Vec::new(),
         }
     }
-    pub(super) fn waiting(&self) -> String {
-        match self {
-            Self::Postgres(prepared) => prepared.waiting(),
-            Self::Mssql(_) => String::new(),
-        }
-    }
 }
 
 impl Binding {
+    pub(super) fn has_fill(&self) -> bool {
+        match self {
+            Self::Postgres(binding) => binding.has_fill(),
+            Self::Mssql(_) => false,
+        }
+    }
     pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
         match (self, prepared) {
             (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding.chains(prepared),
@@ -406,64 +403,28 @@ impl Binding {
             }
         }
     }
-    pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Postgres(binding) => binding.len(),
-            Self::Mssql(binding) => binding.len(),
-        }
-    }
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn compile(
         &mut self,
         prepared: &mut Prepared,
         admin: &mut Conn,
-        extras: &[String],
-        driver: Driver,
-        zone: Option<&pbps_model::SessionZone>,
-        steps: std::ops::Range<usize>,
-    ) -> Result<(), Error> {
-        match (self, prepared) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared)) => {
-                let compile = prepared.compiling(admin, zone)?;
-                binding.compile(extras, driver, zone, compile, steps).await
-            }
-            (Self::Mssql(binding), Prepared::Mssql(prepared)) => {
-                binding.compile(prepared, steps).await
-            }
-            (Self::Postgres(_), Prepared::Mssql(_)) | (Self::Mssql(_), Prepared::Postgres(_)) => {
-                Err(unsupported())
-            }
-        }
-    }
-    pub(super) async fn fill_chained(
-        &mut self,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
-        split: usize,
-        outside: OutsideWrites,
-    ) -> Result<Chained, Error> {
-        match (self, prepared) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding
-                .fill_chained(prepared, admin, split, outside)
-                .await
-                .map(Chained::Postgres),
-            (Self::Mssql(_), _) | (_, Prepared::Mssql(_)) => Err(unsupported()),
-        }
-    }
-    pub(super) async fn compare_chained(
-        &self,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
         target: &mut Conn,
-        chained: &Chained,
-    ) -> Result<Staged, Error> {
-        match (self, prepared, chained) {
-            (Self::Postgres(binding), Prepared::Postgres(prepared), Chained::Postgres(chained)) => {
+        extras: &[String],
+        zone: Option<&pbps_model::SessionZone>,
+        outside: OutsideWrites,
+        staged: &mut Staged,
+    ) -> Result<(), Error> {
+        match (self, prepared, staged) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared), Staged::Postgres(staged)) => {
                 binding
-                    .compare_chained(prepared, admin, target, chained)
+                    .compile(prepared, admin, target, extras, zone, outside, staged)
                     .await
-                    .map(Staged::Postgres)
             }
-            (Self::Mssql(_), _, _) | (_, Prepared::Mssql(_), _) => Err(unsupported()),
+            (Self::Mssql(binding), Prepared::Mssql(prepared), Staged::Mssql(_)) => {
+                let len = binding.len();
+                binding.compile(prepared, 0..len).await
+            }
+            _ => Err(unsupported()),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -543,16 +504,6 @@ impl Binding {
 }
 
 impl Staged {
-    pub(super) fn extend(&mut self, other: Self) {
-        match (self, other) {
-            (Self::Postgres(staged), Self::Postgres(other)) => staged.extend(other),
-            (Self::Mssql(_), Self::Mssql(_))
-            | (Self::Mssql(_), Self::Postgres(_))
-            | (Self::Postgres(_), Self::Mssql(_)) => {
-                unreachable!("SQL Server has no chained reconstruction yet (#2376)")
-            }
-        }
-    }
     pub(super) fn changed_since(&self, current: &CapturedInputs) -> Vec<String> {
         match (self, current) {
             (Self::Postgres(staged), CapturedInputs::Postgres(current)) => {
@@ -718,7 +669,9 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
 use postgres::compile_failed;
 
 #[cfg(test)]
-pub(super) use postgres::{generation_version, reconstruction, release_supplied};
+pub(super) use postgres::reconstruction;
+#[cfg(test)]
+pub(super) use postgres::{generation_version, release_supplied};
 
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.

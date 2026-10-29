@@ -140,10 +140,7 @@ async fn compile(
     r.compile(pg, &pbps_model::SessionZone::utc(), conn).await
 }
 fn actual(r: &Reconstruction) -> Vec<String> {
-    r.committed
-        .iter()
-        .map(|&at| r.steps[at].declaration.clone())
-        .collect()
+    r.committed.iter().map(|&work| r.work_name(work)).collect()
 }
 
 #[tokio::test]
@@ -397,14 +394,12 @@ async fn stalls_name_every_pending_declaration_and_respect_range_barriers() {
                 ]
             };
             let mut r = build(&pg, &changes, &Default::default(), false);
+            if barrier {
+                r.fixture_fill_at(1, Vec::new());
+            }
             let before = r.steps.clone();
             let error = r
-                .compile_steps_in(
-                    &pg,
-                    &pbps_model::SessionZone::utc(),
-                    &mut conn,
-                    0..if barrier { 1 } else { 2 },
-                )
+                .compile_next(&pg, &pbps_model::SessionZone::utc(), &mut conn)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -472,11 +467,21 @@ async fn suffix_failure_keeps_prefix_private_and_fill_at_the_committed_boundary(
             function("f", "RETURN 1 / 0"),
         ];
         let mut r = build(&pg, &changes, &Default::default(), false);
-        r.expect_fill_at(1);
-        r.compile_steps_in(&pg, &pbps_model::SessionZone::utc(), &mut conn, 0..1)
+        r.fixture_fill_at(1, vec![(Nameable::Type, "ext".into(), "filled".into())]);
+        r.compile_next(&pg, &pbps_model::SessionZone::utc(), &mut conn)
             .await
             .unwrap();
-        r.created_before(1, vec![(Nameable::Type, "ext".into(), "filled".into())]);
+        conn.execute("CREATE SCHEMA ext").await.unwrap();
+        let before_fill = crate::resolver::externals::inventory(&mut conn)
+            .await
+            .unwrap();
+        conn.execute("CREATE DOMAIN ext.filled AS integer")
+            .await
+            .unwrap();
+        let after_fill = crate::resolver::externals::inventory(&mut conn)
+            .await
+            .unwrap();
+        r.finish_fill(&before_fill, &after_fill).unwrap();
         // Data failure at CREATE time (constant folding in a view).
         let mut invalid = build(
             &pg,
@@ -491,11 +496,11 @@ async fn suffix_failure_keeps_prefix_private_and_fill_at_the_committed_boundary(
         assert!(compile(&mut invalid, &pg, &mut conn).await.is_err());
         r.fault = Some((Point::Readback, 1));
         let error = r
-            .compile_steps_in(&pg, &pbps_model::SessionZone::utc(), &mut conn, 1..2)
+            .compile_next(&pg, &pbps_model::SessionZone::utc(), &mut conn)
             .await;
         remove(&mut admin, &name).await;
         assert!(error.is_err());
-        assert_eq!(r.committed, [0]);
+        assert_eq!(r.committed, [FillWork::Declared(0), FillWork::Fill(0)]);
         assert!(r.steps[1].created.is_none());
         assert!(r.observations().is_none());
         assert!(
@@ -624,13 +629,29 @@ async fn genuine_syntax_is_refused_with_its_original_diagnosis() {
 fn pending_or_failed_fill_cannot_grant_observations() {
     let pg = crate::Postgres::new();
     let mut r = build(&pg, &[], &Default::default(), false);
-    r.expect_fill_at(0);
+    r.fixture_fill_at(0, Vec::new());
+    assert_eq!(r.len(), 1);
+    assert!(!r.is_empty());
     assert!(r.observations().is_none());
-    r.created_before(0, vec![]);
+    let root = r.fills[0].root.clone();
+    let after = crate::resolver::externals::Inventory::from([(
+        (root.0, 1),
+        crate::resolver::externals::Inventoried {
+            described: root.1,
+            carried: None,
+            name: Some((Nameable::Type, "ext".into(), "filled".into())),
+            generated: false,
+            makers: Vec::new(),
+        },
+    )]);
+    r.finish_fill(&Default::default(), &after).unwrap();
     assert!(r.observations().is_some());
     let mut r = build(&pg, &[], &Default::default(), false);
-    r.expect_fill_at(0);
-    r.created_before(1, vec![]);
+    r.fixture_fill_at(0, Vec::new());
+    assert!(
+        r.finish_fill(&Default::default(), &Default::default())
+            .is_err()
+    );
     assert!(r.observations().is_none());
 }
 

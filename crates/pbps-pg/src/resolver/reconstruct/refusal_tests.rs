@@ -433,7 +433,7 @@ fn module_remedies_require_an_exact_provider_and_no_cycle_or_fill() {
                 ),
             ]
         };
-        let mut r = build(&pg, &changes, &Default::default(), true);
+        let r = build(&pg, &changes, &Default::default(), true);
         let at = r
             .steps
             .iter()
@@ -459,7 +459,10 @@ fn module_remedies_require_an_exact_provider_and_no_cycle_or_fill() {
             why: vec![],
         };
         for fill in [false, true] {
-            r.waiting_fill = fill.then_some(1);
+            let mut r = r.clone();
+            if fill {
+                r.fixture_fill_at(1, Vec::new());
+            }
             let ReconstructError::Refused(report) =
                 r.refusal(180006, vec![pending.clone()], true, vec![])
             else {

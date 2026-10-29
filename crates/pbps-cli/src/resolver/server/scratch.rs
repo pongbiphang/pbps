@@ -352,9 +352,14 @@ impl Run<'_> {
         let extras = &request.write_path_extras;
         let mut reconstruction = self
             .state
-            .reconstruction(target, binding, desired.ids, &hints.module_deps)
+            .reconstruction(
+                target,
+                binding,
+                desired.ids,
+                &hints.module_deps,
+                &mut prepared,
+            )
             .await?;
-        let split = prepared.split(&mut reconstruction);
         let chains = reconstruction.chains(&prepared);
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
             self.state
@@ -374,26 +379,25 @@ impl Run<'_> {
         let zone = target.session_zone().cloned();
         let outside_writes = self.provenance.outside_writes;
         let unfillable = prepared.unfillable();
-        let failed = |error: Error, staged: &engine::Staged, waiting: Option<&String>| {
+        let failed = |error: Error, staged: &engine::Staged| {
             let error = staged.through_shape_view(error);
             if let Error::Creation(mut failure) = error {
-                if !(chains.is_empty() && unfillable.is_empty() && waiting.is_none()) {
+                if !(chains.is_empty() && unfillable.is_empty()) {
                     let context = std::sync::Arc::make_mut(&mut failure);
                     context.externals = true;
                     context
                         .context
-                        .extend(chains.iter().chain(&unfillable).chain(waiting).cloned());
+                        .extend(chains.iter().chain(&unfillable).cloned());
                 }
                 return Error::Creation(failure);
             }
             if let Error::Binding(reason) = &error
-                && !(chains.is_empty() && unfillable.is_empty() && waiting.is_none())
+                && !(chains.is_empty() && unfillable.is_empty())
             {
                 return Error::Externals(
                     chains
                         .iter()
                         .chain(&unfillable)
-                        .chain(waiting)
                         .cloned()
                         .chain([reason.clone()])
                         .collect(),
@@ -401,46 +405,18 @@ impl Run<'_> {
             }
             error
         };
-        // A module scratch compiles before the split cannot read a chained
-        // shape, which does not exist yet; which modules read one only the
-        // compile tells, so a failure there is named as this.
-        let waiting = split.map(|_| prepared.waiting());
-        let steps = reconstruction.len();
         reconstruction
             .compile(
                 &mut prepared,
                 admin,
+                target,
                 extras,
-                driver,
                 zone.as_ref(),
-                0..split.unwrap_or(steps),
+                outside_writes,
+                &mut staged,
             )
             .await
-            .map_err(|error| failed(error, &staged, waiting.as_ref()))?;
-        if let Some(split) = split {
-            // Its shapes name the managed relations just committed, so it
-            // runs now, as the setup role, before anything after them
-            // compiles (DEC-1778.2).
-            let chained = reconstruction
-                .fill_chained(&mut prepared, admin, split, outside_writes)
-                .await?;
-            reconstruction
-                .compile(
-                    &mut prepared,
-                    admin,
-                    extras,
-                    driver,
-                    zone.as_ref(),
-                    split..steps,
-                )
-                .await
-                .map_err(|error| failed(error, &staged, None))?;
-            staged.extend(
-                reconstruction
-                    .compare_chained(&mut prepared, admin, target, &chained)
-                    .await?,
-            );
-        }
+            .map_err(|error| failed(error, &staged))?;
         let compiled = reconstruction
             .capture_desired(
                 &mut prepared,
@@ -531,6 +507,7 @@ tokio::task_local! {
     /// the opening capture: a writer the run cannot otherwise be timed
     /// against (#1755).
     static AFTER_STAGING: Option<String>;
+    pub(super) static FILL_FAILURE2134: Option<(String, String)>;
     /// The build string a test's scratch reports instead of its own: the
     /// pinned servers run one image, and `server_version` is read-only, so
     /// a differently packaged scratch is otherwise out of reach (#1700).
