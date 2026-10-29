@@ -5390,7 +5390,7 @@ fn write_plan(
 }
 
 /// A plan file's contents, as [`write_plan`] writes them.
-fn rendered_plan(plan: &impl pbps_diff::order::ArtifactView) -> anyhow::Result<String> {
+fn rendered_plan(plan: &(impl pbps_diff::order::ArtifactView + ?Sized)) -> anyhow::Result<String> {
     Ok(format!("{}\n", serde_json::to_string_pretty(plan.wire())?))
 }
 

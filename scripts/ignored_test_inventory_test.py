@@ -856,6 +856,33 @@ fn parent<'a>(x: &'a str) { let c = '}'; { real(x); } }
             self.assertEqual(listings[1], {'renamed::nested_case', 'conditional::platform_case', 'conditional_ignore'})
 
 
+class DeploymentServiceOwnership(unittest.TestCase):
+    def test_unconditionally_ignored_service_cases_are_registered_on_every_platform(self):
+        root = Path(__file__).resolve().parents[1]
+        inventory = json.loads((root / "scripts/ignored-test-owners.json").read_text(encoding="utf-8"))
+        cases = {
+            "deploy::services::tests::connected_planning_and_apply_use_in_memory_inputs_without_a_plan_file",
+            "deployment_services1165_command_contracts_on_pg16",
+            "deployment_services1165_command_contracts_on_pg18",
+            "deployment_services1165_command_contracts_on_mssql",
+        }
+        groups = [dict(group, cases=sorted(cases.intersection(group["cases"])))
+                  for group in inventory["groups"] if cases.intersection(group["cases"])]
+        owners = {group["owner"] for group in groups}
+        inventory = dict(inventory, groups=groups,
+                         owners={owner: inventory["owners"][owner] for owner in owners})
+        targets = {}
+        # These four declarations use #[ignore], without a cfg condition. The
+        # host listing alone cannot expose an omitted Windows registration.
+        for group in groups:
+            target = targets.setdefault(tuple(group["target"]), {"all": set(), "ignored": set()})
+            target["all"].update(group["cases"])
+            target["ignored"].update(group["cases"])
+        for platform in ("linux", "win32", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertEqual(audit.validate(root, inventory, targets, platform), len(cases))
+
+
 def load_tests(loader, tests, pattern):
     import ignored_test_inventory_closed_test as closed
     import ignored_test_inventory_history_test as history

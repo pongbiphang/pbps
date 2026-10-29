@@ -814,3 +814,19 @@ complete that create. ADR-0019 accepts this; the resolver's own sweep still
 covers such a container by its keeper and grace. Linux only: the process
 identity is `/proc` and the boot id, and every other platform refuses with one
 typed error rather than record a weaker proof.
+
+
+<a id="dec-1165-8"></a>
+
+**DEC-1165.8. Deployment commands share loaded-input and in-memory artifact boundaries.**
+The ordinary bootstrap and connected planner consume declarations and ids read
+once by their command wrappers; the planner returns its sealed artifact,
+optional script and existing report data before publication. Apply's existing
+post-decode admission and execution path is shared without moving its public
+hooks out of the command. SQL is still written before the plan, bootstrap's
+script write still participates in its build transaction, and committed results
+still report lock cleanup separately. This behaviour-preserving extraction
+adds no test command, runner callback, progress protocol or format field;
+ADR-0019's owned runner and verified re-pin follow separately. Regression tests
+pin original script bytes, refusal/publication order, exact hook payloads and
+transactional, staged and empty-plan command results on both engines.

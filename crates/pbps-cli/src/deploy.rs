@@ -34,6 +34,10 @@ use crate::db::{self, Target};
 
 mod checkout;
 mod guard;
+mod services;
+
+use services::{Attempt, apply_identified};
+pub(crate) use services::{cmd_bootstrap, cmd_plan_db};
 
 /// A scoped live state, plus the declared modules the read could not express.
 ///
@@ -6581,16 +6585,16 @@ fn bootstrap_record(
     snapshot
 }
 
-pub fn cmd_bootstrap(
+fn bootstrap(
     project: &Project,
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    let operator = crate::operator(project.root())?;
-    let dialect = crate::dialect(project)?;
+    declarations: services::Declarations,
+    dialect: crate::emission::SelectedDialect,
+    operator: &str,
+) -> anyhow::Result<Option<services::Bootstrapped>> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
-        let mut loaded = crate::load(project, dialect.as_ref())?;
-        let ids = crate::read_ids(project)?;
+        let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
         refuse_unidentified_bootstrap_objects(&loaded.schema, &ids)?;
 
@@ -6789,7 +6793,7 @@ pub fn cmd_bootstrap(
                 );
             }
             // No target to ask: UTC until #1918 (DEC-1916.1).
-            return write_script(&SessionZone::offline_utc());
+            return write_script(&SessionZone::offline_utc()).map(|()| None);
         };
 
         let statements = crate::statements(
@@ -6816,7 +6820,7 @@ pub fn cmd_bootstrap(
             // A history retention or a cascading key the server lacks (#1502).
             crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
             crate::engine::permission_support(&mut conn, &cs, &ids).await?;
-            crate::engine::lock(&mut conn, &operator).await?;
+            crate::engine::lock(&mut conn, operator).await?;
             let mut transaction_attempted = false;
             let result = async {
                 refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
@@ -6967,7 +6971,7 @@ pub fn cmd_bootstrap(
                 .await?;
                 let snapshot = with_provenance(
                     project.root(),
-                    bootstrap_record(built, held, &loaded, &operator),
+                    bootstrap_record(built, held, &loaded, operator),
                 );
                 let id = crate::engine::record(&mut conn, &snapshot).await?;
                 write_script(&pin_zone(&conn))?;
@@ -6980,7 +6984,7 @@ pub fn cmd_bootstrap(
                 result
             };
             if transaction_attempted && let Err(error) = &result {
-                record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
+                record_failed_bootstrap(&mut conn, project.root(), operator, error).await;
             }
             let unlocked = crate::engine::unlock(&mut conn).await;
             let (id, snapshot) = match result {
@@ -6990,14 +6994,12 @@ pub fn cmd_bootstrap(
                     return Err(error);
                 }
             };
-            println!(
-                "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
-                pbps_model::escape::Escaped(&target.label),
-                snapshot.schema.tables.len()
-            );
-            // Both the DDL and ledger row committed before lock cleanup began.
-            unlocked?;
-            Ok(())
+            Ok(Some(services::Bootstrapped {
+                entry: id,
+                tables: snapshot.schema.tables.len(),
+                target: target.label.clone(),
+                released: unlocked,
+            }))
         })
     })
 }
@@ -7165,21 +7167,20 @@ async fn domain_check_not_valid_warnings(
 /// JSON mode, for `main` to put beside the failure in the one envelope; human
 /// mode printed them when they were found (#1703, DEC-1726.1).
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_plan_db(
+fn plan_db(
     project: &Project,
     target: &Target,
-    out: Option<&std::path::Path>,
-    sql_out: Option<&std::path::Path>,
+    declarations: services::Declarations,
+    dialect: crate::emission::SelectedDialect,
+    script: bool,
     staged: bool,
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
     carried: &mut Vec<crate::output::Finding>,
-) -> anyhow::Result<()> {
-    let dialect = crate::dialect(project)?;
+) -> anyhow::Result<services::PlanResult> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
-        let mut loaded = crate::load(project, dialect.as_ref())?;
-        let ids = crate::read_ids(project)?;
+        let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
         let created_at = crate::now();
         // Keep the runtime alive for this connection across identity resolution.
@@ -7228,11 +7229,7 @@ pub fn cmd_plan_db(
             .any(|f| f.severity == crate::output::Severity::Error)
         {
             let report = crate::output::Report::plain("plan", checkout_findings);
-            return if json {
-                report.emit_json()
-            } else {
-                report.outcome()
-            };
+            return Ok(services::PlanResult::Refused(report));
         }
         if json {
             carried.clone_from(&checkout_findings);
@@ -7279,15 +7276,14 @@ pub fn cmd_plan_db(
             Ok(r) => r,
             Err(blockers) => {
                 if json {
-                    return crate::output::Report::plain(
+                    return Ok(services::PlanResult::Refused(crate::output::Report::plain(
                         "plan",
                         checkout_findings
                             .iter()
                             .cloned()
                             .chain(crate::report::blocker_findings(&blockers))
                             .collect(),
-                    )
-                    .emit_json();
+                    )));
                 }
                 eprintln!("{}", crate::report::blockers(&blockers));
                 bail!("some changes could not be decided automatically");
@@ -7306,7 +7302,7 @@ pub fn cmd_plan_db(
             // The same finding offline `plan --check` reports, so a pipeline
             // reads one id for one refusal whichever command met it (#573).
             if json {
-                return crate::output::Report::plain(
+                return Ok(services::PlanResult::Refused(crate::output::Report::plain(
                     "plan",
                     checkout_findings
                         .iter()
@@ -7315,8 +7311,7 @@ pub fn cmd_plan_db(
                             .at(project.ids_file(), None)
                             .remedy("pbps plan")])
                         .collect(),
-                )
-                .emit_json();
+                )));
             }
             bail!("{message}");
         }
@@ -8551,11 +8546,13 @@ pub fn cmd_plan_db(
             } => {
                 if json {
                     findings.push(finding);
-                    return crate::output::Report::plain("plan", findings).emit_json();
+                    return Ok(services::PlanResult::Refused(crate::output::Report::plain(
+                        "plan", findings,
+                    )));
                 }
                 let report = crate::output::Report::plain("plan", vec![finding]);
                 eprint!("{}", crate::output::human(&report.findings));
-                return report.outcome();
+                return Ok(services::PlanResult::Refused(report));
             }
         };
 
@@ -8708,7 +8705,7 @@ pub fn cmd_plan_db(
             }
         }
 
-        let script = sql_out.map(|_| {
+        let script = script.then(|| {
         format!(
             "-- Generated by pbps against {}\n-- Applyable only through `pbps apply --plan`; never hand-edit this file.\n\n{}",
             plan.baseline.description.shown(),
@@ -8723,43 +8720,12 @@ pub fn cmd_plan_db(
         )
     });
         let plan = pbps_diff::order::seal(cs.ordered(plan.mode, dialect.as_ref()), plan)?;
-        let rendered = out.map(|_| crate::rendered_plan(&plan)).transpose()?;
-        // Both rendered before either is written, and the SQL written first
-        // (DEC-1516.1): a failed write never leaves a new plan beside an old
-        // script. Each is written in place, so the file keeps its owner, group
-        // and permissions, as it always has.
-        if let (Some(path), Some(script)) = (sql_out, &script) {
-            std::fs::write(path, script)
-                .with_context(|| format!("cannot write `{}`", path.display()))?;
-        }
-        if let (Some(path), Some(rendered)) = (out, &rendered) {
-            std::fs::write(path, rendered)
-                .with_context(|| format!("cannot write `{}`", path.display()))?;
-        }
-        if let Some(path) = out
-            && !json
-        {
-            println!(
-                "\nwrote {} (checksum {})",
-                path.display(),
-                pbps_diff::order::ArtifactView::checksum(&plan)
-            );
-        }
-        if let Some(path) = sql_out
-            && !json
-        {
-            println!("wrote {}", path.display());
-        }
-        if out.is_none() && !json {
-            println!(
-                "\nThis plan was not saved. `--out plan.json` writes the artifact `pbps apply` takes."
-            );
-        }
-        if json {
-            let findings = findings.into_iter().chain(recovery_findings()).collect();
-            return crate::output::Report::new("plan", findings, Some(data)).emit_json();
-        }
-        Ok(())
+        Ok(services::PlanResult::Planned(Box::new(services::Planned {
+            artifact: Box::new(plan),
+            script,
+            data,
+            findings,
+        })))
     })
 }
 
@@ -8792,33 +8758,6 @@ pub struct ApplyRequest<'a> {
     pub resume: bool,
 }
 
-/// How an attempt on an identified artifact ended.
-///
-/// The three outcomes are one type so that [`cmd_apply`] has one place to
-/// report them: every path out of [`apply_identified`] arrives here, and the
-/// `on_apply_attempt` hook fires from that one place. Earlier the failure hook
-/// was called at each site that could fail after the lock, and the refusals
-/// before it — a stale `--checksum`, an unapproved risk — returned past the
-/// hook entirely, so the audit sink advertised as seeing every attempt never
-/// saw the rejected artifact.
-enum Attempt {
-    /// Nothing to do; not an attempt in the hook's sense.
-    Empty,
-    /// The plan ran and its ledger entry is durable. `released` is the lock
-    /// cleanup, reported separately because a failed DELETE of the lock row
-    /// cannot turn committed DDL plus its success row into a failed deployment.
-    Applied {
-        entry: i64,
-        released: Result<bool, pbps_db::DbError>,
-    },
-    /// The plan was run under the lock and did not complete. The lock cleanup
-    /// travels with the error so the caller can warn about it.
-    Failed {
-        error: anyhow::Error,
-        released: Result<bool, pbps_db::DbError>,
-    },
-}
-
 /// `pbps apply` — run an approved plan (SPEC §7.3, §7.5).
 pub fn cmd_apply(
     project: &Project,
@@ -8848,7 +8787,10 @@ pub fn cmd_apply(
         &operator,
     );
     let (error, released) = match attempt {
-        Ok(Attempt::Empty) => return Ok(()),
+        Ok(Attempt::Empty) => {
+            println!("The plan is empty; nothing to apply.");
+            return Ok(());
+        }
         Ok(Attempt::Applied { entry, released }) => {
             println!(
                 "Applied {} change(s) to `{}`{}; recorded as entry #{entry}.",
@@ -8909,159 +8851,6 @@ pub fn cmd_apply(
         warn_unreleased(&target.label, released);
     }
     Err(error)
-}
-
-/// Everything `apply` does once it knows which artifact it is holding.
-///
-/// Returns through [`Attempt`] or through `Err`, and nothing else: the caller
-/// turns both into the attempt event, so a refusal added here later cannot
-/// bypass the hook by construction.
-fn apply_identified(
-    project: &Project,
-    target: &Target,
-    request: &ApplyRequest<'_>,
-    plan: &pbps_model::SavedPlan,
-    plan_checksum: &str,
-    selected: &crate::emission::SelectedDialect,
-    operator: &str,
-) -> anyhow::Result<Attempt> {
-    pbps_cli::with_plan_dialect!(selected, |dialect| {
-        let ApplyRequest {
-            plan_path,
-            approved_checksum,
-            allow,
-            staged,
-            resume,
-        } = *request;
-
-        let admitted =
-            pbps_diff::order::admit(plan.clone(), dialect, plan_path, approved_checksum)?;
-        let plan = &admitted;
-
-        // The mode lives in the file because that is what the gate approved; the
-        // flag exists so that the CI configuration says out loud which kind of
-        // deployment this is. A disagreement between them is somebody's mistake,
-        // and running whichever was typed would be the tool choosing the loser.
-        if plan.mode.is_staged() != staged {
-            bail!(
-                "`{}` is a {} plan and `--staged` was {}.\n\
-             A staged plan runs outside a transaction and is applied with `--staged`; a \
-             transactional one is not.",
-                plan_path.display(),
-                plan.mode,
-                if staged { "given" } else { "not given" }
-            );
-        }
-        if resume && !staged {
-            bail!("--resume continues a staged apply; pass --staged as well");
-        }
-
-        // A cluster role's rename has no SQL, but its approved identity mapping
-        // still has to be checked and recorded. Additions and removal of the last
-        // role need the same check (421). SQL Server keeps its connection-free
-        // empty path; PostgreSQL decides whether the role map moved under the lock.
-        if plan.changes.is_empty() && dialect.manages_roles() {
-            println!("The plan is empty; nothing to apply.");
-            return Ok(Attempt::Empty);
-        }
-
-        // The gate. It can be this coarse precisely because the checksum pins the
-        // plan: what `--allow destructive` approves is this plan's destruction and
-        // no other (SPEC §7.3).
-        let unapproved = plan.changes.unapproved_risks(allow);
-        if !unapproved.is_empty() {
-            let names: Vec<&str> = unapproved.iter().map(|r| r.as_str()).collect();
-            bail!(
-                "this plan carries risks that were not approved: {}.\n\
-             Read {} and, if it is what you intend, re-run with --allow {}",
-                names.join(", "),
-                plan_path.display(),
-                plan.changes
-                    .gated_risks()
-                    .iter()
-                    .map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-        }
-
-        let statements = crate::statements(plan, dialect)?;
-        crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
-        // Only for a transactional plan. A staged one exists *because* its
-        // statement cannot run inside a transaction (ADR-0003): `plan --db
-        // --staged` accepts it deliberately, and rejecting it here would leave
-        // staged execution refusing the only kind of change it is for.
-        //
-        // Nothing the T-SQL emitter writes is marked non-transactional yet, so this
-        // is latent — which is the reason to fix it now rather than when the first
-        // such statement arrives and the guard swallows every staged apply.
-        if !staged {
-            reject_non_transactional(&statements)?;
-        }
-        let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
-        let targets = crate::engine::rename_targets(target.driver(), &names);
-        // A resolved plan's key, before anything connects: evidence sealed under
-        // another key, or none, is no evidence here (#616, DEC-952.1).
-        let keyed = pbps_cli::resolver::apply::Keyed::check(
-            plan,
-            pbps_cli::resolver::sealing::environment_key(project, target.environment()),
-            &target.label,
-        )?;
-        let deployment = Deployment {
-            project,
-            target,
-            plan,
-            plan_checksum,
-            statements: &statements,
-            rename_targets: &targets,
-            dialect,
-            operator,
-        };
-
-        let (result, released) = db::runtime()?.block_on(async {
-            let mut conn = db::connect(target).await?;
-
-            // This capability is constant for the connection and needs no ledger
-            // lock. Check before any writes, including staged resumes.
-            crate::engine::permission_support(&mut conn, &plan.changes, &plan.ids).await?;
-            crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
-            // A resolved plan's cluster, constant for the connection like the
-            // checks above: the evidence describes one cluster (#616, DEC-1685.1).
-            let resolved = match &keyed {
-                Some(keyed) => Some(keyed.open(&mut conn).await?),
-                None => None,
-            };
-
-            // The lock comes first, before the checks and not after them: a
-            // pre-flight that passed while another pipeline was mid-apply would
-            // have been answered about a database that is already moving.
-            crate::engine::lock(&mut conn, operator).await?;
-            let result = if staged {
-                apply_staged_under_lock(&mut conn, &deployment, resume)
-                    .await
-                    .map(Some)
-            } else {
-                apply_under_lock(&mut conn, &deployment, resolved.as_ref()).await
-            };
-            if let Err(error) = &result {
-                record_failed_apply(&mut conn, &deployment, error).await;
-            }
-            // Released whatever happened. A lock left behind by a failed apply
-            // blocks the very pipeline that would fix it.
-            let released = crate::engine::unlock(&mut conn).await;
-            Ok::<_, anyhow::Error>((result, released))
-        })?;
-
-        Ok(match result {
-            Ok(Some(entry)) => Attempt::Applied { entry, released },
-            Ok(None) => {
-                released.context("the empty plan's deployment lock could not be released")?;
-                println!("The plan is empty; nothing to apply.");
-                Attempt::Empty
-            }
-            Err(error) => Attempt::Failed { error, released },
-        })
-    })
 }
 
 /// Best-effort audit row for an apply that did not complete. The schema and ids
