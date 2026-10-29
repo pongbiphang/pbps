@@ -47,12 +47,13 @@ pub const CHANGE_EXPAND_CONTRACT: &str = "change.expand-contract";
 pub const CHANGE_NARROWING_ON_DATA: &str = "change.narrowing-on-data";
 pub const GRANT_WIDEN: &str = "grant.widen";
 pub const CHANGE_WINDOW: &str = "change.window";
+pub const UNMANAGED_GRANT: &str = "plan.unmanaged-grant";
 
 pub const DOMAIN_VET_UNAVAILABLE: &str = "plan.domain-vet-unavailable";
 pub const CONSUMER_BREAKING: &str = "consumer.breaking";
 pub const CONSUMER_UNPROVEN: &str = "consumer.unproven";
 
-pub const RULES: [Rule; 13] = [
+pub const RULES: [Rule; 14] = [
     Rule {
         id: DOMAIN_VET_UNAVAILABLE,
         point: Point::ConnectedPlan,
@@ -74,6 +75,14 @@ pub const RULES: [Rule; 13] = [
         point: Point::Plan,
         default: Some(Severity::Error),
         about: "a declared consumer's changed interface or writes cannot be proven compatible",
+        params: &[],
+        required: &[],
+    },
+    Rule {
+        id: UNMANAGED_GRANT,
+        point: Point::ConnectedPlan,
+        default: Some(Severity::Warning),
+        about: "an unmanaged grantee holds a permission pbps cannot express on a managed target",
         params: &[],
         required: &[],
     },
@@ -200,5 +209,14 @@ mod tests {
         let r = rule(CHANGE_WINDOW).unwrap();
         assert_eq!(r.point, Point::ConnectedPlan);
         assert_eq!(r.default, None);
+    }
+
+    #[test]
+    fn unmanaged_grants_are_connected_warnings_by_default() {
+        let r = rule(UNMANAGED_GRANT).unwrap();
+        assert_eq!(r.point, Point::ConnectedPlan);
+        assert_eq!(r.default, Some(Severity::Warning));
+        assert!(r.params.is_empty() && r.required.is_empty());
+        assert_eq!(rule("plan.unmanaged-grants"), None);
     }
 }

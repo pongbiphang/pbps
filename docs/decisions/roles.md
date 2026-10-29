@@ -1198,3 +1198,35 @@ checking that INSERT alone fails and the marker makes the direct insert
 succeed. Full nested-tree adoption, apply, verify and pull remain a
 prerequisite outside this issue: DEC-1170.1 holds only a single-level tree,
 and this grant change does not broaden that boundary.
+
+<a id="dec-2446-1"></a>
+
+**DEC-2446.1. Connected plan names unsupported permissions held by unmanaged
+grantees on managed targets as report-only advisories.** The original repro
+has no identity for its grantee. Refusing that permission would change the
+managed-role boundary in SPEC §4.7 and ADR-0010 §5 and block an existing
+baseline and unrelated deployment. The fatal set remains unchanged: managed
+grantees still refuse the same unsupported permissions, with the same
+schema and targetless exceptions (decisions 95, 105 and 176).
+
+Use the existing `Pulled::unexpressible` collection, never another ACL read.
+One target-membership helper serves both the fatal cut and advisory cut,
+retaining relation namespaces, exact routine signatures and owned-sequence
+column targets. Schema targets retain the existing declarable-schema scope:
+they need no object identity and are kept regardless of schema name. A
+targetless finding cannot prove membership in a managed object and gets no
+advisory; it is still fatal for a managed grantee under the existing rule.
+Owners, PUBLIC and default ACL context retain the reader's existing treatment.
+
+`plan.unmanaged-grant` uses the existing findings envelope and policy
+catalogue, defaults to warning at the connected-plan evaluation point, and
+honors ordinary rule settings and suppressions. It is not attached to a
+change, added to the schema, written into a saved plan or recorded as role
+ownership. Explicit policy configuration can refuse plan production through
+the ordinary policy gate; default planning, baseline, apply and verify keep
+their managed-role boundary. Offline planning has no catalog evidence and
+produces no advisory.
+
+Registering the policy changes the published config schema, so advance the
+published schema set and archive all three generated documents (decision
+465). This does not change the saved-plan, state or envelope wire formats.

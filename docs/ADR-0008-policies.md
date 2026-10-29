@@ -107,6 +107,7 @@ Plan rules, evaluated by `plan`:
 | `consumer.breaking` | declared `consumers` | on, `error` — a consumer loses an object name it still uses or writes |
 | `consumer.unproven` | declared `consumers` | on, `error` — changed interfaces or writes cannot be proven compatible |
 | `change.window` | time zone, allowed windows | off; **evaluated by `plan --db` only**, because it needs a clock and a target |
+| `plan.unmanaged-grant` | — | on, `warning`; **connected plan only**, naming unsupported permissions held by unmanaged grantees on managed targets (DEC-2446.1); report-only, outside the saved plan |
 
 The change-window rule is the one that does not fit an offline `validate`, and
 the answer is not to bend `validate` but to place the rule where a connection

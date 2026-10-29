@@ -606,6 +606,8 @@
         "trace::pg16_docker_keeps_definition_sources_out_of_every_sink",
         "drop_intent2414_removals_require_recorded_reasons_on_pg16",
         "drop_intent2414_removals_require_recorded_reasons_on_pg18",
+        "unsupported_unmanaged_grants_are_report_only_on_pg16",
+        "unsupported_unmanaged_grants_are_report_only_on_pg18",
         "a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names",
         "baseline_catalog_evidence_names_only_the_rebound_held_partition",
         "baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent",

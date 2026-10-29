@@ -870,6 +870,13 @@ grants:
 - Drift compares the managed set only: a declared role's grants on managed
   objects and schemas. A role the ids file does not name is left alone, and so
   is a grant on an object nobody declares.
+  Connected plan reports unsupported grants to unmanaged grantees on managed
+  targets as named `plan.unmanaged-grant` warnings (DEC-2446.1). They are
+  report-only context, outside the schema and saved-plan checksum, and do not
+  adopt the grantee. Schema grants share the existing declarable-schema scope;
+  targetless findings cannot establish managed-object membership and get no
+  advisory. The existing policy settings and suppressions apply, with warning
+  severity by default; managed grantees keep their existing refusal.
 
 ### 4.8 Shared PostgreSQL types
 
