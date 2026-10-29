@@ -367,3 +367,170 @@ fn fill_placement_consumes_the_annotation_settled_managed_order() {
         .is_err()
     );
 }
+
+#[test]
+fn annotated_teardowns_consume_retained_input_addresses_after_a_rename() {
+    use pbps_model::operation::{
+        AddressChain, ModuleEdits, Operations, Origin, Source as LogicalSource,
+    };
+    use pbps_model::plan_names::PlanNames;
+    for intermediate in [false, true] {
+        let address = if intermediate {
+            "app.middle"
+        } else {
+            "app.renamed"
+        };
+        let mut f = Fixture::new();
+        f.after
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .checks
+            .insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "x > 0".into(),
+                },
+            );
+        f.before = f.after.clone();
+        f.base = f.ids.clone();
+        let mut table = f.after.tables.remove(&"app.t".parse().unwrap()).unwrap();
+        table.checks.clear();
+        f.after.tables.insert("app.renamed".parse().unwrap(), table);
+        f.after.modules.clear();
+        f.ids
+            .tables
+            .insert("t_aaaaaa".parse().unwrap(), "app.renamed".parse().unwrap());
+        f.ids.columns.insert(
+            "c_aaaaaa".parse().unwrap(),
+            "app.renamed.x".parse().unwrap(),
+        );
+        let mut changes = vec![
+            Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "app.t".parse().unwrap(),
+                to: address.parse().unwrap(),
+                defaults: vec![],
+            },
+            Change::DropModule {
+                id: "app.f".parse().unwrap(),
+                kind: ModuleKind::View,
+            },
+            Change::DropCheck {
+                table: address.parse().unwrap(),
+                name: "ck".into(),
+            },
+        ];
+        if intermediate {
+            changes.push(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: address.parse().unwrap(),
+                to: "app.renamed".parse().unwrap(),
+                defaults: vec![],
+            });
+        }
+        let mut plan = f
+            .plan(
+                changes,
+                &dependencies(&[("check::app.t.ck", &["app.f"])]),
+                &ObjectDeps::default(),
+            )
+            .unwrap();
+        plan.origins[2] = Origin::Teardown(LogicalSource::Change(2));
+        let raw = Operations::expanded(
+            plan.logical,
+            plan.origins
+                .iter()
+                .cloned()
+                .zip(plan.changes.iter().cloned()),
+            ModuleEdits::Rebuilt,
+        );
+        let names = PlanNames::of(&plan.changes, &f.ids).unwrap();
+        let chain = AddressChain::bind(
+            &names,
+            &raw,
+            &f.base,
+            &f.ids,
+            &Default::default(),
+            &[raw.as_slice()[2].id()].into(),
+        );
+        let operations = raw.with_address_chain(chain);
+        assert!(if intermediate {
+            matches!(
+                operations.as_slice()[2].origin().spelling(),
+                pbps_model::operation::Spelling::Input(_)
+            )
+        } else {
+            matches!(
+                operations.as_slice()[2].origin().spelling(),
+                pbps_model::operation::Spelling::Final
+            )
+        });
+        plan.allocator.reserve(&operations);
+        plan.identities = Some(operations);
+        assert!(
+            plan.annotation_edges()
+                .unwrap()
+                .iter()
+                .any(|e| e.before == 2 && e.after == 1)
+        );
+        let settled = Schedule::new(plan.changes.len()).settle(plan).unwrap();
+        assert_eq!(
+            settled.sequence,
+            if intermediate {
+                vec![0, 2, 1, 3]
+            } else {
+                vec![0, 2, 1]
+            }
+        );
+        assert!(
+            settled
+                .changes
+                .annotation_edges()
+                .unwrap()
+                .iter()
+                .all(|e| e.before < e.after)
+        );
+        let mut unbound = settled.changes;
+        unbound.identities = None;
+        assert!(unbound.annotation_edges().is_err());
+    }
+}
+
+#[test]
+fn tracked_in_place_module_edits_keep_annotation_removal_boundaries() {
+    use pbps_model::operation::{ModuleEdits, Operations};
+    let mut f = Fixture::new();
+    f.after.modules.insert("app.g".parse().unwrap(), view());
+    f.before = f.after.clone();
+    f.base = f.ids.clone();
+    f.after.modules.remove(&"app.g".parse().unwrap());
+    f.after
+        .modules
+        .get_mut(&"app.f".parse().unwrap())
+        .unwrap()
+        .definition = "SELECT 2 AS x".into();
+    let mut plan = f
+        .plan(
+            vec![
+                Change::AlterModule {
+                    id: "app.f".parse().unwrap(),
+                    module: Box::new(f.after.modules[&"app.f".parse().unwrap()].clone()),
+                },
+                Change::DropModule {
+                    id: "app.g".parse().unwrap(),
+                    kind: ModuleKind::View,
+                },
+            ],
+            &dependencies(&[("app.f", &["app.g"])]),
+            &ObjectDeps::default(),
+        )
+        .unwrap();
+    plan.identities = Some(Operations::of_plan(&plan.changes, ModuleEdits::InPlace));
+    assert!(
+        plan.annotation_edges()
+            .unwrap()
+            .iter()
+            .any(|e| e.before == 0 && e.after == 1)
+    );
+}

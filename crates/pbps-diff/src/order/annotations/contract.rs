@@ -203,7 +203,8 @@ impl Contract {
         &self,
         plan: &super::super::PlanningPlan<S>,
     ) -> Result<Vec<Constraint>, String> {
-        // Origin spellings address logical sources, not the current permutation.
+        // Snapshot names follow logical sources; retained operations separately
+        // carry their immutable input address versions (DEC-2296.9).
         let mut logical = self.logical.changes.clone();
         let additions: BTreeMap<_, _> = plan
             .origins
@@ -228,13 +229,18 @@ impl Contract {
             &self.before.ids,
             &self.after.ids,
         );
-        let operations = Operations::expanded(
-            plan.logical,
-            plan.origins
-                .iter()
-                .cloned()
-                .zip(plan.changes.iter().cloned()),
-            ModuleEdits::Rebuilt,
+        let operations = plan.identities.as_ref().map_or_else(
+            || {
+                Operations::expanded(
+                    plan.logical,
+                    plan.origins
+                        .iter()
+                        .cloned()
+                        .zip(plan.changes.iter().cloned()),
+                    ModuleEdits::Rebuilt,
+                )
+            },
+            |operations| operations.with_steps(&plan.changes),
         );
         let mut index = Index {
             standing: self.before.references.clone(),
@@ -292,13 +298,29 @@ impl Contract {
             }
         }
         for (at, operation) in operations.as_slice().iter().enumerate() {
-            for definition in operation.defines(&owners).map_err(|e| e.to_string())? {
-                let reference = self.reference(&definition.key, operation, &owners, &names)?;
+            let inputs = operation.input_owners(&owners);
+            // An annotation follows definition replacement even when the engine
+            // alters a module in place. This is the same observation previously
+            // obtained by rebuilding every operation with ModuleEdits::Rebuilt.
+            let definitions = if matches!(operation.change(), Change::AlterModule { .. }) {
+                let key = operation.key(&owners).map_err(|e| e.to_string())?;
+                [Transition::Ends, Transition::Produces]
+                    .into_iter()
+                    .map(|transition| pbps_model::operation::Definition {
+                        key: key.clone(),
+                        transition,
+                    })
+                    .collect()
+            } else {
+                operation.defines(&owners).map_err(|e| e.to_string())?
+            };
+            for definition in definitions {
+                let reference = self.reference(&definition.key, operation, &inputs, &names)?;
                 if let Some(reference) = reference {
                     self.record(&mut index, reference, at, definition.transition);
                 }
             }
-            self.facets(&mut index, at, operation, &owners, &names)?;
+            self.facets(&mut index, at, operation, &inputs, &names)?;
         }
         let installers: BTreeSet<_> = index
             .boundaries
@@ -311,7 +333,13 @@ impl Contract {
             })
             .collect();
         for (at, operation) in operations.as_slice().iter().enumerate() {
-            self.payload(&mut index, at, operation, &owners, &installers)?;
+            self.payload(
+                &mut index,
+                at,
+                operation,
+                &operation.input_owners(&owners),
+                &installers,
+            )?;
         }
         index.project(&self.base, &self.goal).map_err(|error| {
             let (number, reason) = match error {
@@ -382,9 +410,9 @@ impl Contract {
                         .into_iter()
                         .find_map(|s| s.roots.get(table.uid()).map(|root| (s, root)))
                         .ok_or_else(|| "partition column ownership was not recorded".to_owned())?;
-                    // Projection rebuilds observations on the logical timeline.
-                    // Input address versions belong to the retained executable
-                    // operations, not this snapshot lookup (DEC-2296.9).
+                    // Root column declarations belong to the logical snapshots.
+                    // The child's input address never substitutes for its root's
+                    // recorded column anchor (DEC-2296.9).
                     let table_name = match operation.logical_origin() {
                         Origin::Teardown(_) => self.before.ids.tables.get(root),
                         Origin::Restoration(_) => self.after.ids.tables.get(root),
@@ -394,7 +422,10 @@ impl Contract {
                     .or_else(|| side.ids.tables.get(root))
                     .ok_or_else(|| "root table address is unavailable".to_owned())?;
                     let uid = owners
-                        .column(&table_name.column(column), spelling)
+                        .column(
+                            &table_name.column(column),
+                            operation.logical_origin().spelling(),
+                        )
                         .map_err(|e| e.to_string())?;
                     if root == table.uid() {
                         BoundRoot::Recorded(uid)
