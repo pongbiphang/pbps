@@ -354,8 +354,10 @@ fn parts_in(
     // Scratch can carry a partition default with a placeholder column UID.
     // Annotation endpoints need its real child-table/root-column identity;
     // the existing partition operation resolves that through the shared chain.
-    // Keep the scratch recipe and every unannotated byte unchanged (DEC-2469.3).
-    let parts = if !demanded.is_empty()
+    // Scratch consumers keep their existing carrier; Contract resolves its
+    // identity when reading annotations (DEC-2469.3).
+    let parts = if !scratch
+        && !demanded.is_empty()
         && let Change::CreateTable {
             uid, name, table, ..
         } = &planned.change

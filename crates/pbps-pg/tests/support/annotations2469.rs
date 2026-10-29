@@ -143,7 +143,6 @@ mod partitions;
 async fn partition_default_annotations_follow_the_module_across_ancestor_depths() {
     for (depth, inherited) in [(1, false), (3, false), (1, true), (3, true)] {
         let mut db = TestDb::create(&format!("annotation_partition_{depth}_{inherited}")).await;
-        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
         let fallback = if inherited { "DEFAULT 1" } else { "" };
         db.conn
@@ -183,11 +182,20 @@ async fn partition_default_annotations_follow_the_module_across_ancestor_depths(
             .position(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
             .unwrap();
         assert!(module < default);
-        for step in &plan.changes {
-            for statement in engine.fixture_emit(&step.change, step.strategy).unwrap() {
-                db.conn.execute(&statement.sql).await.unwrap();
-            }
-        }
+        let mut reconstruction = pbps_pg::resolver::reconstruct::Reconstruction::new(
+            &engine,
+            &scene.input().unwrap(),
+            &scene.ids,
+        )
+        .unwrap();
+        reconstruction
+            .compile(&engine, &pbps_model::SessionZone::utc(), &mut db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconstruction.observations().unwrap().len(),
+            reconstruction.len()
+        );
         db.conn
             .execute("INSERT INTO app.child DEFAULT VALUES")
             .await
@@ -196,7 +204,6 @@ async fn partition_default_annotations_follow_the_module_across_ancestor_depths(
         assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
         let rows = db.conn.query("SELECT count(*)::text AS bindings FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef a ON d.classid='pg_catalog.pg_attrdef'::regclass AND d.objid=a.oid WHERE a.adrelid='app.child'::regclass AND d.refclassid='pg_catalog.pg_proc'::regclass AND d.refobjid='app.f()'::regprocedure").await.unwrap();
         assert_eq!(rows[0].try_get::<&str>("bindings").unwrap(), Some("1"));
-        db.conn.execute("COMMIT").await.unwrap();
         db.drop().await;
     }
 }

@@ -346,7 +346,30 @@ impl Contract {
     ) -> Result<Option<Ref>, String> {
         let spelling = operation.origin().spelling();
         let column = |key: &ColumnKey| -> Result<BoundRoot, String> {
-            Ok(match key {
+            // Scratch defaults retain a table-UID carrier for reconstruction.
+            // Resolve it through the same recorded ancestor binding as a
+            // partition operation, without changing any engine's recipe.
+            let carrier =
+                if let (ColumnKey::Recorded(table), Change::AlterColumnDefault { column, .. }) =
+                    (key, operation.change())
+                    && table.uid().kind() == pbps_model::UidKind::Table
+                {
+                    let owner = owners
+                        .table(&column.table, spelling)
+                        .map_err(|e| e.to_string())?;
+                    if &owner != table.uid() {
+                        return Err(
+                            "scratch default carrier does not match its recorded table".into()
+                        );
+                    }
+                    Some(ColumnKey::Partition {
+                        table: table.clone(),
+                        column: column.name.clone(),
+                    })
+                } else {
+                    None
+                };
+            Ok(match carrier.as_ref().unwrap_or(key) {
                 ColumnKey::Recorded(uid) => BoundRoot::Recorded(uid.uid().clone()),
                 ColumnKey::Partition { table, column } => {
                     let sides = if spelling == Spelling::Base {

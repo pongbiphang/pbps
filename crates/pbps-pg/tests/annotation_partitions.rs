@@ -75,6 +75,55 @@ fn a_partition_default_installs_after_its_annotated_module_at_every_depth() {
 }
 
 #[test]
+fn an_annotated_partition_bootstrap_reaches_the_complete_reconstruction() {
+    for depth in [1, 3] {
+        for inherited in [false, true] {
+            for version in [160_015, 180_006] {
+                let scene = Scene::new(depth);
+                let scene = if inherited {
+                    scene.with_root_default().with_existing_ancestors()
+                } else {
+                    scene
+                };
+                let pg = Postgres::new().with_server_version(version);
+                let bootstrap = scene.input().unwrap();
+                let prepared =
+                    scratch::prepare(&bootstrap, &scene.ids, &Default::default(), &pg).unwrap();
+                let reconstruction = pbps_pg::resolver::reconstruct::Reconstruction::new(
+                    &pg, &bootstrap, &scene.ids,
+                )
+                .unwrap();
+                let default = prepared
+                    .changes()
+                    .changes
+                    .iter()
+                    .position(|p| {
+                        matches!(&p.change,
+                    Change::AlterColumnDefault { column, .. } if column.table == scene.child)
+                    })
+                    .unwrap();
+                let module = prepared
+                    .changes()
+                    .changes
+                    .iter()
+                    .position(|p| matches!(p.change, Change::CreateModule { .. }))
+                    .unwrap();
+                assert!(prepared.edges().iter().any(|e| e.before == module
+                    && e.after == default
+                    && e.source == Source::Annotation));
+                assert_eq!(reconstruction.len(), prepared.changes().changes.len());
+                assert!(
+                    reconstruction
+                        .after_creating(&[("app".into(), "child".into())].into())
+                        .is_some()
+                );
+                assert!(reconstruction.observations().is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn an_inherited_fallback_does_not_install_the_partitions_deferred_own_default() {
     let scene = Scene::new(3).with_root_default().with_existing_ancestors();
     let plan = scene.plan(&Postgres::new()).unwrap();
@@ -110,18 +159,22 @@ fn scratch_annotations_share_the_inherited_installation_identity() {
             &Postgres::new(),
         )
         .unwrap();
-        assert!(
-            prepared
-                .changes()
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
-        );
+        let default = prepared.changes().changes.iter().position(|p| matches!(&p.change,
+            Change::AlterColumnDefault { uid, column, .. }
+                if Some(uid) == scene.ids.table_uid(&scene.child) && column == &scene.child.column("x"))).unwrap();
+        let module = prepared
+            .changes()
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .unwrap();
         assert!(
             prepared
                 .edges()
                 .iter()
-                .any(|e| e.source == Source::Annotation)
+                .any(|e| e.source == Source::Annotation
+                    && e.before == module
+                    && e.after == default)
         );
     }
 }
@@ -257,6 +310,13 @@ fn scratch_creation_bytes_do_not_change_without_annotations() {
                 &pg,
             )
             .unwrap();
+            let reconstruction = pbps_pg::resolver::reconstruct::Reconstruction::new(
+                &pg,
+                &propose(scene.changes.clone()),
+                &scene.ids,
+            )
+            .unwrap();
+            assert_eq!(reconstruction.len(), prepared.changes().changes.len());
             let sql: Vec<_> = prepared
                 .changes()
                 .changes
