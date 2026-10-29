@@ -30189,23 +30189,28 @@ fn a_range_beside_a_default_takes_its_rows_through_the_cli_before_postgres_17() 
     );
 }
 
-fn default_move_flow(server: &str, slug: &str, container: &str) {
-    let db = OwnDatabase::new(server, slug);
-    let conn = db.connection().to_owned();
+// Keep row-move and silent-default coverage on the same supported tree.
+// Non-default column storage is named and refused by #2445.
+fn default_move_tree(connection: &str) {
     on_server(
-        &conn,
+        connection,
         "CREATE SCHEMA app; \
          CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, r integer DEFAULT 7, \
              note text, PRIMARY KEY (id, ts), CONSTRAINT ev_r_ck CHECK (r > 0)) \
              PARTITION BY RANGE (ts); \
          CREATE INDEX ev_r ON app.ev (r); \
-         ALTER TABLE app.ev ALTER COLUMN note SET STORAGE EXTERNAL; \
          CREATE TABLE app.ev_2024 PARTITION OF app.ev \
              FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
          CREATE TABLE app.ev_rest PARTITION OF app.ev DEFAULT; \
          INSERT INTO app.ev VALUES (1, '2024-06-01', 1, 'a'), (2, '2025-03-01', 2, 'b'), \
              (3, '2025-12-31', 3, 'c'), (4, '2026-01-01', 4, 'd'), (5, '2030-01-01', 5, 'e')",
     );
+}
+
+fn default_move_flow(server: &str, slug: &str, container: &str) {
+    let db = OwnDatabase::new(server, slug);
+    let conn = db.connection().to_owned();
+    default_move_tree(&conn);
     let d = Demo::new(slug);
     succeeds(d.run(&["pull", "--db", &conn]));
     d.commit();
@@ -30474,11 +30479,13 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
     );
     assert_eq!(
         holds(
-            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.ev_2025'::regclass \
-             AND attname = 'note' AND attstorage = 'e'"
+            "SELECT count(*) FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+             JOIN pg_attribute p ON p.attrelid = 'app.ev'::regclass AND p.attname = a.attname \
+             WHERE a.attrelid = 'app.ev_2025'::regclass AND a.attname = 'note' \
+             AND a.attstorage = p.attstorage AND a.attstorage = t.typstorage"
         ),
         1,
-        "a column's storage is its parent's, as `PARTITION OF` gives it"
+        "a column inherits its parent's supported default storage"
     );
 
     // A key with a delete action references a row the next range would

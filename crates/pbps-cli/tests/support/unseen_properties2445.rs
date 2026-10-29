@@ -1,7 +1,7 @@
 //! Unsupported properties use the ordinary managed-set limitation gate.
 use super::{
-    ClusterRoles, Demo, OwnDatabase, as_role, code, on_server, scalar, stderr, stdout, succeeds,
-    try_on_server,
+    ClusterRoles, Demo, OwnDatabase, as_role, code, default_move_tree, on_server, scalar, stderr,
+    stdout, succeeds, try_on_server,
 };
 use std::process::Command;
 
@@ -425,5 +425,69 @@ fn partition_column_properties_are_named_and_refused() {
             connection,
             "column `app.p0`.`txt` has COMPRESSION `lz4`",
         );
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn partition_tree_with_default_column_properties_stays_silent() {
+    servers(|server, _| {
+        for method in ["pglz", "lz4"] {
+            let own = OwnDatabase::new(server, "properties2445-default-partition-tree");
+            let connection = own.connection();
+            on_server(
+                connection,
+                &format!(
+                    "ALTER DATABASE \"{}\" SET default_toast_compression = '{method}'",
+                    own.name
+                ),
+            );
+            default_move_tree(connection);
+            assert_eq!(
+                scalar(
+                    connection,
+                    &format!(
+                        "SELECT count(*) WHERE current_setting('default_toast_compression') = '{method}'"
+                    )
+                ),
+                1
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_class WHERE oid IN \
+                    ('app.ev'::regclass, 'app.ev_2024'::regclass, 'app.ev_rest'::regclass) \
+                    AND relkind IN ('p', 'r')"
+                ),
+                3
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_attribute a \
+                    JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid IN \
+                    ('app.ev'::regclass, 'app.ev_2024'::regclass, 'app.ev_rest'::regclass) \
+                    AND a.attnum > 0 AND NOT a.attisdropped \
+                    AND (a.attstorage <> t.typstorage OR a.attcompression <> '')"
+                ),
+                0,
+                "the parent, range and DEFAULT partition inherit storage and compression"
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_class WHERE oid IN \
+                    ('app.ev'::regclass, 'app.ev_2024'::regclass, 'app.ev_rest'::regclass) \
+                    AND reltablespace <> 0"
+                ),
+                0,
+                "the whole tree uses the database default tablespace"
+            );
+            let d = baseline(connection, "default-partition-tree");
+            let parent = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
+            for marker in ["partitions:", "ev_2024:", "ev_rest:"] {
+                assert!(parent.contains(marker), "{parent}");
+            }
+        }
     });
 }
