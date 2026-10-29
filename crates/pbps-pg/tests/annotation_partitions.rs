@@ -112,11 +112,7 @@ fn an_annotated_partition_bootstrap_reaches_the_complete_reconstruction() {
                     && e.after == default
                     && e.source == Source::Annotation));
                 assert_eq!(reconstruction.len(), prepared.changes().changes.len());
-                assert!(
-                    reconstruction
-                        .after_creating(&[("app".into(), "child".into())].into())
-                        .is_some()
-                );
+                assert!(reconstruction.next_fill().is_none());
                 assert!(reconstruction.observations().is_none());
             }
         }
