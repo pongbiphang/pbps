@@ -73,7 +73,7 @@ impl StateDir {
     /// Deletes the run's record, temporary and lock. Private: only this module
     /// may, and only after absence is confirmed.
     fn forget(&self, run_id: &str) -> Result<(), Error> {
-        for extension in ["json", "json.tmp", "lock"] {
+        for extension in ["key", "json", "json.tmp", "lock"] {
             let path = self.file(run_id, extension);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}

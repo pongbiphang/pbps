@@ -23,6 +23,29 @@ pub(in crate::deploy) fn apply_identified(
     selected: &crate::emission::SelectedDialect,
     operator: &str,
 ) -> anyhow::Result<Attempt> {
+    crate::db::runtime()?.block_on(apply_async(
+        project,
+        target,
+        request,
+        plan,
+        plan_checksum,
+        selected,
+        operator,
+        None,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::deploy) async fn apply_async(
+    project: &Project,
+    target: &Target,
+    request: &ApplyRequest<'_>,
+    plan: &pbps_model::SavedPlan,
+    plan_checksum: &str,
+    selected: &crate::emission::SelectedDialect,
+    operator: &str,
+    progress: Option<&super::Progress>,
+) -> anyhow::Result<Attempt> {
     pbps_cli::with_plan_dialect!(selected, |dialect| {
         let ApplyRequest {
             plan_path,
@@ -34,6 +57,9 @@ pub(in crate::deploy) fn apply_identified(
 
         let admitted =
             pbps_diff::order::admit(plan.clone(), dialect, plan_path, approved_checksum)?;
+        if let Some(progress) = progress {
+            progress.accepted.set(true);
+        }
         let plan = &admitted;
 
         // The mode lives in the file because that is what the gate approved; the
@@ -113,9 +139,10 @@ pub(in crate::deploy) fn apply_identified(
             rename_targets: &targets,
             dialect,
             operator,
+            progress,
         };
 
-        let (result, released) = db::runtime()?.block_on(async {
+        let (result, released) = Box::pin(async {
             let mut conn = db::connect(target).await?;
 
             // This capability is constant for the connection and needs no ledger
@@ -147,7 +174,8 @@ pub(in crate::deploy) fn apply_identified(
             // blocks the very pipeline that would fix it.
             let released = crate::engine::unlock(&mut conn).await;
             Ok::<_, anyhow::Error>((result, released))
-        })?;
+        })
+        .await?;
 
         Ok(match result {
             Ok(Some(entry)) => Attempt::Applied { entry, released },

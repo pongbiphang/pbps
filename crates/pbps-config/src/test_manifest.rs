@@ -39,7 +39,8 @@ pub struct TestManifest {
 
 /// A full object id. A branch, a tag or an abbreviation names whatever the
 /// repository calls it today; a pin has to keep naming one commit.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
+#[schemars(with = "String")]
 pub struct CommitId(String);
 
 impl CommitId {
@@ -145,7 +146,7 @@ pub struct Assertion {
 
 /// Positive millisecond bounds (ADR-0019 §2). Every one is always present, so
 /// a consumer never has to know the defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct Timeouts {
     pub startup_ms: NonZeroU32,
     pub step_ms: NonZeroU32,

@@ -222,6 +222,16 @@
       "target": ["pbps-cli", "bin", "pbps"],
       "owner": "pg",
       "validate_on": "linux",
+      "ignored_on": ["linux"],
+      "cases": [
+        "deploy::test_run::tests::d2a1165_pg16_owns_credentials_and_executes_only_accepted_sealed_plans",
+        "deploy::test_run::tests::d2a1165_pg18_owns_credentials_and_executes_only_accepted_sealed_plans"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "bin", "pbps"],
+      "owner": "pg",
+      "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["deploy::services::tests::connected_planning_and_apply_use_in_memory_inputs_without_a_plan_file"]
     },

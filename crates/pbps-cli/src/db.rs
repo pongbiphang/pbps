@@ -34,6 +34,15 @@ pub struct Target {
 }
 
 impl Target {
+    pub(crate) fn test_owned(connection: String) -> Self {
+        Self {
+            label: "owned test scratch".into(),
+            connection,
+            environment: Some("test".into()),
+            driver: pbps_db::Driver::Postgres,
+        }
+    }
+
     pub fn connection(&self) -> &str {
         &self.connection
     }

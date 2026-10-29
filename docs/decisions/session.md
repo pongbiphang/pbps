@@ -830,3 +830,32 @@ adds no test command, runner callback, progress protocol or format field;
 ADR-0019's owned runner and verified re-pin follow separately. Regression tests
 pin original script bytes, refusal/publication order, exact hook payloads and
 transactional, staged and empty-plan command results on both engines.
+
+
+<a id="dec-1165-9"></a>
+
+**DEC-1165.9. Owned test execution composes the ordinary deployment services.**
+D2a exposes asynchronous entry points to the same bootstrap, seal/admit and
+apply bodies that ordinary commands use; it adds no statement ordering,
+emitter or public hook. Its consumer is D2b's PostgreSQL `pbps test` command.
+The owned session derives disjoint role names from its run id and generates
+separate apply, fixture and assertion credentials
+and derives its target only from that run's verified `TestScratch`. It provisions
+the namespace prerequisites from bootstrap's existing inventory. Fixtures
+receive DML only on managed non-`data:` tables and USAGE only on their owned or
+default-dependent sequences; an effective PUBLIC grant that broadens the
+DML or permanent CREATE boundary refuses. The private context retains declaration/risk/trust settings but discards user
+runtime selectors, including project-level resolver defaults that may name an
+unowned server; unsupported syntax-only cases keep their ordinary refusals.
+The private fingerprint key is a journal-owned file, removed
+by the same confirmed normal/dead-owner cleanup as the resource record.
+Startup and failed-start cleanup have separate deadlines; the large work
+futures stay boxed after a composed unoptimized test overflowed its stack.
+Admission and statement submission after the final guards are distinct
+in-memory observations. An owned invocation collects ordinary progress as
+findings; existing commands keep their exact text. Evidence is typed `data` in the
+existing `output::Report` envelope, with ordinary findings and no plan payload
+or separate renderer. Live PostgreSQL16/18 lifecycle tests pin wrong-checksum
+and stale-baseline refusals, retained values, actual SQL identities/permissions,
+assertion results and confirmed cleanup. D2b adds command/replay/publication and
+schema75; verified fixture re-pinning remains E. D2a changes no published format.

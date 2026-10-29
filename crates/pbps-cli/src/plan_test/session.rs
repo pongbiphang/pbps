@@ -1,0 +1,240 @@
+//! Credentials and targets can only be derived from this run's owned handle.
+use super::revision::Assembled;
+use crate::{db::Target, test_scratch::TestScratch};
+use anyhow::{Context as _, ensure};
+use pbps_db::{Conn, Driver};
+use pbps_dialect::Dialect as _;
+use pbps_model::{Schema, TableName};
+
+pub(crate) struct Session<'a> {
+    scratch: &'a TestScratch<'a>,
+    target: Target,
+    fixture: String,
+    assertion: String,
+    roles: [String; 3],
+    key: std::path::PathBuf,
+}
+fn quoted(name: &str) -> anyhow::Result<String> {
+    Ok(pbps_pg::Postgres::new().quote_ident(name)?)
+}
+fn table(name: &TableName) -> anyhow::Result<String> {
+    Ok(format!("{}.{}", quoted(&name.schema)?, quoted(&name.name)?))
+}
+impl<'a> Session<'a> {
+    pub async fn new(scratch: &'a TestScratch<'a>, schema: &Schema) -> anyhow::Result<Self> {
+        let admin = scratch.connection();
+        ensure!(
+            !admin.contains("://"),
+            "the owned adapter must return a keyword connection"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, admin).await?;
+        // The frozen declarations must never capture an infrastructure identity.
+        let roles = ["apply", "fixture", "assertion"]
+            .map(|kind| format!("pbps_test_{kind}_{}", scratch.run_id()));
+        let mut passwords = Vec::new();
+        for role in &roles {
+            let password = format!("{:032x}", rand::random::<u128>());
+            let sql = format!(
+                concat!(
+                    "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB ",
+                    "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{password}'"
+                ),
+                role = role,
+                password = password
+            );
+            conn.execute(&sql).await?;
+            passwords.push(password);
+        }
+        let [apply, fixture, assertion] = &roles;
+        conn.execute(&format!("CREATE DATABASE pbps_test OWNER {apply}"))
+            .await?;
+        let permissions = format!(
+            concat!(
+                "REVOKE ALL ON DATABASE pbps_test FROM PUBLIC; ",
+                "GRANT CONNECT ON DATABASE pbps_test TO {apply}, {fixture}, {assertion}; ",
+                "GRANT TEMP ON DATABASE pbps_test TO {fixture}"
+            ),
+            apply = apply,
+            fixture = fixture,
+            assertion = assertion
+        );
+        conn.execute(&permissions).await?;
+        drop(conn);
+        let db = format!("{admin} dbname=pbps_test");
+        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
+        // Namespaces are provisioning prerequisites of ordinary bootstrap,
+        // not managed changes. Reuse its inventory in this fresh owned database.
+        for namespace in crate::deploy::schemas_declared(schema).into_keys() {
+            conn.execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {} AUTHORIZATION {apply}",
+                quoted(&namespace)?
+            ))
+            .await?;
+        }
+        conn.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+            .await?;
+        drop(conn);
+        let connection =
+            |role: &str, password: &str| format!("{db} user={role} password={password}");
+        let key = scratch.fingerprint_key()?;
+        Ok(Self {
+            scratch,
+            target: Target::test_owned(connection(apply, &passwords[0])),
+            fixture: connection(fixture, &passwords[1]),
+            assertion: connection(assertion, &passwords[2]),
+            roles,
+            key,
+        })
+    }
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+    pub fn assertion(&self) -> &str {
+        &self.assertion
+    }
+    pub fn project(&self, input: &Assembled) -> pbps_config::Project {
+        let source = &input.config;
+        // A project default may select an unowned server. Construct explicitly
+        // so a new runtime setting requires a decision instead of leaking in.
+        let config = pbps_config::Config {
+            dialect: source.dialect,
+            trusted_roles: source.trusted_roles.clone(),
+            pin_type_routines: source.pin_type_routines,
+            schema_dir: source.schema_dir.clone(),
+            ids_file: source.ids_file.clone(),
+            environments: std::collections::BTreeMap::from([(
+                "test".into(),
+                pbps_config::Environment {
+                    url_env: "PBPS_TEST_UNUSED".into(),
+                    description: None,
+                    resolve_with: None,
+                    fingerprint_key_env: None,
+                    fingerprint_key_file: Some(self.key.clone()),
+                    rehearse: None,
+                },
+            )]),
+            hooks: Default::default(),
+            unmanaged: source.unmanaged,
+            dev: None,
+            resolvers: Default::default(),
+            resolve_with: None,
+            max_data_rows: source.max_data_rows,
+            partition_runway: source.partition_runway.clone(),
+            policies: source.policies.clone(),
+            consumers: source.consumers.clone(),
+        };
+        pbps_config::Project {
+            root: self
+                .key
+                .parent()
+                .expect("the journal key has a parent")
+                .to_owned(),
+            config,
+        }
+    }
+    pub async fn grants(&self, schema: &Schema) -> anyhow::Result<()> {
+        let db = format!("{} dbname=pbps_test", self.scratch.connection());
+        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
+        let [_, fixture, assertion] = &self.roles;
+        // Check every permanent namespace, including those with no managed table.
+        // Engine identity, not a pg_temp name-prefix guess, excludes temp helpers.
+        let sql = format!(
+            concat!(
+                "SELECT pg_catalog.has_database_privilege('{fixture}', current_database(), 'CREATE') ",
+                "OR pg_catalog.has_database_privilege('{assertion}', current_database(), 'CREATE') ",
+                "OR EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n ",
+                "WHERE n.oid <> pg_catalog.pg_my_temp_schema() ",
+                "AND NOT pg_catalog.pg_is_other_temp_schema(n.oid) AND (",
+                "pg_catalog.has_schema_privilege('{fixture}', n.oid, 'CREATE') OR ",
+                "pg_catalog.has_schema_privilege('{assertion}', n.oid, 'CREATE'))) AS unsafe"
+            ),
+            fixture = fixture,
+            assertion = assertion
+        );
+        let rows = conn.query(&sql).await?;
+        let permanent_create = rows
+            .first()
+            .context("missing CREATE privilege result")?
+            .try_get::<bool>("unsafe")?;
+        ensure!(
+            permanent_create == Some(false),
+            "fixture/assertion privileges permit permanent CREATE; remove broad grants, including any PUBLIC grant"
+        );
+        for (name, declared) in &schema.tables {
+            let t = table(name)?;
+            let namespace = quoted(&name.schema)?;
+            let sql = format!(
+                concat!(
+                    "GRANT USAGE ON SCHEMA {namespace} TO {fixture}, {assertion}; ",
+                    "REVOKE ALL ON {t} FROM {fixture}, {assertion}; ",
+                    "GRANT SELECT ON {t} TO {fixture}, {assertion}"
+                ),
+                namespace = namespace,
+                t = t,
+                fixture = fixture,
+                assertion = assertion
+            );
+            conn.execute(&sql).await?;
+            if declared.data.is_none() {
+                conn.execute(&format!("GRANT INSERT, UPDATE, DELETE ON {t} TO {fixture}"))
+                    .await?;
+                // Ownership and default dependencies name only this table's allocators.
+                let literal = t.replace('\'', "''");
+                let sql = format!(
+                    concat!(
+                        "SELECT DISTINCT n.nspname AS schema, s.relname AS name ",
+                        "FROM pg_catalog.pg_class s JOIN pg_catalog.pg_namespace n ON n.oid=s.relnamespace ",
+                        "WHERE s.relkind='S' AND (EXISTS (SELECT 1 FROM pg_catalog.pg_depend d ",
+                        "WHERE d.classid='pg_class'::regclass AND d.objid=s.oid ",
+                        "AND d.refobjid='{relation}'::regclass AND d.deptype IN ('a','i')) ",
+                        "OR EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef a ",
+                        "ON d.classid='pg_attrdef'::regclass AND d.objid=a.oid ",
+                        "WHERE a.adrelid='{relation}'::regclass AND d.refclassid='pg_class'::regclass ",
+                        "AND d.refobjid=s.oid))"
+                    ),
+                    relation = literal
+                );
+                let rows = conn.query(&sql).await?;
+                for r in rows {
+                    let sequence = TableName::new(
+                        r.try_get::<&str>("schema")?
+                            .context("allocator schema missing")?,
+                        r.try_get::<&str>("name")?
+                            .context("allocator name missing")?,
+                    );
+                    conn.execute(&format!(
+                        "GRANT USAGE ON SEQUENCE {} TO {fixture}",
+                        table(&sequence)?
+                    ))
+                    .await?;
+                }
+            }
+            let literal = t.replace('\'', "''");
+            let sql = format!(
+                concat!(
+                    "SELECT pg_catalog.has_table_privilege('{assertion}', '{relation}', ",
+                    "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR ({reference} AND ",
+                    "pg_catalog.has_table_privilege('{fixture}','{relation}', ",
+                    "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS unsafe"
+                ),
+                relation = literal,
+                reference = declared.data.is_some(),
+                fixture = fixture,
+                assertion = assertion,
+            );
+            let rows = conn.query(&sql).await?;
+            ensure!(
+                rows.first()
+                    .context("missing privilege result")?
+                    .try_get::<bool>("unsafe")?
+                    == Some(false),
+                "the effective SQL privileges for {} exceed the fixture/assertion boundary; remove broad grants, including any PUBLIC grant",
+                name.shown()
+            );
+        }
+        Ok(())
+    }
+    pub async fn fixtures(&self) -> anyhow::Result<Conn> {
+        Ok(Conn::connect(Driver::Postgres, &self.fixture).await?)
+    }
+}

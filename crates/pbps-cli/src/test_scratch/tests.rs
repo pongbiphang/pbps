@@ -1253,3 +1253,28 @@ mod live {
         assert!(!exists(&ours).await && exists(&stranger).await);
     }
 }
+
+#[tokio::test]
+async fn d2a1165_the_private_key_survives_unconfirmed_cleanup_and_goes_with_its_dead_run() {
+    let dir = Dir::new();
+    let run_id = run('a');
+    let cid = id('a');
+    let record = record(&run_id, State::Created, Some(&cid));
+    let lock = dir.dir.lock(&run_id).unwrap();
+    dir.dir.write(&record).unwrap();
+    drop(lock);
+    let key = dir.dir.file(&run_id, "key");
+    std::fs::write(&key, b"private key sentinel").unwrap();
+    let held = container(&run_id, &cid);
+    let refusing = Fake {
+        cannot_remove: Some(vec![cid]),
+        ..Fake::holding(&held)
+    };
+    let refused = reconciled(&dir, &refusing).await;
+    assert_eq!(refused.failures.len(), 1);
+    assert_eq!(std::fs::read(&key).unwrap(), b"private key sentinel");
+    assert!(kept(&dir, &run_id));
+    let cleaned = reconciled(&dir, &Fake::holding(&held)).await;
+    assert_eq!(cleaned.removed, vec![run_id]);
+    assert!(!key.exists());
+}

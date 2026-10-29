@@ -89,6 +89,7 @@ fn planned() -> Planned {
     Planned {
         artifact: Box::new(artifact),
         script: Some("-- exact script\nSELECT 1;\n".into()),
+        statements: 1,
         data: crate::PlanData {
             dependencies: Default::default(),
             baseline: "fixture".into(),
