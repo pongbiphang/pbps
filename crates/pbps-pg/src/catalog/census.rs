@@ -62,6 +62,8 @@ WITH RECURSIVE used_types(oid) AS (
     SELECT 'pg_catalog.pg_tablespace'::regclass, oid, 'tablespace', false FROM pg_catalog.pg_tablespace
 )
 SELECT o.kind, i.identity,
+       CASE WHEN o.classid = 'pg_extension'::regclass AND o.kind = 'extension' THEN
+         (SELECT extname::text FROM pg_catalog.pg_extension WHERE oid = o.oid) END AS extension_name,
        (o.oid < 16384 AND o.classid <> 'pg_catalog.pg_largeobject'::regclass) AS system,
        EXISTS (SELECT 1 FROM extension_members e WHERE e.classid = o.classid AND e.objid = o.oid) AS extension_member,
        o.model_owned
@@ -69,8 +71,14 @@ SELECT o.kind, i.identity,
 "#
 );
 
-pub(super) fn notices(rows: &[Value]) -> Result<Vec<String>, DbError> {
-    let mut out = Vec::new();
+#[derive(Debug, Default)]
+pub(super) struct Notices {
+    pub objects: Vec<String>,
+    pub extensions: std::collections::BTreeMap<pbps_model::ObjectLocalName, String>,
+}
+
+pub(super) fn notices(rows: &[Value]) -> Result<Notices, DbError> {
+    let mut out = Notices::default();
     for row in rows {
         // Decode every field even when a flag would exclude the object:
         // an unreadable row is never an empty census.
@@ -79,15 +87,29 @@ pub(super) fn notices(rows: &[Value]) -> Result<Vec<String>, DbError> {
         let system = super::flag(row, "system")?;
         let extension = super::flag(row, "extension_member")?;
         let owned = super::flag(row, "model_owned")?;
+        let name = if kind == "extension" {
+            let name = super::text(row, "extension_name")?;
+            if name.is_empty() {
+                return Err(DbError::BadRow("extension census name is empty".into()));
+            }
+            Some(name)
+        } else {
+            None
+        };
         if !system && !extension && !owned {
-            out.push(format!(
+            let message = format!(
                 "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison",
                 pbps_model::escape::Escaped(&identity),
-            ));
+            );
+            if let Some(name) = name {
+                out.extensions.insert(name.into(), message);
+            } else {
+                out.objects.push(message);
+            }
         }
     }
-    out.sort();
-    out.dedup();
+    out.objects.sort();
+    out.objects.dedup();
     Ok(out)
 }
 
@@ -103,22 +125,23 @@ mod tests {
                     let row = serde_json::json!({"kind":"operator", "identity":"app.===(integer,integer)",
                         "system":system,"extension_member":extension,"model_owned":owned});
                     let found = notices(&[row]).unwrap();
-                    assert_eq!(!found.is_empty(), !system && !extension && !owned);
-                    if let Some(message) = found.first() {
+                    assert_eq!(!found.objects.is_empty(), !system && !extension && !owned);
+                    if let Some(message) = found.objects.first() {
                         assert!(message.contains("operator `app.===(integer,integer)`"));
                     }
                 }
             }
         }
-        assert!(notices(&[]).unwrap().is_empty());
+        assert!(notices(&[]).unwrap().objects.is_empty());
     }
 
     #[test]
     fn excluded_and_malformed_rows_cannot_be_read_as_an_empty_census() {
-        let row = serde_json::json!({"kind":"extension","identity":"odd\nname", "system":true,
+        let row = serde_json::json!({"kind":"extension","extension_name":"odd\nname","identity":"odd\nname", "system":true,
             "extension_member":false,"model_owned":false});
         for key in [
             "kind",
+            "extension_name",
             "identity",
             "system",
             "extension_member",
@@ -133,6 +156,14 @@ mod tests {
         }
         let mut user = row;
         user["system"] = false.into();
-        assert!(notices(&[user]).unwrap()[0].contains("odd\\nname"));
+        assert!(
+            notices(&[user])
+                .unwrap()
+                .extensions
+                .values()
+                .next()
+                .unwrap()
+                .contains("odd\\nname")
+        );
     }
 }

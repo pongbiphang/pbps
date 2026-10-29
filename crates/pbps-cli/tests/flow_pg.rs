@@ -58,6 +58,9 @@ mod conversions2359;
 #[path = "support/census2444.rs"]
 mod census2444;
 
+#[path = "support/extensions2447.rs"]
+mod extensions2447;
+
 #[path = "support/grant_advisories2446.rs"]
 mod grant_advisories2446;
 

@@ -295,6 +295,7 @@ where
         "EnumValueDto",
         "EnumValueIntentDto",
         "DomainTypeDto",
+        "ExtensionDto",
         "DependencyDto",
         "DependencyName",
         "DependencyKind",

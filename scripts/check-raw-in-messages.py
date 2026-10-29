@@ -209,6 +209,10 @@ ALLOWED = {
         None,
         "writes the declaration YAML, quoting each value with its own `scalar`",
     ),
+    "crates/pbps-load/src/extensions.rs": (
+        None,
+        "writes extension declaration YAML with scalar/JSON quoting, not diagnostic prose",
+    ),
     "crates/pbps-load/src/managed_types.rs": (
         None,
         "writes the type declaration YAML, quoting each value with fmt's `scalar`",

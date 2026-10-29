@@ -25,7 +25,7 @@ const LEN: usize = 6;
 /// held (DEC-2032.1, #2035).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{}` is missing the `t_`, `c_`, `r_` or `y_` prefix", crate::escape::Escaped(.0))]
+    #[error("UID `{}` is missing the `t_`, `c_`, `r_`, `y_` or `e_` prefix", crate::escape::Escaped(.0))]
     BadPrefix(String),
 
     #[error(
@@ -42,6 +42,7 @@ pub enum UidError {
 /// whether a line in the identity file is about a table or a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UidKind {
+    Extension,
     Type,
     Table,
     Column,
@@ -54,6 +55,7 @@ pub enum UidKind {
 impl UidKind {
     pub const fn prefix(self) -> &'static str {
         match self {
+            UidKind::Extension => "e_",
             UidKind::Type => "y_",
             UidKind::Table => "t_",
             UidKind::Column => "c_",
@@ -120,7 +122,9 @@ impl Uid {
     }
 
     pub fn kind(&self) -> UidKind {
-        if self.0.starts_with("y_") {
+        if self.0.starts_with("e_") {
+            UidKind::Extension
+        } else if self.0.starts_with("y_") {
             UidKind::Type
         } else if self.0.starts_with("t_") {
             UidKind::Table
@@ -147,7 +151,8 @@ impl FromStr for Uid {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let rest = s
-            .strip_prefix("t_")
+            .strip_prefix("e_")
+            .or_else(|| s.strip_prefix("t_"))
             .or_else(|| s.strip_prefix("c_"))
             .or_else(|| s.strip_prefix("r_"))
             .or_else(|| s.strip_prefix("y_"))
@@ -267,7 +272,13 @@ mod tests {
 
     #[test]
     fn generated_uids_round_trip() {
-        for kind in [UidKind::Table, UidKind::Column, UidKind::Role] {
+        for kind in [
+            UidKind::Table,
+            UidKind::Column,
+            UidKind::Role,
+            UidKind::Type,
+            UidKind::Extension,
+        ] {
             let u = Uid::generate(kind);
             assert_eq!(u.kind(), kind);
             assert_eq!(u.as_str().parse::<Uid>().unwrap(), u);

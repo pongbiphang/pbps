@@ -69,3 +69,5 @@ DECISIONS 465).
 - `67/` adds the configurable advisory domain-vet availability policy (#2309).
 - `68/` adds plain-string consumer declarations and the two built-in consumer rule IDs (DEC-2398.1).
 - `74/` adds recorded drop row requirements to plan explanations (#2400).
+- `77/` adds chained staged SQL Server resolver evidence (#2376, #2477).
+- `81/` adds exact read-only PostgreSQL extension declarations and state identities (#2447 PR A).

@@ -1749,6 +1749,7 @@ fn cmd_pull(
                 || !ids.columns.is_empty()
                 || !ids.roles.is_empty()
                 || !ids.types.is_empty()
+                || !ids.extensions.is_empty()
                 || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
@@ -1910,6 +1911,14 @@ fn cmd_pull(
     }
 
     let ids = existing_ids.clone().unwrap_or_default();
+    for name in ids.extensions.values() {
+        if !pulled.schema.extensions.contains_key(name) {
+            bail!(
+                "extension `{}` is recorded in the identity file but absent from the database; pull cannot retire it in the read-only extension phase",
+                name.shown()
+            );
+        }
+    }
     let type_limitations = ids
         .types
         .values()
@@ -2064,10 +2073,11 @@ fn cmd_pull(
     }
 
     println!(
-        "Pulled {} table(s), {} module(s) and {} type(s) into `{}`.",
+        "Pulled {} table(s), {} module(s), {} type(s) and {} extension(s) into `{}`.",
         pulled.schema.tables.len(),
         pulled.schema.modules.len(),
         pulled.schema.types.len(),
+        pulled.schema.extensions.len(),
         dir.display()
     );
     let left_out =
@@ -2110,8 +2120,17 @@ fn cmd_pull(
     let minted = res.created_tables.len()
         + res.added_columns.len()
         + res.created_roles.len()
-        + res.ids.types.len().saturating_sub(ids.types.len());
-    let kept = ids.tables.len() + ids.columns.len() + ids.roles.len() + ids.types.len();
+        + res.ids.types.len().saturating_sub(ids.types.len())
+        + res
+            .ids
+            .extensions
+            .len()
+            .saturating_sub(ids.extensions.len());
+    let kept = ids.tables.len()
+        + ids.columns.len()
+        + ids.roles.len()
+        + ids.types.len()
+        + ids.extensions.len();
     println!("Preserved {kept} existing identities; minted {minted} new identities.");
     println!(
         "Next: review and commit these files. Pull does not update database history or accept \
@@ -3315,6 +3334,7 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
                 }
                 other @ (pbps_model::diagnostic::Declaration::Table(_)
                 | pbps_model::diagnostic::Declaration::Module(_)
+                | pbps_model::diagnostic::Declaration::Extension(_)
                 | pbps_model::diagnostic::Declaration::Type(_)
                 | pbps_model::diagnostic::Declaration::Role(_)) => other,
             };
@@ -3363,8 +3383,21 @@ fn declaration_problems_with_sources(
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut out = dependencies::problems(&loaded.dependencies, dialect);
+    if dialect.name() != "postgres" {
+        for name in extensions.keys() {
+            out.push((
+                "dialect.rejected",
+                format!(
+                    "extension `{}`: PostgreSQL extensions are unsupported on {}",
+                    name.shown(),
+                    dialect.name()
+                ),
+            ));
+        }
+    }
     for (name, definition) in types {
         for error in dialect.validate_type(name, definition) {
             out.push((
@@ -4003,6 +4036,9 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Role(r)) => {
                 declared.roles.insert(r.name, r.role);
             }
+            Ok(pbps_load::LoadedFile::Extension(e)) => {
+                declared.extensions.insert(e.name, e.definition);
+            }
             Ok(pbps_load::LoadedFile::Type(t)) => {
                 declared.types.insert(t.name, t.definition);
             }
@@ -4191,6 +4227,11 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Role(r) => {
                 declared.roles.insert(r.name.clone(), r.role.clone());
             }
+            pbps_load::LoadedFile::Extension(e) => {
+                declared
+                    .extensions
+                    .insert(e.name.clone(), e.definition.clone());
+            }
             pbps_load::LoadedFile::Type(t) => {
                 declared.types.insert(t.name.clone(), t.definition.clone());
             }
@@ -4208,6 +4249,10 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
             pbps_load::LoadedFile::Dependency(d) => (
                 pbps_load::render_dependency(&d.name, &d.declaration),
+                Vec::new(),
+            ),
+            pbps_load::LoadedFile::Extension(e) => (
+                pbps_load::render_extension(&e.name, &e.definition),
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Type(t) => {

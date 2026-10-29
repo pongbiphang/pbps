@@ -272,6 +272,7 @@ fn historical_ids(
         columns: observed.columns,
         roles: observed.roles,
         types: observed.types,
+        extensions: observed.extensions,
         tombstones: ids.tombstones,
         moves: ids.moves,
         rebuilds: ids.rebuilds,
@@ -1306,6 +1307,7 @@ mod tests {
             operator: "selected".into(),
         };
         let mut recorded = pbps_model::IdsFile {
+            extensions: BTreeMap::new(),
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [
                 ("t_aaaaaa".parse().unwrap(), table.clone()),
@@ -1483,6 +1485,7 @@ mod tests {
         // The rebuild's sources are retired in the selected record, so their
         // uids are as taken as any live one.
         let selected = pbps_model::IdsFile {
+            extensions: BTreeMap::new(),
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
             columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),

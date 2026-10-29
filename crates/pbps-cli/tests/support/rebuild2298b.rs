@@ -210,7 +210,7 @@ fn acceptance(server: &str) {
             2
         );
         let recorded = latest_snapshot(connection);
-        assert_eq!(recorded.version, 35);
+        assert_eq!(recorded.version, pbps_model::state::CURRENT_VERSION);
         assert_eq!(recorded.ids.tables, plan.ids.tables);
         if dependents {
             assert_eq!(scalar(connection, "SELECT count(*) FROM app.v"), 2);
