@@ -21,14 +21,19 @@ impl DatabaseName {
 impl FromStr for DatabaseName {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Git protects these components even below schema/. Accepting one
+        // would leave declarations untracked despite a successful git add.
+        let git_name = value.trim_end_matches([' ', '.']);
         if value.is_empty()
             || matches!(value, "." | "..")
+            || git_name.eq_ignore_ascii_case(".git")
+            || git_name.eq_ignore_ascii_case("git~1")
             || value
                 .chars()
                 .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
         {
             return Err(format!(
-                "database `{}` must be one nonempty directory component without separators, a drive prefix or control characters",
+                "database `{}` must be one nonempty directory component without separators, a drive prefix, Git metadata name or control characters",
                 Escaped(value)
             ));
         }
@@ -68,7 +73,7 @@ impl schemars::JsonSchema for DatabaseName {
         "DatabaseName".into()
     }
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({"type":"string", "minLength":1, "pattern":r"^(?!\.{1,2}$)[^\u0000-\u001f\u007f-\u009f/\\:]+$"})
+        schemars::json_schema!({"type":"string", "minLength":1, "pattern":r"^(?!(?:\.{1,2}|(?:\.[gG][iI][tT]|[gG][iI][tT]~1)[ .]*)$)[^\u0000-\u001f\u007f-\u009f/\\:]+$"})
     }
 }
 

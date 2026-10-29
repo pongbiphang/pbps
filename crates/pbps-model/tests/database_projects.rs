@@ -13,7 +13,16 @@ fn ids(uid: &str) -> IdsFile {
 
 #[test]
 fn names_are_directory_components_without_defining_engine_equality() {
-    for name in ["sales", "Sales", "db.2026", "顧客", "db with spaces"] {
+    for name in [
+        "sales",
+        "Sales",
+        "db.2026",
+        "顧客",
+        "db with spaces",
+        ".git-data",
+        ".gitignore",
+        "git",
+    ] {
         let value = db(name);
         assert_eq!(value.raw(), name);
         assert_eq!(
@@ -25,6 +34,12 @@ fn names_are_directory_components_without_defining_engine_equality() {
         "",
         ".",
         "..",
+        ".git",
+        ".GIT",
+        ".GiT",
+        ".git.",
+        ".git ",
+        "git~1",
         "a/b",
         "a\\b",
         "C:one",
@@ -107,6 +122,7 @@ fn a_tombstone_in_one_database_reserves_the_identity_in_every_other_database() {
             dropped_at: "2026-10-01".into(),
             reason: "retired".into(),
             operator: "fixture".into(),
+            require: None,
         },
     );
     let files = DatabaseMap::new([(db("a"), retired), (db("b"), ids("t_aaaaaa"))]).unwrap();

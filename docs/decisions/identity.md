@@ -1304,8 +1304,10 @@ ordering, origins, plan checksums and deployment remain A3 and later work.
 `databases:` is a nonempty unique list for SQL Server, with declarations under
 the schema root's database directories and schema.ids.json in each. Database
 names must be usable directory components; this is no claim about engine
-identifier equality. Root-level identities, loose declarations, undeclared
-folders, directory aliases and escapes refuse instead of silently disappearing.
+identifier equality. Git metadata components (`.git` and `git~1`, ignoring
+ASCII case and trailing dots/spaces) refuse because their declarations cannot
+be tracked, even when git add reports success. Root-level identities, loose
+declarations, undeclared folders, directory aliases and escapes refuse instead of silently disappearing.
 A missing identity file means a new identity map; empty, invalid, nonregular or
 unreadable files refuse. Config::parse_project, Project::load_project and the
 per-database loader expose the A1 foundation. Legacy Config::parse and

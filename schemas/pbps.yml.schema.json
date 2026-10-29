@@ -6,6 +6,10 @@
     "dialect": {
       "$ref": "#/$defs/DialectName"
     },
+    "databases": {
+      "description": "SQL Server database coordinates; absent preserves the flat layout.\nLayout/loader support precedes instance-wide command planning (DEC-2501.2).",
+      "$ref": "#/$defs/DatabaseList"
+    },
     "trusted_roles": {
       "description": "Roles the organization trusts to change evaluated user-type code (#2046).",
       "type": "array",
@@ -114,6 +118,25 @@
   "required": [
     "dialect"
   ],
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "databases"
+        ]
+      },
+      "then": {
+        "properties": {
+          "dialect": {
+            "const": "mssql"
+          },
+          "ids_file": {
+            "const": "schema.ids.json"
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "DialectName": {
       "description": "The target database dialect.\n\nA project is bound to exactly one dialect. \"Supports multiple databases\" means\nthe tool can drive different databases, not that one set of declarations\ndeploys to both (SPEC §1.3).",
@@ -122,6 +145,19 @@
         "mssql",
         "postgres"
       ]
+    },
+    "DatabaseList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/DatabaseName"
+      }
+    },
+    "DatabaseName": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!(?:\\.{1,2}|(?:\\.[gG][iI][tT]|[gG][iI][tT]~1)[ .]*)$)[^\\u0000-\\u001f\\u007f-\\u009f/\\\\:]+$"
     },
     "Environment": {
       "description": "One deployment target.\n\n# Why there is no `url:` field\n\nA connection string carries a password, and `pbps.yml` is committed to git.\nThe config therefore names the **environment variable** that holds the\nstring, never the string. This is not an inconvenience to be worked around\nwith a second, undocumented field: an inline `url:` would be a credential in\nversion control, and the one thing worse than not having the feature is\nhaving it and being surprised by it.",

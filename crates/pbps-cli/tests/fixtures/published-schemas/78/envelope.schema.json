@@ -1517,6 +1517,13 @@
             "null"
           ]
         },
+        "dependencies": {
+          "description": "Per-dependency observed placement, separate from the declaration's outcome.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DependencyDetail"
+          }
+        },
         "rule": {
           "description": "The compatibility rule the scratch was qualified under.",
           "type": "string"
@@ -1573,6 +1580,27 @@
         "surfaces",
         "order",
         "prerequisites"
+      ]
+    },
+    "DependencyDetail": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "placement": {
+          "type": "string"
+        },
+        "shape": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "placement"
       ]
     },
     "Limitation": {
@@ -2938,6 +2966,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 73,
+  "x-pbps-schema-version": 78,
   "x-pbps-tool-version": "0.0.0"
 }
