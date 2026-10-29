@@ -970,8 +970,10 @@ spelling, bind at creation and are checked even for PL/pgSQL. An updated
 CHECK/default ordinarily rebuilds or alters through the diff. With a selected
 resolver, a retained validated local CHECK may instead use paired bound-tree
 comparison on an empty scratch carrier (DEC-2354.1). Complete values, casts,
-collations and routine identities stay significant; only source locations are
-ignored. RenameEnumValue carries the exact authored record update and anchors.
+collations and routine identities stay significant. Physical column attributes
+map through verified logical column names; unmapped attributes cannot prove
+equality (DEC-2354.2). Only source locations are ignored. RenameEnumValue carries
+the exact authored record update and anchors.
 Apply independently binds that expression on an empty target TEMP carrier
 under a relation lock before recording; mismatch rolls back. No SQL literal is
 rewritten through a label rename. Unproved, offline and unavailable cases keep
