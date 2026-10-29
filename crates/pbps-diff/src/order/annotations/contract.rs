@@ -299,22 +299,7 @@ impl Contract {
         }
         for (at, operation) in operations.as_slice().iter().enumerate() {
             let inputs = operation.input_owners(&owners);
-            // An annotation follows definition replacement even when the engine
-            // alters a module in place. This is the same observation previously
-            // obtained by rebuilding every operation with ModuleEdits::Rebuilt.
-            let definitions = if matches!(operation.change(), Change::AlterModule { .. }) {
-                let key = operation.key(&owners).map_err(|e| e.to_string())?;
-                [Transition::Ends, Transition::Produces]
-                    .into_iter()
-                    .map(|transition| pbps_model::operation::Definition {
-                        key: key.clone(),
-                        transition,
-                    })
-                    .collect()
-            } else {
-                operation.defines(&owners).map_err(|e| e.to_string())?
-            };
-            for definition in definitions {
+            for definition in operation.defines(&owners).map_err(|e| e.to_string())? {
                 let reference = self.reference(&definition.key, operation, &inputs, &names)?;
                 if let Some(reference) = reference {
                     self.record(&mut index, reference, at, definition.transition);
