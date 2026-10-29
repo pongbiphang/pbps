@@ -16,23 +16,81 @@ pub(super) enum Target {
     Module(ModuleId),
 }
 
-#[derive(Debug)]
-pub(super) struct Entry {
-    pub consumer: String,
-    pub text: String,
-    pub subject: String,
-    pub writes: bool,
-    pub target: Target,
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub(super) consumer: String,
+    pub(super) text: String,
+    pub(super) subject: String,
+    pub(super) writes: bool,
+    pub(super) target: Target,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Bindings(pub(super) Vec<Entry>);
 
+impl Bindings {
+    pub fn contracts(&self) -> impl Iterator<Item = &Entry> {
+        self.0.iter()
+    }
+
+    pub fn on_sides(&self, sides: &[Side<'_>; 2]) -> Self {
+        Self(self.0.iter().map(|entry| entry.on_sides(sides)).collect())
+    }
+
+    /// Spelling and review metadata do not retire an identity-bound contract.
+    pub fn contains(&self, entry: &Entry) -> bool {
+        self.0.iter().any(|own| {
+            own.consumer == entry.consumer
+                && own.writes == entry.writes
+                && own.target == entry.target
+        })
+    }
+}
+
 impl Entry {
-    pub fn access(&self) -> &'static str {
+    /// The declaration spelling, retained for retirement diagnostics.
+    pub fn declaration(&self) -> String {
+        format!(
+            "consumers.{}.{}: {}",
+            self.consumer,
+            self.access(),
+            self.text
+        )
+    }
+
+    /// Evaluate one restored entry through the ordinary plan rule.
+    pub fn bindings(&self) -> Bindings {
+        Bindings(vec![self.clone()])
+    }
+
+    /// Preserve the bound target, including when a vacated spelling is reused.
+    /// Only a named column needs the ordinary partition identity bridge; find
+    /// its table by UID and reuse Object::key, never parse the entry's text.
+    pub fn on_sides(&self, sides: &[Side<'_>; 2]) -> Self {
+        let mut entry = self.clone();
+        if let Target::NamedColumn { table, name } = &self.target {
+            entry.target = sides
+                .iter()
+                .find_map(|side| {
+                    let table = side.ids.tables.get(table)?;
+                    side.schema.tables.get(table)?;
+                    let object = Object::Column(table.column(name.clone()));
+                    // Computed columns also have named targets. Start from a
+                    // side with this bound key, not an ordinary replacement.
+                    if object.key(*side, &[*side])? != self.target {
+                        return None;
+                    }
+                    object.key(*side, sides)
+                })
+                .unwrap_or_else(|| self.target.clone());
+        }
+        entry
+    }
+
+    pub(super) fn access(&self) -> &'static str {
         if self.writes { "writes" } else { "uses" }
     }
-    pub fn table(&self) -> Option<&Uid> {
+    pub(super) fn table(&self) -> Option<&Uid> {
         match &self.target {
             Target::Table(uid)
             | Target::Column { table: uid, .. }
@@ -40,14 +98,14 @@ impl Entry {
             Target::Module(_) => None,
         }
     }
-    pub fn column(&self, uid: &Uid) -> bool {
+    pub(super) fn column(&self, uid: &Uid) -> bool {
         match &self.target {
             Target::Table(_) => true,
             Target::Column { uid: own, .. } => own == uid,
             Target::NamedColumn { .. } | Target::Module(_) => false,
         }
     }
-    pub fn named_column(&self, name: &pbps_model::ColumnName, sides: &[Side<'_>]) -> bool {
+    pub(super) fn named_column(&self, name: &pbps_model::ColumnName, sides: &[Side<'_>]) -> bool {
         match &self.target {
             Target::Table(_) => true,
             Target::NamedColumn { name: own, .. } => own == name,
@@ -57,7 +115,7 @@ impl Entry {
             Target::Module(_) => false,
         }
     }
-    pub fn change_text(&self, change: &Change) -> String {
+    pub(super) fn change_text(&self, change: &Change) -> String {
         // Only typed names and the serialized tag feed prose, never SQL.
         let value = serde_json::to_value(change).expect("a typed change serializes");
         let op = value["op"]

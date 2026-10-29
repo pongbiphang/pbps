@@ -39,6 +39,7 @@ mod reason_input;
 mod rehearsal;
 mod report;
 mod resolution;
+mod retirements;
 mod row_security;
 mod saved_plan;
 mod state_data_work;
@@ -2127,6 +2128,7 @@ pub fn attach_policy_findings<S: Clone>(
     connected: bool,
     before: Side<'_>,
     after: Side<'_>,
+    baseline_revision: Option<&pbps_model::Text>,
 ) -> Vec<output::Finding> {
     let policies = project.config.policies();
     if !policies.check().is_empty() {
@@ -2173,6 +2175,14 @@ pub fn attach_policy_findings<S: Clone>(
         &policies,
         &ctx,
         &pbps_diff::schema_diff::restoration_comparison(before, after, dialect),
+    ));
+    findings.extend(retirements::findings(
+        cs,
+        project,
+        dialect,
+        &ctx,
+        [before, after],
+        baseline_revision,
     ));
     for (_, finding) in &findings {
         out.push(policy_finding(finding));
@@ -5100,6 +5110,7 @@ fn cmd_plan(
                 schema: &loaded.schema,
                 ids: &res.ids,
             },
+            base.git_sha.as_ref(),
         );
         let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
         findings.extend(policy);

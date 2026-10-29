@@ -220,6 +220,23 @@ use their table identity and named column. Modules keep their identity-free
 ModuleId: removing an old routine signature is a name loss, while altering an
 opaque definition is unproven. Identical dependency restoration is compatible.
 
+`explain` lists the contract retirements the saved plan relies on, beside
+the changes they permit, in human and JSON output. Restoring a removed entry
+must yield an unsuppressed error under the plan's policy settings and planning
+time; unrelated retirements and compatible changes are omitted. The diagnostic
+IDs `consumer.retired` and `consumer.retirement-unavailable` have fixed note
+severity; policy settings govern the counterfactual refusal. Each note names
+the consumer, original entry, refusal reason and retiring commit. Attribution
+uses Git's most recent topological commit in `baseline..candidate` where the
+entry is absent and at least one parent has it. Uncommitted removals say
+"working tree, not committed". Missing, incomplete or unreadable history is
+reported as unavailable retirement evidence, not as no reliance. Evidence is
+saved and checksum-pinned at planning time; `explain` needs no Git checkout,
+and `apply` never reevaluates contracts. Older plans without these notes do not
+establish that retirement evidence was assessed. Teams review retirement
+commits through their own process, such as CODEOWNERS; there is no deployment
+inventory or retirement RBAC (SPEC §14.3).
+
 **Limits.** Contracts describe only declared consumers, not dynamic SQL or
 runtime usage. They name objects, not the consumer's login: a grant, revoke or
 role change that breaks a consumer is not caught. They do not promise row

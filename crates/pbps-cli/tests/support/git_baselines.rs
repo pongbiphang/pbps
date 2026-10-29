@@ -163,13 +163,20 @@ pub fn broken() {
         for args in [
             vec!["plan", "--no-dev"],
             vec!["validate", "--since", "HEAD"],
+            vec!["plan", "--no-dev", "--since", "HEAD~0"],
+            vec!["validate", "--since", "HEAD~0"],
         ] {
             let out = d.run(&args);
             let message = format!("{}{}", stdout(&out), stderr(&out));
             let refused = if args[0] == "validate" { 2 } else { 1 };
             assert_eq!(code(&out), refused, "{case}: {message}");
+            let requested = args
+                .last()
+                .filter(|rev| rev.starts_with("HEAD"))
+                .copied()
+                .unwrap_or("HEAD");
             assert!(
-                message.contains(expected_path) && message.contains("HEAD"),
+                message.contains(expected_path) && message.contains(&format!("`{requested}`")),
                 "{case}: {message}"
             );
             assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
