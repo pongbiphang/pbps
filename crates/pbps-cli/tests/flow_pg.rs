@@ -36119,6 +36119,9 @@ fn data_work_preserves_cli_audit_and_json_boundaries() {
 #[path = "support/consumer_contracts.rs"]
 mod consumer_contracts;
 
+#[path = "support/consumer_effective_columns.rs"]
+mod consumer_effective_columns;
+
 #[test]
 #[ignore = "needs PostgreSQL 16 and 18"]
 fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
