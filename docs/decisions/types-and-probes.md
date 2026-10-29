@@ -4354,3 +4354,25 @@ and all other covered fields remain significant. Scratch rebinding and fresh
 target verification share this mapping; the latter still pins the same CHECK
 OID and raw tree while holding its relation lock. These transient observations
 change neither the saved plan nor the authored record format.
+
+
+<a id="dec-2354-3"></a>
+
+**DEC-2354.3. Retained-expression binding executes exactly one statement.**
+A retained CHECK is a declaration expression, not an approved SQL batch.
+Embedding it in a simple-query batch can execute trailing statements or COMMIT
+that the emitted plan never shows. Scratch and fresh apply verification share
+the emitter's command boundaries and the shared PostgreSQL executor
+(DEC-2520.1), using the extended protocol with an empty parameter list: the
+server parses exactly one statement before executing any of it. The common
+executor sets and restores the write search_path as separate commands and
+attempts cleanup even after refusal; never send the wrapper through batch_execute. A refused bind names
+its table, and apply names the retained CHECK. Failed scratch proof keeps the
+ordinary named DropCheck/AddCheck plan or refuses; it cannot endorse retention.
+
+A semicolon inside a string literal is ordinary expression text. A comment-only
+tail is accepted only when it leaves a complete single wrapper statement;
+a line comment that swallows the wrapper's closing syntax refuses. This uses
+the engine's parser, without SQL splitting or a text blacklist. Apply rebinds
+before recording and rolls back on refusal. Neither the payload nor any format
+version changes.

@@ -126,9 +126,16 @@ async fn column_map(conn: &mut Conn, relation: &str) -> Answer<BTreeMap<u32, Str
 
 async fn execute(conn: &mut Conn, pg: &Postgres, context: &TableName, sql: &str) -> Answer<()> {
     let statement = emit::scoped(pg, &context.schema, sql).map_err(|e| e.to_string())?;
-    conn.execute(&statement.sql)
+    // Share native command boundaries and cleanup with declaration binding
+    // (DEC-2520.1); only the retained-specific refusal belongs here (DEC-2354.3).
+    crate::statement::execute(conn, &statement)
         .await
-        .map_err(|_| "the retained expression could not be bound".into())
+        .map_err(|_| {
+            format!(
+                "the retained expression on {} could not be bound as one statement",
+                context.shown()
+            )
+        })
 }
 pub async fn create_carrier(
     conn: &mut Conn,
