@@ -2128,3 +2128,11 @@ and `a_view_with_an_index_the_model_cannot_hold_is_inventoried`
 `an_indexed_views_indexes_survive_formatting` (`crates/pbps-load/src/fmt.rs`);
 and the live `an_indexed_view_round_trips_and_is_restated_with_its_indexes`
 (`crates/pbps-cli/tests/flow.rs`).
+
+<a id="dec-2469-1"></a>
+
+**DEC-2469.1. Object dependency references share one declaration registry, while legacy module annotations remain the only wire contract.** PR A of #2469. A reference has a typed root and selector, using existing names, ModuleId, PartKey and recorded UIDs. Both endpoints use that same type. The closed prefix codec retains bare ModuleId meaning and offers `object::{json}` when shorthand cannot round-trip. An explicit module prefix consumes its entire remainder; typed spellings that collide with a legacy module are refused by declaration-aware parsing. The legacy loader deliberately retains its ModuleId grammar until every new owner has an executable route.
+
+The registry enumerates declared objects and facets, never SQL tokens, in one index. Dialect normalization precedes uniqueness, owner duplication and SCC validation. Binding delegates to the existing Owners/PlanNames spelling boundary: baseline and final references use their own identities, and inherited columns use their parent's recorded column anchor beside the child's table anchor. No UID is fabricated for a missing object or a name-keyed part. Missing, ambiguous and out-of-database providers are refusals, not absent edges.
+
+The coordinator moved `object_deps` persistence and version-aware migration to the first PR that persists a non-module edge. PR A therefore keeps ModuleDeps as the only plan/state authority, converts legacy annotations through the general in-memory model and writes them back losslessly. IDs, plan/state versions and published schemas do not change. Typed parsing/validation is not authorization to accept new YAML or alter ordering; those belong to later PRs of this issue.

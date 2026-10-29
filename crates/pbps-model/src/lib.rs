@@ -39,6 +39,7 @@ pub mod intent;
 pub mod managed_type;
 pub mod module;
 pub mod name;
+pub mod object_ref;
 pub mod operation;
 pub mod part_effects;
 pub mod partitions;
