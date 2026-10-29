@@ -410,6 +410,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         },
         dialect,
         declared.module_deps,
+        facts.membership_catalog(),
     )
     .map_err(Refusal)?;
     let edges = crate::order::row_security::edges(cs.changes.iter().map(|p| &p.change));

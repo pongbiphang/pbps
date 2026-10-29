@@ -261,8 +261,10 @@ PG mappings live in engine effects; the model contains no engine-specific
 merge or catalog query. The soundness, necessity and complete-state determinism
 corpus also enumerates merges and both parent-version cuts.
 
-The high-level schema-diff guards remain until PR 7 activation. Endpoint
-shape differences register typed obligations without an early column diff or
+PostgreSQL column edits and parent-address moves meeting membership changes
+now pass the high-level differ guards (DEC-2296.12). PART changes and uncovered
+engine/endpoint capabilities retain their named refusals. Endpoint shape
+differences register typed obligations without an early column diff or
 a preliminary order. Pending weave projections, engine clauses and stored-row
 probes use the shared lineage and address evidence. At the final schedule and
 resolver boundaries, `PhysicalSources` supplies complete positional membership
@@ -460,7 +462,11 @@ named schedule/proof paths and independent replay: owner replacement,
 parent/partition pairs, detach, parent and table rename chains, partition
 replacement, attach/fallback release, and a standing own override. Its
 inherited-default negative adds no own-default pair. These cases remain the
-oracle for #2296; combined rename/attach live acceptance belongs to #1896 PR 2.
+oracle for #2296. Combined rename/attach live acceptance is active on PG16/PG18
+with the unchanged #1896 default bindings and rows. The existing exhaustive
+operation audit additionally pins every Change kind’s default/module lifecycle
+under module replacement; it uses the same fixture corpus and classifier
+(`ordering_audit::effects_of_each_kind`, DEC-2296.12).
 
 ## What each change requires
 

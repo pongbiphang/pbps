@@ -36417,3 +36417,73 @@ fn deployment_services1165_command_contracts_on_pg18() {
 fn deployment_services1165_command_contracts_on_pg16() {
     deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
 }
+
+#[path = "support/column_meeting_rows.rs"]
+mod column_meeting_rows;
+#[path = "support/default_rebuild.rs"]
+mod default_rebuild;
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_default_rebuild_with_rename_and_attach_keeps_each_declaration() {
+    default_rebuild::rename_and_attach(&server());
+}
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_default_rebuild_with_rename_and_attach_keeps_each_declaration_before_postgres_17() {
+    default_rebuild::rename_and_attach(&old_server());
+}
+#[test]
+#[ignore = "needs live pg16 and pg18"]
+fn column_meeting_probes_follow_the_certified_row_contributions() {
+    for db in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"),
+    ] {
+        column_meeting_rows::rows(&db);
+    }
+}
+#[test]
+#[ignore = "needs live pg16 and pg18"]
+fn a_pending_column_meeting_keeps_unrelated_renamed_default_sources() {
+    for db in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"),
+    ] {
+        default_rebuild::unrelated_rename(&db);
+    }
+}
+
+#[path = "support/partition_moves.rs"]
+mod partition_moves;
+
+#[test]
+#[ignore = "needs live pg"]
+fn all_measured_partition_move_d_profiles_have_live_product_dispositions() {
+    partition_moves::measured(&server());
+}
+#[test]
+#[ignore = "needs live pg16"]
+fn all_measured_partition_move_d_profiles_have_live_product_dispositions_before_postgres_17() {
+    partition_moves::measured(&std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"));
+}
+#[test]
+#[ignore = "needs live pg16 and pg18"]
+fn matching_owned_sequence_types_keep_the_existing_continuation_contract() {
+    for db in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"),
+    ] {
+        partition_moves::supported_numbering(&db);
+    }
+}
+#[test]
+#[ignore = "needs live pg16 and pg18"]
+fn parent_column_and_address_moves_apply_at_their_proved_boundaries() {
+    for db in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG16 fixture"),
+    ] {
+        partition_moves::issue_cases(&db);
+    }
+}

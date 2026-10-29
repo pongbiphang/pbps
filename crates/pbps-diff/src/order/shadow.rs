@@ -108,6 +108,7 @@ pub(super) fn analyse_planning<S>(
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
     plan: &super::PlanningPlan<S>,
     annotations: &[super::Constraint],
 ) -> Shadowed {
@@ -118,7 +119,7 @@ pub(super) fn analyse_planning<S>(
         after,
         dialect,
         catalog,
-        None,
+        stored,
         !plan.boundaries.is_empty(),
         annotations,
     )

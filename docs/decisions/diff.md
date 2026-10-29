@@ -8480,8 +8480,9 @@ remedy. A generic cycle message alone does not discharge that requirement.
 <a id="dec-2296-2"></a>
 
 **DEC-2296.2. Column meetings read a parent's property at the transfer
-boundary; engine merges are portable data.** The column slice may extend the
-contract before activating any producer or removing a guard. `Merge` contains
+boundary; engine merges are portable data.** PostgreSQL column meetings and
+parent-address moves now use the active producers and canonical schedule
+(DEC-2296.12). `Merge` contains
 engine-supplied rows over complete normalized parent and candidate values,
 including bindings and ownership. Its result is a value/ownership fact, not
 SQL, a callback or executable authority. Missing, overlapping or unread rules
@@ -8514,7 +8515,8 @@ column policy separately; no PG18 constraint-locality fact is inferred from
 PG16's absence of NOT NULL rows in `pg_constraint`. The model knows no engine
 version or PostgreSQL recursion policy. General merges can also represent
 other measured parent-dependent property/binding transfers; each production
-mapping must name its evidence. The contract extension alone activates none.
+mapping must name its evidence. Uncovered PART and engine capabilities retain
+their high-level refusals; the column/address activation is DEC-2296.12.
 
 The maintainer approved the column/part evidence boundary on 2026-10-24:
 the checked manifest accounts for all 72 measured D pair profiles (144
@@ -9075,8 +9077,9 @@ changes. The exhaustive operation match remains the classification; adding a
 Change without an arm fails compilation. The matrix keeps the historical
 #1880 cases and their negative; plain/tree retype tests name the paths in
 settle and the sealed proof, and replay independently. The live combined
-rename/attach acceptance is PR 2 after #2296 PR 7 (maintainer decision,
-2026-10-28); PR 1 neither includes those blocked tests nor lifts a guard.
+rename/attach acceptance is active in #2296 PR 7 (DEC-2296.12), with the
+original routine-binding, default, row, verify and empty-replan assertions.
+PR 1 retained those guarded cases (maintainer decision, 2026-10-28).
 
 <a id="dec-2296-4"></a>
 
@@ -9325,3 +9328,42 @@ stored NULLs still produces a positive refusal before apply. Range metadata
 probes remain independent and continue to run. The existing no-baseline API
 retains its prior behavior; production baseline-aware callers use the shared
 guard. No high-level guard, ordering rule, annotation contract or format changes.
+
+
+<a id="dec-2296-12"></a>
+
+**DEC-2296.12. Activate column and parent-address meetings through the existing canonical schedule.**
+PostgreSQL's partition-meeting capability replaces the two blanket refusals
+for a standing parent's column edits or rename meeting attach, detach or
+partition drop. The lineage producers, shared cut compiler, address chains,
+physical-list checks, positional probes and lock annotation now run on the
+real differ route. The canonical class oracle retains its accepted cases,
+three named non-convex endpoint limits, all permitted orders, complete final
+states and nonempty certified results. The physical-list test also starts
+with a real diff and retains its order/remedy assertions.
+
+Release settlement receives the membership catalog already carried by schedule
+Facts. A read matching the exact restored expression can supply its binding;
+a different expression or an unread binding cannot. The partition restoration
+still validates its payload against the goal before reusing ownership. This
+keeps DEC-2296.7's mismatched-payload negatives and absent/unread distinction.
+Catalog reads stay beside module dependents in the existing transaction.
+Offline refusal identifies the pending membership boundary.
+
+The complete dependent-bearing changes/order/spelling golden remains the
+c97cd4ad oracle, including its named refusals. Its formatter removes only the
+empty module-options and absent USING fields added on master since that
+reference; nonempty fields remain differences. The existing exhaustive
+operation audit also pins each Change kind's default/module lifetimes under
+module replacement, using the same fixtures and effects match. This extends
+the oracle without creating a second classifier. The historical #1880
+schedule/proof paths and #1896 PG16/PG18 apply/readback cases remain intact.
+
+This discharges the PR 7 activation assertions in DEC-2296.5, DEC-2296.8,
+DEC-2296.10 and DEC-2296.11. The measured-profile inventory, native two-order
+observations, product accept/refuse outcomes and issue-case checks retain their
+original keys and assertions. PART meetings, partition-key retypes/drops,
+identity capabilities, nested/reparented/bound changes and external adoption
+remain guarded where no active replacement proves them. Missing capabilities
+and incompatible cuts still name the separate-plans remedy. No new pass,
+rank, tie-break, settlement, persisted field or wire version is introduced.

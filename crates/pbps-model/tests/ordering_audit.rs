@@ -1239,6 +1239,68 @@ mod effects_of_each_kind {
         );
     }
 
+    /// Reuse every fixture in the exhaustive operation oracle, with module
+    /// replacement active. This pins the default lifetimes seen by rebuild
+    /// scheduling without introducing a second Change classifier (DEC-2296.12).
+    #[test]
+    fn every_change_kind_has_its_rebuilt_default_interactions_pinned() {
+        let w = world();
+        let names = PlanNames::of(&[], &w.ids).unwrap();
+        let owners = PlanOwners::new(names, &w.ids, &w.ids);
+        let before = Snapshot {
+            schema: &w.schema,
+            ids: &w.ids,
+        };
+        let after = Snapshot {
+            schema: &w.after,
+            ids: &w.ids,
+        };
+        let mut actual: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for (kind, change) in fixtures(&w) {
+            let operations = Operations::expanded(
+                1,
+                [(
+                    Origin::Restoration(Source::Change(0)),
+                    PlannedChange::new(change),
+                )],
+                ModuleEdits::Rebuilt,
+            );
+            let result = effects(&operations.as_slice()[0], &owners, before, after);
+            let row = actual.entry(kind).or_default();
+            if kind == "RebuildPartitionedTable" {
+                assert!(result.unwrap_err().to_string().contains("must be expanded"));
+                row.insert("endpoint limit: expand the approved rebuild recipe first".into());
+                continue;
+            }
+            let fx = result.unwrap_or_else(|e| panic!("{kind}: {e}"));
+            // Keep owner replacement, address and row requirements too: a
+            // default's lifetime is not only its explicit DEFAULT events.
+            row.insert(format!("finishes: {fx:?}"));
+        }
+        let actual: String = actual
+            .iter()
+            .map(|(kind, values)| {
+                format!(
+                    "{kind}\t{}\n",
+                    values.iter().cloned().collect::<Vec<_>>().join(" | ")
+                )
+            })
+            .collect();
+        if std::env::var_os("PBPS_AUDIT_PRINT").is_some() {
+            eprintln!("DEFAULT-ORACLE-BEGIN\n{actual}DEFAULT-ORACLE-END");
+        }
+        assert_eq!(actual, include_str!("fixtures/default-rebuild.golden"));
+        let named: std::collections::BTreeSet<_> = super::row_kinds(
+            &actual
+                .lines()
+                .map(|l| format!("| `{}` |\n", l.split_once('\t').unwrap().0))
+                .collect::<String>(),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(named, super::change_kinds().into_iter().collect());
+    }
+
     /// Negative: a table whose last cell disagrees with the effects is
     /// refused, so the check is not satisfied by an empty comparison.
     #[test]

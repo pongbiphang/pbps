@@ -420,6 +420,7 @@ fn oracle_schedule(
         },
         dialect,
         declared.module_deps,
+        facts.membership_catalog,
     )
     .map_err(Refusal)?;
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));

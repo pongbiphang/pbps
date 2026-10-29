@@ -70,6 +70,7 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
         },
         &Mssql,
         &Default::default(),
+        None,
     )
     .unwrap();
     assert_eq!(shared, expected);
