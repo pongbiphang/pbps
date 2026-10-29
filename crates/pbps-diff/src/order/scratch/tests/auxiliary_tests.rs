@@ -103,3 +103,27 @@ fn auxiliary_missing_prerequisites_and_cycles_refuse_by_name() {
         assert!(why.contains("missing") || why.contains("managed"), "{why}");
     }
 }
+
+#[test]
+fn empty_auxiliary_route_retains_dropped_guesses_before_part_projection() {
+    let changes = vec![role("first"), role("omitted"), role("last")];
+    let mut facts = prepared(&changes, &[(0, 1), (1, 0), (1, 2)]);
+    facts.edges[1].source = crate::order::Source::Guess;
+    // Part projection skips operation 1 and reverses the input parts. Trace
+    // still names the prepared operations, including the skipped cycle member.
+    let at = [Some(1), None, Some(0)];
+    let mut dropped = Vec::new();
+    let (managed, _) =
+        super::super::auxiliary::settle::<usize>(&facts, &at, &[], &mut dropped).unwrap();
+    assert_eq!(managed, [0, 1, 2]);
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].edge, facts.edges[1]);
+    assert_eq!(dropped[0].members, [0, 1]);
+    assert!(dropped[0].backward_only);
+
+    let mut forward = prepared(&changes, &[(0, 1), (1, 2)]);
+    forward.edges[0].source = crate::order::Source::Guess;
+    let mut kept = Vec::new();
+    super::super::auxiliary::settle::<usize>(&forward, &at, &[], &mut kept).unwrap();
+    assert!(kept.is_empty());
+}
