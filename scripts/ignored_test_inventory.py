@@ -752,18 +752,19 @@ def workflow_runs(source, job, platform=None):
             axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
             require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")
             require(axis[2].strip(), f"owner matrix has no known executed variant: {job}")
-            # Only tokens YAML can read as nothing but a string. A quoted value
-            # may hold a comma, and splitting it would invent variants; a
-            # boolean, null or number keeps its type in the matrix, and
+            # Accept plain string tokens and quoted digit strings for shards.
+            # General quoted values may contain commas; splitting those would
+            # invent variants. An unquoted boolean, null or number keeps its type,
             # `matrix.x == 'true'` then compares it as a number and never holds.
             values = [x.strip() for x in axis[2].split(",")]
-            require(all(re.fullmatch(r"[A-Za-z][\w-]*", v) and v.lower() not in YAML_NON_STRINGS for v in values),
+            require(all(re.fullmatch(r"(?:[A-Za-z][\w-]*|'[0-9]+')", v) and v.lower() not in YAML_NON_STRINGS for v in values),
                     f"unsupported matrix value needs an explicit audit: {job}: {line.strip()}")
-            axes[axis[1]] = set(values)
+            axes[axis[1]] = {v.strip("'") for v in values}
         require(axes, f"owner matrix has no known executed variant: {job}")
     for step in steps:
         condition = re.search(r"^        if: (.+)$", step, re.M)
         active = True
+        wanted = {}
         if condition:
             value = condition[1].strip()
             clauses = [re.fullmatch(r"matrix\.([\w-]+) == '([^']+)'", c.strip()) for c in value.split("&&")]
@@ -797,7 +798,14 @@ def workflow_runs(source, job, platform=None):
         tolerated = re.search(r"(?:^|\n)(?:        )?continue-on-error:(.*)", step)
         require(not tolerated or tolerated[1].strip() in KEEPS_FAILURES or not any(True for _ in shell_commands(script)),
                 f"continue-on-error needs an explicit execution audit: {job}")
-        yield script
+        # Expand only exact references to the known, nonempty literal axes.
+        # Shell variables and arbitrary expressions remain outside this subset.
+        scripts = [script]
+        for axis in set(re.findall(r"\$\{\{ matrix\.([\w-]+) \}\}", script)):
+            require(axis in axes, f"unknown matrix axis: {job}: {axis}")
+            scripts = [text.replace("${{ matrix." + axis + " }}", value)
+                       for text in scripts for value in sorted(wanted.get(axis, axes[axis]))]
+        yield from scripts
 
 
 def shell_commands(script):
@@ -825,11 +833,22 @@ def shell_commands(script):
 def cargo_selection(command):
     # CI's wrapper partitions the complete list and refuses incomplete results.
     if command[:3] == ["python3", "scripts/live-shards.py", "ci"]:
-        require(len(command) > 4 and re.fullmatch(r"[0-9]+/[1-9][0-9]*", command[3]),
+        tail = command[3:]
+        while tail and tail[0] in ("--output", "--expected-tests", "--allow-empty"):
+            option = tail[0]
+            if option == "--allow-empty":
+                tail = tail[1:]
+                continue
+            require(len(tail) > 1 and tail[1] and not tail[1].startswith("-"),
+                    f"missing CI shard option value: {option}")
+            if option == "--expected-tests":
+                require(re.fullmatch(r"[1-9][0-9]*", tail[1]), "invalid expected test count")
+            tail = tail[2:]
+        require(len(tail) > 1 and re.fullmatch(r"[0-9]+/[1-9][0-9]*", tail[0]),
                 "invalid CI shard selector")
-        index, count = map(int, command[3].split("/"))
+        index, count = map(int, tail[0].split("/"))
         require(index < count, "CI shard index must be less than its count")
-        command = ["cargo", *command[4:]]
+        command = ["cargo", *tail[1:]]
     if command[:2] != ["cargo", "test"] or "--" not in command: return None
     split = command.index("--"); build, args = command[2:split], command[split + 1:]
     if "--no-run" in build: return None

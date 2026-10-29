@@ -1550,3 +1550,27 @@ browser runner, including OS dependency installation, in a separate job so
 mirror delays no longer extend flow_pg. It remains omitted from pull-request
 runs, as it was within live-pg; ci-gate requires it on every other event
 (DEC-1835.1). Actual shard durations are measured in the merge group.
+
+
+<a id="dec-2509-1"></a>
+
+**DEC-2509.1. SQL Server resolver CI shards the existing selections and audits
+execution receipts at the required gate.** The serial resolver job approached
+the merge queue timeout. Each of three runners retains the same two matching
+SQL Servers and seven ignored-test selections, including the reasoned Express
+skips. The shared CI entry in `live-shards.py` accepts selection filters and
+partitions their enumerated names by sorted position, as for `flow_pg`
+(DEC-2434.1). It checks the complete six-case kill inventory before partitioning,
+then checks each assigned test's actual result and summary (DEC-2357.1).
+Single-case invocations may leave an empty share: CI explicitly opts into
+empty invocation receipts, never an empty filter, while the suite audit still
+refuses a shard empty across all seven selections. Existing single-invocation
+CI callers retain their nonempty-share requirement.
+
+Each shard publishes its authoritative lists, partitions, results and timings.
+`ci-gate` waits for the whole matrix, downloads all receipts and reuses the
+existing union audit, requiring seven invocations per shard. Missing receipts,
+inconsistent lists, an unselected test, incomplete execution or a failed test
+fail the gate. The resolver job and its audit retain the pull-request omission;
+every other CI event requires them. Merge-group job durations and the listed
+versus executed union provide the final timing and membership evidence.
