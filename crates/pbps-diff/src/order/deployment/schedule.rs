@@ -243,6 +243,23 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
         .map_err(Refusal)?;
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
+    // Explicit operation proposals use this route too; they carry the same
+    // boundary obligations as a proposal produced by the guarded differ.
+    if dialect.partition_meetings() {
+        let after = crate::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        };
+        let pending = crate::order::boundaries::meetings(declared.sources.before, after, &cs);
+        cs.pending_boundaries(
+            pending,
+            if dialect.rebuilds_modules() {
+                pbps_model::operation::ModuleEdits::Rebuilt
+            } else {
+                pbps_model::operation::ModuleEdits::InPlace
+            },
+        );
+    }
     let (mut added, mut split, mut moved) = (0, 0, 0);
     let mut skipped = Vec::new();
     if dialect.name() == "postgres" {
@@ -452,6 +469,17 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         crate::order::shadow::Stage::Differ,
         None,
     );
+    crate::order::boundaries::replay(
+        &mut cs,
+        declared.sources.before,
+        crate::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
+        dialect,
+        facts.membership_catalog(),
+    )
+    .map_err(Refusal)?;
     cs.boundaries.ensure(&cs).map_err(Refusal)?;
     Ok(Scheduled {
         changes: crate::order::plan::state::<_, S::Output>(cs),

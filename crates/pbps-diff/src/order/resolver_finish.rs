@@ -2,16 +2,16 @@
 use super::Schedule;
 use crate::resolver::{Error, Ordered};
 use pbps_dialect::Dialect;
+use pbps_model::ChangeSet;
 use pbps_model::operation::{ModuleEdits, Operations, Origin};
 use pbps_model::resolver::OrderingProof;
-use pbps_model::{ChangeSet, IdsFile};
 
 pub(crate) fn finish<D: Dialect + ?Sized>(
     mut ordered: Ordered,
     sequence: &[usize],
     logical_plan: &super::DiffPlan,
     origins: Vec<Origin>,
-    ids: &IdsFile,
+    (before, after): (crate::Side<'_>, crate::Side<'_>),
     dialect: &D,
     module_edits: ModuleEdits,
 ) -> Result<(Ordered<super::Canonical<D>>, Operations), Error> {
@@ -20,7 +20,7 @@ pub(crate) fn finish<D: Dialect + ?Sized>(
     // Settlement can put a validator after seed rows. Preparation's empty
     // context cannot certify that final position (DEC-1503.4); seal the same
     // risks saved-plan validation will derive, including in operation copies.
-    let risks = crate::order::generated::risks(&ordered.changes.payload, ids, dialect);
+    let risks = crate::order::generated::risks(&ordered.changes.payload, after.ids, dialect);
     for (part, risks) in ordered.changes.payload.changes.iter_mut().zip(risks) {
         part.risks = risks;
     }
@@ -45,6 +45,14 @@ pub(crate) fn finish<D: Dialect + ?Sized>(
     );
     let operations = reordered_operations(&operations, sequence);
     ordered.changes.identities = Some(operations.clone());
+    super::boundaries::replay(&mut ordered.changes, before, after, dialect, None)
+        .map_err(Error::Cycle)?;
+    let operations = ordered
+        .changes
+        .identities
+        .as_ref()
+        .unwrap()
+        .with_steps(&ordered.changes.changes);
     // A pending membership boundary is an ordering refusal; canonical also
     // keeps the reserved-rebuild refusal in its existing Names category.
     ordered

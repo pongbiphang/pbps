@@ -185,7 +185,7 @@ pub fn plan_operations<D: Dialect + ?Sized>(
         &sequence,
         &logical,
         prepared.origins,
-        desired.ids,
+        (base, desired),
         dialect,
         module_edits,
     )?;

@@ -45,8 +45,9 @@ pub fn carry_inserts<S>(
     if inserts.is_empty() && drops.is_empty() {
         return Ok(release);
     }
-    let names = pbps_model::plan_names::PlanNames::of(&plan.changes, after.ids)
-        .map_err(|error| error.to_string())?;
+    let names =
+        pbps_model::plan_names::PlanNames::of(&plan.boundaries.names(plan).changes, after.ids)
+            .map_err(|error| error.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);
     let operations = plan.identities.as_ref().map_or_else(
         || {

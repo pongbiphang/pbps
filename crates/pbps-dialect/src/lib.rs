@@ -3569,6 +3569,22 @@ pub trait Dialect {
         Preflight::default()
     }
 
+    /// Whether positional partition/column meetings have an engine proof producer.
+    /// High-level representation guards remain independent of this capability.
+    fn partition_meetings(&self) -> bool {
+        false
+    }
+
+    /// Preflight with the checked baseline, for positional stored-row selection.
+    fn preflight_with_sources(
+        &self,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        partitions: &Partitions,
+        _before: pbps_model::operation::Snapshot<'_>,
+    ) -> Preflight {
+        self.preflight_with(names, partitions)
+    }
+
     /// [`Dialect::preflight`], told which table is whose partition.
     ///
     /// A change to a partitioned parent's column reaches every partition's

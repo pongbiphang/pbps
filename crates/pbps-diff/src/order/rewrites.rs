@@ -51,8 +51,11 @@ fn settle_requirements<S: Clone>(
     catalog: Option<&CatalogFacts>,
     precedence: &[(Change, Change)],
 ) -> Result<super::PlanningPlan<S>, String> {
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
-        .map_err(|error| error.to_string())?;
+    let names = pbps_model::plan_names::PlanNames::of(
+        &changes.boundaries.names(&changes).changes,
+        after.ids,
+    )
+    .map_err(|error| error.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);
     let operations = (!changes.boundaries.is_empty())
         .then_some(&changes.identities)
@@ -189,16 +192,6 @@ fn settle_requirements<S: Clone>(
         .map_err(|refusal| refusal.describe(&changes))?;
     if !settled.changes.boundaries.is_empty() {
         let operations = super::reordered_operations(&operations, &settled.sequence);
-        let effects: Vec<_> = settled
-            .sequence
-            .iter()
-            .map(|&at| effects.effects[at].clone())
-            .collect();
-        settled.changes.boundaries.discharge(
-            operations.as_slice(),
-            &effects,
-            &Default::default(),
-        )?;
         settled.changes.identities = Some(operations);
     }
     Ok(settled.changes)

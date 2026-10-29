@@ -203,3 +203,154 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
         assert!(fx.effects[1].symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",fx.effects[1].symbolic);
     }
 }
+
+use pbps_diff::{
+    Side,
+    order::{
+        deployment::{
+            Sources,
+            schedule::{Declarations, Facts, schedule},
+        },
+        propose,
+    },
+};
+fn scheduled_scene(
+    s: &scenes::Scene,
+    kind: Kind,
+    motion: Motion,
+    version: i64,
+) -> Result<
+    pbps_diff::order::deployment::schedule::Scheduled<pbps_diff::order::Draft, Postgres>,
+    pbps_diff::order::deployment::schedule::Refusal,
+> {
+    let before = Side {
+        schema: &s.before,
+        ids: &s.base_ids,
+    };
+    let plan = propose(pbps_model::ChangeSet {
+        changes: steps(s, kind, motion)
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+    });
+    schedule(
+        plan,
+        &Declarations {
+            schema: &s.after,
+            sources: Sources {
+                before,
+                after: &s.ids,
+            },
+            module_deps: &Default::default(),
+        },
+        &Facts::default(),
+        &Postgres::new().with_server_version(version),
+    )
+}
+
+#[test]
+fn reference_scenes_replay_at_the_schedule_boundary_and_annotate_one_lock_window() {
+    let mut accepted = 0;
+    for kind in KINDS {
+        for motion in [Motion::Attach, Motion::Detach, Motion::Drop] {
+            for final_cut in [false, true] {
+                for version in [160000, 180000] {
+                    let s = build(kind, motion, final_cut);
+                    let label = format!("{kind:?}/{motion:?}/final={final_cut}/PG{version}");
+                    let result = scheduled_scene(&s, kind, motion, version);
+                    let done = match result {
+                        Ok(done) => done,
+                        Err(e) => {
+                            let conservative = motion == Motion::Attach
+                                && final_cut
+                                && ((matches!(kind, Kind::SetNotNull) && version == 160000)
+                                    || matches!(kind, Kind::DropDefault));
+                            assert!(
+                                conservative
+                                    && e.to_string()
+                                        .contains("different physical endpoint identities"),
+                                "{label}: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    if motion != Motion::Drop
+                        && matches!(
+                            kind,
+                            Kind::Add
+                                | Kind::Generated
+                                | Kind::Drop
+                                | Kind::Rename
+                                | Kind::Widen
+                                | Kind::Narrow
+                                | Kind::Collation
+                        )
+                    {
+                        use pbps_model::operation::Origin;
+                        assert_eq!(
+                            done.changes.origins(),
+                            if final_cut {
+                                &[Origin::Whole(0), Origin::Whole(1)]
+                            } else {
+                                &[Origin::Whole(1), Origin::Whole(0)]
+                            },
+                            "{label}"
+                        );
+                    }
+                    let notes = done
+                        .changes
+                        .changes
+                        .iter()
+                        .flat_map(|p| &p.findings)
+                        .filter(|f| f.id == "plan.partition-alter-attach-lock")
+                        .count();
+                    assert_eq!(
+                        notes,
+                        usize::from(
+                            motion == Motion::Attach
+                                && !matches!(kind, Kind::ParentName | Kind::ParentSchema)
+                        ),
+                        "{label}"
+                    );
+                    accepted += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(accepted, 153);
+}
+
+#[test]
+fn physical_column_lists_are_obligations_at_attach_and_detach() {
+    for motion in [Motion::Attach, Motion::Detach] {
+        let mut s = build(Kind::Widen, motion, false);
+        let a = name("app.a");
+        if motion == Motion::Attach {
+            s.before
+                .tables
+                .get_mut(&a)
+                .unwrap()
+                .columns
+                .swap_indices(0, 1);
+        } else {
+            s.after
+                .tables
+                .get_mut(&a)
+                .unwrap()
+                .columns
+                .insert("extra".into(), Column::new("integer".parse().unwrap()));
+            s.ids.columns.insert(uid("c_ffffff"), a.column("extra"));
+        }
+        let error = scheduled_scene(&s, Kind::Widen, motion, 180000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("physical column order") || error.contains("physical order"),
+            "{motion:?}: {error}"
+        );
+        assert!(
+            error.contains(pbps_diff::order::membership::REMEDY),
+            "{error}"
+        );
+    }
+}

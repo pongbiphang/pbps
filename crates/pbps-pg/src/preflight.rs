@@ -128,6 +128,8 @@
 //! table is the disaster the `data-delete` gate exists for, so those rows are
 //! counted and the apply stops the same way.
 
+mod membership;
+
 use pbps_model::ColumnName;
 use pbps_model::ValueSource;
 use std::cell::LazyCell;
@@ -2973,6 +2975,24 @@ fn keys(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("r.k{i}")).collect()
 }
 
+/// Selected physical inputs are read once each, without PostgreSQL recursion.
+fn scalar_read(sources: &[ColumnRef]) -> Result<(String, String), DialectError> {
+    let branches = sources
+        .iter()
+        .map(|source| {
+            Ok(format!(
+                "SELECT {} AS v FROM ONLY {}",
+                quote(source.name.raw())?,
+                qualified(&source.table)?
+            ))
+        })
+        .collect::<Result<Vec<_>, DialectError>>()?;
+    Ok((
+        format!("({}) AS contribution", branches.join(" UNION ALL ")),
+        "v".into(),
+    ))
+}
+
 /// The NULLs a `NOT NULL` would reject.
 ///
 /// `from` is the relation the statement will meet and `reads` is how a row in
@@ -3121,6 +3141,7 @@ fn build<'v, 'p: 'v>(
     names: &impl Deref<Target = AsStored<'v, 'p>>,
     unchecked: &mut Vec<Unchecked>,
     label_arrays: usize,
+    sources: Option<&[ColumnRef]>,
 ) -> Result<Vec<Probe>, DialectError> {
     if reads_recomputed(names, change) {
         return Ok(skip(
@@ -3209,6 +3230,10 @@ fn build<'v, 'p: 'v>(
             to_nullable: false,
             ..
         } => {
+            if let Some(sources) = sources {
+                let (from, reads) = scalar_read(sources)?;
+                return Ok(vec![null_probe(column, &from, &reads)]);
+            }
             let Some(rows) = rows_after(
                 names,
                 &column.table,
@@ -3348,8 +3373,13 @@ fn build<'v, 'p: 'v>(
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
-            let table = qualified(&stored.table)?;
-            let quoted = quote(stored.name.raw())?;
+            if sources.is_some() && using.is_some() {
+                return Ok(skip(change, "a membership conversion expression cannot be evaluated over selected stored columns before apply", unchecked));
+            }
+            let (table, quoted) = match sources {
+                Some(sources) => scalar_read(sources)?,
+                None => (qualified(&stored.table)?, quote(stored.name.raw())?),
+            };
             let mut out = Vec::new();
             // A recorded conversion is evaluated over every stored row, and
             // the probe fails when the engine does: a value the expression
@@ -4099,6 +4129,7 @@ fn without_filtered_rows(
     sql: &str,
     change: &Change,
     names: &AsStored<'_, '_>,
+    sources: Option<&[ColumnRef]>,
 ) -> Result<String, DialectError> {
     let mut relations = BTreeSet::new();
     if let Some(table) = change.table() {
@@ -4115,11 +4146,17 @@ fn without_filtered_rows(
                 .map(|fk| fk.references_table.clone()),
         );
     }
-    let active: Vec<String> = relations
+    let stored: BTreeSet<_> = match sources {
+        Some(sources) => sources.iter().map(|c| c.table.clone()).collect(),
+        None => relations
+            .iter()
+            .filter_map(|table| names.view().table(table))
+            .collect(),
+    };
+    let active: Vec<String> = stored
         .iter()
-        .filter_map(|table| names.view().table(table))
         .map(|table| {
-            qualified(&table).map(|name| {
+            qualified(table).map(|name| {
                 format!(
                     "pg_catalog.row_security_active({}::regclass)",
                     value_literal(&name)
@@ -4193,7 +4230,11 @@ fn relabel_arrays(change: &Change, plan: &PlanNames<'_>) -> usize {
 ///
 /// A probe that cannot be built is reported as unchecked, keeping it distinct
 /// from a change that needs no data question at all.
-pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partitions) -> Preflight {
+pub(crate) fn probes(
+    plan_names: &PlanNames<'_>,
+    partitions: &pbps_model::Partitions,
+    before: Option<pbps_model::operation::Snapshot<'_>>,
+) -> Preflight {
     let facts = PlanFacts::of(plan_names);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
@@ -4222,12 +4263,25 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
             names
         });
-        match build(
-            &p.change,
-            &names,
-            &mut unchecked,
-            relabel_arrays(&p.change, plan_names),
-        ) {
+        let sources = before.and_then(|before| membership::sources(plan_names, step, before));
+        let selected = sources
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(Vec::as_slice);
+        let built = match sources.as_ref() {
+            Some(Err(error)) => Err(DialectError::Invalid {
+                dialect: "postgres",
+                message: error.to_string(),
+            }),
+            _ => build(
+                &p.change,
+                &names,
+                &mut unchecked,
+                relabel_arrays(&p.change, plan_names),
+                selected,
+            ),
+        };
+        match built {
             // A probe of a DEFAULT partition's own rows, after a move out of
             // it, counts rows that are gone by then: a check the moved rows
             // break, or a duplicate between a moved row and a kept one,
@@ -4251,7 +4305,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
                         out.push(probe);
                         continue;
                     }
-                    match without_filtered_rows(&probe.sql, &p.change, &names) {
+                    match without_filtered_rows(&probe.sql, &p.change, &names, selected) {
                         Ok(sql) => {
                             probe.sql = sql;
                             out.push(probe);

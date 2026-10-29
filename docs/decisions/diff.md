@@ -9241,3 +9241,59 @@ successful diff/schedule and nonempty certified result remain PR 7 gates; the
 physical-boundary replay and lock annotation still require PR 6. Every guard
 remains. No format, pass, rank, tie-break, positional replay or engine boundary
 changes; no scratch/fill or annotation-projection changes.
+
+
+<a id="dec-2296-10"></a>
+
+**DEC-2296.10. A moving boundary is discharged against its final positional
+continuation and immutable inputs.** PR 6 keeps the original logical name
+history while existing passes permute, split or append operations. The final
+schedule and resolver-finish entries replay the actual continuation. An earlier
+effect settlement retains operation identities but cannot issue a receipt from
+an empty symbolic baseline. Explicit proposals entering the ordinary scheduler
+register the same obligations as differ proposals.
+
+`PhysicalSources::members_at` must supply complete membership at each attach
+and detach. `columns_at` supplies the complete ordered physical column lists:
+ATTACH compares parent and candidate at that position; DETACH compares the
+retained list with the emitted standalone shape. Unknown membership or shape
+never means an empty list. Symbolic replay then discharges the shared movement
+contracts. A receipt binds the payload, event IDs, logical origins and immutable
+address-chain evidence; changing a physical input requires replay even when
+its logical origin remains the same. Findings and risk metadata do not change
+that evidence. The receipt introduces no ordering edge, rank or settlement.
+
+The lock-window note is emitted once when an ATTACH meets a parent column
+statement. Its parent and changed properties come from `parent_column_uid` and
+`column_transitions`. A sequence-only retune does not claim a parent table ALTER
+lock; a column statement with unchanged values can still hold one.
+
+The dialect's partition-meeting capability admits positional proof production,
+independently of its name. A single UID-derived parent address/template map
+serves the differ's boundary carriers. Pending shape detection is pure and
+ignores annotations; it neither runs `diff_columns` early nor emits changes.
+Pending type, collation, generation and nullability agreement belongs to the
+existing `ShapeCheck`/unsupported-fact contract. Own-identity, cross-schema
+generation and all other representation guards remain in force.
+
+Preflight receives the checked baseline and selects stored scalar inputs with
+`members_at` at the operation's boundary. The ordinary predicate builders read
+those inputs through `UNION ALL` with `ONLY` per contribution, so no descendant
+is counted twice or borrowed from a later boundary. Source selection builds no
+SQL predicate and no RLS wrapper. `without_filtered_rows` remains the single
+wrapper for ordinary and selected scalar probes, guarding every selected stored
+relation before planning its inner query. An unread contribution, created
+input, preceding row write or membership USING expression without an evaluable
+projection is unchecked rather than an empty successful scan. Ordinary plans
+retain their previous probe bytes.
+
+This activates the PR 6 positional replay/receipt, physical-list/order/remedy,
+and schedule-level lock-note deferrals in DEC-2296.5 and DEC-2296.8. The shared
+reference scenes retain their orders and named endpoint limits below the
+guarded differ. PR 7 still owns each canonical assertion requiring its guard
+lift: successful real `class.rs` diff; completed canonical schedule; a nonempty
+certified plan; its complete permitted-order/final-state replay; the canonical
+dependent-bearing changes/order/spellings golden; and the successful real-diff
+setup of `physical_column_lists_are_obligations_at_attach_and_detach`. Their
+reference assertions are unchanged. No guard lift, format, scratch/fill or
+annotation-projection change is included here.

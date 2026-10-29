@@ -430,3 +430,158 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
 async fn a_planned_key_counts_only_references_that_survive_the_current_delete() {
     check_deleted_self_reference(false).await;
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn membership_null_probes_read_each_selected_stored_source_once() {
+    use pbps_model::{
+        Change, IdsFile, PlannedChange, Uid, operation::Snapshot, plan_names::PlanNames,
+    };
+    let mut db = TestDb::create("membership2296f").await;
+    db.conn
+        .execute(
+            "CREATE TABLE public.p(k integer, d bigint) PARTITION BY RANGE(k);
+        CREATE TABLE public.b PARTITION OF public.p FOR VALUES FROM (10) TO (20);
+        INSERT INTO public.b VALUES (11,NULL),(12,NULL);
+        CREATE TABLE public.a(k integer, d bigint);
+        INSERT INTO public.a VALUES (1,NULL);",
+        )
+        .await
+        .unwrap();
+    let schema = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let p: TableName = "public.p".parse().unwrap();
+    let a: TableName = "public.a".parse().unwrap();
+    let b: TableName = "public.b".parse().unwrap();
+    let uid = |s: &str| s.parse::<Uid>().unwrap();
+    let ids = IdsFile {
+        tables: [
+            (uid("t_aaaaaa"), p.clone()),
+            (uid("t_bbbbbb"), a.clone()),
+            (uid("t_cccccc"), b),
+        ]
+        .into(),
+        columns: [
+            (uid("c_aaaaaa"), p.column("k")),
+            (uid("c_bbbbbb"), p.column("d")),
+            (uid("c_cccccc"), a.column("k")),
+            (uid("c_dddddd"), a.column("d")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut after = ids.clone();
+    after.columns.retain(|_, c| c.table != a);
+    let attach = Change::AttachPartition {
+        uid: uid("t_bbbbbb"),
+        table: a,
+        parent: p.clone(),
+        bound: pbps_model::PartitionBound::Range {
+            from: vec![pbps_model::BoundDatum::Value("0".into())],
+            to: vec![pbps_model::BoundDatum::Value("10".into())],
+        },
+        key: vec![],
+        shape: Box::default(),
+    };
+    let tighten = Change::AlterColumnNullability {
+        uid: uid("c_bbbbbb"),
+        column: p.column("d"),
+        ty: ty("bigint"),
+        to_nullable: false,
+        through_external_partitions: false,
+        collation: None,
+    };
+    let pg = Postgres::new();
+    let frame = pg.transaction_framing(&pbps_model::SessionZone::utc());
+    for clean_standing in [false, true] {
+        if clean_standing {
+            db.conn.execute("UPDATE public.b SET d = 1").await.unwrap();
+        }
+        for first in [false, true] {
+            let changes: Vec<_> = if first {
+                vec![attach.clone(), tighten.clone()]
+            } else {
+                vec![tighten.clone(), attach.clone()]
+            }
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect();
+            let names = PlanNames::of(&changes, &after).unwrap();
+            let report = pg.preflight_with_sources(
+                &names,
+                &pbps_model::Partitions::of(&schema).renamed(&names),
+                Snapshot {
+                    schema: &schema,
+                    ids: &ids,
+                },
+            );
+            assert!(report.unchecked.is_empty(), "{report:?}");
+            let probe = report
+                .probes
+                .iter()
+                .find(|p| p.description.contains("existing NULLs"))
+                .unwrap();
+            assert_eq!(probe.sql.matches("query_to_xml").count(), 1);
+            assert_eq!(
+                probe.sql.matches("row_security_active").count(),
+                2 + usize::from(first)
+            );
+            let expected = if clean_standing { 0 } else { 2 } + i64::from(first);
+            assert_eq!(counted(&mut db.conn, &probe.sql).await, expected);
+            db.conn.begin(&frame).await.unwrap();
+            let mut accepted = false;
+            for planned in &changes {
+                for statement in pg.fixture_emit(&planned.change, planned.strategy).unwrap() {
+                    let result = db.conn.execute(&statement.sql).await;
+                    if matches!(planned.change, Change::AlterColumnNullability { .. }) {
+                        accepted = result.is_ok();
+                    } else {
+                        result.unwrap();
+                    }
+                }
+                if matches!(planned.change, Change::AlterColumnNullability { .. }) {
+                    break;
+                }
+            }
+            db.conn.rollback(&frame).await.unwrap();
+            assert_eq!(accepted, expected == 0);
+        }
+    }
+    // RLS on any one selected relation suppresses the whole answer, including
+    // planning of its policy expression behind the one shared wrapper.
+    db.conn
+        .execute(
+            "CREATE ROLE w2296f_reader;
+        GRANT USAGE ON SCHEMA public TO w2296f_reader;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO w2296f_reader;
+        ALTER TABLE public.a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY hide ON public.a USING (false);",
+        )
+        .await
+        .unwrap();
+    let changes = [PlannedChange::new(attach), PlannedChange::new(tighten)];
+    let names = PlanNames::of(&changes, &after).unwrap();
+    let report = pg.preflight_with_sources(
+        &names,
+        &pbps_model::Partitions::of(&schema).renamed(&names),
+        Snapshot {
+            schema: &schema,
+            ids: &ids,
+        },
+    );
+    let probe = report
+        .probes
+        .iter()
+        .find(|p| p.description.contains("existing NULLs"))
+        .unwrap();
+    db.conn.execute("SET ROLE w2296f_reader").await.unwrap();
+    let rows = db.conn.query(&probe.sql).await.unwrap();
+    assert_eq!(rows[0].try_get_at::<i32>(0).unwrap(), None);
+    db.conn
+        .execute("RESET ROLE; DROP OWNED BY w2296f_reader; DROP ROLE w2296f_reader")
+        .await
+        .unwrap();
+    db.drop().await;
+}

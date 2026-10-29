@@ -2833,7 +2833,11 @@ impl Dialect for Postgres {
     /// caller reports how many could not be checked rather than counting them
     /// as passes.
     fn preflight(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> pbps_dialect::Preflight {
-        preflight::probes(names, &pbps_model::Partitions::default())
+        preflight::probes(names, &pbps_model::Partitions::default(), None)
+    }
+
+    fn partition_meetings(&self) -> bool {
+        true
     }
 
     fn preflight_with(
@@ -2841,7 +2845,16 @@ impl Dialect for Postgres {
         names: &pbps_model::plan_names::PlanNames<'_>,
         partitions: &pbps_model::Partitions,
     ) -> pbps_dialect::Preflight {
-        preflight::probes(names, partitions)
+        preflight::probes(names, partitions, None)
+    }
+
+    fn preflight_with_sources(
+        &self,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        partitions: &pbps_model::Partitions,
+        before: pbps_model::operation::Snapshot<'_>,
+    ) -> pbps_dialect::Preflight {
+        preflight::probes(names, partitions, Some(before))
     }
 
     /// Whether an omitted cell in the read-back *means* at-default for this
