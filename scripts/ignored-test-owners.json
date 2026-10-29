@@ -2204,6 +2204,8 @@
         "resolver::server::scratch::live_tests::resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes",
         "resolver::server::scratch::live_tests::domain_tests::domain_vet2309_releases_supplied_run_owned_and_incompatible_scratch",
         "resolver::server::scratch::live_tests::domain_tests::domain_vet2309_missing_extension_types_refuse_with_the_engine_error_and_release",
+        "resolver::server::scratch::live_tests::acceptance621_tests::resolver_refuses_a_scratch_whose_preloaded_libraries_differ_from_the_target",
+        "resolver::server::scratch::live_tests::acceptance621_tests::resolver_replacement_backend_invalidates_the_registered_session",
         "resolver::server::scratch::live_tests::resolver_answers_a_managed_question_without_root_or_observation",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_run_killed_at_any_stage_is_removed_by_the_next_run",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_sweep_removes_a_dead_run_on_each_server",

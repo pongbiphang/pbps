@@ -811,6 +811,11 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
   - `resolver_publishes_its_rechecked_plan_in_the_exact_order` (`flow_pg`):
     `explain` of the published plan from the file alone, and `--staged`
     refused by name (#1517)
+  - `resolver_refuses_a_scratch_whose_preloaded_libraries_differ_from_the_target`
+    (readable shared/session/local preload settings, on both scratch kinds)
+  - `resolver_replacement_backend_invalidates_the_registered_session`
+    (case 14's compatibility inputs; a changed backend invalidates the old
+    continuation, and only fresh registered state can use matching facts)
 
 ## Architectural placement
 
@@ -956,26 +961,19 @@ protection under test is removed.
     non-equivalent apply context invalidate it before DDL. A matching context
     must apply without a spurious rebuild/binding rollback, and running the
     compilation as the setup administrator must fail the negative control.
-17. **`external_fingerprints_require_confidential_artifact_handling` (planned):**
-    use known surrounding source and a small literal dictionary to demonstrate
-    that candidate hashes can match the saved fingerprint. Such evidence must
-    be classified confidential even without a recognized secret; public/unknown
-    handling and a missing/downgraded label refuse publication while preserving
-    prior files. Ordinary logs/diagnostics/explanations must omit the verifier
-    and equivalent derived verifiers. An authorized, access-controlled artifact
-    can still be reviewed offline and applied without new key-management or
-    resolver access; omitting mandatory evidence cannot produce a public plan.
-18. **`confidential_plan_checksums_stay_in_protected_paths` (planned):** trace
-    a confidential plan's exact checksum through plan/explain human and JSON
-    output, command previews, UI/hooks, CI trace/metadata, process arguments and
-    shell history, ledger/snapshot persistence and status/history exports.
-    Ordinary outputs must not expose it or print a runnable checksum command;
-    protected review and launch must still use that exact human-approved SHA-256.
-    An unauthorized direct ledger reader or unqualified audit/runner path refuses
-    publication/application before disclosure or DDL, as appropriate, rather
-    than passing because CLI output was masked. Cover failure paths, unknown
-    historical classification and normal non-confidential plan behavior. Removing
-    a consumer's protection must expose the fixture verifier and fail its test.
+17. **`external_fingerprints_require_confidential_artifact_handling`
+    (superseded by DEC-952.1):** persisted external fingerprints are keyed
+    under the environment key. The public plan is not an unkeyed guessing
+    oracle, so this case requires no protected artifact classification or
+    legacy reader. The plaintext/small-dictionary output trace obligation
+    remains [#2488](https://github.com/pongbiphang/pbps/issues/2488); its
+    completion is recorded in the [acceptance table](RESOLVER-ACCEPTANCE.md).
+18. **`confidential_plan_checksums_stay_in_protected_paths`
+    (superseded by DEC-952.1):** the ordinary approval command uses the exact
+    approved checksum, with no protected launch, ledger or new history field.
+    Output trace controls for definitions and unkeyed dictionary digests
+    remain #2488's obligation. An ordinary checksum is not a waiver of
+    those controls, and #618 being closed does not qualify their cells.
 19. **`private_resolver_inputs_require_verified_transport` (planned; measured profiles only):** cover
     both target capture/recheck and scratch transfer with disposable endpoints.
     Plaintext, downgrade, an untrusted/wrong peer and an unprotected backend hop
@@ -1064,12 +1062,12 @@ protection under test is removed.
      - no reported identifier separates two installations, so case 11's
        replacement is a live marker.
 
-Confidential resolver artifacts in either binding stage additionally depend on
-the completed legacy-reader boundary in decision 5/#594. Its tests must run
-pre-feature clients, unsupported-version and restricted-column readers, direct
-reads and snapshot/fallback paths, with negative controls for verifier exposure
-and for publication/apply attempted before the gate is satisfied. Environment
-support and non-confidential paths do not claim that this dependency is complete.
+DEC-952.1 supersedes decision 5/#594's legacy-reader artifact boundary:
+external-input fingerprints are keyed, and the approved plan checksum follows
+the ordinary review/apply path. The [acceptance table](RESOLVER-ACCEPTANCE.md)
+records that disposition explicitly. Plaintext and small-dictionary output
+trace controls remain #2488's accepted obligation; final cross-engine execution
+and close-out remain #2489. No incomplete accepted cell closes #595.
 
 This supersedes ADR-0009's blanket exclusion of a scratch engine from connected
 planning only for the new resolver path. It does not change that ADR's

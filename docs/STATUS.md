@@ -331,7 +331,10 @@ unaffected, rebuild or unresolved; sealing (#614) and planning integration
 and [delivery tracking](RESOLVER-DELIVERY.md).
 
 **Re-planned by #1528 and #1636 (DEC-1528.1, DEC-1636.1).** Selecting a
-resolver gives the one resolver, on every platform pbps supports. A server
+resolver gives the one resolver. Its build portability is separate from
+the per-engine, per-scratch and per-platform execution evidence in the
+[acceptance matrix](RESOLVER-ACCEPTANCE.md); planning, offline explanation
+and resolved apply have separate rows. A server
 entry runs it on a scratch server the operator supplies (#1672, DEC-1672.1); a
 Docker entry on a container pbps starts from the entry's image and removes
 after the run (#1674, DEC-1674.1). Either kind's `externals` stages external

@@ -23,6 +23,12 @@ shows its evidence offline (DEC-1517.1). #616 applies it in one transaction
    implements [the measured design](RESOLVER-MSSQL.md) #619 delivered, then
    [#621](https://github.com/pongbiphang/pbps/issues/621).
 
+The [acceptance mapping](RESOLVER-ACCEPTANCE.md) is #2487's A slice of #621.
+Its mechanical lint checks names and ownership, not semantic coverage or
+execution. #2488 owns plaintext/dictionary trace controls; #2489 follows #2144
+for the final cross-engine run audit and #595 close-out. An accepted pending
+cell remains open; a named test or a green job that skipped it does not fill it.
+
 The sections below record each delivered step as it shipped. Where one
 describes containment, process observation, executable identity or verified
 channels, it describes the measured profiles #1636 removed.

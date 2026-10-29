@@ -2431,7 +2431,10 @@ DEC-1674.1).**
 - **The resolver** is what selecting a resolver gives, of either kind: a
   `kind: docker` entry, a scratch server pbps starts for the run (#1674), or
   a `kind: server` entry, one the operator supplies (#1672). It is the only
-  resolver, and it runs on every platform pbps supports (#1636).
+  resolver. #1636 makes its build/dispatch portable; live qualification for
+  each engine/build, scratch kind and platform is recorded separately in the
+  [acceptance matrix](RESOLVER-ACCEPTANCE.md). A compiled resolver or a
+  portable offline reader does not qualify planning or resolved apply.
   - pbps does not enforce its scratch's isolation, log handling or channels,
     and observes no process on it. The operator vouches for them. The
     evidence records the entry that ran, the scratch's kind and its
