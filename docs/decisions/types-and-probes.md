@@ -4113,3 +4113,43 @@ parser core and later integration remain separate PRs of #2400.
 Pinned on PostgreSQL 16 and 18 by the guarded-drop recording/apply regressions,
 the late-row rollback witness, the own-column/built-in audit tests, RLS and
 privilege refusals, and the partition lock/writer-wait regression.
+
+<a id="dec-2400-2"></a>
+
+**DEC-2400.2. SQL Server connects the closed predicate tree to recorded drops.**
+
+Recording, planning and apply reuse the UID-bound requirement, checksum,
+dependency checks and consumer hooks of DEC-2400.1. SQL Server resolves only
+columns of that holder through catalog collation, reads actual major/version
+capabilities, and binds the regenerated PR 2a tree with Describe. The recorded
+text never becomes executable SQL. Referenced computed and CLR columns refuse
+in v1, with a stored-column/non-CLR-type remedy and the transition CHECK or
+planned assertion alternatives; unreferenced columns do not refuse.
+
+The `COUNT_BIG(*)` itself takes `TABLOCKX, HOLDLOCK` in the caller's active,
+committable drop transaction. It counts CASE's FALSE and UNKNOWN branch, and
+retains the table X lock across all partitions through DDL and commit. A
+separate TOP query is unnecessary. The hints belong on the count too: measured
+on 17.0.4075.5, a pre-existing SNAPSHOT saw zero late violations without the
+hints and one with them. Writers wait; versioned readers may continue. Existing
+lock-wait and timeout behavior applies without an upgrade or new knob.
+
+One pin block scopes binding and counting inside `sp_executesql`: LANGUAGE
+us_english, DATEFIRST 7, DATEFORMAT mdy, ANSI_NULLS ON, ANSI_WARNINGS ON,
+ARITHABORT ON, ARITHIGNORE OFF, CONCAT_NULL_YIELDS_NULL ON and
+NUMERIC_ROUNDABORT OFF. Dates, weekday/week calculations, NULL concatenation,
+arithmetic errors and numeric rounding agree across record, plan and apply.
+The caller's settings restore on success and error; transaction locks remain.
+The AST brackets identifiers, ANSI_PADDING affects storage only, and collation
+stays with the actual target.
+
+An enabled RLS FILTER policy refuses even for dbo, with a disable-policy and
+transition CHECK/assertion remedy. Disabled and block-only policies are safe
+for counting. Complete policy visibility requires database VIEW DEFINITION
+and no effective object/schema metadata DENY, reusing preflight's proof.
+Unreadable catalog, missing privilege, query error and unreadable/negative
+count never permit removal. Guard admission no longer depends on recorded-conversion support; SQL Server
+conversions remain unsupported. Shared lowering attaches guards on prepared and
+ordinary routes, refuses staged/empty guarded emission, and shares the count
+refusal with PostgreSQL. Export and unframed consumers still refuse. The AST
+is ephemeral: schema set 74, identity v1 and state v35 are unchanged.

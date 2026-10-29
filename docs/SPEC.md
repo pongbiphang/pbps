@@ -1490,13 +1490,20 @@ one tombstone unambiguously. Neither plan nor apply supplies replacement SQL.
 PostgreSQL uses the recorded-conversion binding and built-in decoder: only
 columns of that table, no subqueries, no non-built-in code and no volatile
 routines. The literal and modifier-input protections run before binding,
-under the same empty search path as execution. A predicate referencing a
-column this plan renames, retypes or replaces is refused with the split-plan
+under the same empty search path as execution. SQL Server uses a closed,
+allowlisted predicate tree, resolves columns against the target catalog and
+checks the actual engine version and database compatibility level before
+recording or planning. It regenerates SQL from the vetted tree, never from
+recorded text. Referenced computed or CLR columns and enabled RLS FILTER
+policies are refused in v1, with a stored-column/type, policy-disable or
+transition CHECK/plan-time assertion remedy. Disabled and block-only policies
+do not hide rows. Unreadable metadata or missing privilege refuses.
+A predicate referencing a column this plan renames, retypes or replaces is refused with the split-plan
 remedy. A column-drop predicate cannot depend on another column the plan
 also drops. Rebuild-source requirements are unsupported in v1. A table drop
 honors requirements of the column UIDs it removes too.
 
-Immediately before a guarded drop, apply takes ACCESS EXCLUSIVE directly on
+Immediately before a guarded PostgreSQL drop, apply takes ACCESS EXCLUSIVE directly on
 the table, including its partitions and inheritance children, and counts
 `WHERE (<predicate>) IS NOT TRUE`. FALSE and NULL fail. The lock is held
 through the drop and transaction commit: **readers and writers wait for the
@@ -1504,10 +1511,20 @@ scan's duration**. Existing lock-wait and timeout behavior applies. A positive
 count refuses with the full count; query errors, unreadable counts, active RLS
 and missing privilege refuse too. No unchecked fallback can permit the drop.
 
+For SQL Server, the count itself takes a table X lock with
+`WITH (TABLOCKX, HOLDLOCK)`, covering every partition and holding through the
+drop and commit. It counts `WHERE CASE WHEN (<regenerated predicate>) THEN 0
+ELSE 1 END = 1`, so FALSE and UNKNOWN fail. The hints also force a current
+locking read inside an existing SNAPSHOT transaction. Writers wait; versioned
+readers can continue. The check requires the caller's active transaction and
+uses existing lock-wait/timeout behavior. Binding and counting share scoped
+`sp_executesql` pins for language, date format/first day, NULL/concatenation,
+arithmetic errors and numeric rounding (DEC-2400.2); caller settings restore
+on return or error. Catalog failures and incomplete RLS visibility refuse.
+
 The guard is derived from recorded intent under section 7.5, not a user hook.
 Transactional rehearsal executes it; unframed and staged consumers refuse.
-Standalone SQL export refuses guarded drops. SQL Server integration follows
-PostgreSQL in #2400's separate PR; until then it refuses guarded drops.
+Standalone SQL export refuses guarded drops on both engines.
 
 ---
 

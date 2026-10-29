@@ -39,6 +39,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod drop_requirements;
 pub mod engine_effects;
 pub mod estimate;
 pub mod lower;

@@ -20,13 +20,14 @@
 //!
 //! - **Renames** carry a dependency risk, not a data one. They are answered by
 //!   [`crate::impact`], which asks the catalog instead.
-//! - **Drops** cannot be probed: every row is "affected", and counting them
+//! - **Unannotated drops** have no predicate: every row is "affected", and counting them
 //!   would produce a number that always looks alarming and never decides
 //!   anything.
 //! - **Reducing a `decimal`'s scale** rounds rather than failing, so no count
 //!   exists to take. The `narrowing` class still flags it for approval.
 
 use pbps_model::ColumnName;
+
 use pbps_model::ValueSource;
 use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +43,16 @@ use pbps_model::{Cell, Change, ColumnRef, ColumnType, RowKey, TableName, TypeArg
 use crate::emit::{qualified, verbatim};
 use crate::ident::{literal, quote};
 use crate::types;
+
+/// A database grant alone does not prove policy visibility through object/schema DENYs.
+pub(crate) const ROW_SECURITY_DENIED: &str = r#"EXISTS (SELECT 1 FROM sys.database_permissions dp
+WHERE dp.state = N'D' AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL')
+AND (dp.grantee_principal_id = USER_ID() OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1)
+AND ((dp.class = 1 AND dp.minor_id = 0 AND COALESCE(HAS_PERMS_BY_NAME(
+QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id)),
+N'OBJECT', N'VIEW DEFINITION'), 0) <> 1)
+OR (dp.class = 3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),
+N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1)))"#;
 
 /// Every probe a plan implies.
 ///
@@ -1260,14 +1271,7 @@ fn counting_statement(r: &Referencing<'_>) -> String {
     format!(
         "IF COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION'), 0) <> 1\n\
              THROW 50000, N'Cannot count referencing rows: inspecting row-level security policies requires database VIEW DEFINITION.', 1;\n\
-         IF EXISTS (SELECT 1 FROM sys.database_permissions dp\n\
-                    WHERE dp.state = N'D' AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL')\n\
-                      AND (dp.grantee_principal_id = USER_ID() OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1)\n\
-                      AND ((dp.class = 1 AND dp.minor_id = 0 AND COALESCE(HAS_PERMS_BY_NAME(\n\
-                           QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id)),\n\
-                           N'OBJECT', N'VIEW DEFINITION'), 0) <> 1)\n\
-                        OR (dp.class = 3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),\n\
-                           N'SCHEMA', N'VIEW DEFINITION'), 0) <> 1)))\n\
+         IF {ROW_SECURITY_DENIED}\n\
              THROW 50000, N'Cannot count referencing rows: an effective object/schema metadata DENY prevents a complete view of row-level security policies.', 1;\n\
          DECLARE @n int = 0, @sql nvarchar(max);\n\
          SELECT @sql = STRING_AGG(CONVERT(nvarchar(max), x.stmt), N' ')\n\

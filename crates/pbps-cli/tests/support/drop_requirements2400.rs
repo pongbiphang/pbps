@@ -130,7 +130,7 @@ fn outcome(server: &str) {
     );
     let explained = succeeds(d.run(&["explain", "--plan", plan.to_str().unwrap()]));
     assert!(stdout(&explained).contains(PREDICATE));
-    assert!(stdout(&explained).contains("readers and writers wait"));
+    assert!(stdout(&explained).contains("exclusive table lock through the drop, so writers wait"));
     let sql = d.dir.join("guarded.sql");
     let out = d.run(&["plan", "--db", connection, "--sql", sql.to_str().unwrap()]);
     assert_ne!(code(&out), 0);

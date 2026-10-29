@@ -2857,6 +2857,50 @@
         "consumer_effective_columns::element_contexts_are_protected_through_connected_domain_rebuilds",
         "consumer_effective_columns::partition_overrides_keep_standing_interfaces_and_refuse_real_tightening"
       ]
+    },
+    {
+      "target": [
+        "pbps-mssql",
+        "test",
+        "live"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "drop_requirements2400::requirements_bind_only_target_columns_and_allowlisted_code",
+        "drop_requirements2400::requirements_use_actual_capabilities_and_catalog_collation",
+        "drop_requirements2400::requirements_count_false_and_unknown_and_refuse_without_a_transaction",
+        "drop_requirements2400::requirements_pin_binding_and_evaluation_and_restore_the_callers_settings",
+        "drop_requirements2400::requirements_refuse_filter_policies_and_unreadable_metadata_with_remedies",
+        "drop_requirements2400::requirement_counts_are_current_even_inside_a_preexisting_snapshot",
+        "drop_requirements2400::requirement_count_locks_every_partition_until_the_emitted_drop_commits"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "drop_requirements2400_mssql::guarded_drops_record_replace_clear_checksum_and_apply_on_sql_server",
+        "drop_requirements2400_mssql::a_late_violating_row_rolls_back_the_drop_and_prior_statements_on_sql_server",
+        "drop_requirements2400_mssql::unsafe_requirements_write_nothing_and_referenced_renames_split_the_plan_on_sql_server",
+        "drop_requirements2400_mssql::a_table_drop_honors_its_removed_columns_requirements_on_sql_server",
+        "drop_requirements2400_mssql::guarded_drops_follow_the_table_uid_through_a_rename_on_sql_server"
+      ]
     }
   ]
 }
