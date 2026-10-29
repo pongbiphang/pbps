@@ -340,6 +340,11 @@ impl Owners for InputOwners<'_> {
     }
 }
 impl Operation {
+    /// Immutable name-input evidence, independent of risk/finding metadata.
+    /// A replay receipt cannot survive replacing a shared address contract.
+    pub fn same_input_binding(&self, other: &Self) -> bool {
+        self.id == other.id && self.origin == other.origin && self.addresses == other.addresses
+    }
     pub fn logical_origin(&self) -> &Origin {
         &self.origin
     }

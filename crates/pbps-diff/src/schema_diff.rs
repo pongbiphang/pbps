@@ -1015,6 +1015,32 @@ pub(crate) fn diff_partial_rebuilding(
         declared: declared.ids.index(),
     };
 
+    // One UID-derived address/template map, shared by every moving boundary.
+    // Pending is a pure comparison; diff_columns still runs once in its usual place.
+    let parent_shapes: BTreeMap<_, _> = base_tables
+        .iter()
+        .filter_map(|(uid, old_name)| {
+            if !dialect.partition_meetings() {
+                return None;
+            }
+            let new_name = declared_tables.get(uid)?;
+            let old = base.schema.tables.get(old_name)?;
+            let new = declared.schema.tables.get(new_name)?;
+            let pending = old.partition_by.is_some()
+                && old.partition_of.is_none()
+                && new.partition_by.is_some()
+                && new.partition_of.is_none()
+                && (old_name != new_name || parent_shape_changes(old, new));
+            Some((uid, (old_name, new_name, new, pending)))
+        })
+        .collect();
+    let final_parent = |name: &TableName| {
+        base.ids
+            .table_uid(name)
+            .and_then(|uid| parent_shapes.get(uid))
+            .map_or_else(|| name.clone(), |(_, name, _, _)| (*name).clone())
+    };
+
     // Table present only in the base: dropped. Its foreign keys are dropped
     // first as separate changes — two dropped tables that reference each other
     // would otherwise fail or succeed depending on which DROP TABLE runs first.
@@ -1038,7 +1064,7 @@ pub(crate) fn diff_partial_rebuilding(
                     .tables
                     .get(name)
                     .and_then(|t| t.partition_of.as_ref())
-                    .map(|of| of.parent.clone()),
+                    .map(|of| final_parent(&of.parent)),
             });
         }
     }
@@ -1271,12 +1297,16 @@ pub(crate) fn diff_partial_rebuilding(
                         &renames.apply(base_table, base_name),
                         declared_table,
                         dialect,
+                        base.ids
+                            .table_uid(&of.parent)
+                            .and_then(|uid| parent_shapes.get(uid))
+                            .is_some_and(|(_, _, _, pending)| *pending),
                     )
                 }) {
                 Ok(names) => changes.push(Change::DetachPartition {
                     uid: uid.clone(),
                     table: declared_name.clone(),
-                    parent: of.parent.clone(),
+                    parent: final_parent(&of.parent),
                     names,
                     shape: Box::new(declared_table.clone()),
                 }),
@@ -1306,6 +1336,11 @@ pub(crate) fn diff_partial_rebuilding(
                 of,
                 dialect,
                 read_back,
+                declared
+                    .ids
+                    .table_uid(&of.parent)
+                    .and_then(|uid| parent_shapes.get(uid))
+                    .map(|(old, _, goal, pending)| (*old, *pending, *goal)),
             ) {
                 Ok(Attached {
                     table,
@@ -4160,6 +4195,7 @@ fn detached_names(
     partition: &Table,
     declared: &Table,
     dialect: &(impl Dialect + ?Sized),
+    pending_columns: bool,
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
@@ -4244,7 +4280,7 @@ fn detached_names(
             })
             .collect()
     };
-    if columns(parent) != columns(declared) {
+    if !pending_columns && columns(parent) != columns(declared) {
         what.push("its columns are not its parent's, in its parent's order".to_owned());
     }
     match (&parent.primary_key, &declared.primary_key) {
@@ -4351,6 +4387,19 @@ fn detached_names(
     }
 }
 
+/// Column facts only: annotations and dependents do not make a meeting (DEC-2296.10).
+fn parent_shape_changes(old: &Table, new: &Table) -> bool {
+    old.computed != new.computed
+        || !old
+            .columns
+            .iter()
+            .map(|(n, c)| (n, &c.ty, &c.collation, c.nullable, &c.value_source))
+            .eq(new
+                .columns
+                .iter()
+                .map(|(n, c)| (n, &c.ty, &c.collation, c.nullable, &c.value_source)))
+}
+
 /// A table being attached as declared (#1545): itself as a partition the
 /// moment the attach has run, holding only what the engine leaves it of its
 /// own, and its columns without a default where the parent's has one.
@@ -4391,12 +4440,16 @@ fn attached(
     of: &pbps_model::PartitionOf,
     dialect: &(impl Dialect + ?Sized),
     read_back: Option<&Schema>,
+    boundary: Option<(&TableName, bool, &Table)>,
 ) -> Result<Attached, Vec<String>> {
     let mut what = Vec::new();
+    let parent_name = boundary.map_or(&of.parent, |(name, _, _)| name);
+    let pending_columns = boundary.is_some_and(|(_, pending, _)| pending);
+    let goal_parent = boundary.map(|(_, _, goal)| goal);
     let Some(parent) = base
         .schema
         .tables
-        .get(&of.parent)
+        .get(parent_name)
         .filter(|p| p.partition_by.is_some() && p.partition_of.is_none())
     else {
         return Err(vec![format!(
@@ -4500,7 +4553,7 @@ fn attached(
         }
         t
     };
-    let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, &of.parent));
+    let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, parent_name));
     let (mine, theirs) = (
         columns(&table_spelled, false),
         columns(&parent_spelled, true),
@@ -4513,17 +4566,18 @@ fn attached(
     };
     // The names themselves, not their joined spelling, which two lists can
     // share when a name holds `, ` (#1642 review).
-    if !mine
-        .iter()
-        .map(|(n, _)| n)
-        .eq(theirs.iter().map(|(n, _)| n))
+    if !pending_columns
+        && !mine
+            .iter()
+            .map(|(n, _)| n)
+            .eq(theirs.iter().map(|(n, _)| n))
     {
         what.push(format!(
             "its columns are ({}), and its parent's are ({}), in that order",
             names(&mine),
             names(&theirs)
         ));
-    } else {
+    } else if !pending_columns {
         for ((name, a), (_, b)) in mine.iter().zip(&theirs) {
             if a != b {
                 what.push(format!(
@@ -4553,6 +4607,18 @@ fn attached(
             }
         }
     }
+    if pending_columns
+        && (base_name.schema != parent_name.schema || base_name.schema != of.parent.schema)
+        && table
+            .columns
+            .values()
+            .any(|c| matches!(c.value_source, ValueSource::Generated(_)))
+    {
+        what.push(
+            "a generated column is in another schema; move the table to its parent's schema first"
+                .into(),
+        );
+    }
     let mut own_columns = BTreeMap::new();
     let mut defaultless = Vec::new();
     for (name, c) in &table.columns {
@@ -4563,10 +4629,11 @@ fn attached(
                 name = name.shown(),
             ));
         }
-        let Some(p) = parent.columns.get(name) else {
+        let p = parent.columns.get(name);
+        if p.is_none() && !pending_columns {
             continue;
-        };
-        if c.nullable && !p.nullable {
+        }
+        if !pending_columns && c.nullable && p.is_some_and(|p| !p.nullable) {
             what.push(format!(
                 "its column `{name}` is nullable, and its parent's is NOT NULL",
                 name = name.shown(),
@@ -4586,17 +4653,30 @@ fn attached(
                 | ValueSource::Generated(_) => None,
             })
             .filter(|d| {
-                base_name.schema != of.parent.schema
+                pending_columns
+                    || base_name.schema != of.parent.schema
                     || Some(d)
-                        != (match &p.value_source {
-                            ValueSource::Default(value) => Some(value),
-                            ValueSource::None
-                            | ValueSource::Identity(_)
-                            | ValueSource::Sequence(_)
-                            | ValueSource::Generated(_) => None,
+                        != (match p.map(|p| &p.value_source) {
+                            Some(ValueSource::Default(value)) => Some(value),
+                            None
+                            | Some(
+                                ValueSource::None
+                                | ValueSource::Identity(_)
+                                | ValueSource::Sequence(_)
+                                | ValueSource::Generated(_),
+                            ) => None,
                         })
             }),
-            not_null: !c.nullable && p.nullable,
+            // This is the managed comparison template, not an ATTACH result.
+            // The symbolic merge independently proves the actual local flag.
+            not_null: !c.nullable
+                && (if pending_columns {
+                    goal_parent
+                        .and_then(|p| p.columns.get(name))
+                        .is_some_and(|p| p.nullable)
+                } else {
+                    p.is_some_and(|p| p.nullable)
+                }),
         };
         if (match &c.value_source {
             ValueSource::Default(_) => false,
@@ -4604,9 +4684,18 @@ fn attached(
             | ValueSource::Identity(_)
             | ValueSource::Sequence(_)
             | ValueSource::Generated(_) => true,
-        }) && (match &p.value_source {
-            ValueSource::Default(_) | ValueSource::Sequence(_) => true,
-            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
+        }) && (match (if pending_columns {
+            goal_parent.and_then(|p| p.columns.get(name))
+        } else {
+            p
+        })
+        .map(|p| &p.value_source)
+        {
+            Some(ValueSource::Default(_) | ValueSource::Sequence(_)) => true,
+            None
+            | Some(ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_)) => {
+                false
+            }
         }) {
             defaultless.push(name.clone());
         }
@@ -8378,6 +8467,7 @@ mod tests {
                 &declared,
                 &of,
                 &MinimalDialect,
+                None,
                 None,
             )
         };
@@ -27223,6 +27313,181 @@ mod type_replacement_tests {
                 )
                 .is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+mod meeting_shape_tests {
+    use super::*;
+    use pbps_dialect::{DialectError, MinimalDialect, TypeChangeRisk};
+    struct Engine {
+        enabled: bool,
+        label: &'static str,
+    }
+    impl Dialect for Engine {
+        fn name(&self) -> &'static str {
+            self.label
+        }
+        fn partition_meetings(&self) -> bool {
+            self.enabled
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn transaction_framing(
+            &self,
+            z: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(z)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            None
+        }
+        fn normalize_type(&self, t: &ColumnType) -> Result<ColumnType, DialectError> {
+            MinimalDialect.normalize_type(t)
+        }
+        fn type_change_risk(&self, a: &ColumnType, b: &ColumnType) -> TypeChangeRisk {
+            MinimalDialect.type_change_risk(a, b)
+        }
+        fn fold_ident<'a>(&self, i: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(i)
+        }
+        fn quote_ident(&self, i: &str) -> Result<String, DialectError> {
+            MinimalDialect.quote_ident(i)
+        }
+        fn validate_table(&self, n: &TableName, t: &Table) -> Vec<DialectError> {
+            MinimalDialect.validate_table(n, t)
+        }
+        fn intermediate_tables(
+            &self,
+            c: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<TableName>, DialectError> {
+            MinimalDialect.intermediate_tables(c, strategy)
+        }
+    }
+    #[test]
+    fn pending_shape_ignores_annotations_but_keeps_every_column_fact() {
+        let old = Table {
+            columns: [(
+                "d".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let mut annotated = old.clone();
+        annotated.columns.get_mut("d").unwrap().description = Some("description".into());
+        annotated.columns.get_mut("d").unwrap().deprecated = Some("reason".into());
+        assert!(!parent_shape_changes(&old, &annotated));
+        for property in 0..6 {
+            let mut new = old.clone();
+            let c = new.columns.get_mut("d").unwrap();
+            match property {
+                0 => c.ty = "bigint".parse().unwrap(),
+                1 => c.nullable = false,
+                2 => c.collation = Some(pbps_model::Collation::new("other")),
+                3 => c.value_source = ValueSource::Default("1".into()),
+                4 => {
+                    new.columns.swap_remove("d");
+                }
+                _ => {
+                    let c = new.columns.shift_remove("d").unwrap();
+                    new.columns.insert("e".into(), c);
+                }
+            }
+            assert!(parent_shape_changes(&old, &new), "property {property}");
+        }
+    }
+    #[test]
+    fn meeting_addresses_follow_capability_and_uid_while_guards_remain() {
+        use pbps_model::{Column, PartitionBound, PartitionBy, PartitionOf};
+        let p: TableName = "app.p".parse().unwrap();
+        let q: TableName = "app.q".parse().unwrap();
+        let a: TableName = "app.a".parse().unwrap();
+        let parent = Table {
+            partition_by: Some(PartitionBy {
+                columns: vec!["k".into()],
+                strategy: Default::default(),
+                external: false,
+            }),
+            columns: [("k".into(), Column::new("integer".parse().unwrap()))].into(),
+            ..Default::default()
+        };
+        let mut plain = parent.clone();
+        plain.partition_by = None;
+        let part = Table {
+            partition_of: Some(PartitionOf {
+                parent: p.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        for attaching in [false, true] {
+            let mut base = Schema::default();
+            base.tables.insert(p.clone(), parent.clone());
+            base.tables.insert(
+                a.clone(),
+                if attaching {
+                    plain.clone()
+                } else {
+                    part.clone()
+                },
+            );
+            let mut goal = Schema::default();
+            goal.tables.insert(q.clone(), parent.clone());
+            let mut final_part = part.clone();
+            final_part.partition_of.as_mut().unwrap().parent = q.clone();
+            goal.tables.insert(
+                a.clone(),
+                if attaching { final_part } else { plain.clone() },
+            );
+            let mut ids = IdsFile::default();
+            ids.tables.insert("t_aaaaaa".parse().unwrap(), p.clone());
+            ids.tables.insert("t_bbbbbb".parse().unwrap(), a.clone());
+            ids.columns
+                .insert("c_aaaaaa".parse().unwrap(), p.column("k"));
+            let mut after = ids.clone();
+            after.tables.insert("t_aaaaaa".parse().unwrap(), q.clone());
+            after
+                .columns
+                .insert("c_aaaaaa".parse().unwrap(), q.column("k"));
+            for label in ["postgres", "other"] {
+                for enabled in [false, true] {
+                    let engine = Engine { label, enabled };
+                    let d = diff_partial(
+                        Side {
+                            schema: &base,
+                            ids: &ids,
+                        },
+                        Side {
+                            schema: &goal,
+                            ids: &after,
+                        },
+                        &engine,
+                        &Hints::default(),
+                    );
+                    assert!(
+                        !d.errors.is_empty(),
+                        "the retained parent-rename guard is still active"
+                    );
+                    let boundary = d.changes.changes.iter().find_map(|p| match &p.change {
+                        Change::AttachPartition { parent, .. }
+                        | Change::DetachPartition { parent, .. } => Some(parent),
+                        _ => None,
+                    });
+                    if enabled {
+                        assert_eq!(boundary, Some(&q));
+                    } else if attaching {
+                        assert!(boundary.is_none());
+                    } else {
+                        assert_eq!(boundary, Some(&p));
+                    }
+                }
+            }
         }
     }
 }

@@ -195,7 +195,7 @@ impl<S> PlanningPlan<S> {
         pending: impl IntoIterator<Item = super::boundaries::Boundary>,
         modules: pbps_model::operation::ModuleEdits,
     ) {
-        self.boundaries.require(pending, modules);
+        self.boundaries.require(pending, modules, &self.payload);
         if !self.boundaries.is_empty() && self.identities.is_none() {
             self.identities = Some(pbps_model::operation::Operations::expanded(
                 self.logical,

@@ -1,9 +1,8 @@
 //! Pending boundary comparisons remain attached to the immutable proposal.
-//! A settled permutation alone does not discharge a membership contract.
+//! A settled permutation alone does not discharge a membership contract (DEC-2296.10).
 use super::membership;
 use pbps_model::operation::{
-    Effects, End, Lineage, ModuleEdits, Operation, OperationId, Operations, Origin, Snapshot,
-    Standing,
+    Effects, End, Lineage, ModuleEdits, Operation, Operations, Snapshot, Standing,
     symbolic::{Clause, MoveKind, State},
 };
 use pbps_model::{Change, ChangeSet, Uid};
@@ -23,11 +22,12 @@ pub(super) struct Obligations {
     checked: Option<Receipt>,
     modules: Option<ModuleEdits>,
     rebuild: bool,
+    logical_names: Option<ChangeSet>,
 }
 #[derive(Debug, Clone)]
 struct Receipt {
     steps: Vec<Change>,
-    events: Vec<(OperationId, Origin)>,
+    events: Vec<Operation>,
 }
 impl Obligations {
     pub(super) fn parents(&self) -> BTreeSet<Uid> {
@@ -44,11 +44,21 @@ impl Obligations {
         &mut self,
         pending: impl IntoIterator<Item = Boundary>,
         modules: ModuleEdits,
+        logical: &ChangeSet,
     ) {
         self.pending.extend(pending);
         if !self.pending.is_empty() {
             self.modules = Some(modules);
+            self.logical_names.get_or_insert_with(|| logical.clone());
             self.checked = None;
+        }
+    }
+    pub(super) fn names<'a>(&'a self, current: &'a ChangeSet) -> &'a ChangeSet {
+        self.logical_names.as_ref().unwrap_or(current)
+    }
+    pub(super) fn append_names(&mut self, parts: &[pbps_model::PlannedChange]) {
+        if let Some(names) = &mut self.logical_names {
+            names.changes.extend_from_slice(parts);
         }
     }
     pub(super) fn module_edits(&self) -> ModuleEdits {
@@ -75,11 +85,12 @@ impl Obligations {
                     .steps
                     .iter()
                     .eq(plan.changes.iter().map(|p| &p.change))
+                    && checked.events.len() == events.len()
                     && checked
                         .events
                         .iter()
                         .zip(events.iter())
-                        .all(|((id, origin), op)| *id == op.id() && origin == op.origin())
+                        .all(|(old, op)| old.same_input_binding(op))
                     && plan.origins.iter().eq(events.iter().map(|op| op.origin()))
             })
         {
@@ -114,10 +125,7 @@ impl Obligations {
         membership::project(ops, fx, base).map_err(|why| why.to_string())?;
         self.checked = Some(Receipt {
             steps: ops.iter().map(|op| op.change().clone()).collect(),
-            events: ops
-                .iter()
-                .map(|op| (op.id(), op.origin().clone()))
-                .collect(),
+            events: ops.to_vec(),
         });
         Ok(())
     }
@@ -351,5 +359,179 @@ pub(super) fn transfers(
             }
         }
         effect.symbolic.extend(errors);
+    }
+}
+
+/// Revalidate the actual continuation without adding a step, edge, proof
+/// union or settlement. Only this immutable receipt can cross certification.
+pub(super) fn replay<S>(
+    plan: &mut super::PlanningPlan<S>,
+    before: crate::Side<'_>,
+    after: crate::Side<'_>,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
+) -> Result<(), String> {
+    use pbps_model::operation::{PlanOwners, Snapshot};
+    use pbps_model::physical_sources::{Located, PhysicalSources};
+    use pbps_model::plan_names::{At, PlanNames};
+    if plan.boundaries.is_empty() {
+        return Ok(());
+    }
+    let operations = plan
+        .identities
+        .as_ref()
+        .map(|ops| ops.with_steps(&plan.changes))
+        .unwrap_or_else(|| {
+            Operations::expanded(
+                plan.logical,
+                plan.origins
+                    .iter()
+                    .cloned()
+                    .zip(plan.changes.iter().cloned()),
+                plan.boundaries.module_edits(),
+            )
+        });
+    let names = PlanNames::of(&plan.boundaries.names(plan).changes, after.ids)
+        .map_err(|e| e.to_string())?;
+    let owners = PlanOwners::new(names, before.ids, after.ids);
+    let effects = super::shadow::analyse_with_membership(
+        &operations,
+        &owners,
+        Snapshot {
+            schema: before.schema,
+            ids: before.ids,
+        },
+        Snapshot {
+            schema: after.schema,
+            ids: after.ids,
+        },
+        dialect,
+        None,
+        stored,
+    );
+    if let Some((_, error)) = effects.unowned.first() {
+        return Err(error.to_string());
+    }
+    // The full ordered physical column list is checked at ATTACH, not against
+    // either endpoint's parent shape. PhysicalSources retains source order.
+    let actual = PlanNames::of(&plan.changes, after.ids).map_err(|e| e.to_string())?;
+    let physical = PhysicalSources::of(actual, before.schema, before.ids)
+        .map_err(|e| format!("{e}; {}", membership::REMEDY))?;
+    for (at, op) in operations.iter().enumerate() {
+        if let Change::AttachPartition { table, parent, .. } = op.change() {
+            if !matches!(physical.members_at(parent, At::Before(at)), Located::Present(members) if !members.contains(table))
+            {
+                return Err(format!(
+                    "{} has no complete standalone membership at its attachment boundary; {}",
+                    table.shown(),
+                    membership::REMEDY
+                ));
+            }
+            match (
+                physical.columns_at(parent, At::Before(at)),
+                physical.columns_at(table, At::Before(at)),
+            ) {
+                (Located::Present(expected), Located::Present(candidate))
+                    if expected == candidate => {}
+                _ => {
+                    return Err(format!(
+                        "{} does not match {} in physical column order at its attachment boundary; {}",
+                        table.shown(),
+                        parent.shown(),
+                        membership::REMEDY
+                    ));
+                }
+            }
+        }
+        if let Change::DetachPartition {
+            table,
+            parent,
+            shape,
+            ..
+        } = op.change()
+        {
+            if !matches!(physical.members_at(parent, At::Before(at)), Located::Present(members) if members.contains(table))
+            {
+                return Err(format!(
+                    "{} has no complete attached membership at its detachment boundary; {}",
+                    table.shown(),
+                    membership::REMEDY
+                ));
+            }
+            let expected: Vec<_> = shape
+                .columns
+                .keys()
+                .chain(shape.computed.keys())
+                .cloned()
+                .collect();
+            if physical.columns_at(table, At::Before(at)) != Located::Present(expected) {
+                return Err(format!(
+                    "{} does not retain its declared columns in physical order at its detachment boundary; {}",
+                    table.shown(),
+                    membership::REMEDY
+                ));
+            }
+        }
+    }
+    plan.boundaries
+        .discharge(operations.as_slice(), &effects.effects, &effects.symbolic)?;
+    lock_window(plan, before, after);
+    plan.identities = Some(operations);
+    Ok(())
+}
+
+/// Describe the existing transaction's lock window; never an ordering rule.
+fn lock_window<S>(
+    plan: &mut super::PlanningPlan<S>,
+    before: crate::Side<'_>,
+    after: crate::Side<'_>,
+) {
+    use pbps_model::change::ColumnProperty;
+    use pbps_model::operation::symbolic::Attribute;
+    let id = "plan.partition-alter-attach-lock";
+    if !plan.changes.iter().any(|p| {
+        matches!(&p.change, Change::AttachPartition { uid, .. }
+        if plan.boundaries.pending.iter().any(|b| &b.child == uid))
+    }) || plan
+        .changes
+        .iter()
+        .any(|p| p.findings.iter().any(|f| f.id == id))
+    {
+        return;
+    }
+    let first = plan.changes.iter().enumerate().find_map(|(at, p)| {
+        let uid = p.change.parent_column_uid()?;
+        let transitions = p.change.column_transitions();
+        // Retuning an owned sequence changes only Numbering, not the table.
+        // A column statement with no changed value can still hold its lock.
+        if !transitions.is_empty()
+            && transitions
+                .iter()
+                .all(|t| t.property == ColumnProperty::Column(Attribute::Numbering))
+        {
+            return None;
+        }
+        let parent = [before.ids, after.ids]
+            .into_iter()
+            .find_map(|ids| ids.columns.get(uid).and_then(|c| ids.table_uid(&c.table)))?;
+        plan.boundaries
+            .pending
+            .iter()
+            .any(|b| &b.parent == parent)
+            .then_some(at)
+    });
+    if let Some(at) = first {
+        super::writebacks::findings(
+            plan,
+            &[(
+                at,
+                pbps_model::Finding::new(
+                    id,
+                    pbps_model::Severity::Note,
+                    "This plan holds ACCESS EXCLUSIVE on the parent tree from the first parent ALTER until commit; the attach validation scan runs inside that lock window. This can hold the tree lock longer than separate plans. You may split the column and partition changes into separate plans.",
+                    None,
+                ),
+            )],
+        );
     }
 }

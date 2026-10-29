@@ -128,6 +128,8 @@
 //! table is the disaster the `data-delete` gate exists for, so those rows are
 //! counted and the apply stops the same way.
 
+mod membership;
+
 use pbps_model::ColumnName;
 use pbps_model::ValueSource;
 use std::cell::LazyCell;
@@ -2973,6 +2975,24 @@ fn keys(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("r.k{i}")).collect()
 }
 
+/// Selected physical inputs are read once each, without PostgreSQL recursion.
+fn scalar_read(sources: &[ColumnRef]) -> Result<(String, String), DialectError> {
+    let branches = sources
+        .iter()
+        .map(|source| {
+            Ok(format!(
+                "SELECT {} AS v FROM ONLY {}",
+                quote(source.name.raw())?,
+                qualified(&source.table)?
+            ))
+        })
+        .collect::<Result<Vec<_>, DialectError>>()?;
+    Ok((
+        format!("({}) AS contribution", branches.join(" UNION ALL ")),
+        "v".into(),
+    ))
+}
+
 /// The NULLs a `NOT NULL` would reject.
 ///
 /// `from` is the relation the statement will meet and `reads` is how a row in
@@ -3121,6 +3141,7 @@ fn build<'v, 'p: 'v>(
     names: &impl Deref<Target = AsStored<'v, 'p>>,
     unchecked: &mut Vec<Unchecked>,
     label_arrays: usize,
+    sources: Option<&[ColumnRef]>,
 ) -> Result<Vec<Probe>, DialectError> {
     if reads_recomputed(names, change) {
         return Ok(skip(
@@ -3209,6 +3230,10 @@ fn build<'v, 'p: 'v>(
             to_nullable: false,
             ..
         } => {
+            if let Some(sources) = sources {
+                let (from, reads) = scalar_read(sources)?;
+                return Ok(vec![null_probe(column, &from, &reads)]);
+            }
             let Some(rows) = rows_after(
                 names,
                 &column.table,
@@ -3348,8 +3373,13 @@ fn build<'v, 'p: 'v>(
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
-            let table = qualified(&stored.table)?;
-            let quoted = quote(stored.name.raw())?;
+            if sources.is_some() && using.is_some() {
+                return Ok(skip(change, "a membership conversion expression cannot be evaluated over selected stored columns before apply", unchecked));
+            }
+            let (table, quoted) = match sources {
+                Some(sources) => scalar_read(sources)?,
+                None => (qualified(&stored.table)?, quote(stored.name.raw())?),
+            };
             let mut out = Vec::new();
             // A recorded conversion is evaluated over every stored row, and
             // the probe fails when the engine does: a value the expression
@@ -4099,6 +4129,7 @@ fn without_filtered_rows(
     sql: &str,
     change: &Change,
     names: &AsStored<'_, '_>,
+    sources: Option<&[ColumnRef]>,
 ) -> Result<String, DialectError> {
     let mut relations = BTreeSet::new();
     if let Some(table) = change.table() {
@@ -4115,11 +4146,17 @@ fn without_filtered_rows(
                 .map(|fk| fk.references_table.clone()),
         );
     }
-    let active: Vec<String> = relations
+    let stored: BTreeSet<_> = match sources {
+        Some(sources) => sources.iter().map(|c| c.table.clone()).collect(),
+        None => relations
+            .iter()
+            .filter_map(|table| names.view().table(table))
+            .collect(),
+    };
+    let active: Vec<String> = stored
         .iter()
-        .filter_map(|table| names.view().table(table))
         .map(|table| {
-            qualified(&table).map(|name| {
+            qualified(table).map(|name| {
                 format!(
                     "pg_catalog.row_security_active({}::regclass)",
                     value_literal(&name)
@@ -4193,7 +4230,11 @@ fn relabel_arrays(change: &Change, plan: &PlanNames<'_>) -> usize {
 ///
 /// A probe that cannot be built is reported as unchecked, keeping it distinct
 /// from a change that needs no data question at all.
-pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partitions) -> Preflight {
+pub(crate) fn probes(
+    plan_names: &PlanNames<'_>,
+    partitions: &pbps_model::Partitions,
+    before: Option<pbps_model::operation::Snapshot<'_>>,
+) -> Preflight {
     let facts = PlanFacts::of(plan_names);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
@@ -4222,12 +4263,25 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
             names
         });
-        match build(
-            &p.change,
-            &names,
-            &mut unchecked,
-            relabel_arrays(&p.change, plan_names),
-        ) {
+        let sources = before.and_then(|before| membership::sources(plan_names, step, before));
+        let selected = sources
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(Vec::as_slice);
+        let built = match sources.as_ref() {
+            Some(Err(error)) => Err(DialectError::Invalid {
+                dialect: "postgres",
+                message: error.to_string(),
+            }),
+            _ => build(
+                &p.change,
+                &names,
+                &mut unchecked,
+                relabel_arrays(&p.change, plan_names),
+                selected,
+            ),
+        };
+        match built {
             // A probe of a DEFAULT partition's own rows, after a move out of
             // it, counts rows that are gone by then: a check the moved rows
             // break, or a duplicate between a moved row and a kept one,
@@ -4251,7 +4305,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
                         out.push(probe);
                         continue;
                     }
-                    match without_filtered_rows(&probe.sql, &p.change, &names) {
+                    match without_filtered_rows(&probe.sql, &p.change, &names, selected) {
                         Ok(sql) => {
                             probe.sql = sql;
                             out.push(probe);
@@ -4459,8 +4513,9 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
         }
     }
     partition_probes(
-        plan_names.changes(),
+        plan_names,
         &facts,
+        before,
         partitions,
         &mut out,
         &mut unchecked,
@@ -4478,12 +4533,14 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
 /// dropped, which the engine refuses to detach. Both are asked of the current
 /// prefix, because a partition already dropped has taken its rows with it.
 fn partition_probes(
-    changes: &[pbps_model::PlannedChange],
+    plan_names: &PlanNames<'_>,
     facts: &PlanFacts,
+    before: Option<pbps_model::operation::Snapshot<'_>>,
     partitions: &pbps_model::Partitions,
     out: &mut Vec<Probe>,
     unchecked: &mut Vec<Unchecked>,
 ) {
+    let changes = plan_names.changes();
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
@@ -4502,6 +4559,12 @@ fn partition_probes(
             names
         });
         let names = &projection;
+        let rows = |tables: &[&TableName], probe: Result<Probe, DialectError>| {
+            if let Some(before) = before {
+                membership::unchanged(plan_names, step, before, tables)?;
+            }
+            probe
+        };
         // Only completed detach/drop statements remove rows from a range
         // check. A later removal cannot make this statement valid.
         let leaving = |of: &TableName| {
@@ -4556,8 +4619,10 @@ fn partition_probes(
             // the catalog's to say when the move runs, and the moving
             // statement asks the values it meets there (#1763 review).
             if names.recomputed.is_empty() && names.retyped.is_empty() {
-                match default_reference_probe(name, &parent, &stored, names, &dropped_before, bound)
-                {
+                match rows(
+                    &[default],
+                    default_reference_probe(name, &parent, &stored, names, &dropped_before, bound),
+                ) {
                     Ok(probe) => out.push(probe),
                     Err(error) => {
                         unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
@@ -4573,17 +4638,33 @@ fn partition_probes(
             // An unlogged table is in no publication, whatever it publishes:
             // measured on 16 and 18, the subscriber went on replicating
             // (#1763 review).
-            let inserted = (!table.unlogged)
-                .then(|| default_insert_publication_probe(name, &parent, &stored, bound));
+            let inserted = (!table.unlogged).then(|| {
+                rows(
+                    &[default],
+                    default_insert_publication_probe(name, &parent, &stored, bound),
+                )
+            });
             // The rows a human did not allow to move (#1788), asked by
             // their count alone: the questions above say what a move would
             // set off, this one whether it may happen at all.
-            let unallowed = default_move_bound_probe(name, &parent, &stored, bound, *moves_at_most);
+            let unallowed = rows(
+                &[default],
+                default_move_bound_probe(name, &parent, &stored, bound, *moves_at_most),
+            );
             for probe in [
-                default_hidden_referencers_probe(name, &parent, &stored, names, bound),
-                default_trigger_probe(name, &parent, &stored, &gone, bound),
+                rows(
+                    &[default],
+                    default_hidden_referencers_probe(name, &parent, &stored, names, bound),
+                ),
+                rows(
+                    &[default],
+                    default_trigger_probe(name, &parent, &stored, &gone, bound),
+                ),
                 default_statement_probe(name, &stored, &gone),
-                default_publication_probe(name, &parent, &stored, bound),
+                rows(
+                    &[default],
+                    default_publication_probe(name, &parent, &stored, bound),
+                ),
             ]
             .into_iter()
             .chain(inserted)
@@ -4611,12 +4692,15 @@ fn partition_probes(
                 .view()
                 .table(&of.parent)
                 .unwrap_or_else(|| of.parent.clone());
-            partition_range_probe(
-                name,
-                &parent,
-                &before_the_plan(&of.parent, bound),
-                &leaving,
-                "create a partition",
+            rows(
+                &[&of.parent],
+                partition_range_probe(
+                    name,
+                    &parent,
+                    &before_the_plan(&of.parent, bound),
+                    &leaving,
+                    "create a partition",
+                ),
             )
         } else if let Change::DropTable {
             name,
@@ -4653,7 +4737,7 @@ fn partition_probes(
             let leaving = leaving(parent);
             let bound = &before_the_plan(parent, bound);
             for probe in [
-                attach_range_probe(table, parent, bound),
+                rows(&[table], attach_range_probe(table, parent, bound)),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {
@@ -4667,7 +4751,10 @@ fn partition_probes(
             if matches!(bound, pbps_model::PartitionBound::Hash { .. }) {
                 continue;
             }
-            partition_range_probe(table, parent, bound, &leaving, "attach a table")
+            rows(
+                &[parent],
+                partition_range_probe(table, parent, bound, &leaving, "attach a table"),
+            )
         } else if let Change::AttachPartition {
             table,
             parent,
@@ -4705,7 +4792,10 @@ fn partition_probes(
                 .collect();
             let beside: Vec<&pbps_model::PartitionBound> = beside.iter().collect();
             for probe in [
-                attach_default_rows_probe(table, parent, &beside, &leaving),
+                rows(
+                    &[table],
+                    attach_default_rows_probe(table, parent, &beside, &leaving),
+                ),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {

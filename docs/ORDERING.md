@@ -230,12 +230,16 @@ PG mappings live in engine effects; the model contains no engine-specific
 merge or catalog query. The soundness, necessity and complete-state determinism
 corpus also enumerates merges and both parent-version cuts.
 
-The contract is not activated for guarded plans yet. `attached()` and
-`detached_names()`, early weave/source projections, shipping engine clauses
-and boundary probe grounding remain the column/part PRs' integration work.
-Those PRs carry typed obligations to the existing effect settlement; they
-must not choose a preliminary order to construct their effects. Existing
-stages, Sink, brands, wire fields and the release-verifier policy stay intact.
+The high-level schema-diff guards remain until PR 7 activation. Endpoint
+shape differences register typed obligations without an early column diff or
+a preliminary order. Pending weave projections, engine clauses and stored-row
+probes use the shared lineage and address evidence. At the final schedule and
+resolver boundaries, `PhysicalSources` supplies complete positional membership
+and physical column lists, followed by symbolic replay and a receipt bound to
+payload, events, logical origins and immutable input bindings (DEC-2296.10).
+NULL and type predicates share the selected stored contributions and one RLS
+wrapper. Existing stages, Sink, brands, wire fields and release-verifier policy
+stay intact.
 Test-only small-order enumeration checks soundness and admitted-interval
 completeness; it is not a shipping search/ordering stage.
 

@@ -8141,6 +8141,10 @@ fn plan_db(
                 dialect.as_ref(),
                 &names,
                 &probe_partitions(&recorded_snapshot.schema, &names),
+                Some(pbps_model::operation::Snapshot {
+                    schema: &recorded_snapshot.schema,
+                    ids: &recorded_ids,
+                }),
                 None,
             )
             .await?;
@@ -10719,6 +10723,10 @@ async fn preflight<D: crate::emission::Engine>(
         dialect,
         &names,
         &probe_partitions(stored, &names),
+        Some(pbps_model::operation::Snapshot {
+            schema: stored,
+            ids: stored_ids,
+        }),
         Some(approved),
     )
     .await
@@ -10789,6 +10797,7 @@ async fn run_probes(
     dialect: &dyn pbps_dialect::Dialect,
     names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
+    sources: Option<pbps_model::operation::Snapshot<'_>>,
     approved: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
     pin_session(conn, dialect).await?;
@@ -10799,7 +10808,10 @@ async fn run_probes(
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let report = dialect.preflight_with(names, partitions);
+    let report = match sources {
+        Some(before) => dialect.preflight_with_sources(names, partitions, before),
+        None => dialect.preflight_with(names, partitions),
+    };
     for skipped in &report.unchecked {
         unchecked += 1;
         eprintln!(
@@ -16319,6 +16331,7 @@ mod tests {
                     .unwrap(),
                 &pbps_model::Partitions::default(),
                 None,
+                None,
             )
             .await;
             let after = read(conn.query(&sequence).await.expect("the sequence"));
@@ -16378,6 +16391,7 @@ mod tests {
                 &pbps_model::plan_names::PlanNames::of(&changes.changes, &IdsFile::default())
                     .unwrap(),
                 &pbps_model::Partitions::default(),
+                None,
                 None,
             )
             .await;
@@ -16459,6 +16473,7 @@ mod tests {
             &dialect,
             &pbps_model::plan_names::PlanNames::of(&changes.changes, &IdsFile::default()).unwrap(),
             &pbps_model::Partitions::default(),
+            None,
             None,
         )
         .await;

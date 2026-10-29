@@ -122,6 +122,7 @@ impl PlanningInput {
             } else {
                 super::plan::state(draft)
             };
+        draft.boundaries.append_names(&self.changes);
         let prior = draft.payload.changes.len();
         for part in &self.changes {
             draft

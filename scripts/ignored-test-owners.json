@@ -2195,6 +2195,8 @@
         "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",
         "positional_preflight_tests::a_catalog_key_counts_only_references_that_survive_the_current_delete",
         "positional_preflight_tests::tightening_sees_an_attached_child_only_after_the_attach",
+        "positional_preflight_tests::membership_null_probes_read_each_selected_stored_source_once",
+        "positional_preflight_tests::converted_membership_values_are_unchecked_and_engine_constraints_still_decide",
         "positional_preflight_tests::an_attach_cannot_borrow_a_later_detachs_empty_range",
         "positional_preflight_tests::a_new_key_validates_writes_before_its_own_step_and_never_after_it",
         "positional_preflight_tests::a_planned_key_counts_only_references_that_survive_the_current_delete",

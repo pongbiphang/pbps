@@ -415,3 +415,271 @@ fn version_binding_requires_a_unique_existing_writer_chain() {
         matches!(&fx[1].symbolic[..],[Clause::Recurse(w)] if w.input==Version::After(ops.as_slice()[0].id()) && w.from==value("a"))
     );
 }
+
+#[test]
+fn logical_name_positions_survive_permutation_and_appended_input() {
+    use pbps_model::operation::{Owners, Spelling};
+    use pbps_model::plan_names::{At, PlanNames};
+    let parent: Uid = "t_aaaaaa".parse().unwrap();
+    let child: Uid = "t_bbbbbb".parse().unwrap();
+    let mut base = pbps_model::IdsFile::default();
+    base.tables.insert(parent.clone(), "app.p".parse().unwrap());
+    base.tables.insert(child.clone(), "app.a".parse().unwrap());
+    let mut after = base.clone();
+    after
+        .tables
+        .insert(parent.clone(), "app.q".parse().unwrap());
+    after
+        .roles
+        .insert("r_bbbbbb".parse().unwrap(), "newreader".into());
+    let input = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: parent.clone(),
+                from: "app.p".parse().unwrap(),
+                to: "app.q".parse().unwrap(),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::AttachPartition {
+                uid: child.clone(),
+                table: "app.a".parse().unwrap(),
+                parent: "app.q".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Default,
+                key: vec![],
+                shape: Box::default(),
+            }),
+        ],
+    };
+    let mut plan = crate::order::propose(input);
+    plan.pending_boundaries(
+        [Boundary {
+            parent: parent.clone(),
+            child,
+        }],
+        ModuleEdits::InPlace,
+    );
+    let plan = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(
+        Change::CreateRole {
+            uid: "r_bbbbbb".parse().unwrap(),
+            name: "newreader".into(),
+        },
+    )])
+    .append_to(plan);
+    let mut schedule = Schedule::new(3);
+    schedule.edge(
+        2,
+        0,
+        crate::order::Source::Effect,
+        pbps_model::resolver::OrderReason::Structural,
+    );
+    schedule.edge(
+        0,
+        1,
+        crate::order::Source::Effect,
+        pbps_model::resolver::OrderReason::Structural,
+    );
+    let plan = schedule.settle(plan).unwrap().changes;
+    let attach = plan
+        .identities
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|op| matches!(op.change(), Change::AttachPartition { .. }))
+        .unwrap();
+    let history = plan.boundaries.names(&plan);
+    let names = PlanNames::of(&history.changes, &after).unwrap();
+    let owners = PlanOwners::new(names, &base, &after);
+    assert_eq!(
+        owners
+            .table(&"app.q".parse().unwrap(), attach.origin().spelling())
+            .unwrap(),
+        parent
+    );
+    assert_eq!(
+        owners
+            .role(&"newreader".into(), Spelling::At(At::After(2)))
+            .unwrap(),
+        "r_bbbbbb".parse().unwrap()
+    );
+    let current = PlanOwners::new(PlanNames::of(&plan.changes, &after).unwrap(), &base, &after);
+    assert!(
+        current
+            .table(&"app.q".parse().unwrap(), attach.origin().spelling())
+            .is_err()
+    );
+}
+
+#[test]
+fn public_companions_keep_their_events_while_their_steps_are_out_of_the_window() {
+    let (p, _, _, _) = fixture();
+    let part = PlannedChange::new(Change::PublicExecution {
+        routine: "app.f(integer)".parse().unwrap(),
+        access: pbps_model::PublicAccess::Kept,
+        origin: pbps_model::RoutineOrigin::Rebuilt,
+    });
+    let mut p = crate::order::writebacks::PlanningInput::new(vec![part]).append_to(p);
+    let original = p.identities.clone().unwrap();
+    let event = original.as_slice()[2].id();
+    let decisions = crate::order::take_public_execution(&mut p);
+    assert_eq!(p.changes.len(), 2);
+    assert_eq!(p.identities.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        p.identities.as_ref().unwrap().as_slice()[0].id(),
+        original.as_slice()[0].id()
+    );
+    p = crate::order::writebacks::PlanningInput::new(vec![PlannedChange::new(
+        Change::CreateRole {
+            uid: "r_bbbbbb".parse().unwrap(),
+            name: "later".into(),
+        },
+    )])
+    .append_to(p);
+    let added = p.identities.as_ref().unwrap().as_slice()[2].id();
+    assert_ne!(added, event, "a held logical source stays reserved");
+    crate::order::settle_public_execution(&mut p, decisions);
+    let ids = p.identities.as_ref().unwrap().with_steps(&p.changes);
+    assert_eq!(ids.as_slice()[1].id(), event);
+    assert_eq!(
+        ids.as_slice()[1].origin(),
+        &pbps_model::operation::Origin::Whole(2)
+    );
+    assert_eq!(ids.as_slice()[2].id(), original.as_slice()[1].id());
+    assert_eq!(ids.as_slice()[3].id(), added);
+}
+
+#[test]
+fn retuning_a_parent_owned_sequence_does_not_claim_a_tree_alter_lock() {
+    for retuning in [false, true] {
+        let (mut plan, _, _, _) = fixture();
+        let name: TableName = "app.p".parse().unwrap();
+        let mut ids = pbps_model::IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), name.clone());
+        ids.columns
+            .insert("c_aaaaaa".parse().unwrap(), name.column("d"));
+        let old = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        plan.payload
+            .changes
+            .push(PlannedChange::new(Change::AlterColumnNumbering {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: name.column("d"),
+                ty: "integer".parse().unwrap(),
+                from: old.clone(),
+                to: if retuning {
+                    old
+                } else {
+                    pbps_model::ValueSource::None
+                },
+            }));
+        let schema = pbps_model::Schema::default();
+        let side = crate::Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        lock_window(&mut plan, side, side);
+        let findings = plan
+            .changes
+            .iter()
+            .flat_map(|p| &p.findings)
+            .filter(|f| f.id == "plan.partition-alter-attach-lock")
+            .count();
+        assert_eq!(findings, usize::from(!retuning));
+    }
+}
+
+#[test]
+fn a_changed_physical_spelling_requires_boundary_recertification() {
+    use pbps_model::operation::AddressChain;
+    use pbps_model::plan_names::PlanNames;
+    let (mut plan, ops, effects, state) = fixture();
+    plan.boundaries
+        .discharge(ops.as_slice(), &effects, &state)
+        .unwrap();
+    plan.identities = Some(ops.clone());
+    assert!(plan.boundaries.ensure(&plan).is_ok());
+    let parent: Uid = "t_aaaaaa".parse().unwrap();
+    let mut before = pbps_model::IdsFile::default();
+    before
+        .tables
+        .insert(parent.clone(), "app.p".parse().unwrap());
+    before
+        .tables
+        .insert("t_bbbbbb".parse().unwrap(), "app.a".parse().unwrap());
+    let mut after = before.clone();
+    after
+        .tables
+        .insert(parent.clone(), "app.q".parse().unwrap());
+    let mut history = plan.changes.clone();
+    history[0] = PlannedChange::new(Change::RenameTable {
+        uid: parent,
+        from: "app.p".parse().unwrap(),
+        to: "app.q".parse().unwrap(),
+        defaults: vec![],
+    });
+    history[1] = PlannedChange::new(Change::AttachPartition {
+        uid: "t_bbbbbb".parse().unwrap(),
+        table: "app.a".parse().unwrap(),
+        parent: "app.q".parse().unwrap(),
+        bound: pbps_model::PartitionBound::Default,
+        key: vec![],
+        shape: Box::default(),
+    });
+    let ordered =
+        Operations::from_operations([ops.as_slice()[1].clone(), ops.as_slice()[0].clone()]);
+    let names = PlanNames::of(&history, &after).unwrap();
+    let chain = AddressChain::bind(
+        &names,
+        &ordered,
+        &before,
+        &after,
+        &BTreeSet::new(),
+        &[ops.as_slice()[0].id()].into_iter().collect(),
+    );
+    let altered = ops.with_address_chain(chain);
+    assert_eq!(altered.as_slice()[0].id(), ops.as_slice()[0].id());
+    assert_eq!(altered.as_slice()[0].origin(), ops.as_slice()[0].origin());
+    assert_ne!(
+        altered.as_slice()[0].origin().spelling(),
+        ops.as_slice()[0].origin().spelling()
+    );
+    plan.identities = Some(altered);
+    assert!(plan.boundaries.ensure(&plan).is_err());
+}
+
+#[test]
+fn unread_membership_and_known_empty_membership_have_different_obligations() {
+    for unread in [false, true] {
+        let (mut plan, _, _, _) = fixture();
+        let mut schema = pbps_model::Schema::default();
+        schema
+            .tables
+            .insert("app.a".parse().unwrap(), Default::default());
+        if !unread {
+            schema
+                .tables
+                .insert("app.p".parse().unwrap(), Default::default());
+        }
+        let mut ids = pbps_model::IdsFile::default();
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), "app.p".parse().unwrap());
+        ids.tables
+            .insert("t_bbbbbb".parse().unwrap(), "app.a".parse().unwrap());
+        ids.roles
+            .insert("r_aaaaaa".parse().unwrap(), "unused".into());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        let error = replay(&mut plan, side, side, &pbps_dialect::MinimalDialect, None).unwrap_err();
+        // Known empty membership can advance to the independent missing-engine
+        // transfer obligation. Unread membership cannot advance that far.
+        assert!(
+            error.contains(if unread {
+                "no complete standalone membership"
+            } else {
+                "no symbolic transfer"
+            }),
+            "{error}"
+        );
+        assert!(error.contains(membership::REMEDY), "{error}");
+    }
+}
