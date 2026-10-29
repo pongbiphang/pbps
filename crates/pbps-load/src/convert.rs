@@ -1394,9 +1394,19 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
 
     let mut depends_on = std::collections::BTreeSet::new();
     for v in &dto.depends_on {
+        // The public grammar stays ModuleId-only until the full route ships.
+        // Enter the general model without interpreting old schema names as prefixes.
         match parse_at::<ModuleId>(src, v, "invalid object name in `depends_on`") {
             Ok(n) => {
-                depends_on.insert(n);
+                let reference = pbps_model::object_ref::ObjectRef::whole(
+                    pbps_model::object_ref::Root::Module(n),
+                );
+                depends_on.insert(
+                    reference
+                        .module_id()
+                        .expect("legacy module reference")
+                        .clone(),
+                );
             }
             Err(e) => errs.push(e),
         }

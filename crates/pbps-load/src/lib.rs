@@ -409,7 +409,14 @@ fn collect_files(
             LoadedFile::Module(m) => {
                 let m = *m;
                 if !m.depends_on.is_empty() {
-                    loaded.hints.module_deps.insert(m.id.clone(), m.depends_on);
+                    let references = pbps_model::object_ref::ObjectDeps::from_legacy(
+                        &[(m.id.clone(), m.depends_on)].into(),
+                    );
+                    loaded.hints.module_deps.extend(
+                        references
+                            .to_legacy()
+                            .expect("only legacy annotations are loaded"),
+                    );
                 }
                 if m.public_execute {
                     loaded.hints.public_execute.insert(m.id.clone());
@@ -1565,3 +1572,6 @@ mod dependency_remedy_tests {
         assert!(!pbps_model::module::check_dependencies(&schema, &invalid).is_empty());
     }
 }
+
+#[cfg(test)]
+mod object_ref_tests;

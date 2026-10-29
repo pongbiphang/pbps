@@ -522,7 +522,16 @@ pub fn render_module(
         let _ = writeln!(s, "on: {}", scalar(on));
     }
     if !depends_on.is_empty() {
-        let names: Vec<String> = depends_on.iter().map(|id| id.raw().to_string()).collect();
+        let names: Vec<String> = depends_on
+            .iter()
+            .map(|id| {
+                pbps_model::object_ref::ObjectRef::whole(pbps_model::object_ref::Root::Module(
+                    id.clone(),
+                ))
+                .legacy_spelling()
+                .expect("only module annotations are written")
+            })
+            .collect();
         let _ = writeln!(s, "depends_on: {}", seq(&names));
     }
     // Written only when it is `true`. `false` is what the absent key means,

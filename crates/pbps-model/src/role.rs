@@ -316,25 +316,16 @@ pub fn serial_grant_columns(
     table: &crate::TableName,
     tables: &BTreeMap<crate::TableName, crate::Table>,
 ) -> BTreeSet<crate::ColumnRef> {
-    let mut next = table;
-    // Declarations can reach this helper before partition validation. A
-    // missing parent or a cycle proves no owned sequence, rather than hanging.
-    for _ in 0..tables.len() {
-        let Some((name, table)) = tables.get_key_value(next) else {
-            return BTreeSet::new();
-        };
-        if let Some(of) = &table.partition_of {
-            next = &of.parent;
-        } else {
-            return table
-                .columns
-                .iter()
-                .filter(|(_, c)| matches!(c.value_source, crate::ValueSource::Sequence(_)))
-                .map(|(column, _)| name.column(column))
-                .collect();
-        }
-    }
-    BTreeSet::new()
+    let Some((name, root)) =
+        crate::partitions::ancestor_chain(table, tables).and_then(|chain| chain.last().copied())
+    else {
+        return BTreeSet::new();
+    };
+    root.columns
+        .iter()
+        .filter(|(_, c)| matches!(c.value_source, crate::ValueSource::Sequence(_)))
+        .map(|(column, _)| name.column(column))
+        .collect()
 }
 
 /// Adds the sequence access implied by a declared INSERT on a serial tree.

@@ -1848,6 +1848,20 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
 /// dependent module first (the same argument as ADR-0003's rejection of unknown
 /// `strategy:` keys).
 pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> Vec<String> {
+    use crate::object_ref::{ObjectDeps, ObjectRef, Problem, Registry, Root};
+    let validation = Registry::new(schema).validate(&ObjectDeps::from_legacy(deps), None);
+    let unknown: BTreeSet<_> = validation
+        .iter()
+        .filter_map(|p| {
+            if let Problem::UnknownTarget(r) = p {
+                Some(r.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Keep the existing diagnostic/order contract at the legacy boundary.
+    // General owner and SCC findings are exposed by the typed API, not new YAML.
     let mut problems = Vec::new();
     for (name, on) in deps {
         for target in on {
@@ -1856,7 +1870,7 @@ pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> 
                     "`{name}` lists itself in `depends_on`",
                     name = name.shown()
                 ));
-            } else if !schema.modules.contains_key(target) {
+            } else if unknown.contains(&ObjectRef::whole(Root::Module(target.clone()))) {
                 problems.push(format!(
                     "`{name}` depends on `{target}`, which is not a declared module; the ordering \
                      it asks for would silently not happen",

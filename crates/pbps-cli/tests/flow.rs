@@ -27,6 +27,9 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/object_refs2469.rs"]
+mod object_refs2469;
+
 #[path = "support/drop_intent2414.rs"]
 mod drop_intent2414;
 
