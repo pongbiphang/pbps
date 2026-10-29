@@ -806,12 +806,24 @@ fn settled(first: TypeRead, second: TypeRead) -> TypeRead {
     }
 }
 
+// ELEMENT also sets typelem on base types. Only the element's reverse link
+// proves that the pg_type row aliased as t is its implicit array companion.
+macro_rules! array_companion_sql {
+    () => {
+        "COALESCE((SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem), false)"
+    };
+}
+pub(crate) use array_companion_sql;
+
 /// The row a lookup by name returns.
-const LOOKUP: &str = "
+const LOOKUP: &str = concat!(
+    "
     SELECT t.oid::pg_catalog.int8 AS oid,
            t.typtype::pg_catalog.text AS typtype,
            t.typisdefined AS defined,
-           COALESCE((SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem), false) AS array_of,
+           ",
+    array_companion_sql!(),
+    " AS array_of,
            c.relkind::pg_catalog.text AS relkind,
            n.nspname::pg_catalog.text AS schema,
            pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS schema_usage,
@@ -828,7 +840,8 @@ const LOOKUP: &str = "
       JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
       LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
      WHERE n.nspname::pg_catalog.text = $1
-       AND t.typname::pg_catalog.text = $2";
+       AND t.typname::pg_catalog.text = $2"
+);
 
 async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbError> {
     let rows = conn
@@ -1165,12 +1178,15 @@ impl Built {
 async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT t.oid::pg_catalog.int8 AS oid,
+            concat!(
+                "SELECT t.oid::pg_catalog.int8 AS oid,
                     n.nspname::pg_catalog.text AS schema,
                     t.typname::pg_catalog.text AS name,
                     t.typowner::pg_catalog.int8 AS owner,
                     t.typtype::pg_catalog.text AS typtype,
-                    COALESCE((SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem), false) AS array_of,
+                    ",
+                array_companion_sql!(),
+                " AS array_of,
                     t.typelem::pg_catalog.int8 AS elem,
                     t.typbasetype::pg_catalog.int8 AS base,
                     t.typtypmod AS typmod,
@@ -1197,7 +1213,8 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
                LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
               WHERE t.oid = ANY({})
-              ORDER BY t.oid",
+              ORDER BY t.oid"
+            ),
             oid_array(oids)
         ))
         .await?;

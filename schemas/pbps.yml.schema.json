@@ -615,6 +615,27 @@
                 }
               ]
             },
+            "plan.unheld-object": {
+              "description": "Checks the catalog holds an object that no schema model kind owns.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
             "naming.table": {
               "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
               "anyOf": [
@@ -880,6 +901,7 @@
             "consumer.breaking",
             "consumer.unproven",
             "plan.unmanaged-grant",
+            "plan.unheld-object",
             "naming.table",
             "naming.column",
             "naming.index",
@@ -948,6 +970,6 @@
       "additionalProperties": false
     }
   },
-  "x-pbps-schema-version": 70,
+  "x-pbps-schema-version": 71,
   "x-pbps-tool-version": "0.0.0"
 }

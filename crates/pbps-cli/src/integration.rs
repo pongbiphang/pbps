@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 70;
+pub const SCHEMA_VERSION: u32 = 71;
+// 71: report-only catalog census policy (#2444).
 // 70: report-only unmanaged-grant policy (#2446).
 // 68: declared external consumers and their built-in policy rules (#2398).
 // 67: the advisory domain-vet availability policy (#2309).

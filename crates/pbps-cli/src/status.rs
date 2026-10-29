@@ -1165,6 +1165,7 @@ mod tests {
             baseline_evidence: None,
             schema: live,
             onboarding_notices: Vec::new(),
+            catalog_notices: Vec::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: Vec::new(),

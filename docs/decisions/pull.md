@@ -1060,3 +1060,41 @@ is silent like `DROP DEFAULT`.
 
 Live tests pin each named pull/refusal, each silent default, both server
 compression defaults, and denied catalog columns on both PostgreSQL versions.
+
+<a id="dec-2444-1"></a>
+
+**DEC-2444.1. One report-only catalog census names objects that no model kind
+owns, without admitting them into schema state.** PostgreSQL's catalog batch
+includes the census in the same statement snapshot as the managed projection.
+Object addresses feed `pg_identify_object`, so operators retain signatures and
+global objects retain their actual identity instead of an invented namespace.
+One classification and one message renderer serve every listed catalog.
+
+System objects have OIDs below FirstNormalObjectId (16384). Namespace alone
+is insufficient: an administrator can create user objects in `pg_catalog`.
+Measured on PG16 and PG18, initdb's
+collations, types, plpgsql extension and default tablespaces meet this rule.
+Large objects are the exception: `lo_create` accepts an operator-supplied low
+OID, and there are no built-in large objects. All large-object metadata rows
+therefore remain candidates; their address class is `pg_largeobject`, not
+`pg_largeobject_metadata`. Neither their contents nor subscription connection
+strings are read. A non-superuser can read subscription identity columns on
+both versions even though whole-table SELECT is restricted. Revoked access
+remains the engine's named permission error, never a missing census part.
+
+Extension membership follows `pg_depend`'s `e` entries and their internal or
+automatic dependents. Name the extension and any comment on it, including its
+installation comment, rather than listing its members. Column-owned sequences
+and types reached from live columns through type dependencies are model-owned
+for census purposes; implicit array companions stay unnamed too. Only the
+element type's reverse `typarray` link identifies an implicit array; an
+`ELEMENT` option alone does not. This does not introduce declarations for any
+newly inventoried kind.
+
+Pull and init show the census through their existing warning output. Connected
+plan uses `plan.unheld-object`, a registered connected-only policy with default
+warning severity and ordinary settings/suppressions. Its findings remain in
+the command report, outside saved-plan changes, checksum, identities and
+recorded state. Existing managed-object limitations retain their fatal rules.
+The new policy changes the published config schema, so schema set 71 archives
+all three generated documents; wire formats and older archives do not move.

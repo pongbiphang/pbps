@@ -386,6 +386,7 @@ pub struct RawIndex {
 /// Everything one pull read, before any of it is interpreted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawCatalog {
+    pub catalog_notices: Vec<String>,
     pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
     pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
@@ -758,6 +759,7 @@ impl Parts<'_> {
 pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut pulled = Pulled {
         session_role: raw.session_role.clone(),
+        catalog_notices: raw.catalog_notices.clone(),
         ..Pulled::default()
     };
     pulled.schema.types = raw.types.clone();

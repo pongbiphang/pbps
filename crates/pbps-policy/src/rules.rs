@@ -52,8 +52,9 @@ pub const UNMANAGED_GRANT: &str = "plan.unmanaged-grant";
 pub const DOMAIN_VET_UNAVAILABLE: &str = "plan.domain-vet-unavailable";
 pub const CONSUMER_BREAKING: &str = "consumer.breaking";
 pub const CONSUMER_UNPROVEN: &str = "consumer.unproven";
+pub const UNHELD_OBJECT: &str = "plan.unheld-object";
 
-pub const RULES: [Rule; 14] = [
+pub const RULES: [Rule; 15] = [
     Rule {
         id: DOMAIN_VET_UNAVAILABLE,
         point: Point::ConnectedPlan,
@@ -83,6 +84,14 @@ pub const RULES: [Rule; 14] = [
         point: Point::ConnectedPlan,
         default: Some(Severity::Warning),
         about: "an unmanaged grantee holds a permission pbps cannot express on a managed target",
+        params: &[],
+        required: &[],
+    },
+    Rule {
+        id: UNHELD_OBJECT,
+        point: Point::ConnectedPlan,
+        default: Some(Severity::Warning),
+        about: "the catalog holds an object that no schema model kind owns",
         params: &[],
         required: &[],
     },

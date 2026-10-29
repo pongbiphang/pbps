@@ -439,7 +439,7 @@ How each kind is handled today:
 
 | Kind | Today | Tracking |
 |---|---|---|
-| Extensions, as declared and versioned objects | silent | #2447; the silence is #2444 |
+| Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes and `EXCLUDE` constraints | named | #2448 |
 | `brin` indexes | named | #2449 |
 
@@ -447,7 +447,33 @@ How each kind is handled today:
 
 | Kind | Tracking |
 |---|---|
-| Publications, subscriptions, standalone sequences, user-defined operators, operator classes and casts, extended statistics, event triggers, tablespaces, collation objects, unused range, multirange and base types, transforms, large objects, comments on extensions | #2444 |
+
+### Named by the catalog census
+
+Pull names these objects and connected plan reports them as nonfatal
+`plan.unheld-object` findings by default (DEC-2444.1). They remain outside
+schema state. System objects, extension members, column-owned sequences and
+column-used types are excluded. An unreadable catalog is an error.
+
+| Kind | Tracking |
+|---|---|
+| Extensions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Comments on extensions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Publications | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Subscriptions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Standalone sequences | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| User-defined operators | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Operator classes | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Extended statistics | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Event triggers | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Casts | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Collation objects | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Unused range types | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Unused multirange types | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Unused base types | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Transforms | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Large objects | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Tablespaces beyond the two defaults | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 
 ### Named, no support planned yet
 

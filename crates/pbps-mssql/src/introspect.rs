@@ -2524,6 +2524,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         database_collation: Some(raw.database_collation.clone()),
         schema,
         onboarding_notices,
+        catalog_notices: Vec::new(),
         warnings,
         unexpressible,
         limitations,
