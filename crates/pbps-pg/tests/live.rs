@@ -31,6 +31,9 @@ use pbps_pg::Postgres;
 #[path = "support/assertions.rs"]
 mod assertions1165;
 
+#[path = "support/column_policy.rs"]
+mod column_policy;
+
 #[path = "support/dependencies.rs"]
 mod dependencies_tests;
 

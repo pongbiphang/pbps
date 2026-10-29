@@ -148,15 +148,8 @@ pub(crate) fn meetings(
             if let Change::RenameTable { uid, .. } = &p.change {
                 return uid == parent_uid;
             }
-            let uid = match &p.change {
-                Change::AddColumn { uid, .. }
-                | Change::DropColumn { uid, .. }
-                | Change::RenameColumn { uid, .. }
-                | Change::AlterColumnType { uid, .. }
-                | Change::AlterColumnNullability { uid, .. }
-                | Change::AlterColumnDefault { uid, .. }
-                | Change::AlterColumnNumbering { uid, .. } => uid,
-                _ => return false,
+            let Some(uid) = p.change.parent_column_uid() else {
+                return false;
             };
             [before, after].iter().any(|side| {
                 side.ids

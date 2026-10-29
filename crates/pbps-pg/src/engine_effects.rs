@@ -1,6 +1,9 @@
 //! PostgreSQL's measured membership policy, as portable planning data.
 //! No catalog I/O or tentative ordering belongs in these rules (DEC-2296.2).
+mod columns;
 pub(crate) mod facts;
+mod operations;
+pub use operations::of as symbolic;
 #[cfg(test)]
 mod scenes_test;
 use pbps_model::operation::symbolic::{
