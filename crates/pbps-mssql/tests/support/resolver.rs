@@ -507,6 +507,9 @@ mod editions611 {
     }
 }
 
+#[path = "resolver/auth720.rs"]
+mod auth720;
+
 mod recon611 {
     use super::*;
     use pbps_mssql::resolver::authorization::{
@@ -1264,6 +1267,7 @@ mod recon611 {
                 .await
                 .unwrap();
         }
+        super::auth720::impersonation_answers_preserve_denials().await;
     }
 
     /// A deployer that is the database owner — which a member of `sysadmin`
