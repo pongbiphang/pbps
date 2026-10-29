@@ -125,10 +125,23 @@ async fn column_map(conn: &mut Conn, relation: &str) -> Answer<BTreeMap<u32, Str
 }
 
 async fn execute(conn: &mut Conn, pg: &Postgres, context: &TableName, sql: &str) -> Answer<()> {
-    let statement = emit::scoped(pg, &context.schema, sql).map_err(|e| e.to_string())?;
-    conn.execute(&statement.sql)
+    let path = emit::write_path(pg, &context.schema).map_err(|e| e.to_string())?;
+    let refused = |_| {
+        format!(
+            "the retained expression on {} could not be bound as one statement",
+            context.shown()
+        )
+    };
+    conn.execute_with(&format!("SET search_path = {path}"), &[])
         .await
-        .map_err(|_| "the retained expression could not be bound".into())
+        .map_err(refused)?;
+    // Extended-query parsing refuses a trailing statement before executing any
+    // part of the declared expression. Scratch and apply share this path (DEC-2354.3).
+    let result = conn.execute_with(sql, &[]).await;
+    let restored = conn.execute_with("SET search_path = ''", &[]).await;
+    result.map_err(refused)?;
+    restored.map_err(refused)?;
+    Ok(())
 }
 pub async fn create_carrier(
     conn: &mut Conn,
