@@ -296,3 +296,41 @@ fn stored_columns_are_carried_only_when_someone_read_them() {
     let both = read.with_module_dependents(&dependents);
     assert_eq!(both.membership_catalog(), Some(&stored));
 }
+
+#[test]
+fn indexed_creation_names_keep_foreign_keys_parents_and_row_types_hard() {
+    let mut shape: pbps_model::Table = serde_json::from_value(serde_json::json!({
+        "columns": {"bare": {"type": "bare_type", "nullable": true}, "qualified": {"type": "app.qualified_type", "nullable": true}},
+        "foreign_keys": {"fk": {"columns": ["bare"], "references_table": "app.target", "references_columns": ["id"]}}
+    })).unwrap();
+    shape.partition_of = Some(pbps_model::PartitionOf {
+        parent: "app.parent".parse().unwrap(),
+        bound: pbps_model::PartitionBound::Default,
+        columns: Default::default(),
+    });
+    let create = |name: &str, table| Change::CreateTable {
+        uid: "t_aaaaaa".parse().unwrap(),
+        name: name.parse().unwrap(),
+        table: Box::new(table),
+        beside_default: None,
+        moves_at_most: None,
+    };
+    let owner = create("app.owner", shape);
+    let indexed = TypedCreation::of(&owner);
+    for (provider, inferred) in [
+        ("app.target", false),
+        ("other.target", true),
+        ("app.parent", false),
+        ("other.parent", true),
+        ("app.bare_type", false),
+        ("other.bare_type", false),
+        ("app.qualified_type", false),
+        ("other.qualified_type", true),
+        ("app.absent", true),
+    ] {
+        let provider = create(provider, Default::default());
+        assert_eq!(inferred_need(&owner, &provider, &indexed), inferred);
+        let empty = create("app.empty", Default::default());
+        assert!(inferred_need(&empty, &provider, &TypedCreation::of(&empty)));
+    }
+}

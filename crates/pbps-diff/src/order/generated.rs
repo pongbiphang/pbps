@@ -167,7 +167,7 @@ pub fn functions(changes: &[PlannedChange]) -> Vec<ModuleId> {
         .collect()
 }
 
-type ModuleStep<'a> = (usize, &'a ModuleId, &'a Module);
+type ModuleStep<'a, P = usize> = (P, &'a ModuleId, &'a Module);
 
 #[allow(clippy::wildcard_enum_match_arm)]
 fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
@@ -237,20 +237,31 @@ fn module_dependencies(
             .into_iter()
             .map(|edge| (edge.before, edge.after, true))
             .collect();
+    infer_module_dependencies(modules, dialect, scratch, &mut edges);
+    edges
+}
+
+fn infer_module_dependencies<P: Copy + Ord>(
+    modules: &[ModuleStep<'_, P>],
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+    edges: &mut Vec<(P, P, bool)>,
+) {
+    // Keep vector insertion order; membership must not rescan all emitted edges
+    // for each module pair. P also permits counted comparisons in regression tests.
+    let mut seen: BTreeSet<_> = edges.iter().map(|&(a, b, _)| (a, b)).collect();
     for (i, id, module) in modules {
         let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
             if i == j || id.name() == provider.name() {
                 continue;
             }
-            if !edges.iter().any(|&(a, b, _)| a == *j && b == *i)
-                && dialect.generation_may_call(&text, provider.name())
-            {
+            if !seen.contains(&(*j, *i)) && dialect.generation_may_call(&text, provider.name()) {
+                seen.insert((*j, *i));
                 edges.push((*j, *i, false));
             }
         }
     }
-    edges
 }
 
 pub fn is_part(p: &PlannedChange) -> bool {

@@ -2717,6 +2717,10 @@ fn function_edges(
     for edge in explicit {
         schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
+    let typed_creations: Vec<_> = window
+        .iter()
+        .map(|change| TypedCreation::of(change))
+        .collect();
     let mut previous_free = None;
     for i in 0..n {
         let earlier: Vec<_> = if held.contains(&i) {
@@ -2732,7 +2736,7 @@ fn function_edges(
                     start + i,
                     if explicit {
                         Source::Annotation
-                    } else if inferred_need(window[i], window[j]) {
+                    } else if inferred_need(window[i], window[j], &typed_creations[i]) {
                         Source::Inferred
                     } else {
                         Source::Lexical
@@ -2857,10 +2861,39 @@ fn cycle(
     )
 }
 
+// Index typed creation fields once per operation, not once per candidate
+// provider in the function window. These facts must remain hard.
+#[derive(Default)]
+struct TypedCreation<'a> {
+    tables: BTreeSet<&'a TableName>,
+    row_types: BTreeSet<&'a str>,
+}
+impl<'a> TypedCreation<'a> {
+    fn of(change: &'a Change) -> Self {
+        if let Change::CreateTable { table, .. } = change {
+            Self {
+                tables: table
+                    .foreign_keys
+                    .values()
+                    .map(|key| &key.references_table)
+                    .chain(table.partition_of.iter().map(|of| &of.parent))
+                    .collect(),
+                row_types: table
+                    .columns
+                    .values()
+                    .map(|column| column.ty.base.as_str())
+                    .collect(),
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 // Provenance of the text/conservative branches of `needs`. Typed column,
 // row, containment and foreign-key fields remain stated constraints.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn inferred_need(later: &Change, earlier: &Change) -> bool {
+fn inferred_need(later: &Change, earlier: &Change, typed: &TypedCreation<'_>) -> bool {
     match (earlier, later) {
         (
             Change::CreateModule { id: provider, .. } | Change::AlterModule { id: provider, .. },
@@ -2875,19 +2908,10 @@ fn inferred_need(later: &Change, earlier: &Change) -> bool {
         (Change::AddColumn { .. }, Change::CreateModule { .. } | Change::AlterModule { .. }) => {
             true
         }
-        (Change::CreateTable { name, .. }, Change::CreateTable { table, .. }) => {
-            !table
-                .foreign_keys
-                .values()
-                .any(|key| &key.references_table == name)
-                && !table
-                    .partition_of
-                    .as_ref()
-                    .is_some_and(|of| &of.parent == name)
-                && !table
-                    .columns
-                    .values()
-                    .any(|c| c.ty.base == name.name || c.ty.base == name.raw().to_string())
+        (Change::CreateTable { name, .. }, Change::CreateTable { .. }) => {
+            !typed.tables.contains(name)
+                && !typed.row_types.contains(name.name.as_str())
+                && !typed.row_types.contains(name.raw().to_string().as_str())
         }
         (Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }, _) => {
             false

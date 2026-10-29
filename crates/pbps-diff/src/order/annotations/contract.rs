@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::*;
 use pbps_model::diagnostic::Declaration;
 use pbps_model::object_ref::{BoundRoot, Registry};
+use pbps_model::operation::symbolic::Attribute;
 use pbps_model::operation::{
     ColumnKey, ModuleEdits, ObjectKey, Operations, Owners, PartKey, PlanOwners, Snapshot, Spelling,
 };
@@ -79,18 +80,17 @@ impl Side {
                 .insert(bound.clone());
             side.references.insert(bound);
         }
+        let ids = snapshot.ids.index();
         for name in snapshot.schema.tables.keys() {
             let chain = pbps_model::partitions::ancestor_chain(name, &snapshot.schema.tables)
                 .ok_or_else(|| {
                     format!("partition ancestry for `{}` is unavailable", name.shown())
                 })?;
             let root = chain.last().expect("an ancestor chain includes its root").0;
-            let table = snapshot
-                .ids
+            let table = ids
                 .table_uid(name)
                 .ok_or_else(|| format!("table identity for `{}` is unavailable", name.shown()))?;
-            let root = snapshot
-                .ids
+            let root = ids
                 .table_uid(root)
                 .ok_or_else(|| format!("root identity for `{}` is unavailable", root.shown()))?;
             side.roots.insert(table.clone(), root.clone());
@@ -272,22 +272,17 @@ impl Contract {
         {
             if let BoundRoot::InheritedColumn { column, .. } = &reference.root
                 && let Some(attributes) = changed.get(column)
-                && attributes.iter().any(|a| match reference.part {
-                    Selector::Whole => matches!(
-                        a,
-                        pbps_model::operation::symbolic::Attribute::Type
-                            | pbps_model::operation::symbolic::Attribute::Collation
-                            | pbps_model::operation::symbolic::Attribute::Name
-                    ),
+                && match reference.part {
+                    Selector::Whole => [Attribute::Type, Attribute::Collation, Attribute::Name]
+                        .iter()
+                        .any(|attribute| attributes.contains(attribute)),
                     Selector::Default | Selector::Generation => {
-                        *a == pbps_model::operation::symbolic::Attribute::Default
+                        attributes.contains(&Attribute::Default)
                     }
-                    Selector::NotNull => *a == pbps_model::operation::symbolic::Attribute::NotNull,
-                    Selector::Sequence => {
-                        *a == pbps_model::operation::symbolic::Attribute::Numbering
-                    }
+                    Selector::NotNull => attributes.contains(&Attribute::NotNull),
+                    Selector::Sequence => attributes.contains(&Attribute::Numbering),
                     Selector::Part(_) => false,
-                })
+                }
             {
                 return Err(format!(
                     "cannot project `{}`: recursive engine boundary metadata is required",
@@ -507,7 +502,7 @@ impl Contract {
                 root,
                 part: Selector::Whole,
             };
-            let bound = Registry::new(&self.after.schema)
+            let bound = registry
                 .bind(&reference, owners, op.origin().spelling())
                 .map_err(|e| e.to_string())?;
             self.record(index, bound, at, Transition::Ends);
