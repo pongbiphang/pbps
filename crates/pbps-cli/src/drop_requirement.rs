@@ -1,6 +1,18 @@
 //! Recording is connected: unsafe predicates are refused before the ids write.
 use super::*;
 
+#[derive(clap::Args)]
+pub(super) struct Args {
+    /// Require every row to satisfy this predicate before removal (`-` reads stdin)
+    #[arg(long, conflicts_with = "clear_require")]
+    pub require: Option<String>,
+    /// Remove the recorded row requirement
+    #[arg(long)]
+    pub clear_require: bool,
+    #[command(flatten)]
+    pub target: TargetArgs,
+}
+
 pub(super) fn record(
     project: &Project,
     intent: Intent,

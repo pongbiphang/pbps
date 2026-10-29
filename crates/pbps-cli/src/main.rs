@@ -348,14 +348,10 @@ enum Command {
         /// Why it is being dropped; required for audit
         #[arg(long)]
         reason: pbps_model::Reason,
-        /// Require every row to satisfy this predicate before removal (`-` reads stdin)
-        #[arg(long, conflicts_with = "clear_require")]
-        require: Option<String>,
-        /// Remove the recorded row requirement
-        #[arg(long)]
-        clear_require: bool,
+        // Build these shared options in their own frame: adding them inline to
+        // the command tree overflowed Windows' 1 MiB main stack even at startup.
         #[command(flatten)]
-        target: TargetArgs,
+        requirement: Box<drop_requirement::Args>,
     },
 
     /// Record a table drop
@@ -363,14 +359,8 @@ enum Command {
         table: String,
         #[arg(long)]
         reason: pbps_model::Reason,
-        /// Require every row to satisfy this predicate before removal (`-` reads stdin)
-        #[arg(long, conflicts_with = "clear_require")]
-        require: Option<String>,
-        /// Remove the recorded row requirement
-        #[arg(long)]
-        clear_require: bool,
         #[command(flatten)]
-        target: TargetArgs,
+        requirement: Box<drop_requirement::Args>,
     },
 
     /// Record a database role rename (ADR-0005)
@@ -893,12 +883,16 @@ fn run() -> anyhow::Result<()> {
         error.exit()
     });
     if let Command::Drop {
-        reason, require, ..
+        reason,
+        requirement,
+        ..
     }
     | Command::DropTable {
-        reason, require, ..
+        reason,
+        requirement,
+        ..
     } = &mut cli.command
-        && let Some(expression) = require
+        && let Some(expression) = &mut requirement.require
     {
         let resolved = if expression == "-" && reason.as_ref() == "-" {
             Err("--reason and --require cannot both read standard input".into())
@@ -1424,34 +1418,30 @@ fn run() -> anyhow::Result<()> {
         Command::Drop {
             column,
             reason,
-            require,
-            clear_require,
-            target,
+            requirement,
         } => drop_requirement::record(
             &project,
             Intent::DropColumn {
                 column: column.parse()?,
                 reason,
             },
-            &target,
-            require.as_deref(),
-            clear_require,
+            &requirement.target,
+            requirement.require.as_deref(),
+            requirement.clear_require,
         ),
         Command::DropTable {
             table,
             reason,
-            require,
-            clear_require,
-            target,
+            requirement,
         } => drop_requirement::record(
             &project,
             Intent::DropTable {
                 table: table.parse::<TableName>()?,
                 reason,
             },
-            &target,
-            require.as_deref(),
-            clear_require,
+            &requirement.target,
+            requirement.require.as_deref(),
+            requirement.clear_require,
         ),
         Command::RenameRole { from, to } => cmd_intent(
             &project,
