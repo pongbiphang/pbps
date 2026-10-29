@@ -1281,3 +1281,36 @@ Snapshot and baseline install the link identified by the environment's ledger;
 a missing or partial link refuses rather than guessing from equal names or
 shapes. The ordinary failure audit may record the unchanged source state;
 replacement identities are installed only with a successful rebuild commit.
+
+<a id="dec-2501-1"></a>
+
+**DEC-2501.1. Database coordinates scope names and ownership, while UIDs stay project-global.**
+A SQL Server instance project holds a nonempty map of database names to the
+unchanged per-database Schema, Loaded data and identity files (#2280 A1).
+An InDatabase value requires its database; no optional coordinate or invented
+UID stands for a named module or grant. Identity files remain per database,
+including tombstones. Read and validate every file before exposing the shared
+UID reservation pool; reject cross-file UID collisions naming both databases.
+New and observed identities reserve against that pool. Observations use the
+existing deterministic salt walk, in database-map order, rather than embedding
+a database into a UID. No ownership consumer receives a flattened IdsFile.
+The A0 measurements (#2500) demonstrate why resource-index scoping alone loses
+weave roots and makes PlanNames refuse legitimate equal addresses. Merged
+ordering, origins, plan checksums and deployment remain A3 and later work.
+
+<a id="dec-2501-2"></a>
+
+**DEC-2501.2. Named-database layout uses an explicit loading API until consumers carry its coordinates.**
+`databases:` is a nonempty unique list for SQL Server, with declarations under
+the schema root's database directories and schema.ids.json in each. Database
+names must be usable directory components; this is no claim about engine
+identifier equality. Root-level identities, loose declarations, undeclared
+folders, directory aliases and escapes refuse instead of silently disappearing.
+A missing identity file means a new identity map; empty, invalid, nonregular or
+unreadable files refuse. Config::parse_project, Project::load_project and the
+per-database loader expose the A1 foundation. Legacy Config::parse and
+Project::load continue to accept only the flat layout, so CLI and historical
+readers cannot accidentally flatten a new instance project before A3 exists.
+Absent databases retains existing configuration bytes and the existing loader.
+Only the editor-schema set advances; Schema, ids, plan and ledger wire formats
+do not change in this slice.

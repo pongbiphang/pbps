@@ -46,6 +46,7 @@ pub mod partitions;
 pub mod physical_sources;
 pub mod plan;
 pub mod plan_names;
+pub mod project;
 pub mod reason;
 pub mod rebuild;
 pub mod rebuild_ops;
@@ -120,3 +121,5 @@ pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
 pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};
+
+pub use project::{DatabaseMap, DatabaseName, InDatabase, ProjectSchemas, UidReservations};

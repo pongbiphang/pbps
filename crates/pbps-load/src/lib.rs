@@ -12,6 +12,7 @@ pub mod dto;
 pub mod error;
 pub mod fmt;
 mod managed_types;
+pub mod project;
 
 use std::path::Path;
 
@@ -1575,3 +1576,5 @@ mod dependency_remedy_tests {
 
 #[cfg(test)]
 mod object_ref_tests;
+
+pub use project::{LoadedDatabases, ProjectLoadError, load_database_dirs};

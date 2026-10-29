@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod layout;
 pub mod resolver;
+pub use layout::{DatabaseList, DatabasePaths};
 pub mod test_manifest;
 
 pub const CONFIG_FILE: &str = "pbps.yml";
@@ -311,8 +313,19 @@ pub struct Dev {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("allOf" = serde_json::json!([{"if":{"required":["databases"]},"then":{"properties":{"dialect":{"const":"mssql"},"ids_file":{"const":"schema.ids.json"}}}}])))]
 pub struct Config {
     pub dialect: DialectName,
+
+    /// SQL Server database coordinates; absent preserves the flat layout.
+    /// Layout/loader support precedes instance-wide command planning (DEC-2501.2).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "layout::names"
+    )]
+    #[schemars(with = "DatabaseList")]
+    pub databases: Option<DatabaseList>,
 
     /// Roles the organization trusts to change evaluated user-type code (#2046).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
@@ -438,7 +451,18 @@ fn default_ids_file() -> PathBuf {
 }
 
 impl Config {
+    /// Legacy single-database command input. Named projects need the new
+    /// layout/loader APIs until instance-wide ordering is available.
     pub fn parse(yaml: &str, path: &Path) -> Result<Self, ConfigError> {
+        let config = Self::parse_project(yaml, path)?;
+        if config.databases.is_some() {
+            return Err(ConfigError::Parse { path: path.to_owned(), message: "this command does not yet support instance-wide projects (databases:); use a single-database project".into() });
+        }
+        Ok(config)
+    }
+
+    /// Parse either layout without handing it to a legacy flat consumer.
+    pub fn parse_project(yaml: &str, path: &Path) -> Result<Self, ConfigError> {
         let config: Self = serde_saphyr::from_str(yaml).map_err(|e| {
             // Read again only on failure, so every other error keeps the
             // typed parse's own position.
@@ -499,6 +523,12 @@ impl Config {
                 path: path.to_owned(),
             });
         }
+        config
+            .check_databases()
+            .map_err(|message| ConfigError::Parse {
+                path: path.to_owned(),
+                message,
+            })?;
         Ok(config)
     }
 }
@@ -543,11 +573,18 @@ impl Project {
 
     /// Loads a specific config file directly.
     pub fn load(config_path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with(config_path, Config::parse)
+    }
+
+    fn load_with(
+        config_path: &Path,
+        parse: fn(&str, &Path) -> Result<Config, ConfigError>,
+    ) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(config_path).map_err(|reason| ConfigError::Read {
             path: config_path.to_owned(),
             reason,
         })?;
-        let config = Config::parse(&text, config_path)?;
+        let config = parse(&text, config_path)?;
         // A config file is always inside some directory; the only way to have no
         // parent is to have been handed an empty path.
         let root = config_path.parent().unwrap_or(Path::new(".")).to_owned();

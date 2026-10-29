@@ -157,6 +157,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     }
     let config = Config {
         dialect,
+        databases: None,
         trusted_roles: Default::default(),
         pin_type_routines: false,
         schema_dir: PathBuf::from("schema"),
@@ -711,6 +712,7 @@ mod tests {
         );
         let config = Config {
             dialect: DialectName::Mssql,
+            databases: None,
             trusted_roles: Default::default(),
             pin_type_routines: false,
             schema_dir: PathBuf::from("schema"),
