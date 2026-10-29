@@ -7,7 +7,7 @@
 //! SQL semantics are inferred here.
 
 use crate::ColumnName;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::plan_names::{At, Holder, PlanNames};
 use crate::{Change, ColumnRef, IdsFile, Schema, TableName, Uid};
@@ -90,8 +90,12 @@ pub struct PhysicalSources<'p> {
     holders: History<Slot, Origin>,
     positions: History<Origin, Slot>,
     partitions: History<Uid, Uid>,
+    membership_unknown: BTreeSet<Uid>,
     managed: History<Origin, Uid>,
     table_births: History<Uid, usize>,
+    stored_order: BTreeMap<ColumnRef, usize>,
+    shapes: History<Uid, ()>,
+    excluded: BTreeSet<Uid>,
 }
 
 struct Build<'a, 'p> {
@@ -106,6 +110,18 @@ impl<'p> PhysicalSources<'p> {
         baseline: &Schema,
         baseline_ids: &IdsFile,
     ) -> Result<Self, SourceError> {
+        Self::of_excluding(names, baseline, baseline_ids, BTreeSet::new())
+    }
+
+    /// A partial, non-executable view preserves all name-event positions but
+    /// leaves explicitly pending families unavailable. Their symbolic boundary
+    /// must be replayed before a caller may use a full physical projection.
+    pub fn of_excluding(
+        names: PlanNames<'p>,
+        baseline: &Schema,
+        baseline_ids: &IdsFile,
+        excluded: BTreeSet<Uid>,
+    ) -> Result<Self, SourceError> {
         baseline_ids
             .validate()
             .map_err(|error| SourceError(error.to_string()))?;
@@ -114,13 +130,35 @@ impl<'p> PhysicalSources<'p> {
             .columns_at(At::Start)
             .map(|(uid, column)| (uid.clone(), column))
             .collect();
+        let membership_unknown = baseline
+            .tables
+            .iter()
+            .flat_map(|(name, t)| {
+                if baseline_ids.table_uid(name).is_some() {
+                    return Vec::new();
+                }
+                // Goal names describe which queries lack proof, never a
+                // baseline identity to borrow for an unrecorded relation.
+                std::iter::once(name)
+                    .chain(t.partition_of.iter().map(|p| &p.parent))
+                    .filter_map(|n| match names.holder(n, At::Start) {
+                        Holder::Tracked(u) => Some(u.clone()),
+                        Holder::Unmanaged | Holder::Vacant => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let mut view = Self {
             names,
             holders: History::default(),
             positions: History::default(),
             partitions: History::default(),
+            membership_unknown,
             managed: History::default(),
             table_births: History::default(),
+            stored_order: BTreeMap::new(),
+            shapes: History::default(),
+            excluded,
         };
         let mut build = Build {
             view: &mut view,
@@ -132,6 +170,9 @@ impl<'p> PhysicalSources<'p> {
         // from the catalog. Its eventual catalog lookup must still fail.
         for (uid, column) in initial_columns {
             let owner = build.owner(&column.table, At::Start)?;
+            if build.view.excluded.contains(&owner) {
+                continue;
+            }
             let origin = Origin::Stored(column.clone());
             build.insert(0, (owner, column.name.clone()), origin.clone())?;
             if baseline_ids
@@ -149,6 +190,9 @@ impl<'p> PhysicalSources<'p> {
             let Ok(owner) = build.owner(name, At::Start) else {
                 continue;
             };
+            if build.view.excluded.contains(&owner) {
+                continue;
+            }
             if baseline_ids
                 .table_uid(name)
                 .is_some_and(|before| before != &owner)
@@ -170,8 +214,15 @@ impl<'p> PhysicalSources<'p> {
             } else {
                 table
             };
-            for column in shape.columns.keys().chain(shape.computed.keys()) {
+            build.view.shapes.put(owner.clone(), 0, Some(()));
+            for (position, column) in shape
+                .columns
+                .keys()
+                .chain(shape.computed.keys())
+                .enumerate()
+            {
                 let address = name.column(column);
+                build.view.stored_order.insert(address.clone(), position);
                 build.insert(
                     0,
                     (owner.clone(), column.clone()),
@@ -197,12 +248,114 @@ impl<'p> PhysicalSources<'p> {
         &self.names
     }
 
+    /// Physical order follows the stored source and appended creation events,
+    /// rather than UID/name map order. Renaming keeps a column's position;
+    /// dropping and recreating the same spelling appends a different source.
+    pub fn columns_at(&self, table: &TableName, at: At) -> Located<Vec<ColumnName>> {
+        if matches!(at,At::Before(i)|At::After(i) if i >= self.names.changes().len()) {
+            return Located::Unavailable;
+        }
+        let uid = match self.names.holder(table, at) {
+            Holder::Tracked(uid) => uid,
+            Holder::Vacant => return Located::Retired,
+            Holder::Unmanaged => return Located::Unavailable,
+        };
+        if self.excluded.contains(uid) {
+            return Located::Unavailable;
+        }
+        let boundary = self.names.boundary(at);
+        if self.shapes.get(uid, boundary) != Some(&Some(())) {
+            return Located::Unavailable;
+        }
+        let mut columns = Vec::new();
+        for (owner, name) in self.holders.0.keys().filter(|(owner, _)| owner == uid) {
+            let Some(Some(origin)) = self.holders.get(&(owner.clone(), name.clone()), boundary)
+            else {
+                continue;
+            };
+            let Some(rank) = self.column_rank(origin) else {
+                return Located::Unavailable;
+            };
+            columns.push((rank, name.clone()));
+        }
+        columns.sort_by_key(|(rank, _)| *rank);
+        Located::Present(columns.into_iter().map(|(_, name)| name).collect())
+    }
+    /// Membership shares the column projection's exact boundary. Partial
+    /// projections cannot supply a complete row contribution set.
+    pub fn members_at(&self, parent: &TableName, at: At) -> Located<Vec<TableName>> {
+        if !self.excluded.is_empty()
+            || matches!(at,At::Before(i)|At::After(i) if i>=self.names.changes().len())
+        {
+            return Located::Unavailable;
+        }
+        let parent = match self.names.holder(parent, at) {
+            Holder::Tracked(uid) => uid,
+            Holder::Vacant => return Located::Retired,
+            Holder::Unmanaged => return Located::Unavailable,
+        };
+        if self.membership_unknown.contains(parent)
+            || self.shapes.get(parent, self.names.boundary(at)) != Some(&Some(()))
+        {
+            return Located::Unavailable;
+        }
+        let boundary = self.names.boundary(at);
+        let mut members = Vec::new();
+        for child in self.partitions.0.keys() {
+            if self.partitions.get(child, boundary) == Some(&Some(parent.clone())) {
+                let Some(name) = self.names.table_at(child, at) else {
+                    return Located::Unavailable;
+                };
+                members.push(name.clone());
+            }
+        }
+        Located::Present(members)
+    }
+
+    // Creation provenance admits only the payloads which append columns.
+    // A future change has no physical ordinal until explicitly represented.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn column_rank(&self, origin: &Origin) -> Option<(usize, usize, usize)> {
+        match origin {
+            Origin::Stored(at) => Some((0, 0, *self.stored_order.get(at)?)),
+            Origin::Created {
+                step,
+                slot: (_, name),
+            } => {
+                let position = match &self.names.changes().get(*step)?.change {
+                    Change::CreateTable { table, .. } => {
+                        if let Some(of) = &table.partition_of {
+                            let Located::Present(columns) =
+                                self.columns_at(&of.parent, At::Before(*step))
+                            else {
+                                return None;
+                            };
+                            columns.iter().position(|n| n == name)?
+                        } else {
+                            table
+                                .columns
+                                .keys()
+                                .chain(table.computed.keys())
+                                .position(|n| n == name)?
+                        }
+                    }
+                    Change::AddColumn { .. } | Change::AddComputedColumn { .. } => 0,
+                    _ => return None,
+                };
+                Some((1, *step, position))
+            }
+        }
+    }
+
     pub fn table_source(&self, table: &TableName, at: At) -> Source<TableName> {
         let owner = match self.names.holder(table, at) {
             Holder::Tracked(uid) => uid,
             Holder::Vacant => return Source::Retired,
             Holder::Unmanaged => return Source::Unavailable,
         };
+        if self.excluded.contains(owner) {
+            return Source::Unavailable;
+        }
         match self.table_births.get(owner, self.names.boundary(at)) {
             Some(Some(step)) => Source::Created { step: *step },
             Some(None) => Source::Retired,
@@ -219,6 +372,9 @@ impl<'p> PhysicalSources<'p> {
             Holder::Vacant => return Source::Retired,
             Holder::Unmanaged => return Source::Unavailable,
         };
+        if self.excluded.contains(owner) {
+            return Source::Unavailable;
+        }
         match self.holders.get(
             &(owner.clone(), column.name.clone()),
             self.names.boundary(at),
@@ -235,6 +391,9 @@ impl<'p> PhysicalSources<'p> {
         let Holder::Tracked(uid) = self.names.holder(stored, At::Start) else {
             return Located::Unavailable;
         };
+        if self.excluded.contains(uid) {
+            return Located::Unavailable;
+        }
         let Some(name) = self.names.table_at(uid, at) else {
             return Located::Retired;
         };
@@ -376,6 +535,28 @@ impl Build<'_, '_> {
     fn apply(&mut self, step: usize, change: &Change) -> Result<(), SourceError> {
         let before = At::Before(step);
         let boundary = step + 1;
+        // No physical facts for an excluded identity are inferred from a
+        // provisional membership order. Other identities keep their events.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let excluded = match change {
+            Change::CreateTable { uid, .. }
+            | Change::DropTable { uid, .. }
+            | Change::AttachPartition { uid, .. }
+            | Change::DetachPartition { uid, .. } => self.view.excluded.contains(uid),
+            Change::AddColumn { table, .. }
+            | Change::AddComputedColumn { table, .. }
+            | Change::DropComputedColumn { table, .. }
+            | Change::RenameColumn { table, .. } => {
+                matches!(self.view.names.holder(table, before), Holder::Tracked(uid) if self.view.excluded.contains(uid))
+            }
+            Change::DropColumn { column, .. } => {
+                matches!(self.view.names.holder(&column.table, before), Holder::Tracked(uid) if self.view.excluded.contains(uid))
+            }
+            _ => false,
+        };
+        if excluded {
+            return Ok(());
+        }
         match change {
             Change::RebuildPartitionedTable(_)
             | Change::BuildPartitionedIndex(_)
@@ -385,6 +566,14 @@ impl Build<'_, '_> {
                 self.view
                     .table_births
                     .put(uid.clone(), boundary, Some(step));
+                let known = table.partition_of.as_ref().is_none_or(|p| {
+                    self.owner(&p.parent, before).ok().is_some_and(|parent| {
+                        self.view.shapes.get(&parent, step) == Some(&Some(()))
+                    })
+                });
+                self.view
+                    .shapes
+                    .put(uid.clone(), boundary, known.then_some(()));
                 let columns: Vec<ColumnName> = if let Some(partition) = &table.partition_of {
                     let parent = self.owner(&partition.parent, before)?;
                     let columns = self

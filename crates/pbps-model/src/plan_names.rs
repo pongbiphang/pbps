@@ -97,7 +97,7 @@ impl<A> Transition<A> {
 
 type Timeline<A> = Vec<(usize, Option<A>)>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct History<A> {
     names: BTreeMap<Uid, Timeline<A>>,
     holders: BTreeMap<A, Timeline<Uid>>,
@@ -387,7 +387,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
 /// changes.reverse();
 /// assert!(names.changes().is_empty());
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlanNames<'p> {
     changes: &'p [PlannedChange],
     tables: History<TableName>,
@@ -397,6 +397,25 @@ pub struct PlanNames<'p> {
 
 impl<'p> PlanNames<'p> {
     pub fn of(changes: &'p [PlannedChange], after: &'p IdsFile) -> Result<Self, PlanNamesError> {
+        Self::build(changes, after, &BTreeSet::new())
+    }
+
+    /// Non-executable template projection: listed, recorded identities may
+    /// have pure spelling observations whose placement is still pending.
+    /// Real lifetime/name transitions remain strict. A caller must rebuild
+    /// `of` at the selected order before any canonical completion.
+    pub fn of_templates(
+        changes: &'p [PlannedChange],
+        after: &'p IdsFile,
+        pending: &BTreeSet<Uid>,
+    ) -> Result<Self, PlanNamesError> {
+        Self::build(changes, after, pending)
+    }
+    fn build(
+        changes: &'p [PlannedChange],
+        after: &'p IdsFile,
+        pending: &BTreeSet<Uid>,
+    ) -> Result<Self, PlanNamesError> {
         after.validate()?;
         let mut table_events = Vec::new();
         let mut owner_events: BTreeMap<Uid, Vec<(usize, ColumnLife)>> = BTreeMap::new();
@@ -405,6 +424,13 @@ impl<'p> PlanNames<'p> {
         for (i, p) in changes.iter().enumerate() {
             match identity_change(i, &p.change) {
                 IdentityChange::Table(e, life) => {
+                    if matches!(life, ColumnLife::Keep)
+                        && e.before == e.after
+                        && e.uid.kind() == UidKind::Table
+                        && pending.contains(&e.uid)
+                    {
+                        continue;
+                    }
                     match life {
                         ColumnLife::Keep => {}
                         ColumnLife::Begin(_) | ColumnLife::End => {
@@ -416,7 +442,14 @@ impl<'p> PlanNames<'p> {
                     }
                     table_events.push(e);
                 }
-                IdentityChange::Column(e) => column_events.push(e),
+                IdentityChange::Column(e) => {
+                    if e.before != e.after
+                        || e.uid.kind() != UidKind::Column
+                        || !pending.contains(&e.uid)
+                    {
+                        column_events.push(e);
+                    }
+                }
                 IdentityChange::Role(e) => role_events.push(e),
                 IdentityChange::Other => {}
             }

@@ -9168,3 +9168,36 @@ of expression text is used to infer catalog binding equality.
 **DEC-2296.7. A partition restoration borrows goal ownership only after its emitted value agrees.** (#2296, #2504.) `SetPartitionDefault` writes `to`, otherwise `fallback`, otherwise DROP DEFAULT, including during teardown. Its normalized output must agree with the goal's definition and bindings before the symbolic producer may reuse that goal fact. Removing the declared own override can then use inherited ownership; a disagreeing payload retains its actual local value. An expression whose bindings cannot be modelled remains Unread, and a missing or Unread goal never supplies a Known fact. Teardown models its own payload without borrowing a future goal.
 
 The NOT NULL restoration applies the same output/goal comparison after the existing own-override and parent-requirement checks. ATTACH merges already compare complete definitions/bindings and preserve the actual candidate; standalone DEFAULT writes already qualify goal bindings by the emitted declaration expression. Neither may substitute an unrelated goal for an operation's payload. The regression tests in `crates/pbps-pg/src/engine_effects/production_tests/restoration_tests.rs` pin disagreement, normalized agreement, payload precedence, missing/Unread goals and binding disagreement, without changing the emitter, fact reader or membership activation boundary.
+
+<a id="dec-2296-8"></a>
+
+**DEC-2296.8. Pending source projections expose intent-qualified templates,
+never execution positions.** Before a registered membership boundary settles,
+weave cannot replay that family's physical columns in its tentative order.
+Its read-only projection excludes the lineage family from strict physical
+replay and suppresses only those recorded identities' spelling observations
+in `PlanNames::of_templates`. Real name and lifetime transitions stay strict.
+The registered parents determine the scope; dependent expansion cannot register
+another family. Other sources still follow their exact physical boundary and
+cannot borrow a replacement holder's identity. A release predicate selects the
+baseline template, a restoration selects the goal, and only an in-place edit
+can query both. The predicate carries this intent so callers cannot mismatch it.
+A missing UID, unread shape or incomplete membership remains unavailable;
+a successfully read empty shape or membership remains known empty. Physical
+column order follows stored ordinals and appended creation events, not UID or
+name sorting. Excluded families cannot supply a complete membership answer.
+
+The dependent-bearing reference oracle is now exercised at weave's pending
+stage over the existing class scenes and explicit operation builder, including
+a renamed unrelated holder. Its exact DEFAULT template inventory is frozen
+from reference `c97cd4ad`; the proposals must still fail pending-boundary
+certification. This assertion does not replace the reference's full canonical
+changes/order/spellings comparison. That comparison still needs PR 5's shared
+address-chain qualification and monotonic identity allocation, then PR 7's
+canonical activation. Row 11 remains PR 5 work; no mutable per-operation
+spelling metadata is introduced here. The canonical class successful-diff,
+completed-schedule and nonempty-result assertions still belong to PR 7;
+its lock-note assertion and the physical-list/order/remedy oracle still
+require PR 6 and PR 7 as specified in DEC-2296.5. Every production guard and
+pending-boundary discharge check remains in force. No positional replay,
+rank, tie-break, settlement stage or format changes.

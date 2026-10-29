@@ -30,6 +30,9 @@ struct Receipt {
     events: Vec<(OperationId, Origin)>,
 }
 impl Obligations {
+    pub(super) fn parents(&self) -> BTreeSet<Uid> {
+        self.pending.iter().map(|b| b.parent.clone()).collect()
+    }
     pub(super) fn rebuilt(&self) -> bool {
         self.rebuild
     }
