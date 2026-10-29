@@ -375,6 +375,236 @@ async fn d2a1165_pg18_owns_credentials_and_executes_only_accepted_sealed_plans()
         .unwrap();
 }
 
+async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Result<()> {
+    let dir = crate::adopt::Stage::new("d2a1165-admission")?;
+    let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
+    let image = std::env::var(variable).context(variable.to_owned())?;
+    let scratch = crate::test_scratch::TestScratch::start(
+        &registry,
+        Driver::Postgres,
+        &image,
+        pbps_config::resolver::PullPolicy::Never,
+    )
+    .await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new()?;
+            if routine_defaults {
+                for (name, dependencies, body) in [
+                    ("fixture_leaf()", "", "RETURN 41"),
+                    (
+                        "fixture_default()",
+                        "depends_on: [app.fixture_leaf(), app.fixture_definer()]\n",
+                        "RETURN app.fixture_leaf() + app.fixture_definer()",
+                    ),
+                    (
+                        "fixture_definer()",
+                        "depends_on: [app.private_leaf()]\n",
+                        concat!(
+                            "SECURITY DEFINER SET search_path = app, pg_temp ",
+                            "RETURN app.private_leaf()"
+                        ),
+                    ),
+                    ("private_leaf()", "", "RETURN 1"),
+                    ("not_default()", "", "RETURN 99"),
+                ] {
+                    std::fs::write(
+                        fixture.0.path().join("schema").join(format!("{name}.yml")),
+                        format!(
+                            concat!(
+                                "function: app.{name}\n{dependencies}",
+                                "definition: () RETURNS integer LANGUAGE sql IMMUTABLE {body}\n"
+                            ),
+                            name = name,
+                            dependencies = dependencies,
+                            body = body
+                        ),
+                    )?;
+                }
+                std::fs::write(
+                    fixture.0.path().join("schema/not_default_proc.yml"),
+                    concat!(
+                        "procedure: app.not_default_proc()\ndefinition: ",
+                        "() LANGUAGE sql BEGIN ATOMIC SELECT 1; END\n"
+                    ),
+                )?;
+            } else {
+                let config = fixture.0.path().join("pbps.yml");
+                let text = std::fs::read_to_string(&config)?
+                    .replace("unmanaged: ignore", "unmanaged: error");
+                std::fs::write(config, text)?;
+            }
+            let base = fixture.input(&IdsFile::default(), false, false)?;
+            let session = Session::new(&scratch, &base.loaded.schema).await?;
+            ensure!(session.project(&base).config.unmanaged == base.config.unmanaged);
+            bootstrap(&session, &base).await?;
+            let mut candidate = fixture.input(&base.ids, !routine_defaults, false)?;
+            if routine_defaults {
+                candidate
+                    .loaded
+                    .schema
+                    .tables
+                    .get_mut(&TableName::new("app", "orders"))
+                    .unwrap()
+                    .columns
+                    .get_mut("amount")
+                    .unwrap()
+                    .value_source =
+                    pbps_model::ValueSource::Default("app.fixture_default()".into());
+            } else {
+                // A near-match is not owned infrastructure, even with the run id.
+                let outsider = format!("pbps_test_fixture_{}_other", scratch.run_id());
+                let mut c = admin(&scratch).await?;
+                c.execute(&format!("CREATE ROLE {outsider}")).await?;
+                let mut phase = Phase::new("candidate_plan", "unmanaged outsider");
+                let refused = plan(&session, &candidate, &mut phase).await;
+                ensure!(refused.is_err(), "unmanaged:error admitted an unowned role");
+                let evidence = format!(
+                    "{:?} {}",
+                    refused.err(),
+                    serde_json::to_string(&phase.findings)?
+                );
+                ensure!(evidence.contains(&outsider), "{evidence}");
+                c.execute(&format!("DROP ROLE {outsider}")).await?;
+            }
+            let mut phase = Phase::new("candidate_plan", "admitted");
+            let planned = plan(&session, &candidate, &mut phase).await?;
+            let progress = Progress::default();
+            apply(
+                &session,
+                &candidate,
+                &planned,
+                &mut phase,
+                &planned.artifact.checksum(),
+                &progress,
+            )
+            .await?;
+            ensure!(progress.accepted.get() && progress.started.get());
+            session.grants(&candidate.loaded.schema).await?;
+            let mut fixtures = session.fixtures().await?;
+            if routine_defaults {
+                fixtures
+                    .execute("INSERT INTO app.orders(code) VALUES ('default')")
+                    .await?;
+                ensure!(
+                    fixtures.query("SELECT amount FROM app.orders").await?[0]
+                        .try_get::<i32>("amount")?
+                        == Some(42)
+                );
+                let error = fixtures
+                    .execute("SELECT app.not_default()")
+                    .await
+                    .err()
+                    .context("unneeded routine was granted")?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                let error = fixtures
+                    .execute("SELECT app.private_leaf()")
+                    .await
+                    .err()
+                    .context("definer callee was granted")?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                let error = fixtures
+                    .execute("CALL app.not_default_proc()")
+                    .await
+                    .err()
+                    .context("unneeded procedure was granted")?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                let mut assertions = Conn::connect(Driver::Postgres, session.assertion()).await?;
+                let error = assertions
+                    .execute("SELECT app.fixture_default()")
+                    .await
+                    .err()
+                    .context("assertion role received fixture EXECUTE")?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"));
+                let mut c = admin(&scratch).await?;
+                let rows = c
+                    .query(concat!(
+                        "SELECT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(",
+                        "coalesce(proacl, pg_catalog.acldefault('f', proowner))) a ",
+                        "WHERE a.grantee=0 AND a.privilege_type='EXECUTE') AS allowed ",
+                        "FROM pg_catalog.pg_proc WHERE oid='app.fixture_default()'::regprocedure"
+                    ))
+                    .await?;
+                ensure!(rows[0].try_get::<bool>("allowed")? == Some(false));
+                candidate
+                    .loaded
+                    .schema
+                    .tables
+                    .get_mut(&TableName::new("app", "orders"))
+                    .unwrap()
+                    .columns
+                    .get_mut("amount")
+                    .unwrap()
+                    .value_source = pbps_model::ValueSource::None;
+                let mut phase = Phase::new("candidate_plan", "remove default");
+                let planned = plan(&session, &candidate, &mut phase).await?;
+                apply(
+                    &session,
+                    &candidate,
+                    &planned,
+                    &mut phase,
+                    &planned.artifact.checksum(),
+                    &Progress::default(),
+                )
+                .await?;
+                session.grants(&candidate.loaded.schema).await?;
+                let error = fixtures
+                    .execute("SELECT app.fixture_default()")
+                    .await
+                    .err()
+                    .context("removed default retained fixture EXECUTE")?;
+                ensure!(error.server_error_code().as_deref() == Some("42501"));
+            }
+            let error = fixtures
+                .execute("CREATE TABLE app.forbidden(n integer)")
+                .await
+                .err()
+                .context("fixture could create permanent objects")?;
+            ensure!(error.server_error_code().as_deref() == Some("42501"));
+            let mut phase = Phase::new("candidate_plan", "clean");
+            ensure!(plan(&session, &candidate, &mut phase).await?.data.changes == 0);
+            Ok::<_, anyhow::Error>(())
+        }),
+    )
+    .await;
+    scratch
+        .finish()
+        .await
+        .context("admission regression cleanup")?;
+    result.context("admission regression deadline")??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg16_unmanaged_error_excludes_only_owned_run_roles() {
+    Box::pin(admission_case("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", false))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg18_unmanaged_error_excludes_only_owned_run_roles() {
+    Box::pin(admission_case("PBPS_TEST_PG_SCRATCH_IMAGE", false))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg16_fixture_defaults_receive_only_required_managed_execute() {
+    Box::pin(admission_case("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", true))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg18_fixture_defaults_receive_only_required_managed_execute() {
+    Box::pin(admission_case("PBPS_TEST_PG_SCRATCH_IMAGE", true))
+        .await
+        .unwrap();
+}
+
 #[test]
 fn d2a1165_cleanup_unanswerable_preserves_the_assertion_finding_in_the_existing_envelope() {
     use crate::plan_test::report::{Phase, TestData};
@@ -483,7 +713,7 @@ fn d2a1165_composed_service_futures_stay_below_256_kib() {
                 root: fixture.0.path().to_owned(),
                 config: input.config.clone(),
             };
-            let target = crate::db::Target::test_owned("never polled".into());
+            let target = crate::db::Target::test_owned("never polled".into(), Vec::new());
             let boot = super::super::bootstrap_async(
                 &project,
                 Some(&target),

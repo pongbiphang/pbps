@@ -859,3 +859,9 @@ or separate renderer. Live PostgreSQL16/18 lifecycle tests pin wrong-checksum
 and stale-baseline refusals, retained values, actual SQL identities/permissions,
 assertion results and confirmed cleanup. D2b adds command/replay/publication and
 schema75; verified fixture re-pinning remains E. D2a changes no published format.
+
+The owned run's exact provision and generated execution roles are infrastructure, excluded from the
+unmanaged-policy inventory without weakening that policy for other identities.
+Fixture EXECUTE is refreshed only for managed routines reached through stored
+column-default dependencies, stopping at definer ownership boundaries; PUBLIC
+and assertion privileges stay unchanged.

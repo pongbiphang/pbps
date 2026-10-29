@@ -28,6 +28,13 @@ impl<'a> Session<'a> {
             "the owned adapter must return a keyword connection"
         );
         let mut conn = Conn::connect(Driver::Postgres, admin).await?;
+        let rows = conn.query("SELECT current_user::text AS role").await?;
+        let provision_role: pbps_model::RoleName = rows
+            .first()
+            .context("missing owned provision role result")?
+            .try_get::<&str>("role")?
+            .context("NULL owned provision role")?
+            .into();
         // The frozen declarations must never capture an infrastructure identity.
         let roles = ["apply", "fixture", "assertion"]
             .map(|kind| format!("pbps_test_{kind}_{}", scratch.run_id()));
@@ -79,7 +86,14 @@ impl<'a> Session<'a> {
         let key = scratch.fingerprint_key()?;
         Ok(Self {
             scratch,
-            target: Target::test_owned(connection(apply, &passwords[0])),
+            target: Target::test_owned(
+                connection(apply, &passwords[0]),
+                roles
+                    .iter()
+                    .map(|r| r.as_str().into())
+                    .chain([provision_role])
+                    .collect(),
+            ),
             fixture: connection(fixture, &passwords[1]),
             assertion: connection(assertion, &passwords[2]),
             roles,
@@ -160,6 +174,29 @@ impl<'a> Session<'a> {
             permanent_create == Some(false),
             "fixture/assertion privileges permit permanent CREATE; remove broad grants, including any PUBLIC grant"
         );
+        let mut routines = Vec::new();
+        for id in schema.modules.keys() {
+            let pbps_model::ModuleId::Routine(routine) = id else {
+                continue;
+            };
+            let namespace = quoted(&routine.name.schema)?;
+            let signature = format!(
+                "{}.{}({})",
+                namespace,
+                quoted(&routine.name.name)?,
+                routine
+                    .args
+                    .iter()
+                    .map(|a| a.raw())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            conn.execute(&format!(
+                "REVOKE EXECUTE ON ROUTINE {signature} FROM {fixture}"
+            ))
+            .await?;
+            routines.push((namespace, signature));
+        }
         for (name, declared) in &schema.tables {
             let t = table(name)?;
             let namespace = quoted(&name.schema)?;
@@ -178,6 +215,46 @@ impl<'a> Session<'a> {
             if declared.data.is_none() {
                 conn.execute(&format!("GRANT INSERT, UPDATE, DELETE ON {t} TO {fixture}"))
                     .await?;
+                // Grant only managed routines reached by this table's defaults.
+                // Follow recorded invoker dependencies (SQL-standard bodies);
+                // definer descendants run with their owner’s privileges.
+                // do not widen PUBLIC or give the fixture an owning role.
+                for (namespace, signature) in &routines {
+                    let sql = format!(
+                        concat!(
+                            "WITH RECURSIVE defaults(classid, objid) AS (",
+                            "SELECT 'pg_catalog.pg_attrdef'::regclass, a.oid FROM pg_catalog.pg_attrdef a ",
+                            "WHERE a.adrelid='{relation}'::regclass UNION ",
+                            "SELECT d.refclassid, d.refobjid FROM defaults v JOIN pg_catalog.pg_depend d ",
+                            "ON d.classid=v.classid AND d.objid=v.objid ",
+                            "WHERE d.refclassid IN ('pg_catalog.pg_proc'::regclass, 'pg_catalog.pg_operator'::regclass) ",
+                            "AND (v.classid <> 'pg_catalog.pg_proc'::regclass OR NOT ",
+                            "(SELECT p.prosecdef FROM pg_catalog.pg_proc p WHERE p.oid=v.objid))) ",
+                            "SELECT EXISTS (SELECT 1 FROM defaults WHERE classid='pg_catalog.pg_proc'::regclass ",
+                            "AND objid='{routine}'::regprocedure) AS needed"
+                        ),
+                        relation = t.replace('\'', "''"),
+                        routine = signature.replace('\'', "''")
+                    );
+                    let rows = conn.query(&sql).await?;
+                    if rows
+                        .first()
+                        .context("missing default routine dependency result")?
+                        .try_get::<bool>("needed")?
+                        .context("NULL default routine dependency result")?
+                    {
+                        let grant = format!(
+                            concat!(
+                                "GRANT USAGE ON SCHEMA {} TO {fixture}; ",
+                                "GRANT EXECUTE ON ROUTINE {signature} TO {fixture}"
+                            ),
+                            namespace,
+                            fixture = fixture,
+                            signature = signature
+                        );
+                        conn.execute(&grant).await?;
+                    }
+                }
                 // Ownership and default dependencies name only this table's allocators.
                 let literal = t.replace('\'', "''");
                 let sql = format!(

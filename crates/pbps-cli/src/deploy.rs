@@ -127,7 +127,7 @@ async fn managed_state(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
@@ -148,7 +148,7 @@ struct ManagedRead<'a> {
     ids: &'a IdsFile,
     modules: &'a BTreeSet<ModuleId>,
     external: &'a BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'a>,
     scopes: &'a DataScopes,
     reference: &'a Schema,
     read: crate::engine::Read,
@@ -208,7 +208,7 @@ async fn managed_state_once(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
@@ -2569,7 +2569,7 @@ async fn baseline_state(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     recorded: &Schema,
     as_the_apply_reads_it: &DataScopes,
@@ -2628,7 +2628,7 @@ async fn staged_baseline(
     checked: &BTreeSet<ModuleId>,
     watched: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     checked_scopes: &DataScopes,
     recorded: &Schema,
     watched_scopes: &DataScopes,
@@ -2659,7 +2659,10 @@ async fn staged_baseline(
         watched,
         external,
         &unreadable,
-        pbps_config::Unmanaged::Ignore,
+        db::CatalogPolicy {
+            unmanaged: pbps_config::Unmanaged::Ignore,
+            ..unmanaged
+        },
     )?;
     let rows = crate::engine::read_rows(
         conn,
@@ -2700,7 +2703,7 @@ async fn managed_state_full(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     rows: &BTreeMap<TableName, RowScope>,
     read: crate::engine::Read,
 ) -> anyhow::Result<Managed> {
@@ -2873,9 +2876,14 @@ fn cut(
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
+    // These exact roles belong to the verified owned run, not its declarations.
+    // A similarly named role remains subject to the project's ordinary policy.
+    scoped
+        .unmanaged_roles
+        .retain(|role| !unmanaged.infrastructure_roles.contains(role));
     // A managed role's grant WITH GRANT OPTION is wider than the plain grant
     // the declarations can spell, and was left out of the role's set rather
     // than folded in. Carried beside the comparison so `verify` reports it
@@ -2905,7 +2913,7 @@ fn cut(
         .baseline_evidence
         .as_ref()
         .map(|evidence| evidence.for_managed(&scoped.schema));
-    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
+    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
     Ok(scoped)
 }
 
@@ -5833,7 +5841,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &pbps_diff::external_parents(&baseline.snapshot.schema),
             // The unmanaged policy is applied below instead, beside the
             // finished report, so that neither verdict can erase the other.
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &rows_to_read(&recorded_scopes),
             crate::engine::Read::Snapshot,
         )
@@ -6079,7 +6087,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 &ids,
                 &declared_modules,
                 &pbps_diff::external_parents(&loaded.schema),
-                project.config.unmanaged,
+                target.catalog_policy(project.config.unmanaged),
                 &declared_data,
                 &loaded.schema,
                 crate::engine::Read::Snapshot,
@@ -6332,7 +6340,7 @@ pub fn cmd_baseline(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &declared_data,
                     &loaded.schema,
                     read,
@@ -6887,7 +6895,7 @@ async fn bootstrap_async(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &BTreeMap::new(),
                     crate::engine::Read::Snapshot,
                 )
@@ -6982,7 +6990,7 @@ async fn bootstrap_async(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &loaded.schema.data_scopes(),
                     &loaded.schema,
                     crate::engine::Read::InsideOwnTransaction,
@@ -7512,7 +7520,7 @@ async fn plan_db_async(
             // what the ledger says pbps holds, and a declared switch is the
             // differ's to refuse (DEC-1533.1).
             &pbps_diff::external_parents(&entry.snapshot.schema),
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &to_read,
             crate::engine::Read::Snapshot,
         )
@@ -9147,7 +9155,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         &recorded_ids,
         &recorded_modules,
         &externals_under(&externals, &recorded_ids),
-        project.config.unmanaged,
+        target.catalog_policy(project.config.unmanaged),
         &pinned_baseline_scopes(
             &entry.snapshot.schema.data_scopes(),
             &planned_scopes,
@@ -9331,7 +9339,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
             &externals_under(&externals, &plan.ids),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &plan.data,
             &Schema::default(),
             crate::engine::Read::InsideOwnTransaction,
@@ -9359,7 +9367,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
                 &plan.ids,
                 &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
                 &externals_under(&externals, &plan.ids),
-                project.config.unmanaged,
+                target.catalog_policy(project.config.unmanaged),
                 &plan.data,
                 &Schema::default(),
                 crate::engine::Read::InsideOwnTransaction,
@@ -9697,7 +9705,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &after_modules,
             &after_modules,
             &externals_under(&externals, at_checkpoint),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &entry.snapshot.schema.data_scopes(),
             &entry.snapshot.schema,
             &held_before_the_plan(
@@ -9808,7 +9816,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &recorded_modules,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &recorded_ids),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &pinned_baseline_scopes(
                 &entry.snapshot.schema.data_scopes(),
                 &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
@@ -10172,7 +10180,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &live_ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &live_ids),
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             // The plan's own scope, not the widened one: what a statement
             // leaves is read under the keys the plan leaves, as the closing
             // read is, so a row the renames leave unmanaged is not compared
@@ -10269,7 +10277,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
         &externals_under(&externals, &plan.ids),
-        project.config.unmanaged,
+        target.catalog_policy(project.config.unmanaged),
         &plan.data,
         &Schema::default(),
         crate::engine::Read::Snapshot,
@@ -16832,7 +16840,7 @@ mod tests {
             ids: &ids,
             modules: &modules,
             external: &BTreeSet::new(),
-            unmanaged: pbps_config::Unmanaged::Ignore,
+            unmanaged: pbps_config::Unmanaged::Ignore.into(),
             scopes: &scopes,
             reference: &reference,
             read,
@@ -23263,7 +23271,7 @@ mod tests {
             &modules,
             &BTreeSet::new(),
             &unreadable,
-            pbps_config::Unmanaged::Error,
+            pbps_config::Unmanaged::Error.into(),
         )
         .unwrap_err();
         assert!(refusal.is::<UnmanagedPolicy>(), "{refusal:#}");
@@ -23283,7 +23291,7 @@ mod tests {
             &modules,
             &BTreeSet::new(),
             &unreadable,
-            pbps_config::Unmanaged::Error,
+            pbps_config::Unmanaged::Error.into(),
         )
         .expect("a declared type is refused by managed limitations, not unmanaged policy");
         let relation = Pulled {

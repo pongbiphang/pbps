@@ -81,6 +81,10 @@ SQL_BUILDERS = {
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
+    "crates/pbps-cli/src/plan_test/session.rs": (
+        1,
+        "builds a GRANT signature from normalized routine arguments in the owned session (#1165)",
+    ),
     "crates/pbps-dialect/src/predicate/render.rs": (
         1,
         "renders validated raw type arguments as SQL, not diagnostic prose (#2400)",
