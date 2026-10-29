@@ -92,6 +92,8 @@ pub struct RawTable {
     /// The TOAST relation's `reloptions`: a `toast.*` parameter, which the
     /// model does not declare (#1441).
     pub toast_reloptions: Vec<String>,
+    /// Named only when `reltablespace` is nonzero (DEC-2445.1).
+    pub tablespace: Option<String>,
     /// `relpersistence = 'u'`: an unlogged table (#1443). A temporary one is
     /// never here; it stays a limitation.
     pub unlogged: bool,
@@ -128,6 +130,8 @@ pub struct RawModule {
     /// The table a trigger is on, empty for every other kind.
     pub on_table: String,
     pub definition: String,
+    /// View column defaults, which `pg_get_viewdef` cannot preserve.
+    pub column_defaults: Vec<String>,
 }
 
 /// One argument of one routine's identity, as `format_type` prints it under the
@@ -182,6 +186,10 @@ pub struct RawColumn {
     pub default_sequences: Option<String>,
     /// The column's collation, when it is not the one its type carries.
     pub collation: Option<String>,
+    /// `attstorage`, only where it differs from the type's `typstorage`.
+    pub storage: Option<String>,
+    /// Nonempty `attcompression`; empty means the server-selected default.
+    pub compression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,6 +853,19 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map_or(&[][..], Vec::as_slice);
         if refused.contains(&raw_table.oid) {
             continue;
+        }
+        for raw_column in raw_columns {
+            column_storage(raw_column, &name, &mut pulled);
+        }
+        if let Some(tablespace) = &raw_table.tablespace {
+            note(
+                &mut pulled,
+                &name,
+                format!(
+                    "table `{}` uses TABLESPACE `{tablespace}`, which the declarations do not hold",
+                    name.shown()
+                ),
+            );
         }
         // A partition is its bound and its parent, and what it has of its own:
         // its checks and indexes (#1577). Its columns and keys are the
@@ -2168,6 +2189,17 @@ fn add_module(
         );
     }
 
+    for default in &raw.column_defaults {
+        note_target(
+            pulled,
+            LimitationTarget::module(id.clone()),
+            format!(
+                "view `{}` has column default `{default}`, which the declarations do not hold; \
+                 its query alone cannot recreate that default",
+                here.shown()
+            ),
+        );
+    }
     pulled.schema.modules.insert(
         id,
         Module {
@@ -2624,6 +2656,44 @@ fn sequence_options(
         cycle,
         cache: (cache != DEFAULT_SEQUENCE_CACHE).then_some(cache),
     })
+}
+
+fn column_storage(raw: &RawColumn, table: &TableName, pulled: &mut Pulled) {
+    // Storage inherits from the type; compression inherits from the server
+    // only when its catalog marker is empty, even if an explicit method equals
+    // today's server default (DEC-2445.1).
+    for (property, value) in [
+        (
+            "STORAGE",
+            raw.storage.as_deref().map(|value| match value {
+                "p" => "PLAIN",
+                "e" => "EXTERNAL",
+                "m" => "MAIN",
+                "x" => "EXTENDED",
+                other => other,
+            }),
+        ),
+        (
+            "COMPRESSION",
+            raw.compression.as_deref().map(|value| match value {
+                "p" => "pglz",
+                "l" => "lz4",
+                other => other,
+            }),
+        ),
+    ] {
+        if let Some(value) = value {
+            note(
+                pulled,
+                table,
+                format!(
+                    "column `{}`.`{}` has {property} `{value}`, which the declarations do not hold",
+                    table.shown(),
+                    raw.name
+                ),
+            );
+        }
+    }
 }
 
 fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
@@ -3926,6 +3996,7 @@ mod tests {
             name: name.into(),
             on_table: String::new(),
             definition: definition.into(),
+            column_defaults: Vec::new(),
         }
     }
 
@@ -4008,6 +4079,7 @@ mod tests {
                 identity_index: None,
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
+                tablespace: None,
                 unlogged: false,
                 row_security: Default::default(),
                 partition_key: None,
@@ -5333,6 +5405,7 @@ mod tests {
                 identity_index: None,
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
+                tablespace: None,
                 unlogged: false,
                 row_security: Default::default(),
                 partition_key: None,
@@ -5728,6 +5801,7 @@ mod tests {
             identity_index: None,
             reloptions: Vec::new(),
             toast_reloptions: Vec::new(),
+            tablespace: None,
             unlogged: false,
             row_security: Default::default(),
             partition_key: None,
@@ -5751,6 +5825,8 @@ mod tests {
             serial: None,
             default_sequences: None,
             collation: None,
+            storage: None,
+            compression: None,
         }
     }
 

@@ -1031,3 +1031,32 @@ bootstrap, verify and plan no changes on both versions. A pull of a BY DEFAULT
 identity with a DEFAULT partition must produce a tree that bootstraps and
 pulls back identically. BY DEFAULT retains its existing warning and projection
 to the declaration's ALWAYS identity.
+
+<a id="dec-2445-1"></a>
+
+**DEC-2445.1. Name unsupported table placement, column storage and compression,
+and view column defaults through the existing managed-set limitation gate.**
+A pull must name each property it cannot recreate; connected comparison and
+recording refuse the same limitation on a managed relation or view. These
+facts remain catalog metadata, outside Schema, the plan checksum and the
+published schema set. A view's query is still pulled, with its column defaults
+named separately, just as a table with TOAST reloptions retains its columns.
+
+Storage is non-default only when `attstorage` differs from the column type's
+`typstorage`. Compression is inherited only when `attcompression` is empty:
+an explicit `pglz` or `lz4` remains a property even when it matches today's
+`default_toast_compression`. A table's `reltablespace = 0` means the database
+default, rather than a named placement. Nonzero placement requires a readable
+tablespace name; missing or malformed fields and unreadable catalogs are
+errors, never defaults. View defaults come from live, non-dropped attributes
+and `pg_attrdef`, not from `pg_get_viewdef`, which omits them.
+
+Measured on PostgreSQL 16.15 and 18.6 before the change: with the view already
+pulled and baselined, adding `ALTER VIEW app.v ALTER COLUMN id SET DEFAULT 42`
+still let `plan --db` report `No changes.`. All four omissions therefore use
+the existing fatal limitation path; no new policy or support decision is made.
+On both engines, a view `SET DEFAULT NULL` removes the catalog default, so it
+is silent like `DROP DEFAULT`.
+
+Live tests pin each named pull/refusal, each silent default, both server
+compression defaults, and denied catalog columns on both PostgreSQL versions.
