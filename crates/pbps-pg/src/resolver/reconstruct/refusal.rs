@@ -312,7 +312,7 @@ impl Reconstruction {
             .filter(|(i, step)| {
                 *i != at
                     && step.owner != self.steps[at].owner
-                    && !self.committed.contains(i)
+                    && !self.committed.contains(&super::FillWork::Declared(*i))
                     && !delta.iter().any(|(done, _)| done == i)
             })
             .filter(|(_, s)| {
@@ -360,7 +360,7 @@ impl Reconstruction {
         if code.as_deref() == Some("42703") {
             for (i, step) in self.steps.iter().enumerate() {
                 if i != at
-                    && !self.committed.contains(&i)
+                    && !self.committed.contains(&super::FillWork::Declared(i))
                     && !delta.iter().any(|(at, _)| *at == i)
                     && let pbps_model::Change::AddColumn { table, name, .. } = &step.subject
                     && column.as_ref().map_or_else(
@@ -443,7 +443,7 @@ impl Reconstruction {
         let owners: Vec<_> = pending.iter().filter_map(|p| p.owner.clone()).collect();
         for item in &mut pending {
             if let (Some(Declaration::Module(owner)), Some(last)) = (&item.owner, &item.last)
-                && self.waiting_fill.is_none()
+                && !self.has_fill()
                 && last.reference.is_some()
                 && let [Candidate::Declaration(Declaration::Module(provider))] =
                     last.candidates.as_slice()
@@ -469,12 +469,7 @@ impl Reconstruction {
             committed: self
                 .committed
                 .iter()
-                .map(|&at| self.steps[at].declaration.clone())
-                .chain(self.between.iter().flat_map(|(_, names)| {
-                    names.iter().map(|(kind, schema, name)| {
-                        format!("{kind:?} {}.{} (fill)", Escaped(schema), Escaped(name))
-                    })
-                }))
+                .map(|&work| self.work_name(work))
                 .collect(),
             stalled,
             overtakes,

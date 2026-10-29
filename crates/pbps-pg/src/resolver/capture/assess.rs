@@ -967,15 +967,7 @@ mod tests {
                     // table is deliberately the suffix, not pulled across.
                     let changes = [changes[1].clone(), changes[2].clone(), changes[0].clone()];
                     order = f::build(&pg, &changes, &Default::default(), false);
-                    order.expect_fill_at(2);
-                    order
-                        .compile_steps_in(&pg, &SessionZone::utc(), &mut conn, 0..2)
-                        .await
-                        .unwrap();
-                    conn.execute("CREATE DOMAIN ext.filled AS integer")
-                        .await
-                        .unwrap();
-                    order.created_before(
+                    order.fixture_fill_at(
                         2,
                         vec![(
                             crate::resolver::reconstruct::Nameable::Type,
@@ -984,7 +976,21 @@ mod tests {
                         )],
                     );
                     order
-                        .compile_steps_in(&pg, &SessionZone::utc(), &mut conn, 2..order.len())
+                        .compile_next(&pg, &SessionZone::utc(), &mut conn)
+                        .await
+                        .unwrap();
+                    let before_fill = crate::resolver::externals::inventory(&mut conn)
+                        .await
+                        .unwrap();
+                    conn.execute("CREATE DOMAIN ext.filled AS integer")
+                        .await
+                        .unwrap();
+                    let after_fill = crate::resolver::externals::inventory(&mut conn)
+                        .await
+                        .unwrap();
+                    order.finish_fill(&before_fill, &after_fill).unwrap();
+                    order
+                        .compile_next(&pg, &SessionZone::utc(), &mut conn)
                         .await
                         .unwrap();
                 } else {

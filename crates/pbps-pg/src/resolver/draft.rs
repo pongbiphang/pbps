@@ -130,6 +130,7 @@ struct Object {
     /// The schema, quoted, or empty for an object in none.
     schema: String,
     described: String,
+    name: Option<super::reconstruct::Named>,
 }
 
 /// One `pg_depend` row. `shape` says whether the dependent is a part the
@@ -291,9 +292,17 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
             "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
                       AS catalog, f.objid::text AS oid, \
                     coalesce(pg_catalog.quote_ident(i.schema), '') AS schema, \
-                    pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described \
+                    pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described, \
+                    CASE WHEN c.oid IS NOT NULL THEN CASE WHEN c.reltype=0 THEN 'index' ELSE 'relation' END \
+                         WHEN t.oid IS NOT NULL THEN 'type' END AS name_kind, \
+                    COALESCE(cn.nspname, tn.nspname)::text AS name_schema, \
+                    COALESCE(c.relname, t.typname)::text AS name_leaf \
                FROM ({}) f \
-               CROSS JOIN LATERAL pg_catalog.pg_identify_object(f.classid, f.objid, 0) i",
+               CROSS JOIN LATERAL pg_catalog.pg_identify_object(f.classid, f.objid, 0) i \
+               LEFT JOIN pg_catalog.pg_class c ON f.classid='pg_catalog.pg_class'::pg_catalog.regclass AND c.oid=f.objid \
+               LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=c.relnamespace \
+               LEFT JOIN pg_catalog.pg_type t ON f.classid='pg_catalog.pg_type'::pg_catalog.regclass AND t.oid=f.objid \
+               LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace",
             super::scratch::user_objects()
         ))
         .await?
@@ -303,6 +312,7 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
             Object {
                 schema: text(&row, "schema")?,
                 described: text(&row, "described")?,
+                name: super::externals::catalog_name(&row)?,
             },
         );
     }
@@ -828,6 +838,7 @@ struct Filled {
     /// The managed relations its shape names, by schema and name: a chained
     /// shape is created once the last of them exists.
     after: BTreeSet<(String, String)>,
+    expected: BTreeMap<(String, String), Option<super::reconstruct::Named>>,
 }
 
 #[derive(Debug, Clone)]
@@ -844,57 +855,43 @@ enum How {
 /// What fill sends, once the externals file has run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staging {
+    pub steps: Vec<FillStep>,
     /// Run after the externals file, in the session that ran it: each
     /// schema it writes into, then every object no managed object must
     /// precede.
     pub ahead: String,
-    /// Run once the managed relations in `chained_after` exist (empty for
-    /// none).
-    pub chained: String,
-    /// The managed relations, by schema and name, the chained shapes name.
-    pub chained_after: BTreeSet<(String, String)>,
-    /// What each chained object is, as `pg_describe_object` names it.
-    pub chained_objects: BTreeSet<String>,
     /// What each filled object is, as `pg_describe_object` names it.
     pub filled: BTreeSet<String>,
     /// One finding for each object fill cannot stage, for a compile that
     /// fails for want of one.
     pub unfillable: Vec<String>,
-    /// Each chained object, in order: its description, its SQL, and the
-    /// managed relations it waits for, its own and those of the chained
-    /// objects it names.
-    links: Vec<Link>,
 }
 
-/// A chained object: its description, its SQL, and the managed relations
-/// it waits for.
-type Link = (String, String, BTreeSet<(String, String)>);
-
-impl Staging {
-    /// Keeps the chained objects whose managed relations are all
-    /// `available` (the scratch compile creates each). One that waits for a
-    /// relation it does not create, such as a base table the plan renames,
-    /// is not filled and is named in the findings; what names it waits for
-    /// that relation too, so it goes with it. The rest still are (#1778).
-    pub fn keep_chained(&mut self, available: impl Fn(&BTreeSet<(String, String)>) -> bool) {
-        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.links)
-            .into_iter()
-            .partition(|(_, _, after)| available(after));
-        for (described, _, _) in gone {
-            self.filled.remove(&described);
-            self.chained_objects.remove(&described);
-            self.unfillable.push(format!(
-                "{described} is not filled: its shape names a managed relation the scratch \
-                 compile does not create",
-                described = Escaped(&described)
-            ));
-        }
-        self.chained = kept.iter().map(|(_, sql, _)| sql.as_str()).collect();
-        self.chained_after = kept
-            .iter()
-            .flat_map(|(_, _, after)| after.iter().cloned())
-            .collect();
-        self.links = kept;
+/// An engine-owned target recipe, distinct from a managed change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillStep {
+    pub(crate) name: String,
+    pub(crate) sql: String,
+    pub(crate) after: BTreeSet<(String, String)>,
+    pub(crate) dependencies: Vec<usize>,
+    pub(crate) unavailable: bool,
+    pub(crate) root: (String, String),
+    pub(crate) expected: BTreeMap<(String, String), Option<super::reconstruct::Named>>,
+    pub(crate) names: Vec<super::reconstruct::Named>,
+}
+impl FillStep {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+    pub fn observed_names(
+        &self,
+        before: &super::externals::Inventory,
+        after: &super::externals::Inventory,
+    ) -> Result<Vec<super::reconstruct::Named>, DbError> {
+        super::externals::fill_names(before, after, &self.root, &self.expected)
     }
 }
 
@@ -915,14 +912,9 @@ impl Fill {
         let mut states = Vec::with_capacity(self.objects.len());
         let mut staging = Staging::default();
         let mut ahead = Vec::new();
-        let mut chained = Vec::new();
         let mut schemas = BTreeSet::new();
-        let mut afters: Vec<BTreeSet<(String, String)>> = Vec::with_capacity(self.objects.len());
-        for object in &self.objects {
-            let mut after = object.after.clone();
-            for &index in &object.names {
-                after.extend(afters[index].iter().cloned());
-            }
+        let mut positions = BTreeMap::new();
+        for (object_at, object) in self.objects.iter().enumerate() {
             let part = object.parts.iter().find(|part| created.contains(*part));
             let state = if created.contains(&(object.catalog.clone(), object.described.clone())) {
                 State::Created
@@ -939,7 +931,7 @@ impl Fill {
             } else if let Some(&missing) = object
                 .names
                 .iter()
-                .find(|&&index| states[index] == State::Missing)
+                .find(|&&index| states.get(index) == Some(&State::Missing))
             {
                 staging.unfillable.push(format!(
                     "{} cannot be filled: its shape names {}, which cannot be filled either",
@@ -967,10 +959,11 @@ impl Fill {
                     How::Chained(_) | How::Ahead(_)
                         if object.catalog == "pg_extension"
                             && (matches!(object.how, How::Chained(_))
-                                || object
-                                    .names
-                                    .iter()
-                                    .any(|&index| states[index] == State::Chained)) =>
+                                || object.names.iter().any(|&index| {
+                                    states
+                                        .get(index)
+                                        .is_none_or(|state| *state == State::Chained)
+                                })) =>
                     {
                         staging.unfillable.push(format!(
                             "{} cannot be filled: its shape names a managed relation, and an \
@@ -981,17 +974,14 @@ impl Fill {
                         ));
                         State::Missing
                     }
-                    How::Chained(sql) => {
-                        chained.push(sql.as_str());
-                        State::Chained
-                    }
-                    How::Ahead(sql)
-                        if object
-                            .names
-                            .iter()
-                            .any(|&index| states[index] == State::Chained) =>
+                    How::Chained(_) => State::Chained,
+                    How::Ahead(_)
+                        if object.names.iter().any(|&index| {
+                            states
+                                .get(index)
+                                .is_none_or(|state| *state == State::Chained)
+                        }) =>
                     {
-                        chained.push(sql.as_str());
                         State::Chained
                     }
                     How::Ahead(sql) => {
@@ -1005,31 +995,42 @@ impl Fill {
                 schemas.extend(object.schemas.iter().cloned());
             }
             if state == State::Chained {
-                staging.chained_objects.insert(object.described.clone());
-                staging.chained_after.extend(after.iter().cloned());
-                if let How::Ahead(sql) | How::Chained(sql) = &object.how {
-                    staging
-                        .links
-                        .push((object.described.clone(), sql.clone(), after.clone()));
-                }
+                positions.insert(object_at, staging.steps.len());
+                staging.steps.push(FillStep {
+                    name: object.described.clone(),
+                    sql: match &object.how {
+                        How::Ahead(sql) | How::Chained(sql) => sql.clone(),
+                        How::Not(_) => unreachable!(),
+                    },
+                    after: object.after.clone(),
+                    dependencies: object.names.clone(),
+                    unavailable: false,
+                    root: (object.catalog.clone(), object.described.clone()),
+                    expected: object.expected.clone(),
+                    names: Vec::new(),
+                });
             }
             states.push(state);
-            afters.push(after);
+        }
+        for step in &mut staging.steps {
+            step.dependencies = step
+                .dependencies
+                .iter()
+                .filter_map(|i| match states[*i] {
+                    State::Chained => positions.get(i).copied(),
+                    State::Missing => {
+                        step.unavailable = true;
+                        None
+                    }
+                    State::Created | State::Ahead => None,
+                })
+                .collect();
         }
         staging.ahead = schemas
             .iter()
             .map(|schema| format!("CREATE SCHEMA IF NOT EXISTS {schema};\n"))
             .chain(ahead.into_iter().map(str::to_owned))
             .collect();
-        staging.chained = chained.concat();
-        debug_assert_eq!(
-            staging.chained,
-            staging
-                .links
-                .iter()
-                .map(|(_, sql, _)| sql.as_str())
-                .collect::<String>()
-        );
         staging
     }
 }
@@ -1176,6 +1177,21 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
             Filled {
                 catalog: key.0.clone(),
                 described: described(key),
+                expected: std::iter::once(key)
+                    .chain(
+                        folded
+                            .carriers
+                            .keys()
+                            .copied()
+                            .filter(|part| folded.top(part) == *key),
+                    )
+                    .filter_map(|part| {
+                        facts
+                            .objects
+                            .get(part)
+                            .map(|o| ((part.0.clone(), o.described.clone()), o.name.clone()))
+                    })
+                    .collect(),
                 parts,
                 schemas,
                 how,
@@ -1183,7 +1199,6 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
                 names: folded
                     .shapes(key)
                     .filter_map(|referenced| index.get(referenced).copied())
-                    .filter(|&i| i < index[key])
                     .collect(),
             }
         })

@@ -1553,7 +1553,8 @@ pub(super) fn dropped_signatures(
         .collect()
 }
 
-/// The desired namespace's scratch statements, for this engine.
+/// The desired namespace's scratch statements, for the no-Fill live oracle.
+#[cfg(test)]
 pub(in crate::resolver::server) fn reconstruction(
     driver: Driver,
     extras: &[String],
@@ -1805,6 +1806,7 @@ impl Scratch<'_> {
         binding: &BindingRequest<'_>,
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
+        prepared: &mut Prepared,
     ) -> Result<Binding, Error> {
         let base_managed = Managed::from_schema(binding.base);
         let desired_managed = Managed::from_schema(binding.desired);
@@ -1825,15 +1827,19 @@ impl Scratch<'_> {
         let routines = externals::ManagedRoutines { desired: kept, any };
         let extras = &self.request.write_path_extras;
         let generation_version = generation_version(target).await.map_err(Error::Binding)?;
-        let reconstruction = reconstruction(
-            self.driver,
-            extras,
+        let reconstruction = Reconstruction::with_fills(
+            &pbps_pg::Postgres::with_write_path_extras(extras.to_vec())
+                .with_server_version(generation_version),
             binding.bootstrap,
             ids,
             dependencies,
-            generation_version,
+            std::mem::take(&mut prepared.staging.steps),
         )
-        .map_err(Error::Binding)?;
+        .map_err(compile_failed)?;
+        for name in reconstruction.omitted_fills() {
+            prepared.staging.filled.remove(name);
+            prepared.staging.unfillable.push(format!("{} is not filled: its shape names a managed relation the scratch compile does not create", Escaped(name)));
+        }
         Ok(Binding {
             base_managed,
             desired_managed,
@@ -1867,54 +1873,18 @@ impl Prepared {
         Ok(conn)
     }
 
-    pub(super) fn split(&mut self, binding: &mut Binding) -> Option<usize> {
-        // Where the chained shapes go: just after the last step that creates
-        // a managed relation they name. A shape waiting for one scratch never
-        // creates is not filled, and its chain stays a finding; the others
-        // still are (DEC-1778.2).
-        self.staging
-            .keep_chained(|after| binding.reconstruction.after_creating(after).is_some());
-        if self.staging.chained.is_empty() {
-            None
-        } else {
-            let split = binding
-                .reconstruction
-                .after_creating(&self.staging.chained_after);
-            if let Some(at) = split {
-                binding.reconstruction.expect_fill_at(at);
-            }
-            split
-        }
-    }
-
     pub(super) fn has_filled(&self) -> bool {
         !self.staging.filled.is_empty()
     }
     pub(super) fn unfillable(&self) -> Vec<String> {
         self.staging.unfillable.clone()
     }
-    pub(super) fn waiting(&self) -> String {
-        format!(
-            "fill creates {} only once scratch has created {}, and a declaration scratch \
-                 compiles before that cannot read it: adopt the filled object into the managed \
-                 set, or select no resolver and keep ADR-0013's conservative rebuild",
-            self.staging
-                .chained_objects
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            self.staging
-                .chained_after
-                .iter()
-                .map(|(schema, name)| format!("{schema}.{name}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
 }
 
 impl Binding {
+    pub(super) fn has_fill(&self) -> bool {
+        self.reconstruction.has_fill()
+    }
     pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
         // A chain through a filled object is lifted: fill created it once
         // the managed relations it names existed.
@@ -1930,80 +1900,90 @@ impl Binding {
         )
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.reconstruction.len()
-    }
-
-    /// Compiles the reconstruction's `steps` as whatever role the session is,
-    /// over the run's ordinary connection.
+    /// Walk the one program, borrowing the supplied session sequentially.
+    /// Managed trials cannot cross the compiler-issued Fill boundaries.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn compile(
         &mut self,
-        extras: &[String],
-        driver: Driver,
-        zone: Option<&pbps_model::SessionZone>,
-        connection: &mut impl pbps_db::transport::ExecuteConnection,
-        steps: std::ops::Range<usize>,
-    ) -> Result<(), Error> {
-        match (driver, zone) {
-            (Driver::Postgres, None) => Err(Error::Scope(
-                "the target reported no session time zone to compile in".into(),
-            )),
-            (Driver::Postgres, Some(zone)) => self
-                .reconstruction
-                .compile_steps_in(
-                    &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
-                    zone,
-                    connection,
-                    steps,
-                )
-                .await
-                .map_err(compile_failed),
-            (Driver::Mssql, _) => Err(Error::Binding(super::NO_BINDING_ADAPTER.into())),
-        }
-    }
-
-    pub(super) async fn fill_chained(
-        &mut self,
-        prepared: &mut Prepared,
-        admin: &mut Conn,
-        split: usize,
-        outside_writes: OutsideWrites,
-    ) -> Result<externals::Created, Error> {
-        let (setup, state) = prepared.sessions.setup(admin);
-        let sql = &prepared.staging.chained;
-        let db = |what: &'static str| {
-            move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
-        };
-        let before = inventory(setup).await?;
-        run_fill(setup, state, sql, outside_writes).await?;
-        let after = inventory(setup).await?;
-        // A module compiled before the split may have bound a name these
-        // shapes take, as a routine call one of them now turns into a
-        // cast: the order check sees them as made resolvable here.
-        let names = externals::nameables(setup, &before, &after)
-            .await
-            .map_err(db("the filled objects' names"))?;
-        self.reconstruction.created_before(split, names);
-        Ok(externals::created(&before, &after))
-    }
-
-    pub(super) async fn compare_chained(
-        &self,
         prepared: &mut Prepared,
         admin: &mut Conn,
         target: &mut Conn,
-        chained: &externals::Created,
-    ) -> Result<Staged, Error> {
-        let capture = prepared.sessions.capture(admin);
-        capture::compare_staged(
-            capture,
-            target,
-            chained,
-            &[&self.base_managed, &self.desired_managed],
-            &descriptions(chained),
-        )
-        .await
-        .map_err(stage_failed)
+        extras: &[String],
+        zone: Option<&pbps_model::SessionZone>,
+        outside_writes: OutsideWrites,
+        staged: &mut Staged,
+    ) -> Result<(), Error> {
+        let zone = zone.ok_or_else(|| {
+            Error::Scope("the target reported no session time zone to compile in".into())
+        })?;
+        let pg = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
+        // Inventory is creation provenance, not another placement authority.
+        // Compare after all work: later setup must not stale an earlier proof.
+        let mut created = externals::Created::default();
+        while self.reconstruction.observations().is_none() {
+            if let Some(fill) = self.reconstruction.next_fill() {
+                let (setup, state) = prepared.sessions.setup(admin);
+                #[cfg(test)]
+                if let Ok(Some((name, sql))) =
+                    crate::resolver::server::scratch::FILL_FAILURE2134.try_with(Clone::clone)
+                    && name == fill.name()
+                {
+                    setup
+                        .execute(&sql)
+                        .await
+                        .map_err(|e| Error::Read(format!("the injected fill setup: {e}")))?;
+                }
+                let before = inventory(setup).await?;
+                run_fill(setup, state, fill.sql(), outside_writes).await?;
+                let after = inventory(setup).await?;
+                let delta = externals::created(&before, &after);
+                self.reconstruction
+                    .finish_fill(&before, &after)
+                    .map_err(compile_failed)?;
+                created.roots.extend(delta.roots);
+                created.members.extend(delta.members);
+                created.schemas.extend(delta.schemas);
+            } else {
+                let compile = prepared.compiling(admin, Some(zone))?;
+                if let Err(error) = self.reconstruction.compile_next(&pg, zone, compile).await {
+                    let mut error = compile_failed(error);
+                    if let Some(waiting) = self.reconstruction.waiting() {
+                        match &mut error {
+                            Error::Creation(failure) => {
+                                let failure = std::sync::Arc::make_mut(failure);
+                                failure.externals = true;
+                                failure.context.push(waiting);
+                            }
+                            Error::Binding(reason) => {
+                                error = Error::Externals(vec![waiting, reason.clone()]);
+                            }
+                            Error::Scratch
+                            | Error::Scope(_)
+                            | Error::Incompatible(_)
+                            | Error::Read(_)
+                            | Error::Unusable(_)
+                            | Error::Externals(_)
+                            | Error::Changed(_) => {}
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if !created.roots.is_empty() || !created.members.is_empty() {
+            staged.extend(
+                capture::compare_staged(
+                    prepared.sessions.capture(admin),
+                    target,
+                    &created,
+                    &[&self.base_managed, &self.desired_managed],
+                    &descriptions(&created),
+                )
+                .await
+                .map_err(stage_failed)?,
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -35,7 +35,9 @@ PostgreSQL additionally receives order's branded trial program (DEC-2465.1):
 all non-Guess predecessors constrain every whole-group attempt, while guesses
 may be overtaken after creation refusals. Actual committed successes and fill
 events drive binding assessment; partial execution grants no completion proof.
-The blueprint and its fixed chained-fill range cuts remain immutable.
+The managed blueprint, immutable lowered groups and per-Fill cuts remain fixed.
+Scratch-only Fill entries wait for their exact complete-shape prerequisites
+and contribute ordinary step names, never deployment operations (DEC-2134.1).
 The completed shared declaration/catalog route lives in `order::deployment`.
 A successful differ result retains its preceding sort/rename provenance;
 raw proposals remain non-executable even after all shared stages. Existing

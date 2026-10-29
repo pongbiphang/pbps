@@ -2,7 +2,9 @@
 //! into the parts the engine creates one at a time, and one `Schedule`
 //! settles the constraints `prepare` states over them (DEC-2389.1).
 use super::{Constraint, Schedule};
+mod fill;
 mod trial;
+pub use fill::{FillDependency, FillNode, FillProgram, FillWork};
 /// Scratch-only provenance; operation IDs stay in the prepared coordinate space.
 #[derive(Debug, Clone)]
 pub struct DroppedGuess {

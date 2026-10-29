@@ -964,20 +964,32 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
     assert!(at("table app.n") < at("function app.f(integer)"));
     assert!(at("function app.f(integer)") < at("column app.n.g"));
     assert_eq!(
-        reconstruction.after_creating(&named(&[("app", "n")])),
+        fill_position(&crate::Postgres::new(), &bootstrap, &named(&[("app", "n")])),
         Some(at("column app.n.g") + 1)
     );
     assert_eq!(
-        reconstruction.after_creating(&named(&[("app", "plain"), ("app", "n")])),
+        fill_position(
+            &crate::Postgres::new(),
+            &bootstrap,
+            &named(&[("app", "plain"), ("app", "n")])
+        ),
         Some(at("column app.n.g") + 1),
         "the last of them"
     );
     assert_eq!(
-        reconstruction.after_creating(&named(&[("app", "plain")])),
+        fill_position(
+            &crate::Postgres::new(),
+            &bootstrap,
+            &named(&[("app", "plain")])
+        ),
         Some(at("table app.plain") + 1)
     );
     assert_eq!(
-        reconstruction.after_creating(&named(&[("app", "absent")])),
+        fill_position(
+            &crate::Postgres::new(),
+            &bootstrap,
+            &named(&[("app", "absent")])
+        ),
         None,
         "a relation no step creates"
     );
@@ -1008,9 +1020,11 @@ fn names_created_between_steps_are_later_only_for_modules_before_them() {
         .iter()
         .position(|step| step.declaration == "view app.v")
         .unwrap();
-    reconstruction.between.push((v, vec![shape.clone()]));
+    reconstruction.fixture_fill_at(v, vec![shape.clone()]);
+    reconstruction.observe_blueprint_fixture();
     assert!(!later(&reconstruction), "created before the view compiled");
-    reconstruction.between.push((v + 1, vec![shape]));
+    reconstruction.fixture_fill_at(v + 2, vec![shape]);
+    reconstruction.observe_blueprint_fixture();
     assert!(later(&reconstruction), "created after the view compiled");
 }
 
@@ -1113,10 +1127,11 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
             .later_names_generated("app", "x", "g")
             .is_none()
     );
-    reconstruction.between.push((
+    reconstruction.fixture_fill_at(
         expression + 1,
         vec![(Nameable::Type, "ext".into(), "d".into())],
-    ));
+    );
+    reconstruction.observe_blueprint_fixture();
     assert!(
         reconstruction
             .later_names_generated("app", "n", "g")
@@ -1186,7 +1201,7 @@ fn placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_co
             .is_empty()
     );
     assert_eq!(
-        reconstruction.after_creating(&[("app".into(), "a".into())].into()),
+        fill_position(&pg, &changes, &[("app".into(), "a".into())].into()),
         Some(expression + 1)
     );
     // With unknown capabilities the old whole-table hold still owns the
@@ -1493,5 +1508,161 @@ fn only_the_creation_of_a_type_is_part_of_a_bootstrap() {
             .all(|step| !step.declaration.starts_with("type ")),
         "{:?}",
         untouched.steps
+    );
+}
+
+fn fill_position(
+    pg: &crate::Postgres,
+    changes: &[Change],
+    after: &BTreeSet<(String, String)>,
+) -> Option<usize> {
+    let fill = super::super::draft::FillStep {
+        name: "test fill".into(),
+        sql: String::new(),
+        after: after.clone(),
+        dependencies: Vec::new(),
+        unavailable: false,
+        root: ("pg_type".into(), "type ext.filled".into()),
+        expected: BTreeMap::new(),
+        names: Vec::new(),
+    };
+    let r = Reconstruction::with_fills(
+        pg,
+        &fixture_plan(changes),
+        &fixture_ids(changes),
+        &Default::default(),
+        vec![fill],
+    )
+    .unwrap();
+    r.program
+        .work()
+        .iter()
+        .position(|work| matches!(work, FillWork::Fill(_)))
+}
+
+impl Reconstruction {
+    pub(crate) fn from_prepared(
+        dialect: &crate::Postgres,
+        prepared: pbps_diff::order::scratch::Prepared,
+    ) -> Result<Self, ReconstructError> {
+        Self::from_prepared_with_fills(dialect, prepared, Vec::new())
+    }
+}
+
+impl Reconstruction {
+    pub(crate) fn fixture_fill_at(&mut self, position: usize, names: Vec<Named>) {
+        let (kind, schema, leaf) =
+            names
+                .first()
+                .cloned()
+                .unwrap_or((Nameable::Type, "ext".into(), "filled".into()));
+        let root = (
+            if kind == Nameable::Type {
+                "pg_type"
+            } else {
+                "pg_class"
+            }
+            .into(),
+            format!(
+                "{} {schema}.{leaf}",
+                if kind == Nameable::Type {
+                    "type"
+                } else {
+                    "table"
+                }
+            ),
+        );
+        let fill = crate::resolver::draft::FillStep {
+            name: root.1.clone(),
+            sql: String::new(),
+            after: BTreeSet::new(),
+            dependencies: Vec::new(),
+            unavailable: false,
+            expected: BTreeMap::from([(root.clone(), Some((kind, schema, leaf)))]),
+            root,
+            names,
+        };
+        self.program = self
+            .program
+            .clone()
+            .fixture_insert_fill(position, self.fills.len());
+        self.fills.push(fill);
+    }
+}
+
+#[test]
+fn fill_program_preserves_managed_group_sources_sql_and_prunes_only_unavailable_work() {
+    let pg = crate::Postgres::new();
+    let changes = bootstrap();
+    let plan = fixture_plan(&changes);
+    let ids = fixture_ids(&changes);
+    let base = Reconstruction::new(&pg, &plan, &ids).unwrap();
+    let fill =
+        |name: &str, relations: &[(&str, &str)], dependencies| crate::resolver::draft::FillStep {
+            name: name.into(),
+            sql: String::new(),
+            after: relations
+                .iter()
+                .map(|(s, n)| (s.to_string(), n.to_string()))
+                .collect(),
+            dependencies,
+            unavailable: false,
+            root: ("pg_type".into(), format!("type ext.{name}")),
+            expected: BTreeMap::new(),
+            names: Vec::new(),
+        };
+    let mixed = Reconstruction::with_fills(
+        &pg,
+        &plan,
+        &ids,
+        &Default::default(),
+        vec![
+            fill("early", &[("app", "t")], vec![]),
+            fill("absent", &[("app", "gone")], vec![]),
+            fill("dependent", &[], vec![1]),
+            fill("empty", &[], vec![]),
+            fill("late", &[("app", "v")], vec![0]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        base.lowered.groups(),
+        mixed.lowered.groups(),
+        "all typed groups, sources, origins and SQL are immutable"
+    );
+    assert_eq!(
+        base.steps, mixed.steps,
+        "Fill creates no managed step or change"
+    );
+    assert_eq!(
+        mixed.len(),
+        base.len() + 3,
+        "Fill is ordinary reconstruction work"
+    );
+    assert_eq!(
+        mixed.omitted_fills().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["absent", "dependent"])
+    );
+    assert_eq!(
+        mixed
+            .program
+            .work()
+            .iter()
+            .filter_map(|w| if let FillWork::Declared(i) = w {
+                Some(*i)
+            } else {
+                None
+            })
+            .collect::<Vec<_>>(),
+        (0..base.len()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        mixed.program.work().first(),
+        Some(&FillWork::Fill(3)),
+        "an empty dependency set is genuinely ready"
+    );
+    assert!(
+        mixed.observations().is_none(),
+        "placement alone is no execution proof"
     );
 }

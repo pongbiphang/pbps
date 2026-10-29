@@ -3049,35 +3049,39 @@ DEC-1778.2).**
   - An object one of whose parts the file created (an owned sequence, or an
     extension's member) is not filled, and neither is anything whose shape
     names it.
-- **It lifts a chain through what it writes.** A shape that names a managed
-  relation's row type cannot exist before that relation does, so the compile
-  then runs in two parts:
-  - the deployer's session compiles up to the step that completes the last
-    column shape of every managed relation those shapes name, and commits;
-  - the setup session creates the chained shapes, in `pg_depend` order;
-  - the deployer's session compiles the rest.
+- **It lifts a chain through what it writes.** Each chained shape is a
+  distinct Fill entry in scratch's reconstruction program (DEC-2134.1),
+  immediately after the last complete managed relation shape and each Fill
+  it names. Independent shapes do not wait for an unrelated later table.
+  The settled managed order and immutable lowered groups remain unchanged.
+  Before each Fill, the deployer's current compile segment commits; setup
+  creates the shape under the existing outside-write gate,
+  and compilation resumes with the registered session state restored.
 
-  That step can come among the modules: a split table creates its prefix
-  before a declared function its generation calls, then adds its generated
-  suffix after the function (DEC-1503.1). The fill boundary waits for the
-  complete column shape, not just the prefix's relation name. The split
-  waits for every managed relation a chained shape names; a shape waiting
-  for one the compile does not create (a base table the plan renames) is not filled,
-  and neither is what names it, while the other shapes are. An extension
-  never waits: its script runs code and creates names the split does not
-  order, so one that would is not filled. Where the setup
-  session is the compiling one, the deployer's reproduced settings are set
-  again after fill. A declaration scratch
-  compiles before the split cannot read a chained shape, and that failure
-  refuses, naming what waits for what. One that compiles there may have
-  bound a name a chained shape then takes (a call that the target casts to a
-  domain, for instance): the order check counts the chained shapes' names
-  as created at the split, and such a binding is unresolved. A generated
-  expression's binding is checked at the step that installs its real text:
-  CREATE TABLE, ADD COLUMN or SET EXPRESSION, as the expansion requires.
-  A sequence has no row type, so it takes no call or
-  cast. The chained shapes are compared with the target
-  after the compile, before any binding question is answered.
+  A relation is ready only when its complete required column shape exists.
+  A split table can finish among the modules, after the function its
+  generated suffix calls (DEC-1503.1). A shape whose managed prerequisite
+  the reconstruction never creates is omitted with its transitive Fill
+  dependants and named findings; an independent shape remains. An unreadable
+  prerequisite is a read failure, and a Fill dependency cycle refuses by name.
+  Extensions, routines and unsupported shapes keep their existing restrictions.
+  Where setup borrows the compiling session, both uses remain sequential.
+
+  Root names and explicitly named parts come from the target recipe.
+  Engine-generated carried names, such as implicit arrays and TOAST storage,
+  come from typed fields in the existing per-Fill inventory query, with no
+  extra round trip (DEC-2134.2). Their ownership must reach an expected
+  object. A later Fill can move an earlier implicit array's name; that name
+  delta belongs to the later event. Unexpected creations, removals or
+  changes to explicit names refuse, rather than seal incomplete metadata.
+  Fill names participate in the ordinary later-name check. A declaration
+  that compiles before a required Fill still refuses, naming what waits for
+  what and the remedies; a binding that a later shape could take remains
+  unresolved. Generated-expression attribution stays at the step installing
+  its real text: CREATE TABLE, ADD COLUMN or SET EXPRESSION. A sequence has
+  no row type, so it takes no call or cast. All created shapes are compared together after the program completes and
+  before binding evidence is accepted; a later setup cannot stale an earlier
+  shape comparison.
 - **What it does not stage**, it names when the compile fails for want of it:
   - a routine (pbps sends no routine source);
   - what the draft lists for writing by hand;

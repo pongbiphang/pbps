@@ -38244,7 +38244,7 @@ async fn catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments(
     assert!(
         inventory
             .values()
-            .any(|(name, _)| name == &format!("function c.\"f{raw}\"()"))
+            .any(|object| object.described == format!("function c.\"f{raw}\"()"))
     );
     assert_eq!(data[0].try_get::<&str>("n").unwrap(), Some("7"));
     assert_eq!(ledger[0].try_get::<&str>("n").unwrap(), Some("0"));

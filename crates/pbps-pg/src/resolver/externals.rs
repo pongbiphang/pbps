@@ -320,10 +320,23 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
             "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
                       AS catalog, f.objid::text AS oid, \
                     pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS described, \
+                    CASE WHEN c.oid IS NOT NULL THEN CASE WHEN c.reltype=0 THEN 'index' ELSE 'relation' END \
+                         WHEN t.oid IS NOT NULL THEN 'type' END AS name_kind, \
+                    COALESCE(cn.nspname, tn.nspname)::text AS name_schema, \
+                    COALESCE(c.relname, t.typname)::text AS name_leaf, \
+                    (COALESCE(c.relkind='t', false) OR EXISTS (SELECT FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class toast ON toast.oid=x.indrelid WHERE x.indexrelid=c.oid AND toast.relkind='t') OR EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = t.oid))::text AS generated, \
+                    COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array( \
+                        (SELECT k.relname FROM pg_catalog.pg_class k WHERE k.oid=d.refclassid), d.refobjid::bigint) ORDER BY d.refclassid, d.refobjid) \
+                      FROM pg_catalog.pg_depend d WHERE d.classid=f.classid AND d.objid=f.objid \
+                        AND d.deptype IN ('i','a')), '[]')::text AS makers, \
                     (SELECT pg_catalog.min(d.deptype::text) FROM pg_catalog.pg_depend d \
                       WHERE d.classid = f.classid AND d.objid = f.objid \
                         AND d.deptype IN ('i', 'a', 'e')) AS carried \
-               FROM ({}) f",
+               FROM ({}) f \
+               LEFT JOIN pg_catalog.pg_class c ON f.classid='pg_catalog.pg_class'::pg_catalog.regclass AND c.oid=f.objid \
+               LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=c.relnamespace \
+               LEFT JOIN pg_catalog.pg_type t ON f.classid='pg_catalog.pg_type'::pg_catalog.regclass AND t.oid=f.objid \
+               LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace",
             super::scratch::user_objects()
         ))
         .await
@@ -344,7 +357,18 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
                 .and_then(|kind| kind.chars().next());
             Ok((
                 (text(row, "catalog")?, oid),
-                (text(row, "described")?, carried),
+                Inventoried {
+                    described: text(row, "described")?,
+                    carried,
+                    name: catalog_name(row)?,
+                    generated: match text(row, "generated")?.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(DbError::BadRow("unreadable generated-name flag".into())),
+                    },
+                    makers: serde_json::from_str(&text(row, "makers")?)
+                        .map_err(|_| DbError::BadRow("unreadable inventory makers".into()))?,
+                },
             ))
         })
         .collect()
@@ -352,13 +376,23 @@ pub async fn inventory(conn: &mut impl QueryConnection) -> Result<Inventory, DbE
 
 /// Every object initdb did not create, by catalog and OID, with its
 /// description and how it lives on another object, if it does.
-pub type Inventory = BTreeMap<(String, u32), (String, Option<char>)>;
+pub type Inventory = BTreeMap<(String, u32), Inventoried>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inventoried {
+    pub described: String,
+    pub carried: Option<char>,
+    pub name: Option<super::reconstruct::Named>,
+    pub generated: bool,
+    pub makers: Vec<(String, u32)>,
+}
 
 /// What appeared between two inventories: its roots, the extension members
 /// that came with them, and every schema among either.
 pub fn created(before: &Inventory, after: &Inventory) -> Created {
     let mut created = Created::default();
-    for ((catalog, oid), (described, carried)) in after {
+    for ((catalog, oid), object) in after {
+        let described = &object.described;
+        let carried = &object.carried;
         if before.contains_key(&(catalog.clone(), *oid)) {
             continue;
         }
@@ -383,60 +417,99 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
     created
 }
 
-/// What each object that appeared between two inventories makes
-/// resolvable, by kind, schema and name, as the reconstruction's order check
-/// reads a step's: a relation (an index or a sequence, which have no row
-/// type, apart), a type, a routine. Carried
-/// objects count too, since a table's row type and array type are names a
-/// binding could take (#1778).
-pub async fn nameables(
-    conn: &mut impl QueryConnection,
+/// Publish only names the recipe explicitly promises, and engine-generated
+/// arrays and TOAST storage carried by those objects. Unknown creations fail closed (DEC-2134.2).
+pub fn fill_names(
     before: &Inventory,
     after: &Inventory,
+    root: &(String, String),
+    expected: &BTreeMap<(String, String), Option<super::reconstruct::Named>>,
 ) -> Result<Vec<super::reconstruct::Named>, DbError> {
-    use super::reconstruct::Nameable;
-    let oids = |wanted: &str| {
-        after
-            .keys()
-            .filter(|key| key.0 == wanted && !before.contains_key(*key))
-            .map(|(_, oid)| oid.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let rows = conn
-        .query(&format!(
-            "SELECT 'c' AS k, c.relkind::text AS sub, n.nspname::text AS s, c.relname::text AS n \
-               FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-              WHERE c.oid = ANY('{{{}}}'::pg_catalog.oid[]) \
-             UNION ALL \
-             SELECT 't', '', n.nspname::text, t.typname::text \
-               FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-              WHERE t.oid = ANY('{{{}}}'::pg_catalog.oid[]) \
-             UNION ALL \
-             SELECT 'p', '', n.nspname::text, p.proname::text \
-               FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-              WHERE p.oid = ANY('{{{}}}'::pg_catalog.oid[])",
-            oids("pg_class"),
-            oids("pg_type"),
-            oids("pg_proc"),
-        ))
-        .await?;
-    rows.iter()
-        .map(|row| {
-            let text = |column: &str| -> Result<String, DbError> {
-                Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
-            };
-            let kind = match (text("k")?.as_str(), text("sub")?.as_str()) {
-                // A sequence has no row type either (measured on 16 and
-                // 18), so it takes only a relation's binding, as an index.
-                ("c", "i" | "I" | "S") => Nameable::Index,
-                ("c", _) => Nameable::Relation,
-                ("t", _) => Nameable::Type,
-                _ => Nameable::Routine,
-            };
-            Ok((kind, text("s")?, text("n")?))
-        })
-        .collect()
+    let created: BTreeSet<_> = after
+        .keys()
+        .filter(|key| !before.contains_key(*key))
+        .cloned()
+        .collect();
+    let promised: BTreeSet<_> = created
+        .iter()
+        .filter(|key| expected.contains_key(&(key.0.clone(), after[*key].described.clone())))
+        .cloned()
+        .collect();
+    if !promised
+        .iter()
+        .any(|key| (key.0.clone(), after[key].described.clone()) == *root)
+    {
+        return Err(DbError::BadRow(
+            "fill did not create its promised root".into(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    if before.keys().any(|key| !after.contains_key(key)) {
+        return Err(DbError::BadRow(
+            "fill removed an existing inventory object".into(),
+        ));
+    }
+    for (key, object) in after
+        .iter()
+        .filter(|(key, object)| before.get(*key).is_none_or(|old| old.name != object.name))
+    {
+        if let Some(old) = before.get(key) {
+            // Creating an explicit type can move a pre-existing implicit
+            // array out of its way. The new name belongs to this Fill event.
+            if old.generated
+                && object.generated
+                && old.makers == object.makers
+                && let Some(name @ (super::reconstruct::Nameable::Type, _, _)) = &object.name
+            {
+                names.insert(name.clone());
+                continue;
+            }
+            return Err(DbError::BadRow(
+                "fill changed an existing explicit name".into(),
+            ));
+        }
+        if object.generated {
+            // Only an engine-generated carried name whose ownership reaches an expected
+            // new object qualifies; an event trigger's unrelated array does not.
+            let mut pending = object.makers.clone();
+            let mut seen = BTreeSet::new();
+            let mut carried = false;
+            while let Some(maker) = pending.pop() {
+                if promised.contains(&maker) {
+                    carried = true;
+                    break;
+                }
+                if created.contains(&maker) && seen.insert(maker.clone()) {
+                    pending.extend(after[&maker].makers.iter().cloned());
+                }
+            }
+            if carried
+                && let Some(
+                    name @ (
+                        super::reconstruct::Nameable::Type | super::reconstruct::Nameable::Index,
+                        _,
+                        _,
+                    ),
+                ) = &object.name
+            {
+                names.insert(name.clone());
+                continue;
+            }
+        } else if let Some(name) = expected.get(&(key.0.clone(), object.described.clone())) {
+            if *name != object.name {
+                return Err(DbError::BadRow(
+                    "fill inventory names differ from the target recipe".into(),
+                ));
+            }
+            names.extend(name.iter().cloned());
+            continue;
+        }
+        return Err(DbError::BadRow(format!(
+            "fill created an unexpected object: {}",
+            Escaped(&object.described)
+        )));
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// The names of the schemas with these OIDs in the connected database.
@@ -730,6 +803,23 @@ pub fn chains(
         .collect()
 }
 
+pub(super) fn catalog_name(row: &Row) -> Result<Option<super::reconstruct::Named>, DbError> {
+    let Some(kind) = row.try_get::<&str>("name_kind")? else {
+        return Ok(None);
+    };
+    let kind = match kind {
+        "index" => super::reconstruct::Nameable::Index,
+        "relation" => super::reconstruct::Nameable::Relation,
+        "type" => super::reconstruct::Nameable::Type,
+        _ => return Err(DbError::BadRow("unknown catalog name kind".into())),
+    };
+    Ok(Some((
+        kind,
+        text(row, "name_schema")?,
+        text(row, "name_leaf")?,
+    )))
+}
+
 fn text(row: &Row, field: &str) -> Result<String, DbError> {
     row.try_get::<&str>(field)?
         .map(str::to_owned)
@@ -743,7 +833,16 @@ mod tests {
     #[test]
     fn what_an_externals_file_created_is_its_roots_without_what_they_carry() {
         let object = |catalog: &str, oid, described: &str, carried| {
-            ((catalog.to_owned(), oid), (described.to_owned(), carried))
+            (
+                (catalog.to_owned(), oid),
+                Inventoried {
+                    described: described.to_owned(),
+                    carried,
+                    name: None,
+                    generated: false,
+                    makers: Vec::new(),
+                },
+            )
         };
         let before = BTreeMap::from([object("pg_namespace", 16384, "schema app", None)]);
         let after = BTreeMap::from([
@@ -778,6 +877,80 @@ mod tests {
         assert_eq!(created.schemas, BTreeSet::from([16390, 16402]));
         // Negative: nothing new, nothing created.
         assert_eq!(created_none(&after), Created::default());
+    }
+
+    #[test]
+    fn fill_names_use_the_actual_carried_array_and_reject_unexpected_creations() {
+        use crate::resolver::reconstruct::Nameable::{Relation, Type};
+        let root = ("pg_class".into(), "table ext.c".into());
+        let named = |kind, name: &str| Some((kind, "ext".into(), name.into()));
+        let expected = BTreeMap::from([
+            (root.clone(), named(Relation, "c")),
+            (("pg_type".into(), "type ext.c".into()), named(Type, "c")),
+            // Target's collision selected _c_1. Scratch is allowed to choose _c.
+            (
+                ("pg_type".into(), "type ext.c[]".into()),
+                named(Type, "_c_1"),
+            ),
+        ]);
+        let object = |described: &str, name, generated, makers| Inventoried {
+            described: described.into(),
+            name,
+            generated,
+            makers,
+            carried: Some('i'),
+        };
+        let mut after = Inventory::from([
+            (
+                ("pg_class".into(), 1),
+                object("table ext.c", named(Relation, "c"), false, vec![]),
+            ),
+            (
+                ("pg_type".into(), 2),
+                object(
+                    "type ext.c",
+                    named(Type, "c"),
+                    false,
+                    vec![("pg_class".into(), 1)],
+                ),
+            ),
+            (
+                ("pg_type".into(), 3),
+                object(
+                    "type ext.c[]",
+                    named(Type, "_c"),
+                    true,
+                    vec![("pg_type".into(), 2)],
+                ),
+            ),
+        ]);
+        let names = fill_names(&Inventory::new(), &after, &root, &expected).unwrap();
+        assert!(names.contains(&(Type, "ext".into(), "_c".into())));
+        assert!(!names.contains(&(Type, "ext".into(), "_c_1".into())));
+        // An event trigger's unmodelled carried object cannot be ignored.
+        let extra = ("pg_constraint".into(), 4);
+        after.insert(
+            extra.clone(),
+            object(
+                "constraint unpromised on table ext.c",
+                None,
+                false,
+                vec![("pg_class".into(), 1)],
+            ),
+        );
+        assert!(
+            fill_names(&Inventory::new(), &after, &root, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected")
+        );
+        after.remove(&extra);
+        after.get_mut(&("pg_type".into(), 3)).unwrap().makers = vec![("pg_type".into(), 999)];
+        assert!(fill_names(&Inventory::new(), &after, &root, &expected).is_err());
+        assert!(
+            fill_names(&after, &after, &root, &expected).is_err(),
+            "no new root is no fill"
+        );
     }
 
     #[test]
@@ -841,8 +1014,83 @@ mod tests {
         assert!(shared_changes(&before, &renamed).is_empty());
     }
 
-    fn created_none(inventory: &BTreeMap<(String, u32), (String, Option<char>)>) -> Created {
+    fn created_none(inventory: &Inventory) -> Created {
         created(inventory, inventory)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL 16 and 18"]
+    async fn fill_inventory_records_the_scratch_array_collision_and_refuses_an_unexpected_carried_object()
+     {
+        use crate::resolver::{
+            draft,
+            reconstruct::{Nameable, trial_tests as f},
+        };
+        for server in f::servers() {
+            let (mut target_admin, mut target, target_name, _) = f::database(&server).await;
+            let (mut scratch_admin, mut scratch, scratch_name, _) = f::database(&server).await;
+            let result: Result<_, pbps_db::DbError> = async {
+                target.execute("CREATE SCHEMA ext; CREATE TABLE app.m(id integer); CREATE TYPE ext._c AS ENUM ('occupied'); CREATE TABLE ext.c(m app.m); CREATE VIEW app.v AS SELECT (m).id FROM ext.c").await?;
+                let target_array: String = target.query("SELECT a.typname::text AS name FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace JOIN pg_catalog.pg_type a ON a.oid=t.typarray WHERE n.nspname='ext' AND t.typname='c'").await?[0].try_get::<&str>("name")?.unwrap().into();
+                let mut desired = pbps_model::Schema::default();
+                desired.tables.insert("app.m".parse().unwrap(), pbps_model::Table::default());
+                desired.modules.insert("app.v".parse().unwrap(), pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View, definition: "SELECT (m).id FROM ext.c".into(), description: None, options: Default::default(),
+                });
+                let recipes = draft::fill(&mut target, &desired, &desired, &[]).await
+                    .map_err(|e| pbps_db::DbError::BadRow(e.to_string()))?.staging(&BTreeSet::new());
+                scratch.execute("CREATE TABLE app.m(id integer)").await?;
+                run(&mut scratch, &recipes.ahead).await.map_err(|e| e.error)?;
+                let before = inventory(&mut scratch).await?;
+                let [fill] = recipes.steps.as_slice() else { return Err(pbps_db::DbError::BadRow(format!("expected one fill: {:?}", recipes.steps))); };
+                run(&mut scratch, fill.sql()).await.map_err(|e| e.error)?;
+                let after = inventory(&mut scratch).await?;
+                let names = fill.observed_names(&before, &after)?;
+                // A second Fill can displace the earlier implicit array.
+                run(&mut scratch, "CREATE TYPE ext._c AS ENUM ('occupied')").await.map_err(|e| e.error)?;
+                let later = inventory(&mut scratch).await?;
+                let second_root = ("pg_type".into(), "type ext._c".into());
+                let second_recipe = BTreeMap::from([(second_root.clone(), Some((Nameable::Type, "ext".into(), "_c".into())))]);
+                let renamed = fill_names(&after, &later, &second_root, &second_recipe)?;
+                let moved_array: String = scratch.query("SELECT a.typname::text AS name FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace JOIN pg_catalog.pg_type a ON a.oid=t.typarray WHERE n.nspname='ext' AND t.typname='c'").await?[0].try_get::<&str>("name")?.unwrap().into();
+                scratch.execute("CREATE INDEX unexpected_2134 ON ext.c (((m).id))").await?;
+                let changed = inventory(&mut scratch).await?;
+                let unexpected = fill_names(&after, &changed, &second_root, &second_recipe).err().map(|e| e.to_string());
+                let pid: u32 = target.query("SELECT pg_catalog.pg_backend_pid()::text AS pid").await?[0].try_get::<&str>("pid")?.unwrap().parse().unwrap();
+                target_admin.execute(&format!("SELECT pg_catalog.pg_terminate_backend({pid})")).await?;
+                let unreadable = matches!(draft::fill(&mut target, &desired, &desired, &[]).await, Err(draft::Error::Read { .. }));
+                Ok((target_array, names, renamed, moved_array, unexpected, unreadable))
+            }.await;
+            drop(target);
+            drop(scratch);
+            f::remove(&mut target_admin, &target_name).await;
+            f::remove(&mut scratch_admin, &scratch_name).await;
+            let (target_array, names, renamed, moved_array, unexpected, unreadable) =
+                result.unwrap();
+            assert!(
+                unreadable,
+                "an unreadable prerequisite catalog must not become an empty Fill"
+            );
+            assert_eq!(target_array, "_c_1");
+            assert!(
+                names.contains(&(Nameable::Type, "ext".into(), "_c".into())),
+                "{names:?}"
+            );
+            assert!(
+                !names.contains(&(Nameable::Type, "ext".into(), "_c_1".into())),
+                "{names:?}"
+            );
+            assert_ne!(moved_array, "_c", "the later explicit type displaced it");
+            assert!(
+                renamed.contains(&(Nameable::Type, "ext".into(), moved_array)),
+                "{renamed:?}"
+            );
+            let unexpected = unexpected.expect("an unexpected carried object was accepted");
+            assert!(
+                unexpected.contains("unexpected") && unexpected.contains("unexpected_2134"),
+                "{unexpected}"
+            );
+        }
     }
 
     #[tokio::test]
