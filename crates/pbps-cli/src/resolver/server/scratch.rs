@@ -278,7 +278,7 @@ impl Run<'_> {
             scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
                 .map_err(Error::Scope)?;
         // The target as its own deployer sees it, in one snapshot.
-        let (mut target_catalog, authorization) = scope::read_target(
+        let (mut target_catalog, authorization, history) = scope::read_target_with_history(
             target,
             driver,
             &request.schemas,
@@ -338,7 +338,10 @@ impl Run<'_> {
                 },
             );
         }
-        let limitations = report.limitations.clone();
+        let mut limitations = report.limitations.clone();
+        if let Some((name, reason)) = history.limitation() {
+            limitations.insert(name.into(), reason.into());
+        }
         match report.verdict() {
             Verdict::Verified => {}
             Verdict::Mismatch(facts) => return Err(Error::Incompatible(facts)),
@@ -491,6 +494,7 @@ impl Run<'_> {
             opening,
         };
         let recheck = Opening {
+            history,
             driver,
             request: request.clone(),
             scope_schemas,

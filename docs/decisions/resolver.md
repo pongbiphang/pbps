@@ -5132,3 +5132,74 @@ scratch names impersonation independently. Unrelated denials do not suppress
 a healthy candidate. Copy-based revert witnesses separately remove effective
 admission, DENY replay, each comparison and strict unknown-answer refusal;
 each reaches its specific failing assertion before the source is restored.
+
+
+<a id="dec-695-1"></a>
+
+**DEC-695.1. Publication also checks qualified, readable surviving catalog rows; ordinary deployers keep a named role-history limitation.**
+The maintainer chose option B on #695 on 2026-10-30. Endpoint equality alone
+cannot witness an intervening committed change restored before publication.
+Keep all existing catalog, authorization and native-capture value checks, and
+carry a separate PostgreSQL-only observation from the producer's original
+opening read to its fresh publication recheck. Both scope reads collect the
+observation in their own short repeatable-read snapshot. No transaction or
+target lock spans the scratch run; a refused run retains its original baseline.
+An ordinary scope read and saved-plan apply keep their existing value contract.
+
+The inventory follows the compared inputs: the current database; declared and
+write-path namespaces, extension namespaces and user-collation namespaces;
+installed extensions; extension dependencies and their C-library membership
+rows, procedures and languages; the compared user collations; database/role
+setting rows under the existing current-database/session-login predicates; and
+membership edges whose member is in the deployer's captured role closure.
+Where readable, protected role rows cover that closure and both principals.
+Logical keys are structured tuples, with an OID where the catalog has one,
+plus the row version. Empty readable inventories have completion markers;
+missing, malformed, duplicate or otherwise failed reads are Unknown and
+refuse. Identity changes, removals, arrivals and changed surviving versions
+name their catalog class and logical object, never their physical tokens.
+Whole-row versions conservatively notice updates to columns outside the
+compared projection too.
+
+An actual restricted role query runs inside a savepoint. Only its measured
+42501 permits recovery followed by the fixed `target.role-history` limitation:
+public role values remain checked, but a role change restored between reads
+can be missed when protected row versions cannot be read. Recovery, release,
+other read failures and incomplete readable role inventories refuse. This
+exception does not disable readable membership, namespace or other history.
+Ordinary deployers need no new protected-catalog grant. A change in readable
+role-history coverage between reads also refuses.
+
+A raw `xmin` is a 32-bit ID, including on a tuple whose frozen header preserves
+an old raw value. Qualify its most recent possible full-ID origin strictly
+before the snapshot's oldest active top-level ID, less than 2^31 transactions
+behind that horizon. All active writers and their children start at or beyond
+that horizon. Require the closing next-ID horizon to remain less than 2^31
+from every qualified origin and the opening horizon; reject reversals,
+ambiguous origins and expiry. No intervening writer can then reuse a qualified
+low 32-bit value. Bootstrap/frozen special IDs are not allocated to writers.
+Do not use top-level snapshot visibility functions as a subtransaction proof.
+A long-lived unrelated transaction or an old row can make qualification
+Unknown: end the old transaction where appropriate and start a fresh plan;
+never silently waive history. The boundaries are unit-tested; no live
+wraparound experiment is claimed. PostgreSQL documents snapshot horizons and
+subtransaction limitations in [transaction information functions](https://www.postgresql.org/docs/18/functions-info.html);
+its [PG16 tuple attribute implementation](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/common/heaptuple.c)
+returns raw xmin for the system column.
+
+The guarantee is surviving-row history inside that qualified interval, not a
+catalog audit log. A row absent at both endpoints leaves no witness (for
+example a default created and removed between reads). Runtime settings,
+provider binaries and other off-catalog state retain endpoint checks only.
+Unreadable role history has the named limitation above. The opaque run-local
+carrier has no Debug or Serialize implementation. Physical OIDs, versions and
+snapshot horizons enter no saved evidence, fingerprint or checksum; only the
+public limitation description is sealed and shown by existing explain paths.
+No format or qualification-rule bump changes apply's semantics.
+
+The existing native producer/recheck regression runs on PostgreSQL 16 and 18:
+schema GRANT/REVOKE restores semantic values but refuses publication; a
+SQL-only fixture extension really updates 1.0 to 2.0 and back, exercising
+both scripts and refusing the restored extension row. Ordinary logins still
+publish unchanged or rolled-back plans with their named limitation; readable
+schema history and standing public role-value checks remain enforced.

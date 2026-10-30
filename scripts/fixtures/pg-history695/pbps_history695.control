@@ -1,0 +1,4 @@
+comment = 'SQL-only catalog history fixture (issue 695)'
+default_version = '1.0'
+relocatable = true
+superuser = false

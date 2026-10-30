@@ -5296,9 +5296,13 @@ async fn resolver_recheck_binds_the_target_by_engine_identity() {
     }
 }
 
+#[path = "live_tests/scope695_tests.rs"]
+mod scope695_tests;
+
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_recheck_refuses_a_target_changed_after_the_run() {
+    Box::pin(scope695_tests::readable_catalog_history_is_not_endpoint_equality()).await;
     // Each written from a second connection after the run released its
     // scratch and before the recheck. The changed object or fact is named.
     let cases: &[(&str, &str, &str)] = &[

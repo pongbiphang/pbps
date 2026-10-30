@@ -271,6 +271,25 @@ shows:
 
 The JSON is the field the human line and the viewer read.
 
+PostgreSQL publication also checks the qualified history of readable surviving
+catalog rows between its original opening snapshot and the fresh recheck
+(DEC-695.1). A schema grant restored before publication, or a real extension
+update and reverse update, refuses with the catalog row's logical name even
+when reported values match again. Unchanged and rolled-back changes pass.
+Rows too old or ambiguous for the bounded 32-bit transaction-ID proof refuse
+as Unknown; an unrelated long-lived transaction can prevent qualification.
+Start a fresh plan after resolving that condition. Whole-row versions can
+also conservatively refuse an update outside the compared column projection.
+
+An ordinary deployer remains supported without access to protected role rows.
+Its evidence names `target.role-history`: public role values are checked, but
+a role change restored between reads can be missed. Other readable history
+checks still run. A row absent at both endpoints (such as a default created
+and removed during the run) has no history witness. Runtime settings, provider
+binaries and other off-catalog state keep their endpoint checks. This is a
+run-local publication check; apply's saved-plan contract stays the same, and
+physical row versions, OIDs and snapshot horizons are never saved or printed.
+
 Three gates refuse by name, as `resolver.unresolved`, before deployable
 output exists: SQL Server resolution (#619, #620); `--staged` with a plan that
 needs the resolver; and a retained external object of any candidate class

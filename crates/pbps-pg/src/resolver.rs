@@ -8,6 +8,7 @@ pub mod environment;
 pub mod externals;
 pub mod reconstruct;
 pub mod recovery;
+pub mod scope_witness;
 pub mod scratch;
 pub mod session;
 pub mod standard;
@@ -65,6 +66,49 @@ pub async fn scope_facts(
     scope: &environment::Scope<'_>,
     authorization_schemas: &[String],
 ) -> Result<(CatalogFacts, authorization::AuthorizationContext), DbError> {
+    let (catalog, authorization, _) =
+        collect_scope_facts(conn, scope, authorization_schemas, false).await?;
+    Ok((catalog, authorization))
+}
+
+/// Opening and publication observations with a private, bounded catalog witness.
+/// A usable witness is returned only after its snapshot commits (DEC-695.1).
+pub async fn witnessed_scope_facts(
+    conn: &mut impl QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+) -> Result<
+    (
+        CatalogFacts,
+        authorization::AuthorizationContext,
+        scope_witness::Witness,
+    ),
+    DbError,
+> {
+    let (catalog, authorization, witness) =
+        collect_scope_facts(conn, scope, authorization_schemas, true).await?;
+    Ok((
+        catalog,
+        authorization,
+        witness.ok_or_else(|| {
+            DbError::BadRow("the target catalog witness was not collected".into())
+        })?,
+    ))
+}
+
+async fn collect_scope_facts(
+    conn: &mut impl QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+    witnessed: bool,
+) -> Result<
+    (
+        CatalogFacts,
+        authorization::AuthorizationContext,
+        Option<scope_witness::Witness>,
+    ),
+    DbError,
+> {
     // A transaction already open on this connection would swallow the
     // `BEGIN` below (a warning, not an error, measured on 18): the read would
     // run inside it — under its isolation, on its snapshot if it has one,
@@ -93,7 +137,12 @@ pub async fn scope_facts(
     let outcome = async {
         let authorization = authorization::read(conn, authorization_schemas).await?;
         let catalog = environment::read(conn, scope).await?;
-        Ok::<_, DbError>((catalog, authorization))
+        let witness = if witnessed {
+            Some(scope_witness::read(conn, authorization_schemas, &catalog, &authorization).await?)
+        } else {
+            None
+        };
+        Ok::<_, DbError>((catalog, authorization, witness))
     }
     .await;
     let ended = conn

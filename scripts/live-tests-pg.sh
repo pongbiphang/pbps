@@ -99,6 +99,13 @@ python3 scripts/check-live-fixture.py --cell pg18 --container "$NAME" --port "$P
 python3 scripts/check-live-fixture.py --cell pg16 --container "$OLD_NAME" --port "$OLD_PORT"
 python3 scripts/check-live-fixture.py --cell pg18 --container "$SCRATCH_NAME" --port "$SCRATCH_PORT"
 
+# A SQL-only extension with real forward/reverse updates for the catalog-history
+# witness. Install only after each fixture's pinned identity was checked.
+history_fixture="$(dirname -- "${BASH_SOURCE[0]}")/fixtures/pg-history695"
+for fixture in "$NAME:18" "$OLD_NAME:16" "$SCRATCH_NAME:18"; do
+    docker cp "$history_fixture/." "${fixture%:*}:/usr/share/postgresql/${fixture##*:}/extension/" >/dev/null
+done
+
 # A libpq keyword string rather than a URL: both are accepted, and this one
 # does not need the password percent-encoded.
 export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
