@@ -5315,6 +5315,12 @@ The private canonical schema question inventory is independent of mutable
 schema replay rows. Re-reading and both legacy/staged verification preserve
 that inventory when a wrong recipe or changed scratch default would omit a
 question. Presence, absence and a missing/unreadable answer remain distinct.
+Before verification or a target-domain reread, require exactly the captured
+present sections as complete facts. A partial setup recipe cannot also become
+its own verification expectation: a live correlated recipe erasing dbo keeps
+the public database grants, gains actual UPDATE, and must refuse for omitted
+required facts. Creating only a private question list without checking its
+corresponding answers would still let that wrong recipe verify.
 Every catalog question requires exactly one complete ordinal answer; failed,
 incomplete, duplicate, ambiguous or malformed reads refuse. Staged extensions
 add their target-qualified questions without replacing an earlier contradictory

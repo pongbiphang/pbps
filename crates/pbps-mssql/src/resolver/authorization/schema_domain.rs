@@ -31,6 +31,27 @@ impl Domain {
             .collect()
     }
 
+    pub(super) fn require_complete(
+        &self,
+        schemas: &BTreeMap<String, super::SchemaAuthorization>,
+    ) -> Result<(), DbError> {
+        for (name, presence) in &self.0 {
+            if *presence == Presence::Present && !schemas.contains_key(name) {
+                return Err(DbError::BadRow(format!(
+                    "schema:{name}:unreadable: required target facts were omitted"
+                )));
+            }
+        }
+        for name in schemas.keys() {
+            if self.0.get(name) != Some(&Presence::Present) {
+                return Err(DbError::BadRow(format!(
+                    "schema:{name}:scope: recipe facts are outside the captured present inventory"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn extend(&mut self, extra: Self) -> Result<(), DbError> {
         if extra
             .0
@@ -288,5 +309,24 @@ mod tests {
         domain.extend(Domain::present(["new_schema"])).unwrap();
         assert_eq!(domain.0["missing"], Presence::Absent);
         assert_eq!(domain.0["new_schema"], Presence::Present);
+    }
+    #[test]
+    fn only_present_questions_require_recipe_facts_and_no_extra_fact_can_replace_absence() {
+        let mut facts = BTreeMap::new();
+        assert!(Domain::present(["app"]).require_complete(&facts).is_err());
+        let absent = Domain([("missing".into(), Presence::Absent)].into());
+        absent.require_complete(&facts).unwrap();
+        facts.insert(
+            "missing".to_owned(),
+            super::super::SchemaAuthorization {
+                owner: "dbo".into(),
+                permissions: BTreeSet::new(),
+                grants: vec![],
+            },
+        );
+        assert!(absent.require_complete(&facts).is_err());
+        Domain::present(["missing"])
+            .require_complete(&facts)
+            .unwrap();
     }
 }

@@ -15,7 +15,7 @@ fn literal(name: &str) -> String {
 #[derive(Clone)]
 struct Names {
     token: String,
-    databases: [String; 2],
+    databases: [String; 3],
     deployer: String,
     run_login: String,
 }
@@ -95,7 +95,7 @@ async fn exercise(names: Names, absent: bool) {
         .execute("CREATE SCHEMA app AUTHORIZATION dbo;")
         .await
         .unwrap();
-    target_admin.execute("CREATE TABLE dbo.probe (value int NOT NULL); INSERT dbo.probe VALUES (11); GRANT SELECT, UPDATE ON SCHEMA::dbo TO public;").await.unwrap();
+    target_admin.execute("CREATE TABLE dbo.probe (value int NOT NULL); INSERT dbo.probe VALUES (11); GRANT SELECT, UPDATE TO public;").await.unwrap();
     if !absent {
         target_admin
             .execute("CREATE SCHEMA outside AUTHORIZATION schema_owner;")
@@ -191,6 +191,47 @@ async fn exercise(names: Names, absent: bool) {
             .unwrap()
             .is_empty()
     );
+
+    // A deliberately wrong recipe omits the entire dbo section while the
+    // separate captured question inventory survives. Database-level public
+    // grants still give this reproduction extra executable UPDATE authority.
+    let mut omitted = context.clone();
+    omitted.schemas.remove("dbo");
+    let mut wrong_admin = admin(&names.databases[2]).await;
+    wrong_admin
+        .execute(&format!(
+            "ALTER AUTHORIZATION ON DATABASE::{} TO {};",
+            ident(&names.databases[2]),
+            ident(&names.run_login)
+        ))
+        .await
+        .unwrap();
+    reconstruct(&mut wrong_admin, &map, &omitted, &names.run_login)
+        .await
+        .unwrap();
+    wrong_admin
+        .execute("CREATE TABLE dbo.probe (value int NOT NULL); INSERT dbo.probe VALUES (11);")
+        .await
+        .unwrap();
+    if !absent {
+        wrong_admin.execute("CREATE TABLE outside.probe (value int NOT NULL); INSERT outside.probe VALUES (22);").await.unwrap();
+    }
+    let mut wrong = connect_live(&login_url(&names.run_login, PASSWORD, &names.databases[2]))
+        .await
+        .unwrap();
+    enter(&mut wrong, Some(&user)).await.unwrap();
+    identity(&mut wrong, user.raw()).await;
+    binding(&mut wrong, if absent { "11" } else { "22" }, true).await;
+    let correlated = verify(&mut wrong, &map, &omitted, &schemas)
+        .await
+        .expect_err(
+            "a correlated omitted-schema recipe must not verify its extra executable UPDATE",
+        );
+    assert!(
+        correlated.to_string().contains("schema:dbo:unreadable"),
+        "{correlated}"
+    );
+    drop(wrong);
 
     // Removing the replayed DENY exposes an executable extra permission.
     scratch_admin

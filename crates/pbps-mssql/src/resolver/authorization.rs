@@ -315,6 +315,9 @@ async fn read_in_domain(
     target: &AuthorizationContext,
     schemas: &[String],
 ) -> Result<AuthorizationContext, DbError> {
+    // Setup may use a partial recipe. It must not become the verifier's
+    // expected answer set simply by erasing a captured required section.
+    target.schema_domain.require_complete(&target.schemas)?;
     read_context(conn, schemas, Some(&target.schema_domain)).await
 }
 
@@ -1960,6 +1963,13 @@ mod tests {
         recipe.schemas.clear();
         let stripped: serde_json::Value = serde_json::from_slice(&recipe.canonical()).unwrap();
         assert_eq!(stripped["schema_domain"], original["schema_domain"]);
+        assert!(
+            recipe
+                .schema_domain
+                .require_complete(&recipe.schemas)
+                .is_err(),
+            "erased recipe rows cannot erase a required comparison"
+        );
         let mut incomplete = target.clone();
         incomplete.schema_domain = schema_domain::Domain::default();
         assert!(
