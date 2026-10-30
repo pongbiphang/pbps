@@ -1122,6 +1122,15 @@ fn formatting_preserves_numeric_looking_text_and_non_text_data() {
     fmt_scalars::check_numeric("postgres");
 }
 
+#[path = "support/cluster_roles1527.rs"]
+mod cluster_roles1527;
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn unmanaging_a_bridge_role_keeps_its_chain_and_needs_no_resolver_on_pg18() {
+    cluster_roles1527::check(&server());
+}
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 

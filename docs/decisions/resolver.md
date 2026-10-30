@@ -5495,3 +5495,34 @@ distinguish direct ACLs from inherited PUBLIC access and confirm that the closin
 read sees its transaction's own grant changes. Persisted SQL Server authorization
 retains its existing explicit unsupported refusal. This changes neither the plan
 format version nor public editor schemas, and never broadens binding inputs.
+
+<a id="dec-1527-1"></a>
+
+**DEC-1527.1. PostgreSQL role identities need no resolver gate while they stay externally managed.**
+
+PostgreSQL roles belong to the cluster and remain human-managed
+(ADR-0010 §3, DECISIONS 211). `Postgres::manages_roles()` is false and the
+ordinary differ therefore emits no `CreateRole`, `DropRole` or `RenameRole`.
+A declaration adopts a role that already exists; a rename requires external
+completion; removing a declaration revokes this database's managed grants,
+without dropping the role or removing its membership edges.
+
+The bridge example in #1527 does not provide a reachable counterexample:
+with `deployer -> bridge -> reader`, removing a grantless bridge declaration
+leaves the real role and its chain intact. The connected plan correctly
+reports zero changes and `not_needed`. A direct SQL `DROP ROLE bridge` can
+change schema visibility and bindings, but that is not an operation this
+PostgreSQL plan performs. A new assessment flag, relevance gate, finding or
+run-local identity metadata would add no protection at that entry point.
+Existing schema grant/revoke assessment and ordinary protection remain.
+
+Tests pin all three identity deltas through the real PostgreSQL ordinary
+planner, with grant/revoke controls, and the live bridge case. SQL Server's
+role-only connected plan retains its measured `not_needed` route.
+
+Revisit trigger: any change that makes PostgreSQL manage role identities
+must bring resolver assessment and authorization handling with it. It must
+account for membership topology rather than projecting changes onto the
+current flattened closure, and qualify the resulting bindings on the engine
+before claiming those transitions are supported. No format changes or new
+role-transition support are introduced here.
