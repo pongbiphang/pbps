@@ -184,7 +184,12 @@ fn state_from_json(text: &str, token: &str) -> Result<State, String> {
             .ok_or("unreadable container metadata")
     };
     let labels = &value["Config"]["Labels"];
-    if value["Name"].as_str() != Some(format!("/pbps-scratch-{token}").as_str())
+    // Docker reports the name with a leading slash and Podman without one
+    // (SPEC supports both); only that one optional slash is tolerated.
+    let name = value["Name"]
+        .as_str()
+        .map(|n| n.strip_prefix('/').unwrap_or(n));
+    if name != Some(format!("pbps-scratch-{token}").as_str())
         || labels["pbps.resolver"] != "scratch"
         || labels[TOKEN] != token
     {
@@ -557,12 +562,24 @@ mod tests {
         let valid = serde_json::json!({"Id":"a".repeat(64),"Name":format!("/pbps-scratch-{T}"),"Config":{"Labels":{"pbps.resolver":"scratch",TOKEN:T,ENGINE:"postgres"}},"State":{"Status":"removing","StartedAt":"2026-10-29T00:00:00Z"},"Created":"2026-10-29T00:00:00Z","Mounts":[{"Type":"volume","Name":"owned-volume"}]});
         let state = state_from_json(&valid.to_string(), T).unwrap();
         assert_eq!(state.volumes, ["owned-volume"]);
+        let mut podman = valid.clone();
+        podman["Name"] = format!("pbps-scratch-{T}").into();
+        assert_eq!(
+            state_from_json(&podman.to_string(), T).unwrap().volumes,
+            ["owned-volume"]
+        );
         assert_eq!(
             verdict(&state, None, None, GRACE),
             Liveness::Unprovable("its removal has not yet been confirmed".into())
         );
         for (field, replacement) in [
             ("Name", serde_json::json!("/foreign")),
+            (
+                "Name",
+                serde_json::json!("//pbps-scratch-0123456789abcdef0123456789abcdef"),
+            ),
+            ("Name", serde_json::json!(format!("/pbps-scratch-{T}/"))),
+            ("Name", serde_json::Value::Null),
             ("Id", serde_json::json!("")),
             ("Mounts", serde_json::Value::Null),
             ("Mounts", serde_json::json!([{"Type":"volume"}])),
