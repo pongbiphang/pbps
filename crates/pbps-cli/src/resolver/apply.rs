@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 /// [`Keyed::check`], before apply connects.
 pub struct Keyed<'a> {
     evidence: &'a ResolverEvidence,
+    changes: &'a pbps_model::ChangeSet,
     key: EnvironmentFingerprintKey,
     label: String,
 }
@@ -28,6 +29,7 @@ pub struct Keyed<'a> {
 /// with. Made only by [`Keyed::open`], after the key and the cluster passed.
 pub struct Guard<'a> {
     evidence: &'a ResolverEvidence,
+    changes: &'a pbps_model::ChangeSet,
     key: &'a EnvironmentFingerprintKey,
     scope_schemas: Vec<String>,
     label: &'a str,
@@ -69,6 +71,7 @@ impl<'a> Keyed<'a> {
         }
         Ok(Some(Self {
             evidence,
+            changes: &plan.changes,
             key,
             label: label.to_owned(),
         }))
@@ -106,6 +109,7 @@ impl<'a> Keyed<'a> {
                 .map_err(|why| anyhow::anyhow!("the sealed analysis scope: {why}"))?;
         Ok(Guard {
             evidence,
+            changes: self.changes,
             key,
             scope_schemas,
             label,
@@ -223,9 +227,26 @@ impl Guard<'_> {
             Phase::Before => &self.evidence.authorization().before,
             Phase::After => &self.evidence.authorization().after,
         };
-        if authorization.digest(self.key).as_ref() != Some(expected) {
+        let grants = &self.evidence.authorization().object_grants;
+        let (fingerprints, grant_changes) = if grants.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let read = pbps_pg::catalog::introspect_within_transaction(conn)
+                .await
+                .map_err(|error| self.unreadable("the object grant postconditions", error))?;
+            let end = match phase {
+                Phase::Before => scope::object_grants::End::Before,
+                Phase::After => scope::object_grants::End::After,
+            };
+            scope::object_grants::recheck(self.key, self.changes, grants, &read, end)
+                .map_err(|why| self.unreadable("the object grant postconditions", why))?
+        };
+        if authorization.digest(self.key, &fingerprints).as_ref() != Some(expected)
+            && grant_changes.is_empty()
+        {
             changed.push("the target deployer's authorization".to_owned());
         }
+        changed.extend(grant_changes);
         Ok(changed)
     }
 
@@ -259,11 +280,7 @@ impl Guard<'_> {
         routines
     }
 
-    fn unreadable(
-        &self,
-        what: &str,
-        error: pbps_db::resolver::capture::CaptureError,
-    ) -> anyhow::Error {
+    fn unreadable(&self, what: &str, error: impl std::fmt::Display) -> anyhow::Error {
         anyhow::anyhow!(
             "{what} of `{}` could not be read: {error}\n\
              An unreadable input is not an unchanged one. Nothing has been applied — the \

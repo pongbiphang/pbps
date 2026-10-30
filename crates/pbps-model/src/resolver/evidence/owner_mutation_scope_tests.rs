@@ -40,6 +40,7 @@ fn owner_fixture(change: Change, root: &str) -> (ChangeSet, ResolverEvidence) {
         Change::Grant { .. } | Change::Revoke { .. }
     ) {
         evidence.authorization.changes = BTreeSet::from([0]);
+        evidence.authorization.object_grants = super::super::AuthorizationGrant::fixtures(&changes);
     }
     // Opaque internal records belong to the owner's exact surface; separately
     // owned columns/defaults/checks/indexes in fixture() are independent inputs.

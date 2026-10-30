@@ -90,6 +90,7 @@ pub(super) fn seal<S>(
     proof: pbps_model::resolver::OrderingProof,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
+    object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
 ) -> Result<ResolvedPlan<S>, Error> {
     let Sealing {
         planned,
@@ -117,7 +118,7 @@ pub(super) fn seal<S>(
         ));
     }
     let persisted = authorization
-        .persisted(key, &changes)
+        .persisted(key, &changes, object_grants)
         .map_err(Error::Scope)?;
     if matches!(authorization, scope::Authorization::Mssql(_)) {
         return Err(Error::Scope("SQL Server evidence is unsupported".into()));
@@ -228,7 +229,28 @@ impl Unsealed {
     /// review). A refusal hands the run back with its reason.
     pub async fn recheck(self, target: &mut pbps_db::Conn) -> Result<Rechecked, Box<Refused>> {
         match self.differences(target).await {
-            Ok(changed) if changed.is_empty() => Ok(Rechecked(self)),
+            Ok(changed) if changed.is_empty() => {
+                // The caller can still add grant steps in its final passes.
+                // Retain one private canonical snapshot, then seal only the
+                // final plan's selected questions; none enters binding inputs.
+                let grants = match self.opening.driver {
+                    pbps_db::Driver::Postgres => {
+                        match scope::object_grants::capture(target).await {
+                            Ok(read) => Some(Box::new(read)),
+                            Err(error) => {
+                                return Err(Box::new(Refused {
+                                    error: Error::Read(format!(
+                                        "the recheck's object grants: {error}"
+                                    )),
+                                    unsealed: self,
+                                }));
+                            }
+                        }
+                    }
+                    pbps_db::Driver::Mssql => None,
+                };
+                Ok(Rechecked(self, grants))
+            }
             Ok(changed) => Err(Box::new(Refused {
                 error: Error::Changed(changed),
                 unsealed: self,
@@ -331,7 +353,7 @@ impl Unsealed {
 ///     Rechecked(other)
 /// }
 /// ```
-pub struct Rechecked(Unsealed);
+pub struct Rechecked(Unsealed, Option<Box<pbps_db::catalog::Pulled>>);
 
 impl Rechecked {
     /// Seals `changes`, the resolver's plan after the caller's passes. Every
@@ -344,12 +366,28 @@ impl Rechecked {
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
     ) -> Result<ResolvedPlan<pbps_diff::order::Canonical<D>>, Error> {
-        let run = self.0;
+        let Rechecked(run, grants) = self;
         let changes =
             pbps_diff::order::resolver_remap::finish(&run.ordered.changes, changes, describe)
                 .map_err(Error::Binding)?;
         let proof = changes.proof().clone();
-        seal(&run.key, run.sealing, changes, proof, base, desired)
+        let object_grants = if matches!(run.sealing.authorization, scope::Authorization::Mssql(_)) {
+            // Preserve the existing named unsupported-MSSQL refusal below;
+            // no PostgreSQL grant reader runs on that engine.
+            Vec::new()
+        } else {
+            scope::object_grants::seal(&run.key, &changes, desired.ids, grants.as_deref())
+                .map_err(Error::Scope)?
+        };
+        seal(
+            &run.key,
+            run.sealing,
+            changes,
+            proof,
+            base,
+            desired,
+            object_grants,
+        )
     }
 
     /// The plan in the resolver's own order.

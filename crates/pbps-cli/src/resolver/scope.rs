@@ -21,6 +21,8 @@
 //! as the reproduced deployer — no projection to keep in step with it
 //! (DECISIONS 520, 521).
 
+pub(crate) mod object_grants;
+
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
     CatalogFacts, DatabaseRecipe, RecipeUnavailable, ScopeReport,
@@ -96,8 +98,22 @@ const AUTHORIZATION_RULE: &str = "pbps/authorization-context/v1";
 fn authorization_digest(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     canonical: &[u8],
+    grants: &[String],
 ) -> String {
-    crate::resolver::sealing::hex(key.fingerprint(AUTHORIZATION_RULE, "authorization", canonical))
+    if grants.is_empty() {
+        return crate::resolver::sealing::hex(key.fingerprint(
+            AUTHORIZATION_RULE,
+            "authorization",
+            canonical,
+        ));
+    }
+    let combined =
+        serde_json::to_vec(&(canonical, grants)).expect("authorization condition serialises");
+    crate::resolver::sealing::hex(key.fingerprint(
+        "pbps/authorization-with-object-grants/v1",
+        "authorization",
+        &combined,
+    ))
 }
 
 /// Static authorization seeds for a request. PostgreSQL adds write-path
@@ -428,18 +444,18 @@ impl Authorization {
         }
     }
 
-    /// Persist both sides under the configured environment key. These bytes
-    /// come from the measured context and the adapter's grant projection, not
-    /// from a process-key digest or a caller-chosen expected hash.
-    /// What [`Self::persisted`] seals as its `before` for this context, so
-    /// apply can compare the context it reads now with the plan's `before`
-    /// and `after` (#616). `None` where nothing is sealed.
+    /// Seal the freshly read deployer context together with the selected
+    /// object-grant answers. Their keyed fingerprints use the same endpoint
+    /// as the context, and remain separate from catalog binding inputs.
     pub(crate) fn digest(
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        grants: &[String],
     ) -> Option<String> {
         match self {
-            Self::Postgres(context) => Some(authorization_digest(key, &context.canonical())),
+            Self::Postgres(context) => {
+                Some(authorization_digest(key, &context.canonical(), grants))
+            }
             Self::Mssql(_) => None,
         }
     }
@@ -448,6 +464,7 @@ impl Authorization {
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
         changes: &pbps_model::ChangeSet,
+        object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
     ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
         use pbps_model::Change;
         let planned = planned_schema_grants(changes)?;
@@ -465,11 +482,19 @@ impl Authorization {
                 );
             }
         };
-        let fingerprint = |bytes: &[u8]| authorization_digest(key, bytes);
+        let before_grants: Vec<_> = object_grants
+            .iter()
+            .map(|g| g.before.fingerprint.clone())
+            .collect();
+        let after_grants: Vec<_> = object_grants
+            .iter()
+            .map(|g| g.after.fingerprint.clone())
+            .collect();
         Ok(pbps_model::resolver::AuthorizationCondition {
             rule: self.rule().into(),
-            before: fingerprint(&before),
-            after: fingerprint(&after),
+            before: authorization_digest(key, &before, &before_grants),
+            after: authorization_digest(key, &after, &after_grants),
+            object_grants,
             changes: changes
                 .changes
                 .iter()
@@ -872,7 +897,7 @@ mod tests {
             let key = EnvironmentFingerprintKey::from_file(&path).unwrap();
             std::fs::remove_file(path).unwrap();
             let unchanged = postgres
-                .persisted(&key, &pbps_model::ChangeSet::default())
+                .persisted(&key, &pbps_model::ChangeSet::default(), Vec::new())
                 .unwrap();
             assert_eq!(unchanged.before, unchanged.after);
             let changes = pbps_model::ChangeSet {
@@ -882,7 +907,7 @@ mod tests {
                     permissions: std::collections::BTreeSet::from([pbps_model::Permission::Usage]),
                 })],
             };
-            let projected = postgres.persisted(&key, &changes).unwrap();
+            let projected = postgres.persisted(&key, &changes, Vec::new()).unwrap();
             assert_eq!(projected.before, unchanged.before);
             assert_ne!(projected.before, projected.after);
             assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
@@ -894,7 +919,7 @@ mod tests {
                     },
                 )],
             };
-            assert!(postgres.persisted(&key, &unsupported).is_err());
+            assert!(postgres.persisted(&key, &unsupported, Vec::new()).is_err());
         }
     }
 }
