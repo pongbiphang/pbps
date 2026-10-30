@@ -268,3 +268,76 @@ async fn demanded_forward_columns_preserve_generation_and_column_order() {
         }
     }
 }
+
+#[path = "../../../pbps-diff/tests/fixtures/prefix2469.rs"]
+mod prefix_fixture;
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
+    let engine = Mssql;
+    for facet in prefix_fixture::FACETS {
+        let mut db = TestDb::create(&format!("prefix2469_{facet}")).await;
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+        let f = prefix_fixture::scene(facet, engine.name(), false);
+        let plan = f.compile(&engine).unwrap();
+        let (part, function, column) = prefix_fixture::positions(plan.changes(), facet);
+        assert!(part < function && function < column, "{facet}");
+        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let lowered =
+            lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
+        for (at, group) in lowered.groups().iter().enumerate() {
+            for statement in group.statements() {
+                db.conn.execute(&statement.sql).await.unwrap();
+            }
+            if at == part || at == function {
+                let rows = db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+                let names: Vec<_> = rows
+                    .iter()
+                    .map(|row| row.try_get::<&str>("column_name").unwrap().unwrap())
+                    .collect();
+                assert_eq!(
+                    names,
+                    ["anchor"],
+                    "the facet and function precede the physical append: {facet}"
+                );
+            }
+        }
+        db.conn
+            .execute("INSERT INTO app.p(anchor) VALUES(7)")
+            .await
+            .unwrap();
+        db.conn
+            .execute(if *facet == "default" {
+                "INSERT INTO app.t(x) VALUES(11)"
+            } else {
+                "INSERT INTO app.t(anchor,x) VALUES(7,11)"
+            })
+            .await
+            .unwrap();
+        let rows = db.conn.query("SELECT anchor,x FROM app.t").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("anchor").unwrap(), Some(7));
+        assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(11));
+        db.conn.execute("COMMIT").await.unwrap();
+        db.drop().await;
+        let mut scratch_db = TestDb::create(&format!("prefix2469_scratch_{facet}")).await;
+        scratch_db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        let input = f.bootstrap(&engine).unwrap();
+        let scratch = pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
+            &engine,
+            &input,
+            &f.ids,
+            &Default::default(),
+            None,
+            true,
+        )
+        .unwrap();
+        let last = scratch.len() - 1;
+        scratch
+            .compile_steps(&mut scratch_db.conn, 0..last)
+            .await
+            .unwrap();
+        scratch_db.drop().await;
+    }
+}

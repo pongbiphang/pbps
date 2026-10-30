@@ -102,7 +102,7 @@ pub fn release_schedule(
         super::Checks::ALL,
     );
     let mut schedule = Schedule::of_graph(&graph, operations.as_slice());
-    for edge in super::generated::constraints(plan, after.schema, deps, dialect) {
+    for edge in super::generated::plan_constraints(plan, after.schema, deps, dialect, false) {
         schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
     let slots = super::slots::analyse(operations.as_slice(), &owners, before, dialect);
