@@ -4239,3 +4239,36 @@ An initial offline authoring preview with no historical model carries only
 assumed package prerequisites and says they are unverified; it does not mint
 permission for lifecycle DDL or an executable deployment plan.
 State, plan and published-schema formats do not change.
+
+
+<a id="dec-2447-3"></a>
+
+**DEC-2447.3. Extension management requires explicit selection before adoption.**
+
+This amends the sentences in DEC-2447.1 and DEC-2447.2 that full pull declares
+all installed packages. Pull still reads the complete installed inventory
+strictly, but selects new packages only through repeatable `--extension NAME`.
+Existing extension declarations and held identities remain selected and refresh
+on later pulls, forced ones included. Unknown or uninstalled selections refuse
+by name before any publication; unreadable declarations, identity history or
+inventory cannot become an empty scope. `init --from` has no package selector
+and leaves installed packages unselected as well.
+
+Installed unselected packages gain neither declarations nor identities. Pull
+prints their names and exact versions on one line, followed by a command to
+opt one in; both lines are absent when every installed package is selected.
+Pull has no JSON output. Selection writes desired files, not adoption into
+database history: only explicit baseline or checked bootstrap records the
+selected packages, after exact name/schema/version verification. Neither
+operation discovers additional packages. Ordinary planning still refuses
+unheld adoption before that recording.
+
+Measured on PostgreSQL 16 and 18, stock plpgsql can be reinstalled with a new
+OID, citext can occupy pg_catalog, and arbitrary packages can be inherited from
+a template. Thus neither name, OID, namespace nor server-default version
+expresses management intent. Already minted identities remain managed; there
+is no reliable provenance that permits silently releasing earlier automatic
+adoptions. Missing managed packages on scratch/reconstruction refuse by name:
+provision the exact version/schema externally. Logical scope cuts must project
+both definitions and identities together. PR A installs no package and infers
+no default version; lifecycle and provider-code support remain later slices.

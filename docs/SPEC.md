@@ -1134,14 +1134,22 @@ name. `schema` is explicit. `version` is required, nonempty, quoted text and
 compared exactly; it is neither SemVer nor a request for a server default.
 `renamed_from` is refused. SQL Server refuses extension declarations by name.
 
-A full pull includes installed packages, including bootstrap `plpgsql`, with
-an `e_` identity and their exact schema/version. Extension members and their
+Pull reads the full installed inventory strictly, but ordinary pull declares
+no new extensions (DEC-2447.3). Repeat `pbps pull --extension NAME` to select
+installed packages with their exact schema/version and an `e_` identity.
+Existing extension declarations and identities remain selected and are refreshed
+on later pulls, including forced pulls. Unknown or uninstalled selections
+refuse by name before publication. Installed unselected packages have no new
+identity; pull lists their names/versions and an opt-in command. `init --from`
+also leaves packages unselected. Extension members and their
 internal/automatic subsidiaries remain outside independent declarations;
 ordinary user objects in the same schema remain visible. A managed extension
 ceases to produce `plan.unheld-object`; unsupported comments on it still do.
 The census continues to omit system objects such as bootstrap `plpgsql`.
 
-Baseline and verify compare extensions only inside the recorded identity
+Baseline records only the selected identity scope and verifies each declared
+package's exact installed name/schema/version before adoption. Other installed
+packages are not discovered into that scope. Verify uses the recorded managed
 scope. Old snapshots and ids without `extensions` own none. Declaring an
 already installed but unheld package does not adopt it: use pull and an
 explicit baseline. A connected bootstrap may also adopt declared packages

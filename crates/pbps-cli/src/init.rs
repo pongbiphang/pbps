@@ -209,6 +209,12 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                     &mut pulled,
                     crate::dialect_for(config.dialect).as_ref(),
                 );
+                pulled
+                    .onboarding_notices
+                    .extend(crate::adopt::select_extensions(
+                        &mut pulled.schema,
+                        &Default::default(),
+                    )?);
                 let ids = mint_ids(&pulled.schema, &root)?;
                 (
                     pulled.schema,
