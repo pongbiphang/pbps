@@ -291,6 +291,7 @@ pub fn expand<E: Expansion>(
     }
     changes.boundaries = input.boundaries;
     changes.allocator = input.allocator;
+    changes.annotations = input.annotations;
     Ok(Expanded { changes, rewrites })
 }
 

@@ -28,6 +28,8 @@ pub(super) struct Obligations {
 struct Receipt {
     steps: Vec<Change>,
     events: Vec<Operation>,
+    // Transient intent still constrains the order this receipt discharges.
+    annotations: Vec<super::Constraint>,
 }
 impl Obligations {
     pub(super) fn parents(&self) -> BTreeSet<Uid> {
@@ -69,31 +71,34 @@ impl Obligations {
         self.pending.is_empty()
     }
     pub(super) fn ensure<S>(&self, plan: &super::PlanningPlan<S>) -> Result<(), String> {
-        if self.pending.is_empty()
-            || self.checked.as_ref().is_some_and(|checked| {
-                let events = plan.identities.clone().unwrap_or_else(|| {
-                    Operations::expanded(
-                        plan.logical,
-                        plan.origins
-                            .iter()
-                            .cloned()
-                            .zip(plan.changes.iter().cloned()),
-                        ModuleEdits::InPlace,
-                    )
-                });
-                checked
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let annotations = plan.annotation_edges()?;
+        if self.checked.as_ref().is_some_and(|checked| {
+            let events = plan.identities.clone().unwrap_or_else(|| {
+                Operations::expanded(
+                    plan.logical,
+                    plan.origins
+                        .iter()
+                        .cloned()
+                        .zip(plan.changes.iter().cloned()),
+                    ModuleEdits::InPlace,
+                )
+            });
+            checked.annotations == annotations
+                && checked
                     .steps
                     .iter()
                     .eq(plan.changes.iter().map(|p| &p.change))
-                    && checked.events.len() == events.len()
-                    && checked
-                        .events
-                        .iter()
-                        .zip(events.iter())
-                        .all(|(old, op)| old.same_input_binding(op))
-                    && plan.origins.iter().eq(events.iter().map(|op| op.origin()))
-            })
-        {
+                && checked.events.len() == events.len()
+                && checked
+                    .events
+                    .iter()
+                    .zip(events.iter())
+                    .all(|(old, op)| old.same_input_binding(op))
+                && plan.origins.iter().eq(events.iter().map(|op| op.origin()))
+        }) {
             Ok(())
         } else {
             let boundary = self.pending.first().unwrap();
@@ -110,9 +115,13 @@ impl Obligations {
         ops: &[Operation],
         fx: &[Effects],
         base: &State,
+        annotations: &[super::Constraint],
     ) -> Result<(), String> {
         if self.pending.is_empty() {
             return Ok(());
+        }
+        if annotations.iter().any(|edge| edge.before >= edge.after) {
+            return Err("an annotation boundary is unsatisfied at membership replay".into());
         }
         for boundary in &self.pending {
             if !fx.iter().flat_map(|f| &f.symbolic).any(|c|
@@ -126,6 +135,7 @@ impl Obligations {
         self.checked = Some(Receipt {
             steps: ops.iter().map(|op| op.change().clone()).collect(),
             events: ops.to_vec(),
+            annotations: annotations.to_vec(),
         });
         Ok(())
     }
@@ -231,7 +241,12 @@ mod tests;
 /// Bind prototype inputs only where the ordinary effect contract already
 /// determines a unique writer chain. This does not add ordering preferences:
 /// incomparable writers remain the symbolic compiler's named fork.
-pub(super) fn bind(ops: &Operations, effects: &mut [Effects], baseline: &super::Baseline) {
+pub(super) fn bind(
+    ops: &Operations,
+    effects: &mut [Effects],
+    baseline: &super::Baseline,
+    annotations: &[super::Constraint],
+) {
     use pbps_model::operation::symbolic::{Key, Version};
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<Key, Vec<(usize, usize)>> = BTreeMap::new();
@@ -253,13 +268,23 @@ pub(super) fn bind(ops: &Operations, effects: &mut [Effects], baseline: &super::
             f
         })
         .collect();
-    let graph = super::graph(
+    let mut graph = super::graph(
         ops.as_slice(),
         &concrete,
         baseline,
         &Default::default(),
         super::Checks::ALL,
     );
+    // Annotation edges qualify this same writer chain; they do not add a
+    // settlement or let an incomparable pair borrow the current permutation.
+    graph
+        .edges
+        .extend(annotations.iter().map(|edge| super::Edge {
+            before: edge.before,
+            after: edge.after,
+            source: edge.source,
+            because: super::edges::Because::Declared,
+        }));
     let mut reach = BTreeMap::new();
     for (key, group) in groups.into_iter().filter(|(_, g)| g.len() > 1) {
         for &(at, _) in &group {
@@ -394,7 +419,8 @@ pub(super) fn replay<S>(
     let names = PlanNames::of(&plan.boundaries.names(plan).changes, after.ids)
         .map_err(|e| e.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);
-    let effects = super::shadow::analyse_with_membership(
+    let annotations = plan.annotation_edges()?;
+    let effects = super::shadow::analyse_scoped(
         &operations,
         &owners,
         Snapshot {
@@ -408,6 +434,8 @@ pub(super) fn replay<S>(
         dialect,
         None,
         stored,
+        true,
+        &annotations,
     );
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());
@@ -473,8 +501,12 @@ pub(super) fn replay<S>(
             }
         }
     }
-    plan.boundaries
-        .discharge(operations.as_slice(), &effects.effects, &effects.symbolic)?;
+    plan.boundaries.discharge(
+        operations.as_slice(),
+        &effects.effects,
+        &effects.symbolic,
+        &annotations,
+    )?;
     lock_window(plan, before, after);
     plan.identities = Some(operations);
     Ok(())

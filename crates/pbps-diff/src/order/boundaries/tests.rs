@@ -89,13 +89,17 @@ fn pending_boundaries_survive_settlement_and_cannot_become_canonical() {
             .unwrap_err()
             .contains("pending")
     );
-    p.boundaries.discharge(ops.as_slice(), &fx, &base).unwrap();
+    p.boundaries
+        .discharge(ops.as_slice(), &fx, &base, &[])
+        .unwrap();
     assert!(plan::canonical(p, &pbps_dialect::MinimalDialect).is_ok());
 }
 #[test]
 fn a_changed_boundary_order_requires_replay_again() {
     let (mut p, ops, fx, base) = fixture();
-    p.boundaries.discharge(ops.as_slice(), &fx, &base).unwrap();
+    p.boundaries
+        .discharge(ops.as_slice(), &fx, &base, &[])
+        .unwrap();
     let mut schedule = Schedule::new(2);
     schedule.edge(
         1,
@@ -110,7 +114,7 @@ fn a_changed_boundary_order_requires_replay_again() {
     settled
         .changes
         .boundaries
-        .discharge(ops.as_slice(), &fx, &base)
+        .discharge(ops.as_slice(), &fx, &base, &[])
         .unwrap();
     assert!(plan::canonical(settled.changes, &pbps_dialect::MinimalDialect).is_ok());
 }
@@ -123,6 +127,7 @@ fn an_empty_effect_cannot_discharge_a_missing_transfer() {
             ops.as_slice(),
             &[Effects::default(), Effects::default()],
             &base,
+            &[],
         )
         .unwrap_err();
     assert!(why.contains("no symbolic transfer") && why.contains(membership::REMEDY));
@@ -141,7 +146,9 @@ fn expansion_and_logical_append_do_not_discard_pending_boundaries() {
 #[test]
 fn boundary_discharge_binds_event_identity_as_well_as_payload() {
     let (mut p, ops, fx, base) = fixture();
-    p.boundaries.discharge(ops.as_slice(), &fx, &base).unwrap();
+    p.boundaries
+        .discharge(ops.as_slice(), &fx, &base, &[])
+        .unwrap();
     p.origins.swap(0, 1);
     assert!(plan::canonical(p, &pbps_dialect::MinimalDialect).is_err());
 }
@@ -243,7 +250,7 @@ fn a_noop_expansion_retains_already_settled_split_event_ids() {
     settled
         .changes
         .boundaries
-        .discharge(ops.as_slice(), &fx, &base)
+        .discharge(ops.as_slice(), &fx, &base, &[])
         .unwrap();
     assert!(plan::canonical(settled.changes.clone(), &pbps_dialect::MinimalDialect).is_ok());
     let result = crate::order::expand::expand(settled.changes, &NoWork, 2)
@@ -255,7 +262,9 @@ fn a_noop_expansion_retains_already_settled_split_event_ids() {
 #[test]
 fn appending_a_step_retains_boundary_event_ids_and_requires_new_discharge() {
     let (mut p, ops, fx, base) = fixture();
-    p.boundaries.discharge(ops.as_slice(), &fx, &base).unwrap();
+    p.boundaries
+        .discharge(ops.as_slice(), &fx, &base, &[])
+        .unwrap();
     let addition = PlannedChange::new(Change::CreateRole {
         uid: "r_bbbbbb".parse().unwrap(),
         name: "another".into(),
@@ -273,7 +282,7 @@ fn appending_a_step_retains_boundary_event_ids_and_requires_new_discharge() {
     let mut fx = fx;
     fx.push(Effects::default());
     p.boundaries
-        .discharge(events.as_slice(), &fx, &base)
+        .discharge(events.as_slice(), &fx, &base, &[])
         .unwrap();
     assert!(plan::canonical(p, &pbps_dialect::MinimalDialect).is_ok());
 }
@@ -399,7 +408,7 @@ fn version_binding_requires_a_unique_existing_writer_chain() {
     }
     let baseline = crate::order::Baseline::empty().with_symbolic(state);
     let fork = fx.clone();
-    bind(&ops, &mut fx, &baseline);
+    bind(&ops, &mut fx, &baseline, &[]);
     assert_eq!(
         fx, fork,
         "incomparable writers must retain their explicit fork"
@@ -410,7 +419,7 @@ fn version_binding_requires_a_unique_existing_writer_chain() {
             Incarnation::Base,
         ));
     }
-    bind(&ops, &mut fx, &baseline);
+    bind(&ops, &mut fx, &baseline, &[]);
     assert!(
         matches!(&fx[1].symbolic[..],[Clause::Recurse(w)] if w.input==Version::After(ops.as_slice()[0].id()) && w.from==value("a"))
     );
@@ -592,7 +601,7 @@ fn a_changed_physical_spelling_requires_boundary_recertification() {
     use pbps_model::plan_names::PlanNames;
     let (mut plan, ops, effects, state) = fixture();
     plan.boundaries
-        .discharge(ops.as_slice(), &effects, &state)
+        .discharge(ops.as_slice(), &effects, &state, &[])
         .unwrap();
     plan.identities = Some(ops.clone());
     assert!(plan.boundaries.ensure(&plan).is_ok());
@@ -683,3 +692,6 @@ fn unread_membership_and_known_empty_membership_have_different_obligations() {
         assert!(error.contains(membership::REMEDY), "{error}");
     }
 }
+
+#[path = "annotations_tests.rs"]
+mod annotations;

@@ -999,3 +999,6 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
         assert_eq!(risks, vec![[RiskClass::Revoke].into(); 2]);
     }
 }
+
+#[path = "generated_tests/dependency_index_tests.rs"]
+mod dependency_index;

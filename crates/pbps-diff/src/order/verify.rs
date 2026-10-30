@@ -282,7 +282,7 @@ pub(crate) fn verify_with(
         .collect();
     for e in &g.edges {
         let (before, after) = (operations[e.before].id(), operations[e.after].id());
-        if e.source == Source::Declared && e.before >= e.after {
+        if matches!(e.source, Source::Declared | Source::Annotation) && e.before >= e.after {
             out.push(Violation::BrokenDeclared { before, after });
         } else if unsettled.contains(e) {
             out.push(Violation::Edge {
@@ -293,4 +293,28 @@ pub(crate) fn verify_with(
         }
     }
     out
+}
+
+/// Independently check annotation boundaries against the current input order,
+/// including non-module references. Release correctness remains graph admission.
+pub fn annotations<S>(plan: &super::PlanningPlan<S>) -> Result<Vec<Violation>, String> {
+    let operations = plan.identities.clone().unwrap_or_else(|| {
+        pbps_model::operation::Operations::expanded(
+            plan.logical,
+            plan.origins
+                .iter()
+                .cloned()
+                .zip(plan.changes.iter().cloned()),
+            pbps_model::operation::ModuleEdits::Rebuilt,
+        )
+    });
+    Ok(plan
+        .annotation_edges()?
+        .into_iter()
+        .filter(|e| e.before >= e.after)
+        .map(|edge| Violation::BrokenDeclared {
+            before: operations.as_slice()[edge.before].id(),
+            after: operations.as_slice()[edge.after].id(),
+        })
+        .collect())
 }

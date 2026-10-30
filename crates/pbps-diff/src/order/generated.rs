@@ -167,7 +167,7 @@ pub fn functions(changes: &[PlannedChange]) -> Vec<ModuleId> {
         .collect()
 }
 
-type ModuleStep<'a> = (usize, &'a ModuleId, &'a Module);
+type ModuleStep<'a, P = usize> = (P, &'a ModuleId, &'a Module);
 
 #[allow(clippy::wildcard_enum_match_arm)]
 fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
@@ -232,20 +232,36 @@ fn module_dependencies(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
 ) -> Vec<(usize, usize, bool)> {
-    let mut edges = Vec::new();
+    let mut edges: Vec<_> =
+        super::annotations::modules(modules.iter().map(|(at, id, _)| (*at, *id)), deps)
+            .into_iter()
+            .map(|edge| (edge.before, edge.after, true))
+            .collect();
+    infer_module_dependencies(modules, dialect, scratch, &mut edges);
+    edges
+}
+
+fn infer_module_dependencies<P: Copy + Ord>(
+    modules: &[ModuleStep<'_, P>],
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+    edges: &mut Vec<(P, P, bool)>,
+) {
+    // Keep vector insertion order; membership must not rescan all emitted edges
+    // for each module pair. P also permits counted comparisons in regression tests.
+    let mut seen: BTreeSet<_> = edges.iter().map(|&(a, b, _)| (a, b)).collect();
     for (i, id, module) in modules {
         let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
             if i == j || id.name() == provider.name() {
                 continue;
             }
-            let declared = deps.get(*id).is_some_and(|needs| needs.contains(*provider));
-            if declared || dialect.generation_may_call(&text, provider.name()) {
-                edges.push((*j, *i, declared));
+            if !seen.contains(&(*j, *i)) && dialect.generation_may_call(&text, provider.name()) {
+                seen.insert((*j, *i));
+                edges.push((*j, *i, false));
             }
         }
     }
-    edges
 }
 
 pub fn is_part(p: &PlannedChange) -> bool {
@@ -261,7 +277,15 @@ pub fn parts(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Option<Vec<PlannedChange>>, String> {
-    parts_in(planned, ids, changes, deps, dialect, false)
+    parts_in(
+        planned,
+        ids,
+        changes,
+        deps,
+        dialect,
+        false,
+        &BTreeSet::new(),
+    )
 }
 
 /// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
@@ -275,6 +299,7 @@ fn parts_in(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
+    demanded: &BTreeSet<pbps_model::object_ref::ObjectRef>,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
@@ -318,11 +343,48 @@ fn parts_in(
     };
     let split = if scratch {
         dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
+    } else if !demanded.is_empty() {
+        dialect.annotation_parts(&planned.change, ids, &functions, table_reader, demanded)
     } else {
         dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
     };
     let Some(parts) = split.map_err(|e| e.to_string())? else {
         return Ok(None);
+    };
+    // Scratch can carry a partition default with a placeholder column UID.
+    // Annotation endpoints need its real child-table/root-column identity;
+    // the existing partition operation resolves that through the shared chain.
+    // Scratch consumers keep their existing carrier; Contract resolves its
+    // identity when reading annotations (DEC-2469.3).
+    let parts = if !scratch
+        && !demanded.is_empty()
+        && let Change::CreateTable {
+            uid, name, table, ..
+        } = &planned.change
+        && let Some(of) = &table.partition_of
+    {
+        parts
+            .into_iter()
+            .map(|part| match part {
+                Change::AlterColumnDefault {
+                    column,
+                    from: None,
+                    to: Some(to),
+                    ..
+                } if column.table == *name => Change::SetPartitionDefault {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    parent: of.parent.clone(),
+                    column: column.name,
+                    from: None,
+                    to: Some(to),
+                    fallback: None,
+                },
+                part => part,
+            })
+            .collect()
+    } else {
+        parts
     };
     Ok(Some(
         parts
@@ -550,7 +612,11 @@ pub(super) fn expand_in(
     let mut origins = Vec::new();
     let mut added = 0;
     for (p, origin) in plan.changes.iter().zip(&plan.origins) {
-        match parts_in(p, ids, &plan.changes, deps, dialect, scratch)? {
+        let demanded = plan
+            .annotations
+            .as_ref()
+            .map_or_else(BTreeSet::new, |a| a.demands(&p.change));
+        match parts_in(p, ids, &plan.changes, deps, dialect, scratch, &demanded)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
@@ -840,8 +906,8 @@ pub(super) fn constraints_in(
             if a != b {
                 out.prefer(a, b, OrderReason::Structural);
             }
-        } else {
-            edge(out, a, b);
+        } else if a != b {
+            out.edge(a, b, Source::Inferred, OrderReason::Structural);
         }
     };
     let modules = modules(&cs.changes);
@@ -1050,15 +1116,18 @@ pub(super) fn constraints_in(
     if scratch {
         scratch_rules(cs, declared, dialect, guessed, &mut out);
     }
-    if out.constraints().is_empty() {
-        return Vec::new();
-    }
+    let infer_modules = !out.constraints().is_empty();
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
     for (provider, consumer, declared) in module_dependencies(&modules, deps, dialect, scratch) {
         if declared {
-            edge(&mut out, provider, consumer);
-        } else {
+            out.edge(
+                provider,
+                consumer,
+                Source::Annotation,
+                OrderReason::Structural,
+            );
+        } else if infer_modules {
             guess(&mut out, provider, consumer);
         }
     }

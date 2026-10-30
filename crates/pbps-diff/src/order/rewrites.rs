@@ -87,6 +87,7 @@ fn settle_requirements<S: Clone>(
         dialect,
         catalog,
         &changes,
+        &changes.annotation_edges()?,
     );
     if !effects.effects.iter().any(|fx| {
         fx.requires.iter().any(|r| {

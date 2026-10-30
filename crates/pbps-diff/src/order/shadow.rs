@@ -59,7 +59,15 @@ pub fn analyse_with_catalog(
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
 ) -> Shadowed {
     analyse_scoped(
-        operations, owners, before, after, dialect, catalog, None, false,
+        operations,
+        owners,
+        before,
+        after,
+        dialect,
+        catalog,
+        None,
+        false,
+        &[],
     )
 }
 
@@ -77,7 +85,15 @@ pub fn analyse_with_membership(
     stored: Option<&pbps_model::operation::MembershipCatalog>,
 ) -> Shadowed {
     analyse_scoped(
-        operations, owners, before, after, dialect, catalog, stored, true,
+        operations,
+        owners,
+        before,
+        after,
+        dialect,
+        catalog,
+        stored,
+        true,
+        &[],
     )
 }
 
@@ -93,6 +109,7 @@ pub(super) fn analyse_planning<S>(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     plan: &super::PlanningPlan<S>,
+    annotations: &[super::Constraint],
 ) -> Shadowed {
     analyse_scoped(
         operations,
@@ -103,11 +120,12 @@ pub(super) fn analyse_planning<S>(
         catalog,
         None,
         !plan.boundaries.is_empty(),
+        annotations,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn analyse_scoped(
+pub(super) fn analyse_scoped(
     operations: &Operations,
     owners: &dyn Owners,
     before: Snapshot<'_>,
@@ -116,6 +134,7 @@ fn analyse_scoped(
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     stored: Option<&pbps_model::operation::MembershipCatalog>,
     membership: bool,
+    annotations: &[super::Constraint],
 ) -> Shadowed {
     use pbps_model::operation::{End, Lineage, MembershipCatalog};
     let lineage = Lineage::of(before, after);
@@ -219,6 +238,7 @@ fn analyse_scoped(
             operations,
             &mut effects,
             &Baseline::of(before, owners).with_symbolic(facts.base.clone()),
+            annotations,
         );
         super::boundaries::transfers(&mut effects, &facts.base, dialect);
     }

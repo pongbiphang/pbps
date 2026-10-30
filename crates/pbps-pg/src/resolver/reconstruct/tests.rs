@@ -1666,3 +1666,95 @@ fn fill_program_preserves_managed_group_sources_sql_and_prunes_only_unavailable_
         "placement alone is no execution proof"
     );
 }
+
+#[test]
+fn fills_follow_annotated_facets_and_cannot_bypass_a_creation_cycle() {
+    use pbps_model::{Schema, object_ref::ObjectDeps, operation::Snapshot};
+    let pg = crate::Postgres::new();
+    let mut shape = Table::default();
+    let mut column = Column::new("integer".parse().unwrap());
+    column.value_source = ValueSource::Default("1".into());
+    shape.columns.insert("x".into(), column);
+    let changes = [
+        Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: "app.t".parse().unwrap(),
+            table: Box::new(shape.clone()),
+            beside_default: None,
+            moves_at_most: None,
+        },
+        module("app.v", ModuleKind::View, "SELECT 1 AS x"),
+    ];
+    let Change::CreateModule { id, module } = &changes[1] else {
+        panic!()
+    };
+    let schema = Schema {
+        tables: [("app.t".parse().unwrap(), shape)].into(),
+        modules: [(id.clone(), (**module).clone())].into(),
+        ..Default::default()
+    };
+    let ids = fixture_ids(&changes);
+    let empty = Schema::default();
+    let empty_ids = pbps_model::IdsFile::default();
+    let build = |pairs: &[(&str, &str)]| {
+        let goal = ObjectDeps(
+            pairs
+                .iter()
+                .map(|(a, b)| (a.parse().unwrap(), [b.parse().unwrap()].into()))
+                .collect(),
+        );
+        let plan = fixture_plan(&changes)
+            .with_annotations(
+                Snapshot {
+                    schema: &empty,
+                    ids: &empty_ids,
+                },
+                Snapshot {
+                    schema: &schema,
+                    ids: &ids,
+                },
+                &ObjectDeps::default(),
+                &goal,
+                pbps_model::operation::ModuleEdits::Rebuilt,
+            )
+            .unwrap();
+        let fill = super::super::draft::FillStep {
+            name: "external after view".into(),
+            sql: String::new(),
+            after: [("app".into(), "v".into())].into(),
+            dependencies: Vec::new(),
+            unavailable: false,
+            root: ("pg_type".into(), "type ext.filled".into()),
+            expected: BTreeMap::new(),
+            names: Vec::new(),
+        };
+        Reconstruction::with_fills(&pg, &plan, &ids, &Default::default(), vec![fill])
+    };
+    let r = build(&[
+        ("default::app.t.x", "module::app.v"),
+        ("module::app.v", "table::app.t"),
+    ])
+    .unwrap();
+    assert_eq!(
+        r.steps
+            .iter()
+            .map(|s| s.declaration.as_str())
+            .collect::<Vec<_>>(),
+        ["table app.t", "view app.v", "the default of app.t.x"]
+    );
+    assert_eq!(
+        r.program.work(),
+        &[
+            FillWork::Declared(0),
+            FillWork::Declared(1),
+            FillWork::Fill(0),
+            FillWork::Declared(2)
+        ]
+    );
+    assert!(r.observations().is_none());
+    let error = build(&[("table::app.t", "default::app.t.x")]).unwrap_err();
+    assert!(
+        matches!(error, ReconstructError::Cycle(ref reason) if reason.contains("Annotation")),
+        "{error}"
+    );
+}

@@ -2520,7 +2520,7 @@ pub fn after_the_rebuilds(
     // after it, a moved addition may rest on another, and a validator follows
     // the recomputation it judges only through the order they keep.
     for (i, _) in moves.iter().enumerate().filter(|(_, m)| **m) {
-        schedule.edge(last, i, Source::Lexical, OrderReason::Structural);
+        schedule.edge(last, i, Source::Inferred, OrderReason::Structural);
     }
     let count = moves.iter().filter(|m| **m).count();
     let settled = schedule.settle(cs.clone()).map_err(|refusal| {
@@ -2708,6 +2708,19 @@ fn function_edges(
         ));
     }
     let mut schedule = crate::order::Schedule::new(cs.changes.len());
+    let operations = pbps_model::operation::Operations::of_plan(
+        &cs.changes,
+        pbps_model::operation::ModuleEdits::Rebuilt,
+    );
+    let explicit = crate::order::annotations::legacy(operations.as_slice(), deps);
+    let declared: BTreeSet<_> = explicit.iter().map(|e| (e.before, e.after)).collect();
+    for edge in explicit {
+        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
+    }
+    let typed_creations: Vec<_> = window
+        .iter()
+        .map(|change| TypedCreation::of(change))
+        .collect();
     let mut previous_free = None;
     for i in 0..n {
         let earlier: Vec<_> = if held.contains(&i) {
@@ -2717,17 +2730,14 @@ fn function_edges(
         };
         for j in earlier {
             if needs(window[i], window[j], deps, partitions, dialect) {
-                let declared = window[i]
-                    .module_id()
-                    .zip(window[j].module_id())
-                    .is_some_and(|(later, earlier)| {
-                        deps.get(later).is_some_and(|d| d.contains(earlier))
-                    });
+                let explicit = declared.contains(&(start + j, start + i));
                 schedule.edge(
                     start + j,
                     start + i,
-                    if declared {
-                        Source::Declared
+                    if explicit {
+                        Source::Annotation
+                    } else if inferred_need(window[i], window[j], &typed_creations[i]) {
+                        Source::Inferred
                     } else {
                         Source::Lexical
                     },
@@ -2746,7 +2756,7 @@ fn function_edges(
     }
     for (at, named) in &waits {
         for &create in named {
-            schedule.edge(create, *at, Source::Lexical, OrderReason::Structural);
+            schedule.edge(create, *at, Source::Inferred, OrderReason::Structural);
         }
     }
 
@@ -2849,6 +2859,66 @@ fn cycle(
          both. Split it into two plans: create {functions} in a plan of {their} own first, or \
          add the column without the call first and give it the call in a second plan"
     )
+}
+
+// Index typed creation fields once per operation, not once per candidate
+// provider in the function window. These facts must remain hard.
+#[derive(Default)]
+struct TypedCreation<'a> {
+    tables: BTreeSet<&'a TableName>,
+    row_types: BTreeSet<&'a str>,
+}
+impl<'a> TypedCreation<'a> {
+    fn of(change: &'a Change) -> Self {
+        if let Change::CreateTable { table, .. } = change {
+            Self {
+                tables: table
+                    .foreign_keys
+                    .values()
+                    .map(|key| &key.references_table)
+                    .chain(table.partition_of.iter().map(|of| &of.parent))
+                    .collect(),
+                row_types: table
+                    .columns
+                    .values()
+                    .map(|column| column.ty.base.as_str())
+                    .collect(),
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+// Provenance of the text/conservative branches of `needs`. Typed column,
+// row, containment and foreign-key fields remain stated constraints.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn inferred_need(later: &Change, earlier: &Change, typed: &TypedCreation<'_>) -> bool {
+    match (earlier, later) {
+        (
+            Change::CreateModule { id: provider, .. } | Change::AlterModule { id: provider, .. },
+            Change::CreateModule { id: owner, .. } | Change::AlterModule { id: owner, .. },
+        ) => {
+            !(owner.attached_to().is_some()
+                && owner.attached_to() == provider.referenced_name().as_ref())
+                && !(owner.referenced_name().is_some()
+                    && owner.referenced_name() == provider.referenced_name())
+        }
+        (Change::CreateModule { .. } | Change::AlterModule { .. }, _) => true,
+        (Change::AddColumn { .. }, Change::CreateModule { .. } | Change::AlterModule { .. }) => {
+            true
+        }
+        (Change::CreateTable { name, .. }, Change::CreateTable { .. }) => {
+            !typed.tables.contains(name)
+                && !typed.row_types.contains(name.name.as_str())
+                && !typed.row_types.contains(name.raw().to_string().as_str())
+        }
+        (Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }, _) => {
+            false
+        }
+        (_, Change::CreateModule { .. } | Change::AlterModule { .. }) => true,
+        _ => false,
+    }
 }
 
 /// Whether `later` may need `earlier`, a change ahead of it in the plan, to

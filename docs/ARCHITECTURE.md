@@ -105,6 +105,13 @@ No additional settlement or proof union is introduced. See
 [the contract](ORDERING.md#membership-scoped-effect-contract) for unresolved
 domains, remaining guards, lock-window reporting and readback obligations.
 
+A transient annotation contract in `pbps-diff::order::annotations` binds the
+model registry's references through the existing Owners/PlanNames boundary.
+It describes current operation boundaries and accompanies drafts through the
+existing settlements; it owns neither engine SQL nor a new ordering pass.
+Legal decomposition delegates to the dialect's existing typed recipe. The
+contract is not saved-plan data (DEC-2469.3).
+
 ## New-engine ordering contract
 
 An engine supplies ordering facts and lowering semantics to the shared

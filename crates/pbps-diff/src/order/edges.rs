@@ -17,6 +17,11 @@ pub enum Source {
     Effect,
     /// A `depends_on:` annotation (SPEC §4).
     Declared,
+    /// Explicit declaration intent, never eligible for the legacy fallback.
+    Annotation,
+    /// Text/name inference, hard on the compatibility route. The extended
+    /// annotation contract may qualify this provenance as Guess (DEC-2469.3).
+    Inferred,
     /// What a body or an expression names, read through a lexer (S6a).
     Lexical,
     /// What the engine's catalog says depends on what (connected plans).
@@ -681,7 +686,7 @@ pub fn graph(
         edge(a, b, Source::Effect, Because::RowSecurity);
     }
     declared_edges(operations, declared, &mut |a, b| {
-        edge(a, b, Source::Declared, Because::Declared)
+        edge(a, b, Source::Annotation, Because::Declared)
     });
     let mut result = Graph {
         edges,
@@ -715,36 +720,8 @@ pub fn declared_edges(
     declared: &ModuleDeps,
     edge: &mut dyn FnMut(usize, usize),
 ) {
-    use pbps_model::Change;
-    // Indexed once: a pair scan over every operation per annotation is cubic
-    // in the module operations of a plan.
-    let mut by_module: std::collections::BTreeMap<&pbps_model::ModuleId, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (i, op) in operations.iter().enumerate() {
-        if let Some(id) = op.change().module_id() {
-            by_module.entry(id).or_default().push(i);
-        }
-    }
-    let none: Vec<usize> = Vec::new();
-    let defines =
-        |c: &Change| matches!(c, Change::CreateModule { .. } | Change::AlterModule { .. });
-    for (dependent, inputs) in declared {
-        let dependents = by_module.get(dependent).unwrap_or(&none);
-        for input in inputs {
-            for &i in by_module.get(input).unwrap_or(&none) {
-                for &j in dependents {
-                    let (a, b) = (&operations[i], &operations[j]);
-                    if defines(a.change()) && defines(b.change()) {
-                        edge(i, j);
-                    }
-                    if matches!(a.change(), Change::DropModule { .. })
-                        && matches!(b.change(), Change::DropModule { .. })
-                    {
-                        edge(j, i);
-                    }
-                }
-            }
-        }
+    for constraint in super::annotations::legacy(operations, declared) {
+        edge(constraint.before, constraint.after);
     }
 }
 

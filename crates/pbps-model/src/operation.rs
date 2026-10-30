@@ -197,7 +197,7 @@ pub enum Spelling {
 impl Spelling {
     /// The spelling of what the step itself brings into being: after its
     /// own change, where a whole step is spelled before it.
-    fn produced(self) -> Self {
+    pub fn produced(self) -> Self {
         match self {
             Spelling::At(At::Before(i)) => Spelling::At(At::After(i)),
             Spelling::At(At::Start | At::End | At::After(_))
@@ -628,6 +628,11 @@ impl Operation {
     /// what it does is read from.
     pub fn change(&self) -> &Change {
         &self.step.change
+    }
+
+    /// The engine policy already used by this operation's definitions.
+    pub fn module_edits(&self) -> ModuleEdits {
+        self.modules
     }
 
     pub fn planned(&self) -> &PlannedChange {

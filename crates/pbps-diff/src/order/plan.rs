@@ -90,6 +90,7 @@ pub(super) fn state<S, T>(plan: PlanningPlan<S>) -> PlanningPlan<T> {
     done.identities = plan.identities;
     done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
+    done.annotations = plan.annotations;
     done
 }
 
@@ -143,6 +144,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     done.identities = identities;
     done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
+    done.annotations = plan.annotations;
     Ok(done)
 }
 impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
@@ -169,6 +171,7 @@ pub struct PlanningPlan<S = Draft> {
     pub(super) identities: Option<pbps_model::operation::Operations>,
     pub(super) allocator: pbps_model::operation::IdAllocator,
     pub(super) boundaries: super::boundaries::Obligations,
+    pub(super) annotations: Option<std::sync::Arc<super::annotations::Contract>>,
 }
 
 impl<S> PlanningPlan<S> {
@@ -188,6 +191,7 @@ impl<S> PlanningPlan<S> {
             identities: None,
             allocator: pbps_model::operation::IdAllocator::logical(logical),
             boundaries: Default::default(),
+            annotations: None,
         }
     }
     pub(crate) fn pending_boundaries(
@@ -208,6 +212,29 @@ impl<S> PlanningPlan<S> {
             self.allocator.reserve(self.identities.as_ref().unwrap());
         }
     }
+    /// Attach checked, transient intent before the existing expansion/settlement
+    /// route. Module edits use the same engine policy as operation definitions;
+    /// boundary shape cannot prove that an edited provider stays available.
+    /// It cannot enter the saved wire contract before YAML activation.
+    pub fn with_annotations(
+        mut self,
+        before: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
+        base: &pbps_model::object_ref::ObjectDeps,
+        goal: &pbps_model::object_ref::ObjectDeps,
+        modules: pbps_model::operation::ModuleEdits,
+    ) -> Result<Self, String> {
+        self.annotations = Some(std::sync::Arc::new(super::annotations::Contract::of(
+            &self, before, after, base, goal, modules,
+        )?));
+        Ok(self)
+    }
+    pub fn annotation_edges(&self) -> Result<Vec<super::Constraint>, String> {
+        self.annotations
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |a| a.constraints(self))
+    }
+
     pub fn changes(&self) -> &ChangeSet {
         &self.payload
     }

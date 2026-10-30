@@ -102,46 +102,32 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     let mut changes =
         super::PlanningPlan::new(payload, input.origins.clone(), input.logical, proof);
     changes.boundaries = input.boundaries.clone();
+    changes.annotations = input.annotations.clone();
     super::generated::expand_in(&mut changes, ids, dependencies, dialect, true)?;
     let mut edges =
         super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
-    let mut why: Vec<_> = edges
+    edges.extend(changes.annotation_edges()?);
+    if changes.annotations.as_ref().is_some_and(|a| a.extended) {
+        for edge in &mut edges {
+            if edge.source == super::Source::Inferred {
+                edge.source = super::Source::Guess;
+            }
+        }
+    }
+    let why: Vec<_> = edges
         .iter()
         .map(|edge| EdgeWhy {
             edge: edge.clone(),
             rule: if edge.source == super::Source::Guess {
                 EdgeRule::Inferred
+            } else if edge.source == super::Source::Annotation {
+                EdgeRule::Annotation
             } else {
                 EdgeRule::Structural
             },
         })
         .collect();
-    if dialect.scratch_text_edges_are_guesses() {
-        // Explicit identities must not pass through the inferred same-leaf
-        // exclusion (DEC-2465.1); no general Source/Requirement rule changes.
-        let module_at = |id: &pbps_model::ModuleId| {
-            changes.changes.iter().position(
-                |p| matches!(&p.change, Change::CreateModule { id: found, .. } if found == id),
-            )
-        };
-        for (owner, providers) in dependencies {
-            for provider in providers {
-                if let (Some(before), Some(after)) = (module_at(provider), module_at(owner)) {
-                    let edge = Constraint {
-                        before,
-                        after,
-                        source: super::Source::Lexical,
-                        reason: pbps_model::resolver::OrderReason::Structural,
-                    };
-                    why.push(EdgeWhy {
-                        edge: edge.clone(),
-                        rule: EdgeRule::Annotation,
-                    });
-                    edges.push(edge);
-                }
-            }
-        }
-    }
+
     Ok(Prepared {
         changes,
         edges,

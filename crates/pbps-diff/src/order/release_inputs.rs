@@ -74,8 +74,16 @@ pub fn carry_inserts<S>(
         schema: after.schema,
         ids: after.ids,
     };
-    let effects =
-        super::shadow::analyse_planning(&operations, &owners, base, end, dialect, None, plan);
+    let effects = super::shadow::analyse_planning(
+        &operations,
+        &owners,
+        base,
+        end,
+        dialect,
+        None,
+        plan,
+        &plan.annotation_edges()?,
+    );
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());
     }
