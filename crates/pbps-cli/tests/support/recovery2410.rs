@@ -266,7 +266,7 @@ pub fn run_owned_after_creation(server: &str) {
     assert!(messages.iter().all(|m| m.contains(&token)), "{messages:?}");
     let human = f.plan(&[]);
     assert!(
-        !said(&human).contains("ended without cleaning up"),
+        !said(&human).contains("confirmed removal of"),
         "a clean cluster says nothing"
     );
 }

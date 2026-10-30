@@ -3231,7 +3231,12 @@ pub(crate) fn catalogued_as(
 /// What this command's sweeps found (#2410): a note for what was removed, a
 /// warning with the removing statement for what was not.
 pub(crate) fn recovery_findings() -> Vec<crate::output::Finding> {
-    let collected = pbps_cli::resolver::server::scratch::recovery::take();
+    recovery_report_findings(pbps_cli::resolver::server::scratch::recovery::take())
+}
+
+fn recovery_report_findings(
+    collected: pbps_cli::resolver::server::scratch::recovery::Collected,
+) -> Vec<crate::output::Finding> {
     let mut findings = Vec::new();
     for why in collected.unread {
         findings.push(crate::output::Finding::warning(
@@ -3244,7 +3249,7 @@ pub(crate) fn recovery_findings() -> Vec<crate::output::Finding> {
             findings.push(crate::output::Finding::note(
                 "scratch.recovered",
                 format!(
-                    "removed {} {}, left by run {} which ended without cleaning up",
+                    "confirmed removal of {} {}, left by run {}",
                     resource.kind,
                     resource.names.join(", "),
                     group.token
@@ -11184,6 +11189,62 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_findings_name_only_confirmed_removal_and_keep_volume_failures() {
+        use pbps_cli::resolver::server::scratch::recovery::{Collected, Group, Kept, Resource};
+        let resource = Resource::one("docker container", "owned");
+        let findings = super::recovery_report_findings(Collected {
+            groups: vec![
+                Group {
+                    token: "dead".into(),
+                    removed: vec![resource.clone()],
+                    kept: Vec::new(),
+                },
+                Group {
+                    token: "pending".into(),
+                    removed: Vec::new(),
+                    kept: vec![Kept {
+                        resource,
+                        why: "the docker volume data: permission denied".into(),
+                        statement: "docker rm --force --volumes owned".into(),
+                    }],
+                },
+            ],
+            unread: vec!["daemon denied".into()],
+        });
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.id == "scratch.recovered")
+                .count(),
+            1
+        );
+        let confirmed = findings
+            .iter()
+            .find(|f| f.id == "scratch.recovered")
+            .unwrap();
+        assert!(
+            confirmed
+                .message
+                .starts_with("confirmed removal of docker container owned")
+        );
+        let pending = findings
+            .iter()
+            .find(|f| f.id == "scratch.leftover")
+            .unwrap();
+        assert!(
+            pending
+                .message
+                .contains("docker volume data: permission denied")
+        );
+        assert_eq!(
+            pending.remedy.as_deref(),
+            Some("docker rm --force --volumes owned")
+        );
+        assert!(findings.iter().any(|f| f.id == "scratch.leftovers-unread"));
+        assert!(super::recovery_report_findings(Collected::default()).is_empty());
+    }
+
     /// The plan-time removed-label count and the apply-time probes read the
     /// plan against one relation: the stored partitions under the plan's final
     /// parent names. Here the plan renames the parent, rebuilds an enum column

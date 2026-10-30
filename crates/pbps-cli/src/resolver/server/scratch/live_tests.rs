@@ -4836,7 +4836,9 @@ async fn resolver_docker_names_a_volume_its_removal_left() {
             assert!(!volumes.is_empty());
             for volume in &volumes {
                 assert!(
-                    names.contains(&format!("the docker volume {volume}")),
+                    names
+                        .iter()
+                        .any(|name| { name.starts_with(&format!("the docker volume {volume}: ")) }),
                     "{names:?}"
                 );
             }
