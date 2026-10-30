@@ -77,7 +77,7 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
             serde_json::json!("postgres-catalog-inputs-v3"),
         ),
         ("/before/engine_major", serde_json::json!(17)),
-        ("/authorization/rule", serde_json::json!("pg-auth-v2")),
+        ("/authorization/rule", serde_json::json!("pg-auth-v1")),
     ] {
         let mut changed = json.clone();
         *changed.pointer_mut(path).unwrap() = value;
@@ -124,5 +124,18 @@ fn evidence_sealed_under_another_qualification_rule_is_refused_by_name() {
         let message = error.to_string();
         assert!(message.contains(&format!("`{refused}`")), "{message}");
         assert!(message.contains("plan again"), "{message}");
+    }
+}
+
+#[test]
+fn evidence_requires_the_schema_acl_mode_authorization_rule() {
+    assert_eq!(authorization::RULE, "pg-auth-v2");
+    let current = evidence();
+    validate_evidence(&current).unwrap();
+    for rule in ["pg-auth-v1", "pg-auth-v3"] {
+        let mut json = serde_json::to_value(&current).unwrap();
+        *json.pointer_mut("/authorization/rule").unwrap() = serde_json::json!(rule);
+        let old: ResolverEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(validate_evidence(&old), Err(EvidenceError::Version));
     }
 }

@@ -38151,11 +38151,12 @@ async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
         .await
         .unwrap();
     assert_eq!(auth.schemas["role_names"].owner, owner);
-    assert!(
-        auth.schemas["role_names"].acl[reader.raw()]
-            .iter()
-            .all(|grant| grant.grantor == owner)
-    );
+    let pbps_pg::resolver::authorization::SchemaAcl::Explicit(acl) =
+        &auth.schemas["role_names"].acl
+    else {
+        panic!("the granted schema has an explicit ACL");
+    };
+    assert!(acl[reader.raw()].iter().all(|grant| grant.grantor == owner));
     let absent = pbps_model::RoleName::from(reader.shown().to_string());
     assert_eq!(
         pbps_pg::roles::missing_roles(&mut db.conn, &[&reader, &absent].into())

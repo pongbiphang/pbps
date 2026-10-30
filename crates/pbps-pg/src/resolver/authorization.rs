@@ -16,6 +16,10 @@
 //! Unreadable is not empty: a catalog a least-privilege deployer cannot read
 //! is an error, never an authorization context with nothing in it.
 
+mod schema_acl;
+
+pub use schema_acl::SchemaAcl;
+
 use super::ROLE_BATCH;
 use pbps_db::resolver::environment::DeploymentPrincipal;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
@@ -23,7 +27,7 @@ use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The versioned name of this authorization rule, measured on 16 and 18.
-pub const RULE: &str = "pg-auth-v1";
+pub const RULE: &str = "pg-auth-v2";
 
 /// The privileges the context measures for each kind of object. Enough to
 /// bind a creation against existing objects; not an audit of every grant.
@@ -76,14 +80,15 @@ pub(crate) fn setting_value(name: &str, value: &str) -> Result<String, DbError> 
 
 /// What one in-scope schema grants: its owner, the deployer's effective
 /// answers (for comparison), and the raw ACL (for reconstruction). The ACL
-/// is keyed by grantee role name, with `PUBLIC` for the pseudo-role, so a
+/// retains Default separately from Explicit grants keyed by grantee role
+/// name, with `PUBLIC` for the pseudo-role, so a
 /// reconstruction can grant the same privileges to the same mapped roles and
 /// the effective answer follows from the reproduced membership.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SchemaAuthorization {
     pub owner: pbps_model::RoleName,
     pub privileges: BTreeMap<String, bool>,
-    pub acl: BTreeMap<String, Vec<Grant>>,
+    pub acl: SchemaAcl,
 }
 
 /// One explicit grant on a schema as `aclexplode` reports it: the privilege,
@@ -207,45 +212,35 @@ async fn schema_owner(
     }
 }
 
-/// The schema's grant list from `aclexplode`, keyed by grantee (the
-/// pseudo-role 0 is `PUBLIC`). A schema with the default (NULL) ACL has only
-/// the owner's implicit rights, which reconstruction gets from `AUTHORIZATION`
-/// alone, so an empty map is a real "no explicit grants", not unreadable.
-async fn schema_acl(
-    conn: &mut impl QueryConnection,
-    schema: &str,
-) -> Result<BTreeMap<String, Vec<Grant>>, DbError> {
+/// Retain the namespace header even when no ACL entries explode: NULL is
+/// the owner's default, while an explicit empty ACL denies ordinary owner
+/// privileges (DEC-699.1). The reader stays in its caller's snapshot.
+async fn schema_acl(conn: &mut impl QueryConnection, schema: &str) -> Result<SchemaAcl, DbError> {
     let rows = conn
         .query(&format!(
-            "SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' \
+            "SELECT n.oid::text AS namespace, (n.nspacl IS NULL)::text AS default_acl, \
+                    a.grantee::text AS grantee_oid, \
+                    CASE WHEN a.grantee = 0 THEN 'PUBLIC' \
                          ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
                     pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
-                    a.privilege_type AS privilege, \
-                    a.is_grantable::text AS grantable \
+                    a.privilege_type AS privilege, a.is_grantable::text AS grantable \
              FROM pg_catalog.pg_namespace n \
-             CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS a \
-             WHERE n.nspname = {} ORDER BY 1, 2, 3",
+             LEFT JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS a ON true \
+             WHERE n.nspname = {} ORDER BY 3, 5, 6",
             literal(schema)
         ))
         .await?;
-    let mut acl: BTreeMap<String, Vec<Grant>> = BTreeMap::new();
-    for row in &rows {
-        // The grant option is kept, so a grantee that may re-grant is
-        // distinguished from one that may not, and the grantor, so each
-        // entry is replayed under it (finding on #688); a planned grant the
-        // deployer lacks the option for then fails as apply would.
-        acl.entry(required(row, "grantee", "a grantee")?)
-            .or_default()
-            .push(Grant {
-                privilege: required(row, "privilege", "a privilege type")?,
-                grantable: flag(row, "grantable")?,
-                grantor: required(row, "grantor", "a grantor")?.into(),
-            });
-    }
-    for grants in acl.values_mut() {
-        grants.sort();
-    }
-    Ok(acl)
+    schema_acl::decode(rows.iter().map(|row| {
+        Ok(schema_acl::Fields {
+            namespace: row.try_get::<&str>("namespace")?,
+            default_acl: row.try_get::<&str>("default_acl")?,
+            grantee_oid: row.try_get::<&str>("grantee_oid")?,
+            grantee: row.try_get::<&str>("grantee")?,
+            grantor: row.try_get::<&str>("grantor")?,
+            privilege: row.try_get::<&str>("privilege")?,
+            grantable: row.try_get::<&str>("grantable")?,
+        })
+    }))
 }
 
 async fn schema_privileges(
@@ -405,7 +400,7 @@ impl RoleMap {
                 continue;
             }
             logical.insert(schema.owner.clone());
-            for (grantee, grants) in &schema.acl {
+            for (grantee, grants) in schema.acl.entries() {
                 if grantee != "PUBLIC" {
                     logical.insert(grantee.clone().into());
                 }
@@ -757,21 +752,11 @@ pub async fn reconstruct(
                 quote_ident(&owner),
             ))
             .await?;
-        // A schema nobody granted anything on has a NULL ACL on the target —
-        // the owner's implicit rights alone, read as no entries — and a schema
-        // this run just created reads the same until something touches its
-        // ACL. `REVOKE ... FROM PUBLIC` is such a touch: on a NULL ACL the
-        // engine first materializes the owner's own entry (measured on 18),
-        // which the target does not have, so the commonest schema of all
-        // would never reproduce (finding on #688). It runs only where the
-        // target has entries to reproduce, an ACL the engine materialized the
-        // same way when the first of them was granted. That materialized
-        // entry is the owner's full default, `UC`, but the target's owner
-        // may have revoked part of its own — an ACL of `{owner=U/owner}` —
-        // and a replay only adds, so the owner's entry is cleared to an
-        // empty ACL first and comes back from the replay exactly as the
-        // target has it (measured on 18; finding on #688).
-        if !schema.acl.is_empty() {
+        // Replaying an explicit ACL starts by clearing the owner's ordinary
+        // defaults even when there are no entries to add. Default alone leaves
+        // the fresh NULL ACL untouched. Ownership still carries grant options,
+        // so an owner with no ordinary privileges can re-grant them (DEC-699.1).
+        if matches!(schema.acl, SchemaAcl::Explicit(_)) {
             for holder in ["PUBLIC".to_owned(), quote_ident(&owner)] {
                 admin
                     .query(&format!(
@@ -792,7 +777,7 @@ pub async fn reconstruct(
         // somebody else.
         let mut pending: Vec<(&String, &Grant)> = schema
             .acl
-            .iter()
+            .entries()
             .flat_map(|(grantee, grants)| grants.iter().map(move |grant| (grantee, grant)))
             .collect();
         let mut able: BTreeSet<(pbps_model::RoleName, String)> = BTreeSet::new();
@@ -1000,22 +985,11 @@ pub fn with_planned(
         let Some(schema) = context.schemas.get_mut(&grant.schema) else {
             continue;
         };
-        // A first GRANT/REVOKE materializes the owner's built-in entries.
-        if schema.acl.is_empty() {
-            let owner = schema.owner.clone();
-            let mut defaults: Vec<Grant> = ["CREATE", "USAGE"]
-                .into_iter()
-                .map(|privilege| Grant {
-                    privilege: privilege.into(),
-                    grantable: false,
-                    grantor: owner.clone(),
-                })
-                .collect();
-            defaults.sort();
-            schema.acl.insert(owner.raw().to_owned(), defaults);
-        }
+        // Only Default materializes the owner's built-in entries. Empty
+        // Explicit stays empty until this statement actually adds a grant.
+        let acl = schema.acl.materialize(&schema.owner);
         for privilege in privileges {
-            let entry = schema.acl.entry(grant.role.clone()).or_default();
+            let entry = acl.entry(grant.role.clone()).or_default();
             let had_option = entry
                 .iter()
                 .any(|g| g.privilege == privilege && g.grantor == grantor && g.grantable);
@@ -1030,7 +1004,7 @@ pub fn with_planned(
                 entry.sort();
             }
             if entry.is_empty() {
-                schema.acl.remove(&grant.role);
+                acl.remove(&grant.role);
             }
         }
     }
@@ -1061,8 +1035,11 @@ fn grantor_choice(
         return GrantorChoice::Known(schema.owner.clone());
     }
     let holds_all = |role: &pbps_model::RoleName| {
+        let SchemaAcl::Explicit(entries) = &schema.acl else {
+            return false;
+        };
         privileges.iter().all(|privilege| {
-            schema.acl.get(role.raw()).is_some_and(|grants| {
+            entries.get(role.raw()).is_some_and(|grants| {
                 grants
                     .iter()
                     .any(|grant| grant.privilege == *privilege && grant.grantable)
@@ -1114,9 +1091,9 @@ pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant
 
 /// Recomputes the deployer's effective USAGE/CREATE for each schema from the
 /// ACL, ownership and the deployer's role closure, the way the engine answers
-/// `has_schema_privilege`: a superuser has everything; on a NULL ACL (read
-/// as no entries) the owner, or a deployer inheriting the owner, has
-/// everything implicitly; once the ACL has entries the owner's own ordinary
+/// `has_schema_privilege`: a superuser has everything; on a Default ACL the
+/// owner, or a deployer inheriting the owner, has everything implicitly; on
+/// any Explicit ACL, including empty, the owner's own ordinary
 /// privileges are the entries recorded for it and nothing more — measured on
 /// 18, `{owner=U/owner}` answers CREATE false for the owner itself. An
 /// ownership shortcut that granted both regardless expected CREATE where the
@@ -1136,10 +1113,10 @@ fn recompute_schema_effective(context: &mut AuthorizationContext) {
         grantee == "PUBLIC" || grantee == deployer.raw() || inherited.contains(grantee)
     };
     for schema in context.schemas.values_mut() {
-        let owns_default = schema.acl.is_empty()
+        let owns_default = matches!(schema.acl, SchemaAcl::Default)
             && (schema.owner == deployer || inherited.contains(schema.owner.raw()));
         for privilege in ["USAGE", "CREATE"] {
-            let granted = schema.acl.iter().any(|(grantee, grants)| {
+            let granted = schema.acl.entries().any(|(grantee, grants)| {
                 holders(grantee) && grants.iter().any(|g| g.privilege == privilege)
             });
             schema
@@ -1192,28 +1169,32 @@ pub async fn verify(
         if map.logical_of(got.owner.raw()).as_deref() != Some(want.owner.raw()) {
             differences.push(format!("schema:{name}:owner"));
         }
-        let got_acl: BTreeMap<String, Vec<Grant>> = got
-            .acl
-            .iter()
-            .map(|(grantee, grants)| {
-                let mut grants: Vec<Grant> = grants
+        let got_acl = match &got.acl {
+            SchemaAcl::Default => SchemaAcl::Default,
+            SchemaAcl::Explicit(entries) => SchemaAcl::Explicit(
+                entries
                     .iter()
-                    .map(|g| Grant {
-                        privilege: g.privilege.clone(),
-                        grantable: g.grantable,
-                        grantor: map
-                            .logical_of(g.grantor.raw())
-                            .map(pbps_model::RoleName::from)
-                            .unwrap_or_else(|| g.grantor.clone()),
+                    .map(|(grantee, grants)| {
+                        let mut grants: Vec<Grant> = grants
+                            .iter()
+                            .map(|g| Grant {
+                                privilege: g.privilege.clone(),
+                                grantable: g.grantable,
+                                grantor: map
+                                    .logical_of(g.grantor.raw())
+                                    .map(pbps_model::RoleName::from)
+                                    .unwrap_or_else(|| g.grantor.clone()),
+                            })
+                            .collect();
+                        grants.sort();
+                        (
+                            map.logical_of(grantee).unwrap_or_else(|| grantee.clone()),
+                            grants,
+                        )
                     })
-                    .collect();
-                grants.sort();
-                (
-                    map.logical_of(grantee).unwrap_or_else(|| grantee.clone()),
-                    grants,
-                )
-            })
-            .collect();
+                    .collect(),
+            ),
+        };
         if got_acl != want.acl {
             differences.push(format!("schema:{name}:acl"));
         }
@@ -1321,6 +1302,20 @@ mod tests {
     }
 
     use super::*;
+
+    fn acl(schema: &SchemaAuthorization) -> &BTreeMap<String, Vec<Grant>> {
+        match &schema.acl {
+            SchemaAcl::Explicit(entries) => entries,
+            SchemaAcl::Default => panic!("expected explicit grants"),
+        }
+    }
+
+    fn acl_mut(schema: &mut SchemaAuthorization) -> &mut BTreeMap<String, Vec<Grant>> {
+        match &mut schema.acl {
+            SchemaAcl::Explicit(entries) => entries,
+            SchemaAcl::Default => panic!("expected explicit grants"),
+        }
+    }
 
     #[test]
     fn every_compared_setting_is_part_of_the_context() {
@@ -1450,12 +1445,14 @@ mod tests {
                     privileges: [("USAGE".to_owned(), true), ("CREATE".to_owned(), false)]
                         .into_iter()
                         .collect(),
-                    acl: [(
-                        "app_reader".to_owned(),
-                        vec![grant("USAGE", false, "app_owner")],
-                    )]
-                    .into_iter()
-                    .collect(),
+                    acl: SchemaAcl::Explicit(
+                        [(
+                            "app_reader".to_owned(),
+                            vec![grant("USAGE", false, "app_owner")],
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
                 },
             )]
             .into_iter()
@@ -1585,10 +1582,7 @@ mod tests {
                     inherits: true,
                 },
             );
-            two.schemas
-                .get_mut("app")
-                .unwrap()
-                .acl
+            acl_mut(two.schemas.get_mut("app").unwrap())
                 .insert(role.to_owned(), vec![grant("USAGE", true, "app_owner")]);
         }
         let planned = [PlannedGrant {
@@ -1604,14 +1598,10 @@ mod tests {
         // option itself, owns the schema, or is a superuser; and a revoke of
         // a privilege nobody holds the option for is not a grantor question.
         let mut one = two.clone();
-        one.schemas.get_mut("app").unwrap().acl.remove("aa_second");
+        acl_mut(one.schemas.get_mut("app").unwrap()).remove("aa_second");
         assert!(ambiguous_grantors(&one, &planned).is_empty());
         let mut direct = two.clone();
-        direct
-            .schemas
-            .get_mut("app")
-            .unwrap()
-            .acl
+        acl_mut(direct.schemas.get_mut("app").unwrap())
             .insert("dep".into(), vec![grant("USAGE", true, "app_owner")]);
         assert!(ambiguous_grantors(&direct, &planned).is_empty());
         let mut owns = two.clone();
@@ -1639,9 +1629,11 @@ mod tests {
         schema.owner = "dep".into();
         // `REVOKE CREATE ON SCHEMA app FROM dep` by the owner itself leaves
         // `{dep=U/dep}`, and the engine reads CREATE false for the owner.
-        schema.acl = [("dep".to_owned(), vec![grant("USAGE", false, "dep")])]
-            .into_iter()
-            .collect();
+        schema.acl = SchemaAcl::Explicit(
+            [("dep".to_owned(), vec![grant("USAGE", false, "dep")])]
+                .into_iter()
+                .collect(),
+        );
         schema.privileges = [("USAGE".to_owned(), true), ("CREATE".to_owned(), false)]
             .into_iter()
             .collect();
@@ -1661,13 +1653,13 @@ mod tests {
         );
         assert!(!granted.schemas["app"].privileges["CREATE"]);
         assert_eq!(
-            granted.schemas["app"].acl["app_reader"],
+            acl(&granted.schemas["app"])["app_reader"],
             vec![grant("USAGE", false, "dep")]
         );
         // A NULL ACL is the owner's implicit everything, and a superuser has
         // it whatever the ACL says.
         let mut fresh = owned.clone();
-        fresh.schemas.get_mut("app").unwrap().acl.clear();
+        fresh.schemas.get_mut("app").unwrap().acl = SchemaAcl::Default;
         assert!(with_planned(fresh, &[]).schemas["app"].privileges["CREATE"]);
         owned.principal.superuser = true;
         assert!(with_planned(owned, &[]).schemas["app"].privileges["CREATE"]);
@@ -1692,18 +1684,20 @@ mod tests {
         // it and the owner granted USAGE to the reader.
         let mut base = context();
         base.roles.clear();
-        base.schemas.get_mut("app").unwrap().acl = [
-            ("dep".to_owned(), vec![grant("USAGE", true, "app_owner")]),
-            (
-                "app_reader".to_owned(),
-                vec![
-                    grant("USAGE", false, "app_owner"),
-                    grant("USAGE", false, "dep"),
-                ],
-            ),
-        ]
-        .into_iter()
-        .collect();
+        base.schemas.get_mut("app").unwrap().acl = SchemaAcl::Explicit(
+            [
+                ("dep".to_owned(), vec![grant("USAGE", true, "app_owner")]),
+                (
+                    "app_reader".to_owned(),
+                    vec![
+                        grant("USAGE", false, "app_owner"),
+                        grant("USAGE", false, "dep"),
+                    ],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
         let same = with_planned(base.clone(), &[]);
         assert!(
             same.schemas["app"].privileges["USAGE"],
@@ -1712,7 +1706,7 @@ mod tests {
         // The deployer's revoke removes its own grant and leaves the owner's.
         let revoked = with_planned(base.clone(), &[planned("USAGE", "app_reader", true)]);
         assert_eq!(
-            revoked.schemas["app"].acl["app_reader"],
+            acl(&revoked.schemas["app"])["app_reader"],
             vec![grant("USAGE", false, "app_owner")]
         );
         // The deployer re-granting to itself adds an item under its own
@@ -1720,7 +1714,7 @@ mod tests {
         // grantor (measured on 18); the owner's option entry stays.
         let regranted = with_planned(base.clone(), &[planned("USAGE", "dep", false)]);
         assert_eq!(
-            regranted.schemas["app"].acl["dep"],
+            acl(&regranted.schemas["app"])["dep"],
             vec![
                 grant("USAGE", false, "dep"),
                 grant("USAGE", true, "app_owner")
@@ -1730,14 +1724,15 @@ mod tests {
         // deployer's own grant: the reproduction will not have it.
         let unauthorized = with_planned(base.clone(), &[planned("CREATE", "app_reader", false)]);
         assert!(
-            unauthorized.schemas["app"].acl["app_reader"].contains(&grant("CREATE", false, "dep"))
+            acl(&unauthorized.schemas["app"])["app_reader"]
+                .contains(&grant("CREATE", false, "dep"))
         );
         // As the owner, the deployer's revoke takes the owner's grant instead.
         let mut as_owner = base;
         as_owner.principal.effective = "app_owner".into();
         let owner_revoked = with_planned(as_owner, &[planned("USAGE", "app_reader", true)]);
         assert_eq!(
-            owner_revoked.schemas["app"].acl["app_reader"],
+            acl(&owner_revoked.schemas["app"])["app_reader"],
             vec![grant("USAGE", false, "dep")]
         );
     }
@@ -1757,32 +1752,105 @@ mod tests {
         let mut base = context();
         base.principal.effective = "app_owner".into();
         base.roles.clear();
-        base.schemas.get_mut("app").unwrap().acl.clear();
+        base.schemas.get_mut("app").unwrap().acl = SchemaAcl::Default;
         let defaults = vec![
             grant("CREATE", false, "app_owner"),
             grant("USAGE", false, "app_owner"),
         ];
         let granted = with_planned(base.clone(), &[planned("app_reader", false)]);
-        assert_eq!(granted.schemas["app"].acl["app_owner"], defaults);
+        assert_eq!(acl(&granted.schemas["app"])["app_owner"], defaults);
         assert_eq!(
-            granted.schemas["app"].acl["app_reader"],
+            acl(&granted.schemas["app"])["app_reader"],
             vec![grant("USAGE", false, "app_owner")]
         );
         let revoked = with_planned(base.clone(), &[planned("app_reader", true)]);
-        assert_eq!(revoked.schemas["app"].acl.len(), 1);
-        assert_eq!(revoked.schemas["app"].acl["app_owner"], defaults);
+        assert_eq!(acl(&revoked.schemas["app"]).len(), 1);
+        assert_eq!(acl(&revoked.schemas["app"])["app_owner"], defaults);
         // Already explicit: the owner's entry is whatever the target has,
         // here none, and a grant adds only itself.
         let mut explicit = base;
-        explicit
-            .schemas
-            .get_mut("app")
-            .unwrap()
-            .acl
+        explicit.schemas.get_mut("app").unwrap().acl = SchemaAcl::Explicit(BTreeMap::new());
+        acl_mut(explicit.schemas.get_mut("app").unwrap())
             .insert("other".into(), vec![grant("USAGE", false, "app_owner")]);
         let added = with_planned(explicit, &[planned("app_reader", false)]);
-        assert!(!added.schemas["app"].acl.contains_key("app_owner"));
-        assert_eq!(added.schemas["app"].acl.len(), 2);
+        assert!(!acl(&added.schemas["app"]).contains_key("app_owner"));
+        assert_eq!(acl(&added.schemas["app"]).len(), 2);
+    }
+
+    #[test]
+    fn an_explicit_empty_acl_never_regains_owner_defaults() {
+        let mut base = context();
+        base.roles.clear();
+        let schema = base.schemas.get_mut("app").unwrap();
+        schema.owner = "dep".into();
+        schema.acl = SchemaAcl::Explicit(BTreeMap::new());
+        schema.privileges = BTreeMap::from([("USAGE".into(), false), ("CREATE".into(), false)]);
+        assert_eq!(with_planned(base.clone(), &[]), base);
+        let statement = |role: &str, revoke| PlannedGrant {
+            role: role.into(),
+            schema: "app".into(),
+            privilege: "USAGE".into(),
+            revoke,
+        };
+        let noop = with_planned(base.clone(), &[statement("PUBLIC", true)]);
+        assert_eq!(
+            noop, base,
+            "a no-op revoke cannot materialize revoked owner rights"
+        );
+        let usage = statement("dep", false);
+        let granted = with_planned(base.clone(), std::slice::from_ref(&usage));
+        assert!(granted.schemas["app"].privileges["USAGE"]);
+        assert!(!granted.schemas["app"].privileges["CREATE"]);
+        assert_eq!(
+            acl(&granted.schemas["app"]),
+            &BTreeMap::from([("dep".into(), vec![grant("USAGE", false, "dep")])])
+        );
+        let revoke = statement("dep", true);
+        let empty = with_planned(granted, std::slice::from_ref(&revoke));
+        assert_eq!(empty, base, "removing the final grant stays explicit empty");
+        assert_eq!(with_planned(empty.clone(), &[]), base);
+        assert_eq!(with_planned(base.clone(), &[usage, revoke]), empty);
+        // Ownership retains the implicit grant option, not ordinary CREATE.
+        assert!(
+            matches!(grantor_choice(&base, "app", &["USAGE"]), GrantorChoice::Known(role) if role.raw() == "dep")
+        );
+        let mut superuser = base;
+        superuser.principal.superuser = true;
+        assert!(with_planned(superuser, &[]).schemas["app"].privileges["CREATE"]);
+    }
+
+    #[test]
+    fn canonical_acl_mode_differs_even_when_every_effective_answer_matches() {
+        let mut default = context();
+        default.roles.clear();
+        let schema = default.schemas.get_mut("app").unwrap();
+        schema.acl = SchemaAcl::Default;
+        schema.privileges = BTreeMap::from([("USAGE".into(), false), ("CREATE".into(), false)]);
+        let mut empty = default.clone();
+        empty.schemas.get_mut("app").unwrap().acl = SchemaAcl::Explicit(BTreeMap::new());
+        assert_ne!(default.canonical(), empty.canonical());
+        assert_eq!(with_planned(default.clone(), &[]), default);
+        assert_eq!(with_planned(empty.clone(), &[]), empty);
+        // An explicit full owner ACL also has the default effective answers,
+        // but a different stored mode that must survive canonicalization.
+        default.principal.effective = "app_owner".into();
+        let default = with_planned(default, &[]);
+        let full = with_planned(
+            default.clone(),
+            &[PlannedGrant {
+                role: "PUBLIC".into(),
+                schema: "app".into(),
+                privilege: "USAGE".into(),
+                revoke: true,
+            }],
+        );
+        assert_eq!(
+            default.schemas["app"].privileges,
+            full.schemas["app"].privileges
+        );
+        assert_ne!(default.canonical(), full.canonical());
+        assert_eq!(with_planned(full.clone(), &[]), full);
+        assert_eq!(default.canonical(), default.clone().canonical());
     }
 
     #[test]

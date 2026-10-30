@@ -745,7 +745,7 @@ mod tests {
             privileges: [("USAGE".to_owned(), usage), ("CREATE".to_owned(), false)]
                 .into_iter()
                 .collect(),
-            acl: BTreeMap::new(),
+            acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
         };
         let context = AuthorizationContext {
             principal: pbps_db::resolver::environment::DeploymentPrincipal {
@@ -811,7 +811,7 @@ mod tests {
                 pg_auth::SchemaAuthorization {
                     owner: "d".into(),
                     privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
-                    acl: BTreeMap::new(),
+                    acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
                 },
             )]
             .into_iter()
@@ -845,7 +845,7 @@ mod tests {
                 pg_auth::SchemaAuthorization {
                     owner: "d".into(),
                     privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
-                    acl: BTreeMap::new(),
+                    acl: pbps_pg::resolver::authorization::SchemaAcl::Default,
                 },
             )]
             .into_iter()
@@ -853,7 +853,7 @@ mod tests {
             roles: BTreeMap::new(),
             settings: BTreeMap::new(),
         });
-        assert_eq!(postgres.rule(), "pg-auth-v1");
+        assert_eq!(postgres.rule(), "pg-auth-v2");
         #[cfg(unix)]
         {
             use pbps_db::fingerprint::EnvironmentFingerprintKey;

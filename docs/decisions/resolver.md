@@ -5406,3 +5406,49 @@ principal-row selection on that real fixture. These controls do not qualify
 Windows-domain authentication, group-default inheritance or multiple-group
 precedence. A domain-backed profile claim still requires that native domain
 evidence; the engine's documented group rules are not a Linux measurement.
+
+
+<a id="dec-699-1"></a>
+
+**DEC-699.1. Preserve default and explicit PostgreSQL schema ACLs through authorization qualification.**
+The maintainer chose option A on #699: `SchemaAcl::Default` or
+`SchemaAcl::Explicit(Map)`. Default cannot carry entries, and an explicit
+empty map cannot imply the owner's ordinary CREATE or USAGE. PostgreSQL 16
+and 18 distinguish NULL `nspacl` from `{}`: an owner can revoke both ordinary
+privileges while retaining the implicit grant options that allow self-grant.
+
+The existing snapshot reader retains one namespace header with a left lateral
+join, a mandatory NULL/default flag and a separate nullable entry OID.
+PUBLIC's OID zero is an entry; a NULL entry marker is not. Missing, failed,
+partial, malformed or inconsistent observations refuse rather than become
+an empty ACL. Multiple grants repeat the same header and retain grantor,
+grant option and deterministic ordering.
+
+Replay recreates ordinary schemas with their mapped owners. Default leaves
+the fresh NULL ACL untouched; every Explicit ACL clears PUBLIC and the
+mapped owner's ordinary defaults before replay, including Explicit(empty).
+Grantor-specific replay and its refusal for unreachable grant options stay
+in force. System schemas retain the existing effective-privilege-only
+contract; this change does not replay their owners or ACLs.
+
+The first planned GRANT or REVOKE materializes owner defaults only from
+Default, including a no-op REVOKE. Explicit(empty) gains only actual grants;
+removing its last grant stays Explicit(empty). Zero-operation and repeated
+projection preserve mode. Ownership supplies grant options independently
+of the ordinary privilege answers.
+
+Canonical authorization includes the mode, and ordinary-schema verification
+compares it as part of the named `schema:<name>:acl` condition after mapping
+roles. Default versus Explicit(empty) must differ even when the principal,
+owner and all effective answers are identical; Default versus an explicit
+full owner ACL also remains distinct. The adapter authorization identifier
+advances from `pg-auth-v1` to `pg-auth-v2`. Existing evidence admission refuses
+the old identifier; no enclosing saved-plan, evidence, state or schema
+format changes, legacy fallback or silent resealing is introduced.
+
+Native controls use actual nonsuperuser deployment identities on both
+supported PostgreSQL majors, independent raw catalog/DDL observations,
+a mode-only verifier negative and measured grant/revoke projection. Each
+reader, replay, projection, canonical and verifier fix has a separate
+compiling fix-removal witness. These are authorization qualification facts,
+not a catalog history log or a broader concurrency guarantee.
