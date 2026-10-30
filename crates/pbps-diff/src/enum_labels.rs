@@ -139,6 +139,7 @@ pub(crate) fn changes(
                 from,
                 to,
                 ordinal,
+                retained: Vec::new(),
                 definition: Box::new(ManagedType::Enum {
                     values: current.clone(),
                 }),
@@ -2616,6 +2617,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             ordinal,
+            retained: Vec::new(),
             definition: Box::new(enumeration(&["a"])),
         }
     }
@@ -3343,6 +3345,7 @@ mod rebuild_tests {
             from: from.into(),
             to: to.into(),
             ordinal,
+            retained: Vec::new(),
             definition: Box::new(enumeration(&[])),
         };
         let list = |labels: &[&str]| PartitionBound::List {
@@ -3473,6 +3476,7 @@ mod rebuild_tests {
             from: from.into(),
             to: to.into(),
             ordinal,
+            retained: Vec::new(),
             definition: Box::new(enumeration(&[])),
         };
         let (base, _) = world(&["a", "b"]);
@@ -3532,6 +3536,7 @@ mod rebuild_tests {
             from: "a".into(),
             to: "x".into(),
             ordinal: 0,
+            retained: Vec::new(),
             definition: Box::new(enumeration(&[])),
         };
         assert_eq!(carried(&[other], &list(&["a"])), list(&["a"]));

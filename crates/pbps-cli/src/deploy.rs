@@ -4751,6 +4751,7 @@ fn staged_movement(
         label,
         environment,
         read,
+        None,
     )
 }
 
@@ -4762,6 +4763,7 @@ fn refuse_pinned_movement(
     after: &Schema,
     label: &str,
 ) -> anyhow::Result<()> {
+    let verified = read.retained();
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let mut named_before = sequences_named(dialect, before);
@@ -4774,6 +4776,9 @@ fn refuse_pinned_movement(
     if !renames.0.is_empty() {
         renames.schema(named_before.to_mut());
         pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
+    }
+    if let Some(verified) = verified {
+        verified.comparison(named_before.to_mut(), named_after.as_ref());
     }
     let after = named_after.as_ref();
     let before = named_before.as_ref();
@@ -6668,6 +6673,7 @@ fn bootstrap(
             // plan perfectly well.
             &pbps_model::Hints {
                 row_guard_defaults: Default::default(),
+                retained_expressions: Vec::new(),
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 enum_comments: Default::default(),
                 domain_array_holders: Default::default(),
@@ -7720,6 +7726,16 @@ fn plan_db(
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
+        if conn.driver() == pbps_db::Driver::Postgres && let Some(entry) = scratch.as_mut() {
+            let before = pbps_diff::Side { schema: &base, ids: &recorded_ids };
+            let after = pbps_diff::Side { schema: &declared, ids: &resolved.ids };
+            let requests = pbps_diff::retained::candidates(before,after,&hints);
+            if !requests.is_empty() && pbps_pg::retained::available(&mut conn,&requests).await {
+                hints.retained_expressions = crate::resolution::retained::compare(
+                    entry,&mut conn,target,before,after,&read_back,&hints,&requests,
+                ).await?;
+            }
+        }
         // The modules a rebuilt enum's columns carry, found in the planning
         // transaction and kept for every plan that follows it.
         let enum_dependents = std::cell::RefCell::new(std::collections::BTreeSet::new());
@@ -9166,6 +9182,12 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.changes,
         )
         .await?;
+        let retained = crate::engine::hold_retained(
+            conn,
+            &plan.changes,
+            Some(&entry.snapshot.declared.overlay(&before)),
+        )
+        .await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_dependents(
             conn,
@@ -9290,12 +9312,15 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         // the recording commands follow: a permission the declarations cannot
         // express stops a state being written down, whether it was there at
         // the start or arrived during the run (110).
+        let verified =
+            crate::engine::verify_retained(conn, retained.as_ref(), &after.schema).await?;
         refuse_pinned_movement(
             dialect,
             guard::Read::transactional(guard::Plan {
                 changes: &plan.changes,
                 ids: &plan.ids,
-            }),
+            })
+            .with_retained(verified.as_ref()),
             &before,
             &after.schema,
             &target.label,
@@ -9817,6 +9842,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         rolled?;
     }
 
+    let mut retained_verified = None;
     let total = statements.len();
     // Staged plans carry one logical change. A completed DROP has no catalog
     // target left; a closing-only resume must not ask for that old target.
@@ -9938,7 +9964,15 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
                 .await?;
             let result = async {
+                let retained = crate::engine::hold_retained(
+                    conn,
+                    &plan.changes,
+                    Some(&entry.snapshot.declared.overlay(&previous)),
+                )
+                .await?;
                 conn.execute(&stmt.sql).await?;
+                retained_verified =
+                    crate::engine::verify_retained(conn, retained.as_ref(), &previous).await?;
                 if let Some(type_statement) = &stmt.declared_type {
                     pbps_pg::type_refs::declared::vet(
                         conn,
@@ -10156,99 +10190,143 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 completed: i + 1,
                 total,
             },
+            retained_verified.as_ref(),
         )?;
         previous = recorded;
     }
 
-    // The closing entry is an ordinary apply with no staged marker: its absence
-    // is what tells every later command this environment is no longer
-    // mid-deployment.
-    let after = managed_state(
-        conn,
-        &plan.ids,
-        &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
-        &externals_under(&externals, &plan.ids),
-        project.config.unmanaged,
-        &plan.data,
-        &Schema::default(),
-        crate::engine::Read::Snapshot,
-    )
-    .await?;
-    refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{e:#}\n\n\
+    let retaining = pbps_model::retained::expressions(&plan.changes)
+        .next()
+        .is_some();
+    if retaining {
+        conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+            .await?;
+    }
+    let closing = async {
+        let retained = crate::engine::hold_retained(conn, &plan.changes, None).await?;
+        // The closing entry is an ordinary apply with no staged marker: its absence
+        // is what tells every later command this environment is no longer
+        // mid-deployment.
+        let after = managed_state(
+            conn,
+            &plan.ids,
+            &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
+            &externals_under(&externals, &plan.ids),
+            project.config.unmanaged,
+            &plan.data,
+            &Schema::default(),
+            if retaining {
+                crate::engine::Read::InsideOwnTransaction
+            } else {
+                crate::engine::Read::Snapshot
+            },
+        )
+        .await?;
+        refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{e:#}\n\n\
              All {total} statement(s) completed, but the staged deployment cannot close. \
              Nothing was rolled back; the ledger retains the last checkpoint. \
              Remove the recreated table and run `pbps apply --staged --resume`, \
              or accept the database with `pbps baseline --reason ...` and plan from there."
-            )
-        })?;
-    // And the last window of all: between the final checkpoint and this read.
-    // Refused *before* the ordinary entry is written, because that entry is
-    // what says the deployment finished — leaving the environment on its last
-    // checkpoint is the honest answer, and `refuse_mid_deployment` then makes
-    // every other command say so.
-    staged_pinned_movement(
-        dialect,
-        staged,
-        &previous,
-        &after.schema,
-        &target.label,
-        target.environment(),
-        StagedRead::Closing { total },
-    )?;
-    // The same read, and the half of it no `Schema` holds. Refused here for
-    // the reason the movement check above is: this is the last window, and
-    // the ordinary entry that follows is what says the deployment finished.
-    refuse_unmet_public_execution(&plan.changes, &after, &target.label).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#}\n\n\
+                )
+            })?;
+        let verified =
+            crate::engine::verify_retained(conn, retained.as_ref(), &after.schema).await?;
+        // And the last window of all: between the final checkpoint and this read.
+        // Refused *before* the ordinary entry is written, because that entry is
+        // what says the deployment finished — leaving the environment on its last
+        // checkpoint is the honest answer, and `refuse_mid_deployment` then makes
+        // every other command say so.
+        staged_pinned_movement(
+            dialect,
+            staged,
+            &previous,
+            &after.schema,
+            &target.label,
+            target.environment(),
+            StagedRead::Closing { total },
+            verified.as_ref(),
+        )?;
+        // The same read, and the half of it no `Schema` holds. Refused here for
+        // the reason the movement check above is: this is the last window, and
+        // the ordinary entry that follows is what says the deployment finished.
+        refuse_unmet_public_execution(&plan.changes, &after, &target.label).map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\n\n\
              All {total} statement(s) completed, but the staged deployment cannot close. \
              Nothing was rolled back; the ledger retains the last checkpoint. Settle what \
              moved and run `pbps apply --staged --resume`, or accept the database with \
              `pbps baseline --reason ...` and plan from there."
+            )
+        })?;
+        // The pins once more, because a `--resume` after the last checkpoint runs
+        // no step and so reaches no other check (DEC-319.1).
+        crate::pins::check(
+            conn,
+            project,
+            target,
+            plan,
+            &pinned_managed,
+            if retaining {
+                crate::pins::Check::BeforeRecording {
+                    executed: statements.statements(),
+                }
+            } else {
+                crate::pins::Check::BeforeClosing {
+                    executed: statements.statements(),
+                }
+            },
         )
-    })?;
-    // The pins once more, because a `--resume` after the last checkpoint runs
-    // no step and so reaches no other check (DEC-319.1).
-    crate::pins::check(
-        conn,
-        project,
-        target,
-        plan,
-        &pinned_managed,
-        crate::pins::Check::BeforeClosing {
-            executed: statements.statements(),
-        },
-    )
-    .await
-    .map_err(|e| {
-        e.context(format!(
-            "all {total} statement(s) completed, but the staged deployment cannot close; \
+        .await
+        .map_err(|e| {
+            e.context(format!(
+                "all {total} statement(s) completed, but the staged deployment cannot close; \
              nothing was rolled back and the ledger retains the last checkpoint. Either put \
              the routine back as it was and run `pbps apply --staged --resume`, or accept the \
              database with `pbps baseline --reason ...` and plan from there"
-        ))
-    })?;
-    let mut snapshot = pbps_model::StateSnapshot::new(
-        pbps_model::StateKind::Apply,
-        after.schema,
-        plan.ids.clone(),
-        operator,
-    );
-    snapshot.baseline_evidence = after.baseline_evidence;
-    snapshot.module_deps = plan.module_deps.clone();
-    snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
-    snapshot.plan_checksum = Some(plan_checksum.to_owned());
-    // What the previous state declared, advanced by what this plan wrote: from
-    // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
-    snapshot.declared = entry.snapshot.declared.clone();
-    snapshot
-        .declared
-        .advance_with_partitions(&plan.changes, &snapshot.schema);
-    Ok(crate::engine::record(conn, &snapshot).await?)
+            ))
+        })?;
+        let mut snapshot = pbps_model::StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            after.schema,
+            plan.ids.clone(),
+            operator,
+        );
+        snapshot.baseline_evidence = after.baseline_evidence;
+        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
+        snapshot.plan_checksum = Some(plan_checksum.to_owned());
+        // What the previous state declared, advanced by what this plan wrote: from
+        // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
+        snapshot.declared = entry.snapshot.declared.clone();
+        snapshot
+            .declared
+            .advance_with_partitions(&plan.changes, &snapshot.schema);
+        let id = crate::engine::record(conn, &snapshot).await?;
+        if retaining {
+            crate::pins::check(
+                conn,
+                project,
+                target,
+                plan,
+                &pinned_managed,
+                crate::pins::Check::BeforeCommit {
+                    executed: statements.statements(),
+                },
+            )
+            .await?;
+        }
+        Ok(id)
+    }
+    .await;
+    if retaining {
+        finish_transaction(conn, dialect, closing).await
+    } else {
+        closing
+    }
 }
 
 /// The movement check a staged run can make: each read compared with the one
@@ -10393,16 +10471,25 @@ fn refuse_unmet_public_execution(
     Ok(())
 }
 
-fn staged_pinned_movement(
+#[allow(clippy::too_many_arguments)]
+fn staged_pinned_movement<'a>(
     dialect: &dyn pbps_dialect::Dialect,
-    plan: guard::Staged<'_>,
+    plan: guard::Staged<'a>,
     before: &Schema,
     after: &Schema,
     label: &str,
     environment: Option<&str>,
     read: StagedRead,
+    verified: Option<&'a pbps_pg::retained::Verified>,
 ) -> anyhow::Result<()> {
-    refuse_pinned_movement(dialect, plan.read(read), before, after, label).map_err(|e| {
+    refuse_pinned_movement(
+        dialect,
+        plan.read(read).with_retained(verified),
+        before,
+        after,
+        label,
+    )
+    .map_err(|e| {
         match read {
             StagedRead::Checkpoint { completed, total } => anyhow::anyhow!(
                 "{e:#}\n\n\
@@ -24444,6 +24531,7 @@ mod held_before_the_plan_tests {
                             from: (*from).into(),
                             to: (*to).into(),
                             ordinal,
+                            retained: Vec::new(),
                             definition: Box::new(ManagedType::Enum {
                                 values: vec![(*to).into()],
                             }),

@@ -39,6 +39,7 @@ pub mod domain;
 pub mod preview;
 pub mod recovery;
 pub mod rehearse;
+pub mod retained;
 
 /// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run

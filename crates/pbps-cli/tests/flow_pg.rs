@@ -27,6 +27,8 @@ mod unseen_properties2445;
 
 #[path = "support/domain_vet2309.rs"]
 mod domain_vet2309;
+#[path = "support/retained2354.rs"]
+mod retained2354;
 
 #[path = "support/managed_types.rs"]
 mod managed_types;

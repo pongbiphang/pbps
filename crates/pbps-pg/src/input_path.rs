@@ -1194,7 +1194,7 @@ async fn vet_in_transaction(
 
 /// `server_version_num` / 10000: 16 or 18, the majors the decoder was measured
 /// on. Any other is refused later, by the decoder.
-async fn server_major(conn: &mut Conn) -> Result<u32, DbError> {
+pub(crate) async fn server_major(conn: &mut Conn) -> Result<u32, DbError> {
     let rows = conn
         .query(
             "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4 AS version",

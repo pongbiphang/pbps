@@ -5284,6 +5284,7 @@ mod enum_label_tests {
             from: "sad".into(),
             to: "blue".into(),
             ordinal: 0,
+            retained: Vec::new(),
             definition,
         };
         let domain = |checks: bool| {

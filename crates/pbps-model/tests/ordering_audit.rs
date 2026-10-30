@@ -362,6 +362,7 @@ mod effects_of_each_kind {
                     from: "ok".into(),
                     to: "fine".into(),
                     ordinal: 0,
+                    retained: Vec::new(),
                     definition: Box::new(ManagedType::Enum {
                         values: vec!["fine".into()],
                     }),
