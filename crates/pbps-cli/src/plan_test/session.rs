@@ -35,6 +35,17 @@ impl<'a> Session<'a> {
             .try_get::<&str>("role")?
             .context("NULL owned provision role")?
             .into();
+        // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
+        // Only this owned cluster's administrator supplies those prerequisites;
+        // declared roles remain managed and existing image roles stay untouched.
+        for name in pbps_pg::roles::missing_roles(&mut conn, &schema.roles.keys().collect()).await?
+        {
+            let role = quoted(name.raw())?;
+            conn.execute(&format!(
+                "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+            ))
+            .await?;
+        }
         // The frozen declarations must never capture an infrastructure identity.
         let roles = ["apply", "fixture", "assertion"]
             .map(|kind| format!("pbps_test_{kind}_{}", scratch.run_id()));

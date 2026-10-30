@@ -866,3 +866,9 @@ Fixtures execute managed routines as an ordinary writer, including invoker calle
 whose dependencies PostgreSQL does not record; declared executable code is trusted
 under ADR-0019 §3/§6. PUBLIC and assertion EXECUTE stay unchanged; fixtures
 retain NOCREATEROLE and cannot assume the apply identity.
+
+The owned administrator supplies missing declared cluster-role prerequisites as
+NOLOGIN, non-privileged roles through the existing presence check; present roles
+keep their attributes. These are managed identities, never infrastructure
+exclusions. Ordinary PostgreSQL role creation/refusal rules remain unchanged
+outside the owned cluster (ADR-0010 §3; ADR-0019 §6).

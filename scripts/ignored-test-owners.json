@@ -229,7 +229,9 @@
         "deploy::test_run::tests::d2a1165_pg16_unmanaged_error_excludes_only_owned_run_roles",
         "deploy::test_run::tests::d2a1165_pg18_unmanaged_error_excludes_only_owned_run_roles",
         "deploy::test_run::tests::d2a1165_pg16_fixture_defaults_execute_managed_routines_as_an_ordinary_writer",
-        "deploy::test_run::tests::d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer"
+        "deploy::test_run::tests::d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer",
+        "deploy::test_run::tests::d2a1165_pg16_declared_role_prerequisites_preserve_grants_and_existing_roles",
+        "deploy::test_run::tests::d2a1165_pg18_declared_role_prerequisites_preserve_grants_and_existing_roles"
       ]
     },
     {

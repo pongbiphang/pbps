@@ -2,6 +2,7 @@ use super::*;
 use crate::plan_test::{Revision, report::Status};
 use anyhow::{Context as _, ensure};
 use pbps_db::{Conn, Driver};
+use pbps_dialect::Dialect as _;
 use pbps_diff::order::ArtifactView as _;
 use pbps_model::{IdsFile, Intent, TableName};
 use std::time::Duration;
@@ -375,7 +376,15 @@ async fn d2a1165_pg18_owns_credentials_and_executes_only_accepted_sealed_plans()
         .unwrap();
 }
 
-async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum Admission {
+    Unmanaged,
+    Defaults,
+    DeclaredRoles,
+}
+async fn admission_case(variable: &str, case: Admission) -> anyhow::Result<()> {
+    let routine_defaults = matches!(case, Admission::Defaults);
+    let declared_roles = matches!(case, Admission::DeclaredRoles);
     let dir = crate::adopt::Stage::new("d2a1165-admission")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let image = std::env::var(variable).context(variable.to_owned())?;
@@ -450,10 +459,37 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
                     .replace("unmanaged: ignore", "unmanaged: error");
                 std::fs::write(config, text)?;
             }
+            if declared_roles {
+                let mut c = Conn::connect(Driver::Postgres, scratch.connection()).await?;
+                c.execute("CREATE ROLE app_existing NOLOGIN NOINHERIT CONNECTION LIMIT 7").await?;
+                for (i, name) in ["app_reader", "app\"reader", "app_existing"].iter().enumerate() {
+                    std::fs::write(fixture.0.path().join(format!("schema/role-{i}.yml")), format!(
+                        "role: {}\ngrants:\n  app.orders: [select]\n  schema::app: [usage]\n",
+                        serde_json::to_string(name)?
+                    ))?;
+                }
+            }
             let base = fixture.input(&IdsFile::default(), false, false)?;
             let session = Session::new(&scratch, &base.loaded.schema).await?;
             ensure!(session.project(&base).config.unmanaged == base.config.unmanaged);
             bootstrap(&session, &base).await?;
+            if declared_roles {
+                let mut c = admin(&scratch).await?;
+                for name in ["app_reader", "app\"reader", "app_existing"] {
+                    let rows = c.query_with(concat!(
+                        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls, ",
+                        "rolinherit, rolconnlimit FROM pg_catalog.pg_roles WHERE rolname=$1"
+                    ), &[pbps_db::Param::Str(name)]).await?;
+                    ensure!(rows.len()==1, "declared role missing: {name}");
+                    for flag in ["rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolbypassrls"] {
+                        ensure!(rows[0].try_get::<bool>(flag)?==Some(false), "unsafe role: {name} {flag}");
+                    }
+                    if name == "app_existing" {
+                        ensure!(rows[0].try_get::<bool>("rolinherit")? == Some(false));
+                        ensure!(rows[0].try_get::<i32>("rolconnlimit")? == Some(7));
+                    }
+                }
+            }
             let mut candidate = fixture.input(&base.ids, !routine_defaults, false)?;
             if routine_defaults {
                 candidate
@@ -467,7 +503,7 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
                     .unwrap()
                     .value_source =
                     pbps_model::ValueSource::Default("app.fixture_default()".into());
-            } else {
+            } else if !declared_roles {
                 // A near-match is not owned infrastructure, even with the run id.
                 let outsider = format!("pbps_test_fixture_{}_other", scratch.run_id());
                 let mut c = admin(&scratch).await?;
@@ -497,6 +533,18 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
             .await?;
             ensure!(progress.accepted.get() && progress.started.get());
             session.grants(&candidate.loaded.schema).await?;
+            if declared_roles {
+                let mut c = admin(&scratch).await?;
+                for role in ["app_reader", "app\"reader", "app_existing"] {
+                    let role = pbps_pg::Postgres::new().quote_ident(role)?;
+                    c.execute(&format!("SET ROLE {role}")).await?;
+                    c.execute("SELECT total FROM app.orders").await?;
+                    let e = c.execute("INSERT INTO app.orders(code,total) VALUES ('forbidden',1)").await
+                        .err().context("a declared reader could write")?;
+                    ensure!(e.server_error_code().as_deref() == Some("42501"));
+                    c.execute("RESET ROLE").await?;
+                }
+            }
             let mut fixtures = session.fixtures().await?;
             if routine_defaults {
                 fixtures
@@ -612,30 +660,63 @@ async fn admission_case(variable: &str, routine_defaults: bool) -> anyhow::Resul
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2a1165_pg16_unmanaged_error_excludes_only_owned_run_roles() {
-    Box::pin(admission_case("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", false))
-        .await
-        .unwrap();
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+        Admission::Unmanaged,
+    ))
+    .await
+    .unwrap();
 }
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2a1165_pg18_unmanaged_error_excludes_only_owned_run_roles() {
-    Box::pin(admission_case("PBPS_TEST_PG_SCRATCH_IMAGE", false))
-        .await
-        .unwrap();
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Admission::Unmanaged,
+    ))
+    .await
+    .unwrap();
 }
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2a1165_pg16_fixture_defaults_execute_managed_routines_as_an_ordinary_writer() {
-    Box::pin(admission_case("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", true))
-        .await
-        .unwrap();
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+        Admission::Defaults,
+    ))
+    .await
+    .unwrap();
 }
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer() {
-    Box::pin(admission_case("PBPS_TEST_PG_SCRATCH_IMAGE", true))
-        .await
-        .unwrap();
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Admission::Defaults,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg16_declared_role_prerequisites_preserve_grants_and_existing_roles() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+        Admission::DeclaredRoles,
+    ))
+    .await
+    .unwrap();
+}
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg18_declared_role_prerequisites_preserve_grants_and_existing_roles() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Admission::DeclaredRoles,
+    ))
+    .await
+    .unwrap();
 }
 
 #[test]
