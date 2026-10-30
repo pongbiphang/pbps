@@ -249,11 +249,14 @@ impl Report {
 /// What this process's sweeps found, for the command's JSON.
 #[derive(Debug, Default)]
 pub struct Collected {
+    /// Cleanup results whose cancelled caller never received them (DEC-1519.1).
+    pub cancelled: Vec<Vec<String>>,
     pub groups: Vec<Group>,
     pub unread: Vec<String>,
 }
 
 static COLLECTED: Mutex<Collected> = Mutex::new(Collected {
+    cancelled: Vec::new(),
     groups: Vec::new(),
     unread: Vec::new(),
 });
@@ -266,6 +269,22 @@ pub fn emit(report: &Report) {
     if let Ok(mut collected) = COLLECTED.lock() {
         collected.groups.extend(report.groups.iter().cloned());
         collected.unread.extend(report.unread.clone());
+    }
+}
+
+/// A detached supervisor keeps exact recovery names visible even when its
+/// request's receiver is gone. Never substitute a connection string or panic.
+pub(super) fn cancelled_cleanup(names: Vec<String>) {
+    let shown = names
+        .iter()
+        .map(|name| pbps_model::escape::Escaped(name).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "warning: a cancelled resolver run could not confirm cleanup; remove exactly: {shown}"
+    );
+    if let Ok(mut collected) = COLLECTED.lock() {
+        collected.cancelled.push(names);
     }
 }
 

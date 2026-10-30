@@ -3238,6 +3238,19 @@ fn recovery_report_findings(
     collected: pbps_cli::resolver::server::scratch::recovery::Collected,
 ) -> Vec<crate::output::Finding> {
     let mut findings = Vec::new();
+    for names in collected.cancelled {
+        findings.push(crate::output::Finding::warning(
+            "scratch.cleanup-unconfirmed",
+            format!(
+                "a cancelled resolver run could not confirm cleanup; remove exactly: {}",
+                names
+                    .iter()
+                    .map(|name| pbps_model::escape::Escaped(name).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     for why in collected.unread {
         findings.push(crate::output::Finding::warning(
             "scratch.leftovers-unread",
