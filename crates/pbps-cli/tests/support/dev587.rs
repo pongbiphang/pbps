@@ -429,6 +429,11 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A successful exec proves inherited write descriptors have closed. The
+    // image branch has no fixture effects, so later product invocations need
+    // no retry of stringified failures from inside the CLI (#2554).
+    let ready = stand_in::retry_exec(|| Command::new(&docker).arg("image").output()).unwrap();
+    assert!(ready.status.success(), "{ready:?}");
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     std::env::join_paths(paths).unwrap()
@@ -493,16 +498,7 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
             .env("PBPS_DEV_FIRST", first)
             .env("PBPS_DEV_MAPPING", mapping)
             .env("PBPS_DEV_PORT_STATUS", status);
-        let mut o = command.output().unwrap();
-        for _ in 0..200 {
-            if !stdout(&o).contains("Text file busy")
-                || !std::fs::read_to_string(&log).unwrap().is_empty()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            o = command.output().unwrap();
-        }
+        let o = command.output().unwrap();
         assert_eq!(code(&o), 1, "{} {}", stdout(&o), stderr(&o));
         let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
         assert_eq!(v["result"], "unanswerable", "{v}");
