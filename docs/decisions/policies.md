@@ -280,3 +280,13 @@ unsuppressed error establishes reliance. Git's first topological commit in
 retiring commit. An uncommitted removal and unavailable history are named
 explicitly. Informational saved findings carry the entry, reason and provenance
 to `explain` without a checkout, new artifact field, version bump or apply gate.
+
+<a id="dec-2484-1"></a>
+
+**DEC-2484.1. Consumer changes compare one effective column interface (#2484,
+#2482).** Planning prepares each side once, keyed by owning table UID and source
+column UID. Partition overrides and the full domain chain supply whole-column
+attributes; every array boundary starts a separate value context for NOT NULL
+and opaque CHECKs. Ordinary edits, domain edits and rebuilds use the same
+before/after projection. Effective DEFAULT changes remain distinct from physical
+restorations, whose equivalence stays with the existing differ callback.

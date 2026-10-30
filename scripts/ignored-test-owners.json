@@ -2837,6 +2837,26 @@
         "unseen_properties2445::table_tablespace_is_named_in_pull_and_refused_in_plan",
         "unseen_properties2445::unreadable_property_catalog_columns_are_errors_in_pull_and_plan"
       ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "consumer_effective_columns::ordinary_edits_use_effective_attributes_and_keep_real_change_controls",
+        "consumer_effective_columns::required_domain_columns_need_a_whole_value_supply_for_existing_writers",
+        "consumer_effective_columns::element_contexts_are_protected_through_connected_domain_rebuilds",
+        "consumer_effective_columns::partition_overrides_keep_standing_interfaces_and_refuse_real_tightening"
+      ]
     }
   ]
 }

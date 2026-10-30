@@ -2,6 +2,7 @@
 
 mod binding;
 mod changes;
+mod effective;
 
 use crate::{Context, Policies, evaluate::Live};
 pub use binding::{Bindings, Entry as BoundContract};
@@ -191,6 +192,7 @@ pub fn plan(
 ) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
     let written = written_tables(bound, sides);
+    let interfaces = effective::Interfaces::of(sides, cs);
     let mut tables: BTreeMap<_, _> = sides
         .first()
         .into_iter()
@@ -216,10 +218,7 @@ pub fn plan(
         };
         for entry in &bound.0 {
             // A table created by this plan has no pre-existing writer contract.
-            if entry.writes && entry.table().is_some_and(|uid| {
-                sides[0].table(Some(uid)).is_none() && cs.changes.iter().any(|p|
-                    matches!(&p.change, pbps_model::Change::CreateTable { uid: created, .. } if created == uid))
-            }) {
+            if entry.writes && entry.table().is_some_and(|uid| interfaces.created(uid)) {
                 continue;
             }
             let Some(class) = changes::classify(
@@ -227,7 +226,7 @@ pub fn plan(
                 entry,
                 table,
                 entry.table().and_then(|uid| written.get(uid)),
-                cs,
+                &interfaces,
                 sides,
                 unchanged,
             ) else {

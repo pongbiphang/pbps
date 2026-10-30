@@ -186,6 +186,14 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
     let before = schema();
     let mut after = before.clone();
     let mut new = ids();
+    after
+        .tables
+        .get_mut(&name())
+        .unwrap()
+        .columns
+        .get_mut("old")
+        .unwrap()
+        .nullable = false;
     let change = Change::AlterColumnNullability {
         uid: uid("c_aaaaaa"),
         column: name().column("old"),
@@ -226,7 +234,7 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
         .unwrap()
         .columns
         .insert("added".into(), added.clone());
-    let add = Change::AddColumn {
+    let mut add = Change::AddColumn {
         uid: uid("c_bbbbbb"),
         table: name(),
         name: "added".into(),
@@ -251,6 +259,9 @@ fn writes_tightening_is_unproven_and_a_new_default_supplied_column_is_compatible
         .get_mut("added")
         .unwrap()
         .value_source = ValueSource::None;
+    if let Change::AddColumn { column, .. } = &mut add {
+        column.value_source = ValueSource::None;
+    }
     let f = findings(
         &before,
         &after,
@@ -1010,6 +1021,17 @@ fn partition_overrides_share_the_supplied_new_column_exception() {
                 "{parent_default}/{local_default}: {f:?}"
             );
             // A default on an existing column still changes the writer interface.
+            after
+                .tables
+                .get_mut(&leaf)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .entry("old".into())
+                .or_default()
+                .default = Some("1".into());
             let f = findings(
                 &before,
                 &after,
@@ -1325,6 +1347,9 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
             .get_mut("old")
             .unwrap()
             .ty = ColumnType::reference(changed.clone());
+        before.types.insert(changed.clone(), from.clone());
+        let mut after = before.clone();
+        after.types.insert(changed.clone(), to.clone());
         let change = Change::AlterDomain {
             uid: uid("y_aaaaaa"),
             name: changed.clone(),
@@ -1335,7 +1360,7 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
         assert!(
             findings_with_restoration(
                 &before,
-                &before,
+                &after,
                 &ids(),
                 &ids(),
                 &consumers("app.t.old", true),
@@ -1345,8 +1370,14 @@ fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoratio
             .is_empty()
         );
     }
-    let before = schema();
+    let mut before = schema();
+    before
+        .types
+        .insert(changed.clone(), domain(false, None, None));
     let mut after = before.clone();
+    after
+        .types
+        .insert(changed.clone(), domain(true, None, None));
     let mut new = ids();
     let mut spec = Column::new(ColumnType::reference(changed.clone()));
     spec.value_source = ValueSource::Default("1".into());
@@ -1392,6 +1423,8 @@ fn domain_checks_reach_sibling_writers_and_usage_on_either_side() {
     let to = domain(false, None, Some("VALUE > 0"));
     for matching_side in [0, 1] {
         let mut sides = [schema(), schema()];
+        sides[0].types.insert(changed.clone(), from.clone());
+        sides[1].types.insert(changed.clone(), to.clone());
         let mut i = ids();
         i.columns.insert(uid("c_bbbbbb"), name().column("other"));
         for (index, schema) in sides.iter_mut().enumerate() {
@@ -2030,3 +2063,5 @@ fn named_computed_contracts_do_not_acquire_an_ordinary_replacements_uid() {
         assert!(!restored.contains(replacement.contracts().next().unwrap()));
     }
 }
+
+mod effective_columns;
