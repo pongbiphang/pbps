@@ -4,7 +4,8 @@
 //! The context is read **as the deployer**, over the planning connection,
 //! and every effective answer in it is the engine's own: `fn_my_permissions`
 //! for what the deployer may do on the database and on each in-scope schema,
-//! `IS_ROLEMEMBER` for the roles it is in. Nothing here re-derives an
+//! `IS_ROLEMEMBER` for its roles and `HAS_PERMS_BY_NAME` for enumerated
+//! impersonation candidates. Nothing here re-derives an
 //! effective permission from grant rows; DENY, role nesting, ownership and
 //! fixed roles are the engine's to combine, and a second implementation of
 //! that would be a second thing to keep right.
@@ -43,7 +44,7 @@ pub use staged::{
 
 /// The versioned name of this authorization rule, measured on SQL Server
 /// 2025 (17.0).
-pub const RULE: &str = "mssql-auth-v2";
+pub const RULE: &str = "mssql-auth-v3";
 
 /// Principals every database has, which a reproduction refers to by their
 /// own name instead of cloning.
@@ -275,6 +276,17 @@ fn required(row: &Row, field: &str, what: &str) -> Result<String, DbError> {
         .ok_or_else(|| DbError::BadRow(format!("the authorization context did not report {what}")))
 }
 
+fn impersonation_is_effective(target: &str, answer: Option<&str>) -> Result<bool, DbError> {
+    match answer {
+        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        _ => Err(DbError::BadRow(format!(
+            "the effective IMPERSONATE permission on {} is unreadable",
+            pbps_model::RoleName::from(target).shown()
+        ))),
+    }
+}
+
 /// Reads the context as the connection's current principal.
 pub async fn read(
     conn: &mut impl QueryConnection,
@@ -370,20 +382,28 @@ pub async fn read(
             ),
         )
         .await?;
+        // Positive rows are candidates: DENY may override a public or role
+        // grant. Keep an engine negative distinct from an unknown answer;
+        // neither query filtering nor a Rust permission model does that
+        // (DEC-720.1). This is not an inventory of implicit CONTROL rights.
         for row in conn
             .query(&format!(
-                "SELECT USER_NAME(p.major_id) AS target FROM sys.database_permissions p \
+                "SELECT USER_NAME(p.major_id) AS target, \
+                        CONVERT(nvarchar(8), HAS_PERMS_BY_NAME(USER_NAME(p.major_id), \
+                            N'USER', N'IMPERSONATE')) AS effective \
+                 FROM sys.database_permissions p \
                  WHERE p.class = 4 AND p.permission_name = N'IMPERSONATE' AND p.state IN ('G', 'W') \
                    AND USER_NAME(p.grantee_principal_id) IN ({holder_list}) ORDER BY 1;"
             ))
             .await?
         {
-            context
-                .impersonation
-                .insert(required(&row, "target", "an impersonation target")?.into());
+            let target = required(&row, "target", "an impersonation target")?;
+            if impersonation_is_effective(&target, row.try_get::<&str>("effective")?)? {
+                context.impersonation.insert(target.into());
+            }
         }
-        // Everything else on a principal, a DENY of IMPERSONATE included: the
-        // granted IMPERSONATE rows are the list above, replayed as that.
+        // Raw rows remain a separate replay obligation. In particular, a
+        // DENY is retained even when no positive candidate was admitted.
         for row in conn
             .query(&format!(
                 "SELECT USER_NAME(p.major_id) AS target, \
@@ -1302,6 +1322,25 @@ fn differences_except_schema_owners(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_impersonation_answer_is_known_boolean_or_an_error() {
+        assert!(impersonation_is_effective("other", Some("1")).unwrap());
+        assert!(!impersonation_is_effective("other", Some("0")).unwrap());
+        for unknown in [
+            None,
+            Some(""),
+            Some("2"),
+            Some("01"),
+            Some("true"),
+            Some(" 1"),
+        ] {
+            let error = impersonation_is_effective("other", unknown).unwrap_err();
+            assert!(matches!(error, DbError::BadRow(_)));
+            assert!(error.to_string().contains("IMPERSONATE"));
+            assert!(error.to_string().contains("other"));
+        }
+    }
 
     #[test]
     fn principal_mapping_preserves_raw_owner_grantor_and_spelling_keys() {

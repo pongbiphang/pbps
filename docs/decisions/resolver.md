@@ -5101,3 +5101,34 @@ staged comparison once after the complete program. Comparing immediately
 per Fill would let a later setup mutate an earlier accepted shape and seal
 against a stale comparison, as a real PG negative probe reproduced. The final
 comparison refuses that case and adds no catalog round trip.
+
+<a id="dec-720-1"></a>
+
+**DEC-720.1. SQL Server impersonation candidates require the current deployer's effective permission.**
+Positive class-4 IMPERSONATE grant rows enumerate candidates, not effective
+rights: a direct DENY can override a public or inherited GRANT. In that same
+query and on the same deployment connection, project HAS_PERMS_BY_NAME for
+each candidate. Validate its target name first, admit exactly 1, exclude
+exactly 0, and refuse unreadable, NULL or malformed answers. Preserve query
+and conversion errors. SQL Server combines permissions; Rust does not infer
+precedence from catalog rows. This bounded candidate set does not claim to
+inventory implicit CONTROL or ownership rights. Its changed meaning uses
+mssql-auth-v3; the generic fingerprint domain and saved formats do not change.
+
+Raw principal grants remain a separate obligation. Existing capture, mapping,
+replay and comparison retain the DENY's target, grantee, grantor and state,
+even when the effective set is empty. Both target acquisition and scratch
+verification use the corrected reader. Persistent SQL Server resolver
+authorization remains unsupported; this does not enable its admission path.
+
+An ordinary-login probe and the connected recon611 regression on pinned SQL
+Server 17.0.4075.5 show public GRANT permitting impersonation and direct DENY
+refusing it. Existing DENY replay already preserves that refusal; the original
+wider-scratch execution symptom is historical. Separate healthy and denied
+reconstructions verify equal. An administrative row oracle checks the mapped
+DENY independently of effective refusal. Removing only that row names
+principal:grants even when execution remains denied; adding DENY to the healthy
+scratch names impersonation independently. Unrelated denials do not suppress
+a healthy candidate. Copy-based revert witnesses separately remove effective
+admission, DENY replay, each comparison and strict unknown-answer refusal;
+each reaches its specific failing assertion before the source is restored.
