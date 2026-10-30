@@ -475,3 +475,6 @@ fn generation_can_depend_directly_on_its_column_existence() {
 
 #[path = "creation2469/continuity.rs"]
 mod continuity;
+
+#[path = "creation2469/forward.rs"]
+mod forward;

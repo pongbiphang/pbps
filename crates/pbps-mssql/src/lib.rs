@@ -280,7 +280,7 @@ impl Dialect for Mssql {
                 return Ok(None);
             }
         }
-        let parts = generated::demanded(self, change, ids, functions, &demand)?
+        let parts = generated::demanded(self, change, ids, functions, &mut demand)?
             .unwrap_or_else(|| vec![change.clone()]);
         Ok(Some(pbps_dialect::creation::expose(
             parts, ids, &demand, "mssql",

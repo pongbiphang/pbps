@@ -969,3 +969,11 @@ Empty demand retains the prior expansion bytes. `schedule::diff_annotated`
 performs comparison, annotation validation and canonical scheduling atomically,
 so a computed-call class-order refusal can only yield to a completed hard order.
 Connected SQL Server calls still require catalog-collation capability checks.
+
+A demanded ordinary-column suffix is resolved by the engine creation recipe,
+using the same deferred input closure as its complete-shape and forward-read
+checks (DEC-2469.4). Portable exposure consumes that resolved selection. On
+PostgreSQL a generated expression that loses an input receives the existing
+placeholder/SET EXPRESSION recipe; an unavailable capability is a named refusal.
+Whole-row and partition shape requirements keep their indivisible group. SQL
+Server resolves ordinary and computed suffixes together in its model order.

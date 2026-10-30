@@ -301,3 +301,92 @@ async fn generated_complete_shape_is_version_gated_before_any_sql() {
     }
     db.drop().await;
 }
+
+#[path = "../../../pbps-diff/tests/fixtures/forward2469.rs"]
+mod forward_fixture;
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn demanded_forward_columns_preserve_generation_and_column_order() {
+    for pairs in [1, 2] {
+        for validators in [false, true] {
+            let mut db =
+                TestDb::create(&format!("creation2469_forward_{pairs}_{validators}")).await;
+            db.conn.execute("CREATE SCHEMA app").await.unwrap();
+            db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+            let rows = db
+                .conn
+                .query("SELECT current_setting('server_version_num')::int AS version")
+                .await
+                .unwrap();
+            let version = rows[0].try_get::<i32>("version").unwrap().unwrap() as i64;
+            let engine = Postgres::new().with_server_version(version);
+            let mut f = forward_fixture::Scene::new(pairs, "postgres", validators);
+            if pairs == 2 && validators {
+                f.deps.0[3].1 = ["generation::app.t.a".parse().unwrap()].into();
+            }
+            // Native control: these are valid forward references even on
+            // PG16 when the complete table is created at one boundary.
+            db.conn.execute(if pairs == 1 {
+                "CREATE TABLE app.original(a integer GENERATED ALWAYS AS (b + 1) STORED, b integer)"
+            } else {
+                "CREATE TABLE app.original(a integer GENERATED ALWAYS AS (b + 1) STORED, b integer, c integer GENERATED ALWAYS AS (d + 1) STORED, d integer)"
+            }).await.unwrap();
+            if version < pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN {
+                let error = f.compile(&engine).unwrap_err();
+                assert!(error.contains("SET EXPRESSION"), "{error}");
+                let rows = db
+                    .conn
+                    .query("SELECT (to_regclass('app.t') IS NULL) AS absent")
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].try_get::<bool>("absent").unwrap(), Some(true));
+            } else {
+                let plan = f.compile(&engine).unwrap();
+                execute(&mut db, plan, &engine).await;
+                if validators {
+                    db.conn
+                        .execute("INSERT INTO app.p(k) VALUES(7)")
+                        .await
+                        .unwrap();
+                }
+                db.conn
+                    .execute("INSERT INTO app.t DEFAULT VALUES")
+                    .await
+                    .unwrap();
+                let rows = db.conn.query("SELECT a, b FROM app.t").await.unwrap();
+                assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(8));
+                assert_eq!(rows[0].try_get::<i32>("b").unwrap(), Some(7));
+                if pairs == 2 {
+                    let rows = db.conn.query("SELECT c, d FROM app.t").await.unwrap();
+                    assert_eq!(rows[0].try_get::<i32>("c").unwrap(), Some(12));
+                    assert_eq!(rows[0].try_get::<i32>("d").unwrap(), Some(11));
+                }
+                let rows = db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+                let actual: Vec<_> = rows
+                    .iter()
+                    .map(|r| r.try_get::<&str>("column_name").unwrap().unwrap())
+                    .collect();
+                assert_eq!(actual, f.columns);
+                if validators {
+                    let rows = db.conn.query("SELECT count(*)::integer AS n FROM pg_catalog.pg_indexes WHERE schemaname='app' AND tablename='t' AND indexname='ix_t'").await.unwrap();
+                    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1));
+                }
+            }
+            for invalid in [
+                "CREATE TABLE app.bad_default(a integer DEFAULT (b + 1), b integer)",
+                "CREATE TABLE app.bad_generation(a integer GENERATED ALWAYS AS (b + 1) STORED, b integer GENERATED ALWAYS AS (c + 1) STORED, c integer)",
+            ] {
+                db.conn.execute("SAVEPOINT invalid_forward").await.unwrap();
+                let error = db.conn.execute(invalid).await.unwrap_err();
+                assert!(error.server_error_code().is_some(), "{error}");
+                db.conn
+                    .execute("ROLLBACK TO SAVEPOINT invalid_forward")
+                    .await
+                    .unwrap();
+            }
+            db.conn.execute("COMMIT").await.unwrap();
+            db.drop().await;
+        }
+    }
+}

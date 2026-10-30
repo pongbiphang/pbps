@@ -1427,6 +1427,7 @@
       ],
       "cases": [
         "creation2469::demanded_facets_preserve_native_values_and_declared_column_order",
+        "creation2469::demanded_forward_columns_preserve_generation_and_column_order",
         "creation2469::scratch_creation_facets_keep_auxiliary_setup_boundaries",
         "role_names_refuse_backslash_and_ffff_but_preserve_controls_unicode_and_width",
         "reconstruct2374::a_computed_column_over_a_declared_function_and_a_view_reading_it_compile",
@@ -2328,6 +2329,7 @@
         "annotations2469::partition_default_annotations_follow_the_module_across_ancestor_depths",
         "annotations2469::an_annotated_partition_column_meeting_keeps_its_edge_and_values",
         "creation2469::demanded_facets_preserve_native_values_and_declared_column_order",
+        "creation2469::demanded_forward_columns_preserve_generation_and_column_order",
         "creation2469::scratch_facets_keep_zero_sql_paths_and_require_actual_role_setup",
         "creation2469::generated_complete_shape_is_version_gated_before_any_sql"
       ]

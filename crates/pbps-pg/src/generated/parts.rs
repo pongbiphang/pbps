@@ -10,6 +10,7 @@
 
 use pbps_dialect::DialectError;
 use pbps_model::{Change, ColumnName, ColumnRef, IdsFile, ModuleId, ValueSource};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(crate) fn parts(
     change: &Change,
@@ -26,7 +27,7 @@ pub(crate) fn parts(
         needs_complete_shape,
         version,
         scratch,
-        &Default::default(),
+        &mut Default::default(),
     )
 }
 
@@ -36,7 +37,7 @@ pub(crate) fn demanded(
     functions: &[ModuleId],
     needs_complete_shape: bool,
     version: Option<i64>,
-    demand: &pbps_dialect::creation::Demand,
+    demand: &mut pbps_dialect::creation::Demand,
 ) -> Result<Option<Vec<Change>>, DialectError> {
     parts_in(
         change,
@@ -55,7 +56,7 @@ fn parts_in(
     needs_complete_shape: bool,
     version: Option<i64>,
     scratch: bool,
-    demand: &pbps_dialect::creation::Demand,
+    demand: &mut pbps_dialect::creation::Demand,
 ) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
@@ -79,28 +80,45 @@ fn parts_in(
         return Ok(None);
     };
     let suffix: Vec<_> = table.columns.keys().skip(cut).cloned().collect();
-    // Prefix generations also lose suffix inputs. A forward read within
-    // the retained prefix is safe because CREATE still supplies both columns
-    // together (DEC-1503.2).
-    let later_input = table
+    // The same input graph decides whether the suffix needs placeholders
+    // and which prefix/suffix expressions lose an input when it is extracted.
+    let positions: BTreeMap<_, _> = table
         .columns
-        .iter()
+        .keys()
         .enumerate()
-        .any(|(at, (_, c))| {
-            matches!(&c.value_source, ValueSource::Generated(g) if table.columns.keys().skip(cut.max(at + 1))
-            .any(|column| super::may_read(&g.expression, column.raw())))
-        });
+        .map(|(at, c)| (c, at))
+        .collect();
+    let mut consumers: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    let mut later_input = false;
+    for (generated, spec) in &table.columns {
+        if let ValueSource::Generated(g) = &spec.value_source {
+            for input in table
+                .columns
+                .keys()
+                .filter(|c| super::may_read(&g.expression, c.raw()))
+            {
+                later_input |= positions[input] >= cut.max(positions[generated] + 1);
+                consumers.entry(input).or_default().insert(generated);
+            }
+        }
+    }
     let partition_key = table
         .partition_by
         .as_ref()
         .is_some_and(|key| key.columns.iter().any(|c| suffix.contains(c)));
-    let placeholder = partition_key
-        || later_input
+    let full_shape = partition_key
         || needs_complete_shape
         || suffix.iter().any(|c| demand.required_columns.contains(c));
+    let placeholder = full_shape || later_input;
+    let ordinary_demand = !demand.columns.is_empty();
     let held = placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN);
     if held
-        && (!demand.generation.is_empty()
+        && ((ordinary_demand
+            && table
+                .columns
+                .values()
+                .any(|c| matches!(c.value_source, ValueSource::Generated(_))))
+            || !demand.generation.is_empty()
             || (!demand.required_columns.is_empty()
                 && table
                     .columns
@@ -119,19 +137,34 @@ fn parts_in(
     } else {
         (cut, suffix, placeholder)
     };
-    let pending = if placeholder {
-        table
-            .columns
-            .iter()
-            .filter_map(|(column, c)| {
-                matches!(&c.value_source, ValueSource::Generated(g) if calls(&g.expression) || demand.generation.contains(column))
-                    .then_some(column.clone())
-            })
-            .collect::<Vec<_>>()
+    // Only this recipe chooses the columns that portable extraction may
+    // move. Whole-row and partition requirements retain the physical group;
+    // known column prerequisites can follow their actual AddColumn boundary.
+    demand.columns = if ordinary_demand && !partition_key && !needs_complete_shape && !held {
+        suffix.iter().cloned().collect()
     } else {
-        suffix
+        BTreeSet::new()
     };
-    let late_column = |column: &ColumnName| pending.iter().any(|c| c == column);
+    let pending: BTreeSet<ColumnName> = if placeholder {
+        let mut pending = demand.columns.clone();
+        pending.extend(table.columns.iter().filter_map(|(column, spec)| {
+            matches!(&spec.value_source, ValueSource::Generated(g)
+                if calls(&g.expression) || demand.generation.contains(column))
+            .then_some(column.clone())
+        }));
+        let mut queue: VecDeque<_> = pending.iter().cloned().collect();
+        while let Some(input) = queue.pop_front() {
+            for generated in consumers.get(&input).into_iter().flatten() {
+                if pending.insert((*generated).clone()) {
+                    queue.push_back((*generated).clone());
+                }
+            }
+        }
+        pending
+    } else {
+        suffix.into_iter().collect()
+    };
+    let late_column = |column: &ColumnName| pending.contains(column);
     let late_text = |text: &str| {
         scratch
             || calls(text)
@@ -154,7 +187,7 @@ fn parts_in(
     if placeholder {
         for (column, spec) in &mut bare.columns {
             if let ValueSource::Generated(g) = &mut spec.value_source
-                && (calls(&g.expression) || demand.generation.contains(column))
+                && late_column(column)
             {
                 let from = crate::emit::generation_placeholder(&spec.ty)?;
                 tail.push(Change::AlterColumnExpression {
