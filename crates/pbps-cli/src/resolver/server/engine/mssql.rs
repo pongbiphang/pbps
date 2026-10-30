@@ -641,12 +641,9 @@ impl Scratch<'_> {
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut context = match authorization {
-            scope::Authorization::Mssql(context) => auth::read(
-                target_connection,
-                &context.schemas.keys().cloned().collect::<Vec<_>>(),
-            )
-            .await
-            .map_err(read)?,
+            scope::Authorization::Mssql(context) => auth::reread(target_connection, context)
+                .await
+                .map_err(read)?,
             _ => {
                 return Err(Error::Scope(
                     "the SQL Server authorization belongs to another engine".into(),

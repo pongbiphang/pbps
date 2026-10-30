@@ -79,7 +79,7 @@ pub(in crate::resolver) fn mssql_planned(
 #[derive(Debug, Clone)]
 pub enum Authorization {
     Postgres(pg_auth::AuthorizationContext),
-    Mssql(mssql_auth::AuthorizationContext),
+    Mssql(Box<mssql_auth::AuthorizationContext>),
 }
 
 /// The run-local principals that stand in for the target's on scratch.
@@ -100,12 +100,11 @@ fn authorization_digest(
     crate::resolver::sealing::hex(key.fingerprint(AUTHORIZATION_RULE, "authorization", canonical))
 }
 
-/// The schemas whose authorization is read and reproduced for a request:
-/// the in-scope schemas and, on PostgreSQL, the write-path extras, without
-/// the `pg_temp` alias, which names no persistent schema. SQL Server has no
-/// search path — a bare name binds in its own schema and then in `dbo` — so
-/// a request that carries extras for it describes a path that does not
-/// exist, and is refused rather than silently dropped.
+/// Static authorization seeds for a request. PostgreSQL adds write-path
+/// extras without the nonpersistent `pg_temp` alias. SQL Server's connected
+/// reader adds and qualifies dbo/default fallback questions (DEC-717.1),
+/// including known absence; its static seeds are not the frozen domain.
+/// SQL Server write-path extras still describe no supported path and refuse.
 pub(crate) fn scope_schemas(
     driver: Driver,
     schemas: &[String],
@@ -186,7 +185,7 @@ pub(crate) async fn read_target(
                 &names,
             )
             .await?;
-            Ok((catalog, Authorization::Mssql(authorization)))
+            Ok((catalog, Authorization::Mssql(Box::new(authorization))))
         }
     }
 }

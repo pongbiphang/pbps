@@ -510,6 +510,9 @@ mod editions611 {
 #[path = "resolver/auth720.rs"]
 mod auth720;
 
+#[path = "resolver/auth717.rs"]
+mod auth717;
+
 mod recon611 {
     use super::*;
     use pbps_mssql::resolver::authorization::{
