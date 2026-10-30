@@ -46,7 +46,7 @@ pub use staged::{
 
 /// The versioned name of this authorization rule, measured on SQL Server
 /// 2025 (17.0).
-pub const RULE: &str = "mssql-auth-v4";
+pub const RULE: &str = "mssql-auth-v5";
 
 /// Principals every database has, which a reproduction refers to by their
 /// own name instead of cloning.
@@ -103,7 +103,8 @@ pub struct AuthorizationContext {
     /// run as, and `superuser` whether that user is `dbo` — the database
     /// owner, which a member of `sysadmin` enters every database as.
     pub principal: DeploymentPrincipal,
-    /// Where an unqualified name in an ad hoc statement is looked up first.
+    /// The effective session default, or a catalog-confirmed absent name
+    /// retained only to reproduce that same known absence (DEC-725.1).
     pub default_schema: String,
     /// The engine's fallback answer, distinct from the configured replay name.
     binding_default_schema: Option<String>,
@@ -346,19 +347,25 @@ async fn read_context(
         superuser: effective == "dbo",
         effective: effective.into(),
     };
-    // Keep the configured replay name even when no schema exists. The
-    // independently read engine fallback must agree after reproduction; a
-    // principal-row NULL alone does not establish Windows-group behavior.
-    let default_schema = row
-        .try_get::<&str>("default_schema")?
-        .unwrap_or("dbo")
-        .to_owned();
+    // The session resolves group defaults and catalog spelling. A configured
+    // name is only a provisional replay choice when that answer is NULL:
+    // schema_domain::read must independently prove its absence (DEC-725.1).
+    let configured_default = row.try_get::<&str>("default_schema")?;
     let binding_default_schema = row.try_get::<&str>("binding_default")?.map(str::to_owned);
+    let default_schema = binding_default_schema
+        .as_deref()
+        .or(configured_default)
+        .ok_or_else(|| {
+            DbError::BadRow(
+                "the effective default and configured replay name are unreadable".into(),
+            )
+        })?
+        .to_owned();
     let language = required(row, "language", "the session language")?;
     let observed_schemas = schema_domain::read(
         conn,
         schemas,
-        &default_schema,
+        configured_default.unwrap_or(&default_schema),
         binding_default_schema.as_deref(),
         domain,
     )
@@ -1926,6 +1933,9 @@ mod tests {
         let base = context().canonical();
         let mut other = context();
         other.schemas.get_mut("app").unwrap().grants[1].state = "DENY".into();
+        assert_ne!(other.canonical(), base);
+        let mut other = context();
+        other.default_schema = "another_schema".into();
         assert_ne!(other.canonical(), base);
         let mut other = context();
         other.language = "Deutsch".into();

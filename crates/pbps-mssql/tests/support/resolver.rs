@@ -520,6 +520,228 @@ mod recon611 {
         resolve_spellings, verify,
     };
 
+    /// SQL-login controls do not qualify Windows domain-group inheritance.
+    /// Catalog-equivalent configured spellings still distinguish the old
+    /// principal-row recipe from the session's independently observed answer.
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn the_deployers_default_schema_is_the_sessions_effective_answer() {
+        fn ident(name: &str) -> String {
+            format!("[{}]", name.replace(']', "]]"))
+        }
+        fn literal(name: &str) -> String {
+            format!("N'{}'", name.replace('\'', "''"))
+        }
+        async fn admin(database: &str) -> Conn {
+            connect_live(&format!("{};Database={database}", conn_str()))
+                .await
+                .unwrap()
+        }
+        async fn observe(conn: &mut Conn, expected_user: &str) -> (Option<String>, Option<String>) {
+            let rows = conn
+                .query(
+                    "SELECT USER_NAME() AS effective, SCHEMA_NAME() AS binding_default, \
+                 CONVERT(nvarchar(8), IS_SRVROLEMEMBER(N'sysadmin')) AS elevated, \
+                 (SELECT default_schema_name FROM sys.database_principals \
+                  WHERE principal_id = DATABASE_PRINCIPAL_ID()) AS configured;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].try_get::<&str>("effective").unwrap(),
+                Some(expected_user)
+            );
+            assert_eq!(rows[0].try_get::<&str>("elevated").unwrap(), Some("0"));
+            (
+                rows[0]
+                    .try_get::<&str>("binding_default")
+                    .unwrap()
+                    .map(str::to_owned),
+                rows[0]
+                    .try_get::<&str>("configured")
+                    .unwrap()
+                    .map(str::to_owned),
+            )
+        }
+        async fn binding(conn: &mut Conn, expected: &str) {
+            let rows = conn
+                .query("SELECT CONVERT(nvarchar(8), value) AS value FROM probe;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].try_get::<&str>("value").unwrap(), Some(expected));
+        }
+
+        let token = format!(
+            "{:x}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        );
+        let databases = [
+            format!("pbps725_target_{token}"),
+            format!("pbps725_scratch_{token}"),
+        ];
+        let logins = [
+            format!("pbps725_deployer_{token}"),
+            format!("pbps725_run_{token}"),
+        ];
+        let mut root = admin("master").await;
+        for (query, names) in [
+            ("SELECT name FROM sys.databases;", databases.to_vec()),
+            ("SELECT name FROM sys.server_principals;", logins.to_vec()),
+        ] {
+            let rows = root.query(query).await.unwrap();
+            assert!(
+                !rows.iter().any(|row| names
+                    .iter()
+                    .any(|name| row.try_get::<&str>("name").unwrap() == Some(name.as_str()))),
+                "an existing fixture name is not ours to clean"
+            );
+        }
+        let child_databases = databases.clone();
+        let child_logins = logins.clone();
+        // The parent keeps cleanup ownership if any behavioral assertion panics.
+        let result = tokio::spawn(async move {
+            const PASSWORD: &str = "Pbps!Default725";
+            const PRESENT: &str = "Case725Space";
+            const CONFIGURED: &str = "case725space";
+            const ABSENT: &str = "missing725'[]";
+            let mut setup = admin("master").await;
+            for database in &child_databases {
+                create_database(&mut setup, &format!(
+                    "CREATE DATABASE {} COLLATE Latin1_General_100_CI_AS;", ident(database)
+                )).await.unwrap();
+            }
+            for login in &child_logins {
+                setup.execute(&format!(
+                    "CREATE LOGIN {} WITH PASSWORD = '{PASSWORD}', CHECK_POLICY = OFF;", ident(login)
+                )).await.unwrap();
+            }
+            let mut target_admin = admin(&child_databases[0]).await;
+            target_admin.execute(&format!("CREATE USER {} FOR LOGIN {};",
+                ident(&child_logins[0]), ident(&child_logins[0]))).await.unwrap();
+            target_admin.execute("CREATE SCHEMA Case725Space AUTHORIZATION dbo;").await.unwrap();
+            target_admin.execute("CREATE SCHEMA Alternate725 AUTHORIZATION dbo;").await.unwrap();
+            target_admin.execute(
+                "CREATE TABLE dbo.probe(value int NOT NULL); INSERT dbo.probe VALUES(11); \
+                 CREATE TABLE Case725Space.probe(value int NOT NULL); INSERT Case725Space.probe VALUES(42); \
+                 GRANT SELECT TO public;",
+            ).await.unwrap();
+            let schemas = [PRESENT.to_owned(), "Alternate725".to_owned()];
+            let mut explicit = None;
+            // End on the explicit default so the captured target remains unchanged
+            // throughout replay and its wrong-default/restoration controls.
+            for (configured, expected, value) in [
+                (None, Some("dbo"), "11"),
+                (Some(ABSENT), None, "11"),
+                (Some(CONFIGURED), Some(PRESENT), "42"),
+            ] {
+                if let Some(name) = configured {
+                    target_admin.execute(&format!("ALTER USER {} WITH DEFAULT_SCHEMA = {};",
+                        ident(&child_logins[0]), ident(name))).await.unwrap();
+                }
+                let mut target = connect_live(&login_url(&child_logins[0], PASSWORD, &child_databases[0]))
+                    .await.unwrap();
+                let (oracle, raw) = observe(&mut target, &child_logins[0]).await;
+                assert_eq!(oracle.as_deref(), expected);
+                binding(&mut target, value).await;
+                if configured == Some(CONFIGURED) {
+                    assert_eq!(raw.as_deref(), Some(CONFIGURED), "the historical projection differs");
+                    assert_ne!(raw, oracle, "the engine supplies the catalog spelling");
+                }
+                let context = read(&mut target, &schemas).await.unwrap();
+                if let Some(effective) = oracle.as_deref() {
+                    assert_eq!(context.default_schema, effective,
+                        "the authorization default is the session's effective answer");
+                } else {
+                    assert_eq!(raw.as_deref(), Some(ABSENT));
+                    assert_eq!(context.default_schema, ABSENT,
+                        "known absence retains its configured replay name");
+                    assert!(!context.schemas.contains_key(ABSENT));
+                    let canonical: serde_json::Value = serde_json::from_slice(&context.canonical()).unwrap();
+                    assert_eq!(canonical["schema_domain"][ABSENT], "absent");
+                }
+                if configured == Some(CONFIGURED) {
+                    explicit = Some(context);
+                }
+            }
+            let context = explicit.unwrap();
+            let mut scratch_admin = admin(&child_databases[1]).await;
+            scratch_admin.execute(&format!("ALTER AUTHORIZATION ON DATABASE::{} TO {};",
+                ident(&child_databases[1]), ident(&child_logins[1]))).await.unwrap();
+            let map = PrincipalMap::generate(&context, &[], &token);
+            reconstruct(&mut scratch_admin, &map, &context, &child_logins[1]).await.unwrap();
+            scratch_admin.execute(
+                "CREATE TABLE dbo.probe(value int NOT NULL); INSERT dbo.probe VALUES(11); \
+                 CREATE TABLE Case725Space.probe(value int NOT NULL); INSERT Case725Space.probe VALUES(42); \
+                 CREATE TABLE Alternate725.probe(value int NOT NULL); INSERT Alternate725.probe VALUES(84);",
+            ).await.unwrap();
+            let user = map.deployer(&context).unwrap();
+            let quoted_user = ident(user.raw());
+            let mut scratch = connect_live(&login_url(&child_logins[1], PASSWORD, &child_databases[1]))
+                .await.unwrap();
+            let owner = verify(&mut scratch, &map, &context, &schemas).await.unwrap();
+            assert!(!owner.is_empty(), "the setup owner is not the captured deployer");
+            enter(&mut scratch, Some(&user)).await.unwrap();
+            assert_eq!(observe(&mut scratch, user.raw()).await.0.as_deref(), Some(PRESENT));
+            binding(&mut scratch, "42").await;
+            let differences = verify(&mut scratch, &map, &context, &schemas).await.unwrap();
+            assert!(differences.is_empty(), "{differences:?}");
+            drop(scratch);
+
+            for (default, expected, value, healthy) in [
+                ("Alternate725", "Alternate725", "84", false),
+                (PRESENT, PRESENT, "42", true),
+                // Equivalent catalog spellings preserve the effective context.
+                (CONFIGURED, PRESENT, "42", true),
+            ] {
+                scratch_admin.execute(&format!("ALTER USER {quoted_user} WITH DEFAULT_SCHEMA = {};",
+                    ident(default))).await.unwrap();
+                let mut scratch = connect_live(&login_url(&child_logins[1], PASSWORD, &child_databases[1]))
+                    .await.unwrap();
+                enter(&mut scratch, Some(&user)).await.unwrap();
+                assert_eq!(observe(&mut scratch, user.raw()).await.0.as_deref(), Some(expected));
+                binding(&mut scratch, value).await;
+                let differences = verify(&mut scratch, &map, &context, &schemas).await.unwrap();
+                if healthy {
+                    assert!(differences.is_empty(), "{differences:?}");
+                } else {
+                    assert!(differences.contains(&"default-schema".to_owned()), "{differences:?}");
+                }
+            }
+            let mut target = connect_live(&login_url(&child_logins[0], PASSWORD, &child_databases[0]))
+                .await.unwrap();
+            target.execute("SET NOEXEC ON;").await.unwrap();
+            let error = read(&mut target, &schemas).await.expect_err("an unreadable observer must refuse");
+            target.execute("SET NOEXEC OFF;").await.unwrap();
+            assert!(error.to_string().contains("expected one row"), "{error}");
+        }).await;
+        let _gate = SINGLE_USER_GATE.read().await;
+        for database in &databases {
+            root.execute(&format!(
+                "IF DB_ID({}) IS NOT NULL BEGIN ALTER DATABASE {} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {}; END;",
+                literal(database), ident(database), ident(database)
+            )).await.unwrap();
+        }
+        for login in &logins {
+            let exists = root
+                .query(&format!(
+                    "SELECT name FROM sys.server_principals WHERE name = {};",
+                    literal(login)
+                ))
+                .await
+                .unwrap();
+            if !exists.is_empty() {
+                drop_login_when_idle(&mut root, login).await.unwrap();
+            }
+        }
+        result.unwrap();
+    }
+
     /// On a case-insensitive database `DBO` and `App` are valid spellings of
     /// `dbo` and `app`, and a request may use them. The context is keyed by
     /// the catalog's own names, so the schema every database already has is

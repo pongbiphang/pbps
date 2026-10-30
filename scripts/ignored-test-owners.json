@@ -1626,6 +1626,7 @@
         "resolver_tests::recon611::a_planned_principal_in_another_casing_is_granted_to_the_catalogs_principal",
         "resolver_tests::recon611::a_schema_requested_in_another_casing_is_the_catalogs_schema",
         "resolver_tests::recon611::scratch_reproduces_the_deployers_authorization_not_the_scratch_owners",
+        "resolver_tests::recon611::the_deployers_default_schema_is_the_sessions_effective_answer",
         "resolver_tests::recon611::what_the_deployer_holds_through_public_is_reproduced",
         "resolver_tests::resolver_discovery_reads_product_database_and_restricted_session_without_writes",
         "resolver_tests::scope611::scope_facts_are_the_deployment_sessions_own_and_the_rule_names_each_difference",
