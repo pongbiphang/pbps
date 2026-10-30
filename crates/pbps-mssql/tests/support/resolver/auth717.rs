@@ -178,6 +178,7 @@ async fn exercise(names: Names, absent: bool) {
         scratch_admin.execute("CREATE TABLE outside.probe (value int NOT NULL); INSERT outside.probe VALUES (22);").await.unwrap();
     }
     let user = map.deployer(&context).unwrap();
+    let quoted_user = ident(user.raw());
     let mut scratch = connect_live(&login_url(&names.run_login, PASSWORD, &names.databases[1]))
         .await
         .unwrap();
@@ -193,10 +194,7 @@ async fn exercise(names: Names, absent: bool) {
 
     // Removing the replayed DENY exposes an executable extra permission.
     scratch_admin
-        .execute(&format!(
-            "REVOKE UPDATE ON SCHEMA::dbo FROM {};",
-            ident(user.raw())
-        ))
+        .execute(&format!("REVOKE UPDATE ON SCHEMA::dbo FROM {quoted_user};"))
         .await
         .unwrap();
     binding(&mut scratch, if absent { "11" } else { "22" }, true).await;
@@ -212,10 +210,7 @@ async fn exercise(names: Names, absent: bool) {
         "{differences:?}"
     );
     scratch_admin
-        .execute(&format!(
-            "DENY UPDATE ON SCHEMA::dbo TO {};",
-            ident(user.raw())
-        ))
+        .execute(&format!("DENY UPDATE ON SCHEMA::dbo TO {quoted_user};"))
         .await
         .unwrap();
     assert!(
@@ -232,8 +227,7 @@ async fn exercise(names: Names, absent: bool) {
             .unwrap();
         scratch_admin
             .execute(&format!(
-                "ALTER USER {} WITH DEFAULT_SCHEMA = dbo;",
-                ident(user.raw())
+                "ALTER USER {quoted_user} WITH DEFAULT_SCHEMA = dbo;"
             ))
             .await
             .unwrap();
