@@ -231,7 +231,11 @@
         "deploy::test_run::tests::d2a1165_pg16_fixture_defaults_execute_managed_routines_as_an_ordinary_writer",
         "deploy::test_run::tests::d2a1165_pg18_fixture_defaults_execute_managed_routines_as_an_ordinary_writer",
         "deploy::test_run::tests::d2a1165_pg16_declared_role_prerequisites_preserve_grants_and_existing_roles",
-        "deploy::test_run::tests::d2a1165_pg18_declared_role_prerequisites_preserve_grants_and_existing_roles"
+        "deploy::test_run::tests::d2a1165_pg18_declared_role_prerequisites_preserve_grants_and_existing_roles",
+        "deploy::test_run::tests::d2a1165_pg16_later_revisions_prepare_only_their_role_and_namespace_prerequisites",
+        "deploy::test_run::tests::d2a1165_pg16_policy_recipient_prerequisites_use_the_schema_named_role_inventory",
+        "deploy::test_run::tests::d2a1165_pg18_later_revisions_prepare_only_their_role_and_namespace_prerequisites",
+        "deploy::test_run::tests::d2a1165_pg18_policy_recipient_prerequisites_use_the_schema_named_role_inventory"
       ]
     },
     {

@@ -867,8 +867,12 @@ whose dependencies PostgreSQL does not record; declared executable code is trust
 under ADR-0019 §3/§6. PUBLIC and assertion EXECUTE stay unchanged; fixtures
 retain NOCREATEROLE and cannot assume the apply identity.
 
-The owned administrator supplies missing declared cluster-role prerequisites as
-NOLOGIN, non-privileged roles through the existing presence check; present roles
-keep their attributes. These are managed identities, never infrastructure
-exclusions. Ordinary PostgreSQL role creation/refusal rules remain unchanged
-outside the owned cluster (ADR-0010 §3; ADR-0019 §6).
+Before each bootstrap or plan, the owned administrator supplies that revision's
+namespace prerequisites and missing `Schema::named_roles` (including policy
+recipients) through the existing inventories and presence check. New roles are
+NOLOGIN without elevated privileges; present roles keep their attributes and
+ordinary managed/unmanaged scope. Preparing future revisions together would
+falsely make future roles unmanaged under `unmanaged: error`. Ordinary PostgreSQL
+role rules outside the owned cluster stay unchanged (ADR-0010 §3; ADR-0019 §6).
+Lock cleanup is a separate finding and cannot replace the primary deployment
+cause or erase a committed entry from phase evidence (ADR-0019 §9).

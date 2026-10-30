@@ -21,7 +21,7 @@ fn table(name: &TableName) -> anyhow::Result<String> {
     Ok(format!("{}.{}", quoted(&name.schema)?, quoted(&name.name)?))
 }
 impl<'a> Session<'a> {
-    pub async fn new(scratch: &'a TestScratch<'a>, schema: &Schema) -> anyhow::Result<Self> {
+    pub async fn new(scratch: &'a TestScratch<'a>) -> anyhow::Result<Self> {
         let admin = scratch.connection();
         ensure!(
             !admin.contains("://"),
@@ -35,17 +35,6 @@ impl<'a> Session<'a> {
             .try_get::<&str>("role")?
             .context("NULL owned provision role")?
             .into();
-        // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
-        // Only this owned cluster's administrator supplies those prerequisites;
-        // declared roles remain managed and existing image roles stay untouched.
-        for name in pbps_pg::roles::missing_roles(&mut conn, &schema.roles.keys().collect()).await?
-        {
-            let role = quoted(name.raw())?;
-            conn.execute(&format!(
-                "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-            ))
-            .await?;
-        }
         // The frozen declarations must never capture an infrastructure identity.
         let roles = ["apply", "fixture", "assertion"]
             .map(|kind| format!("pbps_test_{kind}_{}", scratch.run_id()));
@@ -80,15 +69,6 @@ impl<'a> Session<'a> {
         drop(conn);
         let db = format!("{admin} dbname=pbps_test");
         let mut conn = Conn::connect(Driver::Postgres, &db).await?;
-        // Namespaces are provisioning prerequisites of ordinary bootstrap,
-        // not managed changes. Reuse its inventory in this fresh owned database.
-        for namespace in crate::deploy::schemas_declared(schema).into_keys() {
-            conn.execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS {} AUTHORIZATION {apply}",
-                quoted(&namespace)?
-            ))
-            .await?;
-        }
         conn.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
             .await?;
         drop(conn);
@@ -110,6 +90,34 @@ impl<'a> Session<'a> {
             roles,
             key,
         })
+    }
+    // Prepare only the current revision, before its capture/plan. Preparing a
+    // future union would make those future roles unmanaged in an earlier hop.
+    pub async fn prepare(&self, schema: &Schema) -> anyhow::Result<()> {
+        let db = format!("{} dbname=pbps_test", self.scratch.connection());
+        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
+        let apply = &self.roles[0];
+        // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
+        // Only this owned cluster's administrator supplies those prerequisites;
+        // roles keep their ordinary scope and existing image roles stay untouched.
+        let roles = schema.named_roles();
+        for name in pbps_pg::roles::missing_roles(&mut conn, &roles.iter().collect()).await? {
+            let role = quoted(name.raw())?;
+            conn.execute(&format!(
+                "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+            ))
+            .await?;
+        }
+        // Namespaces are provisioning prerequisites of ordinary bootstrap,
+        // not managed changes. Reuse its inventory in this fresh owned database.
+        for namespace in crate::deploy::schemas_declared(schema).into_keys() {
+            conn.execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {} AUTHORIZATION {apply}",
+                quoted(&namespace)?
+            ))
+            .await?;
+        }
+        Ok(())
     }
     pub fn target(&self) -> &Target {
         &self.target

@@ -1,7 +1,7 @@
 //! The owned-only adapter to ordinary deployment services (DEC-1165.9).
 pub(crate) use super::services::Progress;
 use super::services::{Attempt, Declarations, PlanResult, Planned};
-use crate::plan_test::report::Phase;
+use crate::plan_test::report::{Phase, Status};
 use crate::plan_test::revision::Assembled;
 use crate::plan_test::session::Session;
 
@@ -11,7 +11,12 @@ fn declarations(input: &Assembled) -> Declarations {
         ids: input.ids.clone(),
     }
 }
-pub(crate) async fn bootstrap(session: &Session<'_>, input: &Assembled) -> anyhow::Result<i64> {
+pub(crate) async fn bootstrap(
+    session: &Session<'_>,
+    input: &Assembled,
+    phase: &mut Phase,
+) -> anyhow::Result<i64> {
+    session.prepare(&input.loaded.schema).await?;
     let project = session.project(input);
     let built = super::bootstrap_async(
         &project,
@@ -23,7 +28,13 @@ pub(crate) async fn bootstrap(session: &Session<'_>, input: &Assembled) -> anyho
     )
     .await?
     .ok_or_else(|| anyhow::anyhow!("connected bootstrap produced no result"))?;
-    built.released?;
+    finish_attempt(
+        phase,
+        Attempt::Applied {
+            entry: built.entry,
+            released: built.released,
+        },
+    )?;
     Ok(built.entry)
 }
 pub(crate) async fn plan(
@@ -31,6 +42,7 @@ pub(crate) async fn plan(
     input: &Assembled,
     phase: &mut Phase,
 ) -> anyhow::Result<Box<Planned>> {
+    session.prepare(&input.loaded.schema).await?;
     let project = session.project(input);
     let selected = project.config.select_resolver(None, Some("test"))?;
     let mut carried = Vec::new();
@@ -98,18 +110,29 @@ pub(crate) async fn apply(
     phase
         .findings
         .extend(progress.findings.borrow().iter().cloned());
-    match result? {
-        Attempt::Empty => Ok(()),
+    finish_attempt(phase, result?)
+}
+
+fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {
+    let (result, released) = match attempt {
+        Attempt::Empty => return Ok(()),
         Attempt::Applied { entry, released } => {
+            // A committed entry remains evidence even when cleanup fails.
             phase.entry = Some(entry);
-            released?;
-            Ok(())
+            (Ok(()), released)
         }
-        Attempt::Failed { error, released } => {
-            released?;
-            Err(error)
-        }
+        Attempt::Failed { error, released } => (Err(error), released),
+    };
+    if let Err(error) = released {
+        phase.outcome = Status::Unanswerable;
+        phase.findings.push(crate::output::Finding::error(
+            "test.cleanup",
+            format!("deployment lock release failed: {error}"),
+        ));
+        // The ordinary deployment error is primary; cleanup has its own finding.
+        return result.and(Err(error.into()));
     }
+    result
 }
 
 #[cfg(all(test, target_os = "linux"))]
