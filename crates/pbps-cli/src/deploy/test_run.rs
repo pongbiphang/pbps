@@ -43,6 +43,7 @@ pub(crate) async fn plan(
     phase: &mut Phase,
 ) -> anyhow::Result<Box<Planned>> {
     session.prepare(&input.loaded.schema).await?;
+    session.revoke_fixture_routines().await?;
     let project = session.project(input);
     let selected = project.config.select_resolver(None, Some("test"))?;
     let mut carried = Vec::new();
@@ -84,6 +85,7 @@ pub(crate) async fn apply(
     approved: &str,
     progress: &Progress,
 ) -> anyhow::Result<()> {
+    session.revoke_fixture_routines().await?;
     let project = session.project(input);
     let plan = planned.artifact.wire();
     let allow = plan.changes.gated_risks();

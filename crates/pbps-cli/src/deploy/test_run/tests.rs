@@ -96,6 +96,12 @@ async fn admin(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result
     )
     .await?)
 }
+// Reserve a large future's construction space only until it is boxed, before
+// polling it. A call-site Box::pin keeps that space in the caller's poll frame.
+#[inline(never)]
+fn boxed_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
 async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<()> {
     use pbps_pg::assertions::{self, AssertionResult};
     ensure!(scratch.acquired_image().await?.starts_with("sha256:"));
@@ -326,18 +332,23 @@ async fn lifecycle(variable: &str) -> anyhow::Result<()> {
     let dir = crate::adopt::Stage::new("d2a1165-registry")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let image = std::env::var(variable).context(variable.to_owned())?;
-    let scratch = crate::test_scratch::TestScratch::start(
-        &registry,
-        Driver::Postgres,
-        &image,
-        pbps_config::resolver::PullPolicy::Never,
-    )
+    let scratch = boxed_future(|| {
+        crate::test_scratch::TestScratch::start(
+            &registry,
+            Driver::Postgres,
+            &image,
+            pbps_config::resolver::PullPolicy::Never,
+        )
+    })
     .await?;
     let run = scratch.run_id().to_owned();
 
     // Keep the full lifecycle's phases off the small native test-thread stack.
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(120), Box::pin(exercise(&scratch))).await;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(120),
+        boxed_future(|| exercise(&scratch)),
+    )
+    .await;
     let cleanup = scratch.finish().await;
     cleanup.context("owned cleanup must succeed even after a test failure")?;
     ensure!(!registry.path().join(format!("{run}.key")).exists());
@@ -345,14 +356,16 @@ async fn lifecycle(variable: &str) -> anyhow::Result<()> {
     outcome.context("lifecycle deadline")??;
     // A deadline before discovery creates neither a record nor a resource.
     let end = tokio::time::Instant::now() - Duration::from_millis(1);
-    let refused = crate::test_scratch::TestScratch::start_bounded(
-        &registry,
-        Driver::Postgres,
-        &image,
-        pbps_config::resolver::PullPolicy::Never,
-        Some(end),
-        Duration::from_secs(30),
-    )
+    let refused = boxed_future(|| {
+        crate::test_scratch::TestScratch::start_bounded(
+            &registry,
+            Driver::Postgres,
+            &image,
+            pbps_config::resolver::PullPolicy::Never,
+            Some(end),
+            Duration::from_secs(30),
+        )
+    })
     .await;
     match refused {
         Ok(s) => {
@@ -385,6 +398,8 @@ enum Admission {
     DeclaredRoles,
     LaterRoles,
     PolicyRoles,
+    RoutineRebuild,
+    ColumnGrants,
 }
 fn write_default_routines(fixture: &Fixture) -> anyhow::Result<()> {
     for (name, dependencies, language, body) in [
@@ -872,33 +887,187 @@ async fn prerequisite_steps(
     ensure!(plan(&session, &candidate, &mut phase).await?.data.changes == 0);
     Ok(())
 }
+async fn routine_rebuild_steps(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+) -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let module = fixture.0.path().join("schema/rebuild.yml");
+    std::fs::write(
+        &module,
+        "function: app.rebuild_me()\ndefinition: () RETURNS integer LANGUAGE sql IMMUTABLE RETURN 41\n",
+    )?;
+    let base = fixture.input(&IdsFile::default(), false, false)?;
+    let session = Session::new(scratch).await?;
+    bootstrap(&session, &base, &mut Phase::new("bootstrap", "base")).await?;
+    std::fs::write(
+        &module,
+        "function: app.rebuild_me()\ndefinition: () RETURNS bigint LANGUAGE sql IMMUTABLE RETURN 42::bigint\n",
+    )?;
+    let candidate = fixture.input(&base.ids, false, false)?;
+    // A replacement without runner grants is an ordinary admitted plan.
+    plan(
+        &session,
+        &candidate,
+        &mut Phase::new("candidate_plan", "control"),
+    )
+    .await?;
+    session.grants(&base.loaded.schema).await?;
+    let outsider = format!("pbps_test_fixture_{}_other", scratch.run_id());
+    let quoted = pbps_pg::Postgres::new().quote_ident(&outsider)?;
+    let mut c = admin(scratch).await?;
+    c.execute(&format!(
+        "CREATE ROLE {quoted}; GRANT EXECUTE ON ROUTINE app.rebuild_me() TO {quoted}"
+    ))
+    .await?;
+    let mut phase = Phase::new("candidate_plan", "unowned grant");
+    ensure!(
+        plan(&session, &candidate, &mut phase).await.is_err(),
+        "an unrecorded external grant was discarded"
+    );
+    let rows = c.query(&format!("SELECT pg_catalog.has_function_privilege('{outsider}','app.rebuild_me()','EXECUTE') AS allowed")).await?;
+    ensure!(rows[0].try_get::<bool>("allowed")? == Some(true));
+    c.execute(&format!(
+        "REVOKE EXECUTE ON ROUTINE app.rebuild_me() FROM {quoted}; DROP ROLE {quoted}"
+    ))
+    .await?;
+    session.grants(&base.loaded.schema).await?;
+    let mut phase = Phase::new("candidate_plan", "routine replacement");
+    let planned = plan(&session, &candidate, &mut phase)
+        .await
+        .with_context(|| format!("routine replacement findings: {:?}", phase.findings))?;
+    // Apply also sees run-owned grants introduced since capture.
+    session.grants(&base.loaded.schema).await?;
+    apply(
+        &session,
+        &candidate,
+        &planned,
+        &mut phase,
+        &planned.artifact.checksum(),
+        &Progress::default(),
+    )
+    .await?;
+    session.grants(&candidate.loaded.schema).await?;
+    let mut writer = session.fixtures().await?;
+    ensure!(
+        writer.query("SELECT app.rebuild_me() AS value").await?[0].try_get::<i64>("value")?
+            == Some(42)
+    );
+    ensure!(
+        plan(
+            &session,
+            &candidate,
+            &mut Phase::new("candidate_plan", "clean")
+        )
+        .await?
+        .data
+        .changes
+            == 0
+    );
+    Ok(())
+}
+async fn column_grant_steps(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let base = fixture.input(&IdsFile::default(), false, false)?;
+    let session = Session::new(scratch).await?;
+    bootstrap(&session, &base, &mut Phase::new("bootstrap", "base")).await?;
+    session.grants(&base.loaded.schema).await?;
+    let mut writer = session.fixtures().await?;
+    let mut assertion = Conn::connect(Driver::Postgres, session.assertion()).await?;
+    let fixture_role = writer.query("SELECT current_user::text AS role").await?[0]
+        .try_get::<&str>("role")?
+        .context("missing fixture identity")?
+        .to_owned();
+    let assertion_role = assertion.query("SELECT current_user::text AS role").await?[0]
+        .try_get::<&str>("role")?
+        .context("missing assertion identity")?
+        .to_owned();
+    let mut c = admin(scratch).await?;
+    for (relation, permission, role) in [
+        ("app.codes", "INSERT", fixture_role.as_str()),
+        ("app.codes", "UPDATE", fixture_role.as_str()),
+        ("app.orders", "INSERT", assertion_role.as_str()),
+        ("app.orders", "UPDATE", assertion_role.as_str()),
+        ("app.orders", "REFERENCES", assertion_role.as_str()),
+    ] {
+        c.execute(&format!("GRANT {permission}(code) ON {relation} TO PUBLIC"))
+            .await?;
+        let rows = c.query(&format!(concat!(
+            "SELECT pg_catalog.has_table_privilege('{role}','{relation}','{permission}') AS table_allowed, ",
+            "pg_catalog.has_any_column_privilege('{role}','{relation}','{permission}') AS column_allowed"
+        ), role=role, relation=relation, permission=permission)).await?;
+        ensure!(rows[0].try_get::<bool>("table_allowed")? == Some(false));
+        ensure!(rows[0].try_get::<bool>("column_allowed")? == Some(true));
+        let refused = session.grants(&base.loaded.schema).await;
+        if refused.is_ok() && relation == "app.codes" && permission == "INSERT" {
+            writer
+                .execute("INSERT INTO app.codes(code) VALUES ('escaped')")
+                .await?;
+            ensure!(
+                writer
+                    .query("SELECT code FROM app.codes WHERE code='escaped'")
+                    .await?
+                    .len()
+                    == 1
+            );
+            anyhow::bail!(
+                "PUBLIC column INSERT bypassed admission and changed recorded exact reference rows"
+            );
+        }
+        let message = refused
+            .err()
+            .context("effective column writes were admitted")?
+            .to_string();
+        ensure!(
+            message.contains("privileges") && message.contains("PUBLIC"),
+            "{message}"
+        );
+        c.execute(&format!(
+            "REVOKE {permission}(code) ON {relation} FROM PUBLIC"
+        ))
+        .await?;
+        session.grants(&base.loaded.schema).await?;
+    }
+    ensure!(
+        writer
+            .query("SELECT code FROM app.codes WHERE code <> 'kept'")
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+fn admission_scenario<'a>(
+    scratch: &'a crate::test_scratch::TestScratch<'a>,
+    case: Admission,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+    // Construct in this ordinary function; future additions cannot enlarge the
+    // lifecycle's poll frame while it is executing the SQL comparison oracle.
+    match case {
+        Admission::LaterRoles | Admission::PolicyRoles => Box::pin(prerequisite_steps(
+            scratch,
+            matches!(case, Admission::PolicyRoles),
+        )),
+        Admission::RoutineRebuild => Box::pin(routine_rebuild_steps(scratch)),
+        Admission::ColumnGrants => Box::pin(column_grant_steps(scratch)),
+        Admission::Unmanaged | Admission::Defaults | Admission::DeclaredRoles => {
+            Box::pin(admission_work(scratch, case))
+        }
+    }
+}
 async fn admission_case(variable: &str, case: Admission) -> anyhow::Result<()> {
     let dir = crate::adopt::Stage::new("d2a1165-admission")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let image = std::env::var(variable).context(variable.to_owned())?;
-    let scratch = crate::test_scratch::TestScratch::start(
-        &registry,
-        Driver::Postgres,
-        &image,
-        pbps_config::resolver::PullPolicy::Never,
-    )
+    let scratch = boxed_future(|| {
+        crate::test_scratch::TestScratch::start(
+            &registry,
+            Driver::Postgres,
+            &image,
+            pbps_config::resolver::PullPolicy::Never,
+        )
+    })
     .await?;
-    let result = if matches!(case, Admission::LaterRoles | Admission::PolicyRoles) {
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            Box::pin(prerequisite_steps(
-                &scratch,
-                matches!(case, Admission::PolicyRoles),
-            )),
-        )
-        .await
-    } else {
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            Box::pin(admission_work(&scratch, case)),
-        )
-        .await
-    };
+    let result =
+        tokio::time::timeout(Duration::from_secs(120), admission_scenario(&scratch, case)).await;
     scratch
         .finish()
         .await
@@ -1253,4 +1422,48 @@ fn d2a1165_committed_entries_survive_lock_cleanup_failure() {
         .to_string()
         .contains("primary alone")
     );
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg16_fixture_execute_grants_do_not_block_declared_routine_rebuilds() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+        Admission::RoutineRebuild,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg16_column_grants_are_effective_even_without_table_write_privileges() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+        Admission::ColumnGrants,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg18_fixture_execute_grants_do_not_block_declared_routine_rebuilds() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Admission::RoutineRebuild,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and both pinned PostgreSQL scratch images"]
+async fn d2a1165_pg18_column_grants_are_effective_even_without_table_write_privileges() {
+    Box::pin(admission_case(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Admission::ColumnGrants,
+    ))
+    .await
+    .unwrap();
 }

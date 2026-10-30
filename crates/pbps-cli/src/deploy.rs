@@ -10917,7 +10917,7 @@ async fn run_probes(
     sources: Option<pbps_model::operation::Snapshot<'_>>,
     approved: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
-    run_probes_observed(conn, dialect, names, partitions, approved, None).await
+    run_probes_observed(conn, dialect, names, partitions, sources, approved, None).await
 }
 
 async fn run_probes_observed(
@@ -10925,6 +10925,7 @@ async fn run_probes_observed(
     dialect: &dyn pbps_dialect::Dialect,
     names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
+    sources: Option<pbps_model::operation::Snapshot<'_>>,
     approved: Option<&crate::pins::Approved<'_>>,
     progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {

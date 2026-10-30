@@ -91,11 +91,41 @@ impl<'a> Session<'a> {
             key,
         })
     }
+    async fn admin(&self) -> anyhow::Result<Conn> {
+        let db = format!("{} dbname=pbps_test", self.scratch.connection());
+        Ok(Conn::connect(Driver::Postgres, &db).await?)
+    }
+    pub async fn revoke_fixture_routines(&self) -> anyhow::Result<()> {
+        let mut conn = self.admin().await?;
+        let fixture = &self.roles[1];
+        // Temporary runner grants are not declaration grants; leave the ordinary
+        // rebuild ACL guard intact and refresh these only before fixture SQL.
+        let sql = format!(
+            concat!(
+                "SELECT DISTINCT n.nspname AS schema FROM pg_catalog.pg_proc p ",
+                "JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace ",
+                "CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) a ",
+                "WHERE a.grantee='{fixture}'::pg_catalog.regrole ",
+                "AND a.privilege_type='EXECUTE'"
+            ),
+            fixture = fixture
+        );
+        for row in conn.query(&sql).await? {
+            let namespace = quoted(
+                row.try_get::<&str>("schema")?
+                    .context("missing routine namespace")?,
+            )?;
+            conn.execute(&format!(
+                "REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA {namespace} FROM {fixture}"
+            ))
+            .await?;
+        }
+        Ok(())
+    }
     // Prepare only the current revision, before its capture/plan. Preparing a
     // future union would make those future roles unmanaged in an earlier hop.
     pub async fn prepare(&self, schema: &Schema) -> anyhow::Result<()> {
-        let db = format!("{} dbname=pbps_test", self.scratch.connection());
-        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
+        let mut conn = self.admin().await?;
         let apply = &self.roles[0];
         // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
         // Only this owned cluster's administrator supplies those prerequisites;
@@ -166,8 +196,7 @@ impl<'a> Session<'a> {
         }
     }
     pub async fn grants(&self, schema: &Schema) -> anyhow::Result<()> {
-        let db = format!("{} dbname=pbps_test", self.scratch.connection());
-        let mut conn = Conn::connect(Driver::Postgres, &db).await?;
+        let mut conn = self.admin().await?;
         let [_, fixture, assertion] = &self.roles;
         // Check every permanent namespace, including those with no managed table.
         // Engine identity, not a pg_temp name-prefix guess, excludes temp helpers.
@@ -274,12 +303,17 @@ impl<'a> Session<'a> {
                 }
             }
             let literal = t.replace('\'', "''");
+            // Both identities use one effective test; data: controls fixture DML.
             let sql = format!(
                 concat!(
-                    "SELECT pg_catalog.has_table_privilege('{assertion}', '{relation}', ",
-                    "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR ({reference} AND ",
-                    "pg_catalog.has_table_privilege('{fixture}','{relation}', ",
-                    "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS unsafe"
+                    "SELECT EXISTS (SELECT 1 FROM (VALUES ('{assertion}',true), ",
+                    "('{fixture}',{reference})) actor(principal,deny_write) ",
+                    "WHERE actor.deny_write AND (pg_catalog.has_table_privilege(",
+                    "actor.principal::pg_catalog.name,'{relation}', ",
+                    "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR ",
+                    "pg_catalog.has_any_column_privilege(",
+                    "actor.principal::pg_catalog.name,'{relation}', ",
+                    "'INSERT,UPDATE,REFERENCES'))) AS unsafe"
                 ),
                 relation = literal,
                 reference = declared.data.is_some(),

@@ -109,6 +109,21 @@ pub(crate) async fn recover(
     reconcile::reconcile(dir, &Docker, &daemon, deadline).await
 }
 
+async fn bounded_start(
+    start: impl std::future::Future<Output = Result<Held, ProduceError>>,
+    deadline: tokio::time::Instant,
+    cancelled: impl std::future::Future<Output = std::io::Result<()>>,
+    name: &str,
+) -> Result<Held, ProduceError> {
+    let interrupted = |cause: &str| {
+        ProduceError::Cleanup(vec![format!("{cause}; unresolved creation of {name}")])
+    };
+    tokio::select! {
+        result = tokio::time::timeout_at(deadline, start) => result.unwrap_or_else(|_| Err(interrupted("test startup deadline exceeded"))),
+        _ = cancelled => Err(interrupted("test startup cancelled")),
+    }
+}
+
 /// The runtime's identity, bounded by the same deadline as the cleanup it serves.
 async fn discovered(
     deadline: std::time::Instant,
@@ -134,6 +149,23 @@ async fn settle_failed_start(
     if let ProduceError::Cleanup(names) = error
         && record.container.id.is_none()
     {
+        // The before-create record proves a request may have reached the daemon.
+        // Without it, creation was never issued and ordinary cleanup suffices.
+        if dir
+            .read(&record.run_id)
+            .map_err(|e| {
+                failure(
+                    dir,
+                    &record.run_id,
+                    FailureKind::Unprovable,
+                    Vec::new(),
+                    e.to_string(),
+                )
+            })?
+            .is_none()
+        {
+            return remove_run(dir, record, rt).await;
+        }
         let mut kept = record.clone();
         kept.leftovers.clone_from(names);
         let note = "the start's own removal was not confirmed";
@@ -301,15 +333,13 @@ impl<'d> TestScratch<'d> {
             record,
             _lock: lock,
         };
+        let resource = journal.record.container.name.clone();
         let mut owner = RunOwner {
             journal: &mut journal,
         };
         let start = Held::start_owned(driver, image, pull, &mut owner);
         let started = if let Some(deadline) = deadline {
-            tokio::select! {
-                result = tokio::time::timeout_at(deadline, start) => result.unwrap_or_else(|_| Err(ProduceError::Acquire("test startup deadline exceeded".into()))),
-                _ = tokio::signal::ctrl_c() => Err(ProduceError::Acquire("test startup cancelled".into())),
-            }
+            bounded_start(start, deadline, tokio::signal::ctrl_c(), &resource).await
         } else {
             start.await
         };

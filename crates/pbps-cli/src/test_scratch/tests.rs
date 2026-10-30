@@ -1281,3 +1281,78 @@ async fn d2a1165_the_private_key_survives_unconfirmed_cleanup_and_goes_with_its_
     assert_eq!(cleaned.removed, vec![run_id], "{cleaned:?}");
     assert!(!key.exists());
 }
+
+#[tokio::test]
+async fn d2a1165_interrupted_start_keeps_pending_recovery_evidence_through_empty_and_late_listings()
+{
+    use pbps_cli::resolver::server::ProduceError;
+    for (cancelled, token) in [(false, 'a'), (true, 'b')] {
+        let d = Dir::new();
+        let rec = record(&run(token), State::Pending, None);
+        d.dir.write(&rec).unwrap();
+        let cancellation = async move {
+            if cancelled {
+                Ok(())
+            } else {
+                std::future::pending::<std::io::Result<()>>().await
+            }
+        };
+        let end = tokio::time::Instant::now()
+            + if cancelled {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_millis(1)
+            };
+        let error = super::bounded_start(
+            std::future::pending::<Result<super::Held, ProduceError>>(),
+            end,
+            cancellation,
+            &rec.container.name,
+        )
+        .await
+        .err()
+        .unwrap();
+        let cleanup = settle_failed_start(&d.dir, &rec, &error, &Fake::default()).await;
+        assert!(
+            cleanup.is_err(),
+            "an interrupted runtime request was forgotten on an empty listing"
+        );
+        let kept_record = d.dir.read(&rec.run_id).unwrap().unwrap();
+        assert!(!kept_record.leftovers.is_empty());
+        let late = Fake::holding(&container(&rec.run_id, &id('c')));
+        let later = reconciled(&d, &late).await;
+        assert!(
+            later.removed.is_empty()
+                && !later.failures.is_empty()
+                && late.removed.borrow().is_empty()
+        );
+        assert!(kept(&d, &rec.run_id));
+        // A conclusively absent identified container is still cleanable.
+        let known = record(&run('d'), State::Created, Some(&id('e')));
+        d.dir.write(&known).unwrap();
+        assert!(
+            settle_failed_start(&d.dir, &known, &error, &Fake::default())
+                .await
+                .is_ok()
+        );
+        // Without the before-create record, no request was issued.
+        let untouched = record(&run('f'), State::Pending, None);
+        assert!(
+            settle_failed_start(&d.dir, &untouched, &error, &Fake::default())
+                .await
+                .is_ok()
+        );
+        assert!(!kept(&d, &untouched.run_id));
+    }
+    // An unreadable record cannot take the provably unissued-start path.
+    let d = Dir::new();
+    let rec = record(&run('c'), State::Pending, None);
+    let path = d.dir.file(&rec.run_id, "json");
+    std::fs::write(&path, b"not a run record").unwrap();
+    let unknown = ProduceError::Cleanup(vec![rec.container.name.clone()]);
+    let error = settle_failed_start(&d.dir, &rec, &unknown, &Fake::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, FailureKind::Unprovable);
+    assert_eq!(std::fs::read(path).unwrap(), b"not a run record");
+}

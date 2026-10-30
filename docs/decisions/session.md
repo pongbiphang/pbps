@@ -876,3 +876,11 @@ falsely make future roles unmanaged under `unmanaged: error`. Ordinary PostgreSQ
 role rules outside the owned cluster stay unchanged (ADR-0010 §3; ADR-0019 §6).
 Lock cleanup is a separate finding and cannot replace the primary deployment
 cause or erase a committed entry from phase evidence (ADR-0019 §9).
+
+Run-owned routine EXECUTE grants are removed before ordinary planning/apply and
+refreshed for fixtures; other principals' grants retain the ordinary rebuild
+check. Effective write checks include column privileges for both identities
+(PG16/18 routine-rebuild and column-grant regressions). Interrupted creation
+without a returned id retains the existing unconfirmed-leftover evidence; a
+missing before-create record or an identified absent container is still
+cleanable (ADR-0019 §3/§6).
