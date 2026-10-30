@@ -548,18 +548,42 @@ async fn a_leftover_another_login_owns_is_named_with_the_statement_and_keeps_its
     );
 }
 
-/// Drops a real run's future at the point where it waits inside its
-/// externals file, and returns the token of the run it left. The sessions of
-/// the run close with the future and none of its cleanup runs. `inside` is
-/// the supplied database to read the run's sandbox user from; without it the
-/// token is the one of the run-owned scratch database that exists.
+/// Stops an isolated runtime while a real run waits inside its externals
+/// file. Dropping only the request now leaves its supervisor alive
+/// (DEC-1519.1); runtime shutdown is the durable-recovery fallback tested here.
+/// `inside` is the supplied database to read the sandbox token from.
 fn dropped_while_waiting<'a>(
     target: &'a str,
     scratch: &'a str,
     script: &'a str,
     inside: Option<&'a str>,
 ) -> Boxed<'a, String> {
-    Box::pin(dropped_while_waiting_inner(target, scratch, script, inside))
+    let (target, scratch, script, inside) = (
+        target.to_owned(),
+        scratch.to_owned(),
+        script.to_owned(),
+        inside.map(str::to_owned),
+    );
+    Box::pin(async move {
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = runtime.block_on(dropped_while_waiting_inner(
+                &target,
+                &scratch,
+                &script,
+                inside.as_deref(),
+            ));
+            // Stop the independent owner too, rather than asking recovery to
+            // reclaim resources still held by a live supervisor.
+            drop(runtime);
+            token
+        })
+        .await
+        .unwrap()
+    })
 }
 
 async fn dropped_while_waiting_inner(
