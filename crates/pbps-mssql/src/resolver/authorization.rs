@@ -24,8 +24,9 @@
 //! clone of `db_ddladmin` would carry none of what membership in it grants
 //! (DECISIONS 521).
 //!
-//! Unreadable is not empty: a schema that is not there, or a principal row
-//! that does not come back, is an error, never a context with nothing in it.
+//! Unreadable is not empty. Requested schemas must exist; a configured
+//! fallback may be catalog-confirmed absent (DEC-717.1), which is captured
+//! separately from the schema replay recipe and must stay absent on scratch.
 
 use pbps_db::resolver::environment::DeploymentPrincipal;
 use pbps_db::transport::QueryConnection;
@@ -33,6 +34,7 @@ use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod sandbox;
+mod schema_domain;
 pub(crate) use sandbox::enter_cleanup_owner;
 mod staged;
 pub use sandbox::{SandboxDeployer, SandboxScope, apply_session_settings, enter_sandbox_deployer};
@@ -44,7 +46,7 @@ pub use staged::{
 
 /// The versioned name of this authorization rule, measured on SQL Server
 /// 2025 (17.0).
-pub const RULE: &str = "mssql-auth-v3";
+pub const RULE: &str = "mssql-auth-v4";
 
 /// Principals every database has, which a reproduction refers to by their
 /// own name instead of cloning.
@@ -103,6 +105,10 @@ pub struct AuthorizationContext {
     pub principal: DeploymentPrincipal,
     /// Where an unqualified name in an ad hoc statement is looked up first.
     pub default_schema: String,
+    /// The engine's fallback answer, distinct from the configured replay name.
+    binding_default_schema: Option<String>,
+    /// Immutable target-qualified questions, independent of mutable replay rows.
+    schema_domain: schema_domain::Domain,
     /// The session language, which the login's default decides and which in
     /// turn decides the date format and the first day of the week.
     pub language: String,
@@ -292,11 +298,40 @@ pub async fn read(
     conn: &mut impl QueryConnection,
     schemas: &[String],
 ) -> Result<AuthorizationContext, DbError> {
+    read_context(conn, schemas, None).await
+}
+
+/// Re-reads exactly the captured target domain, even if the current default
+/// changed. Replay schema rows never supply this immutable question inventory.
+pub async fn reread(
+    conn: &mut impl QueryConnection,
+    target: &AuthorizationContext,
+) -> Result<AuthorizationContext, DbError> {
+    read_in_domain(conn, target, &[]).await
+}
+
+async fn read_in_domain(
+    conn: &mut impl QueryConnection,
+    target: &AuthorizationContext,
+    schemas: &[String],
+) -> Result<AuthorizationContext, DbError> {
+    // Setup may use a partial recipe. It must not become the verifier's
+    // expected answer set simply by erasing a captured required section.
+    target.schema_domain.require_complete(&target.schemas)?;
+    read_context(conn, schemas, Some(&target.schema_domain)).await
+}
+
+async fn read_context(
+    conn: &mut impl QueryConnection,
+    schemas: &[String],
+    domain: Option<&schema_domain::Domain>,
+) -> Result<AuthorizationContext, DbError> {
     let rows = conn
         .query(
             "SELECT ORIGINAL_LOGIN() AS login, USER_NAME() AS effective, \
                     (SELECT p.default_schema_name FROM sys.database_principals p \
                       WHERE p.principal_id = DATABASE_PRINCIPAL_ID()) AS default_schema, \
+                    SCHEMA_NAME() AS binding_default, \
                     CONVERT(nvarchar(128), @@LANGUAGE) AS [language];",
         )
         .await?;
@@ -311,13 +346,23 @@ pub async fn read(
         superuser: effective == "dbo",
         effective: effective.into(),
     };
-    // A user mapped from a Windows group has no default schema of its own;
-    // the engine falls back to `dbo`, and so does the reproduction.
+    // Keep the configured replay name even when no schema exists. The
+    // independently read engine fallback must agree after reproduction; a
+    // principal-row NULL alone does not establish Windows-group behavior.
     let default_schema = row
         .try_get::<&str>("default_schema")?
         .unwrap_or("dbo")
         .to_owned();
+    let binding_default_schema = row.try_get::<&str>("binding_default")?.map(str::to_owned);
     let language = required(row, "language", "the session language")?;
+    let observed_schemas = schema_domain::read(
+        conn,
+        schemas,
+        &default_schema,
+        binding_default_schema.as_deref(),
+        domain,
+    )
+    .await?;
 
     let database_permissions = permissions(conn, "NULL", "DATABASE").await?;
     let mut roles = BTreeMap::new();
@@ -361,6 +406,8 @@ pub async fn read(
     let mut context = AuthorizationContext {
         principal,
         default_schema,
+        binding_default_schema,
+        schema_domain: observed_schemas.domain,
         language,
         database_permissions,
         database_grants: Vec::new(),
@@ -428,50 +475,15 @@ pub async fn read(
         }
         context.principal_grants.sort();
     }
-    for schema in schemas {
-        let rows = conn
-            .query(&format!(
-                "SELECT s.name AS name, USER_NAME(s.principal_id) AS owner FROM sys.schemas s \
-                 WHERE s.name = {};",
-                literal(schema)
-            ))
-            .await?;
-        // The schema is keyed by the name the catalog holds, not by the
-        // spelling it was asked for. The lookup above compares under the
-        // database's collation, so on a case-insensitive database `DBO`
-        // finds `dbo` — and keyed as `DBO` it was no longer recognised as
-        // the schema every database already has, the reconstruction ran
-        // `CREATE SCHEMA [DBO]` into a scratch database of the same
-        // collation, and a valid request ended on the engine's error 2760
-        // (measured; finding on #611). Which names are one schema is the engine's
-        // answer, read here once, rather than a comparison repeated in Rust.
-        let (name, owner) = match rows.as_slice() {
-            [row] => (
-                required(row, "name", "a schema's name")?,
-                required(row, "owner", "a schema's owner")?,
-            ),
-            // Every login sees every schema's row, so none is absence — and
-            // an absent in-scope schema is a scope that cannot be established.
-            [] => {
-                return Err(DbError::BadRow(format!(
-                    "the in-scope schema {schema} does not exist"
-                )));
-            }
-            _ => {
-                return Err(DbError::BadRow(format!(
-                    "the in-scope schema {schema} is ambiguous"
-                )));
-            }
-        };
-        let permissions = permissions(conn, &literal(schema), "SCHEMA").await?;
-        // For every deployer, `dbo` included: `dbo` sees every row, and a
-        // grant another session makes on an in-scope schema is a target that
-        // is no longer what was sealed, whoever the deployer is.
+    for (name, (catalog_name, owner)) in observed_schemas.present {
+        let permissions = permissions(conn, &literal(&catalog_name), "SCHEMA").await?;
+        // Catalog spelling and deduplication belong to the connected engine.
+        // Include dbo even for an unrequested fallback, including its DENYs.
         let grants = grants(
             conn,
             &format!(
                 "p.class = 3 AND p.major_id = SCHEMA_ID({})",
-                literal(schema)
+                literal(&catalog_name)
             ),
         )
         .await?;
@@ -1198,7 +1210,7 @@ pub async fn verify(
     target: &AuthorizationContext,
     schemas: &[String],
 ) -> Result<Vec<String>, DbError> {
-    let reproduced = read(deployer, schemas).await?;
+    let reproduced = read_in_domain(deployer, target, schemas).await?;
     Ok(differences(map, target, &reproduced))
 }
 
@@ -1244,7 +1256,10 @@ fn differences_except_schema_owners(
         grants.sort();
         grants
     };
-    let mut found = Vec::new();
+    let mut found = target.schema_domain.differences(&reproduced.schema_domain);
+    if reproduced.binding_default_schema != target.binding_default_schema {
+        found.push("default-schema:binding".to_owned());
+    }
     if logical(&reproduced.principal.effective) != target.principal.effective {
         found.push("principal".to_owned());
     }
@@ -1594,6 +1609,8 @@ mod tests {
                 superuser: false,
             },
             default_schema: "app".into(),
+            binding_default_schema: Some("app".into()),
+            schema_domain: schema_domain::Domain::present(["app"]),
             language: "us_english".into(),
             database_permissions: ["CONNECT", "CREATE TABLE"]
                 .into_iter()
@@ -1935,5 +1952,28 @@ mod tests {
     fn a_context_without_principal_grants_keeps_its_canonical_form() {
         let canonical = String::from_utf8(context().canonical()).unwrap();
         assert!(!canonical.contains("principal_grants"), "{canonical}");
+    }
+    #[test]
+    fn erasing_recipe_rows_does_not_erase_the_captured_schema_questions() {
+        let target = context();
+        let map = PrincipalMap::generate(&target, &[], "domain717");
+        assert!(differences(&map, &target, &target).is_empty());
+        let original: serde_json::Value = serde_json::from_slice(&target.canonical()).unwrap();
+        let mut recipe = target.clone();
+        recipe.schemas.clear();
+        let stripped: serde_json::Value = serde_json::from_slice(&recipe.canonical()).unwrap();
+        assert_eq!(stripped["schema_domain"], original["schema_domain"]);
+        assert!(
+            recipe
+                .schema_domain
+                .require_complete(&recipe.schemas)
+                .is_err(),
+            "erased recipe rows cannot erase a required comparison"
+        );
+        let mut incomplete = target.clone();
+        incomplete.schema_domain = schema_domain::Domain::default();
+        assert!(
+            differences(&map, &target, &incomplete).contains(&"schema:app:unreadable".to_owned())
+        );
     }
 }

@@ -1617,6 +1617,8 @@
         "plan_names_tests::layout_estimates_measure_each_occupant_before_and_after_name_reuse",
         "rename_chains_report_each_identity_once_without_changing_dependency_decisions",
         "removal_names_tests::a_removal_keeps_its_stored_table_when_names_change_hands",
+        "resolver_tests::auth717::an_unrequested_fallback_schema_keeps_its_denials_and_identity",
+        "resolver_tests::auth717::a_known_absent_default_stays_absent_through_replay_and_recheck",
         "resolver_tests::contained611::a_partially_contained_target_needs_a_server_that_allows_contained_databases",
         "resolver_tests::recon611::a_dbo_deployer_is_reproduced_by_the_scratch_owner_itself",
         "resolver_tests::recon611::a_grant_from_a_holder_whose_own_grant_the_deployer_cannot_see_is_reproduced",

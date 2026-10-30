@@ -77,6 +77,19 @@ pbps manages no CLR-typed column, so the reference is read as the function.
     schema-bound view and the computed column stay where they were.
   - The compatibility level moves no recorded binding.
 
+**Authorization fallback scope (DEC-717.1).** Each connected authorization
+read includes `dbo`, the requested schemas and the deployer's default-schema
+fallback. Catalog spelling and equality are resolved by SQL Server under the
+database collation. The captured present/absent question domain is independent
+of the replay schema rows. A configured default that is catalog-confirmed
+absent remains absent on scratch; bare statements retain their `dbo` fallback.
+A missing observation or an unanswerable effective default is not that fact.
+Reconstruction creates only target-present schemas. Verification re-asks the
+captured questions even if scratch's default or recipe changed, and names a
+required schema's presence, owner, permissions or grant mismatch. SQL-login
+qualification does not establish Windows-group default-schema behavior (#725)
+or enable persisted SQL Server planning/apply (#2143/#2144).
+
 **Consequence for the resolver.** A one-part reference in a body that is not
 schema-bound is **runtime-bound**. Rebuilding the module cannot pin it, so
 there is no rebuild decision to make for it. Its candidates enter the

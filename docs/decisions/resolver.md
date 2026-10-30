@@ -5297,3 +5297,53 @@ stopped the engine before its record enters `removing`. This proves death at
 once under DEC-2410.3; a still-running unreadable server remains unprovable.
 Native PostgreSQL and SQL Server regressions retain a running observation,
 stop the engine, and require immediate recovery with confirmed absence.
+
+
+<a id="dec-717-1"></a>
+
+**DEC-717.1. Capture the target-qualified SQL Server fallback domain, including known default-schema absence.**
+The maintainer chose option B on #717. Every complete authorization read
+covers requested schemas, `dbo`, the configured default and the independently
+reported `SCHEMA_NAME()` fallback. SQL Server resolves their catalog spelling
+and equality in one left-join statement under its database collation; Rust
+does not case-fold names. Requested schemas still must exist. A configured
+default may be catalog-confirmed absent: retain its name and explicit absence,
+create only present replay schemas, and preserve ordinary bare-name fallback
+to `dbo`. Do not fabricate a schema or treat NULL as generic success.
+
+The private canonical schema question inventory is independent of mutable
+schema replay rows. Re-reading and both legacy/staged verification preserve
+that inventory when a wrong recipe or changed scratch default would omit a
+question. Presence, absence and a missing/unreadable answer remain distinct.
+Before verification or a target-domain reread, require exactly the captured
+present sections as complete facts. A partial setup recipe cannot also become
+its own verification expectation: a live correlated recipe erasing dbo keeps
+the public database grants, gains actual UPDATE, and must refuse for omitted
+required facts. Creating only a private question list without checking its
+corresponding answers would still let that wrong recipe verify.
+Every catalog question requires exactly one complete ordinal answer; failed,
+incomplete, duplicate, ambiguous or malformed reads refuse. Staged extensions
+add their target-qualified questions without replacing an earlier contradictory
+presence observation. Existing raw grants, grantors, options, DENYs, owners and
+engine-effective permission checks remain separate obligations. The existing
+special reproduction of engine-owned `dbo` remains intact.
+
+The canonical contract changes from `mssql-auth-v3` to `mssql-auth-v4`.
+The generic authorization fingerprint domain and saved wire formats do not
+change. Persisted SQL Server authorization and resolved apply remain refused;
+there is no route that silently reseals an older profile. CLI retains the
+context through existing mapped replay and verification boundaries, rather
+than deriving a smaller scope from the scratch deployer's current default.
+SQL Server's existing bracketed double reads retain their consistency limits;
+this is no catalog audit log or lock on the target.
+
+Pinned Linux SQL Server 17.0 ordinary-login controls exercise unrequested
+`dbo` DENY, an existing unrequested default with its owner, database-collation
+deduplication, actual bare-name binding and actual UPDATE refusal. Removing
+the scratch DENY exposes executable extra UPDATE and names both its grant and
+effective-permission differences. Creating a target-absent default, dropping
+a target-present default, or changing the current default cannot erase the
+required question. The engine refuses changing the built-in `dbo` schema's
+owner on this fixture (15150); that failed setup is not a regression witness.
+These SQL-login measurements do not qualify Windows-group effective defaults;
+#725 follows the same known-absence policy with its own qualification.

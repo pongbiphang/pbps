@@ -315,6 +315,7 @@ pub async fn read_staged_permissions(
         .collect();
     if !missing.is_empty() {
         let extra = read(conn, &missing).await?;
+        context.schema_domain.extend(extra.schema_domain)?;
         context.schemas.extend(extra.schemas);
         context.principals.extend(extra.principals);
         context.principal_owners.extend(extra.principal_owners);
@@ -507,7 +508,7 @@ pub async fn verify_staged_authorization(
     current_owners: &OwnerPartition,
 ) -> Result<Vec<String>, DbError> {
     target_owners.verify(current_owners)?;
-    let mut got = read(conn, schemas).await?;
+    let mut got = read_in_domain(conn, target, schemas).await?;
     read_staged_permissions(conn, &mut got, current_owners).await?;
     // The partition already compared schema and object ownership. Its owner
     // aliases cannot normalize ACL principals: an owner may also hold a grant
