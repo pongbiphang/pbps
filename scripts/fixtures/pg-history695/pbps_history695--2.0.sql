@@ -1,0 +1,1 @@
+CREATE FUNCTION pbps_history695_value() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 2;

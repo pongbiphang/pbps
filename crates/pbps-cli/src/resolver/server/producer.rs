@@ -198,6 +198,7 @@ pub struct Unsealed {
 
 /// What the run read on the target, for the publication recheck.
 pub(super) struct Opening {
+    pub history: scope::History,
     pub driver: pbps_db::Driver,
     pub request: ScopeRequest,
     pub scope_schemas: Vec<String>,
@@ -253,7 +254,7 @@ impl Unsealed {
             ]);
         }
         let request = &self.opening.request;
-        let (catalog, authorization) = scope::read_target(
+        let (catalog, authorization, history) = scope::read_target_with_history(
             target,
             self.opening.driver,
             &request.schemas,
@@ -281,6 +282,12 @@ impl Unsealed {
         if !authorization.same_context(&self.sealing.authorization) {
             changed.push("the target deployer's authorization".to_owned());
         }
+        changed.extend(
+            self.opening
+                .history
+                .differences(&history)
+                .map_err(read("catalog history"))?,
+        );
         let differences = engine::recapture(target, &self.opening.current)
             .await
             .map_err(|error| Error::Read(format!("the recheck's capture: {error}")))?;

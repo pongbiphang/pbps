@@ -191,6 +191,71 @@ pub(crate) async fn read_target(
     }
 }
 
+/// Run-local history beside the reported scope; never saved or fingerprinted.
+pub(crate) enum History {
+    Postgres(pbps_pg::resolver::scope_witness::Witness),
+    Mssql,
+}
+
+impl History {
+    pub(crate) fn limitation(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Postgres(witness) => witness.role_history_limitation(),
+            Self::Mssql => None,
+        }
+    }
+
+    pub(crate) fn differences(&self, fresh: &Self) -> Result<Vec<String>, DbError> {
+        match (self, fresh) {
+            (Self::Postgres(before), Self::Postgres(after)) => before.differences(after),
+            (Self::Mssql, Self::Mssql) => Ok(Vec::new()),
+            _ => Err(DbError::BadRow(
+                "the target catalog history changed engine".into(),
+            )),
+        }
+    }
+}
+
+/// The producer's opening/recheck route, with a complete PG sidecar. Ordinary
+/// reads and apply retain read_target's existing endpoint-value contract.
+pub(crate) async fn read_target_with_history(
+    connection: &mut impl QueryConnection,
+    driver: Driver,
+    schemas: &[String],
+    extras: &[String],
+    authorization_schemas: &[String],
+    planned: &[PlannedGrant],
+) -> Result<(CatalogFacts, Authorization, History), DbError> {
+    match driver {
+        Driver::Postgres => {
+            let scope = pbps_pg::resolver::environment::Scope {
+                schemas,
+                write_path_extras: extras,
+            };
+            let (catalog, authorization, witness) =
+                pbps_pg::resolver::witnessed_scope_facts(connection, &scope, authorization_schemas)
+                    .await?;
+            Ok((
+                catalog,
+                Authorization::Postgres(authorization),
+                History::Postgres(witness),
+            ))
+        }
+        Driver::Mssql => {
+            let (catalog, authorization) = read_target(
+                connection,
+                driver,
+                schemas,
+                extras,
+                authorization_schemas,
+                planned,
+            )
+            .await?;
+            Ok((catalog, authorization, History::Mssql))
+        }
+    }
+}
+
 /// How the scratch database must be created to stand in for the target's.
 pub(crate) fn recipe(
     driver: Driver,

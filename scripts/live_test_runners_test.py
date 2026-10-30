@@ -971,6 +971,8 @@ elif command[0] == "cargo":
         print(f"\ntest result: {'FAILED' if failed else 'ok'}. {len(selected)-failed} passed; "
               f"{failed} failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
         sys.exit(101 if failed else 0)
+elif command[:2] == ["docker", "cp"]:
+    pass
 elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
     raise RuntimeError("unexpected external client: " + repr(command))
 ''')
@@ -1098,6 +1100,30 @@ class LiveExecution(unittest.TestCase):
                 self.assertTrue(all(c[-2:] == ["--exact", "fixture case"]
                                     for c in calls if c[0] == "cargo"))
 
+    def test_history_extension_copy_uses_only_checked_fixture_names_before_clients(self):
+        overrides = {key: "history." + value for key, value in FIXTURE_NAMES.items()}
+        result, calls, _ = self.named_fixture_script("pg", overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copies = [c for c in calls if c[:2] == ["docker", "cp"]]
+        expected = self.fixture_names("pg", "history.")
+        self.assertEqual([c[-1].split(":")[0] for c in copies], expected)
+        self.assertEqual([c[-1].split(":")[1] for c in copies], [
+            "/usr/share/postgresql/18/extension/", "/usr/share/postgresql/16/extension/",
+            "/usr/share/postgresql/18/extension/",
+        ])
+        checked = [i for i, c in enumerate(calls)
+                   if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
+        copied = [i for i, c in enumerate(calls) if c[:2] == ["docker", "cp"]]
+        clients = [i for i, c in enumerate(calls) if c[0] == "cargo"]
+        self.assertLess(max(checked), min(copied))
+        self.assertLess(max(copied), min(clients))
+
+    def test_history_extension_copy_failure_stops_before_pg_clients(self):
+        result, calls, _ = self.named_fixture_script("pg", failing="copy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("history fixture copy failure", result.stderr)
+        self.assertFalse(any(c[0] == "cargo" for c in calls))
+
     def test_dotted_names_reuse_only_exact_existing_containers(self):
         overrides = {key: "lane." + value + ".fixture" for key, value in FIXTURE_NAMES.items()}
         for runner in ("mssql", "pg", "resolver"):
@@ -1208,6 +1234,10 @@ elif command[:2] == ["docker", "exec"]:
         sys.exit(1)
     if "SELECT CONVERT" in command[-1]:
         print("SQL_Latin1_General_CP1_CI_AS")
+elif command[:2] == ["docker", "cp"]:
+    if os.environ["PBPS_NAMES_FAILING"] == "copy":
+        print("controlled history fixture copy failure", file=sys.stderr)
+        sys.exit(1)
 elif command[:2] == ["docker", "logs"]:
     print("controlled fixture not ready", file=sys.stderr)
 elif command[0] not in ("cargo", "python3", "sleep"):
@@ -1409,6 +1439,36 @@ elif command[0] != 'sleep':
                     self.assertEqual(any(inventory.selects(selection, key, name)
                                          for selection in selections), expected)
 
+    def test_ci_history_fixture_copy_reaches_each_pinned_service(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Install catalog-history extension fixtures\n", 1)[1].split("      - run:", 1)[0]
+        self.assertIn("if: matrix.suite == 'dialect'", step)
+        for service in ("job.services.postgres.id", "job.services['postgres-old'].id",
+                        "job.services['postgres-scratch'].id"):
+            self.assertIn(service, step)
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory(prefix="pbps-history-ci-") as directory:
+            root = Path(directory)
+            fake = root / "docker"
+            fake.write_text(f"#!{sys.executable}\n" +
+                            "import json,os,sys\n" +
+                            "from pathlib import Path\n" +
+                            "with Path(os.environ['PBPS_HISTORY_CALLS']).open('a') as f:\n" +
+                            " f.write(json.dumps(sys.argv[1:])+'\\n')\n")
+            fake.chmod(0o755)
+            env = fixture_environment(PATH=str(root) + os.pathsep + os.environ["PATH"],
+                                      PBPS_HISTORY_CALLS=str(root / "calls"),
+                                      PG_FIXTURE_18="owned18", PG_FIXTURE_16="owned16",
+                                      PG_FIXTURE_SCRATCH="owned-scratch")
+            result = subprocess.run(["bash", "-ec", command], cwd=ROOT, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            self.assertEqual(calls, [["cp", "scripts/fixtures/pg-history695/.",
+                                      f"{name}:/usr/share/postgresql/{major}/extension/"]
+                                     for name, major in (("owned18", 18), ("owned16", 16),
+                                                         ("owned-scratch", 18))])
+
     def test_driver_error_regressions_run_in_their_engine_jobs(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         for job, target in (("live", "live_mssql"), ("live-pg", "live_pg")):
@@ -1535,6 +1595,8 @@ elif command[:2] == ["docker", "exec"]:
                 mode == "deadline-old" and name == "pbps-test-pg16" or
                 mode == "deadline-scratch" and name == "pbps-test-pg-scratch")
     sys.exit(2 if tcp and (deadline or mode == "initializing" and count <= 2) else 0)
+elif command[:2] == ["docker", "cp"]:
+    pass
 elif command[:2] == ["docker", "logs"]:
     print("controlled server still initializing", file=sys.stderr)
 elif command[:2] == ["python3", "scripts/check-live-fixture.py"]:

@@ -652,6 +652,16 @@ jobs:
       # and the runner's own Docker for a Docker scratch (#1674). The filter
       # must not end in `:`, which YAML reads as a mapping and rejects the
       # whole file.
+      - name: Install catalog-history extension fixtures
+        if: matrix.suite == 'dialect'
+        env:
+          PG_FIXTURE_18: ${{ job.services.postgres.id }}
+          PG_FIXTURE_16: ${{ job.services['postgres-old'].id }}
+          PG_FIXTURE_SCRATCH: ${{ job.services['postgres-scratch'].id }}
+        run: |
+          for fixture in "$PG_FIXTURE_18:18" "$PG_FIXTURE_16:16" "$PG_FIXTURE_SCRATCH:18"; do
+            docker cp scripts/fixtures/pg-history695/. "${fixture%:*}:/usr/share/postgresql/${fixture##*:}/extension/"
+          done
       - run: cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.
