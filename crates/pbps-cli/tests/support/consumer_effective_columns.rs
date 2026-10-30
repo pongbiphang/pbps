@@ -378,3 +378,122 @@ fn partition_overrides_keep_standing_interfaces_and_refuse_real_tightening() {
         }
     });
 }
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn sibling_domain_default_losses_use_the_same_rule_in_alter_and_rebuild_plans() {
+    engines(|server| {
+        for rebuild in [false, true] {
+            for (ty, explicit, expected) in [
+                ("app.d", "", 2),
+                ("app.d", ", default: '9'", 0),
+                ("app.d[]", "", 0),
+            ] {
+                let own = OwnDatabase::new(server, "sibling_domain2453");
+                let c = own.connection();
+                let d = Demo::new("sibling-domain");
+                domain(&d, "d", "integer", "not_null: true\ndefault: '7'\n");
+                d.table(&format!("table: app.t\ncolumns:\n  a: {{type: integer}}\n  b: {{type: '{ty}'{explicit}}}\n"));
+                setup(&d, c);
+                on_server(c, "BEGIN; INSERT INTO app.t(a) VALUES(1); ROLLBACK");
+                domain(
+                    &d,
+                    "d",
+                    if rebuild { "bigint" } else { "integer" },
+                    "not_null: true\n",
+                );
+                config(&d, Some(("app.t.a", true)));
+                check(&d, c, expected);
+                config(&d, None);
+                let saved = check(&d, c, 0).unwrap();
+                let text = serde_json::to_string(&saved).unwrap();
+                assert!(
+                    text.contains(if rebuild {
+                        "enum_rebuild"
+                    } else {
+                        "alter_domain"
+                    }),
+                    "rebuild={rebuild}: {text}"
+                );
+                apply(&d, c);
+                if expected == 2 {
+                    rejects_null(c, "INSERT INTO app.t(a) VALUES(1)");
+                } else {
+                    on_server(c, "INSERT INTO app.t(a) VALUES(1)");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn sibling_default_losses_follow_partition_trees_without_removing_existing_refusals() {
+    engines(|server| {
+        for (label, parent, local, nullable, entry, expected, rejects_insert) in [
+            (
+                "inherited loss",
+                Some("7"),
+                None,
+                false,
+                "app.leaf.a",
+                2,
+                true,
+            ),
+            ("local loss", None, Some("8"), false, "app.t.a", 2, true),
+            (
+                "parent fallback",
+                Some("7"),
+                Some("8"),
+                false,
+                "app.t.a",
+                0,
+                false,
+            ),
+            ("nullable local", None, Some("8"), true, "app.t.a", 0, false),
+            (
+                "existing local match",
+                None,
+                Some("8"),
+                true,
+                "app.leaf.a",
+                2,
+                false,
+            ),
+        ] {
+            let own = OwnDatabase::new(server, "sibling_partition2453");
+            let c = own.connection();
+            let d = Demo::new("sibling-partition");
+            let tree = |parent: Option<&str>, local: Option<&str>| {
+                format!(
+                    "table: app.t\ncolumns:\n  a: {{type: integer}}\n  b: {{type: integer, nullable: {nullable}{}}}\npartition_by: [a]\npartitions:\n  leaf:\n    default: true\n{}",
+                    parent.map_or(String::new(), |v| format!(", default: '{v}'")),
+                    local.map_or(String::new(), |v| format!(
+                        "    columns:\n      b: {{default: '{v}'}}\n"
+                    ))
+                )
+            };
+            d.table(&tree(parent, local));
+            setup(&d, c);
+            on_server(c, "BEGIN; INSERT INTO app.leaf(a) VALUES(1); ROLLBACK");
+            d.table(&tree(if local.is_none() { None } else { parent }, None));
+            config(&d, Some((entry, true)));
+            check(&d, c, expected);
+            config(&d, None);
+            let saved = check(&d, c, 0).unwrap();
+            let text = serde_json::to_string(&saved).unwrap();
+            assert!(
+                text.contains(if local.is_some() {
+                    "set_partition_default"
+                } else {
+                    "alter_column_default"
+                }),
+                "{label}: {text}"
+            );
+            apply(&d, c);
+            // The final case deliberately pins the pre-existing conservative
+            // refusal even though NULL remains legal; #2453 only adds protection.
+            nullable_write(c, "INSERT INTO app.leaf(a) VALUES(1)", !rejects_insert);
+        }
+    });
+}
