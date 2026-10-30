@@ -69,3 +69,36 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
     );
     assert!(emit(&pg, &changes.remove(0), Strategy::default()).is_err());
 }
+
+#[test]
+fn the_shared_emission_entry_refuses_unbalanced_rebuild_conversions() {
+    let pg = Postgres::new();
+    let mut copy = fixture::changes()
+        .into_iter()
+        .find(|c| matches!(c, Change::CopyTableRows(_)))
+        .unwrap();
+    let Change::CopyTableRows(payload) = &mut copy else {
+        unreachable!()
+    };
+    let column = &mut payload.columns[0];
+    let input = column.source.as_ref().unwrap().column.name.clone();
+    let expression_name = quote(input.raw()).unwrap();
+    column.stages.push(pbps_model::CopyStage {
+        input: input.clone(),
+        cast: column.cast.clone(),
+        collation: None,
+        using: Some(format!("{expression_name}) IS NULL OR ({expression_name}")),
+    });
+    let why = emit(&pg, &copy, Strategy::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        why.contains("has unbalanced parentheses") && why.contains("re-record"),
+        "{why}"
+    );
+    let Change::CopyTableRows(payload) = &mut copy else {
+        unreachable!()
+    };
+    payload.columns[0].stages[0].using = Some(format!("({expression_name})"));
+    assert!(emit(&pg, &copy, Strategy::default()).is_ok());
+}

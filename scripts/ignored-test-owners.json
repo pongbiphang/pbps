@@ -215,6 +215,7 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "conversions2331::legacy_unbalanced_using_refuses_planning_and_balanced_controls_apply_on_both_majors",
         "deployment_services1165_command_contracts_on_pg16",
         "deployment_services1165_command_contracts_on_pg18"
       ]
@@ -1690,6 +1691,7 @@
         "darwin"
       ],
       "cases": [
+        "input_path::tests::conversion_vetters_refuse_unbalanced_using_before_binding_on_both_majors",
         "emit::rebuild::native::replacement_preserves_declared_rows_ownership_and_external_bindings",
         "emit::rebuild::native::failed_physical_prefix_restores_the_exact_opening_manifest",
         "resolver::reconstruct::function_tests::held_tables_and_readers_compile_with_their_keys_on_both_servers",

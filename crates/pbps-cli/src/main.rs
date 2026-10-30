@@ -5055,7 +5055,13 @@ fn cmd_plan(
                 if let Some(answers) = prompt::ask_conversions(&needed) {
                     let mut next = res.ids.clone();
                     for (need, using) in &answers {
-                        pbps_diff::conversion::answer(&mut next, need, using, &ctx);
+                        pbps_diff::conversion::answer(
+                            &mut next,
+                            need,
+                            using,
+                            &ctx,
+                            dialect.as_ref(),
+                        )?;
                     }
                     output::or_unanswerable(
                         "plan",
