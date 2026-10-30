@@ -35,6 +35,9 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[path = "live/drop_requirements2400.rs"]
+mod drop_requirements2400;
+
 #[path = "live/predicate2400.rs"]
 mod predicate2400;
 

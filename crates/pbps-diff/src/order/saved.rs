@@ -429,8 +429,8 @@ pub fn validate_saved_plan(
         .map_err(AdmissionError::from_error)?;
     for step in &plan.changes.changes {
         if let Some(guard) = &step.drop_guard {
-            if plan.mode.is_staged() || !dialect.records_conversions() {
-                refuse!("guarded drops require a PostgreSQL transactional plan");
+            if plan.mode.is_staged() {
+                refuse!("guarded drops require a transactional plan");
             }
             if guard.requirements.is_empty()
                 || guard.requirements.iter().any(|(uid, r)| {

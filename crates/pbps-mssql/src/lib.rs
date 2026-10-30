@@ -34,6 +34,7 @@ mod binding;
 pub mod catalog;
 pub mod dependencies;
 pub mod doctor;
+pub mod drop_requirements;
 pub mod edition;
 pub mod emit;
 pub mod estimate;
@@ -188,7 +189,12 @@ impl pbps_dialect::PlanDialect for Mssql {
 
     fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit(&planned.change, planned.strategy)
+        pbps_dialect::drop_requirements::emit(
+            planned.drop_guard.as_ref(),
+            pbps_model::PlanMode::Transactional,
+            "mssql",
+            || emit::emit(&planned.change, planned.strategy),
+        )
     }
 
     fn emit_staged(
@@ -197,7 +203,12 @@ impl pbps_dialect::PlanDialect for Mssql {
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit(&planned.change, planned.strategy)
+        pbps_dialect::drop_requirements::emit(
+            planned.drop_guard.as_ref(),
+            pbps_model::PlanMode::Staged,
+            "mssql",
+            || emit::emit(&planned.change, planned.strategy),
+        )
     }
 }
 

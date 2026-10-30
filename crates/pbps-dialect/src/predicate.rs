@@ -181,6 +181,19 @@ impl<S> Eq for Parsed<S> {}
 /// The scope resolver must resolve only within the one target table, using
 /// engine-owned binding facts. The parser never guesses catalogue collation.
 impl<S: Syntax> Parsed<S> {
+    /// Collect candidates without granting SQL rendering authority. The caller
+    /// still resolves each against the target's catalog before `vet` succeeds.
+    pub fn column_names(&mut self) -> Result<std::collections::BTreeSet<ColumnName>> {
+        let mut names = std::collections::BTreeSet::new();
+        self.root.visit(&mut |value| {
+            if let Value::Column(name) = &value.kind {
+                names.insert(name.clone());
+            }
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
     pub fn vet(
         mut self,
         mut column: impl FnMut(&ColumnName) -> Option<ColumnName>,

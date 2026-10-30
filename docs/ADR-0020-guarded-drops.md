@@ -43,9 +43,16 @@ built-in types and routines. DEC-2378.1's pre-binding protections and the empty
 resolution path of DEC-2378.2 apply before binding. There is no second parser
 or alternate security path for PostgreSQL predicates.
 
-SQL Server's parser, built-in allowlist and version gates are a separate slice.
-PR 2a supplies that core; PR 2b connects it to this recording and apply boundary.
-Until that connection exists, the SQL Server consumer refuses guarded drops.
+SQL Server uses PR 2a's closed typed predicate parser, built-in allowlist and
+version gates at recording, planning and apply. Columns resolve only within
+the UID-selected holder, through the target's catalog collation. The engine's
+major version and current compatibility level are required evidence. Only the
+vetted tree regenerates SQL; the original text is retained for audit/checksum
+and escaped diagnostics. Describe binds regenerated SQL without reading rows.
+Referenced computed and CLR columns are refused in v1 because they could
+introduce execution outside the closed expression vocabulary. Ordinary alias
+types remain allowed. Refusals name the stored-column/non-CLR-type remedy and
+the transition CHECK or planned assertion alternatives.
 
 ### Execution and locking
 
@@ -60,11 +67,33 @@ apply and rolls the transaction back. A failed query, unreadable count,
 missing privilege or active row security refuses too; none means zero rows.
 The refusal names the table, predicate and count when a count is readable.
 
-The count runs under an ACCESS EXCLUSIVE lock, taken directly on the table
+The PostgreSQL count runs under an ACCESS EXCLUSIVE lock, taken directly on the table
 and its partitions and held through the drop. Readers as well as writers wait
 for the scan's duration. It uses apply's existing lock-wait and timeout
 behavior, with no new timeout setting and no weaker-lock upgrade. The plan
 and explanation state that the scan runs under this lock.
+
+SQL Server counts `CASE WHEN (<regenerated predicate>) THEN 0 ELSE 1 END = 1`
+with `COUNT_BIG(*)` and `WITH (TABLOCKX, HOLDLOCK)`. The count itself acquires
+the table X lock, including all physical partitions, and the caller retains it
+through DDL and commit. There is no preliminary lock query or weaker lock
+upgrade. Keeping the hints on the count also avoids stale SNAPSHOT evidence.
+Writers wait; versioned readers can proceed. No new timeout setting is added.
+An absent or uncommittable caller transaction refuses.
+
+Binding and counting use one `sp_executesql`-scoped pin block: `LANGUAGE
+us_english`, `DATEFIRST 7`, `DATEFORMAT mdy`, `ANSI_NULLS ON`, `ANSI_WARNINGS ON`,
+`ARITHABORT ON`, `ARITHIGNORE OFF`, `CONCAT_NULL_YIELDS_NULL ON` and
+`NUMERIC_ROUNDABORT OFF`. Dates/weekdays, NULL/concatenation and arithmetic
+error/rounding behavior must agree across connections. Caller settings restore
+even on error. The regenerated identifiers use brackets; storage-only
+ANSI_PADDING and target collation are not overridden.
+
+Enabled SQL Server RLS FILTER policies are refused even for dbo. A database
+VIEW DEFINITION grant and absence of effective object/schema metadata DENYs
+must establish a complete policy catalog; unreadable is not empty. Disabled
+and block-only policies do not hide rows and are allowed. A refusal explains
+the policy-disable/permission remedy.
 
 ### Consumers and limits
 
@@ -85,8 +114,8 @@ introduce a built-in contract-verification language.
 
 Identity-file version 1 and the current state version 35 remain unchanged by this feature. Compatibility
 tests retain their bytes when there is no requirement. Schema set 74 publishes
-the new shape and merges after #2451's set 68. PostgreSQL ships in PR 1; the
-issue stays open for the SQL Server integration.
+the new shape and merges after #2451's set 68. PR 2b connects the SQL Server
+implementation without changing schema set 74, ids v1 or state v35.
 
 ## Validation
 
@@ -95,3 +124,8 @@ a violating row arriving after plan, refusal before recording unsafe code or
 another table, same-plan renames, checksum changes and a blocked writer that
 cannot enter between the count and drop. Removing the late-row protection must
 make its regression fail. Other protections receive their own revert checks.
+
+SQL Server regressions additionally cover native capability/catalog binding,
+scoped settings restored after success and error, filtered/hidden policies,
+computed/CLR refusals, snapshot freshness and a database-observed blocked
+writer in another physical partition through the emitted drop.

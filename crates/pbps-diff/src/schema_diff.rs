@@ -2682,11 +2682,6 @@ pub(crate) fn diff_partial_rebuilding(
     {
         errs.push(DiffError::DropRequirement { reason });
     }
-    if !dialect.records_conversions() && changes.changes.iter().any(|p| p.drop_guard.is_some()) {
-        errs.push(DiffError::DropRequirement {
-            reason: "guarded drops are not supported on this engine yet".into(),
-        });
-    }
     // Replacement risk belongs to both policy parts, including in partial
     // reports. Reuse the same UID/name pairing as final plan admission.
     let risks = crate::order::generated::risks(&changes, declared.ids, dialect);

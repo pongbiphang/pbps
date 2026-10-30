@@ -129,7 +129,9 @@ pub async fn vet_drop_requirement(
         )
         .await
         .map_err(anyhow::Error::msg),
-        Driver::Mssql => anyhow::bail!("guarded drops are not supported on this engine yet"),
+        Driver::Mssql => Box::pin(pbps_mssql::drop_requirements::vet(conn, table, predicate))
+            .await
+            .map_err(anyhow::Error::msg),
     }
 }
 
@@ -144,9 +146,9 @@ pub async fn check_drop_requirement(
         Driver::Postgres => pbps_pg::drop_requirements::check(conn, guard)
             .await
             .map_err(DbError::Refused),
-        Driver::Mssql => Err(DbError::Refused(
-            "guarded drops are not supported on this engine yet".into(),
-        )),
+        Driver::Mssql => Box::pin(pbps_mssql::drop_requirements::check(conn, guard))
+            .await
+            .map_err(DbError::Refused),
     }
 }
 

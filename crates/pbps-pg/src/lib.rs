@@ -1211,33 +1211,20 @@ impl pbps_dialect::PlanDialect for Postgres {
         let defaults = emit::RowDefaultIndex::new(changes);
         Box::new(move |position| {
             let planned = &changes.changes[position];
-            // Lowering calls this closure directly, so guard handling belongs here.
             let context = defaults.at(position);
-            let mut statements = match mode {
-                pbps_model::PlanMode::Transactional => {
-                    emit::emit_in(self, &planned.change, planned.strategy, &context)?
-                }
-                pbps_model::PlanMode::Staged => {
-                    if planned.drop_guard.is_some() {
-                        return Err(DialectError::Invalid {
-                            dialect: "postgres",
-                            message: "guarded drops require a transactional plan; --staged is unsupported"
-                                .into(),
-                        });
+            pbps_dialect::drop_requirements::emit(
+                planned.drop_guard.as_ref(),
+                mode,
+                "postgres",
+                || match mode {
+                    pbps_model::PlanMode::Transactional => {
+                        emit::emit_in(self, &planned.change, planned.strategy, &context)
                     }
-                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)?
-                }
-            };
-            if let Some(guard) = &planned.drop_guard {
-                let first = statements
-                    .first_mut()
-                    .ok_or_else(|| DialectError::Invalid {
-                        dialect: "postgres",
-                        message: "a guarded drop emitted no statement".into(),
-                    })?;
-                first.drop_guard = Some(guard.clone());
-            }
-            Ok(statements)
+                    pbps_model::PlanMode::Staged => {
+                        emit::emit_staged_in(self, &planned.change, planned.strategy, &context)
+                    }
+                },
+            )
         })
     }
 

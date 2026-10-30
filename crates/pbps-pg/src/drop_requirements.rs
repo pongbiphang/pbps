@@ -70,18 +70,12 @@ pub async fn check(conn: &mut Conn, guard: &DropGuard) -> Result<(), String> {
         let rows = conn.query_with(&sql, &[]).await.map_err(|e| format!(
             "the row requirement `{}` of {} could not be evaluated (SQLSTATE {}); a query or privilege failure never permits removal",
             Escaped(&requirement.predicate), guard.table.shown(), e.server_error_code().as_deref().unwrap_or("unknown")))?;
-        let count = rows
-            .first()
-            .and_then(|r| r.try_get_at::<i64>(0).ok().flatten())
-            .filter(|n| *n >= 0)
-            .ok_or("the row requirement returned no readable count; nothing was removed")?;
-        if count > 0 {
-            return Err(format!(
-                "{count} row(s) of {} violate the row requirement `{}`; nothing was removed",
-                guard.table.shown(),
-                Escaped(&requirement.predicate)
-            ));
-        }
+        pbps_dialect::drop_requirements::check_count(
+            rows.first()
+                .and_then(|r| r.try_get_at::<i64>(0).ok().flatten()),
+            guard,
+            requirement,
+        )?;
     }
     Ok(())
 }

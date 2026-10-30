@@ -1167,7 +1167,7 @@ pub fn changes(cs: &ChangeSet) -> String {
 
 pub fn required_rows(guard: &pbps_model::DropGuard) -> Vec<String> {
     guard.requirements.values().map(|r| format!(
-        "{} requires `{}` immediately before removal; the scan holds ACCESS EXCLUSIVE through the drop, so readers and writers wait",
+        "{} requires `{}` immediately before removal; the scan holds an exclusive table lock through the drop, so writers wait",
         guard.table.shown(), Escaped(&r.predicate))).collect()
 }
 
