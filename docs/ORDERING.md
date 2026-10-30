@@ -259,7 +259,8 @@ a preliminary order. Pending weave projections, engine clauses and stored-row
 probes use the shared lineage and address evidence. At the final schedule and
 resolver boundaries, `PhysicalSources` supplies complete positional membership
 and physical column lists, followed by symbolic replay and a receipt bound to
-payload, events, logical origins and immutable input bindings (DEC-2296.10).
+payload, events, logical origins, immutable input bindings and current annotation
+boundaries (DEC-2296.10, DEC-2469.3).
 NULL and type predicates share the selected stored contributions and one RLS
 wrapper. Existing stages, Sink, brands, wire fields and release-verifier policy
 stay intact.
