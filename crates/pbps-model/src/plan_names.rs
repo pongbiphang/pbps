@@ -1,7 +1,7 @@
 //! Identity-preserving address translation through one ordered plan (DEC-1851.1).
 //!
 //! A name is an address, not an identity. Histories are shared by table,
-//! column and role namespaces; only the exhaustive extraction of typed changes
+//! column, role and type namespaces; only the exhaustive extraction of typed changes
 //! knows which kind of identity a change carries. This is not a catalog name
 //! allocator: even a managed address vacated by the plan can have an unmanaged
 //! catalog occupant that this input does not describe.
@@ -240,6 +240,7 @@ enum IdentityChange {
     Table(Transition<TableName>, ColumnLife),
     Column(Transition<ColumnRef>),
     Role(Transition<crate::RoleName>),
+    Type(Transition<crate::TypeRef>),
     Other,
 }
 
@@ -254,7 +255,7 @@ enum ColumnLife {
 
 /// This match is the one place a future identity-changing variant must answer.
 fn identity_change(step: usize, change: &Change) -> IdentityChange {
-    use IdentityChange::{Column, Other, Role, Table};
+    use IdentityChange::{Column, Other, Role, Table, Type};
     let kept = |column: &ColumnRef| Some(column.clone());
     match change {
         Change::RebuildPartitionedTable(_)
@@ -341,13 +342,22 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(from.clone()),
             Some(to.clone()),
         )),
+        Change::CreateType { uid, name, .. } => {
+            Type(Transition::new(step, uid, None, Some(name.clone())))
+        }
+        Change::DropType { uid, name, .. } => {
+            Type(Transition::new(step, uid, Some(name.clone()), None))
+        }
+        Change::RenameType { uid, from, to, .. } => Type(Transition::new(
+            step,
+            uid,
+            Some(from.clone()),
+            Some(to.clone()),
+        )),
         Change::AddEnumValue { .. }
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
-        | Change::CreateType { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { .. }
@@ -393,6 +403,10 @@ pub struct PlanNames<'p> {
     tables: History<TableName>,
     columns: History<(Uid, ColumnName)>,
     roles: History<crate::RoleName>,
+    // Type ownership was previously queried only at Base/Final. Retain an
+    // unreadable intermediate history until a type boundary asks for it;
+    // unrelated legacy plans must not acquire a new completion requirement.
+    types: Result<History<crate::TypeRef>, String>,
 }
 
 impl<'p> PlanNames<'p> {
@@ -421,6 +435,7 @@ impl<'p> PlanNames<'p> {
         let mut owner_events: BTreeMap<Uid, Vec<(usize, ColumnLife)>> = BTreeMap::new();
         let mut column_events = Vec::new();
         let mut role_events = Vec::new();
+        let mut type_events = Vec::new();
         for (i, p) in changes.iter().enumerate() {
             match identity_change(i, &p.change) {
                 IdentityChange::Table(e, life) => {
@@ -451,11 +466,14 @@ impl<'p> PlanNames<'p> {
                     }
                 }
                 IdentityChange::Role(e) => role_events.push(e),
+                IdentityChange::Type(e) => type_events.push(e),
                 IdentityChange::Other => {}
             }
         }
         let tables = History::of(&table_events, &after.tables, "table", UidKind::Table)?;
         let roles = History::of(&role_events, &after.roles, "role", UidKind::Role)?;
+        let types = History::of(&type_events, &after.types, "type", UidKind::Type)
+            .map_err(|why| why.to_string());
         let owned =
             |column: &ColumnRef, boundary: usize| match tables.holder(&column.table, boundary) {
                 Holder::Tracked(uid) => Ok((uid.clone(), column.name.clone())),
@@ -572,6 +590,7 @@ impl<'p> PlanNames<'p> {
             tables,
             columns,
             roles,
+            types,
         })
     }
 
@@ -599,6 +618,15 @@ impl<'p> PlanNames<'p> {
                 i + 1
             }
         }
+    }
+
+    /// Intermediate managed types use the same UID/address history as tables
+    /// and roles. Unknown, vacant and unreadable remain separate outcomes.
+    pub fn type_holder(&self, name: &crate::TypeRef, at: At) -> Result<Holder<'_>, &str> {
+        self.types
+            .as_ref()
+            .map(|types| types.holder(name, self.boundary(at)))
+            .map_err(String::as_str)
     }
 
     pub fn table_at(&self, table: &Uid, at: At) -> Option<&TableName> {

@@ -141,38 +141,48 @@ impl<'a> DomainDelta<'a> {
         })
     }
 
-    /// The domain once `Loosen` has run: what `from` keeps of what `to` still
-    /// holds, with `to`'s default. The re-read after that half is held to it.
-    pub fn loosened(from: &ManagedType, to: &ManagedType) -> Option<ManagedType> {
-        let (
-            ManagedType::Domain {
-                base,
-                not_null: was_not_null,
-                checks: was_checks,
-                collation,
-                ..
-            },
-            ManagedType::Domain {
-                not_null,
-                default,
-                checks,
-                ..
-            },
-        ) = (from, to)
+    /// Apply only this delta's half to the definition currently installed.
+    /// Creation facets may commute: replay must retain the other installed
+    /// facets, rather than replace them with a recipe's earlier snapshot.
+    pub fn apply_to(&self, current: &ManagedType, half: DomainHalf) -> Option<ManagedType> {
+        let mut current = current.clone();
+        let ManagedType::Domain {
+            not_null,
+            default,
+            checks,
+            ..
+        } = &mut current
         else {
             return None;
         };
-        Some(ManagedType::Domain {
-            base: base.clone(),
-            not_null: *was_not_null && *not_null,
-            default: default.clone(),
-            checks: was_checks
-                .iter()
-                .filter(|(name, text)| checks.get(*name) == Some(*text))
-                .map(|(name, text)| (name.clone(), text.clone()))
-                .collect(),
-            collation: collation.clone(),
-        })
+        match half {
+            DomainHalf::Loosen => {
+                for name in &self.drop_checks {
+                    checks.remove(*name);
+                }
+                if self.drop_not_null {
+                    *not_null = false;
+                }
+                if let Some(value) = self.default {
+                    *default = value.map(str::to_owned);
+                }
+            }
+            DomainHalf::Tighten => {
+                if self.set_not_null {
+                    *not_null = true;
+                }
+                for (name, expression) in &self.add_checks {
+                    checks.insert((*name).clone(), (*expression).to_owned());
+                }
+            }
+        }
+        Some(current)
+    }
+
+    /// The domain once `Loosen` has run; per-statement checks use this same
+    /// delta replay as authored records and reordered creation facets.
+    pub fn loosened(from: &ManagedType, to: &ManagedType) -> Option<ManagedType> {
+        DomainDelta::of(from, to)?.apply_to(from, DomainHalf::Loosen)
     }
 
     /// Whether the `Loosen` half has a statement.

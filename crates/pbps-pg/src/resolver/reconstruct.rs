@@ -378,6 +378,9 @@ impl Reconstruction {
                         None,
                     )?);
                 }
+                Change::AlterDomain { name, .. } if is_part => {
+                    steps.push(make(&format!("domain {}", name.shown()), Vec::new(), None)?);
+                }
                 Change::CreateModule { id, module } => {
                     // A trigger is named by nothing and names its function
                     // with an exact signature.
@@ -1114,7 +1117,7 @@ fn part(
                 Change::CreateModule { id, .. } => {
                     Some(pbps_model::diagnostic::Declaration::Module(id.clone()))
                 }
-                Change::CreateType { name, .. } => {
+                Change::CreateType { name, .. } | Change::AlterDomain { name, .. } => {
                     Some(pbps_model::diagnostic::Declaration::Type(name.clone()))
                 }
                 other => other

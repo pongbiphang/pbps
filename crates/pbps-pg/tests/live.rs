@@ -46,6 +46,9 @@ mod alias_batches;
 #[path = "support/creation2469.rs"]
 mod creation2469;
 
+#[path = "support/domain2469.rs"]
+mod domain2469;
+
 #[path = "support/annotations2469.rs"]
 mod annotations2469;
 

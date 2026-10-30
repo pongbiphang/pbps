@@ -267,6 +267,9 @@ pub(super) fn constraints(
                     Err(e @ OwnerError::Outside { .. }) => {
                         unreachable!("a prepared step outside its logical plan: {e}")
                     }
+                    Err(e @ OwnerError::Names { .. }) => {
+                        unreachable!("a prepared step has invalid name history: {e}")
+                    }
                 }),
         })
         .collect();

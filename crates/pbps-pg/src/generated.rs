@@ -302,6 +302,7 @@ fn cursor_parameter_types(tokens: &[Token<'_>]) -> Vec<std::ops::Range<usize>> {
     spans
 }
 
+pub(crate) mod domains;
 mod parts;
 pub(crate) use parts::demanded;
 pub(crate) use parts::parts;

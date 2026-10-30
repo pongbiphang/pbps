@@ -398,6 +398,12 @@ pub enum OwnerError {
     /// A managed name nothing holds at that boundary.
     #[error("nothing holds `{name}` at {spelling:?}")]
     Vacant { name: String, spelling: Spelling },
+    #[error("cannot bind {name} at {spelling:?}: {why}")]
+    Names {
+        name: String,
+        spelling: Spelling,
+        why: String,
+    },
     /// The step's position is outside the logical plan the owners index.
     #[error("{spelling:?} is outside the indexed plan")]
     Outside { spelling: Spelling },
@@ -493,10 +499,18 @@ impl Owners for PlanOwners<'_> {
                     })
             }
             Spelling::Input(_) => Err(OwnerError::Outside { spelling }),
-            Spelling::At(_) => Err(OwnerError::Unmanaged {
-                name: name.shown().to_string(),
-                spelling,
-            }),
+            Spelling::At(_) => {
+                let at = self.inside(spelling)?;
+                let holder = self
+                    .names
+                    .type_holder(name, at)
+                    .map_err(|why| OwnerError::Names {
+                        name: name.shown().to_string(),
+                        spelling,
+                        why: why.to_owned(),
+                    })?;
+                held(holder, name.shown().to_string(), spelling)
+            }
         }
     }
 

@@ -273,6 +273,10 @@ impl Contract {
         })
     }
 
+    pub(crate) fn goal_ids(&self) -> &IdsFile {
+        &self.after.ids
+    }
+
     #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) fn demands(
         &self,

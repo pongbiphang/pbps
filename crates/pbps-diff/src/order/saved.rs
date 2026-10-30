@@ -518,7 +518,17 @@ pub fn validate_saved_plan(
                 uid.kind() == pbps_model::UidKind::Type
                     && plan.ids.types.get(uid) == Some(name)
                     && plan.declared_type_pins.iter().any(|p| {
-                        p.uid == *uid && p.before.is_none() && p.definition == **definition
+                        p.uid == *uid
+                            && p.before.is_none()
+                            && match (definition.as_ref(), &p.definition) {
+                                // Intermediate domain creation is replayed against
+                                // its final pin by valid_steps below.
+                                (
+                                    pbps_model::ManagedType::Domain { .. },
+                                    pbps_model::ManagedType::Domain { .. },
+                                ) => true,
+                                _ => p.definition == **definition,
+                            }
                     })
             }
             pbps_model::Change::RenameType { uid, from, to, .. } => {
