@@ -66,7 +66,8 @@ fn demanded_suffix_and_forward_generations_share_one_legal_recipe() {
                                     | Change::AddIndex { .. }
                             )
                         {
-                            assert!(install < at);
+                            let input = steps.iter().position(|p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "b")).unwrap();
+                            assert!(input < at, "validators in this fixture read b");
                         }
                     }
                 }

@@ -977,3 +977,17 @@ PostgreSQL a generated expression that loses an input receives the existing
 placeholder/SET EXPRESSION recipe; an unavailable capability is a named refusal.
 Whole-row and partition shape requirements keep their indivisible group. SQL
 Server resolves ordinary and computed suffixes together in its model order.
+
+Extracted prefix facets require their named columns and the inputs found by the
+engine recipe's existing may-read scan, rather than every physical suffix part.
+A placeholder supplies column existence independently of its final generation.
+Whole-row reads retain the complete frontier; foreign keys
+require their local and referenced columns, and replica identity requires its
+key or index. Physical appends still preserve declaration order. This refinement
+uses the transient extended annotation contract; an empty demand retains the
+legacy constraints and proof bytes (DEC-2469.4).
+
+The shared UID/first-write analysis also describes whether column DDL has any
+row values to write. Before an empty root table's first write, ADD COLUMN and
+SET EXPRESSION retain their object/input effects without advertising a value
+rewrite. Standing tables, partition moves and post-write DDL keep those effects.
