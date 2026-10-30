@@ -1,5 +1,5 @@
 //! Per-database declarations and ownership stay separate (DEC-2501.1).
-use crate::{LoadError, Loaded, load_schema_dir};
+use crate::{LoadError, Loaded, collect_files, load_file};
 use pbps_model::{DatabaseMap, DatabaseName, IdsFile, ProjectSchemas, UidReservations};
 use std::{
     collections::BTreeSet,
@@ -52,6 +52,50 @@ fn io(path: &Path, source: std::io::Error) -> ProjectLoadError {
 }
 fn canonical(path: &Path) -> Result<PathBuf, ProjectLoadError> {
     std::fs::canonicalize(path).map_err(|e| io(path, e))
+}
+
+// Directory aliases can cross database ownership or traverse the same tree
+// twice. Discover confined files once, then reuse the ordinary loader's merge
+// and diagnostics; the legacy flat-directory traversal keeps its existing rules.
+fn database_files(db: &DatabaseName, path: &Path) -> Result<Vec<PathBuf>, ProjectLoadError> {
+    let root = canonical(path)?;
+    let mut pending = vec![path.to_owned()];
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    let invalid = |path: &Path| {
+        ProjectLoadError::Layout(format!(
+            "database `{}` has an aliased or escaping declaration path `{}`",
+            db.shown(),
+            path.display()
+        ))
+    };
+    while let Some(dir) = pending.pop() {
+        let real = canonical(&dir)?;
+        if !real.starts_with(&root) || !seen.insert(real) {
+            return Err(invalid(&dir));
+        }
+        for entry in std::fs::read_dir(&dir).map_err(|e| io(&dir, e))? {
+            let entry = entry.map_err(|e| io(&dir, e))?;
+            let path = entry.path();
+            let meta = std::fs::metadata(&path).map_err(|e| io(&path, e))?;
+            if meta.is_dir() {
+                if entry.file_type().map_err(|e| io(&path, e))?.is_symlink() {
+                    return Err(invalid(&path));
+                }
+                pending.push(path);
+            } else if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("yml") | Some("yaml")
+            ) {
+                if !canonical(&path)?.starts_with(&root) {
+                    return Err(invalid(&path));
+                }
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Load `schema/<database>/` using the same single-schema loader for each DB.
@@ -108,7 +152,8 @@ pub fn load_database_dirs(
     let ids = directories.try_map(|_, path| read_ids(&path.join("schema.ids.json")))?;
     let reservations = UidReservations::from_files(&ids).map_err(ProjectLoadError::Layout)?;
     let loaded = directories.try_map(|db, path| {
-        load_schema_dir(path).map_err(|errors| ProjectLoadError::Declarations {
+        let files = database_files(db, path)?;
+        collect_files(files, load_file).map_err(|errors| ProjectLoadError::Declarations {
             database: db.clone(),
             errors,
         })

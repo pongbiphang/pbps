@@ -181,3 +181,152 @@ fn rename_intent_is_kept_in_its_database_and_cannot_name_another_database() {
     };
     assert_eq!(database, db("alpha"));
 }
+
+#[cfg(unix)]
+#[test]
+fn nested_cross_database_directory_links_are_refused() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let paths = dir.paths();
+    let alpha = paths.get(&db("alpha")).unwrap();
+    let beta = paths.get(&db("beta")).unwrap();
+    std::fs::write(beta.join("table.yml"), declaration()).unwrap();
+    symlink("../beta", alpha.join("imported")).unwrap();
+    let error = load_database_dirs(&paths).unwrap_err();
+    assert!(matches!(error, ProjectLoadError::Layout(_)));
+    assert!(error.to_string().contains("alpha"));
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_cross_database_declaration_links_are_refused() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let paths = dir.paths();
+    let alpha = paths.get(&db("alpha")).unwrap();
+    let beta = paths.get(&db("beta")).unwrap();
+    std::fs::write(beta.join("table.yml"), declaration()).unwrap();
+    symlink("../beta/table.yml", alpha.join("imported.yaml")).unwrap();
+    let error = load_database_dirs(&paths).unwrap_err();
+    assert!(matches!(error, ProjectLoadError::Layout(_)));
+    assert!(error.to_string().contains("alpha"));
+}
+
+#[test]
+fn regular_nested_declarations_keep_database_ownership_and_source_paths() {
+    let dir = Dir::new();
+    let paths = dir.paths();
+    for (database, path) in paths.iter() {
+        let nested = path.join("tables/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let table_name = ["dbo.only_", database.raw()].concat();
+        std::fs::write(
+            nested.join("table.yaml"),
+            declaration().replace("dbo.same", &table_name),
+        )
+        .unwrap();
+    }
+    let loaded = load_database_dirs(&paths).unwrap();
+    for (database, path) in paths.iter() {
+        let own = loaded.loaded().get(database).unwrap();
+        assert_eq!(own.schema.tables.len(), 1);
+        let table_name = ["dbo.only_", database.raw()].concat();
+        assert!(own.schema.tables.contains_key(&table_name.parse().unwrap()));
+        assert_eq!(own.sources.len(), 1);
+        assert_eq!(
+            own.sources.values().next().unwrap(),
+            &path.join("tables/nested/table.yaml")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_directory_aliases_refuse_even_when_the_target_is_empty() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let paths = dir.paths();
+    let alpha = paths.get(&db("alpha")).unwrap();
+    std::fs::create_dir(alpha.join("empty")).unwrap();
+    symlink("empty", alpha.join("alias")).unwrap();
+    assert!(matches!(
+        load_database_dirs(&paths),
+        Err(ProjectLoadError::Layout(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_directory_cycles_refuse_before_declaration_traversal() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let paths = dir.paths();
+    symlink(".", paths.get(&db("alpha")).unwrap().join("cycle")).unwrap();
+    assert!(matches!(
+        load_database_dirs(&paths),
+        Err(ProjectLoadError::Layout(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn declaration_file_links_within_the_database_keep_ownership() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let paths = dir.paths();
+    let alpha = paths.get(&db("alpha")).unwrap();
+    let beta = paths.get(&db("beta")).unwrap();
+    std::fs::write(alpha.join("definition.txt"), declaration()).unwrap();
+    std::fs::write(beta.join("notes.txt"), "not a declaration").unwrap();
+    symlink("definition.txt", alpha.join("table.yml")).unwrap();
+    symlink("../beta/notes.txt", alpha.join("notes.md")).unwrap();
+    let loaded = load_database_dirs(&paths).unwrap();
+    assert_eq!(
+        loaded
+            .loaded()
+            .get(&db("alpha"))
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        1
+    );
+    assert!(
+        loaded
+            .loaded()
+            .get(&db("beta"))
+            .unwrap()
+            .schema
+            .tables
+            .is_empty()
+    );
+    assert_eq!(
+        loaded
+            .loaded()
+            .get(&db("alpha"))
+            .unwrap()
+            .sources
+            .values()
+            .next()
+            .unwrap(),
+        &alpha.join("table.yml")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn flat_directory_links_keep_the_existing_loader_behavior() {
+    use std::os::unix::fs::symlink;
+    let flat = Dir::new();
+    let external = Dir::new();
+    std::fs::write(external.0.join("table.yml"), declaration()).unwrap();
+    symlink(&external.0, flat.0.join("imported")).unwrap();
+    assert_eq!(
+        pbps_load::load_schema_dir(&flat.0)
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        1
+    );
+}
