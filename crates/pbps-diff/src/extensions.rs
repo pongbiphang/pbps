@@ -1,15 +1,21 @@
 use crate::{Side, schema_diff::DiffError};
 use std::collections::BTreeSet;
 
-/// The already-adopted packages a scratch bootstrap must start with.
+/// The adopted packages a connected or scratch bootstrap must already hold.
 ///
-/// This is not a target baseline or lifecycle permission: scratch consumers
-/// must verify these exact prerequisites before compiling managed objects.
+/// This is not lifecycle permission: callers must verify these exact
+/// prerequisites before compiling managed objects and before recording them.
 /// Real target differences continue through `differences` (DEC-2447.1).
-pub fn scratch_base(desired: Side<'_>) -> (pbps_model::Schema, pbps_model::IdsFile) {
+pub fn bootstrap_base(desired: Side<'_>) -> (pbps_model::Schema, pbps_model::IdsFile) {
     (
         pbps_model::Schema {
-            extensions: desired.schema.extensions.clone(),
+            extensions: desired
+                .schema
+                .extensions
+                .iter()
+                .filter(|(name, _)| desired.ids.extension_uid(name).is_some())
+                .map(|(name, definition)| (name.clone(), definition.clone()))
+                .collect(),
             ..Default::default()
         },
         pbps_model::IdsFile {
@@ -40,6 +46,11 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
         .extensions
         .keys()
         .chain(desired.schema.extensions.keys())
+        // A full catalog read is inventory, not an adoption. Match the managed
+        // scope even when a caller passes an unprojected read (DEC-2447.2).
+        .filter(|name| {
+            base.ids.extension_uid(name).is_some() || desired.ids.extension_uid(name).is_some()
+        })
         .collect::<BTreeSet<_>>()
     {
         if dialect != "postgres" {
@@ -99,6 +110,55 @@ mod tests {
     use pbps_model::{Extension, IdsFile, Schema};
 
     #[test]
+    fn unowned_inventory_does_not_request_lifecycle_in_either_direction() {
+        for name in ["plpgsql", "citext", "vendor_default"] {
+            for namespace in ["pg_catalog", "packages"] {
+                let schema = Schema {
+                    extensions: [(
+                        name.into(),
+                        Extension {
+                            schema: namespace.into(),
+                            version: "exact".into(),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let empty = Schema::default();
+                let no_ids = IdsFile::default();
+                let unowned = Side {
+                    schema: &schema,
+                    ids: &no_ids,
+                };
+                let absent = Side {
+                    schema: &empty,
+                    ids: &no_ids,
+                };
+                assert!(differences(unowned, absent, "postgres").is_empty());
+                assert!(differences(absent, unowned, "postgres").is_empty());
+                assert!(bootstrap_base(unowned).0.extensions.is_empty());
+                let ids = IdsFile {
+                    extensions: [("e_000001".parse().unwrap(), name.into())].into(),
+                    ..Default::default()
+                };
+                let owned = Side {
+                    schema: &schema,
+                    ids: &ids,
+                };
+                for (before, after, action) in [
+                    (absent, owned, "CREATE EXTENSION"),
+                    (owned, absent, "DROP EXTENSION"),
+                    (unowned, owned, "identity"),
+                ] {
+                    let errors = differences(before, after, "postgres");
+                    assert_eq!(errors.len(), 1);
+                    assert!(errors[0].to_string().contains(action));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scratch_prerequisites_preserve_packages_without_authorizing_target_creation() {
         let schema = Schema {
             extensions: [(
@@ -119,7 +179,7 @@ mod tests {
             schema: &schema,
             ids: &ids,
         };
-        let (scratch, scratch_ids) = scratch_base(desired);
+        let (scratch, scratch_ids) = bootstrap_base(desired);
         assert_eq!(scratch.extensions, schema.extensions);
         assert_eq!(scratch_ids.extensions, ids.extensions);
         assert!(

@@ -134,6 +134,15 @@ async fn bootstrap(conn: &mut Conn, schema: &Schema, hints: &Hints) {
     let ids = pbps_diff::resolve(schema, &base_ids, &[], &context())
         .unwrap()
         .ids;
+    // Full catalog fixtures include preinstalled packages, not install requests.
+    let problems = crate::resolver::scratch::extension_prerequisites(conn, &schema.extensions)
+        .await
+        .unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(side(schema, &ids));
+    empty.extensions = prerequisites.extensions;
+    let mut base_ids = base_ids;
+    base_ids.extensions = prerequisite_ids.extensions;
     let plan = pbps_diff::diff(
         side(&empty, &base_ids),
         side(schema, &ids),

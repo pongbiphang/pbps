@@ -563,3 +563,225 @@ fn scratch_without_the_exact_installable_extension_version_is_named() {
         );
     });
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn connected_bootstrap_adopts_exact_preinstalled_packages_without_lifecycle_ddl() {
+    servers(|admin, slug| {
+        let source = OwnDatabase::new(admin, &format!("extensions2447-bootstrap-source-{slug}"));
+        let target = OwnDatabase::new(admin, &format!("extensions2447-bootstrap-target-{slug}"));
+        for connection in [source.connection(), target.connection()] {
+            // The server-selected defaults differ across majors. Pull pins what
+            // was installed; neither the name nor pg_catalog grants an exemption.
+            on_server(
+                connection,
+                "CREATE SCHEMA ext; CREATE SCHEMA app; CREATE EXTENSION citext SCHEMA pg_catalog; CREATE EXTENSION hstore SCHEMA ext;",
+            );
+        }
+        on_server(source.connection(), "CREATE TABLE app.ordinary(id integer)");
+        on_server(
+            target.connection(),
+            "CREATE EXTENSION pgcrypto SCHEMA ext VERSION '1.3'",
+        );
+        let d = Demo::new(&format!("extensions2447-bootstrap-{slug}"));
+        succeeds(d.run(&["pull", "--db", source.connection()]));
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        assert!(loaded.schema.extensions.contains_key("citext"));
+        assert!(!loaded.schema.extensions.contains_key("pgcrypto"));
+        let inventory = "SELECT jsonb_agg(jsonb_build_array(extname,extnamespace,extversion,oid) ORDER BY extname)::text FROM pg_extension";
+        let before = text_of(target.connection(), inventory);
+        succeeds(d.run(&["bootstrap", "--db", target.connection()]));
+        assert_eq!(text_of(target.connection(), inventory), before);
+        succeeds(d.run(&["verify", "--db", target.connection()]));
+        let report = findings(&d, target.connection());
+        assert_eq!(report["data"]["changes"], 0, "{report}");
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "plan.unheld-object"
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("extension `pgcrypto`")),
+            "{report}"
+        );
+        // Recorded ownership must still make an explicit removal a refused DROP.
+        std::fs::remove_file(extension_file(&d, "hstore")).unwrap();
+        d.commit();
+        assert_refused(&d, target.connection(), "DROP EXTENSION", "hstore");
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_requires_exact_packages_before_creation_and_recording() {
+    servers(|admin, slug| {
+        let source = OwnDatabase::new(admin, &format!("extensions2447-required-source-{slug}"));
+        on_server(
+            source.connection(),
+            "CREATE SCHEMA ext; CREATE SCHEMA app; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE TABLE app.ordinary(id integer)",
+        );
+        let d = Demo::new(&format!("extensions2447-required-{slug}"));
+        succeeds(d.run(&["pull", "--db", source.connection()]));
+        d.commit();
+        for (case, install, expected) in [
+            ("absent", "", "CREATE EXTENSION"),
+            (
+                "version",
+                "CREATE EXTENSION hstore SCHEMA ext VERSION '1.8'",
+                "UPDATE",
+            ),
+            (
+                "schema",
+                "CREATE EXTENSION hstore SCHEMA other VERSION '1.4'",
+                "SET SCHEMA",
+            ),
+            (
+                "occupied",
+                "CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE TABLE app.ordinary(id integer)",
+                "already has",
+            ),
+        ] {
+            let target = OwnDatabase::new(admin, &format!("extensions2447-required-{case}-{slug}"));
+            on_server(
+                target.connection(),
+                "CREATE SCHEMA ext; CREATE SCHEMA other; CREATE SCHEMA app",
+            );
+            if !install.is_empty() {
+                on_server(target.connection(), install);
+            }
+            let out = d.run(&["bootstrap", "--db", target.connection()]);
+            assert_ne!(code(&out), 0);
+            let message = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(message.contains(expected), "{case}: {message}");
+            if case != "occupied" {
+                assert!(message.contains("hstore"), "{message}");
+                assert_eq!(
+                    text_of(
+                        target.connection(),
+                        "SELECT (to_regclass('app.ordinary') IS NULL)::text"
+                    ),
+                    "true"
+                );
+            }
+            if text_of(
+                target.connection(),
+                "SELECT (to_regclass('public.__pbps_state') IS NOT NULL)::text",
+            ) == "true"
+            {
+                assert_eq!(
+                    text_of(
+                        target.connection(),
+                        "SELECT count(*)::text FROM public.__pbps_state"
+                    ),
+                    "0"
+                );
+            }
+        }
+        let target = OwnDatabase::new(admin, &format!("extensions2447-closing-{slug}"));
+        on_server(
+            target.connection(),
+            "CREATE SCHEMA ext; CREATE SCHEMA other; CREATE SCHEMA app; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE FUNCTION public.move_package() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF tg_tag = 'CREATE TABLE' AND to_regclass('app.ordinary') IS NOT NULL THEN ALTER EXTENSION hstore SET SCHEMA other; END IF; END $$; CREATE EVENT TRIGGER move_package ON ddl_command_end EXECUTE FUNCTION public.move_package()",
+        );
+        let out = d.run(&["bootstrap", "--db", target.connection()]);
+        assert_ne!(
+            code(&out),
+            0,
+            "closing drift was recorded: {}",
+            stdout(&out)
+        );
+        assert!(stderr(&out).contains("SET SCHEMA"), "{}", stderr(&out));
+        assert_eq!(
+            text_of(
+                target.connection(),
+                "SELECT (to_regclass('app.ordinary') IS NULL)::text"
+            ),
+            "true"
+        );
+        assert_eq!(
+            text_of(
+                target.connection(),
+                "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='hstore'"
+            ),
+            "ext"
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_sql_checks_exact_packages_on_the_replay_target_before_ddl() {
+    servers(|admin, slug| {
+        let source = OwnDatabase::new(admin, &format!("extensions2447-sql-source-{slug}"));
+        on_server(
+            source.connection(),
+            "CREATE SCHEMA ext; CREATE SCHEMA app; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE TABLE app.ordinary(id integer)",
+        );
+        let d = Demo::new(&format!("extensions2447-sql-{slug}"));
+        succeeds(d.run(&["pull", "--db", source.connection()]));
+        d.commit();
+        let path = d.dir.join("bootstrap.sql");
+        succeeds(d.run(&["bootstrap", "--sql", path.to_str().unwrap()]));
+        let sql = std::fs::read_to_string(&path).unwrap();
+        assert!(!sql.contains("CREATE EXTENSION"));
+        for (case, install) in [
+            ("exact", "CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'"),
+            ("absent", ""),
+            (
+                "version",
+                "CREATE EXTENSION hstore SCHEMA ext VERSION '1.8'",
+            ),
+            (
+                "schema",
+                "CREATE EXTENSION hstore SCHEMA other VERSION '1.4'",
+            ),
+        ] {
+            let target = OwnDatabase::new(admin, &format!("extensions2447-sql-{case}-{slug}"));
+            on_server(
+                target.connection(),
+                "CREATE SCHEMA ext; CREATE SCHEMA other; CREATE SCHEMA app",
+            );
+            if !install.is_empty() {
+                on_server(target.connection(), install);
+            }
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut conn =
+                        pbps_db::Conn::connect(pbps_db::Driver::Postgres, target.connection())
+                            .await
+                            .unwrap();
+                    conn.execute(&sql).await.map_err(|e| e.to_string())
+                });
+            if case == "exact" {
+                result.unwrap();
+                assert_eq!(
+                    text_of(
+                        target.connection(),
+                        "SELECT (to_regclass('app.ordinary') IS NOT NULL)::text"
+                    ),
+                    "true"
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("required extension `hstore`"),
+                    "{case}: {error}"
+                );
+                assert_eq!(
+                    text_of(
+                        target.connection(),
+                        "SELECT (to_regclass('app.ordinary') IS NULL)::text"
+                    ),
+                    "true"
+                );
+            }
+        }
+    });
+}

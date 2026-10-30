@@ -138,7 +138,7 @@ pub async fn run<D: crate::emission::Engine>(
     refuse_absent_roles(conn, &named).await?;
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
-    let (prerequisites, prerequisite_ids) = pbps_diff::scratch_base(plan.desired);
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.desired);
     let bootstrap = pbps_diff::diff(
         pbps_diff::Side {
             schema: &prerequisites,

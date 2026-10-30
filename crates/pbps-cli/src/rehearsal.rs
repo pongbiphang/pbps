@@ -220,7 +220,7 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
         .collect();
     let ids = &ids.without_types(&absent);
     let (prerequisites, prerequisite_ids) =
-        pbps_diff::scratch_base(pbps_diff::Side { schema, ids });
+        pbps_diff::bootstrap_base(pbps_diff::Side { schema, ids });
     let build = pbps_diff::diff(
         pbps_diff::Side {
             schema: &prerequisites,
