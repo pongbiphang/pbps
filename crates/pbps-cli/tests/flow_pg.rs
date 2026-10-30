@@ -8085,19 +8085,35 @@ fn pull_draws_the_line_the_projects_own_rules_draw() {
 const POLICIES_NO_PATTERN: &str =
     "dialect: postgres\npolicies:\n  rules:\n    naming.table: {severity: error}\n";
 
-/// Every file under the project's `schema/` and its identity file, by path,
-/// with its bytes: what a refused `pull` must leave exactly as it found it.
+/// Nested declarations and other fixture files retain their relative paths.
+fn schema_files_and_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let root = dir.join("schema");
+    let mut pending = vec![root.clone()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else {
+                files.push((
+                    path.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Every schema file and the identity file: what a refused pull must preserve.
 fn declarations_and_ids(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
-    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir.join("schema"))
-        .unwrap()
-        .map(|e| {
-            let path = e.unwrap().path();
-            (
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                std::fs::read(&path).unwrap(),
-            )
-        })
-        .collect();
+    let mut out = schema_files_and_bytes(dir);
     if let Ok(ids) = std::fs::read(dir.join("schema.ids.json")) {
         out.push(("schema.ids.json".into(), ids));
     }
@@ -18284,9 +18300,9 @@ fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
     succeeds(d.run(&["pull", "--db", connection]));
     d.commit();
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
-    let trigger = std::fs::read_dir(d.dir.join("schema"))
+    let trigger = pbps_load::schema_files(&d.dir.join("schema"))
         .unwrap()
-        .map(|e| e.unwrap().path())
+        .into_iter()
         .find(|p| {
             std::fs::read_to_string(p)
                 .unwrap()
@@ -29330,21 +29346,21 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     on_server(&pln, "CREATE SCHEMA app");
     let d = {
         let later = Demo::new("boot-1585-planned");
-        std::fs::copy(
-            d.dir.join("schema/app.a_plain.yml"),
-            later.dir.join("schema/app.a_plain.yml"),
-        )
-        .unwrap();
+        // Partial object bootstraps carry the same adopted package prerequisites.
+        for (path, bytes) in schema_files_and_bytes(&d.dir) {
+            if path == "app.a_plain.yml" || std::path::Path::new(&path).starts_with("extensions") {
+                let target = later.dir.join("schema").join(path);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, bytes).unwrap();
+            }
+        }
         succeeds(later.run(&["plan"]));
         later.commit();
         succeeds(later.run(&["bootstrap", "--db", &pln]));
-        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
-            let path = entry.unwrap().path();
-            std::fs::copy(
-                &path,
-                later.dir.join("schema").join(path.file_name().unwrap()),
-            )
-            .unwrap();
+        for (path, bytes) in schema_files_and_bytes(&d.dir) {
+            let target = later.dir.join("schema").join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
         }
         succeeds(later.run(&["plan"]));
         later.commit();
@@ -34709,13 +34725,10 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         on_server(fresh.connection(), "CREATE SCHEMA app");
         let other = Demo::new("rls-bootstrap1172");
         other.keyed(fresh.connection());
-        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(
-                entry.path(),
-                other.dir.join("schema").join(entry.file_name()),
-            )
-            .unwrap();
+        for (path, bytes) in schema_files_and_bytes(&d.dir) {
+            let target = other.dir.join("schema").join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
         }
         std::fs::copy(
             d.dir.join("schema.ids.json"),
@@ -34965,9 +34978,9 @@ fn row_security_routine_renames_and_rebuilds_refuse_only_policy_callers() {
                 // Routine identity is its name/signature (no UID rename).
                 // Declaring its new name removes the old routine and creates
                 // the new one, so the existing dependent refusal must apply.
-                let path = std::fs::read_dir(d.dir.join("schema"))
+                let path = pbps_load::schema_files(&d.dir.join("schema"))
                     .unwrap()
-                    .map(|p| p.unwrap().path())
+                    .into_iter()
                     .find(|p| {
                         std::fs::read_to_string(p)
                             .unwrap()

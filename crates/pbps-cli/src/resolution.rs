@@ -325,7 +325,7 @@ pub(crate) async fn resolve(
         ));
     }
     let dialect = crate::dialect_for(request.project.config.dialect);
-    let (prerequisites, prerequisite_ids) = pbps_diff::scratch_base(request.desired);
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(request.desired);
     let bootstrap = pbps_diff::diff(
         pbps_diff::Side {
             schema: &prerequisites,

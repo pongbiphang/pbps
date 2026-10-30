@@ -5042,10 +5042,16 @@ fn cmd_plan(
         }
 
         if base.is_empty_fallback {
-            let message = format!(
+            let mut message = format!(
                 "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
                 base.description
             );
+            if !loaded.schema.extensions.is_empty() {
+                message = format!(
+                    "the baseline is empty ({}). Ordinary objects are listed as newly created; extension declarations are unverified prerequisites. This is not a real plan against an existing database.",
+                    base.description
+                );
+            }
             if json {
                 findings.push(output::Finding::warning("baseline.empty", message));
             } else {
@@ -5076,6 +5082,19 @@ fn cmd_plan(
         // nothing and the overlay leaves it as it is.
         hints.record_row_defaults(&base.schema);
         let mut base_schema = base.declared.overlay(&base.schema);
+        let mut base_ids = (*base.ids).clone();
+        if base.is_empty_fallback {
+            // With no historical model this is an authoring preview, not a
+            // request to install packages. Connected commands must verify the
+            // exact prerequisites before recording them (DEC-2447.2).
+            let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(Side {
+                schema: &loaded.schema,
+                ids: &res.ids,
+            });
+            base_schema.extensions = prerequisites.extensions;
+            base_ids.extensions = prerequisite_ids.extensions;
+        }
+        let base_ids = base_ids.validated()?;
         // A snapshot is a read, which knows the sequence names it leaves out; a
         // git baseline is declarations, which do not (#1631).
         if let baseline::Source::File(_) = source {
@@ -5084,7 +5103,7 @@ fn cmd_plan(
         let cs = pbps_diff::diff(
             Side {
                 schema: &base_schema,
-                ids: &base.ids,
+                ids: &base_ids,
             },
             Side {
                 schema: &loaded.schema,
@@ -5195,7 +5214,7 @@ fn cmd_plan(
                     sources: dependents::Sources {
                         before: Side {
                             schema: &base_schema,
-                            ids: &base.ids,
+                            ids: &base_ids,
                         },
                         after: &res.ids,
                     },
@@ -5209,7 +5228,7 @@ fn cmd_plan(
         let skipped = scheduled.skipped;
         let mut cs = scheduled.changes;
         findings.extend(deploy::type_replacement_warnings(
-            &base.ids,
+            &base_ids,
             &res.ids,
             cs.changes(),
             json,
@@ -5226,7 +5245,7 @@ fn cmd_plan(
             false,
             Side {
                 schema: &base_schema,
-                ids: &base.ids,
+                ids: &base_ids,
             },
             Side {
                 schema: &loaded.schema,
@@ -5431,8 +5450,12 @@ fn cmd_plan(
                 "rehearsal.unavailable",
                 dev::rehearse(
                     &spec,
-                    &base.schema,
-                    &base.ids,
+                    if base.is_empty_fallback {
+                        &base_schema
+                    } else {
+                        &base.schema
+                    },
+                    &base_ids,
                     &base.hints,
                     &loaded.schema,
                     &res.ids,

@@ -4471,3 +4471,38 @@ server default or skipping the package. The existing environment compatibility
 check still requires target versions to be available on scratch. This rule
 keeps extension code execution/provider certification in the later slices;
 real-target CREATE/DROP/UPDATE/SET SCHEMA differences keep their refusals.
+
+
+<a id="dec-2447-2"></a>
+
+**DEC-2447.2. Installed inventory is not ownership; bootstrap verifies package prerequisites.**
+
+A raw PostgreSQL read includes all installed packages, while a programmatic
+model or a managed-scope cut can omit unheld packages. Compare extension
+lifecycle only for names held by an extension UID on either side. Inventory
+alone cannot request CREATE or DROP, including when it appears only on the
+read-back side. An explicit adoption, identity replacement, removal, version
+change or relocation remains subject to DEC-2447.1's named refusal in an
+ordinary plan. Neither a package name, a system schema, an OID nor an available
+server-default version grants ownership or exempts a managed difference.
+
+Measured on pinned PostgreSQL 16 and 18, template0 starts with plpgsql only.
+The available default for citext differs across the two majors; hstore and
+citext installed with their server defaults, including citext in pg_catalog,
+are inherited exactly when their database is used as a template. Thus being
+preinstalled is a property of the target, not a hard-coded package category.
+Full pull continues to declare every installed package with exact metadata.
+
+Connected bootstrap is an explicit adoption into an empty ordinary managed
+set. As with standing cluster roles and scratch bootstrap, its declared
+extensions must already exist. Form its ordinary-object plan over just the
+adopted package prerequisites, then verify exact name/schema/version under
+the deployment lock and again in the read-back being recorded. Record only
+the declared package identities after those checks. Missing or mismatching
+packages refuse before object creation; standing ordinary objects still refuse.
+Bootstrap never installs, upgrades, moves or drops a package. A --sql script
+checks the same exact metadata on its replay target before any managed DDL.
+An initial offline authoring preview with no historical model carries only
+assumed package prerequisites and says they are unverified; it does not mint
+permission for lifecycle DDL or an executable deployment plan.
+State, plan and published-schema formats do not change.

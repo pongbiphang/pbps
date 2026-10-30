@@ -1160,7 +1160,14 @@ The census continues to omit system objects such as bootstrap `plpgsql`.
 Baseline and verify compare extensions only inside the recorded identity
 scope. Old snapshots and ids without `extensions` own none. Declaring an
 already installed but unheld package does not adopt it: use pull and an
-explicit baseline. A no-op plan is supported. CREATE EXTENSION, DROP
+explicit baseline. A connected bootstrap may also adopt declared packages
+already installed at the exact schema/version: these are prerequisites, not
+CREATE requests (DEC-2447.2). It checks them under the deployment lock and at
+recorded read-back; ordinary managed objects must still be absent. Bootstrap
+SQL export checks those exact prerequisites on its replay target before DDL.
+An initial offline authoring preview labels package prerequisites unverified.
+Raw installed inventory without a UID is not a lifecycle request in
+either comparison direction. A no-op plan is supported. CREATE EXTENSION, DROP
 EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET SCHEMA differences
 are named refusals and named drift, with no partial executable plan. No
 extension installation, code execution, provider-type admission or lifecycle

@@ -6615,6 +6615,9 @@ fn refuse_nonempty_bootstrap(
         .chain(
             extensions
                 .keys()
+                // Exact PostgreSQL packages are separately checked prerequisites,
+                // like standing cluster roles, not objects we create (DEC-2447.2).
+                .filter(|_| dialect.name() != "postgres")
                 .map(|name| format!("extension {}", name.shown())),
         )
         // Omitted definitions still occupy names in the managed set.
@@ -6628,6 +6631,37 @@ fn refuse_nonempty_bootstrap(
             names.len(),
             names.join(", "),
             label = pbps_model::escape::Escaped(label),
+        );
+    }
+    Ok(())
+}
+
+/// Bootstrap may adopt packages it verifies, but cannot install or change them.
+fn refuse_bootstrap_extension_drift(
+    installed: &Schema,
+    desired: &Schema,
+    ids: &IdsFile,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<()> {
+    let errors = pbps_diff::extension_differences(
+        pbps_diff::Side {
+            schema: installed,
+            ids,
+        },
+        pbps_diff::Side {
+            schema: desired,
+            ids,
+        },
+        dialect.name(),
+    );
+    if !errors.is_empty() {
+        bail!(
+            "bootstrap extension prerequisites differ:\n{}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     Ok(())
@@ -6729,11 +6763,16 @@ async fn bootstrap_async(
         }
         let declared_modules = managed_modules(None, Some(&loaded.schema));
 
-        // Bootstrap is the plan from nothing: every declared table is created.
+        // Every ordinary object is created; exact preinstalled packages are
+        // prerequisites, checked under the lock and at read-back (DEC-2447.2).
+        let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(pbps_diff::Side {
+            schema: &loaded.schema,
+            ids: &ids,
+        });
         let cs = pbps_diff::diff(
             pbps_diff::Side {
-                schema: &Schema::default(),
-                ids: &IdsFile::default(),
+                schema: &prerequisites,
+                ids: &prerequisite_ids,
             },
             pbps_diff::Side {
                 schema: &loaded.schema,
@@ -6969,6 +7008,12 @@ async fn bootstrap_async(
                 // instead of refusing (measured on 17.0, #1176).
                 refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
 
+                refuse_bootstrap_extension_drift(
+                    &existing.scoped.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                )?;
                 refuse_nonempty_bootstrap(
                     &existing.scoped.schema,
                     &existing.limitations,
@@ -7027,6 +7072,12 @@ async fn bootstrap_async(
                 // A database-side trigger can add a privilege during the build.
                 // Never commit a snapshot that silently omits it (110, 147).
                 refuse_unexpressible(&built, &target.label, "bootstrap again")?;
+                refuse_bootstrap_extension_drift(
+                    &built.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                )?;
                 crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
                 // And it can take one back. `ddl_command_end` fires on `GRANT`
                 // and on `REVOKE` (measured), so a trigger already in the
@@ -7042,10 +7093,11 @@ async fn bootstrap_async(
                 // those as held would make the next plan skip them (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
-                let held = ids
+                let mut held = ids
                     .without(&built.missing)
                     .without_roles(&gone)
                     .without_types(&built.missing_types);
+                held.extensions.clone_from(&prerequisite_ids.extensions);
                 crate::engine::recheck_type_prerequisites(
                     &mut conn,
                     &bootstrap_pins,
@@ -11736,6 +11788,51 @@ mod tests {
             );
             assert_eq!(snapshot.declared.overlay(&snapshot.schema), loaded.schema);
         }
+    }
+
+    #[test]
+    fn bootstrap_extensions_are_exact_prerequisites_but_ordinary_objects_must_be_absent() {
+        let name = "vendor_default".into();
+        let package = pbps_model::Extension {
+            schema: "pg_catalog".into(),
+            version: "1.0".into(),
+        };
+        let mut schema = Schema {
+            extensions: [(name, package)].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "vendor_default".into())].into(),
+            ..Default::default()
+        };
+        let pg = pbps_pg::Postgres::new();
+        refuse_nonempty_bootstrap(&schema, &[], &pg, "target").unwrap();
+        refuse_bootstrap_extension_drift(&schema, &schema, &ids, &pg).unwrap();
+        assert!(refuse_nonempty_bootstrap(&schema, &[], &pbps_mssql::Mssql, "target").is_err());
+        for changed in [
+            Schema::default(),
+            {
+                let mut changed = schema.clone();
+                changed
+                    .extensions
+                    .get_mut("vendor_default")
+                    .unwrap()
+                    .version = "2.0".into();
+                changed
+            },
+            {
+                let mut changed = schema.clone();
+                changed.extensions.get_mut("vendor_default").unwrap().schema = "other".into();
+                changed
+            },
+        ] {
+            let error = refuse_bootstrap_extension_drift(&changed, &schema, &ids, &pg).unwrap_err();
+            assert!(error.to_string().contains("vendor_default"));
+        }
+        schema
+            .tables
+            .insert(TableName::new("app", "ordinary"), Default::default());
+        assert!(refuse_nonempty_bootstrap(&schema, &[], &pg, "target").is_err());
     }
 
     #[test]
