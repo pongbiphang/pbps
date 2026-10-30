@@ -40,22 +40,42 @@ type Effective = BTreeMap<pbps_model::RoleName, BTreeMap<GrantTarget, BTreeSet<P
 struct ModuleCuts {
     created: BTreeMap<ModuleId, usize>,
     dropped: BTreeMap<ModuleId, usize>,
+    activity: BTreeMap<ModuleId, Vec<(usize, bool)>>,
+    standing: BTreeSet<ModuleId>,
     type_moves: bool,
 }
 
 impl ModuleCuts {
-    fn of(changes: &ChangeSet) -> Self {
-        let mut cuts = Self::default();
+    fn of(changes: &ChangeSet, observed: &Pulled) -> Self {
+        let mut cuts = Self {
+            standing: observed.schema.modules.keys().cloned().collect(),
+            ..Self::default()
+        };
         for (i, p) in changes.changes.iter().enumerate() {
             if let Change::CreateModule { id, .. } = &p.change {
                 cuts.created.entry(id.clone()).or_insert(i);
+                cuts.activity.entry(id.clone()).or_default().push((i, true));
             }
             if let Change::DropModule { id, .. } = &p.change {
                 cuts.dropped.insert(id.clone(), i);
+                cuts.activity
+                    .entry(id.clone())
+                    .or_default()
+                    .push((i, false));
             }
             cuts.type_moves |= matches!(p.change, Change::RenameType { .. });
         }
         cuts
+    }
+
+    fn present_before(&self, id: &ModuleId, index: usize) -> bool {
+        self.activity
+            .get(id)
+            .and_then(|events| {
+                let end = events.partition_point(|(at, _)| *at < index);
+                end.checked_sub(1).map(|last| events[last].1)
+            })
+            .unwrap_or_else(|| self.standing.contains(id))
     }
 }
 
@@ -105,7 +125,7 @@ pub(crate) fn seal(
     }
     let observed = observed.ok_or("object grant evidence has no qualified target read")?;
     let names = PlanNames::of(&changes.changes, ids).map_err(|e| e.to_string())?;
-    let cuts = ModuleCuts::of(changes);
+    let cuts = ModuleCuts::of(changes, observed);
     let mut grants = Vec::new();
     for (&change, write) in &writes {
         let target = canonical_target(observed, changes, change, write)?;
@@ -330,21 +350,30 @@ fn target_at(
 ) -> Result<GrantTargetState, String> {
     let present = |target| GrantTargetState::Present { target };
     match target {
-        GrantTarget::Object(table) => match names.holder(table, At::Before(index)) {
-            Holder::Tracked(uid) => Ok(names
-                .table_at(uid, end.at())
-                .cloned()
-                .map_or(GrantTargetState::Absent, |name| {
-                    present(GrantTarget::Object(name))
-                })),
-            Holder::Unmanaged => {
-                module_at(changes, cuts, index, ModuleId::Named(table.clone()), end)
+        GrantTarget::Object(table) => {
+            let holder = names.holder(table, At::Before(index));
+            if let Holder::Tracked(uid) = holder {
+                Ok(names
+                    .table_at(uid, end.at())
+                    .cloned()
+                    .map_or(GrantTargetState::Absent, |name| {
+                        present(GrantTarget::Object(name))
+                    }))
+            } else {
+                let id = ModuleId::Named(table.clone());
+                // PlanNames describes table slots. A view introduced after
+                // a table moves away owns that same relation name now; an
+                // actually empty slot still cannot authorize a grant.
+                if matches!(holder, Holder::Unmanaged) || cuts.present_before(&id, index) {
+                    module_at(changes, cuts, index, id, end)
+                } else {
+                    Err(format!(
+                        "the grant target {} has no managed holder at its change",
+                        table.shown()
+                    ))
+                }
             }
-            Holder::Vacant => Err(format!(
-                "the grant target {} has no managed holder at its change",
-                table.shown()
-            )),
-        },
+        }
         GrantTarget::Sequence(column) => match names.column_holder(column, At::Before(index)) {
             Holder::Tracked(uid) => Ok(names
                 .column_at(uid, end.at())

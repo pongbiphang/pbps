@@ -397,3 +397,121 @@ fn an_opening_answer_cannot_be_replayed_as_a_closing_condition() {
     );
     assert_eq!(changed.len(), 1, "opening answers cannot certify closing",);
 }
+
+#[test]
+fn a_new_view_can_receive_a_grant_at_a_moved_tables_old_name() {
+    let uid = Uid::derived(UidKind::Table, "vacated1454", 0);
+    let old = ObjectName::new("app", "old");
+    let moved = ObjectName::new("app", "moved");
+    let changes = changes(vec![
+        Change::RenameTable {
+            uid: uid.clone(),
+            from: old.clone(),
+            to: moved.clone(),
+            defaults: vec![],
+        },
+        Change::CreateModule {
+            id: ModuleId::Named(old.clone()),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                options: Default::default(),
+                definition: "SELECT 1 AS n".into(),
+            }),
+        },
+        write(GrantTarget::Object(old.clone()), Permission::Select, true),
+    ]);
+    let ids = IdsFile {
+        tables: BTreeMap::from([(uid, moved)]),
+        ..IdsFile::default()
+    };
+    let before = read(&GrantTarget::Object(old.clone()), &[]);
+    let key = environment_key();
+    let sealed = seal(&key, &changes, &ids, Some(&before))
+        .expect("a newly created view can use a vacated table name");
+    assert_eq!(sealed[0].before.target, GrantTargetState::Absent);
+    assert_eq!(
+        sealed[0].after.target,
+        GrantTargetState::Present {
+            target: GrantTarget::Object(old.clone())
+        }
+    );
+    let after = read(&GrantTarget::Object(old.clone()), &[Permission::Select]);
+    assert!(
+        recheck(&key, &changes, &sealed, &after, End::After)
+            .unwrap()
+            .1
+            .is_empty()
+    );
+    let mut empty = changes.clone();
+    empty.changes.remove(1);
+    assert!(seal(&key, &empty, &ids, Some(&before)).is_err());
+    let mut removed = changes;
+    removed.changes.insert(
+        2,
+        PlannedChange::new(Change::DropModule {
+            id: ModuleId::Named(old),
+            kind: pbps_model::ModuleKind::View,
+        }),
+    );
+    assert!(seal(&key, &removed, &ids, Some(&before)).is_err());
+}
+
+#[test]
+fn a_standing_view_grant_can_precede_a_table_taking_its_name() {
+    let uid = Uid::derived(UidKind::Table, "future1454", 0);
+    let name = ObjectName::new("app", "old");
+    let source = ObjectName::new("app", "source");
+    let changes = changes(vec![
+        write(GrantTarget::Object(name.clone()), Permission::Select, true),
+        Change::DropModule {
+            id: ModuleId::Named(name.clone()),
+            kind: pbps_model::ModuleKind::View,
+        },
+        Change::RenameTable {
+            uid: uid.clone(),
+            from: source,
+            to: name.clone(),
+            defaults: vec![],
+        },
+    ]);
+    let ids = IdsFile {
+        tables: BTreeMap::from([(uid, name.clone())]),
+        ..IdsFile::default()
+    };
+    let mut before = read(&GrantTarget::Object(name.clone()), &[]);
+    before.schema.modules.insert(
+        ModuleId::Named(name.clone()),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            options: Default::default(),
+            definition: "SELECT 1 AS n".into(),
+        },
+    );
+    let key = environment_key();
+    let sealed = seal(&key, &changes, &ids, Some(&before))
+        .expect("a standing view can occupy a future table slot");
+    assert_eq!(
+        sealed[0].before.target,
+        GrantTargetState::Present {
+            target: GrantTarget::Object(name.clone())
+        }
+    );
+    assert_eq!(sealed[0].after.target, GrantTargetState::Absent);
+    assert!(
+        recheck(&key, &changes, &sealed, &before, End::Before)
+            .unwrap()
+            .1
+            .is_empty()
+    );
+    let after = read(&GrantTarget::Object(name), &[]);
+    assert!(
+        recheck(&key, &changes, &sealed, &after, End::After)
+            .unwrap()
+            .1
+            .is_empty()
+    );
+    before.schema.modules.clear();
+    assert!(seal(&key, &changes, &ids, Some(&before)).is_err());
+}

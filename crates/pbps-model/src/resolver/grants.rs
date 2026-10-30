@@ -3,7 +3,7 @@
 use crate::{Change, ChangeSet, GrantTarget, Permission, RoleName};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// An address absent at an endpoint is different from a present target
+/// A target incarnation absent at an endpoint differs from a present target
 /// with no requested grants. Unreadable observations never make this value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
