@@ -1068,3 +1068,261 @@ fn pull_names_unmanaged_packages_and_hides_the_hint_when_all_are_selected() {
         assert_eq!(extension_ids(&d).len(), 3);
     });
 }
+
+fn read_back_fixture(connection: &str, slug: &str, managed: bool) -> Demo {
+    installed(connection);
+    let d = Demo::new(slug);
+    d.keyed(connection);
+    let mut pull = vec!["pull", "--db", connection];
+    if managed {
+        pull.extend(["--extension", "citext"]);
+    }
+    succeeds(d.run(&pull));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "read-back fixture",
+    ]));
+    std::fs::write(
+        d.dir.join("schema/ext.ordinary.yml"),
+        "table: ext.ordinary\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n",
+    )
+    .unwrap();
+    d
+}
+
+fn extension_during_apply(connection: &str, d: &Demo, mutation: &str) -> std::process::Output {
+    use super::{
+        BIN, Drained, KEYED_ENV, KEYED_KEY, KEYED_URL, connected_artifact, fingerprint_key,
+        plan_checksum, scalar, wait_for_the_apply,
+    };
+    use std::process::Command;
+    // Only the approved table's ALTER waits. A catalog-visible wait proves
+    // that both preflight and the in-transaction baseline read have finished.
+    on_server(
+        connection,
+        "CREATE FUNCTION public.hold_extension_read_back() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF tg_tag = 'ALTER TABLE' AND EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE objid = 'ext.ordinary'::regclass) THEN PERFORM pg_advisory_xact_lock(244705); END IF; END $$; CREATE EVENT TRIGGER hold_extension_read_back ON ddl_command_end EXECUTE FUNCTION public.hold_extension_read_back()",
+    );
+    let plan = connected_artifact(d, connection, false);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut holder = rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        conn.execute("SELECT pg_advisory_lock(244705)")
+            .await
+            .unwrap();
+        conn
+    });
+    let checksum = plan_checksum(&plan);
+    let mut child = Drained::spawn(
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args([
+                "apply",
+                "--env",
+                KEYED_ENV,
+                "--plan",
+                plan.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+            ])
+            .env(KEYED_URL, connection)
+            .env(KEYED_KEY, fingerprint_key(9)),
+    );
+    wait_for_the_apply("extension read-back window", &mut child, || {
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=244705 AND NOT granted",
+        ) > 0
+    });
+    on_server(connection, mutation);
+    rt.block_on(async {
+        holder
+            .execute("SELECT pg_advisory_unlock(244705)")
+            .await
+            .unwrap();
+    });
+    child.wait_with_output()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn apply_refuses_concurrent_managed_extension_movement_without_recording() {
+    servers(|admin, slug| {
+        for (case, mutation) in [
+            ("schema", "ALTER EXTENSION citext SET SCHEMA other"),
+            ("version", "ALTER EXTENSION citext UPDATE TO '1.6'"),
+        ] {
+            let slug = format!("extensions2447-guard-{case}-{slug}");
+            let own = OwnDatabase::new(admin, &slug);
+            let connection = own.connection();
+            let d = read_back_fixture(connection, &slug, true);
+            let recorded = super::latest_snapshot(connection);
+            let count = text_of(
+                connection,
+                "SELECT count(*)::text FROM public.__pbps_state WHERE kind <> 'failed'",
+            );
+            let out = extension_during_apply(connection, &d, mutation);
+            assert_ne!(
+                code(&out),
+                0,
+                "managed extension movement was accepted: {}",
+                stdout(&out)
+            );
+            assert!(
+                stderr(&out).contains("extension `citext` changed during"),
+                "{}",
+                stderr(&out)
+            );
+            let failed = super::latest_snapshot(connection);
+            assert_eq!(failed.kind, pbps_model::StateKind::Failed);
+            assert_eq!(
+                failed.schema, recorded.schema,
+                "refused schema was recorded"
+            );
+            assert_eq!(failed.ids, recorded.ids, "refused identities were recorded");
+            assert_eq!(failed.declared, recorded.declared);
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT count(*)::text FROM public.__pbps_state WHERE kind <> 'failed'"
+                ),
+                count
+            );
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT count(*)::text FROM pg_attribute WHERE attrelid='ext.ordinary'::regclass AND attname='added'"
+                ),
+                "0"
+            );
+            // The independently committed native change survives; only this
+            // apply's transaction is rolled back.
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT n.nspname || ':' || e.extversion FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='citext'"
+                ),
+                if case == "schema" {
+                    "other:1.4"
+                } else {
+                    "ext:1.6"
+                }
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn unmanaged_extension_movement_does_not_refuse_an_ordinary_apply() {
+    servers(|admin, slug| {
+        let slug = format!("extensions2447-unmanaged-guard-{slug}");
+        let own = OwnDatabase::new(admin, &slug);
+        let connection = own.connection();
+        let d = read_back_fixture(connection, &slug, false);
+        let ids: pbps_model::IdsFile =
+            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        assert!(ids.extensions.is_empty());
+        succeeds(extension_during_apply(
+            connection,
+            &d,
+            "ALTER EXTENSION citext SET SCHEMA other; ALTER EXTENSION citext UPDATE TO '1.6'",
+        ));
+        assert_eq!(
+            text_of(
+                connection,
+                "SELECT count(*)::text FROM pg_attribute WHERE attrelid='ext.ordinary'::regclass AND attname='added'"
+            ),
+            "1"
+        );
+        let snapshot = super::latest_snapshot(connection);
+        assert!(snapshot.schema.extensions.is_empty(), "{snapshot:?}");
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn exact_managed_extensions_allow_declared_ordinary_changes() {
+    servers(|admin, slug| {
+        let slug = format!("extensions2447-exact-guard-{slug}");
+        let own = OwnDatabase::new(admin, &slug);
+        let connection = own.connection();
+        let d = read_back_fixture(connection, &slug, true);
+        let plan = super::connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        assert_eq!(findings(&d, connection)["data"]["changes"], 0);
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn event_trigger_extension_movement_is_refused_transactionally_and_at_staged_checkpoints() {
+    servers(|admin, slug| {
+        for staged in [false, true] {
+            let slug = format!("extensions2447-event-guard-{staged}-{slug}");
+            let own = OwnDatabase::new(admin, &slug);
+            let connection = own.connection();
+            let d = read_back_fixture(connection, &slug, true);
+            on_server(
+                connection,
+                "CREATE FUNCTION public.move_extension_read_back() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF tg_tag = 'ALTER TABLE' THEN ALTER EXTENSION citext SET SCHEMA other; END IF; END $$; CREATE EVENT TRIGGER move_extension_read_back ON ddl_command_end EXECUTE FUNCTION public.move_extension_read_back()",
+            );
+            let plan = super::connected_artifact(&d, connection, staged);
+            let recorded = super::latest_snapshot(connection);
+            let count = text_of(
+                connection,
+                "SELECT count(*)::text FROM public.__pbps_state WHERE kind='apply'",
+            );
+            let extra: &[&str] = if staged { &["--staged"] } else { &[] };
+            let out = approved_apply(&d, connection, &plan, extra);
+            assert_ne!(
+                code(&out),
+                0,
+                "event trigger movement was accepted: {}",
+                stdout(&out)
+            );
+            assert!(
+                stderr(&out).contains("extension `citext` changed during"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT count(*)::text FROM public.__pbps_state WHERE kind='apply'"
+                ),
+                count
+            );
+            if staged {
+                // A staged statement has committed: its checkpoint records
+                // reality, but the guard refuses successful completion.
+                let checkpoint = super::latest_snapshot(connection);
+                assert_eq!(checkpoint.kind, pbps_model::StateKind::Failed);
+                assert_eq!(checkpoint.schema.extensions["citext"].schema, "other");
+            } else {
+                let failed = super::latest_snapshot(connection);
+                assert_eq!(failed.kind, pbps_model::StateKind::Failed);
+                assert_eq!(failed.schema, recorded.schema);
+                assert_eq!(failed.ids, recorded.ids);
+                assert_eq!(failed.declared, recorded.declared);
+            }
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='citext'"
+                ),
+                if staged { "other" } else { "ext" }
+            );
+        }
+    });
+}

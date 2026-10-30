@@ -1899,8 +1899,9 @@ plan itself, and refuses to record if either comparison fails. The promise has
 two halves:
 
 1. **Everything the plan does not touch is unchanged.** Every table, column,
-   constraint, index, row-security flags, policy, module, role, grant and declared
-   row that no change of the plan names is the same in the read-back as in the approved baseline.
+   constraint, index, row-security flags, policy, module, role, grant, managed
+   extension and declared row that no change of the plan names is the same in
+   the read-back as in the approved baseline.
 2. **Everything the plan does touch is what the plan said.** A column the plan
    adds or alters has the type (normalized), nullability, identity and
    default-presence the plan gives it; a constraint or index the plan adds has
@@ -1912,6 +1913,9 @@ two halves:
    WITH CHECK presence checked independently. A dropped policy is absent.
    Untouched policies keep their exact catalog predicates. Both RLS flags
    match the values the plan leaves, independently of whether any policy exists.
+   Managed extensions retain their exact name, schema and version. PR A admits
+   no extension lifecycle changes, so every admitted plan leaves these fields
+   unchanged; installed packages outside the declarations are not compared.
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 
