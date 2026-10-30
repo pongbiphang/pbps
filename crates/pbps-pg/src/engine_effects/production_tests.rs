@@ -111,7 +111,12 @@ fn attach(s: &Scene) -> Change {
     Change::AttachPartition {
         uid: "t_bbbbbb".parse().unwrap(),
         table: "app.a".parse().unwrap(),
-        parent: "app.p".parse().unwrap(),
+        parent: s.after.tables[&"app.a".parse::<TableName>().unwrap()]
+            .partition_of
+            .as_ref()
+            .unwrap()
+            .parent
+            .clone(),
         bound: bound(),
         key: Default::default(),
         shape: Box::new(s.after.tables[&"app.a".parse::<TableName>().unwrap()].clone()),
@@ -166,124 +171,8 @@ fn read_input(
     assert!(
         pbps_diff::order::membership::project(ordered.as_slice(), &effects, &fx.symbolic).is_ok()
     );
-    let mut final_state = None;
-    let mut all = vec![Vec::new()];
-    for at in 0..ops.len() {
-        all = all
-            .into_iter()
-            .flat_map(|prefix| {
-                (0..=prefix.len()).map(move |position| {
-                    let mut order = prefix.clone();
-                    order.insert(position, at);
-                    order
-                })
-            })
-            .collect();
-    }
-    for order in all {
-        let mut position = vec![0; ops.len()];
-        for (at, &i) in order.iter().enumerate() {
-            position[i] = at;
-        }
-        if !g
-            .edges
-            .iter()
-            .all(|e| position[e.before] < position[e.after])
-        {
-            continue;
-        }
-        let ordered = pbps_diff::order::reordered_operations(&ops, &order);
-        let effects = order
-            .iter()
-            .map(|&at| fx.effects[at].clone())
-            .collect::<Vec<_>>();
-        let replay =
-            pbps_diff::order::membership::project(ordered.as_slice(), &effects, &fx.symbolic)
-                .unwrap();
-        let end = replay.state(pbps_model::plan_names::At::End).unwrap();
-        if let Some(previous) = &final_state {
-            assert_eq!(previous, end, "{order:?}");
-        } else {
-            final_state = Some(end.clone());
-        }
-    }
+    class::assert_permitted_orders(&ops, &fx.effects, &fx.symbolic, &g, "production cut");
     (sequence, g)
-}
-#[test]
-fn a_production_parent_default_meets_the_candidates_own_goal_at_its_cut() {
-    let s = scene(false);
-    let change = Change::AlterColumnDefault {
-        uid: "c_bbbbbb".parse().unwrap(),
-        column: "app.p.d".parse().unwrap(),
-        from: Some("1".into()),
-        to: Some("7".into()),
-    };
-    for reversed in [false, true] {
-        let steps = if reversed {
-            vec![attach(&s), change.clone()]
-        } else {
-            vec![change.clone(), attach(&s)]
-        };
-        let (order, g) = read(&s, steps);
-        assert_eq!(order, if reversed { vec![1, 0] } else { vec![0, 1] });
-        assert!(
-            g.edges
-                .iter()
-                .any(|e| matches!(e.because, pbps_diff::order::Because::Boundary(_)))
-        );
-    }
-}
-#[test]
-fn a_production_restoration_admits_both_parent_default_membership_cuts() {
-    let s = scene(false);
-    let (_, g) = read(
-        &s,
-        vec![
-            attach(&s),
-            Change::AlterColumnDefault {
-                uid: "c_bbbbbb".parse().unwrap(),
-                column: "app.p.d".parse().unwrap(),
-                from: Some("1".into()),
-                to: Some("7".into()),
-            },
-            Change::SetPartitionDefault {
-                uid: "t_bbbbbb".parse().unwrap(),
-                table: "app.a".parse().unwrap(),
-                parent: "app.p".parse().unwrap(),
-                column: "d".into(),
-                from: Some("9".into()),
-                to: Some("9".into()),
-                fallback: None,
-            },
-        ],
-    );
-    assert!(
-        !g.edges
-            .iter()
-            .any(|e| (e.before == 0 && e.after == 1) || (e.before == 1 && e.after == 0)),
-        "{:?}",
-        g.edges
-    );
-}
-#[test]
-fn a_production_column_name_version_precedes_an_attach_using_that_name() {
-    let s = scene(true);
-    let change = Change::RenameColumn {
-        uid: "c_bbbbbb".parse().unwrap(),
-        table: "app.p".parse().unwrap(),
-        from: "d".into(),
-        to: "e".into(),
-        table_was: None,
-    };
-    for reversed in [false, true] {
-        let steps = if reversed {
-            vec![attach(&s), change.clone()]
-        } else {
-            vec![change.clone(), attach(&s)]
-        };
-        let (order, _) = read(&s, steps);
-        assert_eq!(order, if reversed { vec![1, 0] } else { vec![0, 1] });
-    }
 }
 #[test]
 fn an_unread_expression_binding_does_not_turn_into_an_empty_binding_set() {
@@ -339,145 +228,6 @@ fn an_unread_expression_binding_does_not_turn_into_an_empty_binding_set() {
             .value,
         pbps_model::operation::symbolic::Fact::Unread
     );
-}
-
-#[test]
-fn a_production_add_column_uses_presence_instead_of_a_fixed_move_order() {
-    for candidate_has_column in [false, true] {
-        let mut s = scene(false);
-        let p: TableName = "app.p".parse().unwrap();
-        let a: TableName = "app.a".parse().unwrap();
-        s.after
-            .tables
-            .get_mut(&p)
-            .unwrap()
-            .columns
-            .get_mut("d")
-            .unwrap()
-            .value_source = ValueSource::Default("1".into());
-        let mut x = Column::new("integer".parse().unwrap());
-        x.value_source = ValueSource::Default("3".into());
-        s.after
-            .tables
-            .get_mut(&p)
-            .unwrap()
-            .columns
-            .insert("x".into(), x.clone());
-        s.ids
-            .columns
-            .insert("c_eeeeee".parse().unwrap(), p.column("x"));
-        if candidate_has_column {
-            s.before
-                .tables
-                .get_mut(&a)
-                .unwrap()
-                .columns
-                .insert("x".into(), x.clone());
-            s.base_ids
-                .columns
-                .insert("c_ffffff".parse().unwrap(), a.column("x"));
-        }
-        let change = Change::AddColumn {
-            uid: "c_eeeeee".parse().unwrap(),
-            table: p,
-            name: "x".into(),
-            column: Box::new(x),
-        };
-        for reverse in [false, true] {
-            let steps = if reverse {
-                vec![attach(&s), change.clone()]
-            } else {
-                vec![change.clone(), attach(&s)]
-            };
-            let (order, _) = read(&s, steps);
-            let change_first = candidate_has_column != reverse;
-            assert_eq!(order, if change_first { vec![0, 1] } else { vec![1, 0] });
-        }
-    }
-}
-
-#[test]
-fn production_merges_cover_release_values_missing_from_both_endpoints() {
-    let s = scene(false);
-    let (_, g) = read(
-        &s,
-        vec![
-            Change::AlterColumnDefault {
-                uid: "c_bbbbbb".parse().unwrap(),
-                column: "app.p.d".parse().unwrap(),
-                from: Some("1".into()),
-                to: None,
-            },
-            Change::AlterColumnDefault {
-                uid: "c_bbbbbb".parse().unwrap(),
-                column: "app.p.d".parse().unwrap(),
-                from: None,
-                to: Some("7".into()),
-            },
-            attach(&s),
-            Change::SetPartitionDefault {
-                uid: "t_bbbbbb".parse().unwrap(),
-                table: "app.a".parse().unwrap(),
-                parent: "app.p".parse().unwrap(),
-                column: "d".into(),
-                from: Some("9".into()),
-                to: Some("9".into()),
-                fallback: None,
-            },
-        ],
-    );
-    assert!(g.symbolic_unmet.is_empty());
-}
-
-#[test]
-fn a_parent_address_write_keeps_uid_membership_and_its_logical_name_history() {
-    let mut s = scene(false);
-    let old: TableName = "app.p".parse().unwrap();
-    let new: TableName = "other.q".parse().unwrap();
-    let mut parent = s.after.tables.remove(&old).unwrap();
-    parent.columns.get_mut("d").unwrap().value_source = ValueSource::Default("1".into());
-    s.after.tables.insert(new.clone(), parent);
-    s.after
-        .tables
-        .get_mut(&"app.a".parse::<TableName>().unwrap())
-        .unwrap()
-        .partition_of
-        .as_mut()
-        .unwrap()
-        .parent = new.clone();
-    s.ids
-        .tables
-        .insert("t_aaaaaa".parse().unwrap(), new.clone());
-    for at in s.ids.columns.values_mut().filter(|at| at.table == old) {
-        at.table = new.clone();
-    }
-    let logical = vec![
-        Change::RenameTable {
-            uid: "t_aaaaaa".parse().unwrap(),
-            from: old,
-            to: new.clone(),
-            defaults: vec![],
-        },
-        Change::AttachPartition {
-            uid: "t_bbbbbb".parse().unwrap(),
-            table: "app.a".parse().unwrap(),
-            parent: new,
-            bound: bound(),
-            key: vec![],
-            shape: Box::new(s.after.tables[&"app.a".parse::<TableName>().unwrap()].clone()),
-        },
-    ];
-    for input in [vec![0, 1], vec![1, 0]] {
-        let (order, _) = read_input(&s, logical.clone(), Some(&input));
-        assert_eq!(
-            order,
-            if input[0] == 0 {
-                vec![0, 1]
-            } else {
-                vec![1, 0]
-            }
-        );
-    }
 }
 
 #[test]
@@ -639,130 +389,6 @@ fn unrelated_membership_trees_do_not_enter_an_active_familys_facts() {
 }
 
 #[test]
-fn a_defaultless_restoration_clears_own_values_without_inventing_a_parent_default() {
-    let mut s = scene(false);
-    s.after
-        .tables
-        .get_mut(&"app.p".parse::<TableName>().unwrap())
-        .unwrap()
-        .columns
-        .get_mut("d")
-        .unwrap()
-        .value_source = ValueSource::None;
-    s.after
-        .tables
-        .get_mut(&"app.a".parse::<TableName>().unwrap())
-        .unwrap()
-        .partition_of
-        .as_mut()
-        .unwrap()
-        .columns
-        .clear();
-    let steps = vec![
-        Change::AlterColumnDefault {
-            uid: "c_bbbbbb".parse().unwrap(),
-            column: "app.p.d".parse().unwrap(),
-            from: Some("1".into()),
-            to: None,
-        },
-        attach(&s),
-        Change::SetPartitionDefault {
-            uid: "t_bbbbbb".parse().unwrap(),
-            table: "app.a".parse().unwrap(),
-            parent: "app.p".parse().unwrap(),
-            column: "d".into(),
-            from: Some("9".into()),
-            to: None,
-            fallback: None,
-        },
-    ];
-    read(&s, steps);
-}
-
-#[test]
-fn production_not_null_restorations_preserve_both_measured_attach_cuts() {
-    for (old, new, candidate, own, restore) in [
-        (true, false, true, true, false),
-        (false, true, true, false, false),
-        (false, true, false, false, false),
-        (true, false, true, false, true),
-    ] {
-        let mut s = scene(false);
-        let p: TableName = "app.p".parse().unwrap();
-        let a: TableName = "app.a".parse().unwrap();
-        s.before
-            .tables
-            .get_mut(&p)
-            .unwrap()
-            .columns
-            .get_mut("d")
-            .unwrap()
-            .nullable = !old;
-        let goal = s
-            .after
-            .tables
-            .get_mut(&p)
-            .unwrap()
-            .columns
-            .get_mut("d")
-            .unwrap();
-        goal.nullable = !new;
-        goal.value_source = ValueSource::Default("1".into());
-        s.before
-            .tables
-            .get_mut(&a)
-            .unwrap()
-            .columns
-            .get_mut("d")
-            .unwrap()
-            .nullable = !candidate;
-        s.after
-            .tables
-            .get_mut(&a)
-            .unwrap()
-            .partition_of
-            .as_mut()
-            .unwrap()
-            .columns
-            .get_mut("d")
-            .unwrap()
-            .not_null = own;
-        let mut steps = vec![
-            Change::AlterColumnNullability {
-                uid: "c_bbbbbb".parse().unwrap(),
-                column: p.column("d"),
-                ty: "integer".parse().unwrap(),
-                to_nullable: !new,
-                collation: None,
-                through_external_partitions: false,
-            },
-            attach(&s),
-        ];
-        if restore {
-            steps.push(Change::SetPartitionNotNull {
-                uid: "t_bbbbbb".parse().unwrap(),
-                table: a,
-                column: "d".into(),
-                not_null: own,
-            });
-        }
-        let (_, graph) = read(&s, steps.clone());
-        if restore {
-            assert!(
-                !graph.edges.iter().any(|e| ((e.before == 0 && e.after == 1)
-                    || (e.before == 1 && e.after == 0))
-                    && matches!(e.because, pbps_diff::order::Because::Boundary(_))),
-                "a terminal restoration admits both cuts: {:?}",
-                graph.edges
-            );
-            assert!(graph.edges.iter().any(|e| e.before == 1 && e.after == 2));
-        }
-        let reversed: Vec<_> = (0..steps.len()).rev().collect();
-        read_input(&s, steps, Some(&reversed));
-    }
-}
-
-#[test]
 fn a_detached_default_restores_the_transferred_property() {
     let mut s = scene(false);
     std::mem::swap(&mut s.before, &mut s.after);
@@ -869,6 +495,7 @@ fn a_detached_default_restores_the_transferred_property() {
 
 mod class;
 mod meeting_golden;
+pub(in crate::engine_effects) mod policy_support;
 mod scenes_tests;
 
 #[test]
@@ -927,38 +554,6 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
             .iter()
             .any(|c| matches!(c, Clause::Restore(r) if r.value==Fact::Unread))
     );
-}
-
-#[test]
-fn an_attaching_sources_default_chain_is_consumed_before_partition_restoration() {
-    let s = scene(false);
-    let steps = vec![
-        Change::AlterColumnDefault {
-            uid: "c_dddddd".parse().unwrap(),
-            column: "app.a.d".parse().unwrap(),
-            from: Some("9".into()),
-            to: None,
-        },
-        Change::AlterColumnDefault {
-            uid: "c_bbbbbb".parse().unwrap(),
-            column: "app.p.d".parse().unwrap(),
-            from: Some("1".into()),
-            to: Some("7".into()),
-        },
-        attach(&s),
-        Change::SetPartitionDefault {
-            uid: "t_bbbbbb".parse().unwrap(),
-            table: "app.a".parse().unwrap(),
-            parent: "app.p".parse().unwrap(),
-            column: "d".into(),
-            from: None,
-            to: Some("9".into()),
-            fallback: None,
-        },
-    ];
-    let (_, graph) = read(&s, steps);
-    assert!(graph.edges.iter().any(|e| e.before == 0 && e.after == 2));
-    assert!(graph.edges.iter().any(|e| e.before == 2 && e.after == 3));
 }
 
 #[test]

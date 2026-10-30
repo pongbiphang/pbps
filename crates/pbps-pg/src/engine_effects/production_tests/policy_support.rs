@@ -1,11 +1,12 @@
-use super::*;
 use crate::engine_effects::{facts, symbolic};
+use pbps_model::operation::symbolic::*;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
+use pbps_model::{Change, ValueSource};
 use pbps_model::{Column, IdsFile, PlannedChange, Schema, Table, TableName};
 use serde_json::{Value as Json, json};
 
-pub(super) fn change(kind: &str, fields: Json) -> Change {
+pub(in crate::engine_effects) fn change(kind: &str, fields: Json) -> Change {
     let mut row = json!({"op":kind, "uid":"c_aaaaaa", "column":"app.p.d"});
     if matches!(kind, "add_column" | "rename_column" | "rename_table") {
         row.as_object_mut().unwrap().remove("column");
@@ -15,7 +16,7 @@ pub(super) fn change(kind: &str, fields: Json) -> Change {
     }
     serde_json::from_value(row).unwrap()
 }
-pub(super) fn fixture(
+pub(in crate::engine_effects) fn fixture(
     change: &Change,
     version: Option<i64>,
     edit: impl FnOnce(&mut Facts),
@@ -74,7 +75,7 @@ pub(super) fn fixture(
         .unwrap()
         .symbolic
 }
-pub(super) fn rows(clauses: &[Clause]) -> String {
+pub(in crate::engine_effects) fn rows(clauses: &[Clause]) -> String {
     clauses
         .iter()
         .map(|c| match c {

@@ -133,48 +133,7 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                         &Default::default(),
                         Checks::ALL,
                     );
-                    let mut orders = vec![Vec::new()];
-                    for at in 0..operations.len() {
-                        orders = orders
-                            .into_iter()
-                            .flat_map(|prefix| {
-                                (0..=prefix.len()).map(move |i| {
-                                    let mut order = prefix.clone();
-                                    order.insert(i, at);
-                                    order
-                                })
-                            })
-                            .collect();
-                    }
-                    let mut end = None;
-                    for order in orders {
-                        let mut positions = vec![0; order.len()];
-                        for (at, &i) in order.iter().enumerate() {
-                            positions[i] = at;
-                        }
-                        if !g
-                            .edges
-                            .iter()
-                            .all(|e| positions[e.before] < positions[e.after])
-                        {
-                            continue;
-                        }
-                        let ops = pbps_diff::order::reordered_operations(&operations, &order);
-                        let effects: Vec<_> =
-                            order.iter().map(|&i| fx.effects[i].clone()).collect();
-                        let replay = pbps_diff::order::membership::project(
-                            ops.as_slice(),
-                            &effects,
-                            &fx.symbolic,
-                        )
-                        .unwrap_or_else(|e| panic!("{label}/{order:?}: {e}"));
-                        let state = replay.state(pbps_model::plan_names::At::End).unwrap();
-                        if let Some(previous) = &end {
-                            assert_eq!(previous, state, "{label}/{order:?}");
-                        } else {
-                            end = Some(state.clone());
-                        }
-                    }
+                    assert_permitted_orders(&operations, &fx.effects, &fx.symbolic, &g, &label);
 
                     cases += 1;
                 }
@@ -333,4 +292,102 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
         );
         assert!(fx.effects[1].symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",fx.effects[1].symbolic);
     }
+}
+
+pub(super) fn assert_permitted_orders(
+    operations: &Operations,
+    effects: &[pbps_model::operation::Effects],
+    symbolic: &pbps_model::operation::symbolic::State,
+    g: &pbps_diff::order::Graph,
+    label: &str,
+) {
+    let mut orders = vec![Vec::new()];
+    for at in 0..operations.len() {
+        orders = orders
+            .into_iter()
+            .flat_map(|prefix| {
+                (0..=prefix.len()).map(move |i| {
+                    let mut order = prefix.clone();
+                    order.insert(i, at);
+                    order
+                })
+            })
+            .collect();
+    }
+    let mut end = None;
+    for order in orders {
+        let mut positions = vec![0; order.len()];
+        for (at, &i) in order.iter().enumerate() {
+            positions[i] = at;
+        }
+        if !g
+            .edges
+            .iter()
+            .all(|e| positions[e.before] < positions[e.after])
+        {
+            continue;
+        }
+        let ops = pbps_diff::order::reordered_operations(operations, &order);
+        let effects: Vec<_> = order.iter().map(|&i| effects[i].clone()).collect();
+        let replay = pbps_diff::order::membership::project(ops.as_slice(), &effects, symbolic)
+            .unwrap_or_else(|e| panic!("{label}/{order:?}: {e}"));
+        let state = replay.state(pbps_model::plan_names::At::End).unwrap();
+        if let Some(previous) = &end {
+            assert_eq!(previous, state, "{label}/{order:?}");
+        } else {
+            end = Some(state.clone());
+        }
+    }
+
+    assert!(end.is_some(), "{label}: no permitted replay");
+}
+
+mod cuts;
+
+use super::policy_support::{fixture, rows};
+use pbps_model::operation::symbolic::{Attribute, Property};
+use serde::Deserialize;
+#[derive(Deserialize)]
+struct Policy {
+    change: Change,
+    pg16: String,
+    pg18: Option<String>,
+    sequence_input: bool,
+    parent_uid: Option<String>,
+}
+#[test]
+fn the_policy_data_covers_statement_kinds_on_pg16_and_pg18() {
+    let cases: Vec<Policy> = serde_json::from_str(include_str!("class/policies.json")).unwrap();
+    let mut count = 0;
+    assert_eq!(cases.len(), 18);
+    for Policy {
+        change,
+        pg16,
+        pg18,
+        sequence_input,
+        parent_uid,
+    } in cases
+    {
+        assert_eq!(
+            change.parent_column_uid().map(|u| u.as_str()),
+            parent_uid.as_deref()
+        );
+        for (version, expected) in [
+            (160000, pg16.as_str()),
+            (180000, pg18.as_deref().unwrap_or(&pg16)),
+        ] {
+            let actual = fixture(&change, Some(version), |f| {
+                if sequence_input {
+                    for ((_, p), c) in &mut f.base.cells {
+                        if matches!(p, Property::Column(_, Attribute::Numbering)) {
+                            c.value = facts::definition("owned sequence");
+                        }
+                    }
+                }
+            });
+            assert_eq!(rows(&actual), expected, "{version}: {change:?}");
+            count += 1;
+        }
+    }
+    assert_eq!(count, 36);
 }

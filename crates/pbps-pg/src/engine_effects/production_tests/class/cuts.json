@@ -1,0 +1,100 @@
+[
+  {
+    "label": "parent default meets own candidate goal",
+    "steps": [{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": "1","to": "7"},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "sequence": [0,1],
+    "boundary": true
+  },
+  {
+    "label": "restoration admits both default cuts",
+    "steps": [{"attach": true},{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": "1","to": "7"},{"op": "set_partition_default","uid": "t_bbbbbb","table": "app.a","parent": "app.p","column": "d","from": "9","to": "9","fallback": null}],
+    "inputs": [[0,1,2]],
+    "independent": [[0,1]]
+  },
+  {
+    "label": "column name version precedes attach",
+    "rename": true,
+    "steps": [{"op": "rename_column","uid": "c_bbbbbb","table": "app.p","from": "d","to": "e"},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "sequence": [0,1]
+  },
+  {
+    "label": "add column presence: candidate=False",
+    "defaults": ["1","1"],
+    "added": {"column": {"type": "integer","nullable": true,"default": "3"},"candidate": false},
+    "steps": [{"op": "add_column","uid": "c_eeeeee","table": "app.p","name": "x","column": {"type": "integer","nullable": true,"default": "3"}},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "sequence": [1,0]
+  },
+  {
+    "label": "add column presence: candidate=True",
+    "defaults": ["1","1"],
+    "added": {"column": {"type": "integer","nullable": true,"default": "3"},"candidate": true},
+    "steps": [{"op": "add_column","uid": "c_eeeeee","table": "app.p","name": "x","column": {"type": "integer","nullable": true,"default": "3"}},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "sequence": [0,1]
+  },
+  {
+    "label": "release values absent from endpoints",
+    "steps": [{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": "1","to": null},{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": null,"to": "7"},{"attach": true},{"op": "set_partition_default","uid": "t_bbbbbb","table": "app.a","parent": "app.p","column": "d","from": "9","to": "9","fallback": null}],
+    "inputs": [[0,1,2,3]],
+    "unmet_empty": true
+  },
+  {
+    "label": "parent address retains UID and logical history",
+    "defaults": ["1","1"],
+    "address": "other.q",
+    "steps": [{"op": "rename_table","uid": "t_aaaaaa","from": "app.p","to": "other.q","defaults": []},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "input_operations": true,
+    "sequence": [0,1]
+  },
+  {
+    "label": "defaultless restoration clears own values",
+    "defaults": ["1",null],
+    "clear_own": true,
+    "steps": [{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": "1","to": null},{"attach": true},{"op": "set_partition_default","uid": "t_bbbbbb","table": "app.a","parent": "app.p","column": "d","from": "9","to": null,"fallback": null}],
+    "inputs": [[0,1,2]]
+  },
+  {
+    "label": "NOT NULL cuts: [True, False, True, True]",
+    "defaults": ["1","1"],
+    "not_null": [true,false,true,true],
+    "steps": [{"op": "alter_column_nullability","uid": "c_bbbbbb","column": "app.p.d","ty": "integer","to_nullable": true},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "input_operations": true
+  },
+  {
+    "label": "NOT NULL cuts: [False, True, True, False]",
+    "defaults": ["1","1"],
+    "not_null": [false,true,true,false],
+    "steps": [{"op": "alter_column_nullability","uid": "c_bbbbbb","column": "app.p.d","ty": "integer","to_nullable": false},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "input_operations": true
+  },
+  {
+    "label": "NOT NULL cuts: [False, True, False, False]",
+    "defaults": ["1","1"],
+    "not_null": [false,true,false,false],
+    "steps": [{"op": "alter_column_nullability","uid": "c_bbbbbb","column": "app.p.d","ty": "integer","to_nullable": false},{"attach": true}],
+    "inputs": [[0,1],[1,0]],
+    "input_operations": true
+  },
+  {
+    "label": "NOT NULL cuts: [True, False, True, False]",
+    "defaults": ["1","1"],
+    "not_null": [true,false,true,false],
+    "steps": [{"op": "alter_column_nullability","uid": "c_bbbbbb","column": "app.p.d","ty": "integer","to_nullable": true},{"attach": true},{"op": "set_partition_not_null","uid": "t_bbbbbb","table": "app.a","column": "d","not_null": false}],
+    "inputs": [[0,1,2],[2,1,0]],
+    "input_operations": true,
+    "no_boundary": [[0,1]],
+    "edges": [[1,2]]
+  },
+  {
+    "label": "attaching source default chain precedes restoration",
+    "steps": [{"op": "alter_column_default","uid": "c_dddddd","column": "app.a.d","from": "9","to": null},{"op": "alter_column_default","uid": "c_bbbbbb","column": "app.p.d","from": "1","to": "7"},{"attach": true},{"op": "set_partition_default","uid": "t_bbbbbb","table": "app.a","parent": "app.p","column": "d","from": null,"to": "9","fallback": null}],
+    "inputs": [[0,1,2,3]],
+    "edges": [[0,2],[2,3]]
+  }
+]
