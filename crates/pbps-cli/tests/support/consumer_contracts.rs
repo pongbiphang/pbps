@@ -663,3 +663,121 @@ fn declarations(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         })
         .collect()
 }
+
+#[test]
+#[ignore = "needs SQL Server or PostgreSQL 16 and 18"]
+fn consumer_writers_keep_defaults_needed_by_other_existing_columns() {
+    let probe = Demo::new("sibling-default-dialect");
+    let pg = std::fs::read_to_string(probe.dir.join("pbps.yml"))
+        .unwrap()
+        .contains("postgres");
+    let variables: &[&str] = if pg {
+        &["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"]
+    } else {
+        &["PBPS_TEST_DB"]
+    };
+    for variable in variables {
+        let server = std::env::var(variable).unwrap();
+        // Expected outcomes belong to the cases, including actual insert safety.
+        for (label, nullable, replacement, unrelated, added, expected) in [
+            ("required", false, None, false, false, 2),
+            ("nullable", true, None, false, false, 0),
+            ("replacement", false, Some("8"), false, false, 0),
+            ("unrelated", false, None, true, false, 0),
+            ("new-supplied", false, Some("7"), false, true, 0),
+        ] {
+            let own = OwnDatabase::new(&server, "sibling_default2453");
+            let c = own.connection();
+            let d = Demo::new("sibling-default");
+            let shape = |value: Option<&str>, include_b| {
+                format!(
+                    "table: app.t\ncolumns:\n  a: {{type: integer}}\n{}",
+                    if include_b {
+                        format!(
+                            "  b: {{type: integer, nullable: {nullable}{}}}\n",
+                            value.map_or(String::new(), |v| format!(", default: '{v}'"))
+                        )
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            d.table(&shape(Some("7"), !added));
+            let other = d.dir.join("schema/other.yml");
+            std::fs::write(&other, "table: app.other\ncolumns:\n  a: {type: integer}\n  b: {type: integer, nullable: false, default: '7'}\n").unwrap();
+            ok(d.run(&["plan"]));
+            d.commit();
+            on_server(c, "CREATE SCHEMA app");
+            ok(d.run(&["bootstrap", "--db", c]));
+            on_server(
+                c,
+                "BEGIN TRANSACTION; INSERT INTO app.t(a) VALUES(1); ROLLBACK TRANSACTION;",
+            );
+            if unrelated {
+                std::fs::write(&other, "table: app.other\ncolumns:\n  a: {type: integer}\n  b: {type: integer, nullable: false}\n").unwrap();
+            } else {
+                d.table(&shape(replacement, true));
+            }
+            if added {
+                // Connected planning consumes identity intent already recorded
+                // by the offline plan; allocate the new column first.
+                ok(d.run(&["plan"]));
+                d.commit();
+            }
+            config(&d, "consumers:\n  client: {writes: [app.t.a]}\n");
+            let path = d.dir.join("sibling.json");
+            if expected == 2 {
+                let report = refused(
+                    &d,
+                    "consumer.unproven",
+                    &["plan", "--db", c, "--out", path.to_str().unwrap()],
+                );
+                assert!(
+                    report["findings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("consumers.client.writes: app.t.a")
+                                && m.contains("app.t.b"))),
+                    "{label}: {report}"
+                );
+                assert!(!path.exists());
+                config(&d, "consumers:\n  client: {writes: [app.t]}\n");
+                refused(&d, "consumer.unproven", &["plan", "--db", c]);
+            } else {
+                ok(d.run(&["plan", "--db", c, "--out", path.to_str().unwrap()]));
+            }
+            // Retiring the writer permits the real migration, so the native
+            // INSERT proves the compatibility question rather than our model.
+            config(&d, "");
+            ok(d.run(&["plan", "--db", c, "--out", path.to_str().unwrap()]));
+            ok(d.run(&[
+                "apply",
+                "--db",
+                c,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&path),
+                "--allow",
+                "not-null",
+            ]));
+            ok(d.run(&["verify", "--db", c]));
+            if expected == 0 {
+                on_server(c, "INSERT INTO app.t(a) VALUES(1)");
+            } else if pg {
+                on_server(
+                    c,
+                    "DO $case$ BEGIN INSERT INTO app.t(a) VALUES(1); RAISE EXCEPTION 'expected not_null_violation'; EXCEPTION WHEN not_null_violation THEN NULL; END $case$",
+                );
+            } else {
+                on_server(
+                    c,
+                    "BEGIN TRY INSERT INTO app.t(a) VALUES(1); THROW 50000, 'expected error 515', 1; END TRY BEGIN CATCH IF ERROR_NUMBER() <> 515 THROW; END CATCH;",
+                );
+            }
+        }
+    }
+}

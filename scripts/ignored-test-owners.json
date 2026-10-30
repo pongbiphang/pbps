@@ -2929,6 +2929,42 @@
         "drop_requirements2400_mssql::a_table_drop_honors_its_removed_columns_requirements_on_sql_server",
         "drop_requirements2400_mssql::guarded_drops_follow_the_table_uid_through_a_rename_on_sql_server"
       ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "consumer_contracts::consumer_writers_keep_defaults_needed_by_other_existing_columns"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "consumer_contracts::consumer_writers_keep_defaults_needed_by_other_existing_columns",
+        "consumer_effective_columns::sibling_domain_default_losses_use_the_same_rule_in_alter_and_rebuild_plans",
+        "consumer_effective_columns::sibling_default_losses_follow_partition_trees_without_removing_existing_refusals"
+      ]
     }
   ]
 }

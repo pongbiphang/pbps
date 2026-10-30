@@ -6,7 +6,7 @@ use super::{
 };
 use pbps_model::{
     Change, ColumnName, DomainDelta, DomainHalf, ManagedType, PlannedChange, RiskClass, TypeRef,
-    Uid,
+    Uid, ValueSource,
 };
 use std::collections::BTreeSet;
 
@@ -81,7 +81,14 @@ pub(super) fn classify(
     };
     let default = |pair: ColumnPair<'_>, affected| {
         entry.writes
-            && affected
+            // A column writer can omit a sibling supplied by its DEFAULT.
+            // Keep every existing match, including partition-local matches.
+            && (affected
+                || (written_pair(pair)
+                    && pair.after.is_some_and(|after| {
+                        !after.column.nullable
+                            && matches!(after.column.value_source, ValueSource::None)
+                    })))
             && pair.default_changed()
             && !pair.supplied()
             && !unchanged(&p.change, Some(&pair.key.0))
