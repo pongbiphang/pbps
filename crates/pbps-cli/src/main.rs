@@ -1794,7 +1794,9 @@ fn cmd_pull(
         }
     }
 
-    let extension_scope = adopt::extension_scope(&dir, existing_ids.as_ref(), extensions)?;
+    let protected_inputs = [project.ids_file(), project.config_file()];
+    let extension_scope =
+        adopt::extension_scope(&dir, existing_ids.as_ref(), extensions, &protected_inputs)?;
 
     // Annotated because `db::connect` widens the block's error to `anyhow`:
     // it carries the "cannot connect to the database" context every other
@@ -2053,19 +2055,7 @@ fn cmd_pull(
     // Force replaces declarations, never config or identity inputs reached
     // through an output name or one of the entries about to be removed.
     for path in written.iter().chain(&present) {
-        for protected in [project.ids_file(), project.config_file()] {
-            anyhow::ensure!(
-                !paths::same_file(path, &protected)?,
-                "`{}` aliases protected project input `{}`",
-                pbps_model::Text::new(path.display().to_string()).shown(),
-                pbps_model::Text::new(protected.display().to_string()).shown()
-            );
-        }
-        anyhow::ensure!(
-            paths::absolute(path)?.starts_with(&root),
-            "`{}` resolves outside the declaration directory",
-            pbps_model::Text::new(path.display().to_string()).shown()
-        );
+        paths::refuse_declaration_path(path, &root, &protected_inputs)?;
     }
     // Identity validation/serialization remains a semantic prerequisite for
     // declaration publication. Keep unchanged JSON byte-exact.
