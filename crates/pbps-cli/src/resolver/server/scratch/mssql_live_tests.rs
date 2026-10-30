@@ -1357,3 +1357,6 @@ pub(super) fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
     pbps_db::fingerprint::EnvironmentFingerprintKey::from_env("PBPS_TEST_FINGERPRINT_KEY")
         .expect("the LocalDB runner supplies the environment key")
 }
+
+#[path = "chained2376_tests.rs"]
+mod chained2376;

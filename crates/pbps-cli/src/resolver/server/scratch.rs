@@ -420,6 +420,9 @@ impl Run<'_> {
             )
             .await
             .map_err(|error| failed(error, &staged))?;
+        if let Some(completed) = prepared.completed_staged() {
+            staged = completed;
+        }
         let compiled = reconstruction
             .capture_desired(
                 &mut prepared,
@@ -472,6 +475,7 @@ impl Run<'_> {
                 },
                 outside_writes: self.provenance.outside_writes,
                 same_instance: self.provenance.same_instance,
+                dependencies: prepared.dependency_placements(),
             },
             target_cluster: self.planned_identity.to_owned(),
             limitations,

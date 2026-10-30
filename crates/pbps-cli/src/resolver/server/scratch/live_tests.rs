@@ -4920,6 +4920,7 @@ async fn resolver_docker_records_the_image_as_configured_and_unverified() {
             layout: pbps_model::resolver::ScratchLayout::RunOwned,
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
             same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+            dependencies: Default::default(),
         }
     );
     let runtime = serde_json::to_string(&plan.evidence.qualification().runtime).unwrap();

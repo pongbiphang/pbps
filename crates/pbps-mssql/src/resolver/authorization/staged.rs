@@ -90,6 +90,29 @@ pub struct OwnerPartition {
 }
 
 impl OwnerPartition {
+    /// A capture follows bindings through managed objects before they exist
+    /// on scratch. Those roots and their implicit children are not staged
+    /// authorization subjects; explicitly requested external barriers are.
+    pub fn for_staging(
+        captured: &CapturedInputs,
+        context: &AuthorizationContext,
+        excluded: &BTreeSet<ObjectIdentity>,
+    ) -> Result<Self, Uncovered> {
+        let mut owners = Self::from_capture(captured, context)?;
+        owners.owners.retain(|subject, _| match subject {
+            Subject::Securable(id) => {
+                !excluded.contains(id)
+                    && (captured.scope().retained.contains(id)
+                        || !captured
+                            .properties(id)
+                            .and_then(|p| p.get("parent"))
+                            .and_then(|v| serde_json::from_value::<ObjectIdentity>(v.clone()).ok())
+                            .is_some_and(|parent| excluded.contains(&parent)))
+            }
+            Subject::Deployer | Subject::DatabaseOwner => true,
+        });
+        Ok(owners)
+    }
     /// Trusted renderer ownership only. File-supplied subjects are verified,
     /// never passed through an ownership repair.
     pub fn restricted_to(&self, objects: &BTreeSet<ObjectIdentity>) -> Self {
@@ -245,14 +268,14 @@ pub async fn reconstruct_owners(
                 let [row] = rows.as_slice() else {
                     return Err(DbError::Refused(absent_staged_object(&name)));
                 };
-                if let (Some(schema), Some(parent)) = (
-                    row.try_get::<&str>("parent_schema")?,
-                    row.try_get::<&str>("parent_name")?,
-                ) {
-                    let parent = crate::resolver::capture::object(schema, parent);
-                    if target.owners.get(&Subject::Securable(parent)) == Some(owner) {
-                        continue;
-                    }
+                if row.try_get::<&str>("parent_schema")?.is_some()
+                    && row.try_get::<&str>("parent_name")?.is_some()
+                {
+                    // A newly rendered child may arrive after its parent was
+                    // staged, so the repair subset need not include the parent.
+                    // SQL Server rejects repairing a parent-owned child (15346);
+                    // it inherits, and the complete partition is verified later.
+                    continue;
                 }
                 format!("OBJECT::{name}")
             };

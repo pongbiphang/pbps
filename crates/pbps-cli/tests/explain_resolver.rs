@@ -44,6 +44,7 @@ fn sealed_under(
             layout: ScratchLayout::Supplied,
             outside_writes: OutsideWrites::Refused,
             same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+            dependencies: Default::default(),
         },
         IdsFile::default(),
     )
@@ -956,6 +957,7 @@ fn resolved_plan_holding(text: &str) -> SavedPlan {
             layout: ScratchLayout::RunOwned,
             outside_writes: OutsideWrites::Refused,
             same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+            dependencies: Default::default(),
         },
         IdsFile::default(),
     )
@@ -1319,6 +1321,7 @@ fn same_instance_is_explained_and_tampering_fails_the_approved_checksum() {
                 layout: ScratchLayout::Supplied,
                 outside_writes: OutsideWrites::Refused,
                 same_instance: policy,
+                dependencies: Default::default(),
             },
             IdsFile::default(),
         );

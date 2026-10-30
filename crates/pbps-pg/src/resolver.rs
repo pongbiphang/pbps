@@ -33,6 +33,10 @@ pub fn validate_evidence(
     evidence: &pbps_model::resolver::ResolverEvidence,
 ) -> Result<(), pbps_model::resolver::EvidenceError> {
     use pbps_model::resolver::EvidenceError;
+    evidence
+        .qualification()
+        .runtime
+        .validate_dependencies("postgres", std::iter::empty())?;
     // The one runtime reads the facts both engines report and observes no
     // executable (#1672); evidence naming another rule claims coverage it does
     // not have, and the identifier moves with the set of facts compared, so an

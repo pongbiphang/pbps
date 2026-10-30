@@ -5203,3 +5203,61 @@ SQL-only fixture extension really updates 1.0 to 2.0 and back, exercising
 both scripts and refusing the restored extension row. Ordinary logins still
 publish unchanged or rolled-back plans with their named limitation; readable
 schema history and standing public role-value checks remain enforced.
+
+<a id="dec-2376-1"></a>
+
+**DEC-2376.1. Chained SQL Server externals are native scratch steps.**
+Scratch accepts additive SQL-free auxiliary facts alongside its managed parts.
+One shared settlement places each auxiliary immediately after its last
+prerequisite and before its consumers. Auxiliary nodes have no Change, UID or
+managed origin. Empty auxiliary input preserves the existing route. External
+templates are lowered by the SQL Server renderer only after settlement.
+Auxiliary steps execute inside the same compile ranges, on the setup connection;
+their interleaved positions impose hard predecessors and successors on managed
+trial compilation. A trial cannot overtake or retry them without an explicit
+executor opt-in. This is case (a) of the #2465 coordination contract.
+Every stage reuses the environment key fixed by the producer before capture.
+Each successful stage is compared again and merged without overwriting an
+earlier accepted target shape. Cross-engine staging compares owner partitions;
+private observations of the same target retain its owner identities, so adding
+a staged member cannot masquerade as a target change. A prerequisite absent from reconstruction is a
+refusal naming the external and the managed object.
+
+The externals file permits one complete `-- pbps:deferred` marker line outside
+quotes and comments. Its suffix runs on the setup connection after all managed
+steps; file interleaving is not supported. Duplicate markers and a failing
+numbered deferred statement refuse. Inventory is read after partial execution
+so those objects remain in the run's cleanup obligation.
+
+<a id="dec-2376-2"></a>
+
+**DEC-2376.2. Dependency placement describes the observed rehearsal.**
+Scratch runtime evidence carries a map from the three-part DependencyName to
+Bound or Companion with a Compared/Declared shape source, copied from the
+SQL Server preparation handoff. It is distinct from the same-instance file
+policy. Empty maps are omitted without a format-version change; existing
+PostgreSQL bytes remain unchanged. SQL Server artifact readers require exactly
+the plan's declared dependency keys, rejecting both missing and extra records;
+PostgreSQL readers reject any placement record. Explain displays each placement
+and shape source. Its published schema-set metadata advances separately;
+saved-plan, evidence and envelope wire versions do not. Apply performs no
+new dependency query. Full SQL Server
+evidence sealing/admission remains #2143's boundary.
+
+
+<a id="dec-2376-3"></a>
+
+**DEC-2376.3. Chained externals wait for their actual key prerequisite, not every index on a referenced table.** A plain table reference needs the bare table; holding it behind unrelated split keys or indexes can invent a cycle through a managed function and later computed columns. Foreign-key capture already records the referenced constraint identity or unique-index name. The SQL Server blueprint uses that private fact to retain the corresponding provider edge on the referenced table itself (a same-named key on another table is no provider), including an unnamed primary key's producer-issued identity, while leaving unrelated keys out. A missing or unreadable captured foreign-key fact is never inferred from statement text. A live regression creates the legal base-table/view/function/computed/key order on the target, then compiles the same native scratch route with a referenced unique index, unique constraint, named primary key and unnamed primary key. Ordinary diff's computed-function limitation is unchanged.
+
+
+<a id="dec-2376-4"></a>
+
+**DEC-2376.4. External prerequisite walks stop at managed providers.**
+The external-to-external graph stops at both managed providers and external
+roots, then returns only the external boundaries it reaches. A managed
+provider's own dependencies belong to its settled operations; walking through
+its not-yet-created children can invent a cycle between independent external
+readers of the same bare table. Managed prerequisite discovery still traverses
+externals to find their managed anchors. The native four-key regression uses
+two external views before their managed function and computed-column consumers;
+a lexically earlier true external relay also retains its required provider edge.

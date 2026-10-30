@@ -34,6 +34,37 @@ impl Staged {
     pub(super) fn holds(&self, id: &ObjectIdentity) -> bool {
         self.accepted.contains_key(id)
     }
+
+    /// Merge accepted comparisons without overwriting a target observation
+    /// made earlier in the run (DEC-2376.1).
+    pub fn extend(&mut self, other: Self) -> Result<(), Vec<String>> {
+        if self.managed != other.managed {
+            return Err(vec![
+                "staged comparisons disagree on the managed set".into(),
+            ]);
+        }
+
+        let changed = self
+            .accepted
+            .iter()
+            .filter(|(id, properties)| other.accepted.get(*id).is_some_and(|p| p != *properties))
+            .map(|(id, _)| {
+                format!(
+                    "the target changed {} between staged comparisons",
+                    named(id)
+                )
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            return Err(changed);
+        }
+        self.compared.extend(other.compared);
+        self.accepted.extend(other.accepted);
+        self.scope.retained.extend(other.scope.retained);
+        self.scope.candidates.extend(other.scope.candidates);
+        Ok(())
+    }
+
     pub fn compared(&self) -> &BTreeSet<ObjectIdentity> {
         &self.compared
     }
@@ -50,7 +81,13 @@ impl Staged {
         let relevant = barriers(&current.inputs, &self.managed);
         differences(
             &self.accepted,
-            &shapes(&current.inputs, &self.compared, &relevant, &self.managed),
+            &shapes(
+                &current.inputs,
+                &self.compared,
+                &relevant,
+                &self.managed,
+                Owners::Target,
+            ),
             "the target",
         )
     }
@@ -83,6 +120,29 @@ pub async fn compare_staged_declared(
     managed: &[&Schema],
     declarations: &pbps_model::dependency::Dependencies,
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<Staged, StageError> {
+    compare_staged_pending(
+        scratch,
+        target,
+        created,
+        managed,
+        declarations,
+        key,
+        &BTreeSet::new(),
+    )
+    .await
+}
+
+/// Pending roots are compared by a later native reconstruction step. They
+/// cannot contribute an accepted shape before their prerequisites exist.
+pub async fn compare_staged_pending(
+    scratch: &mut impl QueryConnection,
+    target: &mut impl QueryConnection,
+    created: &BTreeSet<ObjectIdentity>,
+    managed: &[&Schema],
+    declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    pending: &BTreeSet<ObjectIdentity>,
 ) -> Result<Staged, StageError> {
     let managed: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let mut refused = Vec::new();
@@ -146,10 +206,12 @@ pub async fn compare_staged_declared(
         .await
         .map_err(StageError::Capture)?;
     scope.retained.extend(created.iter().cloned());
-    let on_target = super::capture_declared(target, &scope, declarations, key)
+    scope.retained.retain(|id| !pending.contains(id));
+    let mut on_target = super::capture_declared(target, &scope, declarations, key)
         .await
         .map_err(StageError::Capture)?;
     scope = on_target.scope().clone();
+    on_target.inputs.retain(|id, _| !pending.contains(id));
     let held_managed = Names::read(scratch, &target_managed.objects)
         .await
         .map_err(StageError::Capture)?;
@@ -163,9 +225,10 @@ pub async fn compare_staged_declared(
     if !waiting.is_empty() {
         return Err(StageError::Refused(waiting));
     }
-    let staged = super::capture_declared(scratch, &scope, declarations, key)
+    let mut staged = super::capture_declared(scratch, &scope, declarations, key)
         .await
         .map_err(StageError::Capture)?;
+    staged.inputs.retain(|id, _| !pending.contains(id));
     let requested: BTreeSet<_> = created
         .iter()
         .cloned()
@@ -239,7 +302,13 @@ pub async fn compare_staged_declared(
     }
     let target_barriers = barriers(&on_target.inputs, &target_managed);
     let scratch_barriers = barriers(&staged.inputs, &scratch_managed);
-    let accepted = shapes(&on_target.inputs, &roots, &target_barriers, &target_managed);
+    let accepted = shapes(
+        &on_target.inputs,
+        &roots,
+        &target_barriers,
+        &target_managed,
+        Owners::Stage,
+    );
     // A sys.objects row alone does not cover a kind's dedicated catalogs.
     // The capture deliberately skips Broker, for example; an unreferenced
     // file-created queue must therefore refuse even when both names exist.
@@ -275,7 +344,13 @@ pub async fn compare_staged_declared(
     if !refused.is_empty() {
         return Err(StageError::Refused(refused));
     }
-    let scratch_shapes = shapes(&staged.inputs, &roots, &scratch_barriers, &scratch_managed);
+    let scratch_shapes = shapes(
+        &staged.inputs,
+        &roots,
+        &scratch_barriers,
+        &scratch_managed,
+        Owners::Stage,
+    );
     let mut findings = spelling_differences(scratch, &accepted, &scratch_shapes)
         .await
         .map_err(StageError::Capture)?;
@@ -286,8 +361,14 @@ pub async fn compare_staged_declared(
         return Err(StageError::Refused(findings));
     }
     Ok(Staged {
+        accepted: shapes(
+            &on_target.inputs,
+            &roots,
+            &target_barriers,
+            &target_managed,
+            Owners::Target,
+        ),
         compared: roots,
-        accepted,
         scope,
         managed: target_managed,
     })
@@ -302,11 +383,32 @@ pub struct ExternalInputs {
 }
 
 impl ExternalInputs {
+    pub fn managed(&self) -> &BTreeSet<ObjectIdentity> {
+        &self.managed
+    }
     pub fn captured(&self) -> &CapturedInputs {
         &self.captured
     }
     pub fn roots(&self) -> &BTreeSet<ObjectIdentity> {
         &self.roots
+    }
+    pub fn prerequisites(&self) -> BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>> {
+        prerequisites(&self.captured, &self.roots, &self.managed)
+    }
+    pub fn external_prerequisites(&self) -> BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>> {
+        // DEC-2376.4: managed providers carry their own prerequisites in the
+        // settled program. Crossing their children here invents external cycles.
+        let boundaries = self.roots.union(&self.managed).cloned().collect();
+        self.roots
+            .iter()
+            .map(|root| {
+                let required = references(&self.captured, root, &boundaries);
+                (
+                    root.clone(),
+                    required.intersection(&self.roots).cloned().collect(),
+                )
+            })
+            .collect()
     }
     pub fn waiting(&self) -> Vec<String> {
         managed_dependencies(&self.captured, &self.roots, &self.managed)
@@ -358,32 +460,69 @@ fn managed_dependencies(
     roots: &BTreeSet<ObjectIdentity>,
     managed: &BTreeSet<ObjectIdentity>,
 ) -> Vec<String> {
-    let mut refused = Vec::new();
-    for root in roots.iter().filter(|id| !managed.contains(*id)) {
-        let mut pending = vec![root.clone()];
-        let mut seen = BTreeSet::new();
-        while let Some(id) = pending.pop() {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            if managed.contains(&id) {
-                refused.push(format!(
+    prerequisites(captured, roots, managed)
+        .into_iter()
+        .flat_map(|(root, managed)| {
+            managed.into_iter().map(move |id| {
+                format!(
                     "external {} depends on managed {}; it waits for chained staging (#2376)",
-                    named(root),
+                    named(&root),
                     named(&id)
-                ));
-                break;
-            }
-            pending.extend(id.signature.iter().cloned());
-            if let Some(input) = captured.inputs.get(&id) {
-                pending.extend(input.bindings.iter().map(|b| b.target.clone()));
-                // A constraint needs its referencing table as well as its
-                // referenced table; neither may be invented during setup.
-                pending.extend(reference(input, "parent"));
-            }
+                )
+            })
+        })
+        .collect()
+}
+
+fn prerequisites(
+    captured: &CapturedInputs,
+    roots: &BTreeSet<ObjectIdentity>,
+    managed: &BTreeSet<ObjectIdentity>,
+) -> BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>> {
+    roots
+        .iter()
+        .filter(|root| !managed.contains(*root))
+        .filter_map(|root| {
+            let required = references(captured, root, managed);
+            (!required.is_empty()).then(|| (root.clone(), required))
+        })
+        .collect()
+}
+
+fn references(
+    captured: &CapturedInputs,
+    root: &ObjectIdentity,
+    providers: &BTreeSet<ObjectIdentity>,
+) -> BTreeSet<ObjectIdentity> {
+    let mut required = BTreeSet::new();
+    let mut pending = vec![root.clone()];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if id != *root && providers.contains(&id) {
+            required.insert(id);
+            continue;
+        }
+        pending.extend(id.signature.iter().cloned());
+        // A relation's typed columns are structural prerequisites; its
+        // independently staged guards are not prerequisites of the relation.
+        pending.extend(
+            captured
+                .inputs
+                .keys()
+                .filter(|child| {
+                    child.class == class::COLUMN && child.signature.first() == Some(&id)
+                })
+                .cloned(),
+        );
+        if let Some(input) = captured.inputs.get(&id) {
+            pending.extend(input.bindings.iter().map(|b| b.target.clone()));
+            pending.extend(reference(input, "parent"));
         }
     }
-    refused
+    required
 }
 
 // Every identity from YAML is resolved in the catalog where it will be used.
@@ -414,6 +553,14 @@ impl Managed {
                         .chain(t.primary_key.iter().filter_map(|p| p.name.as_ref()))
                         .map(|name| super::object(&table.schema, name.raw())),
                 );
+            }
+            for name in schema.types.keys() {
+                schemas.insert(name.schema().into());
+                objects.insert(ObjectIdentity {
+                    class: class::TYPE.into(),
+                    name: vec![name.schema().into(), name.name().into()],
+                    signature: vec![],
+                });
             }
             for name in schema.modules.keys() {
                 schemas.insert(name.schema().into());
@@ -607,11 +754,20 @@ pub(super) fn skipped_child(input: &Input) -> bool {
         )
 }
 
+// A stage compares owner equality across engines. Private target observations
+// retain its stable identity: the partition domain grows during chained staging.
+#[derive(Clone, Copy)]
+enum Owners {
+    Stage,
+    Target,
+}
+
 fn shapes(
     inputs: &BTreeMap<ObjectIdentity, Input>,
     roots: &BTreeSet<ObjectIdentity>,
     barriers: &BTreeSet<ObjectIdentity>,
     managed: &Managed,
+    owners_as: Owners,
 ) -> Shapes {
     let mut included = roots.clone();
     loop {
@@ -700,13 +856,16 @@ fn shapes(
                 if let Some(owner) = owners.get(id) {
                     properties.insert(
                         "owner_group".into(),
-                        json!(
-                            owners
-                                .iter()
-                                .filter(|(_, o)| *o == owner)
-                                .map(|(id, _)| id)
-                                .collect::<Vec<_>>()
-                        ),
+                        match owners_as {
+                            Owners::Target => json!(owner),
+                            Owners::Stage => json!(
+                                owners
+                                    .iter()
+                                    .filter(|(_, o)| *o == owner)
+                                    .map(|(id, _)| id)
+                                    .collect::<Vec<_>>()
+                            ),
+                        },
                     );
                 }
                 (id.clone(), properties)
@@ -910,6 +1069,36 @@ fn differences(target: &Shapes, staged: &Shapes, label: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extending_staging_keeps_prior_shapes_and_rejects_a_changed_target() {
+        use super::*;
+        let id = super::super::object("ext", "first");
+        let make = |root: ObjectIdentity, value| Staged {
+            compared: BTreeSet::from([root.clone()]),
+            accepted: BTreeMap::from([(
+                root.clone(),
+                BTreeMap::from([("shape".into(), json!(value))]),
+            )]),
+            scope: CaptureScope {
+                retained: BTreeSet::from([root]),
+                candidates: Default::default(),
+            },
+            managed: Managed::default(),
+        };
+        let mut staged = make(id.clone(), 1);
+        let original = staged.clone();
+        assert!(staged.extend(make(id.clone(), 2)).is_err());
+        assert_eq!(staged, original);
+        let next = super::super::object("ext", "next");
+        staged.extend(make(next.clone(), 3)).unwrap();
+        assert_eq!(
+            staged.compared(),
+            &BTreeSet::from([id.clone(), next.clone()])
+        );
+        assert_eq!(staged.accepted[&id]["shape"], json!(1));
+        assert!(staged.scope().retained.contains(&next));
+    }
+
     use super::*;
 
     #[test]
@@ -1028,7 +1217,13 @@ mod tests {
                 target: policy.clone(),
             });
         let roots = BTreeSet::from([table.clone()]);
-        let target = shapes(&inputs, &roots, &BTreeSet::new(), &Managed::default());
+        let target = shapes(
+            &inputs,
+            &roots,
+            &BTreeSet::new(),
+            &Managed::default(),
+            Owners::Stage,
+        );
         assert!(target.contains_key(&policy));
         let mut changed = inputs.clone();
         changed
@@ -1038,12 +1233,25 @@ mod tests {
             .insert("sys.security_policies".into(), json!({"is_enabled":"0"}));
         assert_ne!(
             target,
-            shapes(&changed, &roots, &BTreeSet::new(), &Managed::default())
+            shapes(
+                &changed,
+                &roots,
+                &BTreeSet::new(),
+                &Managed::default(),
+                Owners::Stage
+            )
         );
         // A module's ordinary reference is not ownership of its callee.
         inputs.get_mut(&table).unwrap().bindings.clear();
         assert!(
-            !shapes(&inputs, &roots, &BTreeSet::new(), &Managed::default()).contains_key(&policy)
+            !shapes(
+                &inputs,
+                &roots,
+                &BTreeSet::new(),
+                &Managed::default(),
+                Owners::Stage
+            )
+            .contains_key(&policy)
         );
     }
 }

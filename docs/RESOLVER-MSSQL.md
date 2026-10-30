@@ -814,15 +814,32 @@ after dependent objects have been removed. An unreadable type identity or a
 permission without a recorded type drop still refuses. The final inventory
 read must be empty before the sandbox user is removed.
 
-An external or cascade-closure object which needs a managed object cannot
-exist before reconstruction. At a missing scratch prerequisite, the catalog
-check names both objects and says it waits for chained staging (#2376). The
-renderer refuses the same dependency before emitting DDL. The legal chain
-`a -> managed -> x` measures error 1767 before managed exists; inventing that
-table during setup is a managed overlap. #2376 will lift this refusal through
-chained staging and subsequent complete comparison. The all-external chain
-is accepted. Same-instance policy and its shared evidence carrier are implemented by #2270;
-this preparation still does not publish evidence before #2143.
+An external or cascade-closure object which needs a managed object becomes a
+native reconstruction step (DEC-2376.1). The shared scratch blueprint places
+it immediately after its last managed prerequisite, and its renderer template
+runs on the setup connection. It is then compared and merged into `Staged`;
+a prerequisite that reconstruction never creates refuses by both names.
+The legal chain `a -> managed -> x` cannot run earlier (measured error 1767),
+and the file may not invent managed objects during setup.
+
+A complete `-- pbps:deferred` marker line outside strings and comments splits
+the externals file. At most one marker is permitted. The prefix runs during
+setup; the suffix runs on the setup connection after every managed step,
+then is inventoried and compared. For example:
+
+```sql
+CREATE TABLE dbo.a(i int CONSTRAINT a_pk PRIMARY KEY);
+CREATE TABLE dbo.x(i int CONSTRAINT x_pk PRIMARY KEY);
+-- pbps:deferred
+ALTER TABLE dbo.x ADD CONSTRAINT x_managed
+    FOREIGN KEY(i) REFERENCES dbo.managed(i) ON DELETE CASCADE;
+```
+
+The managed declarations supply `dbo.managed`; the deferred file creates only
+its externals. Deferred statements do not interleave with managed steps.
+A failure names the numbered deferred statement, and partially created objects
+remain in the cleanup inventory. Same-instance file policy remains #2270's;
+preparation still does not publish evidence before #2143.
 
 The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
 
