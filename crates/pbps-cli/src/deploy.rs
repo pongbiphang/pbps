@@ -4848,6 +4848,19 @@ fn refuse_pinned_movement(
             expected_types.entry(name).or_insert(None);
         }
     }
+    // Both reads are already scoped to held identities. PR A admits no
+    // extension lifecycle change (DEC-2447.1), so every admitted plan keeps
+    // each exact definition, at checkpoints as well as at the closing read.
+    let extensions: BTreeSet<_> = before
+        .extensions
+        .keys()
+        .chain(after.extensions.keys())
+        .collect();
+    for name in extensions {
+        if before.extensions.get(name) != after.extensions.get(name) {
+            bail!("extension `{}` changed during {label}", name.shown());
+        }
+    }
     let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
     for name in types {
         if before.types.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
@@ -24848,5 +24861,109 @@ mod data_work_failure_tests {
         assert!(
             pbps_model::StateSnapshot::from_json(&serde_json::to_string(&failed).unwrap()).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_guard_tests {
+    use super::*;
+
+    #[test]
+    fn exact_extensions_are_required_at_every_read_back() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "app.new".parse().unwrap(),
+                    table: Box::default(),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )],
+        };
+        for (schema, version) in [("ext", "1.4"), ("other", "1.6")] {
+            let mut before = Schema::default();
+            before.extensions.insert(
+                "package".into(),
+                pbps_model::Extension {
+                    schema: schema.into(),
+                    version: version.into(),
+                },
+            );
+            let mut expected = before.clone();
+            expected
+                .tables
+                .insert("app.new".parse().unwrap(), Default::default());
+            let ids = guard::fixture_ids(&changes, &before);
+            let plan = guard::Plan {
+                changes: &changes,
+                ids: &ids,
+            };
+            let staged = guard::Staged::new(plan).unwrap();
+            for read in [
+                None,
+                Some(StagedRead::Checkpoint {
+                    completed: 1,
+                    total: 2,
+                }),
+                Some(StagedRead::Checkpoint {
+                    completed: 2,
+                    total: 2,
+                }),
+                Some(StagedRead::Closing { total: 2 }),
+            ] {
+                let check = |after: &Schema| {
+                    let read = match read {
+                        None => guard::Read::transactional(plan),
+                        Some(read) => staged.read(read),
+                    };
+                    refuse_pinned_movement(
+                        &pbps_pg::Postgres::new(),
+                        read,
+                        &before,
+                        after,
+                        "fixture",
+                    )
+                };
+                // The ordinary change succeeds with the exact managed values
+                // it was approved over; no lifecycle exemption is invented.
+                check(&expected).unwrap();
+                for case in ["schema", "version", "missing", "renamed", "added"] {
+                    let mut moved = expected.clone();
+                    match case {
+                        "schema" => moved
+                            .extensions
+                            .get_mut("package")
+                            .unwrap()
+                            .schema
+                            .push('x'),
+                        "version" => moved
+                            .extensions
+                            .get_mut("package")
+                            .unwrap()
+                            .version
+                            .push('x'),
+                        "missing" => {
+                            moved.extensions.remove("package");
+                        }
+                        "renamed" => {
+                            let definition = moved.extensions.remove("package").unwrap();
+                            moved.extensions.insert("renamed".into(), definition);
+                        }
+                        "added" => {
+                            moved
+                                .extensions
+                                .insert("new".into(), before.extensions["package"].clone());
+                        }
+                        _ => unreachable!(),
+                    }
+                    let error = check(&moved).unwrap_err().to_string();
+                    assert!(
+                        error.contains("extension `") && error.contains("changed during fixture"),
+                        "{case}: {error}"
+                    );
+                }
+            }
+        }
     }
 }
