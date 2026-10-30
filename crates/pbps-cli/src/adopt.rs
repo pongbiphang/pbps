@@ -32,6 +32,7 @@ pub(crate) fn extension_scope(
     dir: &Path,
     ids: Option<&pbps_model::IdsFile>,
     named: &[String],
+    protected: &[PathBuf],
 ) -> anyhow::Result<BTreeSet<pbps_model::ObjectLocalName>> {
     let mut scope: BTreeSet<_> = named.iter().map(|name| name.as_str().into()).collect();
     if let Some(ids) = ids {
@@ -41,11 +42,15 @@ pub(crate) fn extension_scope(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("cannot read existing extension selection"),
         Ok(_) => {
+            let root = crate::paths::absolute(dir)?;
             // Force may replace duplicate ordinary declarations/aliases. Read
             // each kind independently instead of requiring a merged old model.
             for path in
                 pbps_load::schema_files(dir).context("cannot list existing extension selection")?
             {
+                // Proven foreign paths are refused, not parsed or counted as
+                // absent selection. Genuine unreadable history still refuses.
+                crate::paths::refuse_declaration_path(&path, &root, protected)?;
                 let declared = pbps_load::load_file(&path).map_err(|errors| {
                     anyhow::anyhow!(
                         "cannot read existing extension selection:\n{}",
@@ -1496,5 +1501,103 @@ mod tests {
                 format!("To manage one: pbps pull --extension {argument}")
             );
         }
+    }
+
+    #[test]
+    fn extension_selection_preserves_missing_and_empty_scope_but_refuses_unreadable_history() {
+        let dir = Stage::new("extension-selection-history").unwrap();
+        let schema = dir.path().join("schema");
+        let ids = pbps_model::IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "hstore".into())].into(),
+            ..Default::default()
+        };
+        let held: BTreeSet<_> = ["hstore".into()].into();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            held
+        );
+        assert!(extension_scope(&schema, None, &[], &[]).unwrap().is_empty());
+        std::fs::create_dir(&schema).unwrap();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            held
+        );
+        assert!(extension_scope(&schema, None, &[], &[]).unwrap().is_empty());
+        let path = schema.join("package.yml");
+        for bytes in [
+            b"extension: citext\nversion: [broken\n".as_slice(),
+            b"\xff\xfe".as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = extension_scope(&schema, Some(&ids), &[], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("cannot read existing extension selection"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, "extension: citext\nschema: ext\nversion: '1.4'\n").unwrap();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            ["citext".into(), "hstore".into()].into()
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink("missing-extension.yml", &path).unwrap();
+            assert!(extension_scope(&schema, Some(&ids), &[], &[]).is_err());
+            assert!(std::fs::symlink_metadata(path).unwrap().is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_selection_refuses_foreign_aliases_before_reading_their_contents() {
+        let dir = Stage::new("extension-selection-aliases").unwrap();
+        let schema = dir.path().join("schema");
+        std::fs::create_dir(&schema).unwrap();
+        let protected = dir.path().join("protected.yml");
+        let path = schema.join("candidate.yml");
+        for bytes in [
+            "dialect: postgres\n",
+            "extension: citext\nschema: ext\nversion: '1.4'\n",
+        ] {
+            std::fs::write(&protected, bytes).unwrap();
+            for hard in [false, true] {
+                if hard {
+                    std::fs::hard_link(&protected, &path).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&protected, &path).unwrap();
+                }
+                let error = extension_scope(&schema, None, &[], std::slice::from_ref(&protected))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("aliases protected project input"), "{error}");
+                assert!(
+                    !error.contains("cannot read existing extension selection"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read_to_string(&protected).unwrap(), bytes);
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        // An outside destination is refused even if it looks like a declaration.
+        std::os::unix::fs::symlink(&protected, &path).unwrap();
+        let error = extension_scope(&schema, None, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("resolves outside the declaration directory"),
+            "{error}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        // Equal bytes in a distinct in-root file are genuine explicit selection.
+        std::fs::copy(&protected, &path).unwrap();
+        assert_eq!(
+            extension_scope(&schema, None, &[], &[protected]).unwrap(),
+            ["citext".into()].into()
+        );
     }
 }
