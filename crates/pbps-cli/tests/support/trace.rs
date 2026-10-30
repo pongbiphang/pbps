@@ -687,26 +687,7 @@ impl Fixture {
         std::fs::create_dir(&bin).unwrap();
         let created = self.d.dir.join("disposal.created");
         let attempted = self.d.dir.join("disposal.attempted");
-        executable(
-            &bin.join("docker"),
-            r#"#!/bin/sh
-set -eu
-if [ "$1" = run ]; then
-  set +e
-  "$PBPS_TRACE_DOCKER_REAL" "$@" > "$PBPS_TRACE_CREATED"
-  pbps_trace_status=$?
-  set -e
-  cat "$PBPS_TRACE_CREATED"
-  exit "$pbps_trace_status"
-fi
-if [ "$1" = rm ]; then
-  printf '%s\n' "$@" > "$PBPS_TRACE_ATTEMPTED"
-  echo 'forced trace Docker disposal failure' >&2
-  exit 1
-fi
-exec "$PBPS_TRACE_DOCKER_REAL" "$@"
-"#,
-        );
+        executable(&bin.join("docker"), DISPOSAL_SHIM);
         let before = self.env.clone();
         self.env.extend([
             (
@@ -733,18 +714,8 @@ exec "$PBPS_TRACE_DOCKER_REAL" "$@"
         self.env = before;
         let id = std::fs::read_to_string(created).unwrap();
         let id = id.trim();
-        let attempt = std::fs::read_to_string(attempted).unwrap();
-        let removed = attempt
-            .lines()
-            .skip(1)
-            .filter(|v| !v.starts_with('-'))
-            .collect::<Vec<_>>();
         assert!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(
-            removed,
-            [id],
-            "cleanup must target exactly this run's new container"
-        );
+        assert_disposal_attempts(&std::fs::read_to_string(attempted).unwrap(), id);
         assert!(
             Command::new(&real)
                 .args(["rm", "--force", "--volumes", id])
@@ -1120,6 +1091,140 @@ impl Ui {
         let split = response.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
         response[split..].to_vec()
     }
+}
+
+const DISPOSAL_SHIM: &str = r#"#!/bin/sh
+set -eu
+if [ "$1" = run ]; then
+  set +e
+  "$PBPS_TRACE_DOCKER_REAL" "$@" > "$PBPS_TRACE_CREATED"
+  pbps_trace_status=$?
+  set -e
+  cat "$PBPS_TRACE_CREATED"
+  exit "$pbps_trace_status"
+fi
+if [ "$1" = rm ]; then
+  # Drop may record another attempt while the parent reads this append-only log.
+  printf '%s\n' "$@" "" >> "$PBPS_TRACE_ATTEMPTED"
+  echo 'forced trace Docker disposal failure' >&2
+  exit 1
+fi
+exec "$PBPS_TRACE_DOCKER_REAL" "$@"
+"#;
+
+fn assert_disposal_attempts(recorded: &str, id: &str) {
+    // A blank line commits one argv record; a late writer may still be appending.
+    let (complete, _) = recorded
+        .rsplit_once("\n\n")
+        .expect("at least one disposal attempt must be recorded");
+    assert!(
+        !complete.is_empty(),
+        "at least one disposal attempt must be recorded"
+    );
+    for attempt in complete.split("\n\n") {
+        let mut args = attempt.split('\n');
+        assert_eq!(args.next(), Some("rm"));
+        let removed = args.filter(|v| !v.starts_with('-')).collect::<Vec<_>>();
+        assert_eq!(
+            removed,
+            [id],
+            "cleanup must target exactly this run's new container"
+        );
+    }
+}
+
+#[test]
+fn disposal_records_require_at_least_one_attempt_and_only_the_owned_container() {
+    let owned = "rm\n--force\n--volumes\nowned\n\n";
+    assert_disposal_attempts(&format!("{owned}{owned}rm\n--force"), "owned");
+    for recorded in [
+        String::new(),
+        "\n\n".into(),
+        "rm\n--force\nowned\n".into(),
+        "rm\n--force\nowned\nforeign\n\n".into(),
+        "rm\n--force\nowned \n\n".into(),
+        "rm\n--force\nowned\n\n\n".into(),
+        format!("{owned}rm\n--force\nforeign\n\n"),
+        format!("rm\n--force\nforeign\n\n{owned}"),
+        format!("{owned}rm\n--force\n\n"),
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&recorded, "owned")).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn disposal_records_survive_a_blocked_late_writer() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = Demo::new("trace2533-blocked");
+    let attempted = dir.dir.join("disposal.attempted");
+    let shim = dir.dir.join("docker");
+    let ready = dir.dir.join("ready");
+    let id = "a".repeat(64);
+    executable(&shim, DISPOSAL_SHIM);
+    let command = || {
+        let mut command = Command::new(&shim);
+        command
+            .args(["rm", "--force", "--volumes", &id])
+            .env("PBPS_TRACE_ATTEMPTED", &attempted);
+        command
+    };
+    assert_eq!(command().output().unwrap().status.code(), Some(1));
+    assert!(std::fs::metadata(&attempted).unwrap().len() > 0);
+    // Redirection opens before this function runs. With the old `>` recorder,
+    // ready therefore proves that the previous record has been truncated.
+    executable(
+        &shim,
+        &DISPOSAL_SHIM.replacen(
+            "set -eu\n",
+            "set -eu\nprintf() {\n  : > \"$PBPS_TRACE_BLOCKED\"\n  IFS= read -r release\n  command printf \"$@\"\n}\n",
+            1,
+        ),
+    );
+    let mut late = Reap(
+        command()
+            .env("PBPS_TRACE_BLOCKED", &ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            late.0.try_wait().unwrap().is_none(),
+            "late shim exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late shim never blocked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let during = std::fs::read_to_string(&attempted).unwrap();
+    assert!(late.0.try_wait().unwrap().is_none());
+    late.0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    assert_eq!(late.0.wait().unwrap().code(), Some(1));
+    assert_disposal_attempts(&during, &id);
+    let after = std::fs::read_to_string(&attempted).unwrap();
+    assert_disposal_attempts(&after, &id);
+    assert_eq!(after.matches("\n\n").count(), 2);
 }
 
 fn quoted(value: &str) -> String {
