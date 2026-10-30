@@ -51,6 +51,7 @@ fn annotated(
             },
             &ObjectDeps::default(),
             &goal,
+            pbps_model::operation::ModuleEdits::Rebuilt,
         )
         .unwrap();
     let contract = p.annotations.clone().unwrap();

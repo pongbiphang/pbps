@@ -71,6 +71,7 @@ async fn module_to_object_annotations_drive_installs_and_removals() {
             },
             &ObjectDeps::default(),
             &annotations,
+            pbps_model::operation::ModuleEdits::Rebuilt,
         )
         .unwrap();
     let mut schedule = Schedule::new(2);
@@ -120,6 +121,7 @@ async fn module_to_object_annotations_drive_installs_and_removals() {
             },
             &annotations,
             &ObjectDeps::default(),
+            pbps_model::operation::ModuleEdits::Rebuilt,
         )
         .unwrap();
     let removed = Schedule::new(2).settle(plan).unwrap();
@@ -206,4 +208,100 @@ async fn partition_default_annotations_follow_the_module_across_ancestor_depths(
         assert_eq!(rows[0].try_get::<&str>("bindings").unwrap(), Some("1"));
         db.drop().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn rebuilt_provider_waits_for_annotated_consumer_removal() {
+    let mut db = TestDb::create("annotation_provider_availability").await;
+    let engine = Postgres::new();
+    db.conn.execute("BEGIN").await.unwrap();
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    db.conn
+        .execute("CREATE VIEW app.provider AS SELECT 1 AS x")
+        .await
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW app.consumer AS SELECT x FROM app.provider")
+        .await
+        .unwrap();
+    let module = |definition: &str| Module {
+        kind: ModuleKind::View,
+        definition: definition.into(),
+        description: None,
+        options: Default::default(),
+    };
+    let before = Schema {
+        modules: [
+            ("app.provider".parse().unwrap(), module("SELECT 1 AS x")),
+            (
+                "app.consumer".parse().unwrap(),
+                module("SELECT x FROM app.provider"),
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    after.modules.remove(&"app.consumer".parse().unwrap());
+    after
+        .modules
+        .insert("app.provider".parse().unwrap(), module("SELECT 2 AS x"));
+    let ids = IdsFile::default();
+    let base = ObjectDeps(
+        [(
+            "app.consumer".parse().unwrap(),
+            ["app.provider".parse().unwrap()].into(),
+        )]
+        .into(),
+    );
+    let input = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::AlterModule {
+                id: "app.provider".parse().unwrap(),
+                module: Box::new(module("SELECT 2 AS x")),
+            }),
+            PlannedChange::new(Change::DropModule {
+                id: "app.consumer".parse().unwrap(),
+                kind: ModuleKind::View,
+            }),
+        ],
+    };
+    let annotated = propose(input)
+        .with_annotations(
+            Snapshot {
+                schema: &before,
+                ids: &ids,
+            },
+            Snapshot {
+                schema: &after,
+                ids: &ids,
+            },
+            &base,
+            &ObjectDeps::default(),
+            pbps_model::operation::ModuleEdits::Rebuilt,
+        )
+        .unwrap();
+    let edges = annotated.annotation_edges().unwrap();
+    assert!(edges.iter().any(|e| e.before == 1 && e.after == 0));
+    let settled = Schedule::new(2).settle(annotated).unwrap();
+    assert_eq!(settled.sequence, [1, 0]);
+    let mut sql = Vec::new();
+    for step in &settled.changes.changes {
+        for statement in engine.fixture_emit(&step.change, step.strategy).unwrap() {
+            sql.push(statement.sql.clone());
+            db.conn.execute(&statement.sql).await.unwrap();
+        }
+    }
+    assert!(sql[0].contains("DROP VIEW") && sql[0].contains("consumer"));
+    assert!(sql[1].contains("DROP VIEW") && sql[1].contains("provider"));
+    assert!(sql[2].contains("CREATE VIEW") && sql[2].contains("provider"));
+    let rows = db
+        .conn
+        .query("SELECT CAST(x AS text) AS x FROM app.provider")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<&str>("x").unwrap(), Some("2"));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
 }

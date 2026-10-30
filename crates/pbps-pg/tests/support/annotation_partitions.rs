@@ -199,6 +199,7 @@ impl Scene {
             },
             &ObjectDeps::default(),
             &self.annotations,
+            pbps_model::operation::ModuleEdits::Rebuilt,
         )
     }
     pub fn plan(&self, engine: &Postgres) -> Result<PlanningPlan, String> {

@@ -27,6 +27,7 @@ struct Side {
 #[derive(Debug, Clone)]
 pub struct Contract {
     logical: pbps_model::ChangeSet,
+    modules: ModuleEdits,
     before: Arc<Side>,
     after: Arc<Side>,
     base: Vec<Annotation<BoundRoot>>,
@@ -107,6 +108,7 @@ impl Contract {
         after: Snapshot<'_>,
         base: &ObjectDeps,
         goal: &ObjectDeps,
+        modules: ModuleEdits,
     ) -> Result<Self, String> {
         let owners = PlanOwners::new(
             PlanNames::of(&plan.changes, after.ids).map_err(|e| e.to_string())?,
@@ -173,6 +175,7 @@ impl Contract {
             .any(|(owner, providers)| !legacy(owner) || providers.iter().any(|p| !legacy(p)));
         Ok(Self {
             logical: plan.changes().clone(),
+            modules,
             before: Arc::new(Side::of(before, &owners, Spelling::Base)?),
             after: Arc::new(Side::of(after, &owners, Spelling::Final)?),
             base: base_edges,
@@ -237,7 +240,7 @@ impl Contract {
                         .iter()
                         .cloned()
                         .zip(plan.changes.iter().cloned()),
-                    ModuleEdits::Rebuilt,
+                    self.modules,
                 )
             },
             |operations| operations.with_steps(&plan.changes),
@@ -567,7 +570,12 @@ impl Contract {
             let bound = registry
                 .bind(&reference, owners, op.origin().spelling())
                 .map_err(|e| e.to_string())?;
-            self.record(index, bound, at, Transition::Ends);
+            self.record(index, bound.clone(), at, Transition::Ends);
+            // Both policies replace the declaration, but only InPlace keeps
+            // the provider available to existing consumers (ADR-0009 §3).
+            if op.module_edits() == ModuleEdits::InPlace {
+                index.continuous.insert((bound, at));
+            }
         }
         Ok(())
     }

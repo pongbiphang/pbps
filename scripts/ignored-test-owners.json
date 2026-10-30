@@ -1674,7 +1674,8 @@
         "commutation::schema_bound_callers_block_reversed_edits_and_plain_callers_commute",
         "binding_releases::binding_release_and_an_independent_computed_rebuild_both_apply",
         "commutation::pairs_the_effects_call_independent_commute_on_the_engine",
-        "annotations2469::module_to_object_annotations_drive_installs_and_removals"
+        "annotations2469::module_to_object_annotations_drive_installs_and_removals",
+        "annotations2469::in_place_provider_keeps_availability_and_releases_old_dependencies"
       ]
     },
     {
@@ -2261,6 +2262,7 @@
         "catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments",
         "default_rebuild::a_retyped_defaults_binding_and_assignment_are_measured_before_rebuild_rules",
         "annotations2469::module_to_object_annotations_drive_installs_and_removals",
+        "annotations2469::rebuilt_provider_waits_for_annotated_consumer_removal",
         "annotations2469::partition_default_annotations_follow_the_module_across_ancestor_depths"
       ]
     },

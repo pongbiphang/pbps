@@ -76,6 +76,20 @@ impl Fixture {
         base: &ObjectDeps,
         goal: &ObjectDeps,
     ) -> Result<PlanningPlan, String> {
+        self.plan_with_modules(
+            changes,
+            base,
+            goal,
+            pbps_model::operation::ModuleEdits::Rebuilt,
+        )
+    }
+    fn plan_with_modules(
+        &self,
+        changes: Vec<Change>,
+        base: &ObjectDeps,
+        goal: &ObjectDeps,
+        modules: pbps_model::operation::ModuleEdits,
+    ) -> Result<PlanningPlan, String> {
         propose(ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
         })
@@ -90,6 +104,7 @@ impl Fixture {
             },
             base,
             goal,
+            modules,
         )
     }
 }
@@ -398,3 +413,5 @@ fn every_reference_kind_uses_the_same_boundary_projection() {
         );
     }
 }
+
+mod survival;

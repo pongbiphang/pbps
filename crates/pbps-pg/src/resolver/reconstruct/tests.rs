@@ -1715,6 +1715,7 @@ fn fills_follow_annotated_facets_and_cannot_bypass_a_creation_cycle() {
                 },
                 &ObjectDeps::default(),
                 &goal,
+                pbps_model::operation::ModuleEdits::Rebuilt,
             )
             .unwrap();
         let fill = super::super::draft::FillStep {

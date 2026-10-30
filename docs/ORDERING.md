@@ -161,6 +161,14 @@ same projector; an annotation edit alone adds no DDL. Each existing settlement
 reprojects the transient contract onto its current operation identities, and
 the generic verifier checks the resulting hard edges.
 
+A provider's reverse removal edge is suppressed only when its operation's
+existing `ModuleEdits::InPlace` policy proves availability survives. A module
+rebuilt by DROP/CREATE retains that edge. Installation and removal boundaries
+at the same operation describe replacement of a declaration, not continuity of
+the engine object. The transient contract carries the engine policy even
+before operation identities are allocated; defaults and other facets acquire
+no continuity claim merely by having both boundaries.
+
 Annotation edges cannot enter the legacy declared-edge cycle fallback. An
 extended annotation can displace only explicitly tagged textual or conservative
 inference through the existing Guess SCC policy. Typed, effect, catalog and

@@ -213,16 +213,19 @@ impl<S> PlanningPlan<S> {
         }
     }
     /// Attach checked, transient intent before the existing expansion/settlement
-    /// route. It cannot enter the saved wire contract before YAML activation.
+    /// route. Module edits use the same engine policy as operation definitions;
+    /// boundary shape cannot prove that an edited provider stays available.
+    /// It cannot enter the saved wire contract before YAML activation.
     pub fn with_annotations(
         mut self,
         before: pbps_model::operation::Snapshot<'_>,
         after: pbps_model::operation::Snapshot<'_>,
         base: &pbps_model::object_ref::ObjectDeps,
         goal: &pbps_model::object_ref::ObjectDeps,
+        modules: pbps_model::operation::ModuleEdits,
     ) -> Result<Self, String> {
         self.annotations = Some(std::sync::Arc::new(super::annotations::Contract::of(
-            &self, before, after, base, goal,
+            &self, before, after, base, goal, modules,
         )?));
         Ok(self)
     }

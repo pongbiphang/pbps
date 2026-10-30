@@ -630,6 +630,11 @@ impl Operation {
         &self.step.change
     }
 
+    /// The engine policy already used by this operation's definitions.
+    pub fn module_edits(&self) -> ModuleEdits {
+        self.modules
+    }
+
     pub fn planned(&self) -> &PlannedChange {
         &self.step
     }

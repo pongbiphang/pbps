@@ -38,6 +38,8 @@ pub struct Index<R: Ord> {
     pub boundaries: BTreeMap<ObjectRef<R>, Boundary>,
     pub standing: BTreeSet<ObjectRef<R>>,
     pub containment: BTreeSet<(ObjectRef<R>, ObjectRef<R>)>,
+    /// Availability proven by engine metadata, independently of boundaries.
+    pub continuous: BTreeSet<(ObjectRef<R>, usize)>,
 }
 impl<R: Ord> Default for Index<R> {
     fn default() -> Self {
@@ -45,6 +47,7 @@ impl<R: Ord> Default for Index<R> {
             boundaries: BTreeMap::new(),
             standing: BTreeSet::new(),
             containment: BTreeSet::new(),
+            continuous: BTreeSet::new(),
         }
     }
 }
@@ -89,9 +92,8 @@ impl<R: Ord + Clone> Index<R> {
                     for &provider in providers.into_iter().flatten() {
                         if reverse
                             && self
-                                .boundaries
-                                .get(&annotation.provider)
-                                .is_some_and(|boundary| boundary.installs.contains(&provider))
+                                .continuous
+                                .contains(&(annotation.provider.clone(), provider))
                         {
                             continue; // Availability survives an indivisible in-place replacement.
                         }
