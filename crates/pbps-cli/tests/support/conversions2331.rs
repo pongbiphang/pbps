@@ -954,30 +954,32 @@ fn a_unique_key_added_beside_a_conversion_is_not_counted_over_the_stored_values(
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn an_expression_that_closes_its_statement_runs_nothing_and_is_refused_by_name() {
-    // Each text, and what must be said about it. Every one closes the
-    // `CHECK` the vet binds it in. None may run `injected.boom()`, which a
-    // simple-protocol batch would (`COMMIT; SELECT injected.boom()`) before
-    // the vet had judged the expression (round 3 review).
-    let cases: [(&str, &str); 3] = [
+    // Unbalanced text is refused before recording; a balanced trailing
+    // comment still reaches the native bind refusal. Neither route may run
+    // `injected.boom()`, including through a simple-protocol batch (round 3).
+    let cases: [(&str, &str, bool); 3] = [
         (
             "NULL) IS NULL) OR true)); COMMIT; SELECT injected.boom(); --",
-            "does not bind against the column alone (SQLSTATE 42601)",
+            "has unbalanced parentheses",
+            true,
         ),
         // A trailing comment swallows the closing the vet adds: refused as an
         // expression that does not bind, not read by a scanner.
         (
             "amount::integer -- injected.boom()",
             "does not bind against the column alone (SQLSTATE 42601)",
+            false,
         ),
         // One statement still: the check is closed and a column added whose
         // default would run a domain check at creation if the engine did.
         (
             "1) IS NULL) OR true), d injected.dom DEFAULT (((true",
-            "is more than one expression",
+            "has unbalanced parentheses",
+            true,
         ),
     ];
     for (version, url) in servers() {
-        for (k, (using, said)) in cases.iter().enumerate() {
+        for (k, (using, said, at_record)) in cases.iter().enumerate() {
             let slug = format!("convert2331-inject{version}-{k}");
             let own = OwnDatabase::new(&url, &slug);
             let connection = own.connection();
@@ -991,16 +993,29 @@ fn an_expression_that_closes_its_statement_runs_nothing_and_is_refused_by_name()
                  CREATE DOMAIN injected.dom AS boolean CHECK (injected.boom())",
             );
             d.table(INTEGER);
-            succeeds(with_stdin(&d, &CONVERT, using.as_bytes()));
-            let artifact = connected_artifact(&d, connection, false);
-            on_server(connection, WITNESS);
-            let refused = approved_apply(&d, connection, &artifact, GATE);
+            let refused = if *at_record {
+                on_server(connection, WITNESS);
+                let before = ids_bytes(&d);
+                let refused = with_stdin(&d, &CONVERT, using.as_bytes());
+                assert_ne!(code(&refused), 0, "PG{version} #{k}: {}", stdout(&refused));
+                assert_eq!(ids_bytes(&d), before, "a refused recording writes nothing");
+                assert!(
+                    stderr(&refused).contains("re-record"),
+                    "{}",
+                    stderr(&refused)
+                );
+                refused
+            } else {
+                succeeds(with_stdin(&d, &CONVERT, using.as_bytes()));
+                let artifact = connected_artifact(&d, connection, false);
+                on_server(connection, WITNESS);
+                let refused = approved_apply(&d, connection, &artifact, GATE);
+                assert_eq!(code(&refused), 1, "PG{version} #{k}: {}", stderr(&refused));
+                assert!(stderr(&refused).contains("the conversion `USING "));
+                refused
+            };
             let text = stderr(&refused);
-            assert_eq!(code(&refused), 1, "PG{version} #{k}: {text}");
-            assert!(
-                text.contains(said) && text.contains("the conversion `USING "),
-                "PG{version} #{k}: {text}"
-            );
+            assert!(text.contains(said), "PG{version} #{k}: {text}");
             assert_eq!(
                 scalar(
                     connection,
