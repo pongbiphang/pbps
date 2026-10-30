@@ -6360,6 +6360,15 @@ pub fn cmd_baseline(
                     read,
                 )
                 .await?;
+                // Adoption certifies only the selected exact packages, never
+                // a different installed version or an unheld discovery (DEC-2447.3).
+                refuse_extension_prerequisite_drift(
+                    &scoped.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                    "baseline",
+                )?;
                 report_missing(&scoped);
                 refuse_unexpressible(&scoped, &target.label, "baseline again")?;
                 // A partition a drop intent names is out of the working identity
@@ -6637,12 +6646,20 @@ fn refuse_nonempty_bootstrap(
 }
 
 /// Bootstrap may adopt packages it verifies, but cannot install or change them.
-fn refuse_bootstrap_extension_drift(
+fn refuse_extension_prerequisite_drift(
     installed: &Schema,
     desired: &Schema,
     ids: &IdsFile,
     dialect: &dyn Dialect,
+    operation: &str,
 ) -> anyhow::Result<()> {
+    for name in desired.extensions.keys() {
+        anyhow::ensure!(
+            ids.extension_uid(name).is_some(),
+            "extension `{}` has no identity; select it with `pbps pull --extension` before {operation}",
+            name.shown()
+        );
+    }
     let errors = pbps_diff::extension_differences(
         pbps_diff::Side {
             schema: installed,
@@ -6656,7 +6673,7 @@ fn refuse_bootstrap_extension_drift(
     );
     if !errors.is_empty() {
         bail!(
-            "bootstrap extension prerequisites differ:\n{}",
+            "{operation} extension prerequisites differ:\n{}",
             errors
                 .iter()
                 .map(ToString::to_string)
@@ -7008,11 +7025,12 @@ async fn bootstrap_async(
                 // instead of refusing (measured on 17.0, #1176).
                 refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
 
-                refuse_bootstrap_extension_drift(
+                refuse_extension_prerequisite_drift(
                     &existing.scoped.schema,
                     &loaded.schema,
                     &ids,
                     dialect.as_ref(),
+                    "bootstrap",
                 )?;
                 refuse_nonempty_bootstrap(
                     &existing.scoped.schema,
@@ -7072,11 +7090,12 @@ async fn bootstrap_async(
                 // A database-side trigger can add a privilege during the build.
                 // Never commit a snapshot that silently omits it (110, 147).
                 refuse_unexpressible(&built, &target.label, "bootstrap again")?;
-                refuse_bootstrap_extension_drift(
+                refuse_extension_prerequisite_drift(
                     &built.schema,
                     &loaded.schema,
                     &ids,
                     dialect.as_ref(),
+                    "bootstrap",
                 )?;
                 crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
                 // And it can take one back. `ddl_command_end` fires on `GRANT`
@@ -11807,7 +11826,7 @@ mod tests {
         };
         let pg = pbps_pg::Postgres::new();
         refuse_nonempty_bootstrap(&schema, &[], &pg, "target").unwrap();
-        refuse_bootstrap_extension_drift(&schema, &schema, &ids, &pg).unwrap();
+        refuse_extension_prerequisite_drift(&schema, &schema, &ids, &pg, "bootstrap").unwrap();
         assert!(refuse_nonempty_bootstrap(&schema, &[], &pbps_mssql::Mssql, "target").is_err());
         for changed in [
             Schema::default(),
@@ -11826,7 +11845,9 @@ mod tests {
                 changed
             },
         ] {
-            let error = refuse_bootstrap_extension_drift(&changed, &schema, &ids, &pg).unwrap_err();
+            let error =
+                refuse_extension_prerequisite_drift(&changed, &schema, &ids, &pg, "bootstrap")
+                    .unwrap_err();
             assert!(error.to_string().contains("vendor_default"));
         }
         schema

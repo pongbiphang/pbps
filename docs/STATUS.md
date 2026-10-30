@@ -8,7 +8,10 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 PostgreSQL extension read-only adoption is available (#2447 PR A,
 DEC-2447.1): exact quoted versions, explicit schemas, `e_` identities, pull,
-baseline, verify and no-op plans. Connected bootstrap adopts exact preinstalled
+baseline, verify and no-op plans. Pull selects new packages only through
+repeatable `--extension NAME`; existing declarations/identities stay selected.
+Unselected installed packages remain inventory with an opt-in hint (DEC-2447.3).
+Connected bootstrap adopts exact preinstalled
 package prerequisites without lifecycle DDL (DEC-2447.2); SQL replay checks
 exact package metadata before DDL. Lifecycle changes refuse by action name.
 Installed extension members remain excluded; unheld packages remain census

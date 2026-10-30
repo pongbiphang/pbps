@@ -24,6 +24,87 @@ use pbps_model::{ModuleId, ModuleKind, Role, Schema};
 
 use crate::declaration_file;
 
+/// Catalog presence cannot select code packages for management (DEC-2447.3).
+/// Read declarations as well as identities: a hand-authored package is explicit
+/// selection even before its first pull has minted an identity. An unreadable
+/// project cannot safely be treated as asking for no packages, even with force.
+pub(crate) fn extension_scope(
+    dir: &Path,
+    ids: Option<&pbps_model::IdsFile>,
+    named: &[String],
+) -> anyhow::Result<BTreeSet<pbps_model::ObjectLocalName>> {
+    let mut scope: BTreeSet<_> = named.iter().map(|name| name.as_str().into()).collect();
+    if let Some(ids) = ids {
+        scope.extend(ids.extensions.values().cloned());
+    }
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot read existing extension selection"),
+        Ok(_) => {
+            // Force may replace duplicate ordinary declarations/aliases. Read
+            // each kind independently instead of requiring a merged old model.
+            for path in
+                pbps_load::schema_files(dir).context("cannot list existing extension selection")?
+            {
+                let declared = pbps_load::load_file(&path).map_err(|errors| {
+                    anyhow::anyhow!(
+                        "cannot read existing extension selection:\n{}",
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                })?;
+                if let pbps_load::LoadedFile::Extension(extension) = declared {
+                    scope.insert(extension.name);
+                }
+            }
+        }
+    }
+    Ok(scope)
+}
+
+/// Keep the strict full read, then select declarations before identity minting
+/// and publication. Missing selections refuse rather than silently retiring ids.
+pub(crate) fn select_extensions(
+    schema: &mut Schema,
+    scope: &BTreeSet<pbps_model::ObjectLocalName>,
+) -> anyhow::Result<Vec<String>> {
+    for name in scope {
+        anyhow::ensure!(
+            schema.extensions.contains_key(name),
+            "extension `{}` selected for management is not installed; pull cannot adopt or retire it in the read-only extension phase",
+            name.shown()
+        );
+    }
+    let unmanaged: Vec<_> = schema
+        .extensions
+        .iter()
+        .filter(|(name, _)| !scope.contains(*name))
+        .map(|(name, definition)| {
+            format!(
+                "{} {}",
+                name.shown(),
+                pbps_model::escape::Escaped(&definition.version)
+            )
+        })
+        .collect();
+    let notices = match schema.extensions.keys().find(|name| !scope.contains(*name)) {
+        Some(name) => {
+            let argument = crate::report::shell_arg(name.raw())
+                .unwrap_or_else(|| crate::report::placeholder("extension name"));
+            vec![
+                format!("Installed but not managed: {}", unmanaged.join(", ")),
+                format!("To manage one: pbps pull --extension {argument}"),
+            ]
+        }
+        None => Vec::new(),
+    };
+    schema.extensions.retain(|name, _| scope.contains(name));
+    Ok(notices)
+}
+
 /// Declares `partitions: external` (#1533) on the parents another tool
 /// creates partitions of, and leaves those partitions out of what is written.
 ///
@@ -1388,5 +1469,32 @@ mod tests {
         );
         let found = refuse_policy_errors(&warn, &loaded, pg().as_ref()).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn extension_hints_quote_arguments_and_escape_inventory_text() {
+        for (name, argument) in [
+            ("package name", "\"package name\""),
+            ("package$(true)", "\"<extension name>\""),
+            ("package\nname", "\"<extension name>\""),
+        ] {
+            let mut schema = Schema {
+                extensions: [(
+                    name.into(),
+                    pbps_model::Extension {
+                        schema: "ext".into(),
+                        version: "opaque\nversion".into(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let notices = select_extensions(&mut schema, &BTreeSet::new()).unwrap();
+            assert!(!notices[0].contains('\n'));
+            assert_eq!(
+                notices[1],
+                format!("To manage one: pbps pull --extension {argument}")
+            );
+        }
     }
 }

@@ -24,7 +24,17 @@ fn extension_file(d: &Demo, name: &str) -> std::path::PathBuf {
 
 fn adopted(connection: &str, slug: &str) -> Demo {
     let d = Demo::new(slug);
-    succeeds(d.run(&["pull", "--db", connection]));
+    succeeds(d.run(&[
+        "pull",
+        "--db",
+        connection,
+        "--extension",
+        "citext",
+        "--extension",
+        "hstore",
+        "--extension",
+        "plpgsql",
+    ]));
     succeeds(d.run(&["fmt", "--check"]));
     d.commit();
     succeeds(d.run(&[
@@ -284,7 +294,14 @@ fn legacy_scope_keeps_unheld_packages_out_until_explicit_adoption() {
         .unwrap();
         d.commit();
         assert_refused(&d, connection, "CREATE EXTENSION", "citext");
-        succeeds(d.run(&["pull", "--force", "--db", connection]));
+        succeeds(d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            connection,
+            "--extension",
+            "plpgsql",
+        ]));
         d.commit();
         succeeds(d.run(&[
             "baseline",
@@ -584,7 +601,17 @@ fn connected_bootstrap_adopts_exact_preinstalled_packages_without_lifecycle_ddl(
             "CREATE EXTENSION pgcrypto SCHEMA ext VERSION '1.3'",
         );
         let d = Demo::new(&format!("extensions2447-bootstrap-{slug}"));
-        succeeds(d.run(&["pull", "--db", source.connection()]));
+        succeeds(d.run(&[
+            "pull",
+            "--db",
+            source.connection(),
+            "--extension",
+            "citext",
+            "--extension",
+            "hstore",
+            "--extension",
+            "plpgsql",
+        ]));
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
@@ -626,7 +653,15 @@ fn bootstrap_requires_exact_packages_before_creation_and_recording() {
             "CREATE SCHEMA ext; CREATE SCHEMA app; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE TABLE app.ordinary(id integer)",
         );
         let d = Demo::new(&format!("extensions2447-required-{slug}"));
-        succeeds(d.run(&["pull", "--db", source.connection()]));
+        succeeds(d.run(&[
+            "pull",
+            "--db",
+            source.connection(),
+            "--extension",
+            "hstore",
+            "--extension",
+            "plpgsql",
+        ]));
         d.commit();
         for (case, install, expected) in [
             ("absent", "", "CREATE EXTENSION"),
@@ -722,7 +757,15 @@ fn bootstrap_sql_checks_exact_packages_on_the_replay_target_before_ddl() {
             "CREATE SCHEMA ext; CREATE SCHEMA app; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; CREATE TABLE app.ordinary(id integer)",
         );
         let d = Demo::new(&format!("extensions2447-sql-{slug}"));
-        succeeds(d.run(&["pull", "--db", source.connection()]));
+        succeeds(d.run(&[
+            "pull",
+            "--db",
+            source.connection(),
+            "--extension",
+            "hstore",
+            "--extension",
+            "plpgsql",
+        ]));
         d.commit();
         let path = d.dir.join("bootstrap.sql");
         succeeds(d.run(&["bootstrap", "--sql", path.to_str().unwrap()]));
@@ -783,5 +826,245 @@ fn bootstrap_sql_checks_exact_packages_on_the_replay_target_before_ddl() {
                 );
             }
         }
+    });
+}
+
+fn extension_ids(
+    d: &Demo,
+) -> std::collections::BTreeMap<pbps_model::Uid, pbps_model::ObjectLocalName> {
+    serde_json::from_slice::<pbps_model::IdsFile>(
+        &std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
+    )
+    .unwrap()
+    .extensions
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
+    servers(|admin, slug| {
+        let own = OwnDatabase::new(admin, &format!("extensions2447-selection-{slug}"));
+        let connection = own.connection();
+        installed(connection);
+        let d = Demo::new(&format!("extensions2447-selection-{slug}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        assert!(extension_ids(&d).is_empty());
+        assert!(
+            pbps_load::load_schema_dir(&d.dir.join("schema"))
+                .unwrap()
+                .schema
+                .extensions
+                .is_empty()
+        );
+        assert_eq!(
+            text_of(connection, "SELECT count(*)::text FROM pg_extension"),
+            "3"
+        );
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "ordinary objects only",
+        ]));
+        succeeds(d.run(&[
+            "pull",
+            "--db",
+            connection,
+            "--force",
+            "--extension",
+            "citext",
+        ]));
+        let selected = extension_ids(&d);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.values().next().unwrap().raw(), "citext");
+        // Local selection is not permission to take ownership in an ordinary plan.
+        d.commit();
+        assert_refused(&d, connection, "CREATE EXTENSION", "citext");
+        let package_path = extension_file(&d, "citext");
+        let package = std::fs::read(&package_path).unwrap();
+        let entries = text_of(connection, "SELECT count(*)::text FROM public.__pbps_state");
+        for (schema, version, action) in [("ext", "1.8", "UPDATE"), ("other", "1.4", "SET SCHEMA")]
+        {
+            std::fs::write(
+                &package_path,
+                format!("extension: citext\nschema: {schema}\nversion: '{version}'\n"),
+            )
+            .unwrap();
+            d.commit();
+            let out = d.run(&[
+                "baseline",
+                "--db",
+                connection,
+                "--reason",
+                "must verify exact package",
+            ]);
+            assert_ne!(code(&out), 0, "baseline adopted a mismatching package");
+            assert!(
+                stderr(&out).contains(action) && stderr(&out).contains("citext"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(
+                text_of(connection, "SELECT count(*)::text FROM public.__pbps_state"),
+                entries
+            );
+        }
+        std::fs::write(&package_path, package).unwrap();
+        d.commit();
+        on_server(connection, "DROP EXTENSION citext RESTRICT");
+        let absent = d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "missing package cannot be adopted",
+        ]);
+        assert_ne!(code(&absent), 0);
+        assert!(stderr(&absent).contains("citext"), "{}", stderr(&absent));
+        assert_eq!(
+            text_of(connection, "SELECT count(*)::text FROM public.__pbps_state"),
+            entries
+        );
+        on_server(
+            connection,
+            "CREATE EXTENSION citext SCHEMA ext VERSION '1.4'",
+        );
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "explicitly manage citext",
+        ]));
+        assert_eq!(findings(&d, connection)["data"]["changes"], 0);
+        for args in [
+            vec!["pull", "--db", connection, "--force"],
+            vec![
+                "pull",
+                "--db",
+                connection,
+                "--force",
+                "--extension",
+                "citext",
+                "--extension",
+                "citext",
+            ],
+        ] {
+            succeeds(d.run(&args));
+            assert_eq!(extension_ids(&d), selected);
+        }
+        // A held identity also preserves selection when its local file is absent.
+        std::fs::remove_file(extension_file(&d, "citext")).unwrap();
+        succeeds(d.run(&["pull", "--db", connection, "--force"]));
+        assert_eq!(extension_ids(&d), selected);
+        assert!(extension_file(&d, "citext").exists());
+        let before_ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let before = pbps_load::load_schema_dir(&d.dir.join("schema"))
+            .unwrap()
+            .schema;
+        for name in ["not_installed_2447", "pgcrypto", ""] {
+            let out = d.run(&["pull", "--db", connection, "--force", "--extension", name]);
+            assert_ne!(code(&out), 0);
+            assert!(stderr(&out).contains("not installed"), "{}", stderr(&out));
+            assert!(stderr(&out).contains(name), "{}", stderr(&out));
+            assert_eq!(
+                std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
+                before_ids
+            );
+            assert_eq!(
+                pbps_load::load_schema_dir(&d.dir.join("schema"))
+                    .unwrap()
+                    .schema,
+                before
+            );
+        }
+        // An explicit declaration selects a package before it has an identity.
+        let authored = Demo::new(&format!("extensions2447-authored-{slug}"));
+        std::fs::create_dir_all(authored.dir.join("schema/extensions")).unwrap();
+        std::fs::write(
+            extension_file(&authored, "hstore"),
+            "extension: hstore\nschema: other\nversion: '1.8'\n",
+        )
+        .unwrap();
+        succeeds(authored.run(&["pull", "--db", connection, "--force"]));
+        assert_eq!(extension_ids(&authored).len(), 1);
+        let loaded = pbps_load::load_schema_dir(&authored.dir.join("schema")).unwrap();
+        assert_eq!(loaded.schema.extensions["hstore"].schema, "ext");
+        assert_eq!(loaded.schema.extensions["hstore"].version, "1.4");
+        // Bad declaration history cannot become an empty selection under force.
+        let path = extension_file(&authored, "hstore");
+        std::fs::write(&path, "extension: hstore\nversion: [broken\n").unwrap();
+        let ids = std::fs::read(authored.dir.join("schema.ids.json")).unwrap();
+        let out = authored.run(&["pull", "--db", connection, "--force"]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("extension selection"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(
+            std::fs::read(authored.dir.join("schema.ids.json")).unwrap(),
+            ids
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "extension: hstore\nversion: [broken\n"
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn pull_names_unmanaged_packages_and_hides_the_hint_when_all_are_selected() {
+    servers(|admin, slug| {
+        let own = OwnDatabase::new(admin, &format!("extensions2447-hint-{slug}"));
+        let connection = own.connection();
+        installed(connection);
+        let d = Demo::new(&format!("extensions2447-hint-{slug}"));
+        let out = succeeds(d.run(&["pull", "--db", connection]));
+        let text = stdout(&out);
+        assert!(
+            text.contains("Installed but not managed: citext 1.4, hstore 1.4, plpgsql 1.0"),
+            "{text}"
+        );
+        assert_eq!(text.matches("Installed but not managed:").count(), 1);
+        assert_eq!(
+            text.matches("To manage one: pbps pull --extension citext")
+                .count(),
+            1
+        );
+        let out = succeeds(d.run(&[
+            "pull",
+            "--db",
+            connection,
+            "--force",
+            "--extension",
+            "citext",
+        ]));
+        let text = stdout(&out);
+        assert!(
+            text.contains("Installed but not managed: hstore 1.4, plpgsql 1.0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("To manage one: pbps pull --extension hstore"),
+            "{text}"
+        );
+        let out = succeeds(d.run(&[
+            "pull",
+            "--db",
+            connection,
+            "--force",
+            "--extension",
+            "hstore",
+            "--extension",
+            "plpgsql",
+        ]));
+        let text = stdout(&out);
+        assert!(!text.contains("Installed but not managed:"), "{text}");
+        assert!(!text.contains("To manage one:"), "{text}");
+        assert_eq!(extension_ids(&d).len(), 3);
     });
 }

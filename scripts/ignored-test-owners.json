@@ -695,6 +695,8 @@
         "extensions2447::exact_installed_packages_round_trip_and_native_changes_are_named_drift",
         "extensions2447::changed_lifecycles_never_publish_a_partial_executable_plan",
         "extensions2447::legacy_scope_keeps_unheld_packages_out_until_explicit_adoption",
+        "extensions2447::pull_selects_only_requested_extensions_and_preserves_their_identities",
+        "extensions2447::pull_names_unmanaged_packages_and_hides_the_hint_when_all_are_selected",
         "census2444::census_names_extensions_pgcrypto",
         "census2444::census_names_extensions_uuid",
         "census2444::census_names_unsupported_comment",

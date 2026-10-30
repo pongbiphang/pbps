@@ -474,6 +474,10 @@ enum Command {
         /// repeatable. pg_partman's parents are found without it
         #[arg(long = "partitions-external", value_name = "TABLE")]
         partitions_external: Vec<String>,
+
+        /// Select this installed extension for management (exact schema/version); repeatable
+        #[arg(long = "extension", value_name = "NAME")]
+        extensions: Vec<String>,
     },
 
     /// Run a saved plan against the environment it was computed for
@@ -1538,7 +1542,15 @@ fn run() -> anyhow::Result<()> {
             force,
             data,
             partitions_external,
-        } => cmd_pull(&project, &target, force, &data, &partitions_external),
+            extensions,
+        } => cmd_pull(
+            &project,
+            &target,
+            force,
+            &data,
+            &partitions_external,
+            &extensions,
+        ),
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
             let json = format == OutputFormat::Json;
@@ -1697,6 +1709,7 @@ fn cmd_pull(
     force: bool,
     data: &[String],
     partitions_external: &[String],
+    extensions: &[String],
 ) -> anyhow::Result<()> {
     // 1. Parsed before anything else: a misspelt table name is a fact about
     // the command line alone, and it should cost neither a look at the
@@ -1781,6 +1794,8 @@ fn cmd_pull(
         }
     }
 
+    let extension_scope = adopt::extension_scope(&dir, existing_ids.as_ref(), extensions)?;
+
     // Annotated because `db::connect` widens the block's error to `anyhow`:
     // it carries the "cannot connect to the database" context every other
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
@@ -1790,7 +1805,7 @@ fn cmd_pull(
     // project already said: it reads the environment's `url_env` variable,
     // which is the one thing here that depends on the machine.
     let target = target.resolve(project)?;
-    let pulled = db::runtime()?.block_on(async {
+    let mut pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(&target).await?;
         let mut pulled =
             crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
@@ -1892,6 +1907,7 @@ fn cmd_pull(
         Ok::<_, anyhow::Error>(pulled)
     })?;
 
+    let extension_notices = adopt::select_extensions(&mut pulled.schema, &extension_scope)?;
     for notice in &pulled.onboarding_notices {
         eprintln!("warning: {}", notice);
     }
@@ -1930,14 +1946,6 @@ fn cmd_pull(
     }
 
     let ids = existing_ids.clone().unwrap_or_default();
-    for name in ids.extensions.values() {
-        if !pulled.schema.extensions.contains_key(name) {
-            bail!(
-                "extension `{}` is recorded in the identity file but absent from the database; pull cannot retire it in the read-only extension phase",
-                name.shown()
-            );
-        }
-    }
     let type_limitations = ids
         .types
         .values()
@@ -2099,6 +2107,9 @@ fn cmd_pull(
         pulled.schema.extensions.len(),
         dir.display()
     );
+    for notice in extension_notices {
+        println!("{notice}");
+    }
     let left_out =
         pulled.warnings.len() + pulled.catalog_notices.len() + pulled.unexpressible.len();
     if left_out > 0 {
