@@ -555,7 +555,14 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                 .await
                 .unwrap();
             for kind in ["index", "unique", "primary", "unnamed"] {
-                let function = "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM ext2376.base_ids WHERE i=@x); END";
+                let function = "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM ext2376.base_ids AS v JOIN ext2376.a_peer AS w ON w.i=v.i WHERE v.i=@x); END";
+                // The lexically earlier peer is independent except for UNIQUE,
+                // where its real dependency must still keep it after base_ids.
+                let peer = if kind == "unique" {
+                    "CREATE VIEW ext2376.a_peer AS SELECT i FROM ext2376.base_ids;"
+                } else {
+                    "CREATE VIEW ext2376.a_peer AS SELECT NULLIF(i,0) AS i FROM dbo.managed;"
+                };
                 let key_sql = match kind {
                     "index" => "CREATE UNIQUE INDEX required_d ON dbo.managed(d);",
                     "unique" => "ALTER TABLE dbo.managed ADD CONSTRAINT required_d UNIQUE(d);",
@@ -570,6 +577,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                 for statement in [
                     "CREATE TABLE dbo.a(i int CONSTRAINT a_pk PRIMARY KEY); CREATE TABLE dbo.managed(i int NOT NULL,CONSTRAINT to_a FOREIGN KEY(i) REFERENCES dbo.a(i) ON DELETE CASCADE);".to_owned(),
                     "CREATE VIEW ext2376.base_ids AS SELECT NULLIF(i,0) AS i FROM dbo.managed;".to_owned(),
+                    peer.to_owned(),
                     format!("CREATE FUNCTION dbo.f {function}"),
                     format!("ALTER TABLE dbo.managed ADD c AS dbo.f(i); ALTER TABLE dbo.managed ADD d AS (i + 1) PERSISTED NOT NULL; {key_sql} CREATE INDEX unrelated_d ON dbo.managed(d); CREATE TABLE dbo.x(i int CONSTRAINT x_pk PRIMARY KEY,CONSTRAINT x_required FOREIGN KEY(i) REFERENCES dbo.managed(d) ON DELETE CASCADE);"),
                 ] {
@@ -680,6 +688,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                 )
                 .await
                 .unwrap();
+                let external_prerequisites = inputs.external_prerequisites();
                 let reconstruction =
                     pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
                         &pbps_mssql::Mssql,
@@ -727,7 +736,20 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                     roots.contains(&capture::object("dbo", "x_required")),
                     "{kind}: {roots:?}"
                 );
-                connection(target).await.execute("DROP TABLE dbo.x; DROP TABLE dbo.managed; DROP FUNCTION dbo.f; DROP VIEW ext2376.base_ids; DROP TABLE dbo.a;").await.unwrap();
+                let base = capture::object("ext2376", "base_ids");
+                let peer = capture::object("ext2376", "a_peer");
+                assert!(roots.contains(&peer), "{kind}: {roots:?}");
+                assert!(external_prerequisites[&base].is_empty(), "{kind}");
+                assert_eq!(
+                    external_prerequisites[&peer],
+                    if kind == "unique" {
+                        BTreeSet::from([base])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    "{kind}"
+                );
+                connection(target).await.execute("DROP TABLE dbo.x; DROP TABLE dbo.managed; DROP FUNCTION dbo.f; DROP VIEW ext2376.a_peer; DROP VIEW ext2376.base_ids; DROP TABLE dbo.a;").await.unwrap();
             }
         })
     }

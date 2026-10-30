@@ -396,9 +396,18 @@ impl ExternalInputs {
         prerequisites(&self.captured, &self.roots, &self.managed)
     }
     pub fn external_prerequisites(&self) -> BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>> {
+        // DEC-2376.4: managed providers carry their own prerequisites in the
+        // settled program. Crossing their children here invents external cycles.
+        let boundaries = self.roots.union(&self.managed).cloned().collect();
         self.roots
             .iter()
-            .map(|root| (root.clone(), references(&self.captured, root, &self.roots)))
+            .map(|root| {
+                let required = references(&self.captured, root, &boundaries);
+                (
+                    root.clone(),
+                    required.intersection(&self.roots).cloned().collect(),
+                )
+            })
             .collect()
     }
     pub fn waiting(&self) -> Vec<String> {
