@@ -35,13 +35,21 @@ impl From<logical::Uncovered> for Uncovered {
     }
 }
 
+// Top-level Vars use the catalog surface's range-table convention. Only a
+// trigger qualifier maps both OLD (1) and NEW (2) to the same relation.
+#[derive(Clone, Copy)]
+pub(super) enum Relation {
+    Table(u32),
+    Trigger(u32),
+}
+
 type Result<T> = std::result::Result<T, Uncovered>;
 
 pub(super) fn extract(
     catalog: &Catalog,
     text: &str,
     major: u32,
-    relation: Option<u32>,
+    relation: Option<Relation>,
 ) -> Result<Vec<Binding>> {
     let tree = nodes::decode(text, major)?;
     fn has_node(value: &Value) -> bool {
@@ -94,7 +102,7 @@ struct Frame<'a> {
 fn subobjects<'a>(
     catalog: &Catalog,
     value: &'a Value,
-    relation: Option<u32>,
+    relation: Option<Relation>,
     frames: &mut Vec<Frame<'a>>,
     path: &mut Vec<String>,
     bindings: &mut Vec<Binding>,
@@ -185,17 +193,20 @@ fn subobjects<'a>(
 fn variable(
     catalog: &Catalog,
     node: &Node,
-    relation: Option<u32>,
+    relation: Option<Relation>,
     frames: &[Frame<'_>],
 ) -> Result<ObjectIdentity> {
     let varno = node.number("varno")?;
     let column = signed(node, "varattno")?;
     let level = usize::try_from(node.number("varlevelsup")?).map_err(|_| Uncovered::Context)?;
     let relation = if frames.is_empty() {
-        if level != 0 || varno != 1 {
+        if level != 0 {
             return Err(Uncovered::Context);
         }
-        relation.ok_or(Uncovered::Context)?
+        match (relation, varno) {
+            (Some(Relation::Table(oid)), 1) | (Some(Relation::Trigger(oid)), 1 | 2) => oid,
+            _ => return Err(Uncovered::Context),
+        }
     } else {
         let frame = frames
             .len()
@@ -667,7 +678,9 @@ mod tests {
             ]),
         };
         assert_eq!(
-            variable(&catalog, &node, Some(2), &[]).unwrap().name,
+            variable(&catalog, &node, Some(Relation::Table(2)), &[])
+                .unwrap()
+                .name,
             ["actual"]
         );
         assert_eq!(
@@ -675,7 +688,7 @@ mod tests {
             Err(Uncovered::Context)
         );
         assert_eq!(
-            variable(&catalog, &node, Some(99), &[]),
+            variable(&catalog, &node, Some(Relation::Table(99)), &[]),
             Err(Uncovered::Reference)
         );
     }
@@ -784,3 +797,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bindings/trigger1907_tests.rs"]
+mod trigger1907_tests;
