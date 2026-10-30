@@ -1339,7 +1339,7 @@ impl Dialect for Postgres {
             functions,
             needs_complete_shape,
             self.server_version_num,
-            &demand,
+            &mut demand,
         )?
         .unwrap_or_else(|| vec![change.clone()]);
         Ok(Some(pbps_dialect::creation::expose(
@@ -1379,6 +1379,10 @@ impl Dialect for Postgres {
             self.server_version_num,
             true,
         )
+    }
+
+    fn generation_may_read_column(&self, text: &str, column: &pbps_model::ColumnName) -> bool {
+        generated::may_read(text, column.raw())
     }
 
     fn generation_may_call(&self, text: &str, name: &str) -> bool {

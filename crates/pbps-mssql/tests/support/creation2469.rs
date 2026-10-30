@@ -201,3 +201,70 @@ async fn scratch_creation_facets_keep_auxiliary_setup_boundaries() {
         db.drop().await;
     }
 }
+
+#[path = "../../../pbps-diff/tests/fixtures/forward2469.rs"]
+mod forward_fixture;
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn demanded_forward_columns_preserve_generation_and_column_order() {
+    for pairs in [1, 2] {
+        for validators in [false, true] {
+            let mut db =
+                TestDb::create(&format!("creation2469_forward_{pairs}_{validators}")).await;
+            db.conn.execute("CREATE SCHEMA app").await.unwrap();
+            db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+            let engine = Mssql;
+            let f = forward_fixture::Scene::new(pairs, "mssql", validators);
+            {
+                let plan = f.compile(&engine).unwrap();
+                execute(&mut db, plan, &engine).await;
+                if validators {
+                    db.conn
+                        .execute("INSERT INTO app.p(k) VALUES(7)")
+                        .await
+                        .unwrap();
+                }
+                db.conn
+                    .execute("INSERT INTO app.t(anchor) VALUES(1)")
+                    .await
+                    .unwrap();
+                let rows = db.conn.query("SELECT a, b FROM app.t").await.unwrap();
+                assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(8));
+                assert_eq!(rows[0].try_get::<i32>("b").unwrap(), Some(7));
+                if pairs == 2 {
+                    let rows = db.conn.query("SELECT c, d FROM app.t").await.unwrap();
+                    assert_eq!(rows[0].try_get::<i32>("c").unwrap(), Some(12));
+                    assert_eq!(rows[0].try_get::<i32>("d").unwrap(), Some(11));
+                }
+                let rows = db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+                let actual: Vec<_> = rows
+                    .iter()
+                    .map(|r| r.try_get::<&str>("column_name").unwrap().unwrap())
+                    .collect();
+                assert_eq!(actual, f.columns);
+                if validators {
+                    let rows = db.conn.query("SELECT COUNT(*) AS n FROM sys.indexes WHERE object_id=OBJECT_ID('app.t') AND name='ix_t'").await.unwrap();
+                    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1));
+                }
+            }
+            for invalid in [
+                "CREATE TABLE app.bad_default(a integer DEFAULT (b + 1), b integer)",
+                "CREATE TABLE app.bad_generation(b integer, c AS (b + 1), a AS (c + 1))",
+            ] {
+                db.conn
+                    .execute("SAVE TRANSACTION invalid_forward")
+                    .await
+                    .unwrap();
+                let error = db.conn.execute(invalid).await.unwrap_err();
+                assert!(error.server_error_code().is_some(), "{error}");
+                db.conn
+                    .execute("ROLLBACK TRANSACTION invalid_forward")
+                    .await
+                    .unwrap();
+            }
+            db.conn.execute("COMMIT").await.unwrap();
+            db.drop().await;
+        }
+    }
+}

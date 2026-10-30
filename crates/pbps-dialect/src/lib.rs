@@ -2838,6 +2838,13 @@ pub trait Dialect {
         self.generation_may_call(text, function.name())
     }
 
+    /// The same local-column scan used by the engine's generation recipe.
+    /// Expression installation can read a column added later in the declaration
+    /// without itself appending a physical column (DEC-1503.2).
+    fn generation_may_read_column(&self, text: &str, column: &pbps_model::ColumnName) -> bool {
+        self.may_name(text, column.raw())
+    }
+
     /// The names `text` may read as columns of `table`, for an engine that
     /// can say. `None` is unknown, and keeps the whole-shape rule every
     /// reader of a split table followed before this method existed: wait for

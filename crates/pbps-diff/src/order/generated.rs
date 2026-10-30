@@ -1030,11 +1030,26 @@ pub(super) fn constraints_in(
             .enumerate()
             .filter(|(_, p)| is_part(p) && p.change.table() == Some(name))
             .collect();
+        let replacements: Vec<_> = own
+            .iter()
+            .filter_map(|(at, p)| {
+                if let Change::AlterColumnExpression { column, to, .. } = &p.change {
+                    Some((*at, column, to))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mixed = !replacements.is_empty()
+            && own
+                .iter()
+                .any(|(_, p)| matches!(p.change, Change::AddColumn { .. }));
         let mut previous = first;
         for column in full.columns.keys() {
             for (i, p) in &own {
                 if matches!(&p.change, Change::AddColumn { name, .. } if name == column)
-                    || matches!(&p.change, Change::AlterColumnExpression { column: c, .. } if &c.name == column)
+                    || (!mixed
+                        && matches!(&p.change, Change::AlterColumnExpression { column: c, .. } if &c.name == column))
                 {
                     edge(&mut out, previous, *i);
                     previous = *i;
@@ -1066,7 +1081,27 @@ pub(super) fn constraints_in(
                 }
             }
         }
-        let complete = previous;
+        // A placeholder's final definition is not a physical append. Keep
+        // legacy unmixed chains byte-identical, but let a mixed recipe install
+        // each expression after its actual inputs, not its declaration slot.
+        let mut complete = vec![previous];
+        if mixed {
+            for (at, column, text) in &replacements {
+                for (input, p) in &own {
+                    if let Change::AddColumn { name, .. } = &p.change
+                        && (name == &column.name || dialect.generation_may_read_column(text, name))
+                    {
+                        edge(&mut out, *input, *at);
+                    }
+                }
+                complete.push(*at);
+            }
+        }
+        let finish = |out: &mut Schedule, after| {
+            for &before in &complete {
+                edge(out, before, after);
+            }
+        };
         // The prefix holds every column the table declares, computed ones
         // included, so the first part is already the complete shape.
         let whole = prefix.columns.len() == full.columns.len()
@@ -1080,7 +1115,7 @@ pub(super) fn constraints_in(
                     | Change::AddComputedColumn { .. }
                     | Change::AlterColumnExpression { .. }
             ) {
-                edge(&mut out, complete, *i);
+                finish(&mut out, *i);
             }
             if let Change::SetReplicaIdentity {
                 to: Some(target), ..
@@ -1156,10 +1191,10 @@ pub(super) fn constraints_in(
             // Creation parts have their own column/validator chain above.
             // Every other structural consumer must wait for that chain.
             if uses.complete.contains(&name) && !own.iter().any(|(part, _)| *part == i) {
-                edge(&mut out, complete, i);
+                finish(&mut out, i);
             }
             if uses.seed == Some(name) {
-                edge(&mut out, complete, i);
+                finish(&mut out, i);
                 for (part, p) in &own {
                     match &p.change {
                         Change::AddColumn { .. }
@@ -1188,8 +1223,13 @@ pub(super) fn constraints_in(
                 let name_only = references
                     .iter()
                     .all(|text| dialect.generation_table_name_only(text, name));
-                let shape = if name_only || whole { first } else { complete };
-                guess(&mut out, shape, i);
+                if name_only || whole {
+                    guess(&mut out, first, i);
+                } else {
+                    for &shape in &complete {
+                        guess(&mut out, shape, i);
+                    }
+                }
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -1198,7 +1238,7 @@ pub(super) fn constraints_in(
             } = &p.change
             {
                 if table == name || &constraint.references_table == name {
-                    edge(&mut out, complete, i);
+                    finish(&mut out, i);
                 }
                 if &constraint.references_table == name {
                     for (key, part) in &own {
@@ -1222,7 +1262,13 @@ pub(super) fn constraints_in(
                 if let Some(columns) = reads(dialect, &[&text], name) {
                     wait_for(dialect, &mut out, first, &own, &columns, *i, guessed);
                 } else {
-                    guess(&mut out, if whole { first } else { complete }, *i);
+                    if whole {
+                        guess(&mut out, first, *i);
+                    } else {
+                        for &shape in &complete {
+                            guess(&mut out, shape, *i);
+                        }
+                    }
                 }
             }
         }

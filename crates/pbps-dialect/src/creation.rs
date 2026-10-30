@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub struct Demand {
+    /// Requested column roots; the engine recipe resolves these into its
+    /// legal physical suffix before expose consumes the exact selection.
     pub columns: BTreeSet<ColumnName>,
     pub generation: BTreeSet<ColumnName>,
     pub required_columns: BTreeSet<ColumnName>,
@@ -45,6 +47,18 @@ impl Demand {
         }
         demand
     }
+    /// Resolve the physical suffix once, before the engine decides which
+    /// expressions and shape must remain together (DEC-2469.4).
+    pub fn column_suffix<'a>(
+        &self,
+        columns: impl Iterator<Item = &'a ColumnName>,
+    ) -> BTreeSet<ColumnName> {
+        columns
+            .skip_while(|column| !self.columns.contains(*column))
+            .cloned()
+            .collect()
+    }
+
     pub fn generation(&self, column: &ColumnName) -> bool {
         self.generation.contains(column) || self.columns.contains(column)
     }
@@ -102,8 +116,9 @@ pub fn expose(
                 let mut moved = false;
                 let columns = std::mem::take(&mut table.columns);
                 for (column, mut spec) in columns {
-                    moved |= demand.columns.contains(&column);
-                    if moved {
+                    let extract = demand.columns.contains(&column);
+                    moved |= extract;
+                    if extract {
                         let column_uid = uid(name, &column)?;
                         let mut facets = Vec::new();
                         split_column(name, &column, &column_uid, &mut spec, demand, &mut facets);
