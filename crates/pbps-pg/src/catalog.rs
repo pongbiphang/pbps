@@ -1332,6 +1332,7 @@ fn batch_query(identity: &str) -> String {
         ("modules", modules_query(), "schema_name, name, oid"),
         ("module_args", module_args_query(), "oid, pos"),
         ("roles", ROLES.to_owned(), "name"),
+        ("extensions", "SELECT e.extname::text AS name, n.nspname::text AS schema, e.extversion::text AS version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace".to_owned(), "name"),
         ("types", crate::user_types::managed_query(), "schema, name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
         ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
@@ -1432,6 +1433,41 @@ async fn read_all(conn: &mut Conn) -> Result<CatalogRead, DbError> {
     decode_batch(&read_batch(conn).await?)
 }
 
+fn decode_extensions(
+    rows: &[serde_json::Value],
+) -> Result<BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>, DbError> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let name = text(row, "name")?;
+        let schema = text(row, "schema")?;
+        let version = text(row, "version")?;
+        if name.is_empty()
+            || schema.is_empty()
+            || version.is_empty()
+            || name.len() > 63
+            || schema.len() > 63
+            || [&name, &schema, &version].iter().any(|v| v.contains('\0'))
+        {
+            return Err(DbError::BadRow(
+                "installed extension has an invalid name, schema or version".into(),
+            ));
+        }
+        if out
+            .insert(
+                name.clone().into(),
+                pbps_model::Extension { schema, version },
+            )
+            .is_some()
+        {
+            return Err(DbError::BadRow(format!(
+                "duplicate installed extension `{}`",
+                pbps_model::escape::Escaped(&name)
+            )));
+        }
+    }
+    Ok(out)
+}
+
 fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
     let mut unmanaged_modules = Vec::new();
     let mut warnings = Vec::new();
@@ -1504,10 +1540,17 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         });
     }
 
+    let notices = census::notices(batch.get("census").ok_or_else(|| missing("census"))?)?;
     let mut raw = RawCatalog {
-        catalog_notices: census::notices(batch.get("census").ok_or_else(|| missing("census"))?)?,
+        catalog_notices: notices.objects,
+        extension_notices: notices.extensions,
         ..RawCatalog::default()
     };
+    raw.extensions = decode_extensions(
+        batch
+            .get("extensions")
+            .ok_or_else(|| missing("extensions"))?,
+    )?;
     for row in batch.get("types").ok_or_else(|| missing("types"))? {
         // Without these query columns there is no identity to attribute a
         // limitation to. Their failure still means the query and reader differ.
@@ -5058,6 +5101,32 @@ mod tests {
     }
 
     #[test]
+    fn installed_extensions_require_a_readable_complete_unique_inventory() {
+        let mut batch = empty_catalog_batch();
+        batch.remove("extensions");
+        assert!(
+            decode_batch(&batch)
+                .unwrap_err()
+                .to_string()
+                .contains("extensions")
+        );
+        let row = serde_json::json!({"name":"citext","schema":"ext","version":"1.4"});
+        for key in ["name", "schema", "version"] {
+            for bad in [serde_json::Value::Null, false.into(), "".into()] {
+                let mut changed = row.clone();
+                changed[key] = bad;
+                assert!(decode_extensions(&[changed]).is_err(), "{key}");
+            }
+            let mut missing = row.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(decode_extensions(&[missing]).is_err(), "{key}");
+        }
+        assert!(decode_extensions(&[row.clone(), row.clone()]).is_err());
+        assert!(decode_extensions(&[]).unwrap().is_empty());
+        assert_eq!(decode_extensions(&[row]).unwrap()["citext"].version, "1.4");
+    }
+
+    #[test]
     fn missing_type_inventory_is_not_an_empty_catalog() {
         let mut batch = empty_catalog_batch();
         assert!(decode_batch(&batch).unwrap().0.types.is_empty());
@@ -5212,6 +5281,7 @@ mod tests {
             "modules",
             "module_args",
             "types",
+            "extensions",
             "roles",
             "grants",
             "routine_args",

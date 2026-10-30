@@ -11,6 +11,61 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
 
+/// Exact packages must be provisioned by the scratch operator/externals file.
+/// This read-only gate is shared by resolver compilation and rehearsal; it
+/// must not turn an absent or mismatching package into an assumed prerequisite.
+pub async fn extension_prerequisites(
+    conn: &mut pbps_db::Conn,
+    required: &std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+) -> Result<Vec<String>, DbError> {
+    if required.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One static read also keeps this seam Send for owned scratch workers.
+    let rows = conn.query("SELECT e.extname::text AS name, n.nspname::text AS schema, e.extversion::text AS version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace").await?;
+    let mut installed = std::collections::BTreeMap::new();
+    for row in rows {
+        let name = text(&row, "name")?;
+        let schema = text(&row, "schema")?;
+        let version = text(&row, "version")?;
+        if name.is_empty() || schema.is_empty() || version.is_empty() {
+            return Err(DbError::BadRow(
+                "scratch extension inventory has an empty required field".into(),
+            ));
+        }
+        if installed
+            .insert(name.clone(), pbps_model::Extension { schema, version })
+            .is_some()
+        {
+            return Err(DbError::BadRow(format!(
+                "scratch extension `{}` has duplicate inventory rows",
+                Escaped(&name)
+            )));
+        }
+    }
+    let mut problems = Vec::new();
+    for (name, expected) in required {
+        let expectation = format!(
+            "scratch extension `{}` requires exact version `{}` in schema `{}`",
+            name.shown(),
+            Escaped(&expected.version),
+            Escaped(&expected.schema)
+        );
+        match installed.get(name.raw()) {
+            None => problems.push(format!(
+                "{expectation}, but it is absent; provision it through the scratch externals file"
+            )),
+            Some(actual) if actual != expected => problems.push(format!(
+                "{expectation}; installed version is `{}` in schema `{}`",
+                Escaped(&actual.version),
+                Escaped(&actual.schema)
+            )),
+            Some(_) => {}
+        }
+    }
+    Ok(problems)
+}
+
 /// What the keeper session sets so the engine notices a vanished client
 /// (#2410). `RESET ALL` and `DISCARD ALL` clear them, so a session that runs
 /// either sends them again; `application_name` is set at connection instead.

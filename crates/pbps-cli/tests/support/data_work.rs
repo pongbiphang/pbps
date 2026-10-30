@@ -222,7 +222,7 @@ pub fn acceptance(server: &str, pg: bool) {
     let recorded_id = report["data"]["entry_id"].as_i64().unwrap();
     let after = latest(connection, pg);
     assert_eq!(after.kind, pbps_model::StateKind::DataWork);
-    assert_eq!(after.version, 35);
+    assert_eq!(after.version, pbps_model::state::CURRENT_VERSION);
     assert_eq!(after.operator, "demo");
     assert_eq!(managed(&after), managed(&before));
     use sha2::Digest as _;

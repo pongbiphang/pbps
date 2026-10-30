@@ -24,6 +24,92 @@ use pbps_model::{ModuleId, ModuleKind, Role, Schema};
 
 use crate::declaration_file;
 
+/// Catalog presence cannot select code packages for management (DEC-2447.3).
+/// Read declarations as well as identities: a hand-authored package is explicit
+/// selection even before its first pull has minted an identity. An unreadable
+/// project cannot safely be treated as asking for no packages, even with force.
+pub(crate) fn extension_scope(
+    dir: &Path,
+    ids: Option<&pbps_model::IdsFile>,
+    named: &[String],
+    protected: &[PathBuf],
+) -> anyhow::Result<BTreeSet<pbps_model::ObjectLocalName>> {
+    let mut scope: BTreeSet<_> = named.iter().map(|name| name.as_str().into()).collect();
+    if let Some(ids) = ids {
+        scope.extend(ids.extensions.values().cloned());
+    }
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot read existing extension selection"),
+        Ok(_) => {
+            let root = crate::paths::absolute(dir)?;
+            // Force may replace duplicate ordinary declarations/aliases. Read
+            // each kind independently instead of requiring a merged old model.
+            for path in
+                pbps_load::schema_files(dir).context("cannot list existing extension selection")?
+            {
+                // Proven foreign paths are refused, not parsed or counted as
+                // absent selection. Genuine unreadable history still refuses.
+                crate::paths::refuse_declaration_path(&path, &root, protected)?;
+                let declared = pbps_load::load_file(&path).map_err(|errors| {
+                    anyhow::anyhow!(
+                        "cannot read existing extension selection:\n{}",
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                })?;
+                if let pbps_load::LoadedFile::Extension(extension) = declared {
+                    scope.insert(extension.name);
+                }
+            }
+        }
+    }
+    Ok(scope)
+}
+
+/// Keep the strict full read, then select declarations before identity minting
+/// and publication. Missing selections refuse rather than silently retiring ids.
+pub(crate) fn select_extensions(
+    schema: &mut Schema,
+    scope: &BTreeSet<pbps_model::ObjectLocalName>,
+) -> anyhow::Result<Vec<String>> {
+    for name in scope {
+        anyhow::ensure!(
+            schema.extensions.contains_key(name),
+            "extension `{}` selected for management is not installed; pull cannot adopt or retire it in the read-only extension phase",
+            name.shown()
+        );
+    }
+    let unmanaged: Vec<_> = schema
+        .extensions
+        .iter()
+        .filter(|(name, _)| !scope.contains(*name))
+        .map(|(name, definition)| {
+            format!(
+                "{} {}",
+                name.shown(),
+                pbps_model::escape::Escaped(&definition.version)
+            )
+        })
+        .collect();
+    let notices = match schema.extensions.keys().find(|name| !scope.contains(*name)) {
+        Some(name) => {
+            let argument = crate::report::shell_arg(name.raw())
+                .unwrap_or_else(|| crate::report::placeholder("extension name"));
+            vec![
+                format!("Installed but not managed: {}", unmanaged.join(", ")),
+                format!("To manage one: pbps pull --extension {argument}"),
+            ]
+        }
+        None => Vec::new(),
+    };
+    schema.extensions.retain(|name, _| scope.contains(name));
+    Ok(notices)
+}
+
 /// Declares `partitions: external` (#1533) on the parents another tool
 /// creates partitions of, and leaves those partitions out of what is written.
 ///
@@ -521,6 +607,15 @@ pub(crate) fn write_declarations_with_deps(
     // the first, with the identity file naming both (DECISIONS 135).
     declaration_file::refuse_folded_paths(&declaration_file::paths_of(dir, schema)?)?;
     let mut written = BTreeSet::new();
+    if !schema.extensions.is_empty() {
+        std::fs::create_dir_all(dir.join("extensions"))?;
+    }
+    for (name, definition) in &schema.extensions {
+        let path = declaration_file::extension_path(dir, name);
+        std::fs::write(&path, pbps_load::render_extension(name, definition))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
     for (name, definition) in &schema.types {
         let path = declaration_file::type_path(dir, name)?;
         std::fs::write(&path, pbps_load::render_type(name, definition))
@@ -1379,5 +1474,130 @@ mod tests {
         );
         let found = refuse_policy_errors(&warn, &loaded, pg().as_ref()).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn extension_hints_quote_arguments_and_escape_inventory_text() {
+        for (name, argument) in [
+            ("package name", "\"package name\""),
+            ("package$(true)", "\"<extension name>\""),
+            ("package\nname", "\"<extension name>\""),
+        ] {
+            let mut schema = Schema {
+                extensions: [(
+                    name.into(),
+                    pbps_model::Extension {
+                        schema: "ext".into(),
+                        version: "opaque\nversion".into(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let notices = select_extensions(&mut schema, &BTreeSet::new()).unwrap();
+            assert!(!notices[0].contains('\n'));
+            assert_eq!(
+                notices[1],
+                format!("To manage one: pbps pull --extension {argument}")
+            );
+        }
+    }
+
+    #[test]
+    fn extension_selection_preserves_missing_and_empty_scope_but_refuses_unreadable_history() {
+        let dir = Stage::new("extension-selection-history").unwrap();
+        let schema = dir.path().join("schema");
+        let ids = pbps_model::IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "hstore".into())].into(),
+            ..Default::default()
+        };
+        let held: BTreeSet<_> = ["hstore".into()].into();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            held
+        );
+        assert!(extension_scope(&schema, None, &[], &[]).unwrap().is_empty());
+        std::fs::create_dir(&schema).unwrap();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            held
+        );
+        assert!(extension_scope(&schema, None, &[], &[]).unwrap().is_empty());
+        let path = schema.join("package.yml");
+        for bytes in [
+            b"extension: citext\nversion: [broken\n".as_slice(),
+            b"\xff\xfe".as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = extension_scope(&schema, Some(&ids), &[], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("cannot read existing extension selection"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, "extension: citext\nschema: ext\nversion: '1.4'\n").unwrap();
+        assert_eq!(
+            extension_scope(&schema, Some(&ids), &[], &[]).unwrap(),
+            ["citext".into(), "hstore".into()].into()
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink("missing-extension.yml", &path).unwrap();
+            assert!(extension_scope(&schema, Some(&ids), &[], &[]).is_err());
+            assert!(std::fs::symlink_metadata(path).unwrap().is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_selection_refuses_foreign_aliases_before_reading_their_contents() {
+        let dir = Stage::new("extension-selection-aliases").unwrap();
+        let schema = dir.path().join("schema");
+        std::fs::create_dir(&schema).unwrap();
+        let protected = dir.path().join("protected.yml");
+        let path = schema.join("candidate.yml");
+        for bytes in [
+            "dialect: postgres\n",
+            "extension: citext\nschema: ext\nversion: '1.4'\n",
+        ] {
+            std::fs::write(&protected, bytes).unwrap();
+            for hard in [false, true] {
+                if hard {
+                    std::fs::hard_link(&protected, &path).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&protected, &path).unwrap();
+                }
+                let error = extension_scope(&schema, None, &[], std::slice::from_ref(&protected))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("aliases protected project input"), "{error}");
+                assert!(
+                    !error.contains("cannot read existing extension selection"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read_to_string(&protected).unwrap(), bytes);
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        // An outside destination is refused even if it looks like a declaration.
+        std::os::unix::fs::symlink(&protected, &path).unwrap();
+        let error = extension_scope(&schema, None, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("resolves outside the declaration directory"),
+            "{error}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        // Equal bytes in a distinct in-root file are genuine explicit selection.
+        std::fs::copy(&protected, &path).unwrap();
+        assert_eq!(
+            extension_scope(&schema, None, &[], &[protected]).unwrap(),
+            ["citext".into()].into()
+        );
     }
 }

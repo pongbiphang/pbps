@@ -41,7 +41,9 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 77;
+pub const SCHEMA_VERSION: u32 = 81;
+// 81: exact read-only PostgreSQL extension declarations/state (#2447 PR A).
+// 77: chained SQL Server staged resolver evidence (#2376).
 // 74: guarded drop row requirements in plan explanations (#2400).
 // 71: report-only catalog census policy (#2444).
 // 70: report-only unmanaged-grant policy (#2446).

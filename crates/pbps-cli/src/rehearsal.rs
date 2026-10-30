@@ -219,10 +219,12 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
         .cloned()
         .collect();
     let ids = &ids.without_types(&absent);
+    let (prerequisites, prerequisite_ids) =
+        pbps_diff::bootstrap_base(pbps_diff::Side { schema, ids });
     let build = pbps_diff::diff(
         pbps_diff::Side {
-            schema: &Schema::default(),
-            ids: &IdsFile::default(),
+            schema: &prerequisites,
+            ids: &prerequisite_ids,
         },
         pbps_diff::Side { schema, ids },
         dialect,
@@ -249,8 +251,8 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
             schema,
             sources: crate::dependents::Sources {
                 before: pbps_diff::Side {
-                    schema: &Schema::default(),
-                    ids: &IdsFile::default(),
+                    schema: &prerequisites,
+                    ids: &prerequisite_ids,
                 },
                 after: ids,
             },
@@ -301,6 +303,8 @@ pub async fn rehearse_in(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Findings> {
+    // A scratch bootstrap assumes package state, never permission to install it.
+    crate::engine::require_scratch_extensions(conn, &declared.extensions).await?;
     // The rehearsal reads the rows back and compares; a spelling the engine
     // reads differently would fail that comparison without saying which
     // spelling to write. Asked first, as every connected command asks
@@ -881,6 +885,43 @@ mod tests {
     /// A declared type is recorded when it is planned, so the target's base can
     /// record an identity for a type it does not hold yet. Built from empty,
     /// that is not an identity to claim; the base builds without it.
+    #[test]
+    fn adopted_extensions_are_prerequisites_not_bootstrap_statements() {
+        let pg = pbps_pg::Postgres::new();
+        let schema = Schema {
+            extensions: [(
+                "citext".into(),
+                pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.4".into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "citext".into())].into(),
+            ..Default::default()
+        };
+        let (lowered, _) = lower_from_empty(&pg, &schema, &ids, &Default::default()).unwrap();
+        assert!(lowered.statements().is_empty());
+        assert!(
+            pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &Schema::default(),
+                    ids: &IdsFile::default()
+                },
+                pbps_diff::Side {
+                    schema: &schema,
+                    ids: &ids
+                },
+                &pg,
+                &Default::default()
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn a_type_the_base_records_and_does_not_hold_does_not_stop_it_building() {
         let pg = pbps_pg::Postgres::new();

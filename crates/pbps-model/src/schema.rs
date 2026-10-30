@@ -34,6 +34,10 @@ pub struct Schema {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<crate::TypeRef, crate::ManagedType>,
 
+    /// Database-global PostgreSQL packages, pinned exactly (DEC-2447.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<ObjectLocalName, Extension>,
+
     /// Views, procedures, functions and triggers (ADR-0002).
     ///
     /// Keyed by [`ModuleId`], not by name: what identifies a module depends on
@@ -60,6 +64,14 @@ pub struct Schema {
     /// environment with no managed roles, not a broken file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<crate::RoleName, crate::role::Role>,
+}
+
+/// Installed package state; the database-global name is the map key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extension {
+    pub schema: String,
+    pub version: String,
 }
 
 impl Schema {

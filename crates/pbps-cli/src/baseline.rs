@@ -409,6 +409,10 @@ fn load_from_git(
                 schema.roles.insert(r.name, r.role);
                 count += 1;
             }
+            Ok(pbps_load::LoadedFile::Extension(e)) => {
+                schema.extensions.insert(e.name, e.definition);
+                count += 1;
+            }
             Ok(pbps_load::LoadedFile::Type(t)) => {
                 schema.types.insert(t.name, t.definition);
                 count += 1;

@@ -10,8 +10,10 @@ pub mod convert;
 mod dependencies;
 pub mod dto;
 pub mod error;
+mod extensions;
 pub mod fmt;
 mod managed_types;
+pub use extensions::{LoadedExtension, load_extension_str, render_extension};
 
 use std::path::Path;
 
@@ -96,6 +98,7 @@ pub fn inspect_schema_dir(dir: &Path) -> Result<DiagnosticSchema, Vec<LoadError>
 /// What one declaration file turned out to hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadedFile {
+    Extension(Box<LoadedExtension>),
     Dependency(Box<LoadedDependency>),
     Type(Box<LoadedType>),
     Table(Box<LoadedTable>),
@@ -151,6 +154,9 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
             message: e.to_string(),
         }]
     })?;
+    if probe.extension.is_some() {
+        return load_extension_str(path, text).map(|e| LoadedFile::Extension(Box::new(e)));
+    }
     if probe.dependency.is_some() {
         return load_dependency_str(path, text).map(|d| LoadedFile::Dependency(Box::new(d)));
     }
@@ -173,7 +179,7 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     Err(vec![LoadError::Yaml {
         path: path.to_owned(),
         message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:`, \
-                  `trigger:`, `role:`, `enum:`, `domain:` or `dependency:`"
+                  `trigger:`, `extension:`, `role:`, `enum:`, `domain:` or `dependency:`"
             .to_owned(),
     }])
 }
@@ -305,6 +311,20 @@ fn collect_files(
                 loaded.dependencies.insert(d.name, d.declaration);
                 continue;
             }
+            LoadedFile::Extension(e) => {
+                let key = pbps_model::diagnostic::Declaration::Extension(e.name.clone());
+                if let Some(first) = loaded.sources.get(&key) {
+                    errs.push(already(
+                        &path,
+                        &format!("extension `{}`", e.name.shown()),
+                        first,
+                    ));
+                    continue;
+                }
+                loaded.sources.insert(key, path);
+                loaded.schema.extensions.insert(e.name, e.definition);
+                continue;
+            }
             LoadedFile::Type(t) => {
                 if let Some(first) = seen_types.get(&t.name) {
                     errs.push(already(&path, &format!("type `{}`", t.name.shown()), first));
@@ -424,7 +444,10 @@ fn collect_files(
                 loaded.schema.modules.insert(m.id, m.module);
             }
             // Merged above, in its own namespace.
-            LoadedFile::Role(_) | LoadedFile::Type(_) | LoadedFile::Dependency(_) => {}
+            LoadedFile::Extension(_)
+            | LoadedFile::Role(_)
+            | LoadedFile::Type(_)
+            | LoadedFile::Dependency(_) => {}
         }
     }
 
@@ -1428,6 +1451,7 @@ indexes:
             LoadedFile::Role(r) => assert_eq!(r.name, "app.reader".into()),
             other @ (LoadedFile::Table(_)
             | LoadedFile::Module(_)
+            | LoadedFile::Extension(_)
             | LoadedFile::Type(_)
             | LoadedFile::Dependency(_)) => {
                 panic!("not a role: {other:?}")

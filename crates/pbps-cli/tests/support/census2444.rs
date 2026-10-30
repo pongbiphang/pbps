@@ -94,7 +94,14 @@ fn both_paths(d: &Demo, connection: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect();
     warnings.sort();
-    assert_eq!(warnings, expected, "{}", stderr(&out));
+    // A full pull now declares every extension; connected planning still
+    // inventories packages outside the recorded managed set (DEC-2447.1).
+    let pull_expected: Vec<_> = expected
+        .iter()
+        .filter(|m| !m.starts_with("extension `"))
+        .cloned()
+        .collect();
+    assert_eq!(warnings, pull_expected, "{}", stderr(&out));
     let human = succeeds(d.run(&["plan", "--db", connection]));
     for message in &expected {
         assert_eq!(

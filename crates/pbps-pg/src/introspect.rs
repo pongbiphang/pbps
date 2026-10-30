@@ -387,7 +387,10 @@ pub struct RawIndex {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawCatalog {
     pub catalog_notices: Vec<String>,
+    /// Extension census objects, classified against managed ids by the caller.
+    pub extension_notices: BTreeMap<pbps_model::ObjectLocalName, String>,
     pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
+    pub extensions: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
     pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
     pub columns: Vec<RawColumn>,
@@ -760,9 +763,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut pulled = Pulled {
         session_role: raw.session_role.clone(),
         catalog_notices: raw.catalog_notices.clone(),
+        extension_notices: raw.extension_notices.clone(),
         ..Pulled::default()
     };
     pulled.schema.types = raw.types.clone();
+    pulled.schema.extensions = raw.extensions.clone();
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
     let policies_by_table = group(&raw.row_policies, |p| p.table_oid);

@@ -1166,6 +1166,7 @@ mod tests {
             schema: live,
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
+            extension_notices: std::collections::BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: Vec::new(),

@@ -39,6 +39,11 @@ use pbps_model::{
 pub enum DiffError {
     #[error("{reason}")]
     DropRequirement { reason: String },
+    #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
+    ExtensionLifecycleUnsupported {
+        name: pbps_model::ObjectLocalName,
+        action: String,
+    },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
     EnumValueUse {
         name: pbps_model::TypeRef,
@@ -807,7 +812,7 @@ pub(crate) fn diff_partial_rebuilding(
     if !rebuilds.is_empty() {
         return Diffed {
             changes: ChangeSet { changes: rebuilds },
-            errors: vec![],
+            errors: crate::extensions::differences(base, declared, dialect.name()),
         };
     }
     let mut errs: Vec<DiffError> =
@@ -815,6 +820,11 @@ pub(crate) fn diff_partial_rebuilding(
             .into_iter()
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
+    errs.extend(crate::extensions::differences(
+        base,
+        declared,
+        dialect.name(),
+    ));
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
         errs.push(DiffError::ConversionsUnsupported {
             count: declared.ids.conversions.len(),

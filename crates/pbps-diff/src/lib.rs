@@ -11,6 +11,8 @@ pub mod conversion;
 pub mod domain_rebuild;
 pub mod drop_requirements;
 pub mod enum_labels;
+mod extensions;
+pub use extensions::{bootstrap_base, differences as extension_differences};
 pub mod foreign_keys;
 pub mod identity;
 pub mod managed;

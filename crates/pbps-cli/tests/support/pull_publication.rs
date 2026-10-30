@@ -96,10 +96,15 @@ pub fn aliases(server: &str, pg: bool, cased: bool) {
         let pulled = d.run(&["pull", "--force", "--db", own.connection()]);
         assert_eq!(code(&pulled), 0, "{}{}", stdout(&pulled), stderr(&pulled));
         assert!(stderr(&pulled).contains("removed 1 declaration file(s)"));
-        assert_eq!(
-            pbps_load::schema_files(&dir).unwrap().as_slice(),
-            std::slice::from_ref(&output)
+        let mut expected_files = vec![output.clone()];
+        expected_files.extend(
+            expected
+                .extensions
+                .keys()
+                .map(|name| dir.join("extensions").join([name.raw(), ".yml"].concat())),
         );
+        expected_files.sort();
+        assert_eq!(pbps_load::schema_files(&dir).unwrap(), expected_files);
         assert_eq!(pbps_load::load_schema_dir(&dir).unwrap().schema, expected);
         assert!(!std::fs::symlink_metadata(&output).unwrap().is_symlink());
         ok(d.run(&["validate"]));

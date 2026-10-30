@@ -20,7 +20,7 @@ fn unguarded_tombstones_keep_their_bytes_and_guarded_ones_change_the_checksum() 
     ids.validate().unwrap();
     assert_ne!(state_checksum(&Schema::default(), &ids), before);
     assert_eq!(ids.version, 1);
-    assert_eq!(pbps_model::state::CURRENT_VERSION, 35);
+    assert_eq!(pbps_model::state::CURRENT_VERSION, 36);
     ids.tombstones
         .values_mut()
         .next()
