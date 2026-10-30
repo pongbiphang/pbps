@@ -3238,6 +3238,19 @@ fn recovery_report_findings(
     collected: pbps_cli::resolver::server::scratch::recovery::Collected,
 ) -> Vec<crate::output::Finding> {
     let mut findings = Vec::new();
+    for names in collected.cancelled {
+        findings.push(crate::output::Finding::warning(
+            "scratch.cleanup-unconfirmed",
+            format!(
+                "a cancelled resolver run could not confirm cleanup; remove exactly: {}",
+                names
+                    .iter()
+                    .map(|name| pbps_model::escape::Escaped(name).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     for why in collected.unread {
         findings.push(crate::output::Finding::warning(
             "scratch.leftovers-unread",
@@ -11190,6 +11203,34 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cancelled_cleanup_findings_keep_the_reported_recovery_names() {
+        use pbps_cli::resolver::server::scratch::recovery::Collected;
+        let findings = super::recovery_report_findings(Collected {
+            cancelled: vec![vec![
+                "database pbps_scratch_1519".into(),
+                "role pbps_run_1519".into(),
+            ]],
+            ..Collected::default()
+        });
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.id, "scratch.cleanup-unconfirmed");
+        assert_eq!(finding.severity, crate::output::Severity::Warning);
+        assert_eq!(
+            finding.message,
+            "a cancelled resolver run could not confirm cleanup; remove exactly: \
+             database pbps_scratch_1519, role pbps_run_1519"
+        );
+        let json = serde_json::to_value(finding).unwrap();
+        assert_eq!(json["id"], "scratch.cleanup-unconfirmed");
+        assert_eq!(json["severity"], "warning");
+        assert_eq!(json["message"], finding.message);
+        // An observed cleanup error is returned to its caller instead of
+        // entering this collector, so an empty report must stay silent.
+        assert!(super::recovery_report_findings(Collected::default()).is_empty());
+    }
+
+    #[test]
     fn recovery_findings_name_only_confirmed_removal_and_keep_volume_failures() {
         use pbps_cli::resolver::server::scratch::recovery::{Collected, Group, Kept, Resource};
         let resource = Resource::one("docker container", "owned");
@@ -11211,6 +11252,7 @@ mod tests {
                 },
             ],
             unread: vec!["daemon denied".into()],
+            ..Collected::default()
         });
         assert_eq!(
             findings

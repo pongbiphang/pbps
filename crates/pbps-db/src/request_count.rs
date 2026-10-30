@@ -4,37 +4,60 @@
 //! invocation and a batch containing several statements. This measures the
 //! batching regression's unit of work, not SQL statements or wire messages.
 
-use std::cell::Cell;
 use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 tokio::task_local! {
-    static REQUESTS: Cell<u64>;
+    static REQUESTS: Counter;
 }
 
 /// Counts PostgreSQL requests made by this future on its current task.
 ///
 /// All connections called by the future share its count, including startup
 /// queries on newly opened connections. Separate and nested scopes do not
-/// share counts. Spawned tasks need their own scope; the resolver SQL measured
-/// by the live guard runs in the caller's task. A task scope avoids counting
+/// share counts. A lifecycle supervisor may explicitly inherit this scope;
+/// unrelated spawned work stays unmeasured. A task scope avoids counting
 /// setup or unrelated tests that happen to use the same server.
 pub async fn scope<F: Future>(future: F) -> (F::Output, u64) {
     REQUESTS
-        .scope(Cell::new(0), async {
+        .scope(Counter(Arc::new(AtomicU64::new(0))), async {
             let answer = future.await;
-            (answer, REQUESTS.with(Cell::get))
+            (
+                answer,
+                REQUESTS.with(|count| count.0.load(Ordering::Relaxed)),
+            )
         })
         .await
 }
 
+/// Opaque test measurement shared only with an explicitly owned child task.
+#[derive(Clone)]
+pub struct Counter(Arc<AtomicU64>);
+
+/// Captures the current test measurement without opening a new one.
+pub fn current() -> Option<Counter> {
+    REQUESTS.try_with(Clone::clone).ok()
+}
+
+/// Continues the parent's measurement on a supervisor (DEC-1519.1).
+pub async fn inherit<F: Future>(counter: Option<Counter>, future: F) -> F::Output {
+    match counter {
+        Some(counter) => REQUESTS.scope(counter, future).await,
+        None => future.await,
+    }
+}
+
 pub(crate) fn record() {
     // Requests outside a measurement must not require a measurement owner.
-    let _ = REQUESTS.try_with(|count| count.set(count.get() + 1));
+    let _ = REQUESTS.try_with(|count| count.0.fetch_add(1, Ordering::Relaxed));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{record, scope};
+    use super::{current, inherit, record, scope};
 
     #[tokio::test]
     async fn concurrent_futures_keep_their_counts_across_yields() {
@@ -71,5 +94,36 @@ mod tests {
         assert_eq!((inner, outer), (2, 2));
         record();
         assert_eq!(scope(async {}).await.1, 0);
+    }
+
+    #[tokio::test]
+    async fn an_owned_supervisor_inherits_only_its_explicit_measurement() {
+        let ((), requests) = scope(async {
+            record();
+            let counter = current();
+            tokio::spawn(inherit(counter, async {
+                record();
+                tokio::task::yield_now().await;
+                record();
+            }))
+            .await
+            .unwrap();
+            tokio::spawn(async {
+                record();
+            })
+            .await
+            .unwrap();
+            // A nested measurement still has its own authority.
+            assert_eq!(
+                scope(async {
+                    record();
+                })
+                .await
+                .1,
+                1
+            );
+        })
+        .await;
+        assert_eq!(requests, 3);
     }
 }

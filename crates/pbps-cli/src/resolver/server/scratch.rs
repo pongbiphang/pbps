@@ -39,6 +39,7 @@ pub mod domain;
 pub mod preview;
 pub mod recovery;
 pub mod rehearse;
+mod supervised;
 
 /// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run
@@ -123,64 +124,26 @@ pub async fn produce_unsealed(
         .map_err(|error| ProduceError::Run(Error::Binding(error.to_string())))?;
     let request =
         request(driver, base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
-    let standard = standard.into();
-    // Before either connection opens: a LocalDB instance that cannot be found
-    // is known without touching the target, and every connection of the run
-    // then opens the one endpoint found here (DEC-2271.2).
-    let scratch = &engine::endpoint(driver, scratch).await?;
-    let mut target = Conn::connect(driver, target_connection)
-        .await
-        .map_err(|error| unusable(format!("the target could not be connected: {error}")))?;
-    // Before the scratch session connects, which carries it from its first
-    // packet (#2410).
-    let tokens = Tokens::generate();
-    let mut admin = engine::connect_scratch(driver, scratch, &tokens).await?;
-    let (provisioning, state) = engine::scratch(
+    supervised::Request {
         driver,
-        &mut target,
-        &mut admin,
-        &tokens,
-        planned_identity,
-        scratch,
-        &request,
-        &standard,
-        externals,
-        provenance,
-    )
-    .await?;
-    let mut run = Run {
-        driver,
-        planned_identity,
-        key: &key,
-        request: &request,
-        tokens: &tokens,
-        externals,
-        provenance,
-        state,
-    };
-    let result = run
-        .resolve(
-            provisioning,
-            &mut target,
-            &mut admin,
-            binding,
-            base,
-            desired,
-            hints,
-        )
-        .await;
-    let cleanup = run.state.release(&mut admin).await;
-    drop(run);
-    match (result, cleanup) {
-        (_, Err(names)) => Err(ProduceError::Cleanup(names)),
-        (Err(refused), Ok(())) => Err(ProduceError::Run(refused)),
-        (Ok((ordered, sealing, opening)), Ok(())) => Ok(Unsealed {
-            key,
-            ordered,
-            sealing,
-            opening,
-        }),
+        scratch: scratch.to_owned(),
+        target: target_connection.to_owned(),
+        planned_identity: planned_identity.to_owned(),
+        bootstrap: binding.bootstrap.clone(),
+        base: base.schema.clone(),
+        desired: desired.schema.clone(),
+        base_ids: base.ids.clone(),
+        desired_ids: desired.ids.clone(),
+        dependencies: binding.dependencies.clone(),
+        hints: hints.clone(),
+        key,
+        scope: request,
+        standard: standard.into(),
+        externals: externals.map(str::to_owned),
+        provenance: provenance.clone(),
     }
+    .start()
+    .await
 }
 
 /// What the evidence records of the scratch a run used (#1674): the entry

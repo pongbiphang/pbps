@@ -5347,3 +5347,26 @@ required question. The engine refuses changing the built-in `dbo` schema's
 owner on this fixture (15150); that failed setup is not a regression witness.
 These SQL-login measurements do not qualify Windows-group effective defaults;
 #725 follows the same known-absence policy with its own qualification.
+
+
+<a id="dec-1519-1"></a>
+
+**DEC-1519.1. A supervisor owns resolution and release independently of the request future.**
+The maintainer chose option A on #1519 on 2026-10-30. The public producer
+entry point stays unchanged; an owned request runs in an independent Tokio
+task with the original checked scratch connection and backend. Cancelling
+or dropping the caller closes its result receiver; the supervisor finishes
+resolution and release. Neither is raced against cancellation: dropping an
+in-flight SQL future could abandon a claim before its ownership assignment,
+or leave the checked session inside an unfinished transaction. Input declarations, IDs, hints and the
+fingerprint key belong to the supervisor, so their caller cannot invalidate
+its cleanup obligation. No engine-specific SQL moves into this owner.
+
+A reply owns an unobserved cleanup failure until the caller consumes it.
+Dropping that reply reports its exact recovery names to stderr and the
+existing process recovery collector, including when cancellation races with
+a completed send. An uncancelled caller receives the same cleanup error as
+before. Process death and runtime shutdown cannot run in-process cleanup;
+#2410's durable recovery remains their fallback, and the fallback for a
+cleanup the checked backend could not confirm. It is not a substitute for
+finishing a cancelled request's release in a live server.
