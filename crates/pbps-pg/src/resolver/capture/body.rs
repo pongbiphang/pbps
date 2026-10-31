@@ -33,7 +33,12 @@ fn statements(tree: &Value) -> Result<Vec<&Node>, String> {
     fn query(value: &Value) -> Result<&Node, String> {
         match value {
             Value::Node(node) if node.tag == "QUERY" => Ok(node),
-            Value::Node(_) | Value::Null | Value::Atom(_) | Value::List(_) | Value::Datum => {
+            Value::Node(_)
+            | Value::Null
+            | Value::Atom(_)
+            | Value::List(_)
+            | Value::Datum
+            | Value::DatumBytes { .. } => {
                 Err("a statement of the body is not a parsed query".to_owned())
             }
         }
@@ -45,7 +50,7 @@ fn statements(tree: &Value) -> Result<Vec<&Node>, String> {
             [Value::List(inner)] => inner.iter().map(query).collect(),
             _ => Err("the body is not one list of statements".to_owned()),
         },
-        Value::Null | Value::Atom(_) | Value::Datum => {
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {
             Err("the body is not one list of statements".to_owned())
         }
     }
@@ -56,7 +61,7 @@ fn is_empty(value: &Value) -> bool {
         Value::Null => true,
         Value::List(values) => values.is_empty(),
         Value::Atom(atom) => atom == "false" || atom == "0",
-        Value::Node(_) | Value::Datum => false,
+        Value::Node(_) | Value::Datum | Value::DatumBytes { .. } => false,
     }
 }
 
