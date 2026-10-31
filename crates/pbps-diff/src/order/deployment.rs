@@ -1183,19 +1183,6 @@ pub fn weave(
     // it subsumes is removed after the driver, which cannot remove a logical
     // change (DEC-1958.4).
     crate::order::normalize(cs);
-    if dialect.name() == "mssql" {
-        // Normalization invalidates positional proof. SQL Server has no later
-        // PostgreSQL module settlement, so re-derive this weave's own edges.
-        let mut schedule = Schedule::new(cs.changes.len());
-        super::row_security::module_constraints(
-            &mut schedule,
-            module_order(cs, found, declared, sources, dialect)?,
-        )?;
-        *cs = schedule
-            .settle(cs.clone())
-            .map_err(|why| why.describe(cs))?
-            .changes;
-    }
     Ok(added)
 }
 

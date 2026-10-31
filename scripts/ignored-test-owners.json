@@ -2951,6 +2951,7 @@
       ],
       "cases": [
         "default_holders2455::default_holders_survive_routine_rebuilds_with_and_without_writer_contracts",
+        "default_holders2455::reference_inserts_and_updates_take_the_restored_function_default",
         "consumer_contracts::consumer_writers_keep_defaults_needed_by_other_existing_columns"
       ]
     },

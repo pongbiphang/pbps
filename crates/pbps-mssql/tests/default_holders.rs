@@ -257,3 +257,137 @@ fn an_existing_default_change_is_split_once_and_no_facts_add_no_release() {
     assert_eq!(done.changes.changes(), &expected);
     assert_eq!(done.added, 0);
 }
+
+fn default_consumer_order(update: bool) {
+    use pbps_model::{Cell, Row, Value};
+    for takes_default in [false, true] {
+        let (mut before, mut after, mut ids, mut changes, found) = fixture(false);
+        let table = TableName::new("app", "t");
+        ids.columns
+            .insert("c_000003".parse().unwrap(), table.column("id"));
+        for schema in [&mut before, &mut after] {
+            let t = schema.tables.get_mut(&table).unwrap();
+            let mut id = pbps_model::Column::new("int".parse().unwrap());
+            id.nullable = false;
+            t.columns.insert("id".into(), id);
+            t.primary_key = serde_json::from_value(serde_json::json!({"columns":["id"]})).unwrap();
+            t.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Exact,
+                rows: [("1".into(), Row::from_iter([("old".into(), Value::Int(3))]))].into(),
+            });
+        }
+        let row = if takes_default {
+            Row::default()
+        } else {
+            Row::from_iter([("old".into(), Value::Int(23))])
+        };
+        let key = if update { "1" } else { "2" };
+        after
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .insert(key.into(), row.clone());
+        let change = if update {
+            Change::UpdateRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                key: key.into(),
+                columns: [(
+                    "old".into(),
+                    (
+                        Cell::Value(Value::Int(3)),
+                        if takes_default {
+                            Cell::Default("app.f()".into())
+                        } else {
+                            Cell::Value(Value::Int(23))
+                        },
+                    ),
+                )]
+                .into(),
+                unchanged: Default::default(),
+                types: [("old".into(), "int".parse().unwrap())].into(),
+                after_types: Default::default(),
+                key_type: None,
+            }
+        } else {
+            Change::InsertRow {
+                table: table.clone(),
+                key_column: "id".into(),
+                identity_key: false,
+                key: key.into(),
+                row,
+                defaults: if takes_default {
+                    [("old".into(), "app.f()".into())].into()
+                } else {
+                    Default::default()
+                },
+                types: [("old".into(), "int".parse().unwrap())].into(),
+            }
+        };
+        changes.changes.insert(2, PlannedChange::new(change));
+        let declared = Declarations {
+            schema: &after,
+            sources: Sources {
+                before: Side {
+                    schema: &before,
+                    ids: &ids,
+                },
+                after: &ids,
+            },
+            module_deps: &Default::default(),
+        };
+        let done = order::deployment::schedule::schedule(
+            order::propose(changes),
+            &declared,
+            &Facts::default().with_module_dependents(&found),
+            &Mssql,
+        )
+        .unwrap();
+        let plan = done.changes.changes();
+        let restore = plan
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::AlterColumnDefault { to: Some(_), .. }))
+            .unwrap();
+        let write = plan
+            .changes
+            .iter()
+            .position(|p| {
+                matches!(
+                    p.change,
+                    Change::InsertRow { .. } | Change::UpdateRow { .. }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            restore < write,
+            takes_default,
+            "update={update}, takes_default={takes_default}: {plan:?}"
+        );
+        if takes_default {
+            assert!(
+                done.changes
+                    .proof()
+                    .edges()
+                    .iter()
+                    .any(|e| e.before == restore && e.after == write),
+                "{:?}",
+                done.changes.proof()
+            );
+        }
+    }
+}
+
+#[test]
+fn default_inserts_follow_restoration_but_explicit_values_do_not() {
+    default_consumer_order(false);
+}
+
+#[test]
+fn default_updates_follow_restoration_but_explicit_values_do_not() {
+    default_consumer_order(true);
+}

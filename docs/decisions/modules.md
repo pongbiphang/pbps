@@ -2173,7 +2173,12 @@ this SQL Server read, not in-place edits.
 The shared DEC-1958.2 weave adds or reuses ordinary AlterColumnDefault teardown
 and restoration operations, with its existing catalog edges and risks. After
 normalization invalidates positional proof, SQL Server re-derives those same
-weave edges for its final settlement. Apply re-reads those same facts and checks the saved order; it adds no runtime DDL.
+weave edges for its final settlement. The existing effect-graph dependent
+closure carries consumers with each restoration: an insert using an omitted
+column's default or an update setting DEFAULT requires its final holder,
+whereas an explicit value has no such requirement. Keeping just the catalog
+edges would leave those writes in the release gap and could record NULL.
+Apply re-reads those same facts and checks the saved order; it adds no runtime DDL.
 When the caller column is also retyped, ReleaseGap(Default) (DEC-1896.1) keeps
 it between the pair. Decision 461's DEFAULT-preserving batch finds no DEFAULT
 there, so it performs no duplicate release or restoration. Without a routine
