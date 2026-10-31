@@ -791,6 +791,8 @@
         "managed_types::type_renames_forward_bound_expressions_and_the_next_plan_is_clean",
         "managed_types::type_renames_refuse_default_and_check_edits_inside_the_plan_window",
         "managed_types::staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step",
+        "managed_types::domains_over_built_in_only_function_bodies_are_vetted_and_applied",
+        "managed_types::a_function_replaced_between_plan_and_apply_is_vetted_as_replaced",
         "managed_types::pg_type_names_refuse_row_types_and_admit_indexes_and_sequences_before_emission",
         "managed_types::a_type_move_applies_after_dropping_its_intermediate_holder_and_converges",
         "managed_types::a_type_move_refuses_kept_and_undeclared_intermediate_holders_without_applying",
@@ -2258,6 +2260,10 @@
         "input_path_tests::a_type_that_runs_no_code_still_requires_trusted_owners",
         "input_path_tests::a_read_that_fails_is_unreadable_and_never_admitted",
         "input_path_tests::every_function_on_the_runs_sql_list_exists_is_built_in_and_runs_what_it_is_given",
+        "input_path_tests::a_function_with_a_built_in_only_body_is_admitted_alone_and_in_a_chain",
+        "input_path_tests::a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason",
+        "input_path_tests::the_owner_of_an_admitted_function_must_be_trusted",
+        "input_path_tests::a_function_replaced_between_two_reads_is_judged_by_its_current_body",
         "input_path_tests::reading_the_gate_runs_none_of_the_types_code",
         "input_path_tests::only_the_declared_types_own_default_is_on_the_input_path",
         "input_path_tests::a_default_the_statement_carries_replaces_the_domains_and_its_checks_still_run",
@@ -2793,7 +2799,8 @@
         "drop_requirements2400::requirements_refuse_nulls_query_errors_rls_and_missing_privilege_on_postgres_18",
         "drop_requirements2400::requirements_refuse_nulls_query_errors_rls_and_missing_privilege_on_postgres_16",
         "drop_requirements2400::the_drop_lock_covers_partitions_and_blocks_a_writer_through_the_drop_on_postgres_18",
-        "drop_requirements2400::the_drop_lock_covers_partitions_and_blocks_a_writer_through_the_drop_on_postgres_16"
+        "drop_requirements2400::the_drop_lock_covers_partitions_and_blocks_a_writer_through_the_drop_on_postgres_16",
+        "drop_requirements2400::requirements_and_conversions_admit_a_function_with_a_built_in_only_body"
       ]
     },
     {

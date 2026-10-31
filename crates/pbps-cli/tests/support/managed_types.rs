@@ -325,7 +325,9 @@ fn declared_type_lifecycles_converge_and_vetting_is_atomic() {
         succeeds(bad.run(&["baseline", "--db", db, "--reason", "empty database"]));
         on_server(
             db,
-            "CREATE SCHEMA app; CREATE FUNCTION app.unreviewed(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 > 0",
+            // A string body is not a parsed tree, so it stays refused; a `RETURN` or
+            // `BEGIN ATOMIC` body is proven built-in instead (#2563).
+            "CREATE SCHEMA app; CREATE FUNCTION app.unreviewed(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE AS $$ SELECT $1 > 0 $$",
         );
         std::fs::write(
             bad.dir.join("schema/app.bad.type.yml"),
@@ -1442,7 +1444,7 @@ fn staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step() {
         let db = own.connection();
         on_server(
             db,
-            "CREATE SCHEMA app; CREATE FUNCTION app.unsafe(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 > 0",
+            "CREATE SCHEMA app; CREATE FUNCTION app.unsafe(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE AS $$ SELECT $1 > 0 $$",
         );
         let d = Demo::new("staged-type1635");
         d.commit();
@@ -8659,3 +8661,128 @@ fn signature_module_rebuild_refuses_staged_planning() {
         assert!(no_replacement_left(own.connection()));
     }
 }
+
+const TIER1_FUNCTIONS: &str = "CREATE SCHEMA app;
+    CREATE FUNCTION app.accept(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE
+        BEGIN ATOMIC SELECT $1 > 0; END;
+    CREATE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE SQL IMMUTABLE
+        RETURN position('@' IN $1) > 0;
+    CREATE FUNCTION app.is_valid_email(text) RETURNS boolean LANGUAGE SQL IMMUTABLE
+        BEGIN ATOMIC SELECT app.has_at($1) AND length($1) > 3; END";
+
+fn tier1_declarations(d: &Demo) {
+    std::fs::write(
+        d.dir.join("schema/app.positive.type.yml"),
+        "domain: app.positive\ntype: integer\nchecks:\n  accepted: app.accept(VALUE)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.email.type.yml"),
+        "domain: app.email\ntype: text\nchecks:\n  valid: app.is_valid_email(VALUE)\n",
+    )
+    .unwrap();
+    d.table("table: app.t\ncolumns:\n  value: {type: app.positive}\n  email: {type: app.email}\n");
+}
+
+/// #2563 slice 1: a domain whose CHECK calls a `BEGIN ATOMIC` or `RETURN`
+/// function, alone or through a chain, is vetted in its creating transaction
+/// and applied; the engine then enforces the rule it proved.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domains_over_built_in_only_function_bodies_are_vetted_and_applied() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "tier1_2563");
+        let db = own.connection();
+        on_server(db, TIER1_FUNCTIONS);
+        let d = Demo::new("tier1-2563");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty managed scope"]));
+        tier1_declarations(&d);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("tier1.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_type WHERE typname IN ('positive', 'email')"
+            ),
+            2
+        );
+        on_server(db, "INSERT INTO app.t VALUES (1, 'a@b.c')");
+        for bad in [
+            "INSERT INTO app.t (value) VALUES (0)",
+            "INSERT INTO app.t (email) VALUES ('nope')",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| on_server(db, bad)).is_err(),
+                "the engine must enforce what was proven: {bad}"
+            );
+        }
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+/// #2563 slice 1: the function is read in the creating transaction, so one
+/// replaced between plan and apply is vetted as replaced. Each replacement is
+/// refused by name with its reason and creates nothing; once the function
+/// proves again, the same saved plan applies.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_function_replaced_between_plan_and_apply_is_vetted_as_replaced() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "tier1_swap2563");
+        let db = own.connection();
+        on_server(db, TIER1_FUNCTIONS);
+        let d = Demo::new("tier1-swap2563");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty managed scope"]));
+        tier1_declarations(&d);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("tier1swap.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        for (replacement, name, phrase) in [
+            (
+                "CREATE OR REPLACE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE SQL IMMUTABLE AS $$ SELECT position('@' IN $1) > 0 $$",
+                "app.has_at(text)",
+                "string body",
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE SQL STABLE RETURN position('@' IN $1) > 0",
+                "app.has_at(text)",
+                "declared STABLE",
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION app.accept(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN $1 > 0; END $$",
+                "app.accept(integer)",
+                "language `plpgsql`",
+            ),
+        ] {
+            on_server(db, replacement);
+            let out = apply_plan(&d, db, &path, false);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            let text = stderr(&out);
+            assert!(text.contains(name) && text.contains(phrase), "{text}");
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_type WHERE typname IN ('positive', 'email')"
+                ),
+                0,
+                "a refused vet rolls the creating transaction back"
+            );
+            // Restore the function the plan was made against.
+            on_server(db, TIER1_RESTORE);
+        }
+        succeeds(apply_plan(&d, db, &path, false));
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+const TIER1_RESTORE: &str = "
+    CREATE OR REPLACE FUNCTION app.accept(integer) RETURNS boolean LANGUAGE SQL IMMUTABLE
+        BEGIN ATOMIC SELECT $1 > 0; END;
+    CREATE OR REPLACE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE SQL IMMUTABLE
+        RETURN position('@' IN $1) > 0";

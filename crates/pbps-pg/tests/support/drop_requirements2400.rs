@@ -1,7 +1,11 @@
 use super::user_types_tests::{Scratch, servers};
 use pbps_dialect::Dialect;
 use pbps_model::{DropGuard, DropRequirement};
-use pbps_pg::{Postgres, drop_requirements::check, input_path::vet_requirement};
+use pbps_pg::{
+    Postgres,
+    drop_requirements::check,
+    input_path::{vet_conversion, vet_requirement},
+};
 
 fn guard(predicate: &str) -> DropGuard {
     DropGuard {
@@ -117,7 +121,7 @@ async fn binding(index: usize) {
     .unwrap_err();
     assert_eq!(
         udf,
-        "the row requirement of app.t calls the function `app.user_check(integer)` (owned by `postgres`), which is not built into PostgreSQL; nothing has been changed"
+        "the row requirement of app.t calls the function `app.user_check(integer)` (owned by `postgres`), which is not built into PostgreSQL and cannot be proven to run only built-in code: it has a string body (AS '...' or AS $$...$$), which the catalog keeps as text and not as a parsed tree; only a BEGIN ATOMIC or RETURN body can be proven; nothing has been changed"
     );
     assert_eq!(
         vet_requirement(
@@ -293,4 +297,137 @@ async fn partition_lock(index: usize) {
         .unwrap();
     assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
     db.drop().await;
+}
+
+/// The table-expression sites share tier 1 of #2563 with the domain sites: a
+/// row requirement and a conversion `USING` admit a function whose stored body
+/// proves built-in-only, and refuse what the proof refuses, by name.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body() {
+    use pbps_model::ColumnType;
+    for server in servers() {
+        let mut db = Scratch::create(&server, "requirements_tier1_2563").await;
+        let label = server.label;
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        db.sql(&format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t (amount integer NOT NULL, cents integer);
+             GRANT USAGE ON SCHEMA app TO {stranger};
+             CREATE FUNCTION app.positive(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             CREATE FUNCTION app.chained(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 RETURN app.positive($1) AND $1 < 1000;
+             CREATE FUNCTION app.clamped(integer) RETURNS integer LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT CASE WHEN app.chained($1) THEN $1 ELSE 0 END; END;
+             CREATE FUNCTION app.stable_check(integer) RETURNS boolean LANGUAGE sql STABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             CREATE FUNCTION app.plpgsql_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$ BEGIN RETURN $1 > 0; END $$;
+             CREATE FUNCTION app.calls_plpgsql(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT app.plpgsql_check($1); END;
+             CREATE FUNCTION app.volatile_inside(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT random() < 2 AND $1 > 0; END;
+             CREATE FUNCTION app.theirs(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             ALTER FUNCTION app.theirs(integer) OWNER TO {stranger};"
+        ))
+        .await;
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        // Admitted: alone, in a chain, and with the columns it reads reported.
+        for predicate in ["app.positive(amount)", "app.chained(cents) AND amount > 0"] {
+            let columns = vet_requirement(
+                &mut db.conn,
+                pbps_pg::pins::Within::OwnTransaction,
+                &table,
+                predicate,
+            )
+            .await
+            .unwrap_or_else(|why| panic!("{predicate} on {label}: {why}"));
+            assert!(!columns.is_empty(), "{predicate}");
+        }
+        // Refused by name, with the reason and the nested function that caused it.
+        for (predicate, identity, phrase) in [
+            (
+                "app.stable_check(amount)",
+                "app.stable_check(integer)",
+                "declared STABLE, not IMMUTABLE",
+            ),
+            (
+                "app.plpgsql_check(amount)",
+                "app.plpgsql_check(integer)",
+                "language `plpgsql`",
+            ),
+            (
+                "app.calls_plpgsql(amount)",
+                "app.calls_plpgsql(integer)",
+                "calls `app.plpgsql_check(integer)`, which is written in the language `plpgsql`",
+            ),
+        ] {
+            let why = vet_requirement(
+                &mut db.conn,
+                pbps_pg::pins::Within::OwnTransaction,
+                &table,
+                predicate,
+            )
+            .await
+            .expect_err(predicate);
+            assert!(
+                why.contains(identity) && why.contains(phrase),
+                "{predicate} on {label}: {why}"
+            );
+            assert!(why.ends_with("nothing has been changed"), "{why}");
+        }
+        // A volatile built-in inside a proven body is still a volatile call
+        // in a row requirement, which cannot hold one.
+        let why = vet_requirement(
+            &mut db.conn,
+            pbps_pg::pins::Within::OwnTransaction,
+            &table,
+            "app.volatile_inside(amount)",
+        )
+        .await
+        .expect_err("volatile inside");
+        assert!(why.contains("volatile routine"), "{why}");
+        // The owner rule, with no role declared trusted at this site.
+        let why = vet_requirement(
+            &mut db.conn,
+            pbps_pg::pins::Within::OwnTransaction,
+            &table,
+            "app.theirs(amount)",
+        )
+        .await
+        .expect_err("a stranger's function");
+        assert!(
+            why.contains("app.theirs(integer)") && why.contains(&stranger) && why.contains("owner"),
+            "on {label}: {why}"
+        );
+
+        // The same proof judges a conversion's `USING`.
+        let column = table.column("amount");
+        let integer = ColumnType::simple("integer");
+        vet_conversion(&mut db.conn, &column, &integer, "app.clamped(amount)")
+            .await
+            .unwrap_or_else(|why| panic!("a conversion on {label}: {why}"));
+        for (using, identity, phrase) in [
+            (
+                "CASE WHEN app.stable_check(amount) THEN 1 ELSE 0 END",
+                "app.stable_check(integer)",
+                "declared STABLE",
+            ),
+            (
+                "CASE WHEN app.calls_plpgsql(amount) THEN 1 ELSE 0 END",
+                "app.calls_plpgsql(integer)",
+                "language `plpgsql`",
+            ),
+        ] {
+            let why = vet_conversion(&mut db.conn, &column, &integer, using)
+                .await
+                .expect_err(using);
+            assert!(
+                why.contains(identity) && why.contains(phrase),
+                "{using} on {label}: {why}"
+            );
+        }
+        db.drop().await;
+    }
 }

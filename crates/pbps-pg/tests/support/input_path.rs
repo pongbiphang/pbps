@@ -1847,3 +1847,427 @@ async fn json_return_coercion_runs_a_domain_check_and_is_unreadable_on_postgres_
     );
     assert_eq!((before, after), (0, 1));
 }
+
+/// Tier 1 of #2563: a user function written `BEGIN ATOMIC` or `RETURN` is
+/// admitted when its stored body reaches only built-in code, and a chain of such
+/// functions is proven by recursion. Every shape the design names, on both
+/// majors: a CHECK, a DEFAULT, a user operator whose function is such a
+/// function, a chain of two, the `accept(integer)` row of #2469, and the deepest
+/// chain the bound allows.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_function_with_a_built_in_only_body_is_admitted_alone_and_in_a_chain() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gtier1").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        // The deepest chain admitted: f1 calls f2 ... calls f16, which compares.
+        let mut chain = String::from(
+            "CREATE FUNCTION app.deep16(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;",
+        );
+        for level in (1..16).rev() {
+            chain.push_str(&format!(
+                "CREATE FUNCTION app.deep{level}(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                     BEGIN ATOMIC SELECT app.deep{next}($1); END;",
+                next = level + 1
+            ));
+        }
+        run(&mut me, label, &chain).await;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.is_valid_email(text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 LIKE '%_@_%'; END;
+             CREATE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 RETURN position('@' IN $1) > 0;
+             CREATE FUNCTION app.is_valid_chain(text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT app.has_at($1) AND length($1) > 3; END;
+             CREATE FUNCTION app.accept(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             CREATE FUNCTION app.one() RETURNS integer LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT 1; END;
+             CREATE FUNCTION app.two_statements(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1; SELECT $1 > 0; END;
+             CREATE FUNCTION app.eqf(text, text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 RETURN $1 = $2;
+             CREATE OPERATOR app.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = app.eqf);
+             CREATE DOMAIN app.email AS text CHECK (app.is_valid_email(VALUE));
+             CREATE DOMAIN app.chained AS text CHECK (app.is_valid_chain(VALUE));
+             CREATE DOMAIN app.accepted AS integer CHECK (app.accept(VALUE));
+             CREATE DOMAIN app.defaulted AS integer DEFAULT app.one();
+             CREATE DOMAIN app.every_statement AS integer CHECK (app.two_statements(VALUE));
+             CREATE DOMAIN app.by_operator AS text CHECK (VALUE OPERATOR(app.===) 'x');
+             CREATE DOMAIN app.deepest AS integer CHECK (app.deep1(VALUE));",
+        )
+        .await;
+        for name in [
+            "email",
+            "chained",
+            "accepted",
+            "defaulted",
+            "every_statement",
+            "by_operator",
+            "deepest",
+        ] {
+            let path = gate(&mut me, &[], name).await;
+            assert!(
+                admitted(&path, &format!("app.{name} on {label}")),
+                "app.{name} runs the code it calls"
+            );
+        }
+        // The engine runs what was proven, and refuses what it refuses.
+        run(&mut me, label, "SELECT 'a@b'::app.email, 1::app.accepted").await;
+        for bad in ["SELECT 'plain'::app.email", "SELECT 0::app.accepted"] {
+            assert!(me.execute(bad).await.is_err(), "{bad} on {label}");
+        }
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// Everything tier 1 does not prove is refused by name with its reason, and a
+/// refusal that comes from a callee names the callee: a string body, another
+/// language, STABLE, SECURITY DEFINER, a body that is more than expressions, a
+/// type that is not built in, a call cycle, a chain one deeper than the bound,
+/// and a built-in that runs SQL.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason() {
+    struct Case {
+        name: &'static str,
+        ddl: &'static str,
+        identity: &'static str,
+        detail: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "string",
+            ddl: "CREATE FUNCTION app.f_string(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      AS $$ SELECT $1 > 0 $$",
+            identity: "app.f_string(integer)",
+            detail: "has a string body",
+        },
+        Case {
+            name: "plpgsql",
+            ddl: "CREATE FUNCTION app.f_plpgsql(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                      AS $$ BEGIN RETURN $1 > 0; END $$",
+            identity: "app.f_plpgsql(integer)",
+            detail: "is written in the language `plpgsql`",
+        },
+        Case {
+            name: "stable",
+            ddl: "CREATE FUNCTION app.f_stable(integer) RETURNS boolean LANGUAGE sql STABLE
+                      BEGIN ATOMIC SELECT $1 > 0; END",
+            identity: "app.f_stable(integer)",
+            detail: "is declared STABLE, not IMMUTABLE",
+        },
+        Case {
+            name: "volatile",
+            ddl: "CREATE FUNCTION app.f_volatile(integer) RETURNS boolean LANGUAGE sql
+                      BEGIN ATOMIC SELECT $1 > 0; END",
+            identity: "app.f_volatile(integer)",
+            detail: "is declared VOLATILE, not IMMUTABLE",
+        },
+        Case {
+            name: "definer",
+            ddl: "CREATE FUNCTION app.f_definer(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      SECURITY DEFINER BEGIN ATOMIC SELECT $1 > 0; END",
+            identity: "app.f_definer(integer)",
+            detail: "is SECURITY DEFINER",
+        },
+        Case {
+            name: "table",
+            ddl: "CREATE TABLE app.lookup(id integer);
+                  CREATE FUNCTION app.f_table(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT EXISTS (SELECT 1 FROM app.lookup WHERE id = $1); END",
+            identity: "app.f_table(integer)",
+            detail: "has a body that is not plain",
+        },
+        Case {
+            name: "user_type",
+            ddl: "CREATE TYPE app.pair AS (a integer);
+                  CREATE FUNCTION app.f_type(app.pair) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT ($1).a > 0; END",
+            identity: "app.f_type(app.pair)",
+            detail: "names a type that is not built into PostgreSQL",
+        },
+        Case {
+            name: "calls_unproven",
+            ddl: "CREATE FUNCTION app.leaf_plpgsql(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                      AS $$ BEGIN RETURN $1 > 0; END $$;
+                  CREATE FUNCTION app.f_calls(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.leaf_plpgsql($1); END",
+            identity: "app.f_calls(integer)",
+            detail: "calls `app.leaf_plpgsql(integer)`, which is written in the language `plpgsql`",
+        },
+        Case {
+            name: "calls_stable_deeper",
+            ddl: "CREATE FUNCTION app.deep_stable(integer) RETURNS boolean LANGUAGE sql STABLE
+                      BEGIN ATOMIC SELECT $1 > 0; END;
+                  CREATE FUNCTION app.mid(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.deep_stable($1); END;
+                  CREATE FUNCTION app.f_top(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.mid($1); END",
+            identity: "app.f_top(integer)",
+            detail: "calls `app.mid(integer)`, which calls `app.deep_stable(integer)`, which is declared STABLE",
+        },
+        Case {
+            name: "cycle",
+            ddl: "CREATE FUNCTION app.cyc_a(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT $1 > 0; END;
+                  CREATE FUNCTION app.cyc_b(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.cyc_a($1); END;
+                  CREATE OR REPLACE FUNCTION app.cyc_a(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.cyc_b($1); END",
+            identity: "app.cyc_a(integer)",
+            detail: "a call cycle",
+        },
+        Case {
+            name: "self_cycle",
+            ddl: "CREATE FUNCTION app.selfie(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT $1 > 0; END;
+                  CREATE OR REPLACE FUNCTION app.selfie(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT app.selfie($1 - 1); END",
+            identity: "app.selfie(integer)",
+            detail: "a call cycle",
+        },
+        Case {
+            name: "runs_sql",
+            ddl: "CREATE FUNCTION app.f_runs_sql(text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                      BEGIN ATOMIC SELECT query_to_xml($1, true, true, '') IS NOT NULL; END",
+            identity: "query_to_xml",
+            detail: "",
+        },
+    ];
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gtier1no").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        // One chain of seventeen: one deeper than the bound allows.
+        let mut chain = String::from(
+            "CREATE FUNCTION app.far17(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;",
+        );
+        for level in (1..17).rev() {
+            chain.push_str(&format!(
+                "CREATE FUNCTION app.far{level}(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                     BEGIN ATOMIC SELECT app.far{next}($1); END;",
+                next = level + 1
+            ));
+        }
+        run(&mut me, label, &chain).await;
+        run(
+            &mut me,
+            label,
+            "CREATE DOMAIN app.too_deep AS integer CHECK (app.far1(VALUE))",
+        )
+        .await;
+        let path = gate(&mut me, &[], "too_deep").await;
+        let all = refused(&path, "too_deep");
+        let hits: Vec<_> = routines(all)
+            .into_iter()
+            .filter(|r| r.identity == "app.far1(integer)")
+            .collect();
+        assert_eq!(hits.len(), 1, "{all:?}");
+        assert_eq!(hits[0].why, Why::NotBuiltin);
+        let detail = hits[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("nested more than 16 deep"),
+            "on {label}: {detail}"
+        );
+        // Naming the function where the chain broke, not only the first.
+        assert!(
+            detail.contains("app.far16(integer)"),
+            "on {label}: {detail}"
+        );
+
+        for case in &cases {
+            run(&mut me, label, case.ddl).await;
+            let domain = format!("uses_{}", case.name);
+            let check = match case.name {
+                "runs_sql" => "app.f_runs_sql(VALUE)".to_owned(),
+                _ => format!("app.f_{}(VALUE)", case.name),
+            };
+            let (ty, check) = match case.name {
+                "string"
+                | "plpgsql"
+                | "stable"
+                | "volatile"
+                | "definer"
+                | "table"
+                | "calls_unproven"
+                | "calls_stable_deeper" => ("integer", check),
+                "user_type" => ("app.pair", "app.f_type(VALUE)".to_owned()),
+                "cycle" => ("integer", "app.cyc_a(VALUE)".to_owned()),
+                "self_cycle" => ("integer", "app.selfie(VALUE)".to_owned()),
+                "runs_sql" => ("text", check),
+                other => panic!("{other}"),
+            };
+            let check = match case.name {
+                "calls_stable_deeper" => "app.f_top(VALUE)".to_owned(),
+                "calls_unproven" => "app.f_calls(VALUE)".to_owned(),
+                _ => check,
+            };
+            run(
+                &mut me,
+                label,
+                &format!("CREATE DOMAIN app.{domain} AS {ty} CHECK ({check})"),
+            )
+            .await;
+            let path = gate(&mut me, &[], &domain).await;
+            let all = refused(&path, &format!("{} on {label}", case.name));
+            let hits: Vec<_> = routines(all)
+                .into_iter()
+                .filter(|r| r.identity.contains(case.identity))
+                .collect();
+            assert_eq!(hits.len(), 1, "{} on {label}: {all:?}", case.name);
+            let hit = hits[0];
+            assert_eq!(
+                hit.why,
+                if case.name == "runs_sql" {
+                    Why::RunsSql
+                } else {
+                    Why::NotBuiltin
+                },
+                "{}",
+                case.name
+            );
+            assert!(
+                hit.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(case.detail),
+                "{} on {label}: {:?}",
+                case.name,
+                hit.detail
+            );
+            assert!(hit.used_by.ty.ends_with(&domain), "{:?}", hit.used_by);
+            // The sentence a person reads names the function and the reason.
+            let said = Reason::Routine(hit.clone()).to_string();
+            assert!(
+                said.contains(case.identity) && said.contains(case.detail),
+                "{said}"
+            );
+        }
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// The owner rule applies to a function a proof admitted: whoever can act as its
+/// owner can replace the body after the read, so an untrusted owner is named and
+/// a declared one is not, as for a type.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn the_owner_of_an_admitted_function_must_be_trusted() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gtier1owner").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        db.sql(&format!(
+            "GRANT USAGE ON SCHEMA app TO {stranger};
+             CREATE FUNCTION app.theirs(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             ALTER FUNCTION app.theirs(integer) OWNER TO {stranger};
+             CREATE DOMAIN app.uses_theirs AS integer CHECK (app.theirs(VALUE));
+             ALTER DOMAIN app.uses_theirs OWNER TO CURRENT_USER;"
+        ))
+        .await;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.mine(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             CREATE DOMAIN app.uses_mine AS integer CHECK (app.mine(VALUE));",
+        )
+        .await;
+        assert!(admitted(
+            &gate(&mut me, &[], "uses_mine").await,
+            "uses_mine"
+        ));
+        let theirs = gate(&mut me, &[], "uses_theirs").await;
+        let named: Vec<_> = refused(&theirs, "uses_theirs on a stranger's function")
+            .iter()
+            .filter_map(|r| match r {
+                Reason::RoutineOwner(o) => Some((o.identity.clone(), o.actor.raw().to_owned())),
+                Reason::Routine(_) | Reason::Owner(_) => None,
+            })
+            .collect();
+        assert!(
+            named.contains(&("app.theirs(integer)".to_owned(), stranger.clone())),
+            "on {label}: {named:?}"
+        );
+        // Declared trusted, the same function is admitted: tier 1 adds no trust.
+        let declared = gate(&mut me, &[stranger.as_str()], "uses_theirs").await;
+        assert!(admitted(&declared, "uses_theirs, declared"));
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// A function replaced between two reads is judged by the body it has at the
+/// second one: each read is of the catalog as it is, and nothing is remembered.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_function_replaced_between_two_reads_is_judged_by_its_current_body() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gtier1swap").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.leaf(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 0; END;
+             CREATE FUNCTION app.root(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT app.leaf($1); END;
+             CREATE DOMAIN app.swapped AS integer CHECK (app.root(VALUE));",
+        )
+        .await;
+        assert!(admitted(&gate(&mut me, &[], "swapped").await, "before"));
+        // The callee is replaced by code the proof cannot read.
+        for (replacement, detail) in [
+            (
+                "CREATE OR REPLACE FUNCTION app.leaf(integer) RETURNS boolean LANGUAGE plpgsql
+                     IMMUTABLE AS $$ BEGIN RETURN true; END $$",
+                "language `plpgsql`",
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION app.leaf(integer) RETURNS boolean LANGUAGE sql
+                     IMMUTABLE AS $$ SELECT true $$",
+                "string body",
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION app.leaf(integer) RETURNS boolean LANGUAGE sql
+                     STABLE BEGIN ATOMIC SELECT $1 > 0; END",
+                "declared STABLE",
+            ),
+        ] {
+            run(&mut me, label, replacement).await;
+            let path = gate(&mut me, &[], "swapped").await;
+            let all = refused(&path, "after the replacement");
+            let hit = routines(all)
+                .into_iter()
+                .find(|r| r.identity == "app.root(integer)")
+                .unwrap_or_else(|| panic!("{all:?}"));
+            let said = hit.detail.as_deref().unwrap_or_default();
+            assert!(
+                said.contains("app.leaf(integer)") && said.contains(detail),
+                "{said}"
+            );
+        }
+        // Replaced back by a body that proves, it is admitted again.
+        run(
+            &mut me,
+            label,
+            "CREATE OR REPLACE FUNCTION app.leaf(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 BEGIN ATOMIC SELECT $1 > 1; END",
+        )
+        .await;
+        assert!(admitted(&gate(&mut me, &[], "swapped").await, "restored"));
+        drop(me);
+        db.drop().await;
+    }
+}

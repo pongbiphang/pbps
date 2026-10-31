@@ -4153,3 +4153,73 @@ conversions remain unsupported. Shared lowering attaches guards on prepared and
 ordinary routes, refuses staged/empty guarded emission, and shares the count
 refusal with PostgreSQL. Export and unframed consumers still refuse. The AST
 is ephemeral: schema set 74, identity v1 and state v35 are unchanged.
+
+<a id="dec-2563-1"></a>
+
+**DEC-2563.1. A user function whose stored body provably reaches only built-in code is admitted by the built-in-only decoder (PostgreSQL, tier 1).**
+(#2563, slice 1; the first of three tiers of the design that #2046 left for a
+later issue. Tiers 2 and 3 follow in later slices.) DEC-1635.4's decoder refused
+every function a role wrote, because it could run anything. A `LANGUAGE sql`
+function written `BEGIN ATOMIC` or `RETURN` is different in kind: PostgreSQL
+stores its body parsed, in `pg_proc.prosqlbody`, in the node format of `conbin`.
+The same decoder therefore proves the body, and a body that calls another such
+function is proven by recursion. A function it admits runs only built-in code,
+which is what the proof already admitted, so nothing new is trusted, recorded or
+pinned and no format changes.
+
+One mechanism serves every vetting site. Both the type walk (domain CHECK and
+DEFAULT at creation, an `ADD COLUMN`, an external reference) and the
+table-expression sites (a conversion's `USING`, a row requirement, a copy
+conversion) call the same step on the trees they decoded. It appends each
+admitted function's body, under the use that reaches it, to the list those sites
+already judge. The `RUNS_SQL` list, owner trust, volatility and user types then
+apply to the bodies as to the expression; no second path judges a body.
+
+A function is admitted only when all of these hold, and each refusal names the
+function and the reason (string body, language, volatility, `SECURITY DEFINER`,
+the shape or a type of the body or signature, a call cycle, depth, or a callee
+refused for one of these, by name):
+
+- `LANGUAGE sql` with a non-null `prosqlbody`. A string body (`AS $$...$$`) is
+  text the catalog does not parse and stays refused, as plpgsql, C and every
+  other language do;
+- `IMMUTABLE`, a plain function, not `SECURITY DEFINER`, with no planner support
+  function and no OUT parameter;
+- its argument and return types, and every type its body names, are built in.
+  The executor coerces the result to the declared return type and a user type
+  would bring its casts and its domain CHECKs, which no node of the body names;
+- its body is a list of plain `SELECT` target lists over no relation. A table,
+  view, CTE or subquery brings row security, rules and view bodies that no node
+  of the `Query` names, so every other part of a `Query` must be empty. The rule
+  is "empty unless listed", so a field a later release adds can only refuse;
+- everything its body calls, including the function an operator runs and the
+  comparison function of a row comparison, is built in or proven the same way.
+
+Recursion is bounded: a chain of more than 16 user functions is refused, naming
+the function at the limit, and so is an expression that reaches more than 1,000.
+A cycle (`CREATE OR REPLACE` lets `a` call `b` and `b` call the old `a`, or a
+function call itself) refuses every function on it and every caller of it.
+Absent, empty and unreadable are three answers: a missing `pg_proc` row is a
+failed read; an empty body (`BEGIN ATOMIC END`) calls nothing and is admitted; a
+body the decoder cannot read is a refusal and never "no calls".
+
+Every function is read in the caller's transaction, a level at a time, so a
+function replaced between plan and apply is vetted as it is then. Tier 1 adds no
+trust: whoever owns an admitted function can still replace it after the read,
+which the existing owner rule covers for every routine on the path, so an
+untrusted owner is named and a declared one is not. The table-expression sites
+have no declared roles, so there the engine's own rule (a superuser, or a role
+that can `SET ROLE` to the deployer or to a superuser) decides. A user function
+still refused here keeps `Why::NotBuiltin`, so `pin_type_routines` still pins
+it as a root, unchanged (DEC-2181.2).
+
+Tests: `a_function_with_a_built_in_only_body_is_admitted_alone_and_in_a_chain`,
+`a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason`,
+`the_owner_of_an_admitted_function_must_be_trusted`,
+`a_function_replaced_between_two_reads_is_judged_by_its_current_body` and
+`requirements_and_conversions_admit_a_function_with_a_built_in_only_body` on
+16 and 18; `domains_over_built_in_only_function_bodies_are_vetted_and_applied`
+and `a_function_replaced_between_plan_and_apply_is_vetted_as_replaced` through
+plan and apply; and the unit tests over trees captured from both majors in
+`resolver/capture/body_tests.rs` and `input_path/body.rs`. The `AS $$` form of
+the earlier refusal fixtures stays refused.
