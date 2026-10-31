@@ -893,6 +893,193 @@ fn parent<'a>(x: &'a str) { let c = '}'; { real(x); } }
             self.assertEqual(listings[1], {'renamed::nested_case', 'conditional::platform_case', 'conditional_ignore'})
 
 
+class RuleOwnership(unittest.TestCase):
+    def setUp(self):
+        Ownership.setUp(self)
+        self.inventory["groups"][0]["cases"] = ["scope::owned"]
+        self.targets[KEY] = {"all": {"scope::owned", "ordinary"}, "ignored": {"scope::owned"}}
+        self.rules = {"version": 1, "rules": [
+            {"target": list(KEY), "prefix": "scope::", "owner": "live"}]}
+
+    def check(self, platform="linux"):
+        return audit.validate(self.root, self.inventory, self.targets, platform, self.rules)
+
+    def add_case(self, name):
+        self.targets[KEY]["all"].add(name)
+        self.targets[KEY]["ignored"].add(name)
+
+    def test_a_rule_only_case_has_the_same_ci_selector_audit(self):
+        self.inventory["groups"] = []
+        self.assertEqual(self.check(), 1)
+
+    def test_windows_only_case_in_a_linux_rule_needs_owner_platform_evidence(self):
+        # Linux sees only the existing case; Windows additionally compiles the
+        # cfg(windows) case. A namespace cannot join those discovery results.
+        self.assertEqual(self.check("linux"), 1)
+        self.add_case("scope::windows_only")
+        with self.assertRaisesRegex(audit.InventoryError,
+                                   "scope::windows_only.*win32.*cannot be verified.*platform linux;.*"
+                                   "exact legacy entry.*runs on win32"):
+            self.check("win32")
+
+    def test_a_legacy_backed_linux_rule_case_can_be_discovered_on_both_platforms(self):
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self.check(platform), 1)
+
+    def test_legacy_evidence_still_requires_discovery_on_the_owner_platform(self):
+        self.assertEqual(self.check("win32"), 1)
+        self.targets[KEY]["all"].clear()
+        self.targets[KEY]["ignored"].clear()
+        with self.assertRaisesRegex(audit.InventoryError, "stale case/target mapping"):
+            self.check("linux")
+
+    def test_a_windows_owned_rule_can_run_its_windows_only_case(self):
+        self.inventory["groups"] = []
+        self.inventory["owners"]["live"]["platform"] = "win32"
+        self.workflow.write_text(WORKFLOW.replace("ubuntu-latest", "windows-latest"))
+        self.targets[KEY] = {"all": {"ordinary"}, "ignored": set()}
+        # The rule is a declared owner reference, as an absent-on-Linux legacy
+        # group was. Its own platform remains responsible for a nonempty match.
+        self.assertEqual(self.check("linux"), 0)
+        self.add_case("scope::windows_only")
+        self.assertEqual(self.check("win32"), 1)
+
+    def test_rule_only_cases_use_the_existing_existence_check(self):
+        self.inventory["groups"] = []
+        self.targets[KEY]["all"].remove("scope::owned")
+        with self.assertRaisesRegex(audit.InventoryError, "stale case/target mapping"):
+            self.check()
+
+    def test_rule_only_cases_cannot_be_assigned_to_an_ordinary_runner(self):
+        self.inventory["groups"] = []
+        self.inventory["owners"]["live"]["ordinary"] = True
+        self.workflow.write_text(WORKFLOW.replace(
+            "cargo test -p demo --lib -- --ignored", "cargo test --workspace --all-targets"))
+        with self.assertRaisesRegex(audit.InventoryError, "ordinary runner skips ignored"):
+            self.check()
+
+    def test_legacy_only_cases_remain_owned(self):
+        self.rules["rules"] = []
+        self.assertEqual(self.check(), 1)
+
+    def test_agreeing_rule_and_legacy_entries_own_a_case_once(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_independent_additions_under_a_rule_need_no_registry_edit(self):
+        before = copy.deepcopy((self.inventory, self.rules))
+        self.add_case("scope::first_branch::new_case")
+        self.add_case("scope::second_branch::new_case")
+        self.assertEqual(self.check(), 3)
+        self.assertEqual((self.inventory, self.rules), before)
+
+    def test_an_uncovered_case_names_the_module_rule_to_add(self):
+        self.add_case("uncovered::new_case")
+        with self.assertRaisesRegex(audit.InventoryError,
+                                   "no execution owner:.*uncovered::new_case.*prefix='uncovered::'"):
+            self.check()
+
+    def test_overlapping_rules_are_ambiguous_even_with_the_same_owner(self):
+        self.add_case("scope::nested::owned")
+        # Both rules still match a case if uniqueness is removed: first choose
+        # the nested rule, then the broad rule for scope::owned.
+        self.rules["rules"].insert(0, {"target": list(KEY), "prefix": "scope::nested::", "owner": "live"})
+        for rules in (self.rules["rules"], list(reversed(self.rules["rules"]))):
+            self.rules["rules"] = rules
+            with self.assertRaisesRegex(audit.InventoryError, "ambiguous ownership rules.*scope::nested::owned"):
+                self.check()
+
+    def test_a_rule_matching_nothing_is_refused_on_its_owner_platform(self):
+        self.rules["rules"][0]["prefix"] = "absent::"
+        with self.assertRaisesRegex(audit.InventoryError, "ownership rule matches no cases:.*absent::"):
+            self.check()
+        self.assertEqual(self.check("win32"), 1)
+
+    def test_rule_and_legacy_owner_disagreement_names_the_case(self):
+        self.inventory["owners"]["other"] = copy.deepcopy(self.inventory["owners"]["live"])
+        self.rules["rules"][0]["owner"] = "other"
+        with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*scope::owned"):
+            self.check()
+
+    def test_the_owner_selector_must_cover_the_rule_and_legacy_union(self):
+        self.add_case("scope::not_selected")
+        self.workflow.write_text(WORKFLOW.replace("--ignored", "--ignored --exact scope::owned"))
+        with self.assertRaisesRegex(audit.InventoryError, "CI no longer executes scope::not_selected"):
+            self.check()
+
+    def test_a_rule_does_not_claim_the_same_name_in_another_target(self):
+        self.targets[("demo", "test", "elsewhere")] = {
+            "all": {"scope::owned"}, "ignored": {"scope::owned"}}
+        with self.assertRaisesRegex(audit.InventoryError, "no execution owner:.*elsewhere"):
+            self.check()
+
+    def test_prefixes_stop_at_module_boundaries(self):
+        for prefix in ("scope", "scope:", "scope::::", "scope::*::"):
+            with self.subTest(prefix=prefix):
+                self.rules["rules"][0]["prefix"] = prefix
+                with self.assertRaisesRegex(audit.InventoryError, "module boundary"):
+                    self.check()
+        self.rules["rules"][0]["prefix"] = "scope::"
+        self.add_case("scope_neighbor::new_case")
+        with self.assertRaisesRegex(audit.InventoryError, "no execution owner:.*scope_neighbor"):
+            self.check()
+
+    def test_empty_prefix_owns_a_uniform_target(self):
+        self.rules["rules"][0]["prefix"] = ""
+        self.add_case("new_root_case")
+        self.assertEqual(self.check(), 2)
+
+    def test_rules_cannot_bypass_legacy_staleness_ignore_or_duplicate_checks(self):
+        for mutation, message in (
+            (lambda: self.targets[KEY]["all"].clear(), "stale case/target"),
+            (lambda: self.targets[KEY]["ignored"].clear(), "changed ignore condition"),
+            (lambda: self.inventory["groups"].append(copy.deepcopy(self.inventory["groups"][0])), "duplicate case mapping"),
+        ):
+            old = copy.deepcopy((self.inventory, self.targets))
+            with self.subTest(message=message):
+                mutation()
+                with self.assertRaisesRegex(audit.InventoryError, message):
+                    self.check()
+            self.inventory, self.targets = old
+
+    def test_python_driven_and_nested_child_owners_stay_legacy_only(self):
+        for key, value in (("script", "fixture.py"), ("selection", {}), ("parent", "ordinary")):
+            with self.subTest(key=key):
+                self.inventory["owners"]["live"][key] = value
+                with self.assertRaisesRegex(audit.InventoryError, "require legacy exact entries"):
+                    self.check()
+                del self.inventory["owners"]["live"][key]
+
+    def test_invalid_rules_fail_closed(self):
+        for mutation, message in (
+            (lambda r: r.update(version=2), "unsupported ownership rules version"),
+            (lambda r: r.update(rules={}), "must be a list"),
+            (lambda r: r["rules"][0].update(extra=True), "invalid ownership rule"),
+            (lambda r: r["rules"][0].update(target=["demo"]), "invalid rule target"),
+            (lambda r: r["rules"][0].update(owner="missing"), "unknown rule owner"),
+        ):
+            old = copy.deepcopy(self.rules)
+            with self.subTest(message=message):
+                mutation(self.rules)
+                with self.assertRaisesRegex(audit.InventoryError, message):
+                    self.check()
+            self.rules = old
+
+    def test_current_rules_preserve_every_legacy_owner(self):
+        root = Path(__file__).resolve().parents[1]
+        inventory = json.loads((root / "scripts/ignored-test-owners.json").read_text())
+        rules = json.loads((root / "scripts/ignored-test-rules.json").read_text())
+        legacy = {(*group["target"], name): group["owner"]
+                  for group in inventory["groups"] for name in group["cases"]}
+        assigned = audit.rule_assignments(inventory["owners"], rules, legacy, "linux")
+        self.assertTrue(assigned)
+        self.assertEqual(legacy | assigned, legacy)
+        exact_only = {owner for owner, details in inventory["owners"].items()
+                      if any(key in details for key in ("script", "selection", "parent"))}
+        self.assertFalse(exact_only.intersection(assigned.values()))
+        self.assertTrue(legacy.keys() - assigned.keys())
+
+
 class DeploymentServiceOwnership(unittest.TestCase):
     def test_unconditionally_ignored_service_cases_are_registered_on_every_platform(self):
         root = Path(__file__).resolve().parents[1]

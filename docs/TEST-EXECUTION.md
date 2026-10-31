@@ -1,8 +1,9 @@
 # Ignored-test execution ownership
 
 An ignored test can compile forever without being selected by a fixture.
-`scripts/ignored-test-owners.json` records the crate, target, exact case name,
-execution platform, fixture prerequisites and scheduling owner for these cases.
+`scripts/ignored-test-rules.json` assigns target/module namespaces to execution
+owners. The additive migration keeps `scripts/ignored-test-owners.json` as exact
+legacy fallback and as the owner/fixture/platform definitions (DEC-2562.1).
 The Linux quick job and Windows job check the inventory after their ordinary
 workspace tests. The checker requires Python 3.11 or newer and the project Rust
 toolchain on `PATH`. Run the same checks locally:
@@ -159,10 +160,35 @@ portable successful mutation control. Run the integrated suite on actual
 
 ## Maintaining the inventory
 
-- Add a newly ignored case's fully qualified libtest name to the correct target
-  and owner group. The checker reports the tuple for an unowned case. Register
-  a new owner if no existing invocation can execute it; do not assign a case to
-  a convenient but unrelated fixture.
+- A newly ignored case discovered on its owner's platform in a covered
+  target/module needs no registry edit. Otherwise add a rule in
+  `scripts/ignored-test-rules.json`: `target` is the
+  existing `[crate, kind, name]` tuple, `prefix` is a module path ending in `::`,
+  and `owner` is an existing execution-owner key. An empty prefix covers a whole
+  target only when its ownership is uniform. Prefixes are literal namespaces,
+  not case-name patterns. Every case must match at most one rule, including when
+  overlapping rules name the same owner; there is no longest-prefix priority.
+- Legacy exact entries remain valid, and agreement is required when a rule also
+  covers one. Existing ignore/platform conditions stay authoritative. Mixed root
+  cases and unsplittable mixed modules retain their legacy fallback during this
+  additive migration; existing tests need not move. Put new cases that need a
+  distinct owner in an owned module. Python-driven and nested-child owners keep
+  exact entries and their existing selector/witness proofs.
+- A rule-only case must be discovered on its owner's job platform. A namespace
+  cannot prove that a case discovered elsewhere also compiles there. On another
+  platform, retain an exact legacy entry with the right owner, whose existence
+  is checked on `validate_on`, or use a rule for an owner that runs locally.
+  Rule-only and legacy cases use the same existence/ignore-condition checks and
+  selector audit. Cleanup must retain entries needed for cross-platform existence
+  evidence. Rules do not replace fixture scheduling evidence. A rule matching no
+  known case fails on its owner's discovery platform, where cfg availability is
+  authoritative.
+  Other-platform absence does not prove a dead rule. The checker reports migration
+  equivalence and coverage counts; the migration test compares every legacy owner
+  with the rule-plus-fallback assignment. Later cleanup may remove covered exact
+  entries independently. Current PRs may still append exact entries unchanged.
+- Register a new owner if no existing invocation can execute a case; do not assign
+  a case to a convenient but unrelated fixture.
 - `validate_on` is the platform where the owner compiles and executes the case.
   On that platform a removed name or target fails. On every checked platform,
   newly discovered ignored cases must be registered, and present cases must
