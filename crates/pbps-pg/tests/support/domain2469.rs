@@ -290,3 +290,83 @@ async fn scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks
     assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(11));
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn split_derived_defaults_override_temporary_inheritance() {
+    let f = Fixture::split_defaults(true);
+    let mut db = TestDb::create("domain2469_split_defaults").await;
+    db.conn.execute("CREATE SCHEMA c2469").await.unwrap();
+    let pg = engine(&mut db).await;
+    let why = Fixture::split_defaults(false).compile(&pg).unwrap_err();
+    assert!(
+        why.contains("cycle") || why.contains("wait on one another"),
+        "{why}"
+    );
+    db.conn.execute("BEGIN").await.unwrap();
+    apply(&mut db, &f, &pg, PlanMode::Transactional, false).await;
+    db.conn.execute("CREATE TABLE c2469.default_values(a c2469.d, b c2469.child); INSERT INTO c2469.default_values DEFAULT VALUES").await.unwrap();
+    let rows = db
+        .conn
+        .query("SELECT a::integer AS a,b::integer AS b FROM c2469.default_values")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(7));
+    assert_eq!(rows[0].try_get::<i32>("b").unwrap(), Some(11));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.conn
+        .execute("DROP SCHEMA c2469 CASCADE; CREATE SCHEMA c2469")
+        .await
+        .unwrap();
+    let input = f.bootstrap(&pg).unwrap();
+    let mut scratch =
+        pbps_pg::resolver::reconstruct::Reconstruction::new(&pg, &input, &f.ids).unwrap();
+    scratch
+        .compile(&pg, &pbps_model::SessionZone::utc(), &mut db.conn)
+        .await
+        .unwrap();
+    db.conn.execute("CREATE TABLE c2469.default_values(a c2469.d, b c2469.child); INSERT INTO c2469.default_values DEFAULT VALUES").await.unwrap();
+    let rows = db
+        .conn
+        .query("SELECT a::integer AS a,b::integer AS b FROM c2469.default_values")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(7));
+    assert_eq!(rows[0].try_get::<i32>("b").unwrap(), Some(11));
+    db.conn
+        .execute("DROP SCHEMA c2469 CASCADE; CREATE SCHEMA c2469")
+        .await
+        .unwrap();
+    let mut inherited = Fixture::split_defaults(false);
+    inherited.deps.0[1].1 = ["type::c2469.d".parse().unwrap()].into();
+    inherited.schema.modules = Fixture::new("default", false).schema.modules;
+    for f in [inherited, Fixture::split_shadowing_default()] {
+        let plan = f
+            .compile(&pg)
+            .unwrap()
+            .ordered(PlanMode::Transactional, &pg);
+        let lowered = lower_all(&plan as &dyn pbps_diff::order::PlanView<Postgres>, &pg).unwrap();
+        // Existing implicit-default catalog policy is unchanged. This control
+        // executes certified SQL to measure the actual inherited snapshot.
+        for statement in lowered.iter() {
+            db.conn.execute(&statement.sql).await.unwrap();
+        }
+        let (ty, wanted) = if f.schema.types.len() == 3 {
+            ("c2469.leaf", 11)
+        } else {
+            ("c2469.child", 7)
+        };
+        db.conn.execute(&format!("CREATE TABLE c2469.inherited_values(v {ty}); INSERT INTO c2469.inherited_values DEFAULT VALUES")).await.unwrap();
+        let rows = db
+            .conn
+            .query("SELECT v::integer AS value FROM c2469.inherited_values")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(wanted));
+        db.conn
+            .execute("DROP SCHEMA c2469 CASCADE; CREATE SCHEMA c2469")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}

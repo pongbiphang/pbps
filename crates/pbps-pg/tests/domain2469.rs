@@ -560,3 +560,122 @@ fn an_explicit_intermediate_domain_default_shadows_ancestor_prerequisites() {
         .unwrap();
     assert!(child < default);
 }
+
+#[test]
+fn deferred_explicit_domain_defaults_do_not_require_a_temporary_inherited_copy() {
+    for version in [160015, 180006] {
+        let pg = Postgres::new().with_server_version(version);
+        let f = Fixture::split_defaults(true);
+        let plan = f.compile(&pg).unwrap();
+        let changes = &plan.changes().changes;
+        let created: Vec<_> = changes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if let Change::CreateType { definition, .. } = &p.change {
+                    assert!(matches!(
+                        definition.as_ref(),
+                        ManagedType::Domain { default: None, .. }
+                    ));
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let function = changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .unwrap();
+        let defaults: Vec<_> = changes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                matches!(
+                    p.change,
+                    Change::AlterDomain {
+                        half: DomainHalf::Loosen,
+                        ..
+                    }
+                )
+                .then_some(i)
+            })
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_eq!(defaults.len(), 2);
+        assert!(created[0] < created[1] && created[1] < function);
+        assert!(defaults.iter().all(|i| function < *i));
+        let mut record = Declared::default();
+        record.advance(plan.changes());
+        assert_eq!(record.types, f.schema.types);
+        // A final declaration alone cannot stand in for a missing installer.
+        let mut missing = plan.changes().clone();
+        missing.changes.retain(|p| !matches!(&p.change,Change::AlterDomain{name,..} if name==&"c2469.child".parse().unwrap()));
+        let parts = &missing.changes;
+        let base_default = parts
+            .iter()
+            .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+            .unwrap();
+        let child = parts.iter().position(|p|matches!(&p.change,Change::CreateType{name,..} if name==&"c2469.child".parse().unwrap())).unwrap();
+        let edges =
+            pbps_diff::order::generated::constraints(&missing, &f.schema, &Default::default(), &pg);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.before == base_default && edge.after == child)
+        );
+        let why = Fixture::split_defaults(false).compile(&pg).unwrap_err();
+        assert!(
+            why.contains("cycle") || why.contains("wait on one another"),
+            "{why}"
+        );
+        let mut inherited = Fixture::split_defaults(false);
+        inherited.deps.0[1].1 = ["type::c2469.d".parse().unwrap()].into();
+        inherited.schema.modules = Fixture::new("default", false).schema.modules;
+        let plan = inherited.compile(&pg).unwrap();
+        let parts = &plan.changes().changes;
+        let default = parts
+            .iter()
+            .position(|p| matches!(p.change, Change::AlterDomain { .. }))
+            .unwrap();
+        let child=parts.iter().position(|p|matches!(&p.change,Change::CreateType{name,..} if name==&"c2469.child".parse().unwrap())).unwrap();
+        assert!(default < child);
+    }
+}
+
+#[test]
+fn a_deferred_middle_default_shadows_deeper_defaults_but_precedes_its_copy() {
+    let pg = Postgres::new();
+    let f = Fixture::split_shadowing_default();
+    let plan = f.compile(&pg).unwrap();
+    let parts = &plan.changes().changes;
+    let position = |wanted: &str, create: bool| {
+        parts
+            .iter()
+            .position(|p| {
+                matches!(&p.change, Change::CreateType { name, .. } if create && name == &wanted.parse().unwrap())
+                    || matches!(&p.change, Change::AlterDomain { name, .. } if !create && name == &wanted.parse().unwrap())
+            })
+            .unwrap()
+    };
+    let middle = position("c2469.child", false);
+    let leaf = position("c2469.leaf", true);
+    let root = position("c2469.d", false);
+    assert!(middle < leaf && leaf < root);
+    let edges = pbps_diff::order::generated::constraints(
+        plan.changes(),
+        &f.schema,
+        &Default::default(),
+        &pg,
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge.before == middle && edge.after == leaf)
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|edge| edge.before == root && edge.after == leaf)
+    );
+}

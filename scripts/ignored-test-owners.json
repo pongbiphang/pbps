@@ -2283,7 +2283,8 @@
         "creation2469::generated_complete_shape_is_version_gated_before_any_sql",
         "domain2469::domain_check_uses_the_bare_type_before_its_function_and_enforces_values",
         "domain2469::domain_facets_keep_vetted_intermediates_authored_text_and_execution_modes",
-        "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks"
+        "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks",
+        "domain2469::split_derived_defaults_override_temporary_inheritance"
       ]
     },
     {
