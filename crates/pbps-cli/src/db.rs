@@ -31,9 +31,46 @@ pub struct Target {
     /// have to come from the same `pbps.yml`. Resolved once in [`target`],
     /// where the project is already in hand.
     driver: pbps_db::Driver,
+    infrastructure_roles: Vec<pbps_model::RoleName>,
+}
+
+/// The same unmanaged policy, excluding only identities provisioned by an
+/// owned run. Ordinary deployment targets always have an empty exclusion set.
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogPolicy<'a> {
+    pub unmanaged: pbps_config::Unmanaged,
+    pub infrastructure_roles: &'a [pbps_model::RoleName],
+}
+impl From<pbps_config::Unmanaged> for CatalogPolicy<'_> {
+    fn from(unmanaged: pbps_config::Unmanaged) -> Self {
+        Self {
+            unmanaged,
+            infrastructure_roles: &[],
+        }
+    }
 }
 
 impl Target {
+    pub(crate) fn test_owned(
+        connection: String,
+        infrastructure_roles: Vec<pbps_model::RoleName>,
+    ) -> Self {
+        Self {
+            label: "owned test scratch".into(),
+            connection,
+            environment: Some("test".into()),
+            driver: pbps_db::Driver::Postgres,
+            infrastructure_roles,
+        }
+    }
+
+    pub(crate) fn catalog_policy(&self, unmanaged: pbps_config::Unmanaged) -> CatalogPolicy<'_> {
+        CatalogPolicy {
+            unmanaged,
+            infrastructure_roles: &self.infrastructure_roles,
+        }
+    }
+
     pub fn connection(&self) -> &str {
         &self.connection
     }
@@ -75,12 +112,14 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
             connection: conn.to_owned(),
             environment: None,
             driver: driver_for(project.config.dialect),
+            infrastructure_roles: Vec::new(),
         }),
         (None, Some(name)) => Ok(Target {
             label: name.to_owned(),
             connection: project.connection_string(name)?,
             environment: Some(name.to_owned()),
             driver: driver_for(project.config.dialect),
+            infrastructure_roles: Vec::new(),
         }),
         (None, None) => bail!(
             "this command needs a database: pass --db {} or --env {}",
@@ -107,6 +146,7 @@ pub fn target_from_connection(connection: &str, driver: pbps_db::Driver) -> Targ
         // only thing that knows which engine this plan was computed for is the
         // plan, and `explain` resolves it from there before building a target.
         driver,
+        infrastructure_roles: Vec::new(),
     }
 }
 

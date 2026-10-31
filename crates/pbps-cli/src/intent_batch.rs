@@ -198,7 +198,7 @@ mod tests {
         let crate::Command::Intent(args) = cli.command else {
             panic!("wrong command")
         };
-        args
+        *args
     }
 
     fn unread() -> Result<Reason, String> {

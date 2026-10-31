@@ -41,6 +41,11 @@ pub(crate) enum Error {
     Runtime(String),
     #[error("the scratch could not be started: {0}")]
     Start(String),
+    #[error("the scratch could not be started: {cause}; {cleanup}")]
+    StartCleanup {
+        cause: String,
+        cleanup: Box<CleanupFailure>,
+    },
 }
 
 /// Why a run's resources could not be confirmed gone.
@@ -84,6 +89,8 @@ impl std::fmt::Display for CleanupFailure {
     }
 }
 
+impl std::error::Error for CleanupFailure {}
+
 /// The per-user directory of run records, created private on first use;
 /// `var` reads the environment (`std::env::var_os`).
 pub(crate) fn state_dir(
@@ -100,6 +107,21 @@ pub(crate) async fn recover(
 ) -> Result<Reconciliation, Error> {
     let daemon = discovered(deadline, runtime::current()).await?;
     reconcile::reconcile(dir, &Docker, &daemon, deadline).await
+}
+
+async fn bounded_start(
+    start: impl std::future::Future<Output = Result<Held, ProduceError>>,
+    deadline: tokio::time::Instant,
+    cancelled: impl std::future::Future<Output = std::io::Result<()>>,
+    name: &str,
+) -> Result<Held, ProduceError> {
+    let interrupted = |cause: &str| {
+        ProduceError::Cleanup(vec![format!("{cause}; unresolved creation of {name}")])
+    };
+    tokio::select! {
+        result = tokio::time::timeout_at(deadline, start) => result.unwrap_or_else(|_| Err(interrupted("test startup deadline exceeded"))),
+        _ = cancelled => Err(interrupted("test startup cancelled")),
+    }
 }
 
 /// The runtime's identity, bounded by the same deadline as the cleanup it serves.
@@ -127,6 +149,23 @@ async fn settle_failed_start(
     if let ProduceError::Cleanup(names) = error
         && record.container.id.is_none()
     {
+        // The before-create record proves a request may have reached the daemon.
+        // Without it, creation was never issued and ordinary cleanup suffices.
+        if dir
+            .read(&record.run_id)
+            .map_err(|e| {
+                failure(
+                    dir,
+                    &record.run_id,
+                    FailureKind::Unprovable,
+                    Vec::new(),
+                    e.to_string(),
+                )
+            })?
+            .is_none()
+        {
+            return remove_run(dir, record, rt).await;
+        }
         let mut kept = record.clone();
         kept.leftovers.clone_from(names);
         let note = "the start's own removal was not confirmed";
@@ -233,10 +272,32 @@ impl<'d> TestScratch<'d> {
         image: &str,
         pull: PullPolicy,
     ) -> Result<TestScratch<'d>, Error> {
+        Self::start_bounded(
+            dir,
+            driver,
+            image,
+            pull,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_bounded(
+        dir: &'d StateDir,
+        driver: Driver,
+        image: &str,
+        pull: PullPolicy,
+        deadline: Option<tokio::time::Instant>,
+        cleanup_allowance: std::time::Duration,
+    ) -> Result<TestScratch<'d>, Error> {
         let run_id = record::new_run_id();
-        let daemon = runtime::current()
-            .await
-            .map_err(|f| Error::Runtime(f.to_string()))?;
+        let daemon = match deadline {
+            Some(end) => discovered(end.into_std(), runtime::current()).await?,
+            None => runtime::current()
+                .await
+                .map_err(|f| Error::Runtime(f.to_string()))?,
+        };
         let engine = match driver {
             Driver::Postgres => "postgres",
             Driver::Mssql => "mssql",
@@ -272,25 +333,42 @@ impl<'d> TestScratch<'d> {
             record,
             _lock: lock,
         };
-        match Held::start_owned(
-            driver,
-            image,
-            pull,
-            &mut RunOwner {
-                journal: &mut journal,
-            },
-        )
-        .await
-        {
+        let resource = journal.record.container.name.clone();
+        let mut owner = RunOwner {
+            journal: &mut journal,
+        };
+        let start = Held::start_owned(driver, image, pull, &mut owner);
+        let started = if let Some(deadline) = deadline {
+            bounded_start(start, deadline, tokio::signal::ctrl_c(), &resource).await
+        } else {
+            start.await
+        };
+        match started {
             Ok(held) => Ok(TestScratch { held, journal }),
             Err(error) => {
                 // A start that failed leaves a record; it is deleted only once
                 // the runtime confirms nothing of the run exists.
-                let cleaned = settle_failed_start(dir, &journal.record, &error, &Docker).await;
-                Err(Error::Start(match cleaned {
-                    Ok(()) => error.to_string(),
-                    Err(unconfirmed) => format!("{error}; {unconfirmed}"),
-                }))
+                let cleaned = tokio::time::timeout(
+                    cleanup_allowance,
+                    settle_failed_start(dir, &journal.record, &error, &Docker),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(failure(
+                        dir,
+                        &run_id,
+                        FailureKind::TimedOut,
+                        Vec::new(),
+                        "startup cleanup exceeded its deadline".into(),
+                    ))
+                });
+                match cleaned {
+                    Ok(()) => Err(Error::Start(error.to_string())),
+                    Err(cleanup) => Err(Error::StartCleanup {
+                        cause: error.to_string(),
+                        cleanup: Box::new(cleanup),
+                    }),
+                }
             }
         }
     }
@@ -298,6 +376,61 @@ impl<'d> TestScratch<'d> {
     /// The superuser connection to the owned server.
     pub(crate) fn connection(&self) -> &str {
         self.held.connection()
+    }
+
+    /// The existing journal owns this private file too; normal and dead-owner
+    /// removal both delete it only after resource absence has been confirmed.
+    pub(crate) fn fingerprint_key(&self) -> Result<std::path::PathBuf, Error> {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        let path = self.journal.dir.file(self.run_id(), "key");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|e| Error::State(e.to_string()))?;
+        let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>());
+        file.write_all(key.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| Error::State(e.to_string()))?;
+        Ok(path)
+    }
+
+    pub(crate) async fn acquired_image(&self) -> Result<String, Error> {
+        let id = self
+            .journal
+            .record
+            .container
+            .id
+            .as_deref()
+            .ok_or_else(|| Error::State("the started container has no recorded id".into()))?;
+        let found = Docker
+            .inspect(id)
+            .await
+            .map_err(|f| Error::Runtime(f.to_string()))?
+            .ok_or_else(|| Error::State("the owned container disappeared".into()))?;
+        ours(&self.journal.record, &found).map_err(Error::State)?;
+        let image = pbps_cli::resolver::server::scratch::container::docker(&[
+            "inspect",
+            "--format",
+            "{{.Image}}",
+            id,
+        ])
+        .await
+        .map_err(Error::Runtime)?;
+        // Docker includes the algorithm prefix; Podman reports the same digest bare.
+        let image = image.trim().strip_prefix("sha256:").unwrap_or(image.trim());
+        if image.len() != 64 || !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Runtime(
+                "the acquired image identity is unreadable".into(),
+            ));
+        }
+        Ok(format!("sha256:{image}"))
     }
 
     pub(crate) fn run_id(&self) -> &str {

@@ -35,6 +35,14 @@ use crate::db::{self, Target};
 mod checkout;
 mod guard;
 mod services;
+#[cfg_attr(
+    any(not(test), not(target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "#1165 D2b consumes the owned adapter; only Linux builds its lifecycle tests"
+    )
+)]
+pub(crate) mod test_run;
 
 use services::{Attempt, apply_identified};
 pub(crate) use services::{cmd_bootstrap, cmd_plan_db};
@@ -119,7 +127,7 @@ async fn managed_state(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
@@ -140,7 +148,7 @@ struct ManagedRead<'a> {
     ids: &'a IdsFile,
     modules: &'a BTreeSet<ModuleId>,
     external: &'a BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'a>,
     scopes: &'a DataScopes,
     reference: &'a Schema,
     read: crate::engine::Read,
@@ -200,7 +208,7 @@ async fn managed_state_once(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
@@ -2561,7 +2569,7 @@ async fn baseline_state(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     scopes: &DataScopes,
     recorded: &Schema,
     as_the_apply_reads_it: &DataScopes,
@@ -2620,7 +2628,7 @@ async fn staged_baseline(
     checked: &BTreeSet<ModuleId>,
     watched: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     checked_scopes: &DataScopes,
     recorded: &Schema,
     watched_scopes: &DataScopes,
@@ -2651,7 +2659,10 @@ async fn staged_baseline(
         watched,
         external,
         &unreadable,
-        pbps_config::Unmanaged::Ignore,
+        db::CatalogPolicy {
+            unmanaged: pbps_config::Unmanaged::Ignore,
+            ..unmanaged
+        },
     )?;
     let rows = crate::engine::read_rows(
         conn,
@@ -2692,7 +2703,7 @@ async fn managed_state_full(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
     rows: &BTreeMap<TableName, RowScope>,
     read: crate::engine::Read,
 ) -> anyhow::Result<Managed> {
@@ -2865,9 +2876,14 @@ fn cut(
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
-    unmanaged: pbps_config::Unmanaged,
+    unmanaged: db::CatalogPolicy<'_>,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
+    // These exact roles belong to the verified owned run, not its declarations.
+    // A similarly named role remains subject to the project's ordinary policy.
+    scoped
+        .unmanaged_roles
+        .retain(|role| !unmanaged.infrastructure_roles.contains(role));
     // A managed role's grant WITH GRANT OPTION is wider than the plain grant
     // the declarations can spell, and was left out of the role's set rather
     // than folded in. Carried beside the comparison so `verify` reports it
@@ -2897,7 +2913,7 @@ fn cut(
         .baseline_evidence
         .as_ref()
         .map(|evidence| evidence.for_managed(&scoped.schema));
-    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
+    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
     Ok(scoped)
 }
 
@@ -3633,7 +3649,7 @@ fn ambiguous_line(a: &pbps_db::catalog::Ambiguous) -> String {
 /// Every schema name a declaration spells, and one declaration that spells it
 /// that way — for the message, so the refusal names something the author can
 /// find in a file rather than a bare schema name.
-fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
+pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     let Schema {
         tables,
         types,
@@ -5825,7 +5841,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &pbps_diff::external_parents(&baseline.snapshot.schema),
             // The unmanaged policy is applied below instead, beside the
             // finished report, so that neither verdict can erase the other.
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &rows_to_read(&recorded_scopes),
             crate::engine::Read::Snapshot,
         )
@@ -6071,7 +6087,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 &ids,
                 &declared_modules,
                 &pbps_diff::external_parents(&loaded.schema),
-                project.config.unmanaged,
+                target.catalog_policy(project.config.unmanaged),
                 &declared_data,
                 &loaded.schema,
                 crate::engine::Read::Snapshot,
@@ -6324,7 +6340,7 @@ pub fn cmd_baseline(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &declared_data,
                     &loaded.schema,
                     read,
@@ -6614,6 +6630,24 @@ fn bootstrap(
     dialect: crate::emission::SelectedDialect,
     operator: &str,
 ) -> anyhow::Result<Option<services::Bootstrapped>> {
+    db::runtime()?.block_on(bootstrap_async(
+        project,
+        target,
+        sql_out,
+        declarations,
+        dialect,
+        operator,
+    ))
+}
+
+async fn bootstrap_async(
+    project: &Project,
+    target: Option<&Target>,
+    sql_out: Option<&std::path::Path>,
+    declarations: services::Declarations,
+    dialect: crate::emission::SelectedDialect,
+    operator: &str,
+) -> anyhow::Result<Option<services::Bootstrapped>> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
@@ -6643,7 +6677,7 @@ fn bootstrap(
         // Without a target nothing can be asked, and the script carries the
         // declared text, as it always has.
         if let Some(target) = target {
-            loaded.schema = db::runtime()?.block_on(async {
+            loaded.schema = Box::pin(async {
                 let mut conn = db::connect(target).await?;
                 dialect = crate::engine::planning_dialect_for(&mut conn, &dialect).await?;
                 bootstrap_type_pins(&mut conn, &loaded.schema, &Default::default(), project)
@@ -6660,7 +6694,8 @@ fn bootstrap(
                 // Printed before the refusal, beside it, as the plan prints them.
                 warn_unasked(&unasked);
                 refused
-            })?;
+            })
+            .await?;
         }
         for notice in crate::row_security::binding_notices(&loaded.schema) {
             eprintln!("warning: {notice}");
@@ -6750,7 +6785,7 @@ fn bootstrap(
                 Some(target)
                     if !prefixes.is_empty() || offline.iter().any(|n| !n.searched.is_empty()) =>
                 {
-                    db::runtime()?.block_on(async {
+                    Box::pin(async {
                         let mut conn = db::connect(target).await?;
                         let holders = pbps_pg::catalog::key_name_holders(&mut conn, &prefixes)
                             .await
@@ -6768,7 +6803,8 @@ fn bootstrap(
                             }
                         }
                         Ok::<_, anyhow::Error>(())
-                    })?;
+                    })
+                    .await?;
                 }
                 Some(_) | None => refused = offline,
             }
@@ -6823,7 +6859,7 @@ fn bootstrap(
             &dialect,
         )?;
 
-        db::runtime()?.block_on(async {
+        Box::pin(async {
             let mut conn = db::connect(target).await?;
             let bootstrap_pins =
                 bootstrap_type_pins(&mut conn, &loaded.schema, &cs, project).await?;
@@ -6859,7 +6895,7 @@ fn bootstrap(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &BTreeMap::new(),
                     crate::engine::Read::Snapshot,
                 )
@@ -6954,7 +6990,7 @@ fn bootstrap(
                     &ids,
                     &declared_modules,
                     &pbps_diff::external_parents(&loaded.schema),
-                    project.config.unmanaged,
+                    target.catalog_policy(project.config.unmanaged),
                     &loaded.schema.data_scopes(),
                     &loaded.schema,
                     crate::engine::Read::InsideOwnTransaction,
@@ -7022,6 +7058,7 @@ fn bootstrap(
                 released: unlocked,
             }))
         })
+        .await
     })
 }
 
@@ -7200,6 +7237,35 @@ fn plan_db(
     no_rehearse: bool,
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<services::PlanResult> {
+    db::runtime()?.block_on(plan_db_async(
+        project,
+        target,
+        declarations,
+        dialect,
+        script,
+        staged,
+        json,
+        resolver_selection,
+        no_rehearse,
+        carried,
+        false,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_db_async(
+    project: &Project,
+    target: &Target,
+    declarations: services::Declarations,
+    dialect: crate::emission::SelectedDialect,
+    script: bool,
+    staged: bool,
+    json: bool,
+    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
+    no_rehearse: bool,
+    carried: &mut Vec<crate::output::Finding>,
+    quiet: bool,
+) -> anyhow::Result<services::PlanResult> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
@@ -7207,8 +7273,7 @@ fn plan_db(
         // Keep the runtime alive for this connection across identity resolution.
         // Target provenance must be checked before a stale local mapping can
         // obscure the deletions it would plan (DEC-2397.1).
-        let runtime = db::runtime()?;
-        let checked_target = runtime.block_on(async {
+        let checked_target = async {
             let mut conn = db::connect(target).await?;
             let Some(entry) = crate::engine::latest(&mut conn).await? else {
                 bail!(
@@ -7233,7 +7298,8 @@ fn plan_db(
                     .into_iter()
                     .collect();
             Ok::<_, anyhow::Error>((conn, entry, findings, revision.and_then(|r| r.git_sha)))
-        });
+        }
+        .await;
         // A failed target read cannot produce a plan, but must not replace the
         // established local identity refusals with an environment failure
         // (SPEC 9.8). Retain the error until those checks finish; it is never
@@ -7339,7 +7405,7 @@ fn plan_db(
 
         let (mut conn, mut entry) = checked_target?;
         let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
-        let connected = runtime.block_on(async {
+        let connected = Box::pin(async {
         // The selected resolver entry's scratch, acquired at most once for the
         // resolver and the rehearsal both (#2379).
         let mut scratch = resolver_selection
@@ -7454,7 +7520,7 @@ fn plan_db(
             // what the ledger says pbps holds, and a declared switch is the
             // differ's to refuse (DEC-1533.1).
             &pbps_diff::external_parents(&entry.snapshot.schema),
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &to_read,
             crate::engine::Read::Snapshot,
         )
@@ -7484,7 +7550,9 @@ fn plan_db(
         }
         if refused_by_policy {
             if json {
-                crate::output::Report::plain("plan", findings).emit_json()?;
+                if quiet { carried.clone_from(&findings); } else {
+                    crate::output::Report::plain("plan", findings).emit_json()?;
+                }
             }
             bail!(
                 "a policy set to `error` refuses this plan; fix the declarations, or suppress \
@@ -8154,7 +8222,8 @@ fn plan_db(
             })
         {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
-            run_probes(
+            let observation = services::Progress::default();
+            let result = run_probes_observed(
                 &mut conn,
                 dialect.as_ref(),
                 &names,
@@ -8164,8 +8233,12 @@ fn plan_db(
                     ids: &recorded_ids,
                 }),
                 None,
+                quiet.then_some(&observation),
             )
-            .await?;
+            .await;
+            findings.extend(observation.findings.into_inner());
+            if json { carried.clone_from(&findings); }
+            result?;
         }
         // Again, over what the dependents added: a rebuild the plan now
         // synthesizes needs the transaction as much as one it was given.
@@ -8261,7 +8334,9 @@ fn plan_db(
                 // This is an answered policy question, before any artifact is
                 // written. Keep the rule's typed fields and any earlier notes.
                 findings.extend(policy);
-                crate::output::Report::plain("plan", findings).emit_json()?;
+                if quiet { carried.clone_from(&findings); } else {
+                    crate::output::Report::plain("plan", findings).emit_json()?;
+                }
             }
             bail!(
                 "a policy set to `error` refuses this plan; fix the declarations, or suppress \
@@ -8328,7 +8403,9 @@ fn plan_db(
                          with online index operations",
                         ),
                 );
-                crate::output::Report::plain("plan", findings).emit_json()?;
+                if quiet { carried.clone_from(&findings); } else {
+                    crate::output::Report::plain("plan", findings).emit_json()?;
+                }
             }
             bail!("{refusal}");
         }
@@ -8562,7 +8639,7 @@ fn plan_db(
             resolution,
             rehearsal,
         ))))
-    })?;
+    }).await?;
         let (
             cs,
             (baseline_checksum, baseline_collation, baseline_zone),
@@ -8762,6 +8839,7 @@ fn plan_db(
         Ok(services::PlanResult::Planned(Box::new(services::Planned {
             artifact: Box::new(plan),
             script,
+            statements: statements.len(),
             data,
             findings,
         })))
@@ -8986,6 +9064,7 @@ struct Deployment<'a, D: crate::emission::Engine> {
     rename_targets: &'a [pbps_db::impact::RenameTarget],
     dialect: &'a D,
     operator: &'a str,
+    progress: Option<&'a services::Progress>,
 }
 
 /// Everything between taking the lock and releasing it. Returns the ledger id.
@@ -9007,6 +9086,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         rename_targets,
         dialect,
         operator,
+        progress,
     } = *d;
     let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
@@ -9075,7 +9155,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         &recorded_ids,
         &recorded_modules,
         &externals_under(&externals, &recorded_ids),
-        project.config.unmanaged,
+        target.catalog_policy(project.config.unmanaged),
         &pinned_baseline_scopes(
             &entry.snapshot.schema.data_scopes(),
             &planned_scopes,
@@ -9160,18 +9240,27 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         &scoped.schema,
         &recorded_ids,
         &approved,
+        progress,
     )
     .await?;
 
     // Recorded when the plan was made and never repeated here: apply
     // acquires no scratch (#2379).
     if let Some(record) = &plan.rehearsal {
-        println!(
-            "Rehearsal, recorded in the plan: {}",
-            crate::explain::rehearsal_line(&crate::explain::rehearsal_detail(record))
+        services::notice(
+            progress,
+            "apply.progress",
+            format!(
+                "Rehearsal, recorded in the plan: {}",
+                crate::explain::rehearsal_line(&crate::explain::rehearsal_detail(record))
+            ),
         );
     }
-    println!("Applying {} statement(s)...", statements.len());
+    services::notice(
+        progress,
+        "apply.progress",
+        format!("Applying {} statement(s)...", statements.len()),
+    );
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
@@ -9224,7 +9313,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         if let Some(resolved) = resolved {
             resolved.before_statements(conn).await?;
         }
-        execute_statements(conn, statements, &data_guard, Some(&approved)).await?;
+        execute_statements(conn, statements, &data_guard, Some(&approved), progress).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
             conn,
@@ -9250,7 +9339,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
             &externals_under(&externals, &plan.ids),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &plan.data,
             &Schema::default(),
             crate::engine::Read::InsideOwnTransaction,
@@ -9278,7 +9367,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
                 &plan.ids,
                 &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
                 &externals_under(&externals, &plan.ids),
-                project.config.unmanaged,
+                target.catalog_policy(project.config.unmanaged),
                 &plan.data,
                 &Schema::default(),
                 crate::engine::Read::InsideOwnTransaction,
@@ -9543,6 +9632,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         rename_targets,
         dialect,
         operator,
+        progress: _,
     } = *d;
     let staged = guard::Staged::new(guard::Plan {
         changes: &plan.changes,
@@ -9615,7 +9705,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &after_modules,
             &after_modules,
             &externals_under(&externals, at_checkpoint),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &entry.snapshot.schema.data_scopes(),
             &entry.snapshot.schema,
             &held_before_the_plan(
@@ -9726,7 +9816,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &recorded_modules,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &recorded_ids),
-            project.config.unmanaged,
+            target.catalog_policy(project.config.unmanaged),
             &pinned_baseline_scopes(
                 &entry.snapshot.schema.data_scopes(),
                 &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
@@ -9802,6 +9892,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 plan,
                 managed: &pinned_managed(&entry.snapshot, &plan.changes, &plan.ids),
             },
+            None,
         )
         .await?;
         (0, watching)
@@ -10089,7 +10180,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &live_ids,
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &live_ids),
-            pbps_config::Unmanaged::Ignore,
+            target.catalog_policy(pbps_config::Unmanaged::Ignore),
             // The plan's own scope, not the widened one: what a statement
             // leaves is read under the keys the plan leaves, as the closing
             // read is, so a row the renames leave unmanaged is not compared
@@ -10186,7 +10277,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         &plan.ids,
         &modules_after(&entry.snapshot, &plan.changes, Settled::Whole),
         &externals_under(&externals, &plan.ids),
-        project.config.unmanaged,
+        target.catalog_policy(project.config.unmanaged),
         &plan.data,
         &Schema::default(),
         crate::engine::Read::Snapshot,
@@ -10627,6 +10718,7 @@ async fn drop_preflight(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn preflight<D: crate::emission::Engine>(
     conn: &mut Conn,
     dialect: &D,
@@ -10635,6 +10727,7 @@ async fn preflight<D: crate::emission::Engine>(
     stored: &pbps_model::Schema,
     stored_ids: &IdsFile,
     approved: &crate::pins::Approved<'_>,
+    progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     // **The pins before the questions.** Every read below — the edition, the
     // role checks, the rename impact scans and the probes — used to run under
@@ -10713,12 +10806,16 @@ async fn preflight<D: crate::emission::Engine>(
         if report.is_empty() {
             continue;
         }
-        println!("\n{} {} affects:", target.verb(), report.target);
+        services::notice(
+            progress,
+            "apply.preflight",
+            format!("\n{} {} affects:", target.verb(), report.target),
+        );
         for line in impact_lines(
             &report,
             &crate::engine::impact_notes(conn.driver(), &report),
         ) {
-            println!("{line}");
+            services::notice(progress, "apply.preflight", line);
         }
         for r in &report.blocking {
             blocked.push(format!("{} {}", r.kind, r.name));
@@ -10736,7 +10833,7 @@ async fn preflight<D: crate::emission::Engine>(
     // its new name, so the stored relation is brought under those names
     // (#1751 review).
     let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
-    run_probes(
+    run_probes_observed(
         conn,
         dialect,
         &names,
@@ -10746,6 +10843,7 @@ async fn preflight<D: crate::emission::Engine>(
             ids: stored_ids,
         }),
         Some(approved),
+        progress,
     )
     .await
 }
@@ -10810,6 +10908,7 @@ fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec
 /// refuses a plan this engine takes.
 /// `partitions` is the relation as the database stands before the plan: the
 /// read whose checksum matched the plan's baseline (DEC-1699.1).
+#[cfg(test)]
 async fn run_probes(
     conn: &mut Conn,
     dialect: &dyn pbps_dialect::Dialect,
@@ -10817,6 +10916,18 @@ async fn run_probes(
     partitions: &pbps_model::Partitions,
     sources: Option<pbps_model::operation::Snapshot<'_>>,
     approved: Option<&crate::pins::Approved<'_>>,
+) -> anyhow::Result<()> {
+    run_probes_observed(conn, dialect, names, partitions, sources, approved, None).await
+}
+
+async fn run_probes_observed(
+    conn: &mut Conn,
+    dialect: &dyn pbps_dialect::Dialect,
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    partitions: &pbps_model::Partitions,
+    sources: Option<pbps_model::operation::Snapshot<'_>>,
+    approved: Option<&crate::pins::Approved<'_>>,
+    progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     pin_session(conn, dialect).await?;
     // A recorded conversion's expression is judged before any probe evaluates
@@ -10908,15 +11019,23 @@ async fn run_probes(
         );
     }
     if passed > 0 {
-        println!("Pre-flight: {passed} probe(s) passed against the live data.");
+        services::notice(
+            progress,
+            "apply.preflight",
+            format!("Pre-flight: {passed} probe(s) passed against the live data."),
+        );
     }
     if unchecked > 0 {
         // Said on stdout as well as in the warnings above: an operator reading
         // "3 probes passed" while a fourth went unchecked has been told
         // something true and something misleading in the same breath.
-        println!(
-            "Pre-flight: {unchecked} probe(s) could not be checked here; the engine enforces \
+        services::notice(
+            progress,
+            "apply.preflight",
+            format!(
+                "Pre-flight: {unchecked} probe(s) could not be checked here; the engine enforces \
              them inside the transaction."
+            ),
         );
     }
 
@@ -10938,9 +11057,13 @@ async fn run_probes(
         .map(|r| r.as_str())
         .collect();
     if !unprobed.is_empty() {
-        println!(
-            "Pre-flight: {} risk(s) cannot be probed and rest on the approval alone.",
-            unprobed.join(", ")
+        services::notice(
+            progress,
+            "apply.preflight",
+            format!(
+                "Pre-flight: {} risk(s) cannot be probed and rest on the approval alone.",
+                unprobed.join(", ")
+            ),
         );
     }
     Ok(())
@@ -11034,6 +11157,7 @@ async fn execute_transaction_body(
             &crate::engine::DataWriteGuard::default(),
             None,
             trusted,
+            None,
         )
         .await?;
     }
@@ -11045,6 +11169,7 @@ async fn execute_statements(
     statements: &crate::emission::LoweredPlan,
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
+    progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     for position in 0..statements.len() {
         execute_statement(
@@ -11056,6 +11181,7 @@ async fn execute_statements(
             reviewed
                 .map(|a| &a.project.config.trusted_roles)
                 .unwrap_or(&BTreeSet::new()),
+            progress,
         )
         .await?;
     }
@@ -11064,6 +11190,7 @@ async fn execute_statements(
 
 // Bootstrap checks prerequisites between statements without turning the
 // certified collection into a raw slice that another caller could execute.
+#[allow(clippy::too_many_arguments)]
 async fn execute_statement(
     conn: &mut Conn,
     statements: &crate::emission::LoweredPlan,
@@ -11071,6 +11198,7 @@ async fn execute_statement(
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
     trusted: &BTreeSet<pbps_model::RoleName>,
+    progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     let stmt = &statements[position];
     if let Some(approved) = reviewed {
@@ -11086,6 +11214,9 @@ async fn execute_statement(
     }
     crate::engine::check_data_write(conn, stmt, data_guard).await?;
     crate::engine::check_drop_requirement(conn, stmt).await?;
+    if let Some(progress) = progress {
+        progress.started.set(true);
+    }
     if let Err(e) = conn.execute(&stmt.sql).await {
         // `.context()`, not `anyhow::anyhow!("...{e}")`: interpolating the
         // driver error into the message text would bake its `Display`
@@ -16710,7 +16841,7 @@ mod tests {
             ids: &ids,
             modules: &modules,
             external: &BTreeSet::new(),
-            unmanaged: pbps_config::Unmanaged::Ignore,
+            unmanaged: pbps_config::Unmanaged::Ignore.into(),
             scopes: &scopes,
             reference: &reference,
             read,
@@ -23141,7 +23272,7 @@ mod tests {
             &modules,
             &BTreeSet::new(),
             &unreadable,
-            pbps_config::Unmanaged::Error,
+            pbps_config::Unmanaged::Error.into(),
         )
         .unwrap_err();
         assert!(refusal.is::<UnmanagedPolicy>(), "{refusal:#}");
@@ -23161,7 +23292,7 @@ mod tests {
             &modules,
             &BTreeSet::new(),
             &unreadable,
-            pbps_config::Unmanaged::Error,
+            pbps_config::Unmanaged::Error.into(),
         )
         .expect("a declared type is refused by managed limitations, not unmanaged policy");
         let relation = Pulled {

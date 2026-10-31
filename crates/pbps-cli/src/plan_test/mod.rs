@@ -6,14 +6,30 @@
 //! report is the hash of what ran. [`Frozen::reverify`] is the recheck the
 //! ADR requires before a result is published.
 //!
-//! Nothing in this module starts a container, opens a connection, runs SQL or
-//! writes a file. Every refusal is a [`Refusal`] value, so a caller renders
+//! Input validation starts no container, opens no connection and writes no
+//! file. Every refusal is a [`Refusal`] value, so a caller renders
 //! the same facts as text or JSON and cannot reach a database past one.
 
 mod chain;
 mod files;
 mod git;
-mod revision;
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "#1165 D2b consumes the owned runner; its lifecycle tests are Linux-only"
+    )
+)]
+pub(crate) mod report;
+pub(crate) mod revision;
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "#1165 D2b consumes the owned runner; its lifecycle tests are Linux-only"
+    )
+)]
+pub(crate) mod session;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +43,9 @@ use pbps_config::test_manifest::{Candidate, CommitId, Entries, ManifestError, Te
 use pbps_model::escape::Escaped;
 
 /// What a consumed file is for. Hints live in the declaration files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
     Manifest,
@@ -54,7 +72,8 @@ impl std::fmt::Display for Role {
 /// Where a file's bytes came from: the working tree as it is, or one commit.
 /// An uncommitted working tree is `Working` even when its bytes happen to
 /// equal `HEAD`'s: it does not claim that git supplied them.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, schemars::JsonSchema)]
+#[schemars(with = "String")]
 pub(crate) enum Revision {
     Working,
     Commit(CommitId),
@@ -81,7 +100,7 @@ impl std::fmt::Display for Revision {
 /// One file the run consumed: its path relative to the project root (`/`
 /// separated), and the SHA-256 of its raw bytes, with no newline or SQL
 /// normalization.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct ConsumedFile {
     pub path: String,
     pub revision: Revision,
@@ -222,14 +241,14 @@ impl Refusal {
 
 /// How the candidate is named in a report. A working tree stays uncommitted
 /// even when its bytes match `HEAD`: it does not claim that git supplied them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CandidateKind {
     WorkingTree,
     Commit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct CandidateIdentity {
     kind: CandidateKind,
     uncommitted: bool,
@@ -255,14 +274,14 @@ impl CandidateIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct Pin {
     pub fixture: String,
     pub commit: CommitId,
 }
 
 /// What a run was given, with no password, connection string or plan in it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct InputIdentity {
     pub tool_version: &'static str,
     pub manifest_version: u32,

@@ -182,7 +182,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Record several explicit rename/drop decisions together, or none
-    Intent(intent_batch::BatchArgs),
+    // Keep large argument construction in its own frame, as for drop options:
+    // clap startup must fit Windows' 1 MiB main stack (#2493, #2523).
+    Intent(Box<intent_batch::BatchArgs>),
 
     /// Browse local read views of environments, drift, saved plans and history
     Ui,
@@ -725,7 +727,7 @@ enum KeyCommand {
 #[derive(Subcommand)]
 enum StateCommand {
     /// Record external data work without executing it or changing managed state
-    RecordDataWork(state_data_work::RecordDataWorkArgs),
+    RecordDataWork(Box<state_data_work::RecordDataWorkArgs>),
 
     /// Show this environment's history, newest first
     List {
@@ -1569,7 +1571,7 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
-            StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, args),
+            StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, *args),
             StateCommand::List {
                 target,
                 limit,
@@ -7049,5 +7051,46 @@ mod declaration_source_tests {
                 ))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod command_stack_tests {
+    use clap::Parser as _;
+    use std::mem::{size_of, size_of_val};
+
+    // clap's generated constructors need larger frames than their final values.
+    // x86_64 Linux: Command is 200 bytes boxed or unboxed; its Intent payload is
+    // 8 versus 192. Windows' boxed Command is 224 bytes because paths are wider.
+    // Allow that enum size, but check the payload too: another variant can hide
+    // its growth. The 128-byte payload budget still rejects unboxing by 64 bytes.
+    #[test]
+    fn top_level_commands_keep_a_bounded_inline_payload() {
+        let bytes = size_of::<super::Command>();
+        assert!(
+            bytes <= 28 * size_of::<usize>(),
+            "Command grew to {bytes} bytes; box large command arguments"
+        );
+        let cli =
+            super::Cli::try_parse_from(["pbps", "intent", "--drop", "app.t.a", "reason"]).unwrap();
+        let super::Command::Intent(args) = cli.command else {
+            panic!("expected intent command");
+        };
+        let bytes = size_of_val(&args);
+        assert!(
+            bytes <= 16 * size_of::<usize>(),
+            "Intent payload grew to {bytes} bytes; box large command arguments"
+        );
+    }
+
+    // x86_64 Linux: StateCommand is 80 bytes boxed versus 176 unboxed. This
+    // 128-byte bound passed on Windows too and rejects unboxing by 48 bytes.
+    #[test]
+    fn nested_state_commands_keep_a_bounded_inline_payload() {
+        let bytes = size_of::<super::StateCommand>();
+        assert!(
+            bytes <= 16 * size_of::<usize>(),
+            "StateCommand grew to {bytes} bytes; box large command arguments"
+        );
     }
 }

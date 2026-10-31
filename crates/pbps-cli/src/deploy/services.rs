@@ -3,6 +3,8 @@
 //! File loading/publication and public hooks stay at the command boundary.
 //! The checked bodies consume loaded inputs; no refusal or write moves
 //! across another check when its command boundary is extracted.
+//! Connected work futures stay boxed so composing phases does not embed their
+//! large execution frames in the caller (DEC-1165.9).
 
 use crate::db::Target;
 use crate::output::{Finding, Report};
@@ -12,7 +14,27 @@ use pbps_diff::order::ArtifactView;
 use pbps_model::IdsFile;
 
 mod apply;
-pub(super) use apply::apply_identified;
+pub(super) use apply::{apply_async, apply_identified};
+
+#[derive(Default)]
+pub(crate) struct Progress {
+    pub accepted: std::cell::Cell<bool>,
+    pub started: std::cell::Cell<bool>,
+    pub findings: std::cell::RefCell<Vec<Finding>>,
+}
+
+// Public commands keep their exact text; an owned run retains it as ordinary
+// findings so its command boundary alone renders the existing envelope.
+pub(super) fn notice(progress: Option<&Progress>, id: &str, message: String) {
+    if let Some(progress) = progress {
+        progress
+            .findings
+            .borrow_mut()
+            .push(Finding::note(id, message));
+    } else {
+        println!("{message}");
+    }
+}
 
 pub(super) struct Declarations {
     pub loaded: pbps_load::Loaded,
@@ -62,9 +84,10 @@ pub(super) enum PlanResult {
     Planned(Box<Planned>),
     Refused(Report<()>),
 }
-pub(super) struct Planned {
+pub(crate) struct Planned {
     pub artifact: Box<dyn ArtifactView>,
     pub script: Option<String>,
+    pub statements: usize,
     pub data: crate::PlanData,
     pub findings: Vec<Finding>,
 }
@@ -116,6 +139,7 @@ impl Planned {
         let Self {
             artifact,
             script,
+            statements: _,
             data,
             findings,
         } = self;
