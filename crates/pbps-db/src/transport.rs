@@ -33,6 +33,13 @@ pub trait QueryConnection: query_sealed::Sealed {
 /// resolver runs on its scratch database. Like [`QueryConnection`], it
 /// classifies no SQL.
 pub trait ExecuteConnection: QueryConnection {
+    /// Empty-parameter execution: PostgreSQL uses the single-command extended
+    /// protocol. Callers retain framing commands at their typed boundaries.
+    fn execute_extended<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a;
+
     fn execute<'a>(
         &'a mut self,
         sql: &'a str,
@@ -49,6 +56,10 @@ impl QueryConnection for Conn {
 }
 
 impl ExecuteConnection for Conn {
+    async fn execute_extended<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
+        Conn::execute_with(self, sql, &[]).await.map(|_| ())
+    }
+
     async fn execute<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
         Conn::execute(self, sql).await
     }

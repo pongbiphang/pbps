@@ -284,18 +284,22 @@ impl Reconstruction {
         &self,
         at: usize,
         statement: usize,
-        error: DbError,
+        failure: crate::statement::Failure,
         delta: &[(usize, Step)],
         overtaken: Vec<String>,
     ) -> Diagnosis {
-        let sql = &self.lowered.groups()[at].statements()[statement].sql;
+        let sql = crate::statement::submitted(
+            &self.lowered.groups()[at].statements()[statement],
+            failure.command,
+        );
+        let error = failure.error;
         let owned: Vec<_> = self.steps.iter().filter_map(|s| s.body.clone()).collect();
         let location = location(&error, sql, &owned);
         let code = error.server_error_code();
         let reference = matches!(code.as_deref(), Some("42P01" | "42883" | "42704"))
             .then(|| location.and_then(|(text, byte)| positioned_name(text, byte)))
             .flatten();
-        let regions: Vec<_> = std::iter::once(sql.clone())
+        let regions: Vec<_> = std::iter::once(sql.to_owned())
             .chain(crate::LEXICON.string_literals(sql))
             .collect();
         let column = (code.as_deref() == Some("42703"))

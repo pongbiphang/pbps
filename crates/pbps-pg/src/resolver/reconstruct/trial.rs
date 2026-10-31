@@ -1,10 +1,13 @@
 //! PostgreSQL creation trials, isolated from committed observations (DEC-2465.1).
 use super::{Progress, ReconstructError, Reconstruction, Step, judged_the_statement};
-use pbps_db::{DbError, transport::ExecuteConnection};
+use pbps_db::transport::ExecuteConnection;
 use pbps_diff::order::scratch::Trials;
 
 pub(super) enum Failure {
-    Statement { error: DbError, statement: usize },
+    Statement {
+        error: crate::statement::Failure,
+        statement: usize,
+    },
     Terminal(ReconstructError),
 }
 
@@ -53,10 +56,10 @@ impl Reconstruction {
                     attempt.succeeded();
                 }
                 Err(Failure::Statement { error, statement }) => {
-                    let code = error.server_error_code();
+                    let code = error.error.server_error_code();
                     // Recovery preserves the first creation verdict only when
                     // this attempt also reached an engine verdict (DEC-2465.3).
-                    if !judged_the_statement(&error) {
+                    if !judged_the_statement(&error.error) {
                         return Err(ReconstructError::Interrupted {
                             declaration: self.steps[at].declaration.clone(),
                             reason: error.to_string(),

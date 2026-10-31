@@ -665,8 +665,10 @@ impl Conn {
         #[cfg(feature = "test-request-count")]
         crate::request_count::record();
         let bound = bind(params);
-        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            bound.iter().map(AsRef::as_ref).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
+            .iter()
+            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
         Ok(self
             .client
             .query(sql, &refs)
@@ -684,8 +686,10 @@ impl Conn {
         #[cfg(feature = "test-request-count")]
         crate::request_count::record();
         let bound = bind(params);
-        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            bound.iter().map(AsRef::as_ref).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
+            .iter()
+            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
         Ok(self.client.execute(sql, &refs).await?)
     }
 }
@@ -1168,17 +1172,21 @@ fn tls(config: &Config) -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbEr
 /// `&dyn ToSql + Sync`, and `Param::OptStr` holds an `Option<&str>` whose
 /// `ToSql` implementation is for the `Option` itself, so there is nothing in
 /// the enum of the right shape to point at.
-fn bind<'a>(params: &'a [Param<'a>]) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + 'a>> {
+fn bind<'a>(
+    params: &'a [Param<'a>],
+) -> Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'a>> {
     params
         .iter()
-        .map(|p| -> Box<dyn tokio_postgres::types::ToSql + Sync + 'a> {
-            match *p {
-                Param::I32(v) => Box::new(v),
-                Param::I64(v) => Box::new(v),
-                Param::Str(v) => Box::new(v),
-                Param::OptStr(v) => Box::new(v),
-            }
-        })
+        .map(
+            |p| -> Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'a> {
+                match *p {
+                    Param::I32(v) => Box::new(v),
+                    Param::I64(v) => Box::new(v),
+                    Param::Str(v) => Box::new(v),
+                    Param::OptStr(v) => Box::new(v),
+                }
+            },
+        )
         .collect()
 }
 

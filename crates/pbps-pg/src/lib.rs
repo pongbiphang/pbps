@@ -83,6 +83,7 @@ pub mod roles;
 pub mod rows;
 pub mod staged;
 pub mod state;
+pub mod statement;
 pub mod type_rebuild;
 pub mod type_refs;
 mod types;

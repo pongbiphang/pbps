@@ -2863,3 +2863,118 @@ fn build_reconstruction(
         &crate::resolver::reconstruct::fixture_ids(changes),
     )
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn declared_statement_tails2520_refuse_reconstruction_without_a_marker() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        for table_default in [false, true] {
+            let mut databases = Databases {
+                server: server.clone(),
+                names: Vec::new(),
+            };
+            let name = format!(
+                "pbps_2520_scratch_{}_{}",
+                std::process::id(),
+                u8::from(table_default)
+            );
+            let mut scratch = databases.create(name, &["app"]).await;
+            let desired = if table_default {
+                let mut table = pbps_model::Table::default();
+                let mut column = pbps_model::Column::new("integer".parse().unwrap());
+                column.value_source = pbps_model::ValueSource::Default(
+                    "1)); CREATE TABLE public.marker2520(id integer); SELECT ((1".into(),
+                );
+                table.columns.insert("n".into(), column);
+                Declared::default().table("app.t", table)
+            } else {
+                Declared::default().view(
+                    "app.v",
+                    "SELECT 1 AS n; CREATE TABLE public.marker2520(id integer); SELECT 1",
+                )
+            };
+            let pg = Postgres::new();
+            let mut reconstruction =
+                build_reconstruction(&pg, &bootstrap(&desired.schema, &[])).unwrap();
+            let result = reconstruction
+                .compile(&pg, &pbps_model::SessionZone::utc(), &mut scratch)
+                .await;
+            let rows = scratch
+                .query("SELECT pg_catalog.to_regclass('public.marker2520') IS NULL AS absent")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].try_get::<bool>("absent").unwrap(),
+                Some(true),
+                "a statement tail ran in scratch"
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if table_default { "app.t" } else { "app.v" }),
+                "{error}"
+            );
+            databases.drop().await;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn literal_and_dollar_quoted_semicolons2520_remain_one_declaration() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let mut databases = Databases {
+            server,
+            names: Vec::new(),
+        };
+        let mut scratch = databases
+            .create(
+                format!("pbps_2520_literals_{}", std::process::id()),
+                &["app"],
+            )
+            .await;
+        let mut table = pbps_model::Table::default();
+        let mut id = pbps_model::Column::new("integer".parse().unwrap());
+        id.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        table.columns.insert("id".into(), id.clone());
+        let desired = Declared::default()
+            .table("app.t", table)
+            .view("app.v", "SELECT '; COMMIT; --'::text AS n")
+            .function(
+                "app.f()",
+                "() RETURNS text LANGUAGE sql AS $body$ SELECT ';'; $body$",
+            );
+        let pg = Postgres::new();
+        let mut reconstruction =
+            build_reconstruction(&pg, &bootstrap(&desired.schema, &[])).unwrap();
+        reconstruction
+            .compile(&pg, &pbps_model::SessionZone::utc(), &mut scratch)
+            .await
+            .unwrap();
+        let rows = scratch
+            .query("SELECT n, app.f() AS f FROM app.v")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some("; COMMIT; --"));
+        assert_eq!(rows[0].try_get::<&str>("f").unwrap(), Some(";"));
+        let added = pbps_model::Change::AddColumn {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            table: "app.t".parse().unwrap(),
+            name: "second".into(),
+            column: Box::new(id),
+        };
+        for statement in crate::emit::emit(&pg, &added, Default::default()).unwrap() {
+            crate::statement::execute(&mut scratch, &statement)
+                .await
+                .unwrap();
+        }
+        let rows = scratch
+            .query("INSERT INTO app.t DEFAULT VALUES RETURNING id, second")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<i32>("id").unwrap(), Some(1));
+        assert_eq!(rows[0].try_get::<i32>("second").unwrap(), Some(1));
+        databases.drop().await;
+    }
+}

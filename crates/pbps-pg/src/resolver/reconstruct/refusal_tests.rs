@@ -217,7 +217,7 @@ fn candidates_exclude_the_refused_declaration_but_keep_other_overloads() {
         .iter()
         .position(|step| step.owner.as_ref() == Some(&owner))
         .unwrap();
-    let sql = &r.lowered.groups()[at].statements()[0].sql;
+    let sql = crate::statement::submitted(&r.lowered.groups()[at].statements()[0], 1);
     let byte = sql.rfind("app.f(1)").unwrap();
     for positioned in [false, true] {
         let position =
@@ -226,7 +226,16 @@ fn candidates_exclude_the_refused_declaration_but_keep_other_overloads() {
         if let DbError::Driver { code, .. } = &mut failure {
             *code = Some(if positioned { "42883" } else { "42601" }.into());
         }
-        let diagnosis = r.diagnosis(at, 0, failure, &[], vec![]);
+        let diagnosis = r.diagnosis(
+            at,
+            0,
+            crate::statement::Failure {
+                error: failure,
+                command: 1,
+            },
+            &[],
+            vec![],
+        );
         assert!(
             !diagnosis
                 .candidates
@@ -439,7 +448,7 @@ fn module_remedies_require_an_exact_provider_and_no_cycle_or_fill() {
             .iter()
             .position(|s| s.module.as_ref() == Some(&"app.v".parse().unwrap()))
             .unwrap();
-        let sql = &r.lowered.groups()[at].statements()[0].sql;
+        let sql = crate::statement::submitted(&r.lowered.groups()[at].statements()[0], 1);
         let byte = sql.find("app.w").unwrap();
         let mut e = error(Some(ErrorPosition::Original(
             sql[..byte].chars().count() as u32 + 1,
@@ -447,7 +456,16 @@ fn module_remedies_require_an_exact_provider_and_no_cycle_or_fill() {
         if routine && let DbError::Driver { code, .. } = &mut e {
             *code = Some("42883".into());
         }
-        let last = r.diagnosis(at, 0, e, &[], vec![]);
+        let last = r.diagnosis(
+            at,
+            0,
+            crate::statement::Failure {
+                error: e,
+                command: 1,
+            },
+            &[],
+            vec![],
+        );
         let pending = Pending {
             declaration: r.steps[at].declaration.clone(),
             subject: r.steps[at].subject.clone(),
