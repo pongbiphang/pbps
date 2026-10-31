@@ -2280,7 +2280,11 @@
         "creation2469::demanded_forward_columns_preserve_generation_and_column_order",
         "creation2469::prefix_facets_precede_the_function_and_later_column_in_native_order",
         "creation2469::scratch_facets_keep_zero_sql_paths_and_require_actual_role_setup",
-        "creation2469::generated_complete_shape_is_version_gated_before_any_sql"
+        "creation2469::generated_complete_shape_is_version_gated_before_any_sql",
+        "domain2469::domain_check_uses_the_bare_type_before_its_function_and_enforces_values",
+        "domain2469::domain_facets_keep_vetted_intermediates_authored_text_and_execution_modes",
+        "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks",
+        "domain2469::split_derived_defaults_override_temporary_inheritance"
       ]
     },
     {

@@ -1,4 +1,4 @@
-//! Typed creation parts for a new table, shared by ordinary planning,
+//! Typed creation parts, shared by ordinary planning,
 //! resolver planning and scratch (DEC-1503.1). This module emits no SQL.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +12,8 @@ use pbps_model::{
     Provenance, RiskClass, Schema, ValueSource,
 };
 
+mod calls;
+mod domains;
 mod inputs;
 
 pub const RULE: &str = "generated-new-table";
@@ -209,6 +211,18 @@ fn change_texts<'a>(
     scratch: bool,
 ) -> Vec<&'a str> {
     gather(change, reading_types(dialect, scratch))
+}
+
+fn part_texts<'a>(
+    planned: &'a PlannedChange,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<&'a str> {
+    if is_part(planned) && matches!(planned.change, Change::AlterDomain { .. }) {
+        domains::texts(&planned.change)
+    } else {
+        change_texts(&planned.change, dialect, scratch)
+    }
 }
 
 /// The type spellings scratch's guesses read: only those that name a
@@ -482,7 +496,12 @@ fn parts_in(
                     rule: RULE,
                     role: AddedRole::SplitPart,
                     source: planned.change.subject(),
-                    reason: "the relation exists before its generated expression binds".into(),
+                    reason: if matches!(planned.change, Change::CreateType { .. }) {
+                        "the type exists before its selected creation facets bind"
+                    } else {
+                        "the relation exists before its generated expression binds"
+                    }
+                    .into(),
                 });
                 part
             })
@@ -1039,7 +1058,7 @@ pub fn constraints(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Constraint> {
-    constraints_in(cs, declared, deps, dialect, false, false)
+    constraints_in(cs, declared, deps, dialect, false, false, &BTreeSet::new())
 }
 
 /// The transient annotation contract opts into exact facet prerequisites;
@@ -1051,6 +1070,12 @@ pub(super) fn plan_constraints<S>(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
 ) -> Vec<Constraint> {
+    let empty = plan
+        .annotations
+        .as_ref()
+        .filter(|a| a.extended)
+        .map(|a| empty_columns(plan, a.goal_ids()))
+        .unwrap_or_default();
     constraints_in(
         plan,
         declared,
@@ -1058,6 +1083,7 @@ pub(super) fn plan_constraints<S>(
         dialect,
         scratch,
         plan.annotations.as_ref().is_some_and(|a| a.extended),
+        &empty,
     )
 }
 
@@ -1072,6 +1098,7 @@ pub(super) fn constraints_in(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
     demanded: bool,
+    empty: &BTreeSet<usize>,
 ) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
@@ -1091,6 +1118,12 @@ pub(super) fn constraints_in(
         }
     };
     let modules = modules(&cs.changes);
+    domains::constraints(cs, declared, empty, &mut out);
+    for (part, planned) in cs.changes.iter().enumerate().filter(|(_, p)| is_part(p)) {
+        if matches!(planned.change, Change::AlterDomain { .. }) {
+            calls::add(&mut out, part, planned, &modules, dialect, scratch, guessed);
+        }
+    }
     for (first, p) in cs.changes.iter().enumerate().filter(|(_, p)| is_part(p)) {
         let Change::CreateTable {
             name,
@@ -1245,49 +1278,7 @@ pub(super) fn constraints_in(
                     }
                 }
             }
-            // The engine needs a routine before the expression that calls it.
-            // A name matched anywhere else (a type spelling `text` beside a
-            // view `app.text`) is a guess, and so is a name that is no
-            // function (DEC-2389.4).
-            let read = change_texts(&p.change, dialect, scratch);
-            let expressions = expressions(&p.change);
-            // Call-position hints read code only; literals remain reference
-            // guesses. PG trials resolve both hints (DEC-2465.1).
-            let called: Vec<_> = expressions
-                .iter()
-                .map(|text| {
-                    if guessed {
-                        std::borrow::Cow::Owned(dialect.lexicon().code_only(text))
-                    } else {
-                        std::borrow::Cow::Borrowed(*text)
-                    }
-                })
-                .collect();
-            for (function, id, module) in &modules {
-                if module.kind == ModuleKind::Function
-                    && called.iter().any(|t| dialect.generation_calls(t, id))
-                {
-                    // A call spelling can also be a parameter or a column.
-                    // PG scratch resolves the guess by trials (DEC-2465.1).
-                    if guessed {
-                        guess(&mut out, *function, *i);
-                    } else {
-                        edge(&mut out, *function, *i);
-                    }
-                } else if module.kind == ModuleKind::Function
-                    && guessed
-                    && expressions.iter().any(|t| dialect.generation_calls(t, id))
-                {
-                    guess(&mut out, *function, *i);
-                } else if (module.kind != ModuleKind::Function || !guessed)
-                    && read.iter().any(|t| dialect.generation_calls(t, id))
-                {
-                    // A view or table can be named as a type, a function
-                    // cannot: where guesses are read exactly, a function in
-                    // a type spelling is no reference at all.
-                    guess(&mut out, *function, *i);
-                }
-            }
+            calls::add(&mut out, *i, p, &modules, dialect, scratch, guessed);
         }
         for (i, p) in cs.changes.iter().enumerate() {
             let uses = table_use(&p.change);
@@ -1321,7 +1312,7 @@ pub(super) fn constraints_in(
                     }
                 }
             }
-            let references: Vec<_> = change_texts(&p.change, dialect, scratch)
+            let references: Vec<_> = part_texts(p, dialect, scratch)
                 .into_iter()
                 .filter(|text| dialect.generation_names_table(text, name))
                 .collect();
@@ -1525,6 +1516,7 @@ fn scratch_rules(
                 };
                 let domain = match &p.change {
                     Change::CreateType { definition, .. } => domain_texts(definition, types),
+                    Change::AlterDomain { .. } if is_part(p) => domains::texts(&p.change),
                     _ => Vec::new(),
                 };
                 let all = gather(&p.change, types)

@@ -1333,11 +1333,15 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
     let anchors = definitions.clone();
     let mut replacements: BTreeMap<Uid, ManagedType> = BTreeMap::new();
     let mut rebuilt_domains: BTreeSet<Uid> = BTreeSet::new();
+    let mut created_domains: BTreeSet<Uid> = BTreeSet::new();
     for step in &changes.changes {
         match &step.change {
             Change::CreateType {
                 uid, definition, ..
             } => {
+                if matches!(definition.as_ref(), ManagedType::Domain { .. }) {
+                    created_domains.insert(uid.clone());
+                }
                 definitions.insert(uid.clone(), (**definition).clone());
             }
             // The statements derive from `(from, to, half)` alone, so the
@@ -1354,6 +1358,33 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 to,
                 half,
             } => {
+                // New creation facets carry recipe snapshots, which may commute.
+                // Replay their existing half against the installed definition;
+                // the final pin below still certifies every installed facet.
+                // Standing domain alterations retain their before-anchor checks.
+                if created_domains.contains(uid) {
+                    if !pins
+                        .iter()
+                        .any(|p| &p.uid == uid && &p.name == name && p.before.is_none())
+                    {
+                        return false;
+                    }
+                    let Some(delta) = pbps_model::DomainDelta::of(from, to) else {
+                        return false;
+                    };
+                    let executable = match half {
+                        pbps_model::DomainHalf::Loosen => delta.loosens(),
+                        pbps_model::DomainHalf::Tighten => delta.tightens(),
+                    };
+                    let Some(current) = definitions.get(uid) else {
+                        return false;
+                    };
+                    let Some(next) = delta.apply_to(current, *half).filter(|_| executable) else {
+                        return false;
+                    };
+                    definitions.insert(uid.clone(), next);
+                    continue;
+                }
                 if !pins
                     .iter()
                     .any(|p| &p.uid == uid && &p.name == name && p.definition == **to)
@@ -1527,7 +1558,9 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
     }
     replacements.is_empty()
         && pins.iter().all(|p| {
-            !(matches!(p.definition, ManagedType::Enum { .. }) || rebuilt_domains.contains(&p.uid))
+            !(matches!(p.definition, ManagedType::Enum { .. })
+                || rebuilt_domains.contains(&p.uid)
+                || created_domains.contains(&p.uid))
                 || definitions.get(&p.uid) == Some(&p.definition)
         })
 }

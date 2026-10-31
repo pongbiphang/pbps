@@ -61,8 +61,10 @@ use crate::types::DIALECT;
 use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
+mod domain_parts;
 pub(crate) mod rebuild;
 mod row_defaults;
+pub(crate) use domain_parts::DomainParts;
 pub(crate) use row_defaults::{RowDefaultIndex, RowDefaults};
 
 #[cfg(test)]

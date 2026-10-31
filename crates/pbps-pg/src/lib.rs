@@ -1209,19 +1209,21 @@ impl pbps_dialect::PlanDialect for Postgres {
     ) -> pbps_dialect::lower::Emission<'a> {
         let changes = pbps_dialect::PlanPayload::changes(plan);
         let defaults = emit::RowDefaultIndex::new(changes);
+        let domains = emit::DomainParts::new(changes);
         Box::new(move |position| {
             let planned = &changes.changes[position];
             let context = defaults.at(position);
+            let change = domains.at(position, &planned.change);
             pbps_dialect::drop_requirements::emit(
                 planned.drop_guard.as_ref(),
                 mode,
                 "postgres",
                 || match mode {
                     pbps_model::PlanMode::Transactional => {
-                        emit::emit_in(self, &planned.change, planned.strategy, &context)
+                        emit::emit_in(self, change, planned.strategy, &context)
                     }
                     pbps_model::PlanMode::Staged => {
-                        emit::emit_staged_in(self, &planned.change, planned.strategy, &context)
+                        emit::emit_staged_in(self, change, planned.strategy, &context)
                     }
                 },
             )
@@ -1322,6 +1324,9 @@ impl Dialect for Postgres {
         references: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
         required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
+        if let Some(parts) = generated::domains::parts(change, functions, references) {
+            return Ok(Some(parts));
+        }
         let mut demand = pbps_dialect::creation::Demand::of(change, references);
         demand.required_columns = required_columns.clone();
         if matches!(

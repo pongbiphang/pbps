@@ -362,8 +362,18 @@ impl Declared {
                 | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
-                Change::AlterDomain { name, to, .. } => {
-                    self.types.insert(name.clone(), (**to).clone());
+                Change::AlterDomain {
+                    name,
+                    from,
+                    to,
+                    half,
+                    ..
+                } => {
+                    let current = self.types.get(name).unwrap_or(from);
+                    let definition = crate::DomainDelta::of(from, to)
+                        .and_then(|delta| delta.apply_to(current, *half))
+                        .unwrap_or_else(|| (**to).clone());
+                    self.types.insert(name.clone(), definition);
                 }
                 Change::AddEnumValue {
                     name, definition, ..

@@ -88,6 +88,11 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
             Change::CreateModule { id, module } => {
                 declared.modules.insert(id.clone(), (**module).clone());
             }
+            Change::CreateType {
+                name, definition, ..
+            } => {
+                declared.types.insert(name.clone(), (**definition).clone());
+            }
             _ => {}
         }
     }
