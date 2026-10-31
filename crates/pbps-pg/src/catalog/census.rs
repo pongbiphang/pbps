@@ -75,10 +75,21 @@ pub(super) fn notices(rows: &[Value]) -> Result<Vec<String>, DbError> {
         // Decode every field even when a flag would exclude the object:
         // an unreadable row is never an empty census.
         let kind = super::text(row, "kind")?;
-        let identity = super::text(row, "identity")?;
+        let identity = super::optional_text(row, "identity")?;
         let system = super::flag(row, "system")?;
         let extension = super::flag(row, "extension_member")?;
         let owned = super::flag(row, "model_owned")?;
+        // A lost identity is unreadable evidence even for an excluded object
+        // (DEC-2558.1). Missing keys and malformed flags remain shape errors.
+        let identity = identity.ok_or_else(|| {
+            DbError::Refused(format!(
+                "the catalog changed while it was being read: a census object (kind `{}`) \
+                 was there when the catalog was scanned and gone when its identity was resolved.\n\
+                 Something applied DDL to this database during the pull. \
+                 Run it again when the other change has finished.",
+                pbps_model::escape::Escaped(&kind),
+            ))
+        })?;
         if !system && !extension && !owned {
             out.push(format!(
                 "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison",
@@ -134,5 +145,200 @@ mod tests {
         let mut user = row;
         user["system"] = false.into();
         assert!(notices(&[user]).unwrap()[0].contains("odd\\nname"));
+    }
+
+    #[test]
+    fn census2558_null_identity_is_catalog_movement_for_every_classification() {
+        for system in [false, true] {
+            for extension in [false, true] {
+                for owned in [false, true] {
+                    let row = serde_json::json!({"kind":"base type", "identity":null,
+                        "system":system, "extension_member":extension, "model_owned":owned});
+                    assert_catalog_moved(&[row]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn census2558_missing_and_wrong_fields_stay_shape_errors_with_null_identity() {
+        let row = serde_json::json!({"kind":"base type", "identity":null,
+            "system":true, "extension_member":true, "model_owned":true});
+        for key in [
+            "kind",
+            "identity",
+            "system",
+            "extension_member",
+            "model_owned",
+        ] {
+            let mut missing = row.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                matches!(notices(&[missing]), Err(DbError::BadRow(_))),
+                "{key}"
+            );
+            let mut wrong = row.clone();
+            wrong[key] = serde_json::json!(7);
+            assert!(
+                matches!(notices(&[wrong]), Err(DbError::BadRow(_))),
+                "{key}"
+            );
+            if key != "identity" {
+                let mut unreadable = row.clone();
+                unreadable[key] = Value::Null;
+                assert!(
+                    matches!(notices(&[unreadable]), Err(DbError::BadRow(_))),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn census2558_an_empty_rowset_remains_empty() {
+        assert!(notices(&[]).unwrap().is_empty());
+    }
+
+    fn assert_catalog_moved(rows: &[Value]) {
+        let error = notices(rows).unwrap_err();
+        assert!(matches!(&error, DbError::Refused(_)), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("the catalog changed while it was being read"),
+            "{message}"
+        );
+        assert!(message.contains("kind `base type`"), "{message}");
+        assert!(message.contains("Run it again"), "{message}");
+        assert!(!message.contains("gone out of step"), "{message}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+    async fn census2558_dropped_identity_is_catalog_movement_on_pg16() {
+        dropped_identity("PBPS_TEST_PG_OLD_DB").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+    async fn census2558_dropped_identity_is_catalog_movement_on_pg18() {
+        dropped_identity("PBPS_TEST_PG_DB").await;
+    }
+
+    async fn dropped_identity(variable: &str) {
+        use pbps_db::{Conn, Driver};
+        use std::time::{Duration, Instant};
+
+        let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
+        let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let mut dropper = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let schema = format!("census2558_{}", std::process::id());
+        dropper
+            .execute(&format!(
+                "CREATE SCHEMA {schema}; CREATE TYPE {schema}.e AS ENUM ('x')"
+            ))
+            .await
+            .unwrap();
+        let rows = dropper
+            .query(&format!(
+                "SELECT typarray::int8 AS oid FROM pg_catalog.pg_type \
+             WHERE oid = '{schema}.e'::regtype"
+            ))
+            .await
+            .unwrap();
+        let array_oid = super::super::number(&rows[0], "oid").unwrap();
+        let rows = reader
+            .query("SELECT pg_catalog.pg_backend_pid()::int8 AS pid")
+            .await
+            .unwrap();
+        let pid = super::super::number(&rows[0], "pid").unwrap();
+        let rows = dropper
+            .query(&format!(
+                "SELECT identity FROM pg_catalog.pg_identify_object(\
+             'pg_catalog.pg_type'::regclass, {array_oid}::oid, 0)"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::text(&rows[0], "identity").unwrap(),
+            format!("{schema}.e[]")
+        );
+        dropper
+            .query(&format!(
+                "SELECT pg_catalog.pg_advisory_lock(2558, {pid}::int)"
+            ))
+            .await
+            .unwrap();
+
+        reader
+            .execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+
+        // The materialized row must pass the advisory barrier before the
+        // syscache lookup. A queued lock proves the scan/deparse gap without
+        // relying on a sleep or changing the production census query.
+        let query = format!(
+            "WITH scanned AS MATERIALIZED (\
+               SELECT oid FROM pg_catalog.pg_type WHERE oid = {array_oid}::oid\
+             ), held AS MATERIALIZED (\
+               SELECT oid, pg_catalog.pg_advisory_xact_lock(2558, {pid}::int) FROM scanned\
+             ) SELECT jsonb_build_object(\
+                 'kind', 'base type', 'identity', i.identity,\
+                 'system', false, 'extension_member', false, 'model_owned', true)::text AS payload \
+               FROM held o CROSS JOIN LATERAL pg_catalog.pg_identify_object(\
+                 'pg_catalog.pg_type'::regclass, o.oid, 0) i"
+        );
+        let (rows, ()) = tokio::join!(reader.query(&query), async {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let waiting = dropper
+                    .query(&format!(
+                        "SELECT EXISTS (SELECT FROM pg_catalog.pg_locks \
+                     WHERE pid = {pid} AND locktype = 'advisory' AND NOT granted) AS waiting"
+                    ))
+                    .await
+                    .unwrap();
+                if waiting[0].try_get::<bool>("waiting").unwrap() == Some(true) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the statement never reached its held row"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            dropper
+                .execute(&format!("DROP TYPE {schema}.e"))
+                .await
+                .unwrap();
+            let unlocked = dropper
+                .query(&format!(
+                    "SELECT pg_catalog.pg_advisory_unlock(2558, {pid}::int) AS unlocked"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(unlocked[0].try_get::<bool>("unlocked").unwrap(), Some(true));
+        });
+        // Clean the fixture before checking the decoder so the revert witness
+        // also leaves no schema or session lock behind on its expected failure.
+        reader.execute("ROLLBACK").await.unwrap();
+        dropper
+            .execute(&format!("DROP SCHEMA {schema}"))
+            .await
+            .unwrap();
+        let rows = rows.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the held scan must retain the dropped address"
+        );
+        let payload = super::super::text(&rows[0], "payload").unwrap();
+        let row: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            row.get("identity"),
+            Some(&Value::Null),
+            "the identity lookup must observe the drop: {row}"
+        );
+        assert_catalog_moved(&[row]);
     }
 }
