@@ -161,6 +161,7 @@ impl<'a> Session<'a> {
         // so a new runtime setting requires a decision instead of leaking in.
         let config = pbps_config::Config {
             dialect: source.dialect,
+            databases: None,
             trusted_roles: source.trusted_roles.clone(),
             pin_type_routines: source.pin_type_routines,
             schema_dir: source.schema_dir.clone(),
