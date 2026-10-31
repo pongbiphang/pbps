@@ -449,7 +449,18 @@ fn sibling_domain_default_losses_use_the_same_rule_in_alter_and_rebuild_plans() 
 #[ignore = "needs PostgreSQL 16 and 18"]
 fn sibling_default_losses_follow_partition_trees_without_removing_existing_refusals() {
     engines(|server| {
+        // A table target directly covers every column; a column writer can
+        // omit an uncontracted nullable sibling or use its inherited DEFAULT.
         for (label, parent, local, nullable, entry, expected, rejects_insert) in [
+            (
+                "nullable local for leaf writer",
+                None,
+                Some("8"),
+                true,
+                "app.leaf.a",
+                0,
+                false,
+            ),
             (
                 "inherited loss",
                 Some("7"),
@@ -459,9 +470,26 @@ fn sibling_default_losses_follow_partition_trees_without_removing_existing_refus
                 2,
                 true,
             ),
-            ("local loss", None, Some("8"), false, "app.t.a", 2, true),
             (
-                "parent fallback",
+                "local loss for parent writer",
+                None,
+                Some("8"),
+                false,
+                "app.t.a",
+                2,
+                true,
+            ),
+            (
+                "local loss for leaf writer",
+                None,
+                Some("8"),
+                false,
+                "app.leaf.a",
+                2,
+                true,
+            ),
+            (
+                "parent fallback for parent writer",
                 Some("7"),
                 Some("8"),
                 false,
@@ -469,17 +497,53 @@ fn sibling_default_losses_follow_partition_trees_without_removing_existing_refus
                 0,
                 false,
             ),
-            ("nullable local", None, Some("8"), true, "app.t.a", 0, false),
             (
-                "existing local match",
+                "parent fallback for leaf writer",
+                Some("7"),
+                Some("8"),
+                false,
+                "app.leaf.a",
+                0,
+                false,
+            ),
+            (
+                "nullable local for parent writer",
                 None,
                 Some("8"),
                 true,
-                "app.leaf.a",
+                "app.t.a",
+                0,
+                false,
+            ),
+            (
+                "direct nullable column",
+                None,
+                Some("8"),
+                true,
+                "app.leaf.b",
+                2,
+                false,
+            ),
+            (
+                "table writer covers nullable column",
+                None,
+                Some("8"),
+                true,
+                "app.leaf",
+                2,
+                false,
+            ),
+            (
+                "table writer covers changed fallback",
+                Some("7"),
+                Some("8"),
+                false,
+                "app.leaf",
                 2,
                 false,
             ),
         ] {
+            eprintln!("partition DEFAULT case: {label}");
             let own = OwnDatabase::new(server, "sibling_partition2453");
             let c = own.connection();
             let d = Demo::new("sibling-partition");
@@ -497,9 +561,10 @@ fn sibling_default_losses_follow_partition_trees_without_removing_existing_refus
             on_server(c, "BEGIN; INSERT INTO app.leaf(a) VALUES(1); ROLLBACK");
             d.table(&tree(if local.is_none() { None } else { parent }, None));
             config(&d, Some((entry, true)));
-            check(&d, c, expected);
-            config(&d, None);
-            let saved = check(&d, c, 0).unwrap();
+            let saved = check(&d, c, expected).unwrap_or_else(|| {
+                config(&d, None);
+                check(&d, c, 0).unwrap()
+            });
             let text = serde_json::to_string(&saved).unwrap();
             assert!(
                 text.contains(if local.is_some() {
@@ -510,9 +575,21 @@ fn sibling_default_losses_follow_partition_trees_without_removing_existing_refus
                 "{label}: {text}"
             );
             apply(&d, c);
-            // The final case deliberately pins the pre-existing conservative
-            // refusal even though NULL remains legal; #2453 only adds protection.
-            nullable_write(c, "INSERT INTO app.leaf(a) VALUES(1)", !rejects_insert);
+            if rejects_insert {
+                rejects_null(c, "INSERT INTO app.leaf(a) VALUES(1)");
+            } else {
+                on_server(
+                    c,
+                    &format!(
+                        "DO $case$ DECLARE supplied integer; BEGIN \
+                     INSERT INTO app.leaf(a) VALUES(1) RETURNING b INTO supplied; \
+                     IF supplied IS DISTINCT FROM {} THEN \
+                     RAISE EXCEPTION 'wrong effective sibling value'; \
+                     END IF; END $case$",
+                        parent.unwrap_or("NULL")
+                    ),
+                );
+            }
         }
     });
 }

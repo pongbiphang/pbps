@@ -79,11 +79,11 @@ pub(super) fn classify(
         }) && pair.nullability(entry.writes)
             && !pair.supplied()
     };
-    let default = |pair: ColumnPair<'_>, affected| {
+    let default = |pair: ColumnPair<'_>| {
         entry.writes
-            // A column writer can omit a sibling supplied by its DEFAULT.
-            // Keep every existing match, including partition-local matches.
-            && (affected
+            // Direct contracts cover the pair; sibling writers only need its
+            // last required value source (DEC-2536.1).
+            && (pair_hit(pair)
                 || (written_pair(pair)
                     && pair.after.is_some_and(|after| {
                         !after.column.nullable
@@ -120,7 +120,7 @@ pub(super) fn classify(
                                 DomainHalf::Loosen
                             }
                         }) && nullability(pair))
-                            || (half != Some(DomainHalf::Tighten) && default(pair, pair_hit(pair)))
+                            || (half != Some(DomainHalf::Tighten) && default(pair))
                             || (half != Some(DomainHalf::Loosen)
                                 && (collation(pair)
                                     || (entry.writes
@@ -210,7 +210,7 @@ pub(super) fn classify(
         Change::AlterColumnDefault { uid, .. } => interfaces
             .columns()
             .filter(|pair| pair.has_uid(uid))
-            .any(|pair| default(pair, pair_hit(pair)))
+            .any(default)
             .then_some(U),
         Change::AlterColumnExpression { uid, .. } => {
             (column(uid) || (entry.writes && hit)).then_some(U)
@@ -242,7 +242,7 @@ pub(super) fn classify(
             .filter(|pair| {
                 table == Some(pair.table) && pair.addresses().any(|at| &at.name == column)
             })
-            .any(|pair| default(pair, hit))
+            .any(default)
             .then_some(U),
         Change::SetPartitionNotNull { column, .. } => interfaces
             .columns()
