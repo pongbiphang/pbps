@@ -3990,15 +3990,31 @@ pub async fn rebuild_names(
 }
 
 /// Every dependent of every module this plan drops, read inside the caller's
-/// transaction (`modules::dependents` refuses outside one). Empty on SQL
-/// Server, whose `CREATE OR ALTER` rebuilds nothing.
+/// transaction (`modules::dependents` refuses outside one). SQL Server captures
+/// DEFAULT holders only for explicit routine drops (DEC-2455.1).
 async fn module_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
 ) -> anyhow::Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>> {
     let mut found = BTreeMap::new();
-    if conn.driver() != Driver::Postgres {
-        return Ok(found);
+    if conn.driver() == Driver::Mssql {
+        // CREATE OR ALTER does not drop a routine; only explicit teardown does.
+        let roots = changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::DropModule {
+                    id,
+                    kind: pbps_model::ModuleKind::Function,
+                } = &p.change
+                {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        return Ok(pbps_mssql::catalog::module_default_dependents(conn, &roots).await?);
     }
     for (id, kind) in crate::dependents::dropped_modules(changes) {
         let deps = pbps_pg::modules::dependents(conn, &id, kind).await?;
@@ -4016,9 +4032,8 @@ async fn module_dependents(
 /// held to the same bar as one the declarations edit.
 ///
 /// It is where a connected plan is scheduled, on either engine: SQL Server
-/// has no module dependents to read, and its plan goes through the schedule
-/// with the members of the roles it drops, `role_members`, which the caller
-/// read when there were any.
+/// supplies DEFAULT holders for explicit routine drops, along with the members
+/// of the roles it drops, `role_members`, which the caller read when needed.
 ///
 /// `rediff` plans the same revision again with the given unchanged modules
 /// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
@@ -4054,14 +4069,32 @@ pub async fn account_for_module_dependents<
         None => crate::dependents::schedule::Facts::default(),
     };
     if conn.driver() != Driver::Postgres {
+        let found = module_dependents(conn, &changes).await?;
+        let read = read.with_module_dependents(&found);
         let scheduled =
             crate::dependents::schedule::schedule(changes, &declarations, &read, dialect)?;
-        return Ok((scheduled.changes, ConnectedCheck {
-            name: "module_dependents",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
-        }));
+        return Ok((
+            scheduled.changes,
+            ConnectedCheck {
+                name: "module_dependents",
+                engine: "SQL Server",
+                status: if found.values().any(|v| !v.is_empty()) {
+                    "passed"
+                } else {
+                    "not_applicable"
+                },
+                message: if found.is_empty() {
+                    "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into()
+                } else {
+                    format!(
+                        "{} DEFAULT holder(s) of {} dropped routine(s) accounted for; {} change(s) added",
+                        found.values().map(Vec::len).sum::<usize>(),
+                        found.len(),
+                        scheduled.added
+                    )
+                },
+            },
+        ));
     }
     // Version is observed once, before the pure expansion. Ordinary CLI
     // planning has no extra write-path schemas (DEC-1503.1).
@@ -4297,9 +4330,14 @@ async fn check_module_dependency_facts(
     let left = crate::dependents::unaccounted(changes, &found, &partitions, &sources);
     if !left.is_empty() {
         anyhow::bail!(
-            "module_dependents (PostgreSQL): the database now holds dependents this plan does not \
+            "module_dependents ({}): the database now holds dependents this plan does not \
              remove before dropping what they depend on, so the engine would refuse the drop:\n  {}\n\
              Plan again, so the plan accounts for them where the approver can see it.",
+            if conn.driver() == Driver::Mssql {
+                "SQL Server"
+            } else {
+                "PostgreSQL"
+            },
             left.join("\n  ")
         );
     }

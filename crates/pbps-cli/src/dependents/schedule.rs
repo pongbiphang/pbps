@@ -398,6 +398,10 @@ fn oracle_schedule(
         // (#1553).
         after_the_rows_that_leave(&mut cs, declared.schema).map_err(Refusal::module_passes)?;
         settle_public_execution(&mut cs, decisions);
+    } else if let Some(found) = facts.module_dependents {
+        // Explicit SQL Server routine drops have the same DEFAULT obligations.
+        added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
+            .map_err(Refusal::module_passes)?;
     }
     // The differ sorted the role drops before it could know who holds whom;
     // once the members are in, a role holding another dropped role goes
