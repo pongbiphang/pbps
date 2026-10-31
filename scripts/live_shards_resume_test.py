@@ -7,6 +7,7 @@ and `free`. No fixture is started. Run: python3 scripts/live_shards_resume_test.
 """
 
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -344,6 +345,140 @@ class Resume(Harness):
         self.assertNotEqual(result.returncode, 0)
         logs = "".join(p.read_text() for p in output.glob("pg/*.log"))
         self.assertIn("test list changed", logs)
+
+
+class Chain(Harness):
+    """A resume's evidence is the whole chain behind it, not only the last link."""
+
+    def proved(self, output):
+        """Names this run's receipts prove or carry, by their own account."""
+        names = set()
+        for row in self.receipts(output).values():
+            names |= set(row["carried"])
+            if row["valid"]:
+                names |= {n for n, r in row["reported"].items() if r["status"] == "ok"}
+        return names
+
+    def ran(self, output):
+        return {n for row in self.receipts(output).values() for n in row["reported"]}
+
+    def lose_a_receipts(self, output):
+        """Model a run killed before the `--lib` invocation wrote any receipt."""
+        lost = [p for p, row in self.receipts(output).items() if "--lib" in row["args"]]
+        self.assertTrue(lost)
+        for path in lost:
+            path.unlink()
+        (output / "summary.json").unlink(missing_ok=True)
+
+    def test_a_resume_interrupted_before_its_receipts_still_inherits_the_first_runs_names(self):
+        first = self.stopped_run()
+        proven = self.proved(first)
+        self.assertTrue(proven & set(A_NAMES))
+        _, second = self.drive("--resume", str(first), check=0)
+        self.lose_a_receipts(second)
+        _, third = self.drive("--resume", str(second), check=0)
+        self.assertEqual(self.ran(third) & proven, set(), "names proven by the first run are rerun")
+        summary = self.summary(third)
+        self.assertEqual((summary["pg"]["union"], summary["pg"]["passed"]), ("exact", len(A_NAMES) + len(B_NAMES)))
+        self.assertEqual(summary["pg"]["carried"], len(self.proved(third) - self.ran(third)))
+        self.assertTrue(proven <= set(n for row in self.receipts(third).values() for n in row["carried"]))
+        audited, _ = PlainRun.shards_audit(self, third)
+        self.assertEqual(json.loads(audited.stdout)["union"], "exact")
+
+    def test_a_chain_of_three_interrupted_links_keeps_every_links_names(self):
+        first = self.stopped_run()
+        proven = self.proved(first)
+        _, second = self.drive("--resume", str(first), die="b03")
+        self.lose_a_receipts(second)
+        _, third = self.drive("--resume", str(second), die="b04")
+        self.lose_a_receipts(third)
+        survivors = self.proved(third) - set(n for row in self.receipts(third).values() for n in row["carried"]
+                                             if "--lib" not in row["args"])
+        _, fourth = self.drive("--resume", str(third), check=0)
+        self.assertEqual(self.ran(fourth) & proven, set())
+        self.assertEqual(self.ran(fourth) & (self.proved(third) - set(A_NAMES)), set())
+        self.assertEqual(self.summary(fourth)["pg"]["union"], "exact")
+        self.assertTrue(survivors <= self.proved(fourth))
+        runs = {r["run"] for row in self.receipts(fourth).values() for r in row["carried"].values()}
+        self.assertIn(json.loads((first / "manifest.json").read_text())["run_id"], runs)
+
+    def test_the_failure_history_survives_a_link_without_receipts(self):
+        self.set_register([{"test": "a03", "cargo": CARGO, "issue": 1, "expires": Resume.soon(self)}])
+        _, first = self.drive(fail=["a03"])
+        _, second = self.drive("--resume", str(first))
+        self.lose_a_receipts(second)
+        _, third = self.drive("--resume", str(second), check=0)
+        counts = json.loads((third / "manifest.json").read_text())["failed"]["pg"]
+        self.assertEqual([c["a03"] for c in counts.values() if "a03" in c], [1])
+
+    def snapshot_case(self, mutate, fragment):
+        first = self.stopped_run()
+        _, second = self.drive("--resume", str(first), check=0)
+        mutate(second)
+        result, output = self.drive("--resume", str(second))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(fragment, result.stderr)
+        self.assertFalse(output.exists(), "a refused resume creates no output")
+
+    def rewrite(self, directory, **changes):
+        """Change resume-input.json and keep the manifest's digest of it honest."""
+        path = directory / "resume-input.json"
+        snapshot = json.loads(path.read_text())
+        snapshot.update(changes)
+        path.write_text(json.dumps(snapshot))
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["resumed_from"]["snapshot_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+
+    def test_a_tampered_or_mismatched_inherited_snapshot_is_refused(self):
+        def add_name(directory):
+            path = directory / "resume-input.json"
+            snapshot = json.loads(path.read_text())
+            next(iter(snapshot["keys"]["pg"].values()))["ok"]["a99"] = {"status": "ok", "seconds": 1, "run": "x"}
+            path.write_text(json.dumps(snapshot))  # the manifest's digest no longer matches
+
+        def keys_with(directory, edit):
+            snapshot = json.loads((directory / "resume-input.json").read_text())
+            edit(next(iter(snapshot["keys"]["pg"].values())))
+            self.rewrite(directory, keys=snapshot["keys"])
+
+        cases = {
+            "contents changed": (add_name, "does not match its digest"),
+            "snapshot missing": (lambda d: (d / "resume-input.json").unlink(), "unreadable resume snapshot"),
+            "snapshot truncated": (lambda d: (d / "resume-input.json").write_text('{"keys"'), "does not match its digest"),
+            "no digest in the manifest": (lambda d: self.edit_manifest_link(d, snapshot_sha256=None), "no digest"),
+            "malformed after a matching digest": (lambda d: self.rewrite(d, keys=[]), "malformed resume snapshot"),
+            "snapshot of another run": (lambda d: self.rewrite(d, run_id="f" * 32), "another run"),
+            "snapshot of another head": (lambda d: self.rewrite(d, tree="0" * 40), "another head"),
+            "snapshot of other inputs": (lambda d: self.rewrite(d, inputs="1" * 64), "another head"),
+            "ok name outside the list": (lambda d: keys_with(d, lambda e: e["ok"].update(
+                zz={"status": "ok", "seconds": 1, "run": "x"})), "malformed resume snapshot"),
+            "ok status that is not ok": (lambda d: keys_with(d, lambda e: e["ok"].update(
+                {e["listed"][0]: {"status": "FAILED", "seconds": 1, "run": "x"}})), "malformed resume snapshot"),
+            "list that disagrees with the receipts": (lambda d: keys_with(d, lambda e: e["listed"].append("zz")),
+                                                      "disagree"),
+        }
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name):
+                self.snapshot_case(mutate, fragment)
+
+    def edit_manifest_link(self, directory, **changes):
+        path = directory / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["resumed_from"].update(changes)
+        path.write_text(json.dumps(manifest))
+
+    def test_a_receipt_carrying_what_the_snapshot_never_proved_is_refused(self):
+        first = self.stopped_run()
+        _, second = self.drive("--resume", str(first), check=0)
+        for path, row in self.receipts(second).items():
+            if "--lib" in row["args"]:  # every shard agrees, so only the snapshot can contradict them
+                row["carried"]["a98"] = {"status": "ok", "seconds": 1, "run": "x"}
+                path.write_text(json.dumps(row))
+        result, _ = self.drive("--resume", str(second))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("never proved", result.stderr)
 
 
 class Flakes(Harness):

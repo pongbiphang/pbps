@@ -1595,9 +1595,14 @@ pinned in them, so the digest covers only what the tree cannot: the toolchain
 (every `PBPS_*`, `INSTA_*` and `CARGO_PROFILE_*` variable and the `RUSTFLAGS`
 family), minus scheduling and fixture identity. A receipt is evidence only when it
 parses, carries both values equal to the current ones and is `valid`; a missing
-receipt is merely an unproven name. An unreadable, partial or mismatched previous
-output refuses. A `FAILED` name outside the register of DEC-2553.2, or one that
-failed more than twice on a head, refuses, whatever row reported it. A resume may
+receipt is merely an unproven name. A resumed run also keeps what it inherited: its
+`resume-input.json` is read back, checked against the digest in its manifest and
+against the current head and inputs, and merged with its receipts, so a resume of a
+resume loses nothing when a link stops before an invocation writes receipts, and
+every link of a chain answers to the same head and inputs. An unreadable, partial
+or mismatched previous output, or inherited snapshot, refuses. A `FAILED` name outside the register of DEC-2553.2, or one that
+failed more than twice on a head, counted across the whole chain, refuses,
+whatever row reported it. A resume may
 use other shard counts and weights, since ok-ness is per invocation and name, and
 it still starts each suite's fixtures. The accepted gaps are gitignored files,
 `~/.cargo/config.toml`, the engine and host, and time-dependent tests, which keep
