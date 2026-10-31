@@ -7817,9 +7817,11 @@ async fn plan_db_async(
             let after = pbps_diff::Side { schema: &declared, ids: &resolved.ids };
             let requests = pbps_diff::retained::candidates(before,after,&hints);
             if !requests.is_empty() && pbps_pg::retained::available(&mut conn,&requests).await {
-                hints.retained_expressions = crate::resolution::retained::compare(
+                // Paired binding carries the resolver lifecycle. Keep its future
+                // separate from the connected planner's other binding phases.
+                hints.retained_expressions = Box::pin(crate::resolution::retained::compare(
                     entry,&mut conn,target,before,after,&read_back,&hints,&requests,
-                ).await?;
+                )).await?;
             }
         }
         // The modules a rebuilt enum's columns carry, found in the planning
@@ -10322,7 +10324,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
     }
-    let closing = async {
+    // Keep the closing guard's large future off every caller's apply future,
+    // including transactional applies that never enter this staged path.
+    let closing = Box::pin(async {
         let retained = crate::engine::hold_retained(conn, &plan.changes, None).await?;
         // The closing entry is an ordinary apply with no staged marker: its absence
         // is what tells every later command this environment is no longer
@@ -10440,7 +10444,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             .await?;
         }
         Ok(id)
-    }
+    })
     .await;
     if retaining {
         finish_transaction(conn, dialect, closing).await
