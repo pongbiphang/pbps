@@ -10,6 +10,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/stand_in.rs"]
+mod stand_in;
+
 #[cfg(test)]
 #[path = "../../pbps-diff/tests/support/role_order.rs"]
 mod role_order_oracle;

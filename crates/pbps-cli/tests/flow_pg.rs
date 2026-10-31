@@ -19,6 +19,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/stand_in.rs"]
+mod stand_in;
+
 #[path = "support/trace.rs"]
 mod trace;
 

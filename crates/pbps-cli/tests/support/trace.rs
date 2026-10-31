@@ -1179,7 +1179,13 @@ fn disposal_records_survive_a_blocked_late_writer() {
             .env("PBPS_TRACE_ATTEMPTED", &attempted);
         command
     };
-    assert_eq!(command().output().unwrap().status.code(), Some(1));
+    assert_eq!(
+        stand_in::retry_exec(|| command().output())
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
     assert!(std::fs::metadata(&attempted).unwrap().len() > 0);
     // Redirection opens before this function runs. With the old `>` recorder,
     // ready therefore proves that the previous record has been truncated.
@@ -1192,13 +1198,15 @@ fn disposal_records_survive_a_blocked_late_writer() {
         ),
     );
     let mut late = Reap(
-        command()
-            .env("PBPS_TRACE_BLOCKED", &ready)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        stand_in::retry_exec(|| {
+            command()
+                .env("PBPS_TRACE_BLOCKED", &ready)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+        .unwrap(),
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !ready.exists() {
