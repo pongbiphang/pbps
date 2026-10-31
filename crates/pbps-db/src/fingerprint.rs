@@ -526,14 +526,17 @@ mod tests {
 
         let dir = KeyDirectory::new();
         let path = dir.0.join("key.fifo");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .unwrap();
+        // The POSIX utility also exists on macOS, where rustix has no mknodat.
+        let made = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&path)
+            .output()
+            .expect("the FIFO regression requires the POSIX mkfifo utility");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
         // Bound even an opener that blocks: a timeout thread cannot cancel open(2).
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
