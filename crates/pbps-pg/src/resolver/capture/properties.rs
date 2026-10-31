@@ -20,7 +20,7 @@ use pbps_db::resolver::capture::rules::{Coverage, unclassified};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub(super) const RULE: &str = "postgres-catalog-inputs-v2";
+pub(super) const RULE: &str = "postgres-catalog-inputs-v3";
 pub(super) const CLASSES: &[&str] = &[
     "pg_namespace",
     "pg_class",

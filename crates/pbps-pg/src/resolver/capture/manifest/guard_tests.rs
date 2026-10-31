@@ -586,3 +586,6 @@ fn policy_ownership_refuses_unreadable_or_mismatched_catalog_provenance() {
         }
     }
 }
+
+#[path = "partition1566_tests.rs"]
+mod partition1566;

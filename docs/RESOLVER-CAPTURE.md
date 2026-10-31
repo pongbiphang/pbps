@@ -146,8 +146,10 @@ ordinary connection, and compares no executable.
 
 ## Private comparison and delivery limits
 
-Rule `postgres-catalog-inputs-v2` defines the complete property and binding
-representations; v1, which fingerprinted owners and ACLs, is no longer read. Comparisons use HMAC-SHA256 fingerprints, framed by the rule
+Rule `postgres-catalog-inputs-v3` defines the complete property and binding
+representations and partition-aware ownership (DEC-1566.1); v1 and v2 evidence
+are no longer read. Its closed partition-bound layouts retain nested type and
+collation references and refuse unknown or missing fields. Comparisons use HMAC-SHA256 fingerprints, framed by the rule
 and the input's component, over canonical properties, full engine definitions
 including literals, logical bindings, recorded baseline and effective session
 inputs. Membership/absence is explicit. Identity equality alone cannot hide a

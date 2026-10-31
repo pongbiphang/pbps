@@ -62,7 +62,7 @@ fn sealed(
     // Use the public sealing constructors so an invalid fixture cannot turn an
     // explanation regression into an unrelated deserialization refusal.
     let manifest = InputManifest::new(
-        "postgres-catalog-inputs-v2".into(),
+        "postgres-catalog-inputs-v3".into(),
         18,
         "01".repeat(8),
         ReadScope {
