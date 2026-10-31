@@ -1410,6 +1410,7 @@ dependencies = [
  "pbps-dialect",
  "pbps-model",
  "rand 0.10.2",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "schemars",
