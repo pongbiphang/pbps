@@ -54,6 +54,46 @@ introduce execution outside the closed expression vocabulary. Ordinary alias
 types remain allowed. Refusals name the stored-column/non-CLR-type remedy and
 the transition CHECK or planned assertion alternatives.
 
+### SQL Server predicates without regular expressions
+
+SQL Server drop requirements do not accept `REGEXP_*` functions
+(DEC-2426.1). Use the allowlisted arithmetic and string functions for mappings
+that they express: `REPLACE` for fixed punctuation, `CHARINDEX` with `LEFT` or
+`SUBSTRING` for delimiter-based extraction, and `LOWER`, `UPPER`, `LTRIM` or
+`RTRIM` for normalization. For example, a requirement can compare
+`normalized_code = LOWER(LTRIM(RTRIM(old_code)))`. Function availability still
+depends on the target engine and compatibility level.
+
+These are not general regex substitutes. `LIKE` ranges follow the target
+collation, so `[A-Z]` need not enforce case-sensitive ASCII; a fixed number of
+`REPLACE` passes need not collapse an arbitrary run of whitespace.
+
+For a mapping outside that vocabulary, add a transition CHECK and validate it
+against existing rows. On SQL Server 2025, a whitespace-normalization mapping
+can use this CHECK expression:
+
+```sql
+CHECK (
+    source_text IS NOT NULL
+    AND normalized_text IS NOT NULL
+    AND normalized_text = REGEXP_REPLACE(LTRIM(RTRIM(source_text)), N'\s+', N' ')
+)
+```
+
+The explicit NULL guards matter: a CHECK accepts UNKNOWN, while a drop
+requirement demands TRUE. Keep the validated CHECK enabled through the contract
+step, including writes after planning; do not remove it in an earlier deploy.
+If the contract removes its source column or table, retire the CHECK with that
+structure. The example requires native engine support: `REGEXP_REPLACE` works
+on the measured 2025 build at compatibility 160 and 170; SQL Server 2022 has no
+native regex functions. This does not admit regex into a drop requirement or
+add an execution hook.
+
+Plan-time assertions (#2401, planned) are another place for evidence outside
+the row-predicate vocabulary. Their result describes the rows at planning time;
+it does not protect against a violating write before the contract. Use the
+transition CHECK when that interval needs continuous enforcement.
+
 ### Execution and locking
 
 Immediately before removing the guarded structure, pbps generates the count:

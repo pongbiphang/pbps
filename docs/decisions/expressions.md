@@ -1278,3 +1278,34 @@ Live: `json_value_regeneration_matches_native_three_valued_logic`.
 **DEC-2400.47. Predicate CASE.**
 Shape and gate: simple or searched, at least one WHEN arm, optional ELSE, at most ten nested levels; baseline major 10.
 Live: `case_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2426-1"></a>
+
+**DEC-2426.1. Keep SQL Server regular expressions outside drop requirements.**
+The #2426 survey found no concrete backfill blocked on regex support. Arithmetic,
+fixed punctuation removal and delimiter extraction fit the existing vocabulary.
+Strict ASCII validation and arbitrary whitespace normalization are real gaps;
+use a validated transition CHECK with explicit NULL guards, retained through the
+contract, or planned #2401 assertions for plan-time evidence only. The remedies
+and their limits are in [ADR-0020](../ADR-0020-guarded-drops.md).
+
+Measured on SQL Server 2025 17.0.4075.5, `REGEXP_LIKE` requires compatibility
+170; at 160 it gives error 195. `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`
+and `REGEXP_COUNT` work at both 160 and 170. SQL Server 2022 16.0.4295.3 at
+compatibility 160 gives 195 for all five, during execution and Describe.
+`REGEXP_LIKE` is a predicate: scalar and `= 1` positions fail with 156 and 102.
+Adding it therefore needs predicate grammar as well as an allowlist and
+capability gate. The other four fit the existing scalar mechanism; all would
+need per-function parity and refusal tests. No new connected API is needed.
+
+All five accepted MAX inputs through a measured 2 MiB (2,097,152-byte) UTF-8
+boundary and refused larger inputs with 19311. This is not SQL Server storage
+size: 2,097,152 ASCII characters in `nvarchar(max)` occupied 4 MiB and succeeded.
+Full-width `varchar(8000)` and `nvarchar(4000)` patterns succeeded; MAX-typed
+patterns failed with 8116 even below those widths. Raw SQL and outputs are linked
+from issue #2426 rather than checked into the repository. These facts describe
+the measured builds, not every engine version or Azure deployment.
+
+Keep the current parser, gates and formats unchanged. Revisit a bounded,
+version-gated addition when a concrete mapping justifies it. Table-valued regex
+functions remain excluded as subqueries; CLR and execution hooks are not remedies.
