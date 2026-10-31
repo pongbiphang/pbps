@@ -47,6 +47,8 @@ EXPRESS_INVENTORY = {
 EXPRESS_TESTS = set().union(*EXPRESS_INVENTORY.values())
 MANIFEST = "manifest.json"
 SNAPSHOT = "resume-input.json"
+# The proxy prints this, then a key, for a call whose every test was carried by a resume.
+CARRIED_LINE = "pbps-live-carried "
 REGISTER = "scripts/known-flakes.json"
 # A registered flake that fails a third time on one head is not flaky (DEC-2553.1).
 MAX_FLAKE_FAILURES = 2
@@ -585,7 +587,7 @@ def cargo_proxy(args):
     real = env["PBPS_LIVE_REAL_CARGO"]
     cargo, flags, listing = libtest_args(args)
     identity = hashlib.sha256(json.dumps(cargo).encode()).hexdigest()[:24]
-    invocation = hashlib.sha256(json.dumps(args).encode()).hexdigest()[:24]
+    invocation = invocation_id(args)
     # TLS repeats one exact command with three different trust inputs. Preserve
     # each occurrence as its own obligation instead of overwriting its receipt.
     occurrence = len(list(root.glob(invocation + "-*.json")))
@@ -602,6 +604,10 @@ def cargo_proxy(args):
     verify_express(groups)
     assigned = groups[index]
     print(f"shard {index}/{count} {key}: {len(assigned)}/{len(names)} tests", flush=True)
+    if carried and not assigned:
+        # A caller that checks per-test output sees nothing for a name proven
+        # earlier; this line is its cue to ask `carried_attestation`.
+        print(CARRIED_LINE + key, flush=True)
     reported, code, seconds, valid = {}, 0, 0.0, True
     if assigned:
         reported, code, seconds, valid = run_tests(
@@ -616,6 +622,37 @@ def cargo_proxy(args):
     write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
+
+
+def invocation_id(args):
+    return hashlib.sha256(json.dumps(args).encode()).hexdigest()[:24]
+
+
+def carried_attestation(output, args, env, occurrence):
+    """The names a validated resume carried for exactly this proxied cargo call.
+
+    A runner that checks the proxy's per-test output after the call cannot see
+    a name that was proven earlier, because nothing ran. It may accept the call
+    only here: the proxy printed `CARRIED_LINE` for the key this call must have
+    (its arguments and occurrence), and that key's receipt confirms, against the
+    run's own resume snapshot, head and inputs, that the whole list was carried
+    and nothing ran. Anything else, including a run without `--resume`, is None.
+    """
+    key = f"{invocation_id(args)}-{occurrence}"
+    if CARRIED_LINE + key not in output.splitlines():
+        return None
+    try:
+        row = read_json(Path(env["PBPS_LIVE_SHARD_DIR"]) / (key + ".json"), "receipt")
+        check_row(row, key)
+        proof = read_json(Path(env["PBPS_LIVE_RESUME"]), "resume snapshot")["keys"][env["PBPS_LIVE_SUITE"]][key]
+    except (KeyError, TypeError, ValueError):
+        return None
+    identity = row["tree"] is not None and (row["tree"], row["inputs"]) == (
+        env.get("PBPS_LIVE_TREE"), env.get("PBPS_LIVE_INPUTS"))
+    same = row["args"] == args and sorted(row["listed"]) == proof.get("listed")
+    carried = row["carried"] and row["carried"] == {n: proof["ok"][n] for n in row["listed"] if n in proof["ok"]}
+    nothing_ran = row["valid"] and not row["assigned"] and not row["reported"]
+    return sorted(row["carried"]) if identity and same and carried and nothing_ran else None
 
 
 def resumed(env, key, names):
