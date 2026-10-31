@@ -33,6 +33,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/object_refs2469.rs"]
 mod object_refs2469;
 
+#[path = "support/default_holders2455.rs"]
+mod default_holders2455;
+
 #[path = "support/drop_requirements2400_mssql.rs"]
 mod drop_requirements2400_mssql;
 

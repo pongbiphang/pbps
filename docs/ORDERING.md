@@ -477,7 +477,7 @@ requirement is common to all of them, so it is listed once,
 
 | Change | Class | Requires before it | Creates, removes or rewrites | Effects (checked) |
 |---|---|---|---|---|
-| `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
+| `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views and catalog-bound ordinary DEFAULT holders | Removes the module, frees its name | removes |
 | `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
 | `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |
@@ -727,7 +727,7 @@ one class and the dependents a class cannot see.
 |---|---|---|---|
 | `DropPolicy` → `DropModule`, `DropColumn` or `AlterColumnType` | fixed | class 0 before every module-drop rank and before classes 5/9; shared teardown edges survive settlement, including drop-only plans | ✓ DEC-1173.2 |
 | Dependent module → its table, column or retyped column | fixed | class 0 first. P: rebuilt around a retype from the catalog | ✓ DECISIONS 311; `to_rebuild` |
-| Catalog dependents of a dropped or rebuilt module | engine | `weave`, an expansion: added steps and `Catalog` edges, settled after each rewrite | ✓ DECISIONS 311, DEC-942.1, DEC-1958.2 |
+| Catalog dependents of a dropped or rebuilt module (S: ordinary DEFAULT holders of an explicit routine drop) | engine | `weave`, an expansion: added steps and `Catalog` edges, settled after each rewrite | ✓ DECISIONS 311, DEC-942.1, DEC-1958.2, DEC-2455.1 |
 | `DropModule` → `DropModule` of a module it names | fixed | `drop_rank`, deepest first inside class 0, from the base's lexed names | ✓ DECISIONS 311, 315 |
 | Generated column's release (expression change, column or table drop) → drop of the function it calls | engine | a `Catalog` edge from each release, and from the drops of dependent modules, to the drop | ✓ DEC-1168.1, DEC-1958.2 |
 | An identity given up → its column's nullability relaxed | fixed | rank −3 before −1. Measured on 16 and 18, `DROP NOT NULL` on an identity column is refused ("is an identity column") | ✓ DEC-1889.1 |

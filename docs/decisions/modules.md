@@ -2157,3 +2157,31 @@ Approved design §8.4 asks the dialect for an existing legal creation decomposit
 The transient contract travels beside draft planning state, preserving logical source spellings across permutations. Each existing settlement and the generic verifier project it onto current operation identities. Scratch uses the same hard projection, including paths through skipped logical vertices, and its existing inference fallback. This introduces no pass, rank, tie-break, YAML, persisted field or format bump; legacy ModuleDeps remains the wire contract until the first PR that persists a non-module annotation.
 
 Pinned by `order::annotations::tests` and its continuation tests, the explicit-cycle benchmark, and `annotations2469::module_to_object_annotations_drive_installs_and_removals` on PostgreSQL 16/18 and SQL Server.
+
+<a id="dec-2455-1"></a>
+
+**DEC-2455.1. SQL Server routine drops release ordinary DEFAULT holders through
+module-dependent facts and the existing weave.** A schema-bound input change
+requires DROP/CREATE even though ordinary module edits use CREATE OR ALTER
+(DEC-2329.2). Measured on 17.0.4075.5, a DEFAULT's constraint object has a
+schema-bound `sys.sql_expression_dependencies` edge to its function and blocks
+DROP FUNCTION with 3729. Capture resolves that edge to its owning table and
+column, behind the existing visibility proof; denied or unreadable evidence
+refuses, rather than becoming an empty set. Only actual function drops enter
+this SQL Server read, not in-place edits.
+
+The shared DEC-1958.2 weave adds or reuses ordinary AlterColumnDefault teardown
+and restoration operations, with its existing catalog edges and risks. After
+normalization invalidates positional proof, SQL Server re-derives those same
+weave edges for its final settlement. The existing effect-graph dependent
+closure carries consumers with each restoration: an insert using an omitted
+column's default or an update setting DEFAULT requires its final holder,
+whereas an explicit value has no such requirement. Keeping just the catalog
+edges would leave those writes in the release gap and could record NULL.
+Apply re-reads those same facts and checks the saved order; it adds no runtime DDL.
+When the caller column is also retyped, ReleaseGap(Default) (DEC-1896.1) keeps
+it between the pair. Decision 461's DEFAULT-preserving batch finds no DEFAULT
+there, so it performs no duplicate release or restoration. Without a routine
+drop, the ordinary retype keeps that batch and gains no extra typed changes.
+Computed callers (#1421) and general DEFAULT-rebuild classification (#1896)
+remain separate work; no consumer verdict or wire format changes here.
