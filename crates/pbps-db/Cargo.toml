@@ -57,5 +57,9 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 [target.'cfg(windows)'.dependencies]
 tiberius = { workspace = true, features = ["winauth"] }
 
+# Key files must be opened without blocking on a FIFO before their type is known.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

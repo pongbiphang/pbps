@@ -166,23 +166,60 @@ impl FingerprintKey {
     /// everyone on the host holds.
     #[cfg(unix)]
     pub fn from_file(path: &Path) -> Result<Self, KeyError> {
-        use std::os::unix::fs::PermissionsExt;
+        // A FIFO can block in open itself, before its type can be checked.
+        let file = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| KeyError::UnreadableFile {
+            path: path.to_owned(),
+            reason: std::io::Error::from(error).to_string(),
+        })?;
+        Self::from_open_file(path, file.into())
+    }
+
+    #[cfg(unix)]
+    fn from_open_file(path: &Path, mut file: std::fs::File) -> Result<Self, KeyError> {
+        use std::io::Read;
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
         let unreadable = |e: std::io::Error| KeyError::UnreadableFile {
             path: path.to_owned(),
             reason: e.to_string(),
         };
-        let mode = std::fs::metadata(path)
-            .map_err(unreadable)?
-            .permissions()
-            .mode()
-            & 0o777;
+        // The path may be replaced after open. Both the permission proof and
+        // the bytes must belong to this handle, including through a symlink.
+        let metadata = file.metadata().map_err(unreadable)?;
+        let kind = metadata.file_type();
+        if !kind.is_file() {
+            let kind = if kind.is_fifo() {
+                "FIFO"
+            } else if kind.is_dir() {
+                "directory"
+            } else if kind.is_socket() {
+                "socket"
+            } else if kind.is_block_device() {
+                "block device"
+            } else if kind.is_char_device() {
+                "character device"
+            } else {
+                "non-regular file"
+            };
+            return Err(KeyError::UnreadableFile {
+                path: path.to_owned(),
+                reason: format!("expected a regular file, found {kind}"),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(KeyError::OpenFile {
                 path: path.to_owned(),
                 mode,
             });
         }
-        let text = std::fs::read_to_string(path).map_err(unreadable)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(unreadable)?;
         Self::parse(&text, &format!("`{}`", path.display()))
     }
 
@@ -374,6 +411,163 @@ mod tests {
             Err(KeyError::UnreadableFile { .. })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct KeyDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl KeyDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("pbps-key-956-{:032x}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KeyDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_key(path: &Path, text: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_key_path_does_not_replace_the_checked_bytes() {
+        let dir = KeyDirectory::new();
+        let path = dir.0.join("key");
+        let replacement = dir.0.join("replacement");
+        let original = STANDARD.encode([1_u8; MIN_KEY_BYTES]);
+        let public = STANDARD.encode([2_u8; MIN_KEY_BYTES]);
+        write_key(&path, &original, 0o600);
+        write_key(&replacement, &public, 0o644);
+        let opened = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let loaded = FingerprintKey::from_open_file(&path, opened).unwrap();
+        assert_eq!(
+            loaded.id(),
+            FingerprintKey::parse(&original, "fixture").unwrap().id()
+        );
+        assert_ne!(
+            loaded.id(),
+            FingerprintKey::parse(&public, "fixture").unwrap().id()
+        );
+        assert!(matches!(
+            FingerprintKey::from_file(&path),
+            Err(KeyError::OpenFile { mode: 0o644, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_replacement_cannot_bless_an_opened_public_key() {
+        let dir = KeyDirectory::new();
+        let path = dir.0.join("key");
+        let replacement = dir.0.join("replacement");
+        let public = STANDARD.encode([3_u8; MIN_KEY_BYTES]);
+        write_key(&path, &public, 0o644);
+        write_key(&replacement, &FingerprintKey::generate(), 0o600);
+        let opened = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let error = FingerprintKey::from_open_file(&path, opened).unwrap_err();
+        assert!(matches!(&error, KeyError::OpenFile { mode: 0o644, .. }));
+        assert!(!error.to_string().contains(&public));
+        assert!(FingerprintKey::from_file(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_owner_only_file_can_supply_the_key() {
+        let dir = KeyDirectory::new();
+        let path = dir.0.join("key");
+        let alias = dir.0.join("alias");
+        let text = FingerprintKey::generate();
+        write_key(&path, &text, 0o600);
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert_eq!(
+            FingerprintKey::from_file(&alias).unwrap().id(),
+            FingerprintKey::parse(&text, "fixture").unwrap().id()
+        );
+        assert!(matches!(
+            FingerprintKey::from_file(&dir.0),
+            Err(KeyError::UnreadableFile { reason, .. }) if reason.contains("directory")
+        ));
+        // Following a symlink does not waive the target handle's permission check.
+        write_key(&path, &text, 0o644);
+        assert!(matches!(
+            FingerprintKey::from_file(&alias),
+            Err(KeyError::OpenFile { mode: 0o644, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_key_is_refused_without_waiting_for_a_writer() {
+        const CHILD_PATH: &str = "PBPS_TEST_956_FIFO_KEY_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let error = FingerprintKey::from_file(Path::new(&path)).unwrap_err();
+            assert!(
+                matches!(&error, KeyError::UnreadableFile { reason, .. } if reason.contains("FIFO")),
+                "{error}"
+            );
+            return;
+        }
+
+        let dir = KeyDirectory::new();
+        let path = dir.0.join("key.fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        // Bound even an opener that blocks: a timeout thread cannot cancel open(2).
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fingerprint::tests::a_fifo_key_is_refused_without_waiting_for_a_writer",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "key loading waited for a FIFO writer instead of refusing its type"
+        );
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(not(unix))]
