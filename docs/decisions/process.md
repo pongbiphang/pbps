@@ -1593,7 +1593,13 @@ fixture and nested-child owners retain exact entries and their DEC-1413.1
 source/witness contract. Uniform module subtrees are derived from current owners;
 mixed roots and indivisible mixed modules keep exact fallback without moving
 tests. The migration test proves that every legacy case retains its owner under
-the combined assignment. New ignored cases in covered modules need no file edit;
-uncovered modules get a rule. The legacy file is unchanged in this PR so existing
-branches may still append entries; covered entries can be removed in a separate
-cleanup. DEC-1370.1's complete CI selection guarantee remains unchanged.
+the combined assignment. New ignored cases discovered on their owner's platform
+can use covered modules without a file edit; uncovered modules get a rule.
+Rule-only cases must be discovered on the owner's
+job platform; a namespace supplies no cross-platform existence evidence. Exact
+entries retain that obligation on `validate_on`, and both sources use the same
+existence and ignore-condition checks. A foreign-platform rule-only case names
+the remedy: an exact entry with the right owner, or a locally executing owner.
+The legacy file is unchanged in this PR so existing branches may still append
+entries; cleanup must retain cross-platform existence entries. DEC-1370.1's
+complete CI selection guarantee remains unchanged.

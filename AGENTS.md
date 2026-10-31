@@ -110,7 +110,9 @@ Read before changing things:
 - Before queueing a full gate, confirm the head merges cleanly with
   `origin/master`. Rebase a conflicting head first.
 - Use the Python version CI pins.
-- A new `#[ignore]` test in a covered target/module needs no registry edit.
+- A new `#[ignore]` test discovered on its owner's platform can use a covered
+  target/module rule without a registry edit. Cross-platform discovery needs an
+  exact legacy entry or an owner that runs on the discovering platform.
   For an uncovered module, add a unique rule to `scripts/ignored-test-rules.json`.
   Python-driven and child-helper owners retain legacy exact entries; see
   `docs/TEST-EXECUTION.md`.

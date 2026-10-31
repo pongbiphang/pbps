@@ -912,6 +912,45 @@ class RuleOwnership(unittest.TestCase):
         self.inventory["groups"] = []
         self.assertEqual(self.check(), 1)
 
+    def test_windows_only_case_in_a_linux_rule_needs_owner_platform_evidence(self):
+        # Linux sees only the existing case; Windows additionally compiles the
+        # cfg(windows) case. A namespace cannot join those discovery results.
+        self.assertEqual(self.check("linux"), 1)
+        self.add_case("scope::windows_only")
+        with self.assertRaisesRegex(audit.InventoryError,
+                                   "scope::windows_only.*win32.*cannot be verified.*platform linux;.*"
+                                   "exact legacy entry.*runs on win32"):
+            self.check("win32")
+
+    def test_a_legacy_backed_linux_rule_case_can_be_discovered_on_both_platforms(self):
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self.check(platform), 1)
+
+    def test_legacy_evidence_still_requires_discovery_on_the_owner_platform(self):
+        self.assertEqual(self.check("win32"), 1)
+        self.targets[KEY]["all"].clear()
+        self.targets[KEY]["ignored"].clear()
+        with self.assertRaisesRegex(audit.InventoryError, "stale case/target mapping"):
+            self.check("linux")
+
+    def test_a_windows_owned_rule_can_run_its_windows_only_case(self):
+        self.inventory["groups"] = []
+        self.inventory["owners"]["live"]["platform"] = "win32"
+        self.workflow.write_text(WORKFLOW.replace("ubuntu-latest", "windows-latest"))
+        self.targets[KEY] = {"all": {"ordinary"}, "ignored": set()}
+        # The rule is a declared owner reference, as an absent-on-Linux legacy
+        # group was. Its own platform remains responsible for a nonempty match.
+        self.assertEqual(self.check("linux"), 0)
+        self.add_case("scope::windows_only")
+        self.assertEqual(self.check("win32"), 1)
+
+    def test_rule_only_cases_use_the_existing_existence_check(self):
+        self.inventory["groups"] = []
+        self.targets[KEY]["all"].remove("scope::owned")
+        with self.assertRaisesRegex(audit.InventoryError, "stale case/target mapping"):
+            self.check()
+
     def test_rule_only_cases_cannot_be_assigned_to_an_ordinary_runner(self):
         self.inventory["groups"] = []
         self.inventory["owners"]["live"]["ordinary"] = True

@@ -998,26 +998,37 @@ def validate(root, inventory, targets, platform, rules=None):
             case = (*key, name)
             require(case not in entries, f"duplicate case mapping: {case}")
             entries[case] = group; used.add(group["owner"])
-            if platform == group["validate_on"]:
-                require(key in targets and name in targets[key]["all"], f"stale case/target mapping: {case}")
-            if key in targets and name in targets[key]["all"]:
-                require((name in targets[key]["ignored"]) == (platform in group["ignored_on"]), f"changed ignore condition: {case}")
     groups = list(inventory["groups"])
     cases = set(entries) | {(*key, name) for key, target in targets.items() for name in target["ignored"]}
     assignments = rule_assignments(owners, rules if rules is not None else {"version": 1, "rules": []},
                                    cases, platform)
+    if rules is not None:
+        used.update(rule["owner"] for rule in rules["rules"])
     for case, owner in assignments.items():
         if case in entries:
             require(entries[case]["owner"] == owner,
                     f"rule and legacy owners disagree for {case}: {owner} != {entries[case]['owner']}")
         else:
-            # Rules add live cases without weakening any legacy ignore condition.
-            # Newly discovered cases retain the same owner-platform/CI audit below.
+            # Exact entries are checked on validate_on. A namespace alone cannot
+            # establish that another platform compiles this particular case.
+            require(platform == owners[owner]["platform"],
+                    f"rule-only case {case} discovered on {platform} cannot be verified on "
+                    f"owner {owner}'s platform {owners[owner]['platform']}; "
+                    "add an exact legacy entry with the right owner, or a rule for an owner "
+                    f"that runs on {platform}")
             group = {"target": list(case[:3]), "owner": owner, "validate_on": owners[owner]["platform"],
                      "ignored_on": ["linux", "win32", "darwin"], "cases": [case[3]]}
             entries[case] = group
             groups.append(group)
             used.add(owner)
+    # Both sources use the same per-platform existence and ignore-condition
+    # checks. Cross-platform exact entries keep their validate_on obligation.
+    for case, group in entries.items():
+        key, name = case[:3], case[3]
+        if platform == group["validate_on"]:
+            require(key in targets and name in targets[key]["all"], f"stale case/target mapping: {case}")
+        if key in targets and name in targets[key]["all"]:
+            require((name in targets[key]["ignored"]) == (platform in group["ignored_on"]), f"changed ignore condition: {case}")
     for key, target in targets.items():
         for name in target["ignored"]:
             prefix = name.rpartition("::")[0] + "::" if "::" in name else ""
