@@ -19,6 +19,7 @@ pub(super) fn constraints(
     out: &mut Schedule,
 ) {
     let mut creates = BTreeMap::new();
+    let mut default_installers = BTreeSet::new();
     let mut facets: BTreeMap<&TypeRef, Vec<(usize, bool)>> = BTreeMap::new();
     for (at, planned) in cs.changes.iter().enumerate() {
         match &planned.change {
@@ -33,6 +34,9 @@ pub(super) fn constraints(
                 ..
             } if is_part(planned) => {
                 if let Some(delta) = DomainDelta::of(from, to) {
+                    if *half == DomainHalf::Loosen && delta.default.flatten().is_some() {
+                        default_installers.insert(name);
+                    }
                     facets
                         .entry(name)
                         .or_default()
@@ -92,12 +96,26 @@ pub(super) fn constraints(
     };
     for (at, planned) in cs.changes.iter().enumerate() {
         match &planned.change {
-            Change::CreateType { definition, .. } => {
+            Change::CreateType {
+                name, definition, ..
+            } => {
                 if let ManagedType::Domain { base, default, .. } = definition.as_ref() {
+                    // An extracted explicit DEFAULT overrides any temporary
+                    // inheritance. Its absence from CREATE is not a demand to
+                    // copy the base's default; require both the final declaration
+                    // and the actual installer before relaxing that prerequisite.
+                    let deferred_default = default_installers.contains(name)
+                        && matches!(
+                            declared.types.get(name),
+                            Some(ManagedType::Domain {
+                                default: Some(_),
+                                ..
+                            })
+                        );
                     require(
                         base,
                         at,
-                        if default.is_none() {
+                        if default.is_none() && !deferred_default {
                             Need::Default
                         } else {
                             Need::Type

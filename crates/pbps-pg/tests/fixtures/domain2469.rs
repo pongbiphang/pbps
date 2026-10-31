@@ -231,3 +231,38 @@ impl Fixture {
         f
     }
 }
+
+impl Fixture {
+    pub fn split_defaults(explicit: bool) -> Self {
+        let mut f = Self::new("default", false);
+        let child: TypeRef = "c2469.child".parse().unwrap();
+        let mut definition = domain(explicit.then_some("11"), false, &[]);
+        if let ManagedType::Domain { base, .. } = &mut definition {
+            *base = ColumnType::reference("c2469.d".parse().unwrap());
+        }
+        f.schema.types.insert(child.clone(), definition);
+        f.ids.types.insert("y_bbbbbb".parse().unwrap(), child);
+        f.schema.modules.get_mut(&"c2469.accept(integer)".parse().unwrap()).unwrap().definition = "(v integer) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN 'c2469.child'::regtype IS NOT NULL AND v > 0".into();
+        f.deps.0[1].1 = ["type::c2469.child".parse().unwrap()].into();
+        if explicit {
+            f.deps.0.push((
+                "default::type::c2469.child".parse().unwrap(),
+                ["module::c2469.accept(integer)".parse().unwrap()].into(),
+            ));
+        }
+        f
+    }
+    pub fn split_shadowing_default() -> Self {
+        let mut f = Self::split_defaults(true);
+        let leaf: TypeRef = "c2469.leaf".parse().unwrap();
+        let mut definition = domain(None, false, &[]);
+        if let ManagedType::Domain { base, .. } = &mut definition {
+            *base = ColumnType::reference("c2469.child".parse().unwrap());
+        }
+        f.schema.types.insert(leaf.clone(), definition);
+        f.ids.types.insert("y_cccccc".parse().unwrap(), leaf);
+        f.deps.0[1].1 = ["type::c2469.leaf".parse().unwrap()].into();
+        f.deps.0[2].1 = ["type::c2469.child".parse().unwrap()].into();
+        f
+    }
+}
