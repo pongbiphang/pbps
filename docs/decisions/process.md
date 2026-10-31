@@ -1600,7 +1600,12 @@ receipt is merely an unproven name. A resumed run also keeps what it inherited: 
 against the current head and inputs, and merged with its receipts, so a resume of a
 resume loses nothing when a link stops before an invocation writes receipts, and
 every link of a chain answers to the same head and inputs. An unreadable, partial
-or mismatched previous output, or inherited snapshot, refuses. A `FAILED` name outside the register of DEC-2553.2, or one that
+or mismatched previous output, or inherited snapshot, refuses. A runner that reads
+the proxy's per-test output afterwards, as the TLS helper does, sees nothing for a
+carried call; it may accept one only when the proxy printed the carried line for
+that call's key and the key's receipt confirms, against the run's snapshot, head
+and inputs, that everything was carried and nothing ran. Silence, another key or
+occurrence, or a run without `--resume` stays a failure. A `FAILED` name outside the register of DEC-2553.2, or one that
 failed more than twice on a head, counted across the whole chain, refuses,
 whatever row reported it. A resume may
 use other shard counts and weights, since ok-ness is per invocation and name, and

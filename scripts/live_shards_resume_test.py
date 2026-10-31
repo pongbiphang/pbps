@@ -6,9 +6,11 @@ Every case runs the real driver, shard entry and cargo proxy from a copy of
 and `free`. No fixture is started. Run: python3 scripts/live_shards_resume_test.py
 """
 
+import contextlib
 import datetime
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -20,7 +22,8 @@ import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ("live-shards.py", "known_flakes.py", "ignored_test_inventory.py", "ci_release_scope.py")
+SCRIPTS = ("live-shards.py", "live-transport.py", "known_flakes.py", "ignored_test_inventory.py",
+           "ci_release_scope.py")
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 CARGO = ["test", "-p", "demo", "--lib", "--"]
 A_NAMES = [f"a{i:02}" for i in range(12)]
@@ -30,6 +33,8 @@ FAKE_CARGO = '''#!{python}
 import json, os, sys
 args = sys.argv[1:]
 names = json.loads(os.environ["FAKE_A"]) if "--lib" in args else json.loads(os.environ["FAKE_B"])
+if "--test" in args and args[args.index("--test") + 1] == "tls":
+    names = [args[args.index("--exact") + 1]]
 if "--list" in args:
     print("\\n".join(n + ": test" for n in names))
     print(f"\\n{{len(names)}} tests, 0 benchmarks")
@@ -55,6 +60,27 @@ if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
 fi
 cargo test -p demo --lib -- --ignored "$@"
 cargo test -p demo --test second -- --ignored "$@"
+'''
+
+
+# The real runners run the TLS helper after the sharded suites, on shard zero only.
+RUNNER_TLS = RUNNER + '''if [[ -z ${PBPS_LIVE_SHARD:-} ]]; then
+    python3 scripts/tls_case.py
+elif [[ ${PBPS_LIVE_SHARD%%/*} == 0 ]]; then
+    PBPS_LIVE_PINNED=1 python3 scripts/tls_case.py
+fi
+'''
+
+# Drives the real `run_case` the way `live-transport.py main` does: one case, then one case three times.
+TLS_CASE = '''import importlib.util, os
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("transport", Path(__file__).with_name("live-transport.py"))
+transport = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(transport)
+cargo = ["cargo", "test", "-p", "demo", "--test", "tls", "--"]
+transport.run_case(cargo, "tls_verified", dict(os.environ))
+for _ in range(3):
+    transport.run_case(cargo, "tls_untrusted", dict(os.environ))
 '''
 
 
@@ -479,6 +505,140 @@ class Chain(Harness):
         result, _ = self.drive("--resume", str(second))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("never proved", result.stderr)
+
+
+class Tls(Harness):
+    """A resume that carries a TLS case must still finish through the real helper."""
+
+    TLS_NAMES = {"tls_verified", "tls_untrusted"}
+    TOTAL = len(A_NAMES) + len(B_NAMES) + 4
+
+    def setUp(self):
+        (self.repo / "scripts/live-tests-pg.sh").write_text(RUNNER_TLS)
+        (self.repo / "scripts/tls_case.py").write_text(TLS_CASE)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "tls runner")
+
+    def tearDown(self):
+        (self.repo / "scripts/live-tests-pg.sh").write_text(RUNNER)
+        (self.repo / "scripts/tls_case.py").unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "plain runner")
+        super().tearDown()
+
+    def stopped_after_tls(self):
+        # The TLS cases run before `second`, so a death in `second` leaves them proven.
+        output = self.stopped_run(die="b03")
+        proven = {n for row in self.receipts(output).values() if row["valid"]
+                  for n, r in row["reported"].items() if r["status"] == "ok"}
+        self.assertTrue(self.TLS_NAMES <= proven, "the first run should have proven the TLS cases")
+        return output
+
+    def resumed(self):
+        stopped = self.stopped_after_tls()
+        _, output = self.drive("--resume", str(stopped), check=0)
+        return output
+
+    def test_a_resume_that_carried_the_tls_cases_finishes_and_audits_exactly(self):
+        output = self.resumed()
+        summary = self.summary(output)
+        self.assertEqual((summary["pg"]["union"], summary["pg"]["passed"]), ("exact", self.TOTAL))
+        carried = {n for row in self.receipts(output).values() for n in row["carried"]}
+        self.assertTrue(self.TLS_NAMES <= carried)
+        audited, _ = PlainRun.shards_audit(self, output)
+        self.assertEqual(json.loads(audited.stdout)["union"], "exact")
+
+    def test_a_run_without_resume_prints_no_attestation_and_finishes(self):
+        _, output = self.drive(check=0)
+        self.assertEqual(self.summary(output)["pg"]["passed"], self.TOTAL)
+        self.assertNotIn(self.shards.CARRIED_LINE, "".join(p.read_text() for p in output.glob("pg/*.log")))
+
+    def attested(self):
+        """A genuine resume's receipts, the environment its shard ran in, and the proxy's lines."""
+        output = self.resumed()
+        directory = output / "pg/0"
+        keys = {}
+        for path, row in self.receipts(output).items():
+            if path.parent.name == "0" and "--test" in row["args"] and "tls" in row["args"]:
+                keys.setdefault(row["args"][row["args"].index("--exact") + 1], []).append(path.stem)
+        manifest = json.loads((output / "manifest.json").read_text())
+        env = {"PBPS_LIVE_RESUME": str(output / "resume-input.json"), "PBPS_LIVE_SHARD_DIR": str(directory),
+               "PBPS_LIVE_TREE": manifest["tree"], "PBPS_LIVE_INPUTS": manifest["inputs"], "PBPS_LIVE_SUITE": "pg"}
+        return directory, {n: sorted(k) for n, k in keys.items()}, env
+
+    def transport(self):
+        return load_shards(self.repo / "scripts/live-transport.py")
+
+    def run_case(self, transport, env, output, test="tls_verified", code=0):
+        """The real `run_case` against a `cargo` that only prints `output` and succeeds."""
+        fake = self.runs / "fake-cargo"
+        fake.mkdir(exist_ok=True)
+        (fake / "cargo").write_text("#!/bin/sh\nprintf '%s' \"$ECHO_OUT\"\nexit ${ECHO_RC:-0}\n")
+        (fake / "cargo").chmod(0o755)
+        process_env = dict(os.environ, ECHO_OUT=output, ECHO_RC=str(code), PATH=f"{fake}{os.pathsep}{os.environ['PATH']}", **env)
+        with contextlib.redirect_stdout(io.StringIO()):
+            transport.run_case(["cargo", "test", "-p", "demo", "--test", "tls", "--"], test, process_env)
+
+    def line(self, key):
+        return f"shard 0/2 {key}: 0/1 tests\n{self.shards.CARRIED_LINE}{key}\n"
+
+    def test_the_helper_accepts_only_what_the_proxy_attests_and_the_receipts_confirm(self):
+        directory, keys, env = self.attested()
+        verified = keys["tls_verified"][0]
+        self.run_case(self.transport(), env, self.line(verified))  # a genuine attestation is accepted
+        refused = {
+            "silent proxy": (env, ""),
+            "the shard line only": (env, f"shard 0/2 {verified}: 0/1 tests\n"),
+            "attestation without a resumed run": ({k: v for k, v in env.items() if k != "PBPS_LIVE_RESUME"},
+                                                  self.line(verified)),
+            "key of another case": (env, self.line(keys["tls_untrusted"][0])),
+            "key that names no receipt": (env, self.line("0" * 24 + "-0")),
+            "key of another occurrence": (env, self.line(verified.rsplit("-", 1)[0] + "-1")),
+        }
+        for name, (variant, output) in refused.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(RuntimeError, "exactly once"):
+                    self.run_case(self.transport(), variant, output)
+        with self.subTest("attested but the proxy failed"):
+            with self.assertRaisesRegex(RuntimeError, "exactly once"):
+                self.run_case(self.transport(), env, self.line(verified), code=1)
+        with self.subTest("the verifier alone, without a resume"):
+            args = ["test", "-p", "demo", "--test", "tls", "--", "--ignored", "--exact", "tls_verified",
+                    "--test-threads=1", "--format=pretty", "--color=never"]
+            self.assertEqual(self.shards.carried_attestation(self.line(verified), args, env, 0), ["tls_verified"])
+            bare = {k: v for k, v in env.items() if k != "PBPS_LIVE_RESUME"}
+            self.assertIsNone(self.shards.carried_attestation(self.line(verified), args, bare, 0))
+
+    def test_a_receipt_that_does_not_confirm_the_attestation_is_refused(self):
+        directory, keys, env = self.attested()
+        verified = keys["tls_verified"][0]
+        path = directory / (verified + ".json")
+        original = json.loads(path.read_text())
+        changes = {
+            "nothing carried": {"carried": {}},
+            "the case ran here": {"assigned": ["tls_verified"]},
+            "another command": {"args": original["args"] + ["--extra"]},
+            "another head": {"tree": "0" * 40},
+            "other inputs": {"inputs": "1" * 64},
+            "an invalid row": {"valid": False},
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                path.write_text(json.dumps({**original, **change}))
+                with self.assertRaisesRegex(RuntimeError, "exactly once"):
+                    self.run_case(self.transport(), env, self.line(verified))
+        path.write_text(json.dumps(original))
+
+    def test_each_occurrence_of_a_repeated_case_needs_its_own_attestation(self):
+        directory, keys, env = self.attested()
+        first, second, third = keys["tls_untrusted"]
+        transport = self.transport()
+        self.run_case(transport, env, self.line(first), "tls_untrusted")
+        with self.assertRaisesRegex(RuntimeError, "exactly once"):
+            self.run_case(transport, env, self.line(first), "tls_untrusted")  # the first one's evidence again
+        transport = self.transport()
+        for key in (first, second, third):
+            self.run_case(transport, env, self.line(key), "tls_untrusted")
 
 
 class Flakes(Harness):
