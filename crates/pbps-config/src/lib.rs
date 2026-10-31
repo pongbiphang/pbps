@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod fingerprint_sources;
 pub mod layout;
 pub mod resolver;
 pub use layout::{DatabaseList, DatabasePaths};
@@ -82,6 +83,18 @@ pub enum ConfigError {
          keep the one its key is delivered through"
     )]
     AmbiguousFingerprintKey { name: String },
+
+    #[error(
+        "environments `{first}` and `{second}` share one fingerprint key {kind}; deliver an independent key to each environment (DEC-964.1)"
+    )]
+    SharedFingerprintKeySource {
+        first: String,
+        second: String,
+        kind: &'static str,
+    },
+
+    #[error("cannot establish fingerprint key file addresses: {reason}")]
+    FingerprintKeyPathContext { reason: std::io::Error },
 
     /// The declarations directory holds the project itself: it is the project
     /// root or a directory above it (#739). Every `.yml` beneath it is read as
@@ -518,6 +531,7 @@ impl Config {
         }) {
             return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
         }
+        fingerprint_sources::validate(&config.environments, path)?;
         if config.schema_dir.is_relative() && only_dot_segments(&config.schema_dir) {
             return Err(ConfigError::SchemaDirHoldsTheProject {
                 path: path.to_owned(),

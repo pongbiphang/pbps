@@ -27,6 +27,7 @@
 
 use pbps_config::Project;
 use pbps_db::Conn;
+#[cfg(all(test, unix))]
 use pbps_db::fingerprint::FingerprintKey;
 
 use crate::{db, output};
@@ -301,54 +302,10 @@ pub struct Requested {
     pub target: anyhow::Result<db::Target>,
 }
 
-/// One finding per environment about its fingerprint key (DEC-952.1): its
-/// identifier when it loads, an error naming the fault when a configured key
-/// does not, and a note when none is configured — nothing uses the key yet
-/// but engine-assisted planning, so its absence refuses nothing today.
-fn fingerprint_key_findings(project: &Project, names: &[String]) -> Vec<output::Finding> {
-    names
-        .iter()
-        .map(|name| {
-            let source = match project.fingerprint_key_source(name) {
-                Ok(source) => source,
-                Err(e) => {
-                    return output::Finding::error("environment.fingerprint-key", e.to_string());
-                }
-            };
-            let loaded = match &source {
-                None => {
-                    return output::Finding::note(
-                        "environment.no-fingerprint-key",
-                        format!(
-                            "environment `{name}` configures no fingerprint key; a PostgreSQL plan \
-                             needs one when it pins routines (DEC-319.1), and so will \
-                             engine-assisted planning (--resolve-with)"
-                        ),
-                    )
-                    .remedy(format!(
-                        "pbps key generate --out {}   # then set `fingerprint_key_file` in pbps.yml",
-                        crate::report::shell_arg(&format!("{name}.fingerprint.key"))
-                            .unwrap_or_else(|| crate::report::placeholder("key path"))
-                    ));
-                }
-                Some(pbps_config::FingerprintKeySource::Env(var)) => FingerprintKey::from_env(var),
-                Some(pbps_config::FingerprintKeySource::File(path)) => {
-                    FingerprintKey::from_file(path)
-                }
-            };
-            match loaded {
-                Ok(key) => output::Finding::note(
-                    "environment.fingerprint-key",
-                    format!("environment `{name}` has fingerprint key {}", key.id()),
-                ),
-                Err(e) => output::Finding::error(
-                    "environment.fingerprint-key",
-                    format!("environment `{name}`: {e}"),
-                ),
-            }
-        })
-        .collect()
-}
+/// Key diagnosis observes only the requested environments (DEC-964.1).
+mod keys;
+#[cfg(all(test, unix))]
+use keys::fingerprint_key_findings;
 
 pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyhow::Result<()> {
     let dialect = output::or_unanswerable(
@@ -433,11 +390,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // The fingerprint key is checked without a connection, for the requested
     // environment or, with no target, for every configured one: a `--db`
     // target names no environment and so no key.
-    let key_envs: Vec<String> = match &one {
-        Some(Requested { name, .. }) => name.iter().cloned().collect(),
-        None => project.config.environments.keys().cloned().collect(),
-    };
-    findings.extend(fingerprint_key_findings(project, &key_envs));
+    findings.extend(keys::for_request(project, one.as_ref()));
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
