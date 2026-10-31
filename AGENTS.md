@@ -97,7 +97,8 @@ Read before changing things:
   DEC-2415.1). All green, then push:
   - before marking the PR ready;
   - before every push in the ready phase;
-  - before pushing a rebase, except a docs-only rebase (DEC-2000.1).
+  - before pushing a rebase, except a docs-only rebase (DEC-2000.1) and a
+    rebase whose own patch is unchanged (DEC-2553.3).
 - Every other push (the first push and draft-round fixes) runs the
   **round gate**:
   - the two decision checks and the two raw-in-messages checks;
@@ -107,6 +108,22 @@ Read before changing things:
   - A round fix that breaks something it did not touch is found by the full
     gate before ready.
 - A docs-only push runs only the two decision checks.
+- **Complete a stopped gate; do not repeat it** (DEC-2553.1). When a sharded
+  run stops on an infrastructure fault, or fails only on tests registered in
+  `scripts/known-flakes.json` (DEC-2553.2), finish it on the same head with
+  `scripts/live-shards.py --resume <previous-output>`.
+  - It reruns only the names with no `ok` receipt, and the combined receipts
+    must still equal `--list` exactly.
+  - It refuses a different head tree or inputs digest, an unreadable or
+    partial previous output, and any `FAILED` test that is not a registered,
+    unexpired flake. Such a failure needs a fix and a new full gate.
+  - A resume of a resume is supported: resume the latest output, which carries
+    the whole chain, and a flake still counts at most twice per head across it.
+  - Record both outputs' `summary.json` paths and the head tree in the PR.
+- Register a flake only for an open issue, with an expiry at most 30 days out.
+  The register is read from `origin/master`, so an entry waives nothing in the
+  PR that adds it. An expired entry is inactive; the check refuses it only in
+  a PR that touches the register and in the nightly run.
 - Before queueing a full gate, confirm the head merges cleanly with
   `origin/master`. Rebase a conflicting head first.
 - Use the Python version CI pins.
@@ -200,7 +217,9 @@ Read before changing things:
     a label was added.
 - Before enqueueing, the primary agent independently verifies:
   - the issue-to-diff match and the architecture;
-  - local-test evidence;
+  - local-test evidence (for a resumed gate, both `summary.json` files and the
+    head tree; for an unchanged-patch rebase, the `gate_scope.py` output,
+    rerun);
   - review counts and heads, and thread dispositions;
   - dependency order and required CI checks.
 - Subagents never enqueue and never merge.
@@ -249,6 +268,16 @@ Read before changing things:
   3. Approve the CI run on the resulting head.
   - No full gate and no new review are needed.
   - A rebase for a merge-group interaction is never docs-only.
+- **Rebase with an unchanged patch** (DEC-2553.3): when `scripts/gate_scope.py`
+  reports `unchanged` for the last head a full gate passed on and the rebased
+  head, the rebase needs no new full gate:
+  1. Run the two decision checks, the two raw-in-messages checks, `fmt` and
+     warning-free `clippy` on the rebased tree.
+  2. Push with `--force-with-lease`.
+  3. Obtain the resulting-head review as for any rebase, then approve the CI
+     run on that head.
+  - Record the script's output in the PR.
+  - A rebase for a merge-group interaction is never one of these.
 
 ## Deleting a merged head branch
 

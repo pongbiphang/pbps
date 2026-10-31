@@ -5,6 +5,7 @@ It never alters a shared test server's TLS configuration or the host trust store
 """
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,24 +22,41 @@ IMAGES = {
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
 PASSWORD = "Pbps!Test12345"
+# How many times each command has run in this process: the sharded driver keys
+# a repeated command's receipts by occurrence (DEC-2553.1).
+CALLS = {}
 
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
 
 
+def carried(output, args, env, occurrence):
+    """Whether a resumed gate proved this exact call earlier, so nothing ran."""
+    if not env.get("PBPS_LIVE_RESUME"):
+        return False
+    spec = importlib.util.spec_from_file_location("live_shards", Path(__file__).with_name("live-shards.py"))
+    shards = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shards)
+    return shards.carried_attestation(output, args, env, occurrence) is not None
+
+
 def run_case(command, test, env):
-    result = subprocess.run(
-        [*command, "--ignored", "--exact", test, "--test-threads=1",
-         "--format=pretty", "--color=never"],
-        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    args = [*command, "--ignored", "--exact", test, "--test-threads=1",
+            "--format=pretty", "--color=never"]
+    occurrence = CALLS[tuple(args)] = CALLS.get(tuple(args), -1) + 1
+    result = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="", flush=True)
     # libtest succeeds when a renamed or filtered case runs zero tests. Both
     # its named result and its sole summary must attest to this exact case.
     lines = result.stdout.splitlines()
     cases = [line for line in lines if re.match(r"test .+ \.\.\. ", line)]
     summaries = [line for line in lines if line.startswith("test result:")]
+    if (not result.returncode and not cases and not summaries
+            and carried(result.stdout, args[1:], env, occurrence)):
+        # `--resume` proved this case on this head; the proxy ran nothing, so
+        # there is no result to read. Its receipt is the evidence (DEC-2553.1).
+        return
     if (result.returncode or cases != [f"test {test} ... ok"]
             or len(summaries) != 1
             or not re.fullmatch(
