@@ -18,7 +18,7 @@
 //! over the full effect graph and requires the order it was given back: that
 //! is how "every edge is respected" is checked (DEC-1956.3).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use pbps_model::ChangeSet;
@@ -87,7 +87,7 @@ pub enum Refusal {
         /// Every step left unordered, ascending: the cycle's members and
         /// what waits on them.
         waiting: Vec<usize>,
-        /// Only symbolic membership participants add this scoped remedy.
+        /// Context from this SCC only: symbolic membership and inline CREATE groups.
         remedy: Option<String>,
     },
 }
@@ -217,6 +217,7 @@ pub struct Schedule {
     keeps: Vec<Keep>,
     obligations: Vec<Obligation>,
     symbolic_constraints: BTreeSet<Constraint>,
+    creation_contexts: BTreeMap<usize, String>,
 }
 
 impl Schedule {
@@ -311,6 +312,20 @@ impl Schedule {
         &self.constraints
     }
 
+    pub(crate) fn inline_contexts(
+        &mut self,
+        changes: &ChangeSet,
+        context: &BTreeMap<pbps_model::Uid, String>,
+    ) {
+        for (at, p) in changes.changes.iter().enumerate() {
+            if let pbps_model::Change::CreateTable { uid, .. } = &p.change
+                && let Some(reason) = context.get(uid)
+            {
+                self.creation_contexts.insert(at, reason.clone());
+            }
+        }
+    }
+
     /// The order of the steps, as the positions they came from.
     pub fn sequence(&self) -> Result<Vec<usize>, Refusal> {
         self.settled().map(|(sequence, _)| sequence)
@@ -319,6 +334,9 @@ impl Schedule {
     /// `changes`, which the schedule was built over, in its order.
     pub fn settle<S>(&self, plan: super::PlanningPlan<S>) -> Result<Settled<S>, Refusal> {
         let mut schedule = self.clone();
+        if let Some(contract) = &plan.annotations {
+            schedule.inline_contexts(plan.changes(), &contract.inline);
+        }
         for edge in plan.annotation_edges().map_err(|refusal| {
             Refusal::Unmet(vec![Obligation {
                 operation: 0,
@@ -557,10 +575,23 @@ impl Schedule {
                 .collect();
             // Only the reported component can justify this remedy. A
             // symbolic edge elsewhere cannot explain an ordinary cycle.
-            let remedy = edges
+            let mut context = BTreeSet::new();
+            if edges
                 .iter()
                 .any(|edge| self.symbolic_constraints.contains(edge))
-                .then(|| super::membership::REMEDY.into());
+            {
+                context.insert(super::membership::REMEDY.to_owned());
+            }
+            // These are engine facts about CREATEs in this exact SCC, not a
+            // second cycle test or a new reason to refuse a legal order.
+            context.extend(
+                members
+                    .iter()
+                    .filter_map(|at| self.creation_contexts.get(at))
+                    .cloned(),
+            );
+            let remedy =
+                (!context.is_empty()).then(|| context.into_iter().collect::<Vec<_>>().join("; "));
             return Err(Refusal::Cycle {
                 members,
                 edges,

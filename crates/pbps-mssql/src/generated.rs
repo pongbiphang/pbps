@@ -21,6 +21,63 @@ use pbps_model::{Change, IdsFile, ModuleId, ValueSource};
 use std::collections::BTreeSet;
 use unicode_normalization::char::is_combining_mark;
 
+/// Measured on SQL Server 2022/2025: these surfaces must share CREATE.
+pub(crate) fn inline(
+    name: &pbps_model::TableName,
+    table: &pbps_model::Table,
+) -> pbps_dialect::creation::Inline {
+    let mut inline = pbps_dialect::creation::Inline::default();
+    for (column, spec) in &table.columns {
+        if matches!(spec.value_source, ValueSource::Identity(_)) {
+            inline.column_not_null.insert(
+                column.clone(),
+                "SQL Server identity needs NOT NULL in its column installation",
+            );
+        }
+    }
+    if let Some((first, _)) = table.columns.first() {
+        inline.column(name, first, "SQL Server needs its first ordinary column");
+    } else {
+        inline.unavailable = Some(
+            "SQL Server CREATE requires an ordinary physical column; a computed-only group is not a legal CREATE",
+        );
+    }
+    if let Some(period) = &table.system_time {
+        for column in [&period.start, &period.end] {
+            inline.column(
+                name,
+                column,
+                "SQL Server PERIOD FOR SYSTEM_TIME needs both period columns",
+            );
+            inline.not_null(
+                name,
+                column,
+                "SQL Server PERIOD FOR SYSTEM_TIME needs NOT NULL period columns",
+            );
+        }
+        if period.versioning.is_some() {
+            inline.part(
+                name,
+                pbps_model::operation::PartKey::PrimaryKey,
+                "SQL Server SYSTEM_VERSIONING needs the primary key",
+            );
+            for column in table.primary_key.iter().flat_map(|key| &key.columns) {
+                inline.column(
+                    name,
+                    column,
+                    "SQL Server SYSTEM_VERSIONING needs the primary-key columns",
+                );
+                inline.not_null(
+                    name,
+                    column,
+                    "SQL Server SYSTEM_VERSIONING needs the primary key's NOT NULL columns",
+                );
+            }
+        }
+    }
+    inline
+}
+
 /// Whether `text` calls a declared function: by the two-part name SQL Server
 /// requires of a scalar function in an expression (a one-part call is 195,
 /// measured), by schema and leaf name as `name_key` compares them.
@@ -74,8 +131,18 @@ fn parts_in(
     let cut = table.computed.iter().position(|(column, c)| {
         calling(&c.expression) || demand.generation(column) || demand.not_null(column)
     });
-    demand.columns = demand.column_suffix(table.columns.keys());
+    demand.resolve_suffix(name, table);
     let cut = (!demand.columns.is_empty()).then_some(0).or(cut);
+    // Physical computed order keeps every predecessor of a required one.
+    let kept = table
+        .computed
+        .keys()
+        .enumerate()
+        .filter(|(_, c)| demand.inline.keeps_column(name, c))
+        .map(|(i, _)| i + 1)
+        .max()
+        .unwrap_or(0);
+    let cut = cut.map(|cut| cut.max(kept));
     let default_calls = table
         .columns
         .values()
@@ -124,11 +191,12 @@ fn parts_in(
             computed: expression.clone(),
         });
     }
-    if bare
-        .primary_key
-        .as_ref()
-        .is_some_and(|key| late_column(&key.columns))
-    {
+    if bare.primary_key.as_ref().is_some_and(|key| {
+        !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::PrimaryKey)
+            && late_column(&key.columns)
+    }) {
         tail.push(Change::SetPrimaryKey {
             table: name.clone(),
             from: None,
@@ -137,7 +205,11 @@ fn parts_in(
         });
     }
     for (key, constraint) in std::mem::take(&mut bare.unique) {
-        if late_column(&constraint.columns) {
+        if !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::Unique(key.clone()))
+            && late_column(&constraint.columns)
+        {
             tail.push(Change::AddUnique {
                 table: name.clone(),
                 clustered: table.unique_is_clustered(key.raw()),
@@ -159,7 +231,11 @@ fn parts_in(
             })
             || (index.holds_expression() && !pending.is_empty())
             || index.filter.as_deref().is_some_and(late_text);
-        if deferred {
+        if deferred
+            && !demand
+                .inline
+                .keeps_part(name, &pbps_model::operation::PartKey::Index(key.clone()))
+        {
             tail.push(Change::AddIndex {
                 table: name.clone(),
                 clustered: table.index_is_clustered(key.raw()),
@@ -173,14 +249,25 @@ fn parts_in(
     // The differ already separates foreign keys from every new table; one
     // the table still holds waits as one of its parts.
     for (key, constraint) in std::mem::take(&mut bare.foreign_keys) {
-        tail.push(Change::AddForeignKey {
-            table: name.clone(),
-            name: key,
-            constraint: Box::new(constraint),
-        });
+        if demand.inline.keeps_part(
+            name,
+            &pbps_model::operation::PartKey::ForeignKey(key.clone()),
+        ) {
+            bare.foreign_keys.insert(key, constraint);
+        } else {
+            tail.push(Change::AddForeignKey {
+                table: name.clone(),
+                name: key,
+                constraint: Box::new(constraint),
+            });
+        }
     }
     for (key, constraint) in std::mem::take(&mut bare.checks) {
-        if late_text(&constraint.expression) {
+        if !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::Check(key.clone()))
+            && late_text(&constraint.expression)
+        {
             tail.push(Change::AddCheck {
                 table: name.clone(),
                 name: key,
@@ -204,6 +291,7 @@ fn parts_in(
     for (column, spec) in &mut bare.columns {
         if let ValueSource::Default(text) = &mut spec.value_source
             && calling(text)
+            && !demand.inline.keeps_default(name, column)
         {
             let to = std::mem::take(text);
             spec.value_source = ValueSource::None;
@@ -223,6 +311,7 @@ fn parts_in(
         moves_at_most: *moves_at_most,
     }];
     parts.extend(tail);
+    demand.inline.check(&parts, "mssql")?;
     Ok(Some(parts))
 }
 

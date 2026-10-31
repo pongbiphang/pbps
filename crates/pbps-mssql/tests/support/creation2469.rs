@@ -389,3 +389,112 @@ async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
         scratch_db.drop().await;
     }
 }
+
+#[path = "../../../pbps-diff/tests/fixtures/creation2469_inline.rs"]
+mod required_groups;
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn required_inline_groups_preserve_create_options_and_late_columns() {
+    let engine = Mssql;
+    for versioned in [false, true] {
+        let f = required_groups::temporal(versioned);
+        let mut db = TestDb::create("creation2469_inline_temporal").await;
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+        let plan = f.compile(&engine).unwrap();
+        let function = plan
+            .changes()
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .unwrap();
+        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let lowered =
+            lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
+        for (at, group) in lowered.groups().iter().enumerate() {
+            for statement in group.statements() {
+                db.conn.execute(&statement.sql).await.unwrap();
+            }
+            if at == function {
+                let rows=db.conn.query("SELECT COUNT(*) AS n FROM sys.key_constraints WHERE parent_object_id=OBJECT_ID('app.t') AND type='PK'").await.unwrap();
+                assert_eq!(
+                    rows[0].try_get::<i32>("n").unwrap(),
+                    Some(i32::from(versioned))
+                );
+                let rows=db.conn.query("SELECT name FROM sys.columns WHERE object_id=OBJECT_ID('app.t') ORDER BY column_id").await.unwrap();
+                let names: Vec<_> = rows
+                    .iter()
+                    .map(|r| r.try_get::<&str>("name").unwrap().unwrap())
+                    .collect();
+                assert_eq!(names, ["anchor", "vf", "vt"]);
+            }
+        }
+        let rows=db.conn.query("SELECT CONVERT(int,temporal_type) AS kind FROM sys.tables WHERE object_id=OBJECT_ID('app.t')").await.unwrap();
+        assert_eq!(
+            rows[0].try_get::<i32>("kind").unwrap(),
+            Some(if versioned { 2 } else { 0 })
+        );
+        db.conn
+            .execute("INSERT INTO app.t(anchor,x) VALUES(1,7)")
+            .await
+            .unwrap();
+        let rows = db.conn.query("SELECT x FROM app.t").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
+        if versioned {
+            let error = required_groups::require(f, "primary_key::app.t")
+                .compile(&engine)
+                .unwrap_err();
+            assert!(
+                error.contains("inline") && error.contains("primary key"),
+                "{error}"
+            );
+        }
+        db.conn.execute("COMMIT").await.unwrap();
+        db.drop().await;
+    }
+    let mut db = TestDb::create("creation2469_inline_separated").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+    execute(
+        &mut db,
+        required_groups::separated_providers("mssql")
+            .compile(&engine)
+            .unwrap(),
+        &engine,
+    )
+    .await;
+    db.conn
+        .execute("INSERT INTO app.t(anchor,x) VALUES(1,7)")
+        .await
+        .unwrap();
+    let rows = db.conn.query("SELECT x FROM app.t").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+    let mut db = TestDb::create("creation2469_inline_identity").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+    execute(
+        &mut db,
+        required_groups::identity("mssql").compile(&engine).unwrap(),
+        &engine,
+    )
+    .await;
+    db.conn
+        .execute("INSERT INTO app.t(anchor) VALUES(1)")
+        .await
+        .unwrap();
+    let rows = db.conn.query("SELECT x FROM app.t").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(1));
+    let rows = db
+        .conn
+        .query(
+            "SELECT is_nullable FROM sys.columns WHERE object_id=OBJECT_ID('app.t') AND name='x'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(false));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+}

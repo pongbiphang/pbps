@@ -28,11 +28,13 @@ pub(crate) struct Creation {
     pub references: BTreeSet<ObjectRef>,
     pub columns: BTreeMap<ObjectRef, pbps_model::ColumnName>,
     pub dependencies: Arc<BTreeMap<ObjectRef, BTreeSet<ObjectRef>>>,
+    pub local_dependencies: Arc<BTreeMap<ObjectRef, BTreeSet<ObjectRef>>>,
 }
 
 /// Descriptive identity evidence beside a draft, never saved-plan data.
 #[derive(Debug, Clone)]
 pub struct Contract {
+    pub(crate) inline: BTreeMap<Uid, String>,
     logical: pbps_model::ChangeSet,
     modules: ModuleEdits,
     before: Arc<Side>,
@@ -206,6 +208,7 @@ impl Contract {
             let mut requested = BTreeSet::new();
             let mut references = BTreeSet::new();
             let mut columns = BTreeMap::new();
+            let mut actual_refs = BTreeMap::new();
             for reference in demanded.get(&canonical).into_iter().flatten() {
                 let mut actual = reference.clone();
                 match &mut actual.root {
@@ -234,6 +237,7 @@ impl Contract {
                 if let Root::Column(column) = &actual.root {
                     columns.insert(reference.clone(), column.name.clone());
                 }
+                actual_refs.insert(reference.clone(), actual.clone());
                 // Provider-only existence/generation can stay in the legal prefix.
                 if !matches!(reference.root, Root::Column(_))
                     || !matches!(reference.part, Selector::Whole | Selector::Generation)
@@ -247,6 +251,20 @@ impl Contract {
                     references.extend(dependencies.get(reference).into_iter().flatten().cloned());
                 }
             }
+            // Project only this source's local graph using the exact binding
+            // translation above. Temporary/rebound names are not goal spellings.
+            let local_dependencies = actual_refs
+                .iter()
+                .map(|(reference, actual)| {
+                    let providers = dependencies
+                        .get(reference)
+                        .into_iter()
+                        .flatten()
+                        .map(|p| actual_refs.get(p).unwrap_or(p).clone())
+                        .collect();
+                    (actual.clone(), providers)
+                })
+                .collect();
             creation.insert(
                 origin.source(),
                 (
@@ -255,11 +273,13 @@ impl Contract {
                         references,
                         columns,
                         dependencies: dependencies.clone(),
+                        local_dependencies: Arc::new(local_dependencies),
                     },
                 ),
             );
         }
         Ok(Self {
+            inline: BTreeMap::new(),
             creation,
             logical: plan.changes().clone(),
             modules,
@@ -439,7 +459,19 @@ impl Contract {
             let annotation = &self.goal[number];
             let setup = [&annotation.owner, &annotation.provider].iter().any(|r| matches!(&r.root, BoundRoot::Recorded(uid) if self.after.ids.roles.contains_key(uid)) && !self.before.references.contains(*r));
             let reason=if matches!(error,ProjectionError::Missing(_)) && setup { "a fixed external setup boundary has no installation operation; provision the role before the baseline" } else {reason};
-            format!("cannot project annotation `{}` depends on `{}`: {reason}", self.labels[&annotation.owner], self.labels[&annotation.provider])
+            let ids = self.after.ids.index();
+            let inline = if matches!(error,ProjectionError::InternalCycle(_)) {
+                [&annotation.owner, &annotation.provider].into_iter().find_map(|r| {
+                    let uid=match &r.root {
+                        BoundRoot::Recorded(uid)=>self.after.ids.columns.get(uid).and_then(|c|ids.table_uid(&c.table)).unwrap_or(uid),
+                        BoundRoot::InheritedColumn{table,..}|BoundRoot::LocalColumn{table,..}=>table,
+                        BoundRoot::Module(_)|BoundRoot::Trigger{..}=>return None,
+                    };
+                    self.inline.get(uid)
+                })
+            } else { None };
+            let context=inline.map_or_else(String::new,|why|format!("; {why}"));
+            format!("cannot project annotation `{}` depends on `{}`: {reason}{context}", self.labels[&annotation.owner], self.labels[&annotation.provider])
         })
     }
 

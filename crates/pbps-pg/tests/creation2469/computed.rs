@@ -78,7 +78,7 @@ fn generated_column_and_not_null_demands_keep_the_postgres_recipe() {
 }
 
 #[test]
-fn the_first_computed_column_keeps_a_nonempty_sql_server_create_group() {
+fn a_computed_only_sql_server_create_names_the_missing_physical_column() {
     for facet in ["column", "not_null", "generation"] {
         let mut f = generated_facet(facet, "mssql");
         f.schema
@@ -89,7 +89,7 @@ fn the_first_computed_column_keeps_a_nonempty_sql_server_create_group() {
             .clear();
         f.ids.columns.remove(&"c_aaaaaa".parse().unwrap());
         let why = f.compile(&pbps_mssql::Mssql).unwrap_err();
-        assert!(why.contains("wait on one another"), "{facet}: {why}");
+        assert!(why.contains("ordinary physical column"), "{facet}: {why}");
     }
 }
 

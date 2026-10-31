@@ -495,3 +495,127 @@ async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
         }
     }
 }
+
+#[path = "../../../pbps-diff/tests/fixtures/creation2469_inline.rs"]
+mod required_groups;
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn required_inline_groups_preserve_create_options_and_late_columns() {
+    let mut db = TestDb::create("creation2469_inline_partition").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let rows = db
+        .conn
+        .query("SELECT current_setting('server_version_num')::int AS version")
+        .await
+        .unwrap();
+    let engine = Postgres::new()
+        .with_server_version(rows[0].try_get::<i32>("version").unwrap().unwrap() as i64);
+    db.conn.execute("BEGIN").await.unwrap();
+    let f = required_groups::partitioned();
+    let plan = f.compile(&engine).unwrap();
+    let function = plan
+        .changes()
+        .changes
+        .iter()
+        .position(|p| matches!(p.change, pbps_model::Change::CreateModule { .. }))
+        .unwrap();
+    let ordered = plan.ordered(PlanMode::Transactional, &engine);
+    let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
+    for (at, group) in lowered.groups().iter().enumerate() {
+        for statement in group.statements() {
+            db.conn.execute(&statement.sql).await.unwrap();
+        }
+        if at == function {
+            let rows=db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+            let columns: Vec<_> = rows
+                .iter()
+                .map(|r| r.try_get::<&str>("column_name").unwrap().unwrap())
+                .collect();
+            assert_eq!(columns, ["anchor"]);
+            let rows=db.conn.query("SELECT count(*)::int AS n FROM pg_partitioned_table WHERE partrelid='app.t'::regclass").await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1));
+        }
+    }
+    db.conn.execute("CREATE TABLE app.t0 PARTITION OF app.t FOR VALUES FROM(0) TO(100); INSERT INTO app.t(anchor,x) VALUES(1,7)").await.unwrap();
+    let rows = db.conn.query("SELECT x FROM app.t").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
+    let error = required_groups::require(f, "column::app.t.anchor")
+        .compile(&engine)
+        .unwrap_err();
+    assert!(
+        error.contains("inline") && error.contains("PARTITION BY"),
+        "{error}"
+    );
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+    let mut db = TestDb::create("creation2469_inline_separated").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    db.conn.execute("BEGIN").await.unwrap();
+    execute(
+        &mut db,
+        required_groups::separated_providers("postgres")
+            .compile(&engine)
+            .unwrap(),
+        &engine,
+    )
+    .await;
+    db.conn.execute("CREATE TABLE app.t0 PARTITION OF app.t FOR VALUES FROM(0) TO(100); INSERT INTO app.t(anchor,x,y) VALUES(1,7,11)").await.unwrap();
+    let rows = db.conn.query("SELECT y FROM app.t").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("y").unwrap(), Some(11));
+    let rows=db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+    let columns: Vec<_> = rows
+        .iter()
+        .map(|r| r.try_get::<&str>("column_name").unwrap().unwrap())
+        .collect();
+    assert_eq!(columns, ["anchor", "x", "y"]);
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+    let mut db = TestDb::create("creation2469_inline_generation").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    let rows = db
+        .conn
+        .query("SELECT current_setting('server_version_num')::int AS version")
+        .await
+        .unwrap();
+    let f = required_groups::separated_generation();
+    if rows[0].try_get::<i32>("version").unwrap().unwrap() >= 170000 {
+        db.conn.execute("BEGIN").await.unwrap();
+        execute(&mut db, f.compile(&engine).unwrap(), &engine).await;
+        db.conn.execute("CREATE TABLE app.t0 PARTITION OF app.t FOR VALUES FROM(0) TO(100); INSERT INTO app.t(x,y) VALUES(7,11)").await.unwrap();
+        let rows = db.conn.query("SELECT anchor,y FROM app.t").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("anchor").unwrap(), Some(7));
+        assert_eq!(rows[0].try_get::<i32>("y").unwrap(), Some(11));
+        let rows=db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+        let columns: Vec<_> = rows
+            .iter()
+            .map(|r| r.try_get::<&str>("column_name").unwrap().unwrap())
+            .collect();
+        assert_eq!(columns, ["anchor", "x", "y"]);
+        db.conn.execute("COMMIT").await.unwrap();
+    } else {
+        assert!(f.compile(&engine).unwrap_err().contains("SET EXPRESSION"));
+    }
+    db.drop().await;
+    let mut db = TestDb::create("creation2469_inline_identity").await;
+    db.conn.execute("CREATE SCHEMA app").await.unwrap();
+    db.conn.execute("BEGIN").await.unwrap();
+    execute(
+        &mut db,
+        required_groups::identity("postgres")
+            .compile(&engine)
+            .unwrap(),
+        &engine,
+    )
+    .await;
+    db.conn
+        .execute("INSERT INTO app.t(anchor) VALUES(1)")
+        .await
+        .unwrap();
+    let rows = db.conn.query("SELECT x FROM app.t").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(1));
+    let rows=db.conn.query("SELECT attnotnull AS nn FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='x'").await.unwrap();
+    assert_eq!(rows[0].try_get::<bool>("nn").unwrap(), Some(true));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+}

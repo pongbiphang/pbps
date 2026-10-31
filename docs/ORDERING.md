@@ -975,7 +975,7 @@ Connected SQL Server calls still require catalog-collation capability checks.
 
 A demanded ordinary-column suffix is resolved by the engine creation recipe,
 using the same deferred input closure as its complete-shape and forward-read
-checks (DEC-2469.4). Portable exposure consumes that resolved selection. On
+checks (DEC-2469.4). Portable exposure consumes that resolved selection and the engine's required-inline CREATE group. Its local prerequisite closure and the extraction/ordering input query are shared: retaining a versioned primary key also retains its named inputs, while an independent key is not moved merely because a column suffix moves. Identity NOT NULL follows its whole column installation. A group that cannot precede its own provider yields the existing refusal with the engine requirement as context. On
 PostgreSQL a generated expression that loses an input receives the existing
 placeholder/SET EXPRESSION recipe; an unavailable capability is a named refusal.
 Whole-row and partition shape requirements keep their indivisible group. SQL

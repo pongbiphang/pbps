@@ -374,6 +374,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
         .map_err(Refusal)?;
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
+    crate::order::generated::inline_contexts(&mut cs, dialect);
     // Explicit operation proposals use this route too; they carry the same
     // boundary obligations as a proposal produced by the guarded differ.
     if dialect.partition_meetings() {

@@ -2767,7 +2767,7 @@ pub trait Dialect {
         ids: &pbps_model::IdsFile,
         functions: &[pbps_model::ModuleId],
         needs_complete_shape: bool,
-        _demanded: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        _demanded: creation::Request<'_>,
         _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         self.creation_parts(
@@ -2780,6 +2780,16 @@ pub trait Dialect {
         )
     }
 
+    /// Surfaces required in a table's CREATE by this engine's options/kind.
+    /// This is transient recipe metadata, never persisted annotation intent.
+    fn creation_inline(
+        &self,
+        _name: &pbps_model::TableName,
+        _table: &pbps_model::Table,
+    ) -> creation::Inline {
+        creation::Inline::default()
+    }
+
     /// Engine-owned demand recipe, beneath the shared annotation identity seam.
     fn creation_parts(
         &self,
@@ -2787,7 +2797,7 @@ pub trait Dialect {
         ids: &pbps_model::IdsFile,
         functions: &[pbps_model::ModuleId],
         needs_complete_shape: bool,
-        _demanded: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        _demanded: creation::Request<'_>,
         _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         self.scratch_table_parts(change, ids, functions, needs_complete_shape)

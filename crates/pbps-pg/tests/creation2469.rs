@@ -484,3 +484,6 @@ mod prefix;
 
 #[path = "creation2469/computed.rs"]
 mod computed;
+
+#[path = "creation2469/inline.rs"]
+mod inline;

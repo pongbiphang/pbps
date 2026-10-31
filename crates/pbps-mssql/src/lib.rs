@@ -246,16 +246,20 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
+    fn creation_inline(&self, name: &TableName, table: &Table) -> pbps_dialect::creation::Inline {
+        generated::inline(name, table)
+    }
+
     fn creation_parts(
         &self,
         change: &Change,
         ids: &pbps_model::IdsFile,
         functions: &[pbps_model::ModuleId],
         _needs_complete_shape: bool,
-        references: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        request: pbps_dialect::creation::Request<'_>,
         _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
-        let mut demand = pbps_dialect::creation::Demand::of(change, references);
+        let mut demand = pbps_dialect::creation::Demand::for_request(change, request, self);
         if matches!(
             change,
             Change::CreateTable {
@@ -265,25 +269,10 @@ impl Dialect for Mssql {
         ) {
             return Ok(None);
         }
-        if let Change::CreateTable { table, .. } = change {
-            // SQL Server cannot create a zero-column table. Its first physical
-            // column stays in the root's indivisible installation group.
-            if let Some((first, _)) = table.columns.first() {
-                demand.columns.remove(first);
-            }
-            if table.columns.is_empty()
-                && table
-                    .computed
-                    .first_key_value()
-                    .is_some_and(|(column, _)| demand.generation(column) || demand.not_null(column))
-            {
-                return Ok(None);
-            }
-        }
         let parts = generated::demanded(self, change, ids, functions, &mut demand)?
             .unwrap_or_else(|| vec![change.clone()]);
         Ok(Some(pbps_dialect::creation::expose(
-            parts, ids, &demand, "mssql",
+            parts, ids, &demand, self,
         )?))
     }
 

@@ -414,7 +414,11 @@ fn parts_in(
             ids,
             &functions,
             table_reader,
-            demanded,
+            pbps_dialect::creation::Request {
+                scratch,
+                references: demanded,
+                dependencies: Some(&prerequisites.local_dependencies),
+            },
             &required_columns,
         )
     } else if scratch {
@@ -747,6 +751,33 @@ pub fn expand(
     expand_in(plan, ids, deps, dialect, false)
 }
 
+/// Prepare descriptive engine facts before any existing settlement can refuse.
+pub(super) fn inline_contexts(plan: &mut super::PlanningPlan, dialect: &(impl Dialect + ?Sized)) {
+    if !plan.annotations.as_ref().is_some_and(|a| a.extended) {
+        return;
+    }
+    let inline: BTreeMap<_, _> = plan
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateTable {
+                uid, name, table, ..
+            } = &p.change
+            {
+                dialect
+                    .creation_inline(name, table)
+                    .explanation()
+                    .map(|reason| (uid.clone(), reason))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if let Some(contract) = &mut plan.annotations {
+        std::sync::Arc::make_mut(contract).inline.extend(inline);
+    }
+}
+
 /// [`expand`], splitting as the scratch reconstruction does when `scratch`.
 pub(super) fn expand_in(
     plan: &mut super::PlanningPlan,
@@ -756,6 +787,7 @@ pub(super) fn expand_in(
     scratch: bool,
 ) -> Result<usize, String> {
     let mut expanded = Vec::new();
+    let mut inline = BTreeMap::new();
     let mut origins = Vec::new();
     let mut added = 0;
     for (p, origin) in plan.changes.iter().zip(&plan.origins) {
@@ -778,6 +810,14 @@ pub(super) fn expand_in(
             &prerequisites,
         )? {
             Some(parts) => {
+                if plan.annotations.as_ref().is_some_and(|a| a.extended)
+                    && let Change::CreateTable {
+                        uid, name, table, ..
+                    } = &p.change
+                    && let Some(reason) = dialect.creation_inline(name, table).explanation()
+                {
+                    inline.insert(uid.clone(), reason);
+                }
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
                     // A table that scratch leaves whole is still one part.
@@ -795,6 +835,9 @@ pub(super) fn expand_in(
                 origins.push(origin.clone());
             }
         }
+    }
+    if let Some(contract) = &mut plan.annotations {
+        std::sync::Arc::make_mut(contract).inline.extend(inline);
     }
     plan.payload.changes = expanded;
     plan.origins = origins;
