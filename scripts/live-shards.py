@@ -973,6 +973,10 @@ def main():
         return cargo_proxy(sys.argv[2:])
     if sys.argv[1:2] == ["shard"]:
         return shard(sys.argv[2], sys.argv[3:])
+    if sys.argv[1:2] == ["attest"]:
+        # A runner's check of the proxy's output: `attest <occurrence> <args json>`, output on stdin.
+        names = carried_attestation(sys.stdin.read(), json.loads(sys.argv[3]), os.environ, int(sys.argv[2]))
+        return 0 if names else 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["all", *RUNNERS], default="all")
     parser.add_argument("--mssql-shards", type=int)

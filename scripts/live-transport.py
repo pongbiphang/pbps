@@ -5,13 +5,13 @@ It never alters a shared test server's TLS configuration or the host trust store
 """
 
 import argparse
-import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -32,20 +32,26 @@ def run(*args, **kwargs):
 
 
 def carried(output, args, env, occurrence):
-    """Whether a resumed gate proved this exact call earlier, so nothing ran."""
+    """Whether a resumed gate proved this exact call earlier, so nothing ran.
+
+    The driver's script holds the verification; asking it keeps one rule for
+    every runner that reads the proxy's output."""
     if not env.get("PBPS_LIVE_RESUME"):
         return False
-    spec = importlib.util.spec_from_file_location("live_shards", Path(__file__).with_name("live-shards.py"))
-    shards = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(shards)
-    return shards.carried_attestation(output, args, env, occurrence) is not None
+    verdict = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("live-shards.py")), "attest", str(occurrence), json.dumps(args)],
+        input=output, text=True, env=env, stdout=subprocess.DEVNULL)
+    return verdict.returncode == 0
 
 
 def run_case(command, test, env):
-    args = [*command, "--ignored", "--exact", test, "--test-threads=1",
-            "--format=pretty", "--color=never"]
-    occurrence = CALLS[tuple(args)] = CALLS.get(tuple(args), -1) + 1
-    result = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run(
+        [*command, "--ignored", "--exact", test, "--test-threads=1",
+         "--format=pretty", "--color=never"],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    args = tuple(result.args)
+    occurrence = CALLS[args] = CALLS.get(args, -1) + 1
     print(result.stdout, end="", flush=True)
     # libtest succeeds when a renamed or filtered case runs zero tests. Both
     # its named result and its sole summary must attest to this exact case.
@@ -53,7 +59,7 @@ def run_case(command, test, env):
     cases = [line for line in lines if re.match(r"test .+ \.\.\. ", line)]
     summaries = [line for line in lines if line.startswith("test result:")]
     if (not result.returncode and not cases and not summaries
-            and carried(result.stdout, args[1:], env, occurrence)):
+            and carried(result.stdout, list(args[1:]), env, occurrence)):
         # `--resume` proved this case on this head; the proxy ran nothing, so
         # there is no result to read. Its receipt is the evidence (DEC-2553.1).
         return
