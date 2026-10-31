@@ -22,6 +22,9 @@
 //!   construction. A row comparison is the one operator the executor does not
 //!   call: it runs its operator family's btree comparison function for the
 //!   operator's types, so that function is the code judged, not the operator's.
+//!   A function a role wrote is the one exception, and it is a case of the same
+//!   proof: when its stored body is a parsed `BEGIN ATOMIC` or `RETURN` tree that
+//!   itself reaches only such code, it runs nothing else (#2563, [`body`]).
 //! - **(b) the types are owned by trusted roles.** Only the owner of a type can
 //!   change what its input path runs, and so can every role that can act as that
 //!   owner: by membership with `SET` or `INHERIT`, or by `ADMIN`, which can grant
@@ -102,6 +105,7 @@
 //! `search_path` of its own. A pass that differs from the one before it is
 //! [`Unreadable::Failed`].
 
+mod body;
 mod literal_inputs;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -296,6 +300,9 @@ pub struct RoutineReason {
     pub used_by: Use,
     /// The implementation function, including operator support functions.
     pub oid: Oid,
+    /// For a function a role wrote, why it could not be proven to run only
+    /// built-in code (#2563): a clause continuing "it".
+    pub detail: Option<String>,
 }
 
 /// A type on the input path that a role which is not trusted can change.
@@ -379,9 +386,13 @@ impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Routine(r) => {
-                let what = match r.why {
-                    Why::NotBuiltin => "is not built into PostgreSQL",
-                    Why::RunsSql => "runs SQL or code named by its arguments",
+                let what = match (r.why, &r.detail) {
+                    (Why::NotBuiltin, None) => "is not built into PostgreSQL".to_owned(),
+                    (Why::NotBuiltin, Some(detail)) => format!(
+                        "is not built into PostgreSQL and cannot be proven to run only built-in \
+                         code: {detail}"
+                    ),
+                    (Why::RunsSql, _) => "runs SQL or code named by its arguments".to_owned(),
                 };
                 match &r.runs {
                     None => write!(
@@ -423,7 +434,7 @@ impl fmt::Display for Reason {
             ),
             Self::RoutineOwner(o) => write!(
                 f,
-                "the type input {} `{}` is owned by `{}`, and untrusted role `{}` can act as that owner; pinning does not replace owner trust",
+                "the input-path {} `{}` is owned by `{}`, and untrusted role `{}` can act as that owner; pinning does not replace owner trust",
                 o.kind.as_str(),
                 o.identity,
                 o.owner.shown(),
@@ -1105,20 +1116,6 @@ async fn vet_in_transaction(
         .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
     let bound = bound_objects(&text, major)
         .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
-    // Built-in types only: a user-defined or domain type in the tree runs its
-    // own input path (v1 scope).
-    if bound.domain_coercions.iter().any(|_| true)
-        || bound
-            .types
-            .iter()
-            .chain(&bound.input_coercions)
-            .any(|oid| !is_builtin(Oid::from(*oid)))
-    {
-        return Err(refuse(
-            "names a type that is not built into PostgreSQL, or coerces to a domain, which \
-             runs code of its own",
-        ));
-    }
     let used_by = Use {
         ty: shown.to_owned(),
         part: if predicate {
@@ -1127,33 +1124,87 @@ async fn vet_in_transaction(
             Part::Conversion
         },
     };
-    let functions: BTreeMap<Oid, Vec<Use>> = bound
-        .routines
-        .iter()
-        .map(|f| (Oid::from(*f), vec![used_by.clone()]))
-        .collect();
-    let operators: BTreeMap<Oid, Vec<Use>> = bound
-        .operators
-        .iter()
-        .map(|o| (Oid::from(*o), vec![used_by.clone()]))
-        .collect();
-    let row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = bound
-        .row_compares
-        .iter()
-        .map(|(o, f)| ((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]))
-        .collect();
-    let (reasons, _, _) = unadmitted_routines(conn, &denied, &functions, &operators, &row_compares)
+    // A user function whose body is proven built-in-only adds its body's trees
+    // under this use (#2563), so everything below judges them as the expression.
+    let mut bounds = vec![(used_by.clone(), bound)];
+    let mut proven = body::Proven::default();
+    body::expand(conn, major, &mut bounds, &mut proven)
         .await
         .map_err(|failure| match failure {
             Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
             Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
         })?;
+    // Built-in types only: a user-defined or domain type in the tree runs its
+    // own input path (v1 scope).
+    if bounds.iter().any(|(_, bound)| {
+        bound.domain_coercions.iter().any(|_| true)
+            || bound
+                .types
+                .iter()
+                .chain(&bound.input_coercions)
+                .any(|oid| !is_builtin(Oid::from(*oid)))
+    }) {
+        return Err(refuse(
+            "names a type that is not built into PostgreSQL, or coerces to a domain, which \
+             runs code of its own",
+        ));
+    }
+    let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
+    let mut operators: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
+    let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
+    for (used_by, bound) in &bounds {
+        for f in &bound.routines {
+            functions.insert(Oid::from(*f), vec![used_by.clone()]);
+        }
+        for o in &bound.operators {
+            operators.insert(Oid::from(*o), vec![used_by.clone()]);
+        }
+        for (o, f) in &bound.row_compares {
+            row_compares.insert((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]);
+        }
+    }
+    let (reasons, _, owners) = unadmitted_routines(
+        conn,
+        &denied,
+        &functions,
+        &operators,
+        &row_compares,
+        &proven,
+    )
+    .await
+    .map_err(|failure| match failure {
+        Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
+        Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
+    })?;
+    let mut reasons: Vec<Reason> = reasons.into_iter().map(Reason::Routine).collect();
+    // The engine made every built-in, so only an admitted user function has an
+    // owner to trust. Whoever can act as it can replace its body after this
+    // read, so the owner rule of the module docs applies here as it does to a
+    // type; no role is declared trusted at this site.
+    if !proven.is_empty() {
+        let wanted: BTreeSet<Oid> = owners.iter().map(|o| o.owner_oid).collect();
+        let actors = untrusted_actors(conn, &[], &wanted).await.map_err(|_| {
+            refuse("could not be vetted: the owners of the routines it calls could not be read")
+        })?;
+        for routine in owners {
+            for actor in actors.get(&routine.owner_oid).into_iter().flatten() {
+                reasons.push(Reason::RoutineOwner(RoutineOwnerReason {
+                    kind: routine.kind,
+                    identity: routine.identity.clone(),
+                    owner: routine.owner.clone(),
+                    actor: actor.clone(),
+                }));
+            }
+        }
+    }
     if !reasons.is_empty() {
+        reasons.sort();
+        reasons.dedup();
         return Err(format!(
             "{}; nothing has been changed",
             reasons
                 .iter()
-                .map(|r| Reason::Routine(r.clone()).to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("; ")
         ));
@@ -1280,6 +1331,8 @@ async fn gather(
     // Operator and operator family of a row comparison.
     let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
     let mut runs_code = false;
+    // The user functions whose bodies were proven built-in-only (#2563).
+    let mut proven = body::Proven::default();
 
     let mut roots = BTreeMap::from([(root, added.fill == Fill::StatementDefault)]);
     let mut constructed = BTreeSet::new();
@@ -1390,6 +1443,10 @@ async fn gather(
                 bounds.push((used_by.clone(), certify(&text, major, &used_by)?));
             }
         }
+        // A user function whose body is proven built-in-only contributes its
+        // body's trees under the use that reaches it, and so is judged by
+        // everything below exactly as the expression itself is.
+        body::expand(conn, major, &mut bounds, &mut proven).await?;
         let mut next = BTreeMap::new();
         for (used_by, bound) in bounds {
             for f in &bound.routines {
@@ -1435,8 +1492,15 @@ async fn gather(
         roots = next;
     }
 
-    let (routines, non_immutable, mut routine_owners) =
-        unadmitted_routines(conn, runs_sql, &functions, &operators, &row_compares).await?;
+    let (routines, non_immutable, mut routine_owners) = unadmitted_routines(
+        conn,
+        runs_sql,
+        &functions,
+        &operators,
+        &row_compares,
+        &proven,
+    )
+    .await?;
     let handler_rows = function_rows(conn, &handlers.iter().copied().collect::<Vec<_>>()).await?;
     for oid in handlers {
         let row = handler_rows.get(&oid).ok_or_else(|| {
@@ -1628,7 +1692,17 @@ async fn unadmitted_routines(
     functions: &BTreeMap<Oid, Vec<Use>>,
     operators: &BTreeMap<Oid, Vec<Use>>,
     row_compares: &BTreeMap<(Oid, Oid), Vec<Use>>,
+    proven: &body::Proven,
 ) -> Result<(Vec<RoutineReason>, bool, Vec<OwnedRoutine>), Failure> {
+    // A function a role wrote is not admitted unless its body was proven
+    // (#2563); the reason it was not is the proof's own sentence.
+    let unproven = |oid: Oid| -> Option<(Why, Option<String>)> {
+        match why_not_admitted(oid, runs_sql)? {
+            Why::NotBuiltin if proven.admits(oid) => None,
+            Why::NotBuiltin => Some((Why::NotBuiltin, proven.refusal(oid).map(str::to_owned))),
+            why => Some((why, None)),
+        }
+    };
     let mut operator_ids: BTreeSet<Oid> = operators.keys().copied().collect();
     operator_ids.extend(row_compares.keys().map(|(operator, _)| *operator));
     let operator_rows = operator_rows(conn, &operator_ids.into_iter().collect::<Vec<_>>()).await?;
@@ -1697,7 +1771,7 @@ async fn unadmitted_routines(
         .collect();
     let mut out = Vec::new();
     for (oid, uses) in functions {
-        let Some(why) = why_not_admitted(*oid, runs_sql) else {
+        let Some((why, detail)) = unproven(*oid) else {
             continue;
         };
         let row = function(*oid)?;
@@ -1713,6 +1787,7 @@ async fn unadmitted_routines(
                 owner: row.owner.clone(),
                 why,
                 used_by: used_by.clone(),
+                detail: detail.clone(),
             });
         }
     }
@@ -1720,7 +1795,7 @@ async fn unadmitted_routines(
         let row = operator_rows.get(oid).ok_or_else(|| {
             Failure::Uncertified(format!("the operator with OID {oid} is not in the catalog"))
         })?;
-        let Some(why) = why_not_admitted(row.code, runs_sql) else {
+        let Some((why, detail)) = unproven(row.code) else {
             continue;
         };
         let runs = function(row.code)?;
@@ -1733,6 +1808,7 @@ async fn unadmitted_routines(
                 owner: row.owner.clone(),
                 why,
                 used_by: used_by.clone(),
+                detail: detail.clone(),
             });
         }
     }
@@ -1751,7 +1827,7 @@ async fn unadmitted_routines(
                 row.identity
             ))
         })?;
-        let Some(why) = why_not_admitted(*support, runs_sql) else {
+        let Some((why, detail)) = unproven(*support) else {
             continue;
         };
         let runs = function(*support)?;
@@ -1764,6 +1840,7 @@ async fn unadmitted_routines(
                 owner: row.owner.clone(),
                 why,
                 used_by: used_by.clone(),
+                detail: detail.clone(),
             });
         }
     }
@@ -2094,6 +2171,7 @@ mod tests {
             owner: "alice".to_owned().into(),
             why: Why::NotBuiltin,
             used_by: used("app.positive"),
+            detail: None,
         }
     }
 

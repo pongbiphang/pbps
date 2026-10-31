@@ -112,7 +112,9 @@ fn plan(d: &Demo, db: &str, scratch: &str, extra: &[&str]) -> Output {
     d.run_with_env(&args, &[("PBPS_VET2309_SCRATCH", scratch)])
 }
 
-const EXTERNALS: &str = "CREATE SCHEMA ext; CREATE FUNCTION ext.bad(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$BEGIN RAISE EXCEPTION 'code ran'; END$$; CREATE FUNCTION ext.dflt() RETURNS text LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'default ran'; END$$; CREATE FUNCTION ext.eqf(text,text) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN $1=$2; CREATE OPERATOR ext.=== (LEFTARG=text, RIGHTARG=text, FUNCTION=ext.eqf);";
+// `ext.eqf` is a string body, which no proof reads: a `RETURN` or `BEGIN ATOMIC`
+// body that reaches only built-ins is admitted instead (#2563).
+const EXTERNALS: &str = "CREATE SCHEMA ext; CREATE FUNCTION ext.bad(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$BEGIN RAISE EXCEPTION 'code ran'; END$$; CREATE FUNCTION ext.dflt() RETURNS text LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'default ran'; END$$; CREATE FUNCTION ext.eqf(text,text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT $1=$2$$; CREATE OPERATOR ext.=== (LEFTARG=text, RIGHTARG=text, FUNCTION=ext.eqf);";
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]

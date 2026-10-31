@@ -1206,6 +1206,7 @@ mod code_only_tests {
                     ty: "app.d".into(),
                     part: Part::Default,
                 },
+                detail: None,
             });
             assert_eq!(
                 code_only(InputPath::Refused(vec![

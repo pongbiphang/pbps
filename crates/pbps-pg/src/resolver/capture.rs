@@ -5,6 +5,7 @@
 //! requested read scope and the lifecycle must qualify non-snapshot inputs.
 
 mod bindings;
+mod body;
 mod logical;
 mod nodes;
 pub(crate) mod policy_names;
@@ -26,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// admits only built-in code has to know exactly that. The tree carries every
 /// occurrence, and the decoder refuses a node or a field it does not know
 /// instead of certifying a partial set (see `nodes`).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Bound {
     /// Every function the tree names: calls, cast functions, an operator's
     /// own function (`opfuncid`).
@@ -57,11 +58,42 @@ type RowCompareSlot = (Vec<String>, String);
 pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
     let tree = nodes::decode(text, major)
         .map_err(|e| format!("the stored expression is not one this release can read ({e:?})"))?;
+    bind(&tree, major, false)
+}
+
+/// Why a stored function body is not a tree the input-path proof can read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BodyError {
+    /// The decoder does not know the tree: not a body that runs nothing.
+    Unreadable(String),
+    /// A readable tree that is more than a list of plain `SELECT` expressions.
+    NotPlain(String),
+}
+
+/// The objects a function's stored `prosqlbody` binds (#2563). The body of a
+/// `BEGIN ATOMIC` or `RETURN` function is a parsed `Query` list in the same
+/// node format as `conbin`, so it goes through the same decoder and the same
+/// execution proof. It is admitted only as a list of `SELECT`s over no
+/// relation: a table, view, CTE or subquery would bring in row security,
+/// rules and further code that no expression node names (see `body`).
+pub(crate) fn bound_body(text: &str, major: u32) -> Result<Bound, BodyError> {
+    let tree = nodes::decode(text, major).map_err(|e| {
+        BodyError::Unreadable(format!(
+            "the stored body is not one this release can read ({e:?})"
+        ))
+    })?;
+    body::check(&tree).map_err(BodyError::NotPlain)?;
+    bind(&tree, major, true).map_err(BodyError::Unreadable)
+}
+
+/// The shared proof. `body` admits what only a function body holds: its
+/// statements' target lists and its arguments as `PARAM` nodes.
+fn bind(tree: &nodes::Value, major: u32, body: bool) -> Result<Bound, String> {
     let mut bound = Bound::default();
     // A row comparison lists its operators and their families side by side, so
     // each pair is found by the node and the position they share.
     let mut compared: BTreeMap<RowCompareSlot, (Option<u32>, Option<u32>)> = BTreeMap::new();
-    for reference in nodes::references(&tree, major).map_err(|e| {
+    for reference in nodes::references(tree, major).map_err(|e| {
         format!("the stored expression has a reference this release cannot read ({e:?})")
     })? {
         if reference.node == "ROWCOMPAREEXPR"
@@ -114,13 +146,23 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
             }
         }
     }
-    input_coercions(&tree, &mut bound.input_coercions)?;
+    if body {
+        for expression in body::expressions(tree)? {
+            input_coercions(expression, &mut bound.input_coercions, true)?;
+        }
+    } else {
+        input_coercions(tree, &mut bound.input_coercions, false)?;
+    }
     Ok(bound)
 }
 
 /// Knowing a node's layout does not prove what it executes (DEC-2181.4).
 /// Keep the input-path proof closed independently of the resolver's decoder.
-fn input_coercions(value: &nodes::Value, inputs: &mut BTreeSet<u32>) -> Result<(), String> {
+fn input_coercions(
+    value: &nodes::Value,
+    inputs: &mut BTreeSet<u32>,
+    body: bool,
+) -> Result<(), String> {
     use nodes::Value;
     match value {
         Value::Node(node) => {
@@ -148,6 +190,11 @@ fn input_coercions(value: &nodes::Value, inputs: &mut BTreeSet<u32>) -> Result<(
                 // only ever admits a recorded conversion's expression, bound
                 // against its one column (#2331): the read copies a value.
                 "VAR" => {}
+                // An argument of the function whose body this is: a copy of a
+                // value its caller already passed. Only the external kind, and
+                // only in a body, where no subplan or sublink can be.
+                "PARAM"
+                    if body && node.fields.get("paramkind") == Some(&Value::Atom("0".into())) => {}
                 // C1's superuser-installed base-type/operator-class support
                 // boundary applies to these dispatchers (input_path's module
                 // docs). Neither performs an implicit domain input conversion.
@@ -169,12 +216,12 @@ fn input_coercions(value: &nodes::Value, inputs: &mut BTreeSet<u32>) -> Result<(
                 }
             }
             for child in node.fields.values() {
-                input_coercions(child, inputs)?;
+                input_coercions(child, inputs, body)?;
             }
         }
         Value::List(values) => {
             for child in values {
-                input_coercions(child, inputs)?;
+                input_coercions(child, inputs, body)?;
             }
         }
         Value::Null | Value::Atom(_) | Value::Datum => {}
@@ -366,6 +413,9 @@ pub async fn recapture(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod body_tests;
 
 mod baseline;
 

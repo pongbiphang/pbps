@@ -1035,7 +1035,12 @@ CREATE/ALTER, inside the same transaction and before dependents, apply re-reads
 its definition and vets its bound stored trees with the existing built-in-only
 input-path decoder. Enum labels/order and domain base/collation/NOT NULL/CHECK
 names compare exactly; rewritten default/check text compares by presence,
-following §7.6. Before-statement drift compares full catalog definitions. Failure rolls back the creating transaction. Staging never
+following §7.6. A user function in a bound tree is admitted only when its
+stored body proves built-in-only (DEC-2563.1): `LANGUAGE sql` with a parsed
+`BEGIN ATOMIC` or `RETURN` body, `IMMUTABLE`, not `SECURITY DEFINER`, built-in
+types, plain expressions over no relation, and every function it calls proven
+the same way; a string body, another language, a cycle or a chain deeper than 16
+is refused by name with its reason. Before-statement drift compares full catalog definitions. Failure rolls back the creating transaction. Staging never
 separates creation from vetting, and resume accepts committed, vetted steps.
 Existing declared types keep the existing owner-trust rule; created types are
 owned by the deployer. External references keep their existing pins and gate.
