@@ -509,6 +509,15 @@ fn formatting_preserves_numeric_looking_text_and_non_text_data() {
     fmt_scalars::check_numeric("mssql");
 }
 
+#[path = "support/role_identity_mssql1527.rs"]
+mod role_identity_mssql1527;
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn role_identity_changes_need_no_sql_server_resolver() {
+    role_identity_mssql1527::check(&std::env::var("PBPS_TEST_DB").unwrap());
+}
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 

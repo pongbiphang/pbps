@@ -203,6 +203,22 @@
   },
   "groups": [
     {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "unmanaging_a_bridge_role_keeps_its_chain_and_needs_no_resolver_on_pg18"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["role_identity_changes_need_no_sql_server_resolver"]
+    },
+    {
       "target": ["pbps-cli", "bin", "pbps"],
       "owner": "pg",
       "validate_on": "linux",
