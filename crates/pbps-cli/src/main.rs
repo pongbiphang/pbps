@@ -182,7 +182,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Record several explicit rename/drop decisions together, or none
-    Intent(intent_batch::BatchArgs),
+    // Keep large argument construction in its own frame, as for drop options:
+    // clap startup must fit Windows' 1 MiB main stack (#2493, #2523).
+    Intent(Box<intent_batch::BatchArgs>),
 
     /// Browse local read views of environments, drift, saved plans and history
     Ui,
@@ -725,7 +727,7 @@ enum KeyCommand {
 #[derive(Subcommand)]
 enum StateCommand {
     /// Record external data work without executing it or changing managed state
-    RecordDataWork(state_data_work::RecordDataWorkArgs),
+    RecordDataWork(Box<state_data_work::RecordDataWorkArgs>),
 
     /// Show this environment's history, newest first
     List {
@@ -1569,7 +1571,7 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
-            StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, args),
+            StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, *args),
             StateCommand::List {
                 target,
                 limit,
@@ -7049,5 +7051,31 @@ mod declaration_source_tests {
                 ))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod command_stack_tests {
+    use std::mem::size_of;
+
+    // clap's generated argument constructors need much larger frames than their
+    // final values. Bound both enum levels so Linux catches growing inline
+    // payloads before Windows exhausts its 1 MiB main stack at startup.
+    #[test]
+    fn top_level_commands_keep_a_bounded_inline_payload() {
+        let bytes = size_of::<super::Command>();
+        assert!(
+            bytes <= 25 * size_of::<usize>(),
+            "Command grew to {bytes} bytes; box large command arguments"
+        );
+    }
+
+    #[test]
+    fn nested_state_commands_keep_a_bounded_inline_payload() {
+        let bytes = size_of::<super::StateCommand>();
+        assert!(
+            bytes <= 16 * size_of::<usize>(),
+            "StateCommand grew to {bytes} bytes; box large command arguments"
+        );
     }
 }
