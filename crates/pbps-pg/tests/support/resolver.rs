@@ -1,5 +1,13 @@
 use super::*;
 use pbps_db::resolver::{Candidate, DiscoveryCompatibility};
+use pbps_pg::resolver::authorization::{Grant, SchemaAcl, SchemaAuthorization};
+
+fn schema_grants(schema: &SchemaAuthorization) -> &std::collections::BTreeMap<String, Vec<Grant>> {
+    match &schema.acl {
+        SchemaAcl::Explicit(entries) => entries,
+        SchemaAcl::Default => panic!("expected an explicit ACL"),
+    }
+}
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
@@ -860,6 +868,55 @@ mod recon610 {
         PlannedGrant, RoleMap, apply_planned, read, reconstruct, verify, with_planned,
     };
 
+    // Native catalog and DDL oracles must not reuse the authorization reader:
+    // an empty explicit ACL and a default ACL give the owner opposite answers.
+    async fn assert_owner_schema(conn: &mut Conn, schema: &str, owner: &str, default: bool) {
+        let row = conn
+            .query(&format!(
+                "SELECT pg_catalog.pg_get_userbyid(nspowner)::text AS owner, \
+                    (nspacl IS NULL)::text AS default_acl, \
+                    COALESCE(cardinality(nspacl), 0)::text AS entries \
+             FROM pg_catalog.pg_namespace WHERE nspname = '{schema}'"
+            ))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.try_get::<&str>("owner").unwrap(), Some(owner));
+        assert_eq!(
+            row.try_get::<&str>("default_acl").unwrap(),
+            Some(if default { "true" } else { "false" })
+        );
+        assert_eq!(row.try_get::<&str>("entries").unwrap(), Some("0"));
+    }
+
+    async fn assert_owner_create(conn: &mut Conn, schema: &str, actor: &str, allowed: bool) {
+        let who = conn
+            .query(
+                "SELECT current_user::text AS actor, current_setting('is_superuser') AS superuser",
+            )
+            .await
+            .unwrap();
+        assert_eq!(who[0].try_get::<&str>("actor").unwrap(), Some(actor));
+        assert_eq!(who[0].try_get::<&str>("superuser").unwrap(), Some("off"));
+        let result = conn
+            .execute(&format!("CREATE TABLE {schema}.acl699_probe (id integer)"))
+            .await;
+        if allowed {
+            result.unwrap();
+            conn.execute(&format!("DROP TABLE {schema}.acl699_probe"))
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().server_error_code().as_deref(),
+                Some("42501"),
+                "{schema}"
+            );
+            let rows = conn.query(&format!("SELECT c.relname::text AS object FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' AND c.relname = 'acl699_probe'")).await.unwrap();
+            assert!(rows.is_empty(), "denied CREATE left a relation");
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
     async fn scratch_reproduces_the_deployers_authorization_not_the_admins() {
@@ -912,6 +969,11 @@ mod recon610 {
                  CREATE SCHEMA plain AUTHORIZATION {owner}; \
                  CREATE SCHEMA trimmed AUTHORIZATION {owner}; \
                  REVOKE CREATE ON SCHEMA trimmed FROM {owner}; \
+                 CREATE SCHEMA empty AUTHORIZATION {dep}; \
+                 REVOKE ALL ON SCHEMA empty FROM PUBLIC, {dep}; \
+                 CREATE SCHEMA empty_other AUTHORIZATION {owner}; \
+                 REVOKE ALL ON SCHEMA empty_other FROM PUBLIC, {owner}; \
+                 CREATE SCHEMA owner_default AUTHORIZATION {dep}; \
                  CREATE SCHEMA mine AUTHORIZATION {dep}; \
                  REVOKE CREATE ON SCHEMA mine FROM {dep}; \
                  DROP SCHEMA public; CREATE SCHEMA public AUTHORIZATION {owner}; \
@@ -939,6 +1001,9 @@ mod recon610 {
             "plain".to_owned(),
             "trimmed".to_owned(),
             "mine".to_owned(),
+            "empty".to_owned(),
+            "empty_other".to_owned(),
+            "owner_default".to_owned(),
             "public".to_owned(),
             // A write-path extra the engine provides: not droppable, owned
             // by the bootstrap superuser, so the reproduction keeps the
@@ -972,7 +1037,24 @@ mod recon610 {
             .execute(&format!("GRANT USAGE ON SCHEMA secret TO {reader}"))
             .await
             .unwrap();
+        assert_owner_schema(&mut planning, "empty", &dep, false).await;
+        assert_owner_schema(&mut planning, "owner_default", &dep, true).await;
+        assert_owner_create(&mut planning, "empty", &dep, false).await;
+        assert_owner_create(&mut planning, "owner_default", &dep, true).await;
         let target = read(&mut planning, &schemas).await.unwrap();
+        assert_eq!(target.principal.effective.raw(), dep);
+        assert!(!target.principal.superuser);
+        assert_eq!(
+            target.schemas["empty"].acl,
+            SchemaAcl::Explicit(Default::default())
+        );
+        assert_eq!(
+            target.schemas["empty_other"].acl,
+            SchemaAcl::Explicit(Default::default())
+        );
+        assert_eq!(target.schemas["owner_default"].acl, SchemaAcl::Default);
+        assert_eq!(with_planned(target.clone(), &[]), target);
+
         // The deployer's login defaults: a quoted list, which must come back
         // from the reproduction as the same list and not as one element
         // spelled like it, and a compared setting outside the old shorter
@@ -1005,12 +1087,12 @@ mod recon610 {
             target.settings
         );
         assert!(
-            target.schemas["plain"].acl.is_empty(),
+            target.schemas["plain"].acl == SchemaAcl::Default,
             "{:?}",
             target.schemas["plain"]
         );
         assert!(
-            target.schemas["public"].acl.is_empty(),
+            target.schemas["public"].acl == SchemaAcl::Default,
             "{:?}",
             target.schemas["public"]
         );
@@ -1021,8 +1103,7 @@ mod recon610 {
         assert!(target.schemas["mine"].privileges["USAGE"]);
         assert!(!target.schemas["mine"].privileges["CREATE"]);
         assert_eq!(
-            target.schemas["trimmed"]
-                .acl
+            schema_grants(&target.schemas["trimmed"])
                 .get(&owner)
                 .map(|grants| grants
                     .iter()
@@ -1033,7 +1114,7 @@ mod recon610 {
             target.schemas["trimmed"].acl
         );
         assert!(
-            target.schemas["secret"].acl[&reader]
+            schema_grants(&target.schemas["secret"])[&reader]
                 .iter()
                 .any(|g| g.privilege == "USAGE" && g.grantor == dep.clone().into()),
             "{:?}",
@@ -1069,37 +1150,7 @@ mod recon610 {
         )
         .await
         .unwrap();
-        let mapped_deployer = {
-            // The mapped deployer is the run-local name for the logical dep.
-            let names = map.run_local_names();
-            // Find it by asking the map through a reconstruction artefact:
-            // the run login is a member of exactly the deployer, so SET ROLE
-            // to each until current_user changes to a covered role.
-            let mut found = None;
-            for candidate in &names {
-                if run
-                    .execute(&format!(
-                        "SET ROLE {candidate}",
-                        // Preserve the original spelling in this SQL or comparison fixture.
-                        candidate = candidate.raw(),
-                    ))
-                    .await
-                    .is_ok()
-                {
-                    let who = run.query("SELECT current_user AS u").await.unwrap()[0]
-                        .try_get::<&str>("u")
-                        .unwrap()
-                        .unwrap()
-                        .to_owned();
-                    run.execute("RESET ROLE").await.unwrap();
-                    if who == candidate.raw() {
-                        found = Some(candidate.clone());
-                        break;
-                    }
-                }
-            }
-            found.expect("the run login can become the mapped deployer")
-        };
+        let mapped_deployer = map.deployer(&target).unwrap();
         run.execute(&format!(
             "SET ROLE {mapped_deployer}",
             // Preserve the original spelling in this SQL or comparison fixture.
@@ -1107,11 +1158,57 @@ mod recon610 {
         ))
         .await
         .unwrap();
+        assert_owner_create(&mut run, "empty", mapped_deployer.raw(), false).await;
+        assert_owner_create(&mut run, "owner_default", mapped_deployer.raw(), true).await;
+        assert_owner_schema(&mut run, "empty", mapped_deployer.raw(), false).await;
+        assert_owner_schema(&mut run, "owner_default", mapped_deployer.raw(), true).await;
         let differences = verify(&mut run, &map, &target, &schemas).await.unwrap();
         assert!(
             differences.is_empty(),
             "reproduction differed: {differences:?}"
         );
+        // Mode-only negative: the deployer does not inherit empty_other's
+        // owner. Default and explicit empty give identical effective answers
+        // and have zero exploded grants, so only mode comparison can refuse.
+        let actual = read(&mut run, &schemas).await.unwrap();
+        let other_owner = actual.schemas["empty_other"].owner.raw();
+        assert_owner_schema(&mut run, "empty_other", other_owner, false).await;
+        scratch_admin
+            .execute(&format!(
+                "DROP SCHEMA empty_other; CREATE SCHEMA empty_other AUTHORIZATION {other_owner}",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                other_owner = actual.schemas["empty_other"].owner.raw(),
+            ))
+            .await
+            .unwrap();
+        let wrong_mode = read(&mut run, &schemas).await.unwrap();
+        assert_eq!(wrong_mode.principal, actual.principal);
+        assert_eq!(
+            wrong_mode.schemas["empty_other"].owner,
+            actual.schemas["empty_other"].owner
+        );
+        assert_eq!(
+            wrong_mode.schemas["empty_other"].privileges,
+            actual.schemas["empty_other"].privileges
+        );
+        assert_owner_schema(&mut run, "empty_other", other_owner, true).await;
+        assert_eq!(
+            verify(&mut run, &map, &target, &schemas).await.unwrap(),
+            vec!["schema:empty_other:acl"]
+        );
+        scratch_admin
+            .execute(&format!(
+                "REVOKE ALL ON SCHEMA empty_other FROM PUBLIC, {other_owner}"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            verify(&mut run, &map, &target, &schemas)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
         // The deployer's membership in `pg_read_all_settings` is reproduced as
         // membership in the real predefined role, not a clone of it, so the
         // mapped deployer sees the superuser-only settings the way the target
@@ -1158,7 +1255,7 @@ mod recon610 {
             revoke: true,
         }];
         let expected = with_planned(target.clone(), &usable);
-        assert!(!expected.schemas["secret"].acl.contains_key(&reader));
+        assert!(!schema_grants(&expected.schemas["secret"]).contains_key(&reader));
         assert!(expected.schemas["secret"].privileges["USAGE"]);
         apply_planned(&mut scratch_admin, &map, &deployer_role, &usable)
             .await
@@ -1202,6 +1299,77 @@ mod recon610 {
             "{refused:?}"
         );
 
+        // Compare each projection against real statements on both engines'
+        // sides. Include a no-op first REVOKE, owner self-grant from empty,
+        // removal of the final grant, PUBLIC and repeated projection.
+        let matrix_schemas = ["empty".to_owned(), "owner_default".to_owned()];
+        let mut projected = read(&mut planning, &matrix_schemas).await.unwrap();
+        let initial = projected.clone();
+        let mut statements = Vec::new();
+        for schema in &matrix_schemas {
+            for (index, (role, revoke)) in [
+                ("PUBLIC", true),
+                (dep.as_str(), false),
+                (dep.as_str(), true),
+                ("PUBLIC", false),
+                ("PUBLIC", true),
+                (dep.as_str(), false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let statement = PlannedGrant {
+                    role: role.into(),
+                    schema: schema.clone(),
+                    privilege: "USAGE".into(),
+                    revoke,
+                };
+                planning
+                    .execute(&format!(
+                        "{} USAGE ON SCHEMA {schema} {} {role}",
+                        if revoke { "REVOKE" } else { "GRANT" },
+                        if revoke { "FROM" } else { "TO" }
+                    ))
+                    .await
+                    .unwrap();
+                apply_planned(
+                    &mut scratch_admin,
+                    &map,
+                    &mapped_deployer,
+                    std::slice::from_ref(&statement),
+                )
+                .await
+                .unwrap();
+                projected = with_planned(projected, std::slice::from_ref(&statement));
+                assert_eq!(
+                    read(&mut planning, &matrix_schemas).await.unwrap(),
+                    projected,
+                    "{schema}/{index}"
+                );
+                assert_eq!(
+                    verify(&mut run, &map, &projected, &matrix_schemas)
+                        .await
+                        .unwrap(),
+                    Vec::<String>::new(),
+                    "{schema}/{index}"
+                );
+                if schema == "empty" {
+                    assert!(!projected.schemas[schema].privileges["CREATE"]);
+                    if index == 1 {
+                        assert!(projected.schemas[schema].privileges["USAGE"]);
+                    }
+                    if index == 2 {
+                        assert_owner_schema(&mut planning, schema, &dep, false).await;
+                    }
+                }
+                statements.push(statement);
+            }
+        }
+        assert_eq!(with_planned(initial, &statements), projected);
+        assert_eq!(with_planned(projected.clone(), &[]), projected);
+        assert_owner_create(&mut run, "empty", mapped_deployer.raw(), false).await;
+        assert_owner_create(&mut run, "owner_default", mapped_deployer.raw(), true).await;
+
         // A membership revoked on the target after qualification, one that
         // changes no schema answer (the deployer never inherited `owner`), is
         // still an authorization the reproduction has and the target no
@@ -1227,6 +1395,8 @@ mod recon610 {
             "{absent:?}"
         );
 
+        run.execute("SET ROLE NONE").await.unwrap();
+        planning.execute("SET ROLE NONE").await.unwrap();
         drop(planning);
         drop(setup);
         drop(run);
@@ -1307,7 +1477,7 @@ mod recon610_public {
         assert_eq!(target.schemas["public"].owner, "pg_database_owner".into());
         assert!(target.schemas["public"].privileges["USAGE"]);
         assert!(!target.schemas["public"].privileges["CREATE"]);
-        assert!(target.schemas["public"].acl.contains_key("PUBLIC"));
+        assert!(schema_grants(&target.schemas["public"]).contains_key("PUBLIC"));
 
         let map = RoleMap::generate(&target, &[], &run_login, &format!("p{pid}"));
         let mut scratch_admin =
@@ -1439,7 +1609,7 @@ mod recon610_super {
         let target = read(&mut planning, &schemas).await.unwrap();
         assert!(target.principal.superuser);
         assert_eq!(target.schemas["public"].owner, "pg_database_owner".into());
-        assert!(target.schemas[&fresh].acl.is_empty());
+        assert!(target.schemas[&fresh].acl == SchemaAcl::Default);
 
         let planned = [PlannedGrant {
             role: "PUBLIC".into(),
@@ -1489,7 +1659,7 @@ mod recon610_super {
             .await
             .unwrap();
         let expected = with_planned(target.clone(), &planned);
-        assert!(expected.schemas[&fresh].acl.contains_key("PUBLIC"));
+        assert!(schema_grants(&expected.schemas[&fresh]).contains_key("PUBLIC"));
         let after = verify(&mut run, &map, &expected, &schemas).await.unwrap();
         assert!(
             after.is_empty(),

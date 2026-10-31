@@ -95,7 +95,11 @@ authorization metadata and physical bookkeeping. Owners, ACLs, shared
 (`pg_shdepend`) owner/ACL rows, initial privileges and default ACLs are
 authorization metadata: they do not change what a creation binds, so they are
 not read as prerequisites (DEC-1274.1). The deployer's effective privileges,
-which do change name lookup, are the separate authorization condition. Public
+which do change name lookup, are the separate authorization condition. PostgreSQL
+schema authorization preserves NULL/default ACLs separately from explicit
+ACLs, including explicit empty. Replay, planned grant projection and
+verification retain that distinction even when current effective answers
+match; `pg-auth-v2` evidence binds it (DEC-699.1). Public
 `pg_roles` supplies role facts without reading password verifiers from
 `pg_authid`. A constraint's internal triggers, whose names embed
 their OID, are identified by relation, constraint and trigger function. A

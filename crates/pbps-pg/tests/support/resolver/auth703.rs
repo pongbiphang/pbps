@@ -291,7 +291,7 @@ async fn exercise(server: String, names: Names, mapped_names: Arc<Mutex<Vec<Stri
     );
 }
 
-async fn one(server: &str, major: u32) -> Result<String, String> {
+async fn one(server: &str) -> Result<(u32, String), String> {
     let names = Names::new();
     let mut admin = Conn::connect(Driver::Postgres, server).await.unwrap();
     let rows = admin
@@ -304,7 +304,11 @@ async fn one(server: &str, major: u32) -> Result<String, String> {
         .unwrap()
         .parse::<u32>()
         .unwrap();
-    assert_eq!(version / 10000, major);
+    let major = version / 10000;
+    assert!(
+        matches!(major, 16 | 18),
+        "supported PostgreSQL major: {major}"
+    );
     let build = rows[0]
         .try_get::<&str>("build")
         .unwrap()
@@ -370,19 +374,26 @@ async fn one(server: &str, major: u32) -> Result<String, String> {
         ));
     }
     outcome
-        .map(|()| build)
+        .map(|()| (major, build))
         .map_err(|error| format!("PG{major}: {error}"))
 }
 
 pub(super) async fn switchability_is_reproduced_independently() {
     let mut failures = Vec::new();
-    for (key, major) in [("PBPS_TEST_PG_DB", 18), ("PBPS_TEST_PG_OLD_DB", 16)] {
+    let mut observed = std::collections::BTreeSet::new();
+    // The enclosing ACL case also runs with PBPS_TEST_PG_DB explicitly set
+    // to 16. Require both real majors without assigning one by variable name.
+    for key in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
         let server = std::env::var(key).expect("both required PostgreSQL endpoints must exist");
-        match one(&server, major).await {
-            Ok(build) => println!("auth703 completed PG{major}: {build}"),
+        match one(&server).await {
+            Ok((major, build)) => {
+                observed.insert(major);
+                println!("auth703 completed PG{major}: {build}");
+            }
             Err(error) => failures.push(error),
         }
     }
+    assert_eq!(observed, std::collections::BTreeSet::from([16, 18]));
     assert!(
         failures.is_empty(),
         "authorization switchability failed: {failures:?}"
