@@ -4262,3 +4262,24 @@ expressions do not reach the temporary DDL; the CHECK appears only in the
 approved plan. Copy USING expressions are already vetted with extended
 execution in input_path::vet_in_transaction (DEC-1635.4). Live cases pin both
 early default refusal and CHECK exclusion without executing the plan. The apply-time probe consumes the verified saved plan.
+
+
+<a id="dec-2394-1"></a>
+
+**DEC-2394.1. A foreign key re-added around a recorded conversion counts
+orphans over the converted stored rows on either side (#2394).** This amends
+DEC-2359.1's unchecked orphan probe. The stored SELECT reads the unchanged,
+vetted expression over its own table's row, with the exact assignment cast
+shared with the conversion's own probe, including the target type modifier.
+No SQL text is substituted and no guard for the old value's plain cast is
+applied to the expression's result. Vetting still precedes pre-flight; the
+empty search path and read-only framing are unchanged.
+
+Only the foreign-key stored branch opts in. Planned inserted/updated key
+values retain their unchecked policy where a recorded expression cannot be
+projected, rather than evaluating the conversion twice. Unique, primary-key,
+filtered-index and CHECK probes keep their existing policies; changing their
+admission is outside this issue. A partition inherits its parent's conversion
+expression and evaluates it against its own row. Live cases on PostgreSQL 16
+and 18 pin matching transformed keys and orphan refusal on either end before
+any ALTER TABLE, witnessed by a sequence that survives transaction rollback.

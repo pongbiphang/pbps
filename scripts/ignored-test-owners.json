@@ -715,7 +715,7 @@
         "conversions2331::not_null_beside_a_conversion_is_checked_on_the_converted_value",
         "conversions2359::a_change_inside_the_types_a_key_joins_leaves_the_key_to_the_engine",
         "conversions2359::a_conversion_beside_a_key_on_another_column_leaves_the_key_standing",
-        "conversions2359::a_converted_value_that_breaks_the_reference_rolls_the_whole_plan_back",
+        "conversions2359::a_converted_value_that_breaks_either_end_is_refused_before_any_statement",
         "conversions2359::a_key_from_a_table_to_itself_is_rebuilt_around_the_conversion",
         "conversions2359::a_key_left_between_types_that_do_not_meet_is_refused_by_plan_before_any_statement",
         "conversions2359::a_recorded_conversion_on_both_ends_of_a_key_applies_with_the_key_validated",

@@ -135,8 +135,8 @@ fn a_recorded_conversion_on_both_ends_of_a_key_applies_with_the_key_validated() 
         );
         put(&d, "app.p.yml", &declared_as(PARENT, "integer"));
         put(&d, "app.c.yml", &declared_as(CHILD, "integer"));
-        convert(&d, "app.p.id", "id::integer");
-        convert(&d, "app.c.pid", "pid::integer");
+        convert(&d, "app.p.id", "id::integer + 100");
+        convert(&d, "app.c.pid", "pid::integer + 100");
         let planned = d.run(&["plan", "--db", connection]);
         assert!(
             shows_the_key_rebuilt(&stdout(&planned)),
@@ -149,12 +149,12 @@ fn a_recorded_conversion_on_both_ends_of_a_key_applies_with_the_key_validated() 
         // The rows read back converted, and the key holds them.
         assert_eq!(
             scalar(connection, "SELECT sum(id)::bigint FROM app.p"),
-            6,
+            306,
             "PG{version}"
         );
         assert_eq!(
             scalar(connection, "SELECT sum(pid)::bigint FROM app.c"),
-            3,
+            203,
             "PG{version}"
         );
         assert_eq!(
@@ -230,42 +230,48 @@ fn an_ordinary_retype_across_the_types_a_key_joins_takes_the_key_down_the_same_w
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn a_converted_value_that_breaks_the_reference_rolls_the_whole_plan_back() {
+fn a_converted_value_that_breaks_either_end_is_refused_before_any_statement() {
     for (version, url) in servers() {
-        let slug = format!("convert2359-orphan{version}");
-        let own = OwnDatabase::new(&url, &slug);
-        let connection = own.connection();
-        let d = bootstrapped_pair(connection, &slug, PARENT, CHILD);
-        on_server(
-            connection,
-            "INSERT INTO app.p VALUES ('1'),('2'); INSERT INTO app.c VALUES (1,'1'),(2,'2')",
-        );
-        put(&d, "app.p.yml", &declared_as(PARENT, "integer"));
-        put(&d, "app.c.yml", &declared_as(CHILD, "integer"));
-        convert(&d, "app.p.id", "id::integer");
-        // Every child now names a parent that is not there.
-        convert(&d, "app.c.pid", "pid::integer + 100");
-        let artifact = connected_artifact(&d, connection, false);
-        let key_before = key_oid(connection);
-        let refused = approved_apply(&d, connection, &artifact, GATE);
-        let text = stderr(&refused);
-        assert_eq!(code(&refused), 1, "PG{version}: {text}");
-        assert!(
-            text.contains("the whole plan was rolled back")
-                && text.contains("violates foreign key constraint \"fk_c_p\""),
-            "PG{version}: {text}"
-        );
-        assert!(
-            both_still_text(connection),
-            "PG{version}: nothing converted"
-        );
-        assert!(key_stands_validated(connection), "PG{version}");
-        assert_eq!(key_oid(connection), key_before, "PG{version}: the same key");
-        assert_eq!(
-            scalar(connection, "SELECT sum(pid::integer) FROM app.c"),
-            3,
-            "PG{version}: the rows are as they were"
-        );
+        for (side, parent, child) in [
+            ("child", "id::integer", "pid::integer + 100"),
+            ("parent", "id::integer + 100", "pid::integer"),
+        ] {
+            let slug = format!("convert2394-{side}{version}");
+            let own = OwnDatabase::new(&url, &slug);
+            let connection = own.connection();
+            let d = bootstrapped_pair(connection, &slug, PARENT, CHILD);
+            on_server(
+                connection,
+                "INSERT INTO app.p VALUES ('1'),('2'); INSERT INTO app.c VALUES (1,'1'),(2,'2')",
+            );
+            put(&d, "app.p.yml", &declared_as(PARENT, "integer"));
+            put(&d, "app.c.yml", &declared_as(CHILD, "integer"));
+            convert(&d, "app.p.id", parent);
+            convert(&d, "app.c.pid", child);
+            let artifact = connected_artifact(&d, connection, false);
+            let key_before = key_oid(connection);
+            on_server(connection, WITNESS);
+            let refused = approved_apply(&d, connection, &artifact, GATE);
+            let text = stderr(&refused);
+            assert_eq!(code(&refused), 1, "PG{version} {side}: {text}");
+            assert!(
+                text.contains("nothing has been changed")
+                    && text.contains("fk_c_p")
+                    && text.contains("2 rows"),
+                "PG{version} {side}: {text}"
+            );
+            // The nontransactional counter distinguishes early refusal from
+            // a constraint error that rolls an executed ALTER back.
+            assert_eq!(executed(connection), 0, "PG{version} {side}: {text}");
+            assert!(both_still_text(connection), "PG{version} {side}");
+            assert!(key_stands_validated(connection), "PG{version} {side}");
+            assert_eq!(key_oid(connection), key_before, "PG{version} {side}");
+            assert_eq!(
+                scalar(connection, "SELECT sum(pid::integer) FROM app.c"),
+                3,
+                "PG{version} {side}: the rows are as they were"
+            );
+        }
     }
 }
 
