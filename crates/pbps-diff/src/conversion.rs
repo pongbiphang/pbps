@@ -44,6 +44,52 @@ fn canonical(
         .map_err(|e| refused(column, e.to_string()))
 }
 
+fn check_expression(
+    column: &ColumnRef,
+    using: &str,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), ConversionError> {
+    if using.trim().is_empty() {
+        return Err(refused(column, "the expression is blank"));
+    }
+    if !dialect.lexicon().parentheses_balanced(using) {
+        return Err(refused(
+            column,
+            "the USING expression has unbalanced parentheses; write one complete expression and re-record with `pbps convert <column> --using -`",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate only conversions this operation consumes, including rebuild copies.
+/// Preview planning need not emit SQL, so it asks the same question explicitly.
+pub fn check_change(
+    change: &Change,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), ConversionError> {
+    let mut expressions = Vec::new();
+    if let Change::AlterColumnType {
+        column,
+        using: Some(using),
+        ..
+    } = change
+    {
+        expressions.push((column, using.as_str()));
+    }
+    if let Change::CopyTableRows(copy) = change {
+        expressions.extend(copy.columns.iter().flat_map(|column| {
+            column
+                .stages
+                .iter()
+                .filter_map(|stage| stage.using.as_deref().map(|using| (&column.target, using)))
+        }));
+    }
+    for (column, using) in expressions {
+        check_expression(column, using, dialect)?;
+    }
+    Ok(())
+}
+
 fn declared_type<'a>(schema: &'a Schema, column: &ColumnRef) -> Option<&'a ColumnType> {
     schema
         .tables
@@ -77,9 +123,7 @@ pub fn record(
              (ADR-0012 section 5)",
         ));
     }
-    if using.trim().is_empty() {
-        return Err(refused(column, "the expression is blank"));
-    }
+    check_expression(column, using, dialect)?;
     let Some(uid) = ids.column_uid(column) else {
         return Err(refused(
             column,
@@ -234,7 +278,14 @@ pub fn needed(changes: &[PlannedChange], dialect: &(impl Dialect + ?Sized)) -> V
 
 /// Records what a person answered for a change [`needed`] named: the
 /// expression for exactly that `from` to `to`.
-pub fn answer(ids: &mut IdsFile, need: &Needed, using: &str, ctx: &Context) {
+pub fn answer(
+    ids: &mut IdsFile,
+    need: &Needed,
+    using: &str,
+    ctx: &Context,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), ConversionError> {
+    check_expression(&need.column, using, dialect)?;
     ids.conversions.insert(
         need.uid.clone(),
         Conversion {
@@ -245,6 +296,7 @@ pub fn answer(ids: &mut IdsFile, need: &Needed, using: &str, ctx: &Context) {
             operator: ctx.operator.clone(),
         },
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -749,6 +801,42 @@ mod tests {
     }
 
     #[test]
+    fn recording_and_prompt_answers_refuse_unbalanced_using_before_changing_ids() {
+        let (base, declared) = (schema("text"), schema("integer"));
+        let original = ids_of(&base);
+        let need = Needed {
+            uid: original.column_uid(&amount()).unwrap().clone(),
+            column: amount(),
+            from: "text".into(),
+            to: "integer".into(),
+        };
+        for using in ["amount) IS NULL OR (amount", "(amount"] {
+            let error = record(
+                Side {
+                    schema: &base,
+                    ids: &original,
+                },
+                &declared,
+                &original,
+                &amount(),
+                using,
+                None,
+                &ctx(),
+                &Converts,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("has unbalanced parentheses"));
+            let mut answered = original.clone();
+            assert!(answer(&mut answered, &need, using, &ctx(), &Converts).is_err());
+            assert_eq!(answered, original, "a refused answer records nothing");
+        }
+        let using = "(nullif(amount, '(' /* ) */))::integer";
+        let mut answered = original;
+        answer(&mut answered, &need, using, &ctx(), &Converts).unwrap();
+        assert_eq!(answered.conversions[&need.uid].using, using);
+    }
+
+    #[test]
     fn answering_records_exactly_the_pair_that_was_asked_about() {
         let (base, declared) = (schema("varchar(10)"), schema("bigint"));
         let base_ids = ids_of(&base);
@@ -756,7 +844,7 @@ mod tests {
         let planned: Vec<PlannedChange> = bare.into_iter().map(PlannedChange::new).collect();
         let asked = needed(&planned, &Converts);
         let mut ids = base_ids.clone();
-        answer(&mut ids, &asked[0], "amount::bigint", &ctx());
+        answer(&mut ids, &asked[0], "amount::bigint", &ctx(), &Converts).unwrap();
         ids.validate().unwrap();
         let changes = plan((&base, &base_ids), (&declared, &ids), &Converts).unwrap();
         assert_eq!(using_of(&changes), [Some("amount::bigint")]);

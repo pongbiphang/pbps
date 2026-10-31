@@ -3820,6 +3820,8 @@ pub(crate) fn emit_in(
     strategy: Strategy,
     row_defaults: &RowDefaults<'_>,
 ) -> Sql {
+    // DEC-2400.1: legacy recordings must stay inside every conversion wrapper.
+    pbps_diff::conversion::check_change(change, pg).map_err(|error| invalid(error.to_string()))?;
     match change {
         Change::BuildPartitionedIndex(recipe) => rebuild::build_partitioned_index(pg, recipe),
         Change::CopyTableRows(copy) => rebuild::copy_table_rows(pg, copy),

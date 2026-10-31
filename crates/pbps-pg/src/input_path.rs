@@ -869,6 +869,13 @@ pub async fn vet_conversion(
     from: &pbps_model::ColumnType,
     using: &str,
 ) -> Result<(), String> {
+    if !crate::LEXICON.parentheses_balanced(using) {
+        return Err(format!(
+            "the conversion of {} has unbalanced parentheses; write one complete expression and re-record with `pbps convert {} --using -`",
+            column.shown(),
+            column.shown()
+        ));
+    }
     let shown = column.shown().to_string();
     let shown = shown.as_str();
     let normalized = crate::types::normalize(from)
@@ -926,26 +933,7 @@ pub async fn vet_requirement(
     if predicate.trim().is_empty() {
         return Err(refused("is blank"));
     }
-    // Binding and counting add different wrappers. The predicate must not
-    // close either wrapper and splice its operators into the surrounding SQL.
-    let mut depth = 0usize;
-    let mut quoted = false;
-    for ch in crate::LEXICON.header(predicate).chars() {
-        if ch == '"' {
-            quoted = !quoted;
-        } else if !quoted {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth = depth.checked_sub(1).ok_or_else(|| {
-                        refused("has unbalanced parentheses; it must be one complete expression")
-                    })?;
-                }
-                _ => {}
-            }
-        }
-    }
-    if depth != 0 {
+    if !crate::LEXICON.parentheses_balanced(predicate) {
         return Err(refused(
             "has unbalanced parentheses; it must be one complete expression",
         ));
@@ -1949,6 +1937,12 @@ pub(crate) async fn vet_copy_conversion(
     from: &pbps_model::ColumnType,
     using: &str,
 ) -> Result<(), String> {
+    if !crate::LEXICON.parentheses_balanced(using) {
+        return Err(format!(
+            "the rebuild conversion of column `{}` has unbalanced parentheses; write one complete expression and re-record with `pbps convert <column> --using -`",
+            column.shown()
+        ));
+    }
     let name = crate::quote(column.raw()).map_err(|e| e.to_string())?;
     let ty = crate::types::normalize(from).map_err(|e| e.to_string())?;
     vet_in_transaction(
@@ -1969,6 +1963,51 @@ pub(crate) async fn vet_copy_conversion(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn conversion_vetters_refuse_unbalanced_using_before_binding_on_both_majors() {
+        for key in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+            let url = std::env::var(key).expect("the PostgreSQL fixture");
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &url)
+                .await
+                .unwrap();
+            let column = pbps_model::TableName::new("app", "t").column("amount");
+            let from = "text".parse().unwrap();
+            for using in ["amount) IS NULL OR (amount", "(amount"] {
+                let why = super::vet_conversion(&mut conn, &column, &from, using)
+                    .await
+                    .unwrap_err();
+                assert!(why.contains("has unbalanced parentheses"), "{key}: {why}");
+                assert!(why.contains("pbps convert app.t.amount --using -"), "{why}");
+            }
+            let controls = [
+                "(amount)::integer",
+                "(nullif(\"amount\", '(' /* ) */))::integer",
+            ];
+            for using in controls {
+                super::vet_conversion(&mut conn, &column, &from, using)
+                    .await
+                    .unwrap();
+            }
+            conn.execute("BEGIN; SET LOCAL search_path = ''")
+                .await
+                .unwrap();
+            for using in ["amount) IS NULL OR (amount", "(amount"] {
+                let why = super::vet_copy_conversion(&mut conn, &column.name, &from, using)
+                    .await
+                    .unwrap_err();
+                assert!(why.contains("has unbalanced parentheses"), "{key}: {why}");
+                assert!(why.contains("re-record"), "{why}");
+            }
+            for using in controls {
+                super::vet_copy_conversion(&mut conn, &column.name, &from, using)
+                    .await
+                    .unwrap();
+            }
+            conn.execute("ROLLBACK").await.unwrap();
+        }
+    }
+
     #[test]
     fn a_domain_check_use_escapes_its_local_name_once() {
         let used = super::Use {

@@ -1207,6 +1207,41 @@ impl Lexicon {
         self.code_only_inner(definition, false)
     }
 
+    /// Whether code parentheses stay inside one expression (DEC-2400.1).
+    /// This is a boundary check, not SQL validation: the engine still binds it.
+    #[must_use]
+    pub fn parentheses_balanced(&self, expression: &str) -> bool {
+        let code = self.header(expression);
+        let mut chars = code.chars().peekable();
+        let mut depth = 0usize;
+        let mut quoted = None;
+        while let Some(ch) = chars.next() {
+            if let Some(close) = quoted {
+                if ch == close {
+                    if chars.peek() == Some(&close) {
+                        chars.next();
+                    } else {
+                        quoted = None;
+                    }
+                }
+            } else if let Some((_, close)) =
+                self.quoted_identifiers.iter().find(|(open, _)| *open == ch)
+            {
+                quoted = Some(*close);
+            } else {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => match depth.checked_sub(1) {
+                        Some(next) => depth = next,
+                        None => return false,
+                    },
+                    _ => {}
+                }
+            }
+        }
+        depth == 0
+    }
+
     /// The contents of every string literal in `text`, decoded: `'…'`,
     /// `E'…'`, `U&'…'` with its `UESCAPE`, a continued literal, and on an
     /// engine with dollar quoting `$tag$…$tag$`. Comments and quoted
@@ -7567,6 +7602,27 @@ mod code_only_tests {
         ] {
             assert!(super::sql_string(invalid, 0).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn expression_parentheses_cannot_escape_a_wrapper_but_noncode_does_not_count() {
+        for text in ["x) OR (x", "(x", "x)", ")("] {
+            assert!(!PG.parentheses_balanced(text), "{text}");
+        }
+        for text in [
+            "((x)::integer)",
+            "nullif(x, '(' /* ) /* ( */ ) */)::integer",
+            "(x || E'\\'(' || $tag$)($tag$)",
+            "(x -- )\n)",
+            r#"("co""l) (")"#,
+        ] {
+            assert!(PG.parentheses_balanced(text), "{text}");
+        }
+        assert!(MSSQL.parentheses_balanced("([a]]b)(])"));
+        assert!(
+            !PG.parentheses_balanced("a[(]"),
+            "PG brackets are subscripts"
+        );
     }
 
     #[test]

@@ -186,6 +186,12 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
     facts: &Facts<'_>,
     dialect: &D,
 ) -> Result<pbps_diff::order::deployment::schedule::Scheduled<S, D>, Refusal> {
+    // Offline previews may write artifacts without emitting SQL. Refuse the
+    // same consumed USING/copy expressions before either planning route writes.
+    for planned in &cs.changes().changes {
+        pbps_diff::conversion::check_change(&planned.change, dialect)
+            .map_err(|error| Refusal(error.to_string()))?;
+    }
     use pbps_diff::order::deployment as owned;
     let declarations = owned::schedule::Declarations {
         schema: declared.schema,
