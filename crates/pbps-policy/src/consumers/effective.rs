@@ -1,5 +1,8 @@
 //! One declared value interface per side, independent of the emitted change.
-use super::{Side, binding::column_target};
+use super::{
+    Side,
+    binding::{Target, column_target},
+};
 use pbps_model::{
     Change, ChangeSet, Column, ColumnRef, DomainDelta, ManagedType, ObjectLocalName, TypeRef, Uid,
     ValueSource,
@@ -146,7 +149,10 @@ impl Interfaces {
             .0
             .iter()
             .filter_map(|(key, column)| {
-                column_target(&column.at, sides[1], sides).map(|target| (target, key))
+                let target = column_target(&column.at, sides[1], sides)?;
+                // Only a UID-bearing bridge proves membership continuity: an
+                // inherited spelling can also name a replacement column.
+                matches!(target, Target::Column { .. }).then_some((target, key))
             })
             .collect();
         let mut matched = BTreeSet::new();

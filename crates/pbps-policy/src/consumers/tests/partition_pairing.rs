@@ -262,3 +262,80 @@ fn exact_source_uids_keep_their_pair_before_partition_name_bridges() {
         );
     }
 }
+
+#[test]
+fn inherited_replacements_keep_the_supplied_column_exception_for_sibling_writers() {
+    let (before, old, _, _, leaf) = endpoints();
+    for with_default in [true, false] {
+        let mut after = before.clone();
+        let mut replacement = Column::new(ColumnType::simple("integer")).not_null();
+        if with_default {
+            replacement.value_source = ValueSource::Default("0".into());
+        }
+        after
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .insert("other".into(), replacement.clone());
+        let mut new = old.clone();
+        new.columns.remove(&uid("c_cccccc"));
+        new.columns.insert(uid("c_eeeeee"), name().column("other"));
+        let changes = vec![
+            Change::DropColumn {
+                uid: uid("c_cccccc"),
+                column: name().column("other"),
+            },
+            Change::AddColumn {
+                uid: uid("c_eeeeee"),
+                table: name(),
+                name: "other".into(),
+                column: Box::new(replacement),
+            },
+        ];
+        for entry in ["app.t.old", "app.leaf.old"] {
+            let found = findings(
+                &before,
+                &after,
+                &old,
+                &new,
+                &consumers(entry, true),
+                changes.clone(),
+            );
+            assert_eq!(
+                found.len(),
+                usize::from(!with_default),
+                "{entry}, default={with_default}: {found:?}"
+            );
+            if !with_default {
+                assert_eq!(found[0].0, 1);
+                assert_eq!(found[0].1.id, "consumer.unproven");
+            }
+        }
+        let sides = [
+            Side {
+                schema: &before,
+                ids: &old,
+            },
+            Side {
+                schema: &after,
+                ids: &new,
+            },
+        ];
+        let interfaces = effective::Interfaces::of(
+            &sides,
+            &ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            },
+        );
+        let replacement = interfaces
+            .columns()
+            .find(|pair| pair.table == &uid("t_bbbbbb") && pair.has_uid(&uid("c_eeeeee")))
+            .unwrap();
+        assert!(
+            replacement.before.is_none(),
+            "a reused inherited spelling does not establish continuity"
+        );
+        assert_eq!(replacement.after.unwrap().at, leaf.column("other"));
+    }
+}
