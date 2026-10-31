@@ -176,6 +176,9 @@ binding facts remain hard. Plans without extended annotations retain the
 existing inference policy and serialized bytes.
 
 A demanded surface first asks for the dialect's existing legal creation recipe.
+SQL Server selects its computed suffix from column, generation and NOT NULL
+demands before narrowing the ordinary suffix; computed NOT NULL stays in that
+column's installation definition (DEC-2469.4).
 Otherwise its indivisible group's boundary applies. An owner requiring its own
 contained surface before creation is a named internal cycle. The index describes
 actual operation payloads, so extracted facets are exposed only by their own

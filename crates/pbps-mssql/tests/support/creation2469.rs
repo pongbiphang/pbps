@@ -1,9 +1,9 @@
 use super::*;
 #[path = "../../../pbps-diff/tests/fixtures/creation2469.rs"]
 mod fixture;
-use fixture::{FACETS, Fixture};
+use fixture::{FACETS, Fixture, generated_facet};
 use pbps_dialect::lower::lower_all;
-use pbps_model::{PlanMode, object_ref::ObjectDeps};
+use pbps_model::{Change, PlanMode, object_ref::ObjectDeps};
 type Engine = Mssql;
 
 async fn execute(db: &mut TestDb, plan: pbps_diff::order::CanonicalPlan<Engine>, engine: &Engine) {
@@ -11,6 +11,54 @@ async fn execute(db: &mut TestDb, plan: pbps_diff::order::CanonicalPlan<Engine>,
     let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, engine).unwrap();
     for statement in &lowered {
         db.conn.execute(&statement.sql).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn demanded_computed_columns_and_not_null_wait_for_the_function() {
+    let engine = Mssql;
+    for facet in ["column", "not_null"] {
+        let mut db = TestDb::create(&format!("creation2469_computed_{facet}")).await;
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+        let f = generated_facet(facet, engine.name());
+        let plan = f.compile(&engine).unwrap();
+        let function = plan
+            .changes()
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .unwrap();
+        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let lowered =
+            lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
+        for (at, group) in lowered.groups().iter().enumerate() {
+            for statement in group.statements() {
+                db.conn.execute(&statement.sql).await.unwrap();
+            }
+            if at == function {
+                let rows = db.conn.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app' AND table_name='t' ORDER BY ordinal_position").await.unwrap();
+                let names: Vec<_> = rows
+                    .iter()
+                    .map(|row| row.try_get::<&str>("column_name").unwrap().unwrap())
+                    .collect();
+                assert_eq!(names, ["anchor"], "{facet}");
+            }
+        }
+        db.conn
+            .execute("INSERT INTO app.t(anchor) VALUES(1)")
+            .await
+            .unwrap();
+        let rows = db.conn.query("SELECT g AS value FROM app.t").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(7));
+        let rows = db.conn.query("SELECT is_persisted, is_nullable FROM sys.computed_columns WHERE object_id=OBJECT_ID('app.t') AND name='g'").await.unwrap();
+        assert_eq!(rows[0].try_get::<bool>("is_persisted").unwrap(), Some(true));
+        if facet == "not_null" {
+            assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(false));
+        }
+        db.conn.execute("COMMIT").await.unwrap();
+        db.drop().await;
     }
 }
 #[tokio::test]

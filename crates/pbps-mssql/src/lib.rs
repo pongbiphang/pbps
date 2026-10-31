@@ -275,7 +275,7 @@ impl Dialect for Mssql {
                 && table
                     .computed
                     .first_key_value()
-                    .is_some_and(|(column, _)| demand.generation(column))
+                    .is_some_and(|(column, _)| demand.generation(column) || demand.not_null(column))
             {
                 return Ok(None);
             }
