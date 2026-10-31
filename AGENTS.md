@@ -117,6 +117,8 @@ Read before changing things:
   - It refuses a different head tree or inputs digest, an unreadable or
     partial previous output, and any `FAILED` test that is not a registered,
     unexpired flake. Such a failure needs a fix and a new full gate.
+  - A resume of a resume is supported: resume the latest output, which carries
+    the whole chain, and a flake still counts at most twice per head across it.
   - Record both outputs' `summary.json` paths and the head tree in the PR.
 - Register a flake only for an open issue, with an expiry at most 30 days out.
   The register is read from `origin/master`, so an entry waives nothing in the

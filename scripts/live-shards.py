@@ -46,6 +46,7 @@ EXPRESS_INVENTORY = {
 }
 EXPRESS_TESTS = set().union(*EXPRESS_INVENTORY.values())
 MANIFEST = "manifest.json"
+SNAPSHOT = "resume-input.json"
 REGISTER = "scripts/known-flakes.json"
 # A registered flake that fails a third time on one head is not flaky (DEC-2553.1).
 MAX_FLAKE_FAILURES = 2
@@ -385,6 +386,43 @@ def check_row(row, path):
             f"malformed result in receipt {path}")
 
 
+def load_inherited(previous, manifest, tree, inputs, suites):
+    """The evidence a resumed run was itself given, so a chain keeps every link.
+
+    The previous run's receipts only cover what it ran; what it inherited sits
+    in its `resume-input.json`. The manifest holds that file's digest, so a
+    snapshot edited afterwards is refused, and the snapshot repeats the head
+    and inputs it was validated against, so every link answers to the same ones.
+    """
+    link = manifest.get("resumed_from")
+    if link is None:
+        return {}
+    require(isinstance(link, dict) and isinstance(link.get("run_id"), str)
+            and isinstance(link.get("snapshot_sha256"), str),
+            "the previous run's manifest has no digest of its resume snapshot")
+    path = previous / SNAPSHOT
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"unreadable resume snapshot {path}: {error}") from error
+    require(hashlib.sha256(raw).hexdigest() == link["snapshot_sha256"],
+            f"resume snapshot {path} does not match its digest")
+    snapshot = read_json(path, "resume snapshot")
+    require(isinstance(snapshot, dict) and isinstance(snapshot.get("keys"), dict)
+            and set(snapshot["keys"]) <= set(suites), "malformed resume snapshot")
+    require(snapshot.get("run_id") == link["run_id"], "resume snapshot belongs to another run")
+    require(snapshot.get("tree") == tree and snapshot.get("inputs") == inputs,
+            "resume snapshot was written for another head or inputs")
+    for entries in snapshot["keys"].values():
+        require(isinstance(entries, dict), "malformed resume snapshot")
+        for entry in entries.values():
+            ok = isinstance(entry, dict) and isinstance(entry.get("ok"), dict) and isinstance(entry.get("listed"), list)
+            require(ok and all(isinstance(n, str) for n in entry["listed"]) and set(entry["ok"]) <= set(entry["listed"])
+                    and all(isinstance(r, dict) and r.get("status") == "ok" for r in entry["ok"].values()),
+                    "malformed resume snapshot")
+    return snapshot["keys"]
+
+
 def load_resume(previous, tree, inputs, suites, flakes):
     """Read what a previous run on this head proved; refuse anything else (DEC-2553.1).
 
@@ -408,6 +446,7 @@ def load_resume(previous, tree, inputs, suites, flakes):
             f"the previous run covered {manifest.get('suites')}, not {suites}")
     history = manifest.get("failed", {})
     require(isinstance(history, dict), "malformed failure history")
+    inherited = load_inherited(previous, manifest, tree, inputs, suites)
     proven, failures, waived, refused = {}, {}, [], []
     for suite in suites:
         directory = previous / suite
@@ -419,11 +458,19 @@ def load_resume(previous, tree, inputs, suites, flakes):
             require(row["tree"] == tree and row["inputs"] == inputs,
                     f"receipt {path} was written for another head or inputs")
             rows.setdefault(path.stem, []).append(row)
+        before = inherited.get(suite, {})
         for key, group in rows.items():
             first = group[0]
             require(all(row["args"] == first["args"] and sorted(row["listed"]) == sorted(first["listed"])
                         and row["carried"] == first["carried"] for row in group),
                     f"receipts of invocation {key} disagree")
+            base = before.get(key)
+            require(base is None or base["listed"] == sorted(first["listed"]),
+                    f"receipts of invocation {key} disagree with the inherited list")
+            # What the run carried is exactly what its snapshot proved, so the
+            # receipts already hold the inherited names.
+            require(first["carried"] == (base["ok"] if base else {}),
+                    f"receipts of invocation {key} carry what the inherited snapshot never proved")
             ok = dict(first["carried"])
             counts = dict(history.get(suite, {}).get(key, {}))
             cargo = tuple(libtest_args(first["args"])[0])
@@ -444,6 +491,9 @@ def load_resume(previous, tree, inputs, suites, flakes):
                 ok.pop(name, None)
             proven.setdefault(suite, {})[key] = {"listed": sorted(first["listed"]), "ok": ok}
             failures.setdefault(suite, {})[key] = {n: c for n, c in counts.items() if c}
+        # An invocation this run never reached keeps what the chain proved and failed.
+        for key, entry in before.items():
+            proven.setdefault(suite, {}).setdefault(key, {"listed": entry["listed"], "ok": dict(entry["ok"])})
         for key, counts in history.get(suite, {}).items():
             failures.setdefault(suite, {}).setdefault(key, counts)
     require(not refused, "FAILED outside the unexpired known-flake register, or failed more than "
@@ -749,12 +799,14 @@ def drive(args):
             env[name] = value
     resumed_from = None
     if previous:
-        snapshot_path = output / "resume-input.json"
-        write_atomic(snapshot_path, json.dumps({"run_id": origin["run_id"], "keys": proven}))
+        snapshot_path = output / SNAPSHOT
+        text = json.dumps({"run_id": origin["run_id"], "tree": tree, "inputs": inputs, "keys": proven})
+        write_atomic(snapshot_path, text)
         env["PBPS_LIVE_RESUME"] = str(snapshot_path.resolve())
         summary_path = Path(previous) / "summary.json"
         resumed_from = {"run_id": origin["run_id"], "output": str(Path(previous).resolve()),
                         "manifest_sha256": hashlib.sha256((Path(previous) / MANIFEST).read_bytes()).hexdigest(),
+                        "snapshot_sha256": hashlib.sha256(text.encode()).hexdigest(),
                         "summary_sha256": (hashlib.sha256(summary_path.read_bytes()).hexdigest()
                                            if summary_path.exists() else None),
                         "flakes": [{k: f[k] for k in ("test", "cargo", "issue")} for f in waived]}
