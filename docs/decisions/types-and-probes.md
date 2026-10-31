@@ -4195,8 +4195,11 @@ refused for one of these, by name):
 - everything its body calls, including the function an operator runs and the
   comparison function of a row comparison, is built in or proven the same way.
 
-Recursion is bounded: a chain of more than 16 user functions is refused, naming
-the function at the limit, and so is an expression that reaches more than 1,000.
+Recursion is bounded: a function whose longest call path has more than 16 user
+functions is refused, and so is an expression that reaches more than 1,000. The
+depth is computed over the call graph and never from the order functions were
+read in, so naming every function of a chain in one expression cannot hide it:
+the head of a 17-function chain is refused and the rest are admitted.
 A cycle (`CREATE OR REPLACE` lets `a` call `b` and `b` call the old `a`, or a
 function call itself) refuses every function on it and every caller of it.
 Absent, empty and unreadable are three answers: a missing `pg_proc` row is a

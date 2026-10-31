@@ -1901,6 +1901,19 @@ async fn a_function_with_a_built_in_only_body_is_admitted_alone_and_in_a_chain()
              CREATE DOMAIN app.deepest AS integer CHECK (app.deep1(VALUE));",
         )
         .await;
+        // The same chain with every function named by the expression itself:
+        // all sixteen are read together, and the depth is still the longest
+        // call path, which is the bound.
+        let named: Vec<String> = (1..=16).map(|n| format!("app.deep{n}(VALUE)")).collect();
+        run(
+            &mut me,
+            label,
+            &format!(
+                "CREATE DOMAIN app.deepest_named AS integer CHECK ({})",
+                named.join(" AND ")
+            ),
+        )
+        .await;
         for name in [
             "email",
             "chained",
@@ -1909,6 +1922,7 @@ async fn a_function_with_a_built_in_only_body_is_admitted_alone_and_in_a_chain()
             "every_statement",
             "by_operator",
             "deepest",
+            "deepest_named",
         ] {
             let path = gate(&mut me, &[], name).await;
             assert!(
@@ -2079,6 +2093,30 @@ async fn a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason() {
         // Naming the function where the chain broke, not only the first.
         assert!(
             detail.contains("app.far16(integer)"),
+            "on {label}: {detail}"
+        );
+
+        // The reviewer's scene: the expression names every function of the
+        // chain, so all seventeen are read at once. The depth is the longest
+        // call path, so the head of the chain is refused all the same, and it
+        // alone: each other function starts a chain within the bound.
+        let named: Vec<String> = (1..=17).map(|n| format!("app.far{n}(VALUE)")).collect();
+        run(
+            &mut me,
+            label,
+            &format!(
+                "CREATE DOMAIN app.names_all_far AS integer CHECK ({})",
+                named.join(" AND ")
+            ),
+        )
+        .await;
+        let path = gate(&mut me, &[], "names_all_far").await;
+        let all = refused(&path, "names_all_far");
+        let identities: Vec<_> = routines(all).iter().map(|r| r.identity.as_str()).collect();
+        assert_eq!(identities, ["app.far1(integer)"], "on {label}: {all:?}");
+        let detail = routines(all)[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("17 user functions") && detail.contains("nested more than 16 deep"),
             "on {label}: {detail}"
         );
 

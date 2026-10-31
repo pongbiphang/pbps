@@ -242,6 +242,22 @@ async fn prove(
             })?;
             level_nodes.push((*oid, judge(row, major)));
         }
+        // A function first reached after `MAX_DEPTH` calls ends a call path of
+        // more than `MAX_DEPTH` functions, so it is not read further: every
+        // function above it on that path is refused through it. The read level
+        // only bounds the reading; admission rests on the longest call path of
+        // each function (`verdict`), so naming a chain's functions directly
+        // cannot hide its depth.
+        if level >= MAX_DEPTH {
+            for (oid, mut node) in level_nodes {
+                node.own = vec![format!(
+                    "is nested more than {MAX_DEPTH} deep in a chain of user functions"
+                )];
+                node.bound = None;
+                nodes.insert(oid, node);
+            }
+            break;
+        }
         // A function already refused for its own defect is not explored: what
         // it calls cannot admit it.
         let resolver = Resolver::read(
@@ -256,12 +272,6 @@ async fn prove(
         for (oid, mut node) in level_nodes {
             if let Some(bound) = node.bound.as_ref().filter(|_| node.own.is_empty()) {
                 node.calls = resolver.user_callees(bound)?;
-                if level + 1 >= MAX_DEPTH && !node.calls.is_empty() {
-                    node.own.push(format!(
-                        "calls other user functions nested more than {MAX_DEPTH} deep"
-                    ));
-                    node.calls.clear();
-                }
                 next.extend(node.calls.iter().filter(|c| !nodes.contains_key(*c)));
             }
             nodes.insert(oid, node);
@@ -272,12 +282,12 @@ async fn prove(
     }
     let mut state = BTreeMap::new();
     for oid in nodes.keys() {
-        verdict(*oid, &nodes, &mut state);
+        verdict(*oid, &nodes, &mut state, MAX_DEPTH);
     }
     let mut proven = Proven::default();
     let mut bodies = BTreeMap::new();
     for (oid, node) in &nodes {
-        if state.get(oid) == Some(&Verdict::Admitted) {
+        if state.get(oid).is_some_and(|v| v.is_admitted()) {
             proven.admitted.insert(*oid);
             if let Some(bound) = &node.bound {
                 bodies.insert(*oid, (node.calls.clone(), bound.clone()));
@@ -295,15 +305,33 @@ async fn prove(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Verdict {
     Visiting,
-    Admitted,
+    /// Admitted, with the number of functions on its longest call path
+    /// (itself included).
+    Admitted(usize),
+    /// Admitted in every other way, but its longest call path is this many
+    /// functions, more than the bound `.1`.
+    TooDeep(usize, usize),
     /// Refused for its own defect or for the first refused function it calls.
     Refused(Option<Oid>),
 }
 
-/// A function is admitted when it has no defect of its own and everything it
-/// calls is admitted. A function reached again while it is still being judged
-/// is a call cycle, and refuses every function on the way back to it.
-fn verdict(oid: Oid, nodes: &BTreeMap<Oid, Node>, state: &mut BTreeMap<Oid, Verdict>) -> Verdict {
+impl Verdict {
+    fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted(_))
+    }
+}
+
+/// A function is admitted when it has no defect of its own, everything it calls
+/// is admitted and its longest call path has at most `max` functions. A
+/// function reached again while it is still being judged is a call cycle, and
+/// refuses every function on the way back to it. Each answer follows from the
+/// call graph alone, so none depends on the order the functions were read in.
+fn verdict(
+    oid: Oid,
+    nodes: &BTreeMap<Oid, Node>,
+    state: &mut BTreeMap<Oid, Verdict>,
+    max: usize,
+) -> Verdict {
     match state.get(&oid) {
         Some(Verdict::Visiting) => return Verdict::Refused(Some(oid)),
         Some(done) => return *done,
@@ -314,10 +342,21 @@ fn verdict(oid: Oid, nodes: &BTreeMap<Oid, Node>, state: &mut BTreeMap<Oid, Verd
     let result = if !node.own.is_empty() {
         Verdict::Refused(None)
     } else {
-        node.calls
-            .iter()
-            .find(|callee| verdict(**callee, nodes, state) != Verdict::Admitted)
-            .map_or(Verdict::Admitted, |callee| Verdict::Refused(Some(*callee)))
+        let mut deepest = 0;
+        let mut refused = None;
+        for callee in &node.calls {
+            match verdict(*callee, nodes, state, max) {
+                Verdict::Admitted(depth) => deepest = deepest.max(depth),
+                Verdict::Visiting | Verdict::TooDeep(..) | Verdict::Refused(_) => {
+                    refused.get_or_insert(*callee);
+                }
+            }
+        }
+        match refused {
+            Some(callee) => Verdict::Refused(Some(callee)),
+            None if deepest + 1 > max => Verdict::TooDeep(deepest + 1, max),
+            None => Verdict::Admitted(deepest + 1),
+        }
     };
     state.insert(oid, result);
     result
@@ -348,6 +387,9 @@ fn clause(
                     clause(*callee, nodes, state, seen)
                 )
             }
+        }
+        Some(Verdict::TooDeep(depth, max)) => {
+            format!("starts a chain of {depth} user functions, nested more than {max} deep")
         }
         _ => node.own.join(" and "),
     }
@@ -678,7 +720,7 @@ mod tests {
     fn resolve(nodes: &BTreeMap<Oid, Node>) -> BTreeMap<Oid, Verdict> {
         let mut state = BTreeMap::new();
         for oid in nodes.keys() {
-            verdict(*oid, nodes, &mut state);
+            verdict(*oid, nodes, &mut state, MAX_DEPTH);
         }
         state
     }
@@ -692,7 +734,7 @@ mod tests {
             (3, node("app.c()", &[], &[4])),
             (4, node("app.d()", &[], &[])),
         ]);
-        assert!(resolve(&nodes).values().all(|v| *v == Verdict::Admitted));
+        assert!(resolve(&nodes).values().all(|v| v.is_admitted()));
         // Negative: one refused leaf refuses everything above it, and nothing
         // that does not call it.
         let mut nodes = nodes;
@@ -705,7 +747,7 @@ mod tests {
         for refused in [1, 2, 3, 4] {
             assert!(matches!(state[&refused], Verdict::Refused(_)), "{refused}");
         }
-        assert_eq!(state[&5], Verdict::Admitted);
+        assert!(state[&5].is_admitted());
         let sentence = clause(1, &nodes, &state, &mut BTreeSet::new());
         assert_eq!(
             sentence,
@@ -729,7 +771,7 @@ mod tests {
             assert!(matches!(state[&refused], Verdict::Refused(_)), "{refused}");
         }
         // Negative: a function outside every cycle is still admitted.
-        assert_eq!(state[&6], Verdict::Admitted);
+        assert!(state[&6].is_admitted());
         for oid in [2, 4] {
             let sentence = clause(oid, &nodes, &state, &mut BTreeSet::new());
             assert!(sentence.contains("call cycle"), "{oid}: {sentence}");
@@ -758,7 +800,7 @@ mod tests {
             clause(1, &nodes, &state, &mut BTreeSet::new()),
             "is SECURITY DEFINER and has a planner support function"
         );
-        assert_eq!(state[&2], Verdict::Admitted);
+        assert!(state[&2].is_admitted());
     }
 
     #[test]
@@ -798,5 +840,91 @@ mod tests {
         let mut seen = BTreeSet::new();
         collect(9, &bodies, &mut seen);
         assert_eq!(seen, BTreeSet::from([9]));
+    }
+
+    /// The deepest call path of `chain` functions: 1 calls 2 ... calls `chain`.
+    fn chain(chain: Oid) -> BTreeMap<Oid, Node> {
+        (1..=chain)
+            .map(|oid| {
+                let calls: Vec<Oid> = if oid < chain { vec![oid + 1] } else { vec![] };
+                (oid, node(&format!("app.f{oid}()"), &[], &calls))
+            })
+            .collect()
+    }
+
+    fn resolve_to(nodes: &BTreeMap<Oid, Node>, max: usize) -> BTreeMap<Oid, Verdict> {
+        let mut state = BTreeMap::new();
+        for oid in nodes.keys() {
+            verdict(*oid, nodes, &mut state, max);
+        }
+        state
+    }
+
+    #[test]
+    fn the_depth_is_the_longest_call_path_and_not_the_shortest_or_the_read_level() {
+        // A chain of exactly the bound is admitted from its first function.
+        let state = resolve_to(&chain(3), 3);
+        assert_eq!(state[&1], Verdict::Admitted(3));
+        assert_eq!(state[&3], Verdict::Admitted(1));
+        // One more function and the first is refused, and only the first:
+        // every other function of it is still a chain within the bound.
+        let state = resolve_to(&chain(4), 3);
+        assert_eq!(state[&1], Verdict::TooDeep(4, 3));
+        for oid in [2, 3, 4] {
+            assert!(state[&oid].is_admitted(), "{oid}");
+        }
+        let nodes = chain(4);
+        assert_eq!(
+            clause(1, &nodes, &state, &mut BTreeSet::new()),
+            "starts a chain of 4 user functions, nested more than 3 deep"
+        );
+        // Two paths of different lengths to the same function: `top` calls
+        // `leaf` directly (2 functions) and through `m1` and `m2` (4). Only the
+        // longer one counts, whichever is found first.
+        let nodes = BTreeMap::from([
+            (1, node("app.top()", &[], &[4, 2])),
+            (2, node("app.m1()", &[], &[3])),
+            (3, node("app.m2()", &[], &[4])),
+            (4, node("app.leaf()", &[], &[])),
+        ]);
+        assert_eq!(resolve_to(&nodes, 4)[&1], Verdict::Admitted(4));
+        assert_eq!(resolve_to(&nodes, 3)[&1], Verdict::TooDeep(4, 3));
+        // A function above a too-deep one is refused by naming it.
+        let nodes = BTreeMap::from([
+            (5, node("app.above()", &[], &[1])),
+            (1, node("app.top()", &[], &[4, 2])),
+            (2, node("app.m1()", &[], &[3])),
+            (3, node("app.m2()", &[], &[4])),
+            (4, node("app.leaf()", &[], &[])),
+        ]);
+        let state = resolve_to(&nodes, 3);
+        assert!(matches!(state[&5], Verdict::Refused(Some(1))));
+        assert_eq!(
+            clause(5, &nodes, &state, &mut BTreeSet::new()),
+            "calls `app.top()`, which starts a chain of 4 user functions, nested more than 3 deep"
+        );
+        // Negative: the order of the functions does not change any answer.
+        let reordered: BTreeMap<Oid, Node> = nodes
+            .iter()
+            .map(|(oid, n)| {
+                (
+                    100 - oid,
+                    Node {
+                        identity: n.identity.clone(),
+                        own: n.own.clone(),
+                        bound: None,
+                        calls: n.calls.iter().map(|c| 100 - c).collect(),
+                    },
+                )
+            })
+            .collect();
+        let again = resolve_to(&reordered, 3);
+        for (oid, verdict) in &state {
+            assert_eq!(
+                std::mem::discriminant(verdict),
+                std::mem::discriminant(&again[&(100 - oid)]),
+                "{oid}"
+            );
+        }
     }
 }
