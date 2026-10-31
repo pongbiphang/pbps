@@ -1102,3 +1102,110 @@ fn a_working_path_through_a_symlink_keeps_the_spelling_that_reached_the_file() {
     }
     inputs.reverify().unwrap();
 }
+
+#[test]
+fn d2b1_1165_partial_revision_refusals_keep_every_available_hash_and_resolved_commit() {
+    let (repo, old, base) = standard();
+    repo.write("pbps.yml", "dialect: postgres\nunknown_key: rejected\n");
+    let mut observed = ObservedInputs::default();
+    assert!(
+        validate_recorded(
+            &repo.project,
+            &repo.project.join("tests/pbps-tests.yml"),
+            &mut observed
+        )
+        .is_err()
+    );
+    assert!(observed.resolved_commits.values().any(|c| c == &old));
+    assert!(observed.resolved_commits.values().any(|c| c == &base));
+    assert_eq!(observed.resolved_commits["candidate"], base);
+    for (role, revision, path) in [
+        (Role::Manifest, Revision::Working, "tests/pbps-tests.yml"),
+        (Role::Fixture, Revision::Working, "tests/f.sql"),
+        (Role::Config, Revision::Working, "pbps.yml"),
+        (Role::Ids, Revision::Commit(old), "schema.ids.json"),
+    ] {
+        assert!(
+            observed.files.iter().any(|f| f.role == role
+                && f.revision == revision
+                && f.path == path
+                && f.sha256.len() == 64),
+            "{role} {path}"
+        );
+    }
+}
+
+#[test]
+fn d2b1_1165_partial_sql_and_invalid_manifest_hashes_survive_their_refusals() {
+    let (repo, _, _) = standard();
+    repo.write("tests/f.sql", [0xff]);
+    std::fs::remove_file(repo.project.join("tests/a.sql")).unwrap();
+    let mut observed = ObservedInputs::default();
+    assert!(
+        validate_recorded(
+            &repo.project,
+            &repo.project.join("tests/pbps-tests.yml"),
+            &mut observed
+        )
+        .is_err()
+    );
+    assert!(observed.files.iter().any(|f| f.path == "tests/f.sql"));
+    assert!(observed.files.iter().any(|f| f.role == Role::Manifest));
+    assert!(!observed.files.iter().any(|f| f.path == "tests/a.sql"));
+    repo.write("tests/pbps-tests.yml", "version: 999\n");
+    let mut observed = ObservedInputs::default();
+    assert!(
+        validate_recorded(
+            &repo.project,
+            &repo.project.join("tests/pbps-tests.yml"),
+            &mut observed
+        )
+        .is_err()
+    );
+    assert_eq!(observed.files.len(), 1);
+    assert_eq!(observed.files[0].role, Role::Manifest);
+}
+
+#[test]
+fn d2b1_1165_success_requires_final_input_verification_and_keeps_changed_input_evidence() {
+    let (repo, _, _) = standard();
+    let inputs = repo.validate().unwrap_or_else(|e| panic!("{e:?}"));
+    let mut data = report::TestData::new(false);
+    data.input = Some(inputs.identity.clone());
+    data.cleanup_confirmed = true;
+    let refused = data.finish();
+    assert!(matches!(
+        refused.result,
+        crate::output::Outcome::Unanswerable
+    ));
+    let mut known = report::TestData::new(false);
+    known.input = Some(inputs.identity.clone());
+    known
+        .phases
+        .push(report::Phase::new("input", "known refusal"));
+    known.failure(0, "test.input", "unsupported operation".into(), false);
+    assert!(matches!(
+        known.finish().result,
+        crate::output::Outcome::Findings
+    ));
+    let mut good = report::TestData::new(false);
+    good.input = Some(inputs.identity.clone());
+    good.cleanup_confirmed = true;
+    good.reverify(&inputs);
+    assert!(matches!(good.finish().result, crate::output::Outcome::Ok));
+    repo.write("tests/a.sql", "SELECT 1\n");
+    let mut bad = report::TestData::new(false);
+    bad.input = Some(inputs.identity.clone());
+    bad.cleanup_confirmed = true;
+    bad.reverify(&inputs);
+    let refused = bad.finish();
+    assert!(matches!(
+        refused.result,
+        crate::output::Outcome::Unanswerable
+    ));
+    assert!(refused.findings.iter().any(|f| f.message.contains("a.sql")));
+    assert_eq!(
+        refused.data.as_ref().unwrap().input.as_ref().unwrap().files,
+        inputs.identity.files
+    );
+}

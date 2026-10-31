@@ -1,10 +1,18 @@
 //! The owned-only adapter to ordinary deployment services (DEC-1165.9).
-pub(crate) use super::services::Progress;
-use super::services::{Attempt, Declarations, PlanResult, Planned};
+use super::services::{Attempt, Declarations, PlanResult};
+pub(crate) use super::services::{Planned, Progress};
 use crate::plan_test::report::{Phase, Status};
 use crate::plan_test::revision::Assembled;
 use crate::plan_test::session::Session;
 
+// Reserve a large future's construction space only until it is boxed, before
+// polling it. A call-site Box::pin keeps that space in the caller's poll frame.
+#[inline(never)]
+pub(crate) fn boxed_future<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
 fn declarations(input: &Assembled) -> Declarations {
     Declarations {
         loaded: input.loaded.clone(),
@@ -107,12 +115,16 @@ pub(crate) async fn apply(
         Some(progress),
     )
     .await;
+    collect_progress(phase, progress);
+    finish_attempt(phase, result?)
+}
+
+/// The caller still owns this after a cancelled future, and taking the findings
+/// makes collecting on both completion and cancellation safe without duplicates.
+pub(crate) fn collect_progress(phase: &mut Phase, progress: &Progress) {
     phase.accepted = progress.accepted.get();
     phase.started = progress.started.get();
-    phase
-        .findings
-        .extend(progress.findings.borrow().iter().cloned());
-    finish_attempt(phase, result?)
+    phase.findings.extend(progress.findings.take());
 }
 
 fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {

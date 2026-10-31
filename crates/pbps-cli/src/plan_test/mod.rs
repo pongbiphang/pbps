@@ -11,13 +11,21 @@
 //! the same facts as text or JSON and cannot reach a database past one.
 
 mod chain;
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
+    )
+)]
+pub(crate) mod execution;
 mod files;
 mod git;
 #[cfg_attr(
     not(target_os = "linux"),
     expect(
         dead_code,
-        reason = "#1165 D2b consumes the owned runner; its lifecycle tests are Linux-only"
+        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
     )
 )]
 pub(crate) mod report;
@@ -26,7 +34,7 @@ pub(crate) mod revision;
     not(target_os = "linux"),
     expect(
         dead_code,
-        reason = "#1165 D2b consumes the owned runner; its lifecycle tests are Linux-only"
+        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
     )
 )]
 pub(crate) mod session;
@@ -35,7 +43,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) use chain::{ChainProblem, ReplayChain};
-pub(crate) use files::{Frozen, freeze};
+pub(crate) use files::Frozen;
+#[cfg(test)]
+use files::freeze;
 pub(crate) use git::GitProblem;
 pub(crate) use revision::{Assembled, Problem as RevisionProblem};
 
@@ -298,6 +308,13 @@ pub(crate) struct InputIdentity {
     pub files: Vec<ConsumedFile>,
 }
 
+/// Observations survive a later refusal; they never certify a partial input set.
+#[derive(Default, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ObservedInputs {
+    pub files: Vec<ConsumedFile>,
+    pub resolved_commits: BTreeMap<String, CommitId>,
+}
+
 /// Every input of a run, read once and checked before anything is provisioned.
 pub(crate) struct Inputs {
     pub identity: InputIdentity,
@@ -329,11 +346,20 @@ fn pin_label(manifest: &TestManifest, commit: &CommitId) -> String {
 /// the base as a commit with the declarations, identity and intent a replay
 /// needs, the candidate as it is now or as a commit, and the order the pins
 /// replay in. Every refusal found is returned, not the first.
+#[cfg(test)]
 pub(crate) fn validate_inputs(
     project_root: &Path,
     manifest_path: &Path,
 ) -> Result<Inputs, Vec<Refusal>> {
-    let frozen = freeze(project_root, manifest_path)?;
+    validate_recorded(project_root, manifest_path, &mut ObservedInputs::default())
+}
+
+pub(crate) fn validate_recorded(
+    project_root: &Path,
+    manifest_path: &Path,
+    observed: &mut ObservedInputs,
+) -> Result<Inputs, Vec<Refusal>> {
+    let frozen = files::freeze_recorded(project_root, manifest_path, &mut observed.files)?;
     let root = project_root
         .canonicalize()
         .expect("the project root was canonicalized when the manifest was read");
@@ -346,7 +372,12 @@ pub(crate) fn validate_inputs(
     let mut present = Vec::new();
     for commit in distinct {
         match git::present(&root, commit) {
-            Ok(()) => present.push(commit.clone()),
+            Ok(()) => {
+                observed
+                    .resolved_commits
+                    .insert(commit.to_string(), commit.clone());
+                present.push(commit.clone());
+            }
             Err(problem) => refusals.push(Refusal::Git {
                 what: pin_label(manifest, commit),
                 problem,
@@ -387,9 +418,14 @@ pub(crate) fn validate_inputs(
         },
     };
 
+    if let Some(tip) = &tip {
+        observed
+            .resolved_commits
+            .insert("candidate".into(), tip.clone());
+    }
     let mut revisions = BTreeMap::new();
     for commit in &present {
-        let loaded = revision::read_commit(&root, commit)
+        let loaded = revision::read_commit_recorded(&root, commit, &mut observed.files)
             .and_then(|raw| revision::assemble(raw, manifest.dialect, None));
         match loaded {
             Ok(found) => {
@@ -408,8 +444,10 @@ pub(crate) fn validate_inputs(
     };
     let candidate = candidate_revision.and_then(|revision| {
         let raw = match &revision {
-            Revision::Working => revision::read_working(&root),
-            Revision::Commit(commit) => revision::read_commit(&root, commit),
+            Revision::Working => revision::read_working_recorded(&root, &mut observed.files),
+            Revision::Commit(commit) => {
+                revision::read_commit_recorded(&root, commit, &mut observed.files)
+            }
         };
         match raw.and_then(|raw| revision::assemble(raw, manifest.dialect, Some(&root))) {
             Ok(found) => Some(found),

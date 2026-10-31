@@ -291,12 +291,42 @@ impl<'d> TestScratch<'d> {
         deadline: Option<tokio::time::Instant>,
         cleanup_allowance: std::time::Duration,
     ) -> Result<TestScratch<'d>, Error> {
+        Self::start_cancelled(
+            dir,
+            driver,
+            image,
+            pull,
+            deadline,
+            cleanup_allowance,
+            tokio::signal::ctrl_c(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_cancelled(
+        dir: &'d StateDir,
+        driver: Driver,
+        image: &str,
+        pull: PullPolicy,
+        deadline: Option<tokio::time::Instant>,
+        cleanup_allowance: std::time::Duration,
+        cancelled: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<TestScratch<'d>, Error> {
+        if deadline.is_some_and(|end| tokio::time::Instant::now() >= end) {
+            return Err(Error::Start("test startup deadline exceeded".into()));
+        }
         let run_id = record::new_run_id();
-        let daemon = match deadline {
-            Some(end) => discovered(end.into_std(), runtime::current()).await?,
-            None => runtime::current()
-                .await
-                .map_err(|f| Error::Runtime(f.to_string()))?,
+        tokio::pin!(cancelled);
+        let daemon = tokio::select! {
+            biased;
+            _ = &mut cancelled => return Err(Error::Start("test startup cancelled".into())),
+            result = async {
+                match deadline {
+                    Some(end) => discovered(end.into_std(), runtime::current()).await,
+                    None => runtime::current().await.map_err(|f| Error::Runtime(f.to_string())),
+                }
+            } => result?,
         };
         let engine = match driver {
             Driver::Postgres => "postgres",
@@ -338,10 +368,9 @@ impl<'d> TestScratch<'d> {
             journal: &mut journal,
         };
         let start = Held::start_owned(driver, image, pull, &mut owner);
-        let started = if let Some(deadline) = deadline {
-            bounded_start(start, deadline, tokio::signal::ctrl_c(), &resource).await
-        } else {
-            start.await
+        let started = match deadline {
+            Some(end) => bounded_start(start, end, &mut cancelled, &resource).await,
+            None => start.await,
         };
         match started {
             Ok(held) => Ok(TestScratch { held, journal }),

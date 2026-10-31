@@ -96,12 +96,6 @@ async fn admin(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result
     )
     .await?)
 }
-// Reserve a large future's construction space only until it is boxed, before
-// polling it. A call-site Box::pin keeps that space in the caller's poll frame.
-#[inline(never)]
-fn boxed_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    Box::pin(make())
-}
 async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<()> {
     use pbps_pg::assertions::{self, AssertionResult};
     ensure!(scratch.acquired_image().await?.starts_with("sha256:"));
@@ -1467,3 +1461,5 @@ async fn d2a1165_pg18_column_grants_are_effective_even_without_table_write_privi
     .await
     .unwrap();
 }
+
+mod execution_tests;

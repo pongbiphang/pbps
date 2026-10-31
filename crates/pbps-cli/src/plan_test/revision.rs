@@ -158,12 +158,20 @@ fn tree_entries(
     path: &str,
     wanted: impl Fn(&str, &str) -> bool,
     project: &str,
+    observed: &mut Vec<ConsumedFile>,
+    role: Role,
 ) -> Result<Vec<(String, Vec<u8>)>, Problem> {
     let mut found = Vec::new();
     let mut refusal = None;
     let shown = |repo_path: &str| relative(project, repo_path);
     git_objects::read_with(root, commit.as_str(), path, wanted, |entry, mode, bytes| {
         if mode == "100644" || mode == "100755" {
+            observed.push(consumed(
+                role,
+                &Revision::Commit(commit.clone()),
+                &shown(entry),
+                bytes,
+            ));
             found.push((shown(entry), bytes.to_vec()));
         } else {
             refusal.get_or_insert(Problem::NotRegular {
@@ -191,6 +199,8 @@ fn tree_file(
     commit: &CommitId,
     path: &str,
     project: &str,
+    observed: &mut Vec<ConsumedFile>,
+    role: Role,
 ) -> Result<Option<(String, Vec<u8>)>, Problem> {
     let below = format!("{path}/");
     let mut found = tree_entries(
@@ -199,6 +209,8 @@ fn tree_file(
         path,
         |entry, _mode| entry == path || entry.starts_with(&below),
         project,
+        observed,
+        role,
     )?;
     let named = relative(project, path);
     match found.pop() {
@@ -216,7 +228,11 @@ fn tree_file(
 /// An entry git has no record of is absent; one it cannot read is a refusal,
 /// never an empty file (#1814 is the same mistake in `baseline::ids_from`,
 /// which this does not use).
-pub(super) fn read_commit(root: &Path, commit: &CommitId) -> Result<Raw, Vec<Problem>> {
+pub(super) fn read_commit_recorded(
+    root: &Path,
+    commit: &CommitId,
+    observed: &mut Vec<ConsumedFile>,
+) -> Result<Raw, Vec<Problem>> {
     let revision = Revision::Commit(commit.clone());
     let prefix = relative_to(root).map_err(|e| {
         vec![Problem::Unreadable {
@@ -226,7 +242,7 @@ pub(super) fn read_commit(root: &Path, commit: &CommitId) -> Result<Raw, Vec<Pro
     })?;
     let config_rel = under(&prefix, Path::new(pbps_config::CONFIG_FILE))
         .map_err(|e| vec![Problem::Paths(format!("{e:#}"))])?;
-    let config = tree_file(root, commit, &config_rel, &prefix)
+    let config = tree_file(root, commit, &config_rel, &prefix, observed, Role::Config)
         .map_err(|p| vec![p])?
         .ok_or_else(|| vec![Problem::ConfigAbsent])?;
     let parsed = Config::parse(
@@ -262,6 +278,8 @@ pub(super) fn read_commit(root: &Path, commit: &CommitId) -> Result<Raw, Vec<Pro
                     || mode == git_objects::SYMLINK
             },
             &prefix,
+            observed,
+            Role::Declaration,
         )
         .map_err(|p| problems.push(p))
         .unwrap_or_default(),
@@ -274,7 +292,7 @@ pub(super) fn read_commit(root: &Path, commit: &CommitId) -> Result<Raw, Vec<Pro
             Vec::new()
         }
     };
-    let ids = tree_file(root, commit, &ids_rel, &prefix)
+    let ids = tree_file(root, commit, &ids_rel, &prefix, observed, Role::Ids)
         .map_err(|p| problems.push(p))
         .unwrap_or_default();
     if problems.is_empty() {
@@ -346,6 +364,13 @@ pub(super) fn git_objects_tree_exists(
 /// Reads the inputs of the working tree at `root` (canonical): the files
 /// `plan` reads, in the bytes they have now.
 pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
+    read_working_recorded(root, &mut Vec::new())
+}
+
+pub(super) fn read_working_recorded(
+    root: &Path,
+    observed: &mut Vec<ConsumedFile>,
+) -> Result<Raw, Vec<Problem>> {
     // The path as it was traversed, relative to the root. Collapsing `..`
     // lexically would be wrong after a symlink: `alias/..` is the parent of
     // what `alias` points at, not the root, so the recorded name must keep
@@ -363,7 +388,7 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
             },
         )
     };
-    let regular = |path: &Path| -> Result<Option<Vec<u8>>, Problem> {
+    let mut regular = |path: &Path, role: Role| -> Result<Option<Vec<u8>>, Problem> {
         let named = shown(path);
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
@@ -378,14 +403,15 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
         // Through a symlink, as the ordinary loader reads; a dangling one is
         // damaged history, not an absent file.
         match std::fs::metadata(path) {
-            Ok(meta) if meta.is_file() => {
-                std::fs::read(path)
-                    .map(Some)
-                    .map_err(|e| Problem::Unreadable {
-                        path: named,
-                        reason: e.to_string(),
-                    })
-            }
+            Ok(meta) if meta.is_file() => std::fs::read(path)
+                .map(|bytes| {
+                    observed.push(consumed(role, &Revision::Working, &named, &bytes));
+                    Some(bytes)
+                })
+                .map_err(|e| Problem::Unreadable {
+                    path: named,
+                    reason: e.to_string(),
+                }),
             Ok(_) => Err(Problem::NotRegular {
                 path: named,
                 what: "it is not a file".to_owned(),
@@ -397,7 +423,7 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
         }
     };
     let config_path = root.join(pbps_config::CONFIG_FILE);
-    let config_bytes = regular(&config_path)
+    let config_bytes = regular(&config_path, Role::Config)
         .map_err(|p| vec![p])?
         .ok_or_else(|| vec![Problem::ConfigAbsent])?;
     let config_name = shown(&config_path);
@@ -422,7 +448,7 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
     let declarations = match pbps_load::schema_files(&schema_dir) {
         Ok(files) => files
             .iter()
-            .filter_map(|path| match regular(path) {
+            .filter_map(|path| match regular(path, Role::Declaration) {
                 // The name is the declaration's key. Two names that differ
                 // only in bytes no UTF-8 string holds would collapse to one
                 // key once shown lossily, and one declaration would vanish.
@@ -457,7 +483,7 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
         }
     };
     let ids_path = root.join(&parsed.ids_file);
-    let ids = regular(&ids_path)
+    let ids = regular(&ids_path, Role::Ids)
         .map_err(|p| problems.push(p))
         .unwrap_or_default()
         .map(|bytes| (shown(&ids_path), bytes));

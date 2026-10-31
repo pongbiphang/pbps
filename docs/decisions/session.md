@@ -857,8 +857,8 @@ findings; existing commands keep their exact text. Evidence is typed `data` in t
 existing `output::Report` envelope, with ordinary findings and no plan payload
 or separate renderer. Live PostgreSQL16/18 lifecycle tests pin wrong-checksum
 and stale-baseline refusals, retained values, actual SQL identities/permissions,
-assertion results and confirmed cleanup. D2b adds command/replay/publication and
-schema75; verified fixture re-pinning remains E. D2a changes no published format.
+assertion results and confirmed cleanup. D2b2 adds command/replay/publication and
+the published results schema; verified fixture re-pinning remains E. D2a changes no published format.
 
 The owned run's exact provision and generated execution roles are infrastructure, excluded from the
 unmanaged-policy inventory without weakening that policy for other identities.
@@ -884,3 +884,27 @@ check. Effective write checks include column privileges for both identities
 without a returned id retains the existing unconfirmed-leftover evidence; a
 missing before-create record or an identified absent container is still
 cleanable (ADR-0019 §3/§6).
+
+
+<a id="dec-1165-10"></a>
+
+**DEC-1165.10. Owned work shares one cancellation observation and keeps partial evidence.**
+D2b1 prepares D2b2's command without publishing a command or schema. One sticky
+cancellation observation spans acquisition, provision and work; failed-start
+settlement and final cleanup retain their separate bounded allowances. A
+`StartCleanup` carries its own run/resource/remedy evidence beside startup's
+primary cause. Each ordinary bootstrap, plan and apply starts its own step
+budget under the run deadline. D2a's non-inlined boxing seam keeps each bounded
+service future off its caller's frame; size bounds and PG16/18 lifecycle tests
+cover both the ordinary test stack and the production CLI-thread boundary.
+Dropping a work future cannot drop its borrowed
+admission/submission observations or findings, and refreshing grants adds to
+phase time instead of replacing it. The existing readers retain each available
+file hash and resolved commit even when a later input refuses; missing identities
+have explicit reasons. Qualification requires input re-verification and confirmed
+cleanup, with both original failure and cleanup outcomes retained in the existing
+report envelope (ADR-0019 §2/§3/§9). PG16/18 direct D2a-service tests pin retained
+values, ordinary refusals, cancellation and cleanup; input/evidence tests pin
+partial refusals and unavailable identities. Replay and public publication are
+D2b2; the prerequisite-design class remains #2552 and the combined bootstrap/
+unlock evidence follow-up remains #2547.

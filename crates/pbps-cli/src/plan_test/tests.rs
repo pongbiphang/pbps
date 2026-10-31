@@ -453,3 +453,20 @@ fn the_project_path_is_slash_separated_and_never_absolute() {
         );
     }
 }
+
+#[test]
+fn d2b1_1165_reverification_keeps_the_non_utf8_unusable_refusal() {
+    let project = Project::new();
+    let frozen = project.standard();
+    project.write("tests/f.sql", [0xff]);
+    let errors = frozen.reverify().unwrap_err();
+    assert!(
+        errors.iter().any(|r| matches!(r,
+            Refusal::Changed { path, change: Change::Unusable(Problem::NotUtf8) }
+            if path=="tests/f.sql"
+        )),
+        "{errors:?}"
+    );
+    project.write("tests/f.sql", "INSERT INTO t VALUES (1);\n");
+    assert!(frozen.reverify().is_ok());
+}
