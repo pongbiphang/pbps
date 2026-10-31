@@ -1098,3 +1098,21 @@ the command report, outside saved-plan changes, checksum, identities and
 recorded state. Existing managed-object limitations retain their fatal rules.
 The new policy changes the published config schema, so schema set 71 archives
 all three generated documents; wire formats and older archives do not move.
+
+<a id="dec-2558-1"></a>
+
+**DEC-2558.1. A census identity lost after its scan is catalog movement.**
+`pg_identify_object` can return a present NULL identity when concurrent DDL
+removes the scanned address, including an implicit array type that the census
+would otherwise exclude. Like the lost module deparse in decision 309, this
+is unreadable evidence from a moving catalog, not a missing query column and
+not an empty inventory. Refuse with the existing catalog-changed message
+family, name the scanned kind and tell the operator to retry after the DDL.
+
+Decode identity with the existing optional accessor and validate every other
+field before classifying that NULL, even for system, extension-member or
+model-owned rows. Missing keys and wrong JSON types keep their row-shape
+errors; an empty rowset remains empty. Do not skip or coalesce a lost row, alter
+the census query, or change the caller's READ COMMITTED scope (decision 423).
+Held-statement scan/drop regressions pin the engine's NULL and the decoder's
+refusal on PostgreSQL 16 and 18 without a timing sleep.

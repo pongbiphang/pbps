@@ -1728,6 +1728,8 @@
         "catalog::tests::row_security_is_read_and_adopted_coherently",
         "catalog::tests::a_partitions_identity_facts_come_from_its_parent_by_column_name",
         "catalog::tests::the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own",
+        "catalog::census::tests::census2558_dropped_identity_is_catalog_movement_on_pg16",
+        "catalog::census::tests::census2558_dropped_identity_is_catalog_movement_on_pg18",
         "preflight::tests::probe_intermediates_stay_wide_until_the_final_clamp",
         "resolver::binding_tests::a_body_compiled_before_a_same_named_candidate_is_unresolved",
         "resolver::binding_tests::a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved",
