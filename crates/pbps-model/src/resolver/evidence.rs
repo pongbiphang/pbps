@@ -206,6 +206,11 @@ pub struct AuthorizationCondition {
     /// Exactly the approved authorization-changing steps. The adapter derives
     /// `after` at planning time; apply checks it and never projects new grants.
     pub changes: BTreeSet<usize>,
+    /// Typed, environment-keyed ACL postconditions, never binding inputs.
+    /// Old evidence can deserialize so its version receives a named refusal;
+    /// current evidence must cover every object grant in the approved plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_grants: Vec<super::AuthorizationGrant>,
 }
 
 /// This version covers creation-time bindings only; a runtime-bound body is
@@ -219,8 +224,9 @@ pub enum BindingCoverage {
 /// The evidence format this build writes and reads. 3 adds the target's
 /// cluster identity and the accepted limitations to the qualification
 /// (#1516, #1700); 4, the resolver entry and scratch layout to the runtime
-/// (#1517); 6, the declared type as a surface of its own (#2407).
-pub const EVIDENCE_VERSION: u32 = 6;
+/// (#1517); 6, the declared type as a surface of its own (#2407); 7,
+/// independently keyed object-grant postconditions (#1454).
+pub const EVIDENCE_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -391,7 +397,8 @@ impl ResolverEvidence {
             })
             .map(|(i, _)| i)
             .collect::<BTreeSet<_>>();
-        if authorization_changes != self.authorization.changes
+        if !super::AuthorizationGrant::complete(changes, &self.authorization.object_grants)
+            || authorization_changes != self.authorization.changes
             || (authorization_changes.is_empty()
                 && self.authorization.before != self.authorization.after)
         {
@@ -758,6 +765,7 @@ mod tests {
                 before: "07".repeat(32),
                 after: "07".repeat(32),
                 changes: BTreeSet::new(),
+                object_grants: Vec::new(),
             },
             manifest(false),
             &manifest(true),
@@ -1066,6 +1074,7 @@ mod tests {
         let before = observed(&template, &compiled());
         let mut authorization = template.authorization.clone();
         authorization.changes = BTreeSet::from([0]);
+        authorization.object_grants = crate::resolver::AuthorizationGrant::fixtures(&changes);
         // ACLs are not fingerprinted (DEC-1274.1): the grant changes no
         // prerequisite, so it needs no transition and the granted view keeps
         // its full opening fingerprint for the closing recheck.

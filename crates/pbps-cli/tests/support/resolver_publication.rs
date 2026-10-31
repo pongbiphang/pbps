@@ -1952,3 +1952,6 @@ pub fn declared_types(server: &str) {
 
 #[path = "trigger_when1907.rs"]
 mod trigger_when1907;
+
+#[path = "object_grants1454.rs"]
+mod object_grants1454;

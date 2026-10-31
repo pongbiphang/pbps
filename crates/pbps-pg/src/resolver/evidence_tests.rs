@@ -50,6 +50,7 @@ fn evidence() -> ResolverEvidence {
             before: "10".repeat(32),
             after: "10".repeat(32),
             changes: BTreeSet::new(),
+            object_grants: Vec::new(),
         },
         manifest.clone(),
         &manifest,

@@ -5452,3 +5452,46 @@ a mode-only verifier negative and measured grant/revoke projection. Each
 reader, replay, projection, canonical and verifier fix has a separate
 compiling fix-removal witness. These are authorization qualification facts,
 not a catalog history log or a broader concurrency guarantee.
+
+<a id="dec-1454-1"></a>
+
+**DEC-1454.1. Seal selected object-grant postconditions independently of binding inputs.**
+This amends the object-grant boundary described by DEC-1274.1. Owners and ACLs
+remain outside catalog binding fingerprints: a grant does not change a binding.
+Resolved evidence version 7 additionally requires exactly one typed question for
+every approved non-schema GRANT, REVOKE and PUBLIC execution decision. Each
+question carries its change index, endpoint target and principal, and a keyed
+answer for each endpoint. Explicit absence differs from a present empty grant;
+a failed or unexpressible read refuses. The endpoint phase label, question and answer are sealed under
+the selected environment key and the distinct `pbps/object-grant-condition/v1`
+domain. The deployer-context digest incorporates these fingerprints under
+`pbps/authorization-with-object-grants/v1`; plans with no such questions retain
+the existing authorization-context domain. Schema-grant admission and projection
+remain the adapter's existing responsibility.
+
+The producer retains a private fresh canonical PostgreSQL catalog read at its
+publication recheck because final ordering passes may still add grant steps.
+Sealing selects only the final plan's written permissions, rather than exporting
+an ACL or predicting untouched grants. The ordinary canonical reader and shared
+effective-grant expansion supply the answers; no ACL decoder or effective-user
+permission simulation is duplicated. Tracked tables, columns and roles use
+PlanNames at the grant's actual position and the two endpoints. Routine questions
+retain their exact overload and follow ordered create/drop and type-name changes.
+PUBLIC is a distinct principal from a role literally named `PUBLIC`. A table
+slot that is vacant can hold a named module: its canonical opening inventory
+and indexed create/drop history prove presence at the grant. This covers both a
+new view using a moved table's old name and a standing view before a future table
+occupies its name; table history alone proves neither module's absence. Repeated writes use
+the final approved writer of each selected permission.
+
+Target-only apply rereads the canonical catalog inside its transaction before
+statements and before recording. It checks the selected answers together with
+the deployer context, independently of the ordinary schema/grant guard; a removed
+grant names its object-grant postcondition. PostgreSQL 16 and 18 regressions
+publish a resolved table-grant plan, require its own before/after keyed answers
+to differ, apply it successfully, then remove the grant inside a transaction and
+require the resolver closing guard alone to refuse. Private engine measurements
+distinguish direct ACLs from inherited PUBLIC access and confirm that the closing
+read sees its transaction's own grant changes. Persisted SQL Server authorization
+retains its existing explicit unsupported refusal. This changes neither the plan
+format version nor public editor schemas, and never broadens binding inputs.

@@ -2920,7 +2920,9 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg18",
-        "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg16"
+        "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg16",
+        "resolver_publication::object_grants1454::an_object_grant_moves_the_sealed_authorization_on_pg18",
+        "resolver_publication::object_grants1454::an_object_grant_moves_the_sealed_authorization_on_pg16"
       ]
     },
     {

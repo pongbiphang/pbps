@@ -1731,6 +1731,7 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
             changes.changes.insert(0, PlannedChange::new(grant));
             evidence.authorization.changes = BTreeSet::from([0]);
         }
+        evidence.authorization.object_grants = super::super::AuthorizationGrant::fixtures(&changes);
         evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
         evidence.validate(&changes).unwrap();
         let mut unplanned = changes.clone();

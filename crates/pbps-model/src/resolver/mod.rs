@@ -24,6 +24,9 @@ pub use projection::ObjectTransition;
 
 mod recheck;
 
+mod grants;
+pub use grants::{AuthorizationGrant, GrantPhase, GrantPrincipal, GrantTargetState, GrantWrite};
+
 mod evidence;
 pub use evidence::{
     AuthorizationCondition, BindingCoverage, DependencyPlacement, DependencyShape, EvidenceError,
