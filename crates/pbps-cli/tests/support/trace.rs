@@ -1104,6 +1104,12 @@ if [ "$1" = run ]; then
   exit "$pbps_trace_status"
 fi
 if [ "$1" = rm ]; then
+  # Recovery precedes this run opening its capture (DEC-2410.3). Once opened,
+  # even an empty capture keeps every target subject to the disposal assertion.
+  # Recorder-only controls omit CREATED and always exercise recording.
+  if [ -n "${PBPS_TRACE_CREATED:-}" ] && [ ! -e "$PBPS_TRACE_CREATED" ]; then
+    exec "$PBPS_TRACE_DOCKER_REAL" "$@"
+  fi
   # Drop may record another attempt while the parent reads this append-only log.
   printf '%s\n' "$@" "" >> "$PBPS_TRACE_ATTEMPTED"
   echo 'forced trace Docker disposal failure' >&2
@@ -1150,6 +1156,99 @@ fn disposal_records_require_at_least_one_attempt_and_only_the_owned_container() 
     ] {
         assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&recorded, "owned")).is_err());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn disposal_control_separates_prior_recovery_from_the_new_runs_cleanup() {
+    let dir = Demo::new("trace2560-recovery");
+    let shim = dir.dir.join("docker");
+    let created = dir.dir.join("disposal.created");
+    let attempted = dir.dir.join("disposal.attempted");
+    let forwarded = dir.dir.join("forwarded");
+    let id = "a".repeat(64);
+    let prior = "b".repeat(64);
+    std::fs::write(&shim, DISPOSAL_SHIM).unwrap();
+    // The real-runtime stand-in is an interpreter reading these files. No
+    // daemon-visible orphan or freshly written executable is involved.
+    std::fs::write(
+        dir.dir.join("run"),
+        "printf '%s\\n' run \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
+         printf '%s\\n' \"$PBPS_TRACE_CONTROL_ID\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.dir.join("rm"),
+        "printf '%s\\n' rm \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
+         exit \"${PBPS_TRACE_CONTROL_STATUS:-0}\"\n",
+    )
+    .unwrap();
+    let command = |args: &[&str]| {
+        let mut command = Command::new("sh");
+        command
+            .arg(&shim)
+            .args(args)
+            .current_dir(&dir.dir)
+            .env("PBPS_TRACE_DOCKER_REAL", "sh")
+            .env("PBPS_TRACE_CREATED", &created)
+            .env("PBPS_TRACE_ATTEMPTED", &attempted)
+            .env("PBPS_TRACE_FORWARDED", &forwarded)
+            .env("PBPS_TRACE_CONTROL_ID", &id)
+            .env("PBPS_TRACE_CONTROL_STATUS", "0");
+        command
+    };
+    let prior_rm = ["rm", "--force", "--volumes", &prior];
+    // An opened but empty capture is already the current run's phase. It
+    // must not turn a foreign cleanup into unobserved recovery.
+    std::fs::write(&created, "").unwrap();
+    assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
+    let record = std::fs::read_to_string(&attempted).unwrap();
+    assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&forwarded).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::remove_file(&created).unwrap();
+    std::fs::remove_file(&attempted).unwrap();
+
+    assert!(command(&prior_rm).output().unwrap().status.success());
+    assert_eq!(
+        command(&prior_rm)
+            .env("PBPS_TRACE_CONTROL_STATUS", "37")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(37),
+        "recovery preserves the real runtime's failure status"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempted).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let run = command(&["run", "--detach", "fixture-image"])
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    assert_eq!(stdout(&run), format!("{id}\n"));
+    assert_eq!(
+        std::fs::read_to_string(&created).unwrap(),
+        format!("{id}\n")
+    );
+    let recovery = format!("rm\n--force\n--volumes\n{prior}\n\n");
+    let before = std::fs::read_to_string(&forwarded).unwrap();
+    assert_eq!(
+        before,
+        format!("{recovery}{recovery}run\n--detach\nfixture-image\n\n")
+    );
+
+    let own_rm = ["rm", "--force", "--volumes", &id];
+    assert_eq!(command(&own_rm).output().unwrap().status.code(), Some(1));
+    assert_disposal_attempts(&std::fs::read_to_string(&attempted).unwrap(), &id);
+    assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
+    let record = std::fs::read_to_string(&attempted).unwrap();
+    assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
+    assert_eq!(std::fs::read_to_string(&forwarded).unwrap(), before);
 }
 
 #[cfg(unix)]
