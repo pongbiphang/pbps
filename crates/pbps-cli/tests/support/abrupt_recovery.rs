@@ -741,18 +741,43 @@ impl CheckpointOutput {
 }
 
 #[cfg(target_os = "linux")]
+fn cli_worker_wait_channel(tasks: &std::path::Path) -> String {
+    let mut worker = None;
+    for task in std::fs::read_dir(tasks).expect("owned child task directory") {
+        let task = task.expect("owned child task entry").path();
+        let comm = std::fs::read_to_string(task.join("comm")).expect("owned child task comm");
+        let name = comm
+            .strip_suffix('\n')
+            .filter(|name| !name.is_empty())
+            .expect("owned child task comm record");
+        if name == "pbps-cli" {
+            assert!(
+                worker.replace(task).is_none(),
+                "owned child must have exactly one pbps-cli worker"
+            );
+        }
+    }
+    let worker = worker.expect("owned child must have exactly one pbps-cli worker");
+    let channel =
+        std::fs::read_to_string(worker.join("wchan")).expect("owned CLI worker wait channel");
+    assert!(!channel.trim().is_empty(), "empty CLI worker wait channel");
+    channel
+}
+
+#[cfg(target_os = "linux")]
 impl Running {
     fn await_pipe_write(&mut self) {
         // A full pipe alone is not a receipt: without this witness a fast
         // observer can see checkpoint 1 while the CLI is already advancing.
-        // The main thread executes apply through Runtime::block_on; stdout is
-        // its only pipe (stderr is a file). An unreadable/hidden wait channel
-        // is failed fixture setup, never permission to use a timing guess.
-        let wait = format!("/proc/{}/wchan", self.child.id());
+        // The named pbps-cli worker executes apply through Runtime::block_on;
+        // main only joins it. Stdout is the worker's only pipe (stderr is a
+        // file). Require exactly one readable worker task; unreadable/hidden
+        // wait channels fail fixture setup, never permit a timing guess.
+        let tasks = std::path::PathBuf::from(format!("/proc/{}/task", self.child.id()));
         let start = Instant::now();
         loop {
             assert!(self.child.try_wait().unwrap().is_none());
-            let channel = std::fs::read_to_string(&wait).expect("owned child wait channel");
+            let channel = cli_worker_wait_channel(&tasks);
             if channel.trim().ends_with("pipe_write") {
                 return;
             }
@@ -828,4 +853,67 @@ pub(super) fn interrupt_after_type_checkpoint(
     assert_eq!(e.latest(), recorded);
     succeeds(d.run(&["unlock", "--db", connection]));
     recorded
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::cli_worker_wait_channel;
+    use std::path::Path;
+
+    fn task(tasks: &Path, tid: &str, name: &str, channel: &str) {
+        let path = tasks.join(tid);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("comm"), format!("{name}\n")).unwrap();
+        std::fs::write(path.join("wchan"), channel).unwrap();
+    }
+
+    #[test]
+    fn pipe_gate_selects_only_the_unique_exactly_named_cli_worker() {
+        let d = super::super::Demo::new("worker-wchan");
+        let tasks = d.dir.join("task");
+        task(&tasks, "1", "main", "pipe_write");
+        task(&tasks, "2", "pbps-cli", "futex_do_wait");
+        task(&tasks, "3", "pbps-cli-extra", "pipe_write");
+        task(&tasks, "4", "pbps-cli ", "pipe_write");
+        assert_eq!(cli_worker_wait_channel(&tasks), "futex_do_wait");
+        std::fs::write(tasks.join("2/wchan"), "pipe_write").unwrap();
+        assert_eq!(cli_worker_wait_channel(&tasks), "pipe_write");
+    }
+
+    #[test]
+    fn pipe_gate_refuses_missing_ambiguous_or_unreadable_tasks() {
+        for case in [
+            "missing-directory",
+            "unreadable-task",
+            "missing-worker",
+            "duplicate-worker",
+            "missing-comm",
+            "unreadable-comm",
+            "empty-comm",
+            "missing-wchan",
+            "unreadable-wchan",
+            "empty-wchan",
+        ] {
+            let d = super::super::Demo::new("invalid-worker-wchan");
+            let tasks = d.dir.join("task");
+            task(&tasks, "1", "pbps-cli", "pipe_write");
+            match case {
+                "missing-directory" => std::fs::remove_dir_all(&tasks).unwrap(),
+                "unreadable-task" => std::fs::write(tasks.join("bad-entry"), "").unwrap(),
+                "missing-worker" => std::fs::write(tasks.join("1/comm"), "pbps-cli \n").unwrap(),
+                "duplicate-worker" => task(&tasks, "2", "pbps-cli", "pipe_write"),
+                "missing-comm" => std::fs::remove_file(tasks.join("1/comm")).unwrap(),
+                "unreadable-comm" => std::fs::write(tasks.join("1/comm"), [0xff]).unwrap(),
+                "empty-comm" => std::fs::write(tasks.join("1/comm"), "").unwrap(),
+                "missing-wchan" => std::fs::remove_file(tasks.join("1/wchan")).unwrap(),
+                "unreadable-wchan" => std::fs::write(tasks.join("1/wchan"), [0xff]).unwrap(),
+                "empty-wchan" => std::fs::write(tasks.join("1/wchan"), "").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                std::panic::catch_unwind(|| cli_worker_wait_channel(&tasks)).is_err(),
+                "{case} must fail fixture setup"
+            );
+        }
+    }
 }

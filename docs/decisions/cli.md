@@ -1618,3 +1618,23 @@ mode is reapplied after copying. Identity writes and the exit 2 result for
 unresolved identity intent remain outside this helper (DEC-1790.1). The
 per-output removal-membership scan is unnecessary and removed (#2352);
 protected-input and containment checks remain.
+
+
+<a id="dec-2571-1"></a>
+
+**DEC-2571.1. Run the whole CLI on an explicitly sized worker stack.**
+Windows' 1 MiB main stack can overflow during debug command-tree walks before
+project discovery. A Linux debug `man` probe succeeds at 1 MiB but overflows
+at 992 KiB and every smaller tested size; that narrow margin cannot qualify
+the Windows codegen. Start `run()` on one named `pbps-cli` thread with an
+8 MiB stack, matching the measured Linux main-stack budget and retaining
+headroom across debug layouts and deeper commands. This covers parsing,
+schemas, completions and man pages without a target-specific linker setting.
+
+Join the worker before applying the existing 0 / finding / 1 exit mapping.
+Return its errors unchanged, report a spawn failure as an ordinary error,
+and resume its panic so it cannot become success. Keep the boxed drop
+requirements: they still bound command-tree values and removing them would
+be a separate, unqualified startup-cost change. An isolated 1 MiB caller and
+negative small-stack child pin the worker's headroom without making a clap
+overflow threshold part of the cross-platform test contract.
