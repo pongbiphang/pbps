@@ -4,6 +4,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import datetime
 import hashlib
 import json
 import math
@@ -18,6 +19,7 @@ import sys
 import tempfile
 from threading import Event, Lock, Thread
 import time
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,13 @@ EXPRESS_INVENTORY = {
     },
 }
 EXPRESS_TESTS = set().union(*EXPRESS_INVENTORY.values())
+MANIFEST = "manifest.json"
+REGISTER = "scripts/known-flakes.json"
+# A registered flake that fails a third time on one head is not flaky (DEC-2553.1).
+MAX_FLAKE_FAILURES = 2
+# Default-include: any variable with these spellings may change a verdict.
+INPUT_PREFIXES = ("PBPS_", "INSTA_", "CARGO_PROFILE_")
+INPUT_NAMES = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS"}
 FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
@@ -51,6 +60,9 @@ FIXTURES = {
            ("PBPS_TEST_PG_OLD_NAME", "PBPS_TEST_PG_OLD_PORT", "pg16", 27321),
            ("PBPS_TEST_PG_SCRATCH_NAME", "PBPS_TEST_PG_SCRATCH_PORT", "pg-scratch", 27322)],
 }
+# Fixture identity is chosen per shard, so it cannot change what a test proves.
+FIXTURE_VARIABLES = {v for fixtures in FIXTURES.values() for name, port, _, _ in fixtures
+                     for v in (name, port)}
 
 
 def require(condition, message):
@@ -304,6 +316,141 @@ def listed_tests(output):
     return names
 
 
+def git_output(root, *args):
+    result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True)
+    require(result.returncode == 0, f"git {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def tree_identity(root):
+    """HEAD's tree id when the worktree is exactly that tree, else None (DEC-2553.1).
+
+    An untracked file counts as a change: Cargo discovers `tests/*.rs` by name.
+    `target` is excluded because gate worktrees symlink it to the build disk and
+    `.gitignore` names it as a directory, so the link itself reads as untracked.
+    """
+    try:
+        head = git_output(root, "rev-parse", "--verify", "HEAD^{tree}").strip()
+        dirty = git_output(root, "status", "--porcelain", "--untracked-files=all",
+                           "--", ".", ":(exclude)target")
+    except (ValueError, OSError):
+        return None
+    return head if re.fullmatch(r"[0-9a-f]{40,64}", head) and not dirty else None
+
+
+def inputs_digest(env):
+    """Digest of what a verdict depends on and the head tree cannot prove.
+
+    The tree proves every tracked file, including the lockfile, the runners and
+    the image digests pinned in them. The toolchain that built the tests and the
+    environment the runners and tests read are outside it.
+    """
+    def tool(command):
+        result = subprocess.run(command, env=env, cwd=ROOT, text=True, capture_output=True)
+        require(result.returncode == 0, f"{command[0]} failed: {result.stderr.strip()}")
+        return result.stdout
+    names = sorted(name for name in env
+                   if name not in FIXTURE_VARIABLES and not name.startswith("PBPS_LIVE_")
+                   and (name in INPUT_NAMES or name.startswith(INPUT_PREFIXES)))
+    # rustc's commit and host identify the toolchain; cargo ships with it.
+    body = {"version": 1, "rustc": tool(["rustc", "-vV"]),
+            "env": {name: env[name] for name in names}}
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest(), names
+
+
+def write_atomic(path, text):
+    # A killed writer must not leave a truncated receipt that a resume would refuse.
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
+def read_json(path, what):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"unreadable {what} {path}: {error}") from error
+
+
+def check_row(row, path):
+    names = lambda value: isinstance(value, list) and all(isinstance(n, str) for n in value)
+    require(isinstance(row, dict) and all(
+        key in row for key in ("args", "listed", "assigned", "reported", "valid", "tree", "inputs", "carried")),
+        f"receipt {path} lacks the head identity or a field")
+    require(names(row["args"]) and names(row["listed"]) and names(row["assigned"])
+            and isinstance(row["valid"], bool) and isinstance(row["reported"], dict)
+            and isinstance(row["carried"], dict), f"malformed receipt {path}")
+    require(all(isinstance(r, dict) and r.get("status") in ("ok", "FAILED") for r in row["reported"].values())
+            and all(isinstance(r, dict) and r.get("status") == "ok" for r in row["carried"].values()),
+            f"malformed result in receipt {path}")
+
+
+def load_resume(previous, tree, inputs, suites, flakes):
+    """Read what a previous run on this head proved; refuse anything else (DEC-2553.1).
+
+    A missing receipt only means a name is not proven yet. A receipt that is
+    unreadable, malformed, from another head or inputs, or that disagrees with
+    its siblings refuses the whole resume. `flakes` maps (cargo, name) to its
+    register entry. Returns (proven, failures, waived): proven names per suite
+    and invocation key, FAILED totals per head, and the register entries used.
+    """
+    previous = Path(previous)
+    manifest = read_json(previous / MANIFEST, "manifest")
+    require(isinstance(manifest, dict) and manifest.get("version") == 1
+            and isinstance(manifest.get("run_id"), str), "unsupported previous manifest")
+    for name, value in (("tree", tree), ("inputs", inputs)):
+        require(isinstance(manifest.get(name), str) and manifest[name],
+                f"the previous run has no {name} identity (dirty or unreadable)")
+        require(value is not None, f"this run has no {name} identity (dirty or unreadable)")
+        require(manifest[name] == value, f"previous {name} {manifest[name][:12]} != current {value[:12]}"
+                + (f" (environment: {', '.join(manifest.get('inputs_env', []))})" if name == "inputs" else ""))
+    require(sorted(manifest.get("suites", [])) == sorted(suites),
+            f"the previous run covered {manifest.get('suites')}, not {suites}")
+    history = manifest.get("failed", {})
+    require(isinstance(history, dict), "malformed failure history")
+    proven, failures, waived, refused = {}, {}, [], []
+    for suite in suites:
+        directory = previous / suite
+        require(directory.is_dir(), f"the previous output has no {suite} receipts")
+        rows = {}
+        for path in sorted(directory.glob("*/*.json")):
+            row = read_json(path, "receipt")
+            check_row(row, path)
+            require(row["tree"] == tree and row["inputs"] == inputs,
+                    f"receipt {path} was written for another head or inputs")
+            rows.setdefault(path.stem, []).append(row)
+        for key, group in rows.items():
+            first = group[0]
+            require(all(row["args"] == first["args"] and sorted(row["listed"]) == sorted(first["listed"])
+                        and row["carried"] == first["carried"] for row in group),
+                    f"receipts of invocation {key} disagree")
+            ok = dict(first["carried"])
+            counts = dict(history.get(suite, {}).get(key, {}))
+            cargo = tuple(libtest_args(first["args"])[0])
+            failed = set()
+            for row in group:
+                for name, result in row["reported"].items():
+                    if result["status"] == "FAILED":
+                        failed.add(name)
+                        counts[name] = counts.get(name, 0) + 1
+                        flake = flakes.get((cargo, name))
+                        if flake is None or counts[name] > MAX_FLAKE_FAILURES:
+                            refused.append(f"{suite}: {name}")
+                        else:
+                            waived.append(flake)
+                    elif row["valid"]:
+                        ok[name] = {"status": "ok", "seconds": result["seconds"], "run": manifest["run_id"]}
+            for name in failed:
+                ok.pop(name, None)
+            proven.setdefault(suite, {})[key] = {"listed": sorted(first["listed"]), "ok": ok}
+            failures.setdefault(suite, {})[key] = {n: c for n, c in counts.items() if c}
+        for key, counts in history.get(suite, {}).items():
+            failures.setdefault(suite, {}).setdefault(key, counts)
+    require(not refused, "FAILED outside the unexpired known-flake register, or failed more than "
+            f"{MAX_FLAKE_FAILURES} times on this head: " + ", ".join(sorted(set(refused))))
+    return proven, failures, waived, manifest
+
+
 def run_tests(command, assigned):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
@@ -398,7 +545,10 @@ def cargo_proxy(args):
     require(enumeration.returncode == 0, "cargo --list failed")
     names = listed_tests(enumeration.stdout)
     pinned = env.get("PBPS_LIVE_PINNED") == "1"
-    groups = partition(names, count, identity, read_weights(env.get("PBPS_LIVE_WEIGHTS")), pinned)
+    carried, remaining = resumed(env, key, names), names
+    if carried:
+        remaining = [name for name in names if name not in carried]
+    groups = partition(remaining, count, identity, read_weights(env.get("PBPS_LIVE_WEIGHTS")), pinned)
     verify_express(groups)
     assigned = groups[index]
     print(f"shard {index}/{count} {key}: {len(assigned)}/{len(names)} tests", flush=True)
@@ -407,12 +557,30 @@ def cargo_proxy(args):
         reported, code, seconds, valid = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
              "--color=never", *assigned], assigned)
+    # The head the tests ran on must still be the head the driver started on.
+    tree = tree_identity(ROOT)
     receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
                "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
-               "valid": valid}
-    (root / (key + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
+               "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
+               "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried}
+    write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
+
+
+def resumed(env, key, names):
+    """The names an earlier run of this head already proved for this invocation."""
+    path = env.get("PBPS_LIVE_RESUME")
+    if not path:
+        return {}
+    snapshot = read_json(Path(path), "resume snapshot")
+    require(isinstance(snapshot, dict) and isinstance(snapshot.get("keys"), dict),
+            "unreadable resume snapshot")
+    entry = snapshot["keys"].get(env["PBPS_LIVE_SUITE"], {}).get(key)
+    if entry is None:
+        return {}
+    require(sorted(names) == entry["listed"], "the test list changed since the previous run")
+    return {name: entry["ok"][name] for name in names if name in entry["ok"]}
 
 
 def shard(suite, extra):
@@ -431,10 +599,12 @@ def shard(suite, extra):
     proxy.write_text(f"#!{sys.executable}\nimport os, sys\nos.execv({sys.executable!r}, "
                      f"[{sys.executable!r}, {str(SCRIPT)!r}, 'cargo', *sys.argv[1:]])\n")
     proxy.chmod(0o755)
-    env.update(PBPS_LIVE_ACTIVE="1", PBPS_LIVE_REAL_CARGO=real,
+    env.update(PBPS_LIVE_ACTIVE="1", PBPS_LIVE_REAL_CARGO=real, PBPS_LIVE_SUITE=suite,
                PBPS_LIVE_SHARD_DIR=str(root), PATH=str(proxy.parent) + os.pathsep + env["PATH"])
     result = subprocess.run(["bash", str(ROOT / "scripts" / RUNNERS[suite]), *extra], cwd=ROOT, env=env)
-    require(any(json.loads(p.read_text())["assigned"] for p in root.glob("*.json")),
+    receipts = [json.loads(p.read_text()) for p in root.glob("*.json")]
+    # A resumed shard may have nothing left; it must still have run every invocation.
+    require(receipts if env.get("PBPS_LIVE_RESUME") else any(r["assigned"] for r in receipts),
             "shard is empty for the whole suite")
     return result.returncode
 
@@ -445,9 +615,11 @@ def audit(suite_root, count, *, expected_invocations=None):
     if expected_invocations is not None:
         require(all(len(shard) == expected_invocations for shard in receipts),
                 "unexpected invocation receipt count")
-    require(all(any(r["assigned"] for r in shard.values()) for shard in receipts),
+    # A resumed run may leave a shard nothing to run; it must still have receipts.
+    resumed = any(row.get("carried") for shard in receipts for row in shard.values())
+    require(all(shard if resumed else any(r["assigned"] for r in shard.values()) for shard in receipts),
             "a shard is empty for the whole suite")
-    passed = failed = 0
+    passed = failed = carried_total = 0
     measured = {}
     for key in sorted(set().union(*(set(shard) for shard in receipts))):
         rows = [shard.get(key) for shard in receipts]
@@ -455,6 +627,10 @@ def audit(suite_root, count, *, expected_invocations=None):
         require(all(row is not None for row in rows) or
                 reference["pinned"] and rows[0] is not None
                 and all(row is None for row in rows[1:]), "missing invocation receipt")
+        carried = reference.get("carried", {})
+        require(isinstance(carried, dict) and all(isinstance(r, dict) and r.get("status") == "ok"
+                                                    for r in carried.values()),
+                "a carried name is not ok")
         groups = []
         for index, row in enumerate(rows):
             if row is None:
@@ -462,6 +638,7 @@ def audit(suite_root, count, *, expected_invocations=None):
                 continue
             require(all(row[k] == reference[k] for k in ("args", "identity", "listed", "groups", "pinned")),
                     "shards disagree about the invocation or partition")
+            require(row.get("carried", {}) == carried, "shards disagree about the carried names")
             require(row["assigned"] == row["groups"][index], "assignment differs from partition")
             require(row["valid"], "libtest reports or summary are incomplete")
             require(set(row["assigned"]) == set(row["reported"]), "assigned test has no result")
@@ -472,9 +649,23 @@ def audit(suite_root, count, *, expected_invocations=None):
                 passed += result["status"] == "ok"
                 failed += result["status"] == "FAILED"
                 measured[row["identity"] + ":" + name] = result["seconds"]
-        verify_union(reference["listed"], groups)
+        require(not set(carried).intersection(name for group in groups for name in group),
+                "a carried name ran again")
+        verify_union(reference["listed"], [*groups, sorted(carried)])
         verify_express(groups)
-    return {"passed": passed, "failed": failed, "union": "exact"}, measured
+        passed += len(carried)
+        carried_total += len(carried)
+    result = {"passed": passed, "failed": failed, "union": "exact"}
+    if carried_total:
+        result["carried"] = carried_total
+    return result, measured
+
+
+def register_flakes(ref):
+    """The unexpired register entries of `ref`, keyed by (cargo prefix, test name)."""
+    import known_flakes
+    entries = known_flakes.load(git_output(ROOT, "show", f"{ref}:{REGISTER}"))
+    return known_flakes.active(entries, datetime.datetime.now(datetime.timezone.utc).date())
 
 
 def available_gb():
@@ -524,9 +715,24 @@ def drive(args):
     counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
     print(f"available memory: {memory:.2f} GiB; shards: "
           + ", ".join(f"{suite}={counts[suite]}" for suite in suites), flush=True)
+    env = dict(os.environ, PBPS_LIVE_PREFIX=args.prefix)
+    # Identity and resume evidence are settled before anything is created, so a
+    # refused resume leaves no output directory behind (DEC-2553.1).
+    tree = tree_identity(ROOT)
+    try:
+        inputs, inputs_env = inputs_digest(env)
+    except (ValueError, OSError):
+        inputs, inputs_env = None, []
+    run_id = uuid.uuid4().hex
+    previous = getattr(args, "resume", None)
+    proven, failures, waived, origin = {}, {}, [], None
+    if previous:
+        require(args.output and Path(previous).resolve() != Path(args.output).resolve(),
+                "--resume needs a fresh --output of its own")
+        proven, failures, waived, origin = load_resume(
+            previous, tree, inputs, suites, register_flakes(getattr(args, "flakes_ref", "origin/master")))
     output = Path(args.output or tempfile.mkdtemp(prefix="pbps-live-shards-"))
     output.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, PBPS_LIVE_PREFIX=args.prefix)
     weights = read_weights(args.weights)
     # One immutable snapshot for the whole run prevents different shards from
     # repartitioning as measurements are published by another run.
@@ -537,6 +743,25 @@ def drive(args):
         env.pop("PBPS_LIVE_WEIGHTS", None)
     else:
         env["PBPS_LIVE_WEIGHTS"] = str(snapshot.resolve())
+    env["PBPS_LIVE_RUN"] = run_id
+    for name, value in (("PBPS_LIVE_TREE", tree), ("PBPS_LIVE_INPUTS", inputs)):
+        if value is not None:
+            env[name] = value
+    resumed_from = None
+    if previous:
+        snapshot_path = output / "resume-input.json"
+        write_atomic(snapshot_path, json.dumps({"run_id": origin["run_id"], "keys": proven}))
+        env["PBPS_LIVE_RESUME"] = str(snapshot_path.resolve())
+        summary_path = Path(previous) / "summary.json"
+        resumed_from = {"run_id": origin["run_id"], "output": str(Path(previous).resolve()),
+                        "manifest_sha256": hashlib.sha256((Path(previous) / MANIFEST).read_bytes()).hexdigest(),
+                        "summary_sha256": (hashlib.sha256(summary_path.read_bytes()).hexdigest()
+                                           if summary_path.exists() else None),
+                        "flakes": [{k: f[k] for k in ("test", "cargo", "issue")} for f in waived]}
+    write_atomic(output / MANIFEST, json.dumps(
+        {"version": 1, "run_id": run_id, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+         "suites": suites, "shards": counts, "tree": tree, "inputs": inputs, "inputs_env": inputs_env,
+         "failed": failures, "resumed_from": resumed_from}, indent=2) + "\n")
     summary, measured = {}, {}
     used_names, used_ports = set(), set()
     tasks = []
@@ -619,6 +844,7 @@ def drive(args):
     summary["run"] = {"seconds": elapsed, "available_gib": memory, "shards": counts,
                       "minimum_available_gib": min(memory_samples), "memory_samples": len(memory_samples),
                       "memory_sample_seconds": MEMORY_SAMPLE_SECONDS, "memory_errors": memory_errors}
+    summary["run"].update(run_id=run_id, tree=tree, inputs=inputs, resumed_from=resumed_from)
     summary["run"]["express_tests_on_shard_zero"] = express
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"total: {elapsed:.2f}s; minimum available memory: {min(memory_samples):.2f} GiB; "
@@ -666,6 +892,10 @@ def main():
     parser.add_argument("--weights")
     parser.add_argument("--measure", help="write observed per-test seconds as a weights JSON file")
     parser.add_argument("--output", help="fresh directory for receipts, per-shard logs and summary")
+    parser.add_argument("--resume", metavar="PREVIOUS_OUTPUT",
+                        help="finish a stopped run of this same head: rerun only the names it did not prove")
+    parser.add_argument("--flakes-ref", default="origin/master",
+                        help="git ref whose scripts/known-flakes.json may waive FAILED names on --resume")
     return drive(parser.parse_args())
 
 
