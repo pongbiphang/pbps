@@ -56,19 +56,19 @@ pub(super) fn classify(
             })
     };
     let pair_hit = |pair: ColumnPair<'_>| {
-        Some(&pair.key.0) == entry.table()
-            && (entry.column(&pair.key.1)
+        Some(pair.table) == entry.table()
+            && (pair.uids().any(|uid| entry.column(uid))
                 // Names bridge inherited targets, never a different ordinary UID.
                 || (matches!(&entry.target, Target::NamedColumn { .. })
                     && pair
                         .addresses()
                         .any(|at| entry.named_column(&at.name, sides))))
     };
-    let written_pair = |pair: ColumnPair<'_>| written.is_some_and(|set| set.contains(&pair.key.0));
+    let written_pair = |pair: ColumnPair<'_>| written.is_some_and(|set| set.contains(pair.table));
     let supplied = |uid: &Uid| {
         interfaces
             .columns()
-            .any(|pair| &pair.key.1 == uid && pair_hit(pair) && pair.supplied())
+            .any(|pair| pair.has_uid(uid) && pair_hit(pair) && pair.supplied())
     };
     let named = |name: &ColumnName| hit && entry.named_column(name, sides);
     let nullability = |pair: ColumnPair<'_>| {
@@ -91,7 +91,7 @@ pub(super) fn classify(
                     })))
             && pair.default_changed()
             && !pair.supplied()
-            && !unchanged(&p.change, Some(&pair.key.0))
+            && !unchanged(&p.change, Some(pair.table))
     };
     let collation =
         |pair: ColumnPair<'_>| pair_hit(pair) && pair.collation_changed() && !pair.supplied();
@@ -126,7 +126,7 @@ pub(super) fn classify(
                                     || (entry.writes
                                         && written_pair(pair)
                                         && pair.adds_checks(name, &delta)
-                                        && !unchanged(&p.change, Some(&pair.key.0))))))
+                                        && !unchanged(&p.change, Some(pair.table))))))
                 })
                 .then_some(U)
         };
@@ -186,7 +186,7 @@ pub(super) fn classify(
             column(uid).then_some(B)
         }
         Change::AddColumn { uid, .. } => write(interfaces.columns().any(|pair| {
-            &pair.key.1 == uid
+            pair.has_uid(uid)
                 && written_pair(pair)
                 && pair.after.is_some_and(|c| !c.column.nullable)
                 && !pair.supplied()
@@ -195,21 +195,21 @@ pub(super) fn classify(
             uid,
             interfaces
                 .columns()
-                .filter(|pair| &pair.key.1 == uid)
+                .filter(|pair| pair.has_uid(uid))
                 .any(nullability),
             interfaces
                 .columns()
-                .filter(|pair| &pair.key.1 == uid)
+                .filter(|pair| pair.has_uid(uid))
                 .any(collation),
         ),
         Change::AlterColumnNullability { uid, .. } => interfaces
             .columns()
-            .filter(|pair| &pair.key.1 == uid)
+            .filter(|pair| pair.has_uid(uid))
             .any(nullability)
             .then_some(U),
         Change::AlterColumnDefault { uid, .. } => interfaces
             .columns()
-            .filter(|pair| &pair.key.1 == uid)
+            .filter(|pair| pair.has_uid(uid))
             .any(|pair| default(pair, pair_hit(pair)))
             .then_some(U),
         Change::AlterColumnExpression { uid, .. } => {
@@ -240,14 +240,14 @@ pub(super) fn classify(
         Change::SetPartitionDefault { column, .. } => interfaces
             .columns()
             .filter(|pair| {
-                table == Some(&pair.key.0) && pair.addresses().any(|at| &at.name == column)
+                table == Some(pair.table) && pair.addresses().any(|at| &at.name == column)
             })
             .any(|pair| default(pair, hit))
             .then_some(U),
         Change::SetPartitionNotNull { column, .. } => interfaces
             .columns()
             .filter(|pair| {
-                table == Some(&pair.key.0) && pair.addresses().any(|at| &at.name == column)
+                table == Some(pair.table) && pair.addresses().any(|at| &at.name == column)
             })
             .any(nullability)
             .then_some(U),

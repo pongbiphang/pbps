@@ -2067,3 +2067,5 @@ fn named_computed_contracts_do_not_acquire_an_ordinary_replacements_uid() {
 mod effective_columns;
 
 mod sibling_defaults;
+
+mod partition_pairing;

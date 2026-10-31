@@ -175,34 +175,7 @@ impl Object {
     fn key(&self, side: Side<'_>, sides: &[Side<'_>]) -> Option<Target> {
         match self {
             Self::Table(t) => side.ids.table_uid(t).cloned().map(Target::Table),
-            Self::Column(c) => {
-                let table = side.ids.table_uid(&c.table)?.clone();
-                let uid = side.ids.column_uid(c).or_else(|| {
-                    // Attaching retires the leaf's column UID; detaching assigns
-                    // one. Its table UID and effective column join the two sides.
-                    side.schema.tables[&c.table].partition_of.as_ref()?;
-                    side.column(c)?;
-                    sides.iter().find_map(|s| {
-                        s.ids
-                            .column_uid(&s.ids.tables.get(&table)?.column(c.name.clone()))
-                    })
-                });
-                Some(match uid {
-                    Some(uid) => Target::Column {
-                        table,
-                        uid: uid.clone(),
-                    },
-                    None if side.column(c).is_some_and(|(source, _)| source != *c)
-                        || side.schema.tables[&c.table].computed.contains_key(&c.name) =>
-                    {
-                        Target::NamedColumn {
-                            table,
-                            name: c.name.clone(),
-                        }
-                    }
-                    None => return None,
-                })
-            }
+            Self::Column(c) => column_target(c, side, sides),
             Self::Module(m) => Some(Target::Module(m.clone())),
         }
     }
@@ -213,6 +186,37 @@ impl Object {
             Self::Module(m) => m.raw().to_string(),
         }
     }
+}
+
+// Binding and effective-interface pairing must share the partition UID bridge.
+// An ordinary column's own UID always wins over another column's spelling.
+pub(super) fn column_target(c: &ColumnRef, side: Side<'_>, sides: &[Side<'_>]) -> Option<Target> {
+    let table = side.ids.table_uid(&c.table)?.clone();
+    let uid = side.ids.column_uid(c).or_else(|| {
+        // Attaching retires the leaf's column UID; detaching assigns
+        // one. Its table UID and effective column join the two sides.
+        side.schema.tables[&c.table].partition_of.as_ref()?;
+        side.column(c)?;
+        sides.iter().find_map(|s| {
+            s.ids
+                .column_uid(&s.ids.tables.get(&table)?.column(c.name.clone()))
+        })
+    });
+    Some(match uid {
+        Some(uid) => Target::Column {
+            table,
+            uid: uid.clone(),
+        },
+        None if side.column(c).is_some_and(|(source, _)| source != *c)
+            || side.schema.tables[&c.table].computed.contains_key(&c.name) =>
+        {
+            Target::NamedColumn {
+                table,
+                name: c.name.clone(),
+            }
+        }
+        None => return None,
+    })
 }
 
 fn candidates(

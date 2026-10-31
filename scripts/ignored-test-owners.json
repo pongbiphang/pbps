@@ -3007,6 +3007,24 @@
         "matching_owned_sequence_types_keep_the_existing_continuation_contract",
         "parent_column_and_address_moves_apply_at_their_proved_boundaries"
       ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "consumer_effective_columns::partition_membership_attachment_keeps_the_reader_bound_to_its_effective_column",
+        "consumer_effective_columns::partition_membership_detachment_keeps_domain_nullability_visible_to_readers"
+      ]
     }
   ]
 }

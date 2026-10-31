@@ -1,5 +1,8 @@
 //! One declared value interface per side, independent of the emitted change.
-use super::Side;
+use super::{
+    Side,
+    binding::{Target, column_target},
+};
 use pbps_model::{
     Change, ChangeSet, Column, ColumnRef, DomainDelta, ManagedType, ObjectLocalName, TypeRef, Uid,
     ValueSource,
@@ -114,6 +117,7 @@ impl EffectiveSide {
 
 pub(super) struct Interfaces {
     sides: [EffectiveSide; 2],
+    pairs: Vec<[Option<Key>; 2]>,
     added: BTreeSet<Uid>,
     created: BTreeSet<Uid>,
     added_columns: BTreeSet<ColumnRef>,
@@ -139,8 +143,42 @@ impl Interfaces {
                 created.insert(uid.clone());
             }
         }
+        let effective = sides.map(EffectiveSide::of);
+        let [before, after] = &effective;
+        let targets: BTreeMap<_, _> = after
+            .0
+            .iter()
+            .filter_map(|(key, column)| {
+                let target = column_target(&column.at, sides[1], sides)?;
+                // Only a UID-bearing bridge proves membership continuity: an
+                // inherited spelling can also name a replacement column.
+                matches!(target, Target::Column { .. }).then_some((target, key))
+            })
+            .collect();
+        let mut matched = BTreeSet::new();
+        let mut pairs = Vec::new();
+        for (key, column) in &before.0 {
+            // Exact source UIDs also follow inherited column renames. Only the
+            // ordinary binder may bridge a membership transition's new UID.
+            let next = after.0.get_key_value(key).map(|(key, _)| key).or_else(|| {
+                column_target(&column.at, sides[0], sides)
+                    .and_then(|target| targets.get(&target).copied())
+                    // Reserve every exact match, even one visited later.
+                    .filter(|key| !before.0.contains_key(*key))
+            });
+            let next = next.filter(|key| matched.insert((*key).clone()));
+            pairs.push([Some(key.clone()), next.cloned()]);
+        }
+        pairs.extend(
+            after
+                .0
+                .keys()
+                .filter(|key| !matched.contains(*key))
+                .map(|key| [None, Some(key.clone())]),
+        );
         Self {
-            sides: sides.map(EffectiveSide::of),
+            sides: effective,
+            pairs,
             added,
             created,
             added_columns,
@@ -154,27 +192,37 @@ impl Interfaces {
     }
     pub fn columns(&self) -> impl Iterator<Item = ColumnPair<'_>> {
         let [before, after] = &self.sides;
-        before
-            .0
-            .keys()
-            .chain(after.0.keys().filter(|key| !before.0.contains_key(*key)))
-            .map(|key| ColumnPair {
-                key,
-                before: before.0.get(key),
-                after: after.0.get(key),
-                added: self.added.contains(&key.1),
-            })
+        self.pairs.iter().map(|[b, a]| {
+            let key = b.as_ref().or(a.as_ref()).expect("a pair has a side");
+            ColumnPair {
+                table: &key.0,
+                uids: [b.as_ref().map(|k| &k.1), a.as_ref().map(|k| &k.1)],
+                before: b.as_ref().and_then(|key| before.0.get(key)),
+                after: a.as_ref().and_then(|key| after.0.get(key)),
+                // Joining a standing leaf to a new parent column is not a new
+                // supplied column for that leaf's existing consumer.
+                added: b.is_none() && a.as_ref().is_some_and(|key| self.added.contains(&key.1)),
+            }
+        })
     }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct ColumnPair<'a> {
-    pub key: &'a Key,
+    pub table: &'a Uid,
+    uids: [Option<&'a Uid>; 2],
     pub before: Option<&'a EffectiveColumn>,
     pub after: Option<&'a EffectiveColumn>,
     added: bool,
 }
 impl<'a> ColumnPair<'a> {
+    // Neither the old contract nor a parent edit may lose its source UID.
+    pub fn uids(self) -> impl Iterator<Item = &'a Uid> {
+        self.uids.into_iter().flatten()
+    }
+    pub fn has_uid(self, uid: &Uid) -> bool {
+        self.uids().any(|own| own == uid)
+    }
     pub fn addresses(self) -> impl Iterator<Item = &'a ColumnRef> {
         [self.before, self.after]
             .into_iter()
