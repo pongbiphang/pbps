@@ -90,6 +90,15 @@ required schema's presence, owner, permissions or grant mismatch. SQL-login
 qualification does not establish Windows-group default-schema behavior (#725)
 or enable persisted SQL Server planning/apply (#2143/#2144).
 
+**Effective replay default (DEC-725.1).** For an existing default schema,
+the replay name comes from the deployer session's `SCHEMA_NAME()`, including
+the engine's catalog spelling. The principal-row value does not override
+that answer. Only a NULL answer with independently confirmed configured-name
+absence retains that configured replay name; missing observations refuse.
+Target and mapped scratch use this common reader under `mssql-auth-v5`.
+Ordinary SQL-login controls cover equivalent configured spellings, mapped
+replay and default drift; Windows-domain/group precedence remains unmeasured.
+
 **Consequence for the resolver.** A one-part reference in a body that is not
 schema-bound is **runtime-bound**. Rebuilding the module cannot pin it, so
 there is no rebuild decision to make for it. Its candidates enter the

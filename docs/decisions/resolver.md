@@ -5370,3 +5370,39 @@ before. Process death and runtime shutdown cannot run in-process cleanup;
 #2410's durable recovery remains their fallback, and the fallback for a
 cleanup the checked backend could not confirm. It is not a substitute for
 finishing a cancelled request's release in a live server.
+
+
+<a id="dec-725-1"></a>
+
+**DEC-725.1. Reproduce the session-effective default schema, retaining a configured name only for independently confirmed absence.**
+The default used for an existing schema is the deployer session's
+`SCHEMA_NAME()` answer. Principal metadata is a replay input for known absence,
+not an interpreter of Windows-group precedence or a source of catalog
+spelling. An ordinary SQL login can already expose the distinction: a
+configured spelling equivalent under the database collation can differ from
+the catalog name the session reports. The same shared reader selects the
+target and mapped scratch defaults and names a changed effective default.
+
+Option B from #717 also governs this read. A NULL effective answer may retain
+the configured name only after the target-qualified schema-domain mechanism
+independently confirms that name is absent. Replay must leave it absent; bare
+statements keep their measured `dbo` fallback. A missing effective answer and
+missing configured name refuse, without inventing `dbo`. The configured seed
+and immutable questions from DEC-717.1 still reach both complete bracketed
+reads, target rereads and both verifiers; changing the replay choice does not
+replace their independent observations or raw grant/owner obligations.
+
+The concrete contract advances from `mssql-auth-v4` to `mssql-auth-v5`. The
+generic authorization fingerprint domain and saved formats do not change.
+Persisted SQL Server authorization and planning/apply remain refused until
+their separately governed delivery; no old profile is silently resealed.
+
+The connected regression measures ordinary SQL logins on the pinned Linux
+SQL Server 17.0 fixture, omitted and explicit defaults, catalog-equivalent
+configured spelling, known absence, actual bare-name binding, mapped scratch
+verification, setup-owner and changed-default negatives, restoration and an
+unreadable observer. Its effective-name assertion fails under the historical
+principal-row selection on that real fixture. These controls do not qualify
+Windows-domain authentication, group-default inheritance or multiple-group
+precedence. A domain-backed profile claim still requires that native domain
+evidence; the engine's documented group rules are not a Linux measurement.
