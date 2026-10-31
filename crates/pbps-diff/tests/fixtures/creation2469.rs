@@ -29,6 +29,34 @@ pub struct Fixture {
     pub deps: ObjectDeps,
     pub owner: String,
 }
+
+pub fn generated_facet(facet: &str, engine: &str) -> Fixture {
+    let mut fixture = Fixture::new("generation", engine);
+    fixture.owner = format!("{facet}::app.t.g");
+    fixture.deps.0[0].0 = fixture.owner.parse().unwrap();
+    let table = fixture
+        .schema
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap();
+    table.columns.shift_remove("x");
+    fixture.ids.columns.remove(&"c_bbbbbb".parse().unwrap());
+    if engine == "mssql" {
+        fixture
+            .schema
+            .modules
+            .get_mut(&"app.f".parse().unwrap())
+            .unwrap()
+            .definition = "() RETURNS integer WITH SCHEMABINDING AS BEGIN RETURN 7; END".into();
+        let computed = table.computed.get_mut("g").unwrap();
+        computed.persisted = true;
+        computed.not_null = facet == "not_null";
+    } else {
+        table.columns.get_mut("g").unwrap().nullable = facet != "not_null";
+    }
+    fixture
+}
+
 impl Fixture {
     pub fn new(facet: &str, engine: &str) -> Self {
         let t: TableName = "app.t".parse().unwrap();

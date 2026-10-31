@@ -68,14 +68,14 @@ fn parts_in(
     else {
         return Ok(None);
     };
-    demand.columns = demand.column_suffix(table.columns.keys());
     let calling = |text: &str| functions.iter().any(|id| calls(dialect, text, id));
-    let cut = (!demand.columns.is_empty()).then_some(0).or_else(|| {
-        table
-            .computed
-            .iter()
-            .position(|(column, c)| calling(&c.expression) || demand.generation(column))
+    // Resolve computed demands before narrowing columns to the ordinary suffix.
+    // Computed NOT NULL belongs to the same column definition (DEC-2469.4).
+    let cut = table.computed.iter().position(|(column, c)| {
+        calling(&c.expression) || demand.generation(column) || demand.not_null(column)
     });
+    demand.columns = demand.column_suffix(table.columns.keys());
+    let cut = (!demand.columns.is_empty()).then_some(0).or(cut);
     let default_calls = table
         .columns
         .values()

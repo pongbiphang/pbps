@@ -62,6 +62,10 @@ impl Demand {
     pub fn generation(&self, column: &ColumnName) -> bool {
         self.generation.contains(column) || self.columns.contains(column)
     }
+
+    pub fn not_null(&self, column: &ColumnName) -> bool {
+        self.not_null.contains(column)
+    }
 }
 
 /// Retain the engine's legal generation groups, then expose requested portable
