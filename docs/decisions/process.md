@@ -1574,3 +1574,77 @@ inconsistent lists, an unselected test, incomplete execution or a failed test
 fail the gate. The resolver job and its audit retain the pull-request omission;
 every other CI event requires them. Merge-group job durations and the listed
 versus executed union provide the final timing and membership evidence.
+
+<a id="dec-2553-1"></a>
+
+**DEC-2553.1. A stopped gate is completed on the same head by its receipts, never
+repeated whole.** Of 67 retained gate runs, 15 (22 %) ended on an infrastructure
+fault or a known flake, and the stopped run's receipts already proved 73–99 % of
+the suite; workers finished such gates by hand, without a guard.
+`scripts/live-shards.py` now records the head tree, an inputs digest and the names
+carried from earlier runs in each receipt, and writes a manifest before the first
+runner starts, so an interrupted run is as resumable as a failed one.
+`--resume <output>` refuses unless the previous run's head tree and inputs digest
+equal the current ones, reruns only the names with no `ok` receipt, and applies
+DEC-2357.1's audit to the combined receipts: every listed name is `ok` in its
+latest run, exactly once, and the union equals `--list`. The tree is the worktree's
+`HEAD^{tree}` and only counts when the worktree is clean, untracked files included.
+It proves every tracked file, including the lockfile, the runners and the images
+pinned in them, so the digest covers only what the tree cannot: the toolchain
+(`rustc -vV`) and the environment the runners and tests read, default-include
+(every `PBPS_*`, `INSTA_*` and `CARGO_PROFILE_*` variable and the `RUSTFLAGS`
+family), minus scheduling and fixture identity. A receipt is evidence only when it
+parses, carries both values equal to the current ones and is `valid`; a missing
+receipt is merely an unproven name. An unreadable, partial or mismatched previous
+output refuses. A `FAILED` name outside the register of DEC-2553.2, or one that
+failed more than twice on a head, refuses, whatever row reported it. A resume may
+use other shard counts and weights, since ok-ness is per invocation and name, and
+it still starts each suite's fixtures. The accepted gaps are gitignored files,
+`~/.cargo/config.toml`, the engine and host, and time-dependent tests, which keep
+their earlier verdict as any full gate does until the merge group. This amends
+DEC-2357.1 (the union holds across runs of one head) and DEC-1838.1 (a stopped
+full gate is finished, not retaken). It selects, skips and requires exactly what a
+plain run does, and the merge group still runs everything (DEC-1835.1).
+
+<a id="dec-2553-2"></a>
+
+**DEC-2553.2. A flake is waived only by a register entry that names an open issue
+and expires.** "Rerun it alone and call the gate green" had no rule and no end
+(#2513, #2532 and #2550 were each judged case by case). `scripts/known-flakes.json`
+lists the exact test name, its cargo invocation prefix, the issue and an expiry.
+`scripts/known_flakes.py` runs in CI and refuses an entry without an issue, a name
+or invocation that no longer exists in the compiled inventory, a duplicate, an
+unknown field and an expiry more than 30 days out. A gate that fails only on
+registered, unexpired flakes may be completed under DEC-2553.1; every other
+failure is a failure. The driver reads the register from `origin/master`
+(`--flakes-ref`), so a PR cannot waive its own failure by adding the entry. An
+expired entry is simply inactive: it waives nothing at resume time, and it does
+not fail the check of every pull request that runs after its date. The check
+refuses an expired entry only in a change that touches the register and in the
+nightly `master` run, where `ci.yml` passes the event and the merge base. An
+unreadable diff there is treated as touching it. The register never skips or
+selects a test.
+
+<a id="dec-2553-3"></a>
+
+**DEC-2553.3. A rebase whose own patch is unchanged needs no new full gate.**
+Of 91 code-conflict rebases in 2026-10-17..30, 18 left the pull request's own
+added and removed lines identical (two sides adding adjacent lines in
+`integration.rs`, `deploy.rs`, `schemas/*`, `ignored-test-owners.json`), and none
+of the 21 pull requests with such a rebase was ejected by the merge group for
+anything a local gate could see. `scripts/gate_scope.py` compares, per file, the
+multiset of `+`/`-` lines of `git diff --no-renames -U0` for the pair the last
+full gate passed on and for the rebased pair. The patch is unchanged only if every
+file's multiset is equal, neither diff touches a manifest, the lockfile, the
+toolchain file, `.cargo/`, `.github/`, a live runner or what it sources, every ref
+resolves, each head descends from its base and no patch is binary. A dropped
+master line shows as a new `-` line, so a resolution that edits anything is not
+unchanged. Such a rebase still runs the decision and raw-in-messages checks, `fmt`,
+warning-free `clippy` on the rebased tree, the pull-request CI run and the
+resulting-head review; the merge group still runs everything (DEC-1835.1). This
+generalises DEC-2000.1 from "the conflicts are documentation" to "the patch is
+unchanged" and amends DEC-1838.1's list of heads that take the full gate. What the
+rule cannot see is the same lines landing where master changed their meaning; that
+is the interaction every unrebased pull request already carries to the merge group
+(DECISIONS 502), and a miss costs one ejection, against an observed 1.8 % rate of
+live failures after a full local gate (5 of 271 merge-group runs).
