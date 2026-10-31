@@ -2250,6 +2250,9 @@ permissive ALL policy and explicit TRUE policy admitted different rows.
 
 ## CI
 
+- Windows executables start with a 1 MiB main stack; debug command-tree walks
+  such as `pbps man` can overflow it. Keep the whole CLI on its explicitly
+  sized worker thread (DEC-2571.1).
 - On Windows, `cmd.exe /C` does not decode the standard argv quoting that
   `Command::arg` produces. A hook containing an ordinary quoted path reached
   `cmd` with backslash-escaped quotes and failed before reading its payload.

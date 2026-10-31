@@ -846,8 +846,25 @@ impl TargetArgs {
     }
 }
 
+// Keep the whole CLI off platform defaults, notably Windows' 1 MiB main
+// stack. 8 MiB matches the measured Linux main stack with room for debug
+// command-tree walks and platform codegen differences (DEC-2571.1).
+const CLI_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn run_on_cli_thread(
+    task: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("pbps-cli".into())
+        .stack_size(CLI_STACK_SIZE)
+        .spawn(task)
+        .context("could not start the CLI worker thread")?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 fn main() {
-    if let Err(e) = run() {
+    if let Err(e) = run_on_cli_thread(run) {
         if let Some(found) = e.downcast_ref::<Found>() {
             // A report that already listed what it found prints nothing more;
             // repeating "error: drift found" underneath it would add noise, not
@@ -5972,6 +5989,85 @@ pub(crate) fn test_planning<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_worker_has_stack_headroom_from_a_one_mib_caller() {
+        const CHILD: &str = "PBPS_TEST_CLI_STACK_2571";
+        if let Ok(mode) = std::env::var(CHILD) {
+            // Only the isolated child can overflow; leave the parent suite's
+            // core policy and stack defaults alone.
+            #[cfg(unix)]
+            rustix::process::setrlimit(
+                rustix::process::Resource::Core,
+                rustix::process::Rlimit {
+                    current: Some(0),
+                    maximum: Some(0),
+                },
+            )
+            .unwrap();
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    if mode == "sized" {
+                        run_on_cli_thread(|| {
+                            assert_eq!(std::thread::current().name(), Some("pbps-cli"));
+                            stack_headroom_probe();
+                            Ok(())
+                        })
+                        .unwrap();
+                    } else {
+                        assert_eq!(mode, "small");
+                        stack_headroom_probe();
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        for (mode, success) in [("sized", true), ("small", false)] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::cli_worker_has_stack_headroom_from_a_one_mib_caller",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), success, "{mode}: {stderr}");
+            if !success {
+                assert!(stderr.contains("overflowed its stack"), "{stderr}");
+            }
+        }
+    }
+
+    // Pin stack headroom rather than a platform-specific clap overflow
+    // threshold: codegen can move that threshold on unrelated changes.
+    #[inline(never)]
+    fn stack_headroom_probe() {
+        let mut bytes = [0_u8; 2 * 1024 * 1024];
+        std::hint::black_box(&mut bytes);
+    }
+
+    #[test]
+    fn cli_worker_preserves_findings_errors_and_panic_payloads() {
+        for error in [
+            anyhow::Error::new(Found::new("a finding")),
+            anyhow::anyhow!("a failure"),
+        ] {
+            let message = error.to_string();
+            let finding = error.is::<Found>();
+            let returned = run_on_cli_thread(move || Err(error)).unwrap_err();
+            assert_eq!(returned.to_string(), message);
+            assert_eq!(returned.is::<Found>(), finding);
+        }
+        let panic =
+            std::panic::catch_unwind(|| run_on_cli_thread(|| std::panic::panic_any(2571_usize)))
+                .unwrap_err();
+        assert_eq!(*panic.downcast::<usize>().unwrap(), 2571);
+    }
 
     #[test]
     fn identity_writes_refuse_invalid_mappings_before_touching_the_file() {
