@@ -386,6 +386,31 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
 /// Complete observed identities while reserving another historical record's
 /// UIDs too. Derivation must never manufacture a match to its recorded intent.
 pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsFile) -> IdsFile {
+    let taken = reserved
+        .tables
+        .keys()
+        .chain(reserved.columns.keys())
+        .chain(reserved.roles.keys())
+        .chain(reserved.types.keys())
+        .chain(reserved.tombstones.keys())
+        .cloned()
+        .collect();
+    observed_ids_reserved(live, recorded, taken)
+}
+
+/// Observe one database while reserving every participating database's UIDs.
+/// Call in DatabaseMap order so derived collisions retain deterministic salts.
+pub fn observed_ids_with_reservations(
+    live: &Schema,
+    recorded: &IdsFile,
+    reserved: &mut pbps_model::UidReservations,
+) -> IdsFile {
+    let observed = observed_ids_reserved(live, recorded, reserved.iter().cloned().collect());
+    reserved.reserve_file(&observed);
+    observed
+}
+
+fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<Uid>) -> IdsFile {
     let tables_by_name: BTreeMap<&TableName, &Uid> =
         recorded.tables.iter().map(|(u, n)| (n, u)).collect();
     let columns_by_ref: BTreeMap<&ColumnRef, &Uid> =
@@ -396,20 +421,16 @@ pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsF
     // report a rename that never happened.
     let roles_by_name: BTreeMap<&pbps_model::RoleName, &Uid> =
         recorded.roles.iter().map(|(u, n)| (n, u)).collect();
-    let mut taken: BTreeSet<Uid> = recorded
-        .tables
-        .keys()
-        .chain(recorded.columns.keys())
-        .chain(recorded.roles.keys())
-        .chain(recorded.types.keys())
-        .chain(recorded.tombstones.keys())
-        .chain(reserved.tables.keys())
-        .chain(reserved.columns.keys())
-        .chain(reserved.roles.keys())
-        .chain(reserved.types.keys())
-        .chain(reserved.tombstones.keys())
-        .cloned()
-        .collect();
+    taken.extend(
+        recorded
+            .tables
+            .keys()
+            .chain(recorded.columns.keys())
+            .chain(recorded.roles.keys())
+            .chain(recorded.types.keys())
+            .chain(recorded.tombstones.keys())
+            .cloned(),
+    );
 
     let mut observed = IdsFile::default();
     for (name, table) in &live.tables {
