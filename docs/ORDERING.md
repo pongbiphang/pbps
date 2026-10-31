@@ -176,6 +176,9 @@ binding facts remain hard. Plans without extended annotations retain the
 existing inference policy and serialized bytes.
 
 A demanded surface first asks for the dialect's existing legal creation recipe.
+SQL Server selects its computed suffix from column, generation and NOT NULL
+demands before narrowing the ordinary suffix; computed NOT NULL stays in that
+column's installation definition (DEC-2469.4).
 Otherwise its indivisible group's boundary applies. An owner requiring its own
 contained surface before creation is a named internal cycle. The index describes
 actual operation payloads, so extracted facets are exposed only by their own
@@ -957,3 +960,37 @@ The shadow verifier uses the same type resources, final-incarnation requirements
 slot claims and releases; pending Types handovers join the existing
 `after_the_rebuilds` slot settlement, which also carries their dependents.
 The release verifier remains unchanged.
+
+## Demanded portable creation facets
+
+Typed library annotations can select portable table creation boundaries through
+`Dialect::creation_parts` (DEC-2469.4). The shared identity wrapper remains above
+that hook. Existing recipes and typed Changes preserve column order and legal
+engine groups; the current settlement projects the resulting hard edges. A
+placeholder column supplies existence only until its final generation installer.
+Empty demand retains the prior expansion bytes. `schedule::diff_annotated`
+performs comparison, annotation validation and canonical scheduling atomically,
+so a computed-call class-order refusal can only yield to a completed hard order.
+Connected SQL Server calls still require catalog-collation capability checks.
+
+A demanded ordinary-column suffix is resolved by the engine creation recipe,
+using the same deferred input closure as its complete-shape and forward-read
+checks (DEC-2469.4). Portable exposure consumes that resolved selection. On
+PostgreSQL a generated expression that loses an input receives the existing
+placeholder/SET EXPRESSION recipe; an unavailable capability is a named refusal.
+Whole-row and partition shape requirements keep their indivisible group. SQL
+Server resolves ordinary and computed suffixes together in its model order.
+
+Extracted prefix facets require their named columns and the inputs found by the
+engine recipe's existing may-read scan, rather than every physical suffix part.
+A placeholder supplies column existence independently of its final generation.
+Whole-row reads retain the complete frontier; foreign keys
+require their local and referenced columns, and replica identity requires its
+key or index. Physical appends still preserve declaration order. This refinement
+uses the transient extended annotation contract; an empty demand retains the
+legacy constraints and proof bytes (DEC-2469.4).
+
+The shared UID/first-write analysis also describes whether column DDL has any
+row values to write. Before an empty root table's first write, ADD COLUMN and
+SET EXPRESSION retain their object/input effects without advertising a value
+rewrite. Standing tables, partition moves and post-write DDL keep those effects.

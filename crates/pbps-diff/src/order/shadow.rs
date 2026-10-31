@@ -210,11 +210,25 @@ pub(super) fn analyse_scoped(
             }
         }
     }
+    let empty = super::generated::empty_columns(&payload, after.ids);
     let mut unowned = Vec::new();
     let mut effects: Vec<_> = operations
         .iter()
-        .map(|op: &Operation| {
-            let portable = effects(op, owners, before, after);
+        .enumerate()
+        .map(|(at, op): (_, &Operation)| {
+            let portable = effects(op, owners, before, after).map(|mut fx| {
+                // No portable column values are rewritten before this root's
+                // first write. Object/input effects and engine facts remain hard.
+                if empty.contains(&at) {
+                    let keep = |resource: &pbps_model::operation::Resource| {
+                        !matches!(resource, pbps_model::operation::Resource::Column(_))
+                    };
+                    fx.creates.retain(keep);
+                    fx.rewrites.retain(keep);
+                    fx.removes.retain(keep);
+                }
+                fx
+            });
             let engine = dialect
                 .engine_effects(op, owners, before, after, catalog)
                 .and_then(|e| {

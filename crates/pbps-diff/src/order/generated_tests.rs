@@ -1002,3 +1002,77 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
 
 #[path = "generated_tests/dependency_index_tests.rs"]
 mod dependency_index;
+
+#[test]
+fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
+    let uid: Uid = "t_aaaaaa".parse().unwrap();
+    let old: TableName = "app.t".parse().unwrap();
+    let new: TableName = "app.u".parse().unwrap();
+    let ids = IdsFile {
+        tables: [(uid.clone(), new.clone())].into(),
+        columns: [
+            ("c_aaaaaa".parse().unwrap(), new.column("x")),
+            ("c_bbbbbb".parse().unwrap(), new.column("y")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let add = |name, uid: &str| Change::AddColumn {
+        uid: uid.parse().unwrap(),
+        table: new.clone(),
+        name,
+        column: Box::new(Column::new("integer".parse().unwrap())),
+    };
+    let create = Change::CreateTable {
+        uid: uid.clone(),
+        name: old.clone(),
+        table: Box::default(),
+        beside_default: None,
+        moves_at_most: None,
+    };
+    let row = Change::InsertRow {
+        table: new.clone(),
+        key_column: "id".into(),
+        identity_key: false,
+        key: "1".into(),
+        row: Row::default(),
+        defaults: Default::default(),
+        types: Default::default(),
+    };
+    let changes = |steps: Vec<Change>| ChangeSet {
+        changes: steps.into_iter().map(PlannedChange::new).collect(),
+    };
+    let cs = changes(vec![
+        create.clone(),
+        Change::RenameTable {
+            uid,
+            from: old,
+            to: new.clone(),
+            defaults: Default::default(),
+        },
+        add("x".into(), "c_aaaaaa"),
+        row,
+        add("y".into(), "c_bbbbbb"),
+    ]);
+    pbps_model::plan_names::PlanNames::of(&cs.changes, &ids)
+        .expect("the fixture has complete name history");
+    assert_eq!(super::empty_columns(&cs, &ids), [2].into());
+    assert!(
+        super::empty_columns(&changes(vec![add("x".into(), "c_aaaaaa")]), &ids).is_empty(),
+        "standing ADD COLUMN can write existing rows"
+    );
+    let mut moving = create;
+    if let Change::CreateTable {
+        name,
+        beside_default,
+        ..
+    } = &mut moving
+    {
+        *name = new.clone();
+        *beside_default = Some("app.default_rows".parse().unwrap());
+    }
+    assert!(
+        super::empty_columns(&changes(vec![moving, add("x".into(), "c_aaaaaa")]), &ids).is_empty(),
+        "moving creation supplies no empty-root evidence"
+    );
+}

@@ -39,6 +39,25 @@ pub(crate) fn parts(
     ids: &IdsFile,
     functions: &[ModuleId],
 ) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(dialect, change, ids, functions, &mut Default::default())
+}
+
+pub(crate) fn demanded(
+    dialect: &Mssql,
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    demand: &mut pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(dialect, change, ids, functions, demand)
+}
+fn parts_in(
+    dialect: &Mssql,
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    demand: &mut pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
         name,
@@ -50,7 +69,13 @@ pub(crate) fn parts(
         return Ok(None);
     };
     let calling = |text: &str| functions.iter().any(|id| calls(dialect, text, id));
-    let cut = table.computed.values().position(|c| calling(&c.expression));
+    // Resolve computed demands before narrowing columns to the ordinary suffix.
+    // Computed NOT NULL belongs to the same column definition (DEC-2469.4).
+    let cut = table.computed.iter().position(|(column, c)| {
+        calling(&c.expression) || demand.generation(column) || demand.not_null(column)
+    });
+    demand.columns = demand.column_suffix(table.columns.keys());
+    let cut = (!demand.columns.is_empty()).then_some(0).or(cut);
     let default_calls = table
         .columns
         .values()
@@ -64,6 +89,7 @@ pub(crate) fn parts(
         .computed
         .keys()
         .skip(cut)
+        .chain(&demand.columns)
         .map(|c| name_key(c.raw()))
         .collect();
     // A key's column list names model columns exactly. A part that reads a late

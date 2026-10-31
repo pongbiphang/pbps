@@ -222,3 +222,6 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         cleanup.execute(&format!("USE master; ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]")).await.unwrap();
     }
 }
+
+#[path = "mssql_live_tests/creation2469_tests.rs"]
+mod creation2469;

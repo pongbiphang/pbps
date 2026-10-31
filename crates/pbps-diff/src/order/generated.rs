@@ -12,6 +12,8 @@ use pbps_model::{
     Provenance, RiskClass, Schema, ValueSource,
 };
 
+mod inputs;
+
 pub const RULE: &str = "generated-new-table";
 
 /// Structural uses, separate from the lexical references in `texts`.
@@ -285,13 +287,21 @@ pub fn parts(
         dialect,
         false,
         &BTreeSet::new(),
+        &Default::default(),
     )
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CreationNeed {
+    Module(usize),
+    Reference(pbps_model::object_ref::ObjectRef),
 }
 
 /// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
 /// engine splits every new table, not only one whose generation needs a
 /// planned function (DEC-2389.1).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[allow(clippy::too_many_arguments)]
 fn parts_in(
     planned: &PlannedChange,
     ids: &IdsFile,
@@ -300,51 +310,115 @@ fn parts_in(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
     demanded: &BTreeSet<pbps_model::object_ref::ObjectRef>,
+    prerequisites: &super::annotations::Creation,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
     // settlement uses rather than predicting a different call graph here.
-    let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
+    let (table_reader, required_columns) = if let Change::CreateTable { name, table, .. } =
+        &planned.change
+    {
         let modules = modules(changes);
         let edges = module_dependencies(&modules, deps, dialect, scratch);
+        let mut providers: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (provider, consumer, _) in &edges {
+            providers.entry(*consumer).or_default().push(*provider);
+        }
         let mut pending: Vec<_> = modules
+                .iter()
+                .filter(|(_,id,module)| module.kind==ModuleKind::Function && table.columns.values().any(|c|matches!(&c.value_source,ValueSource::Generated(g) if dialect.generation_may_call(&g.expression,id.name()))))
+                .map(|(at, _, _)| CreationNeed::Module(*at))
+                .collect();
+        pending.extend(
+            prerequisites
+                .references
+                .iter()
+                .cloned()
+                .map(CreationNeed::Reference),
+        );
+        let by_at: BTreeMap<_, _> = modules
             .iter()
-            .filter(|(_, id, module)| {
-                module.kind == ModuleKind::Function
-                    && table.columns.values().any(|c| {
-                        matches!(&c.value_source,
-                ValueSource::Generated(g) if dialect.generation_may_call(
-                    &g.expression, id.name()))
-                    })
-            })
-            .map(|(i, _, _)| *i)
+            .map(|(at, id, module)| (*at, (*id, *module)))
             .collect();
+        let mut by_id: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (at, id, _) in &modules {
+            by_id.entry((*id).clone()).or_default().push(*at);
+        }
         let mut reached = BTreeSet::new();
-        while let Some(at) = pending.pop() {
-            if reached.insert(at) {
-                pending.extend(
-                    edges
-                        .iter()
-                        .filter(|(_, consumer, _)| *consumer == at)
-                        .map(|(provider, _, _)| *provider),
-                );
+        let mut required = BTreeSet::new();
+        let mut reader = false;
+        while let Some(need) = pending.pop() {
+            if !reached.insert(need.clone()) {
+                continue;
+            }
+            match need {
+                CreationNeed::Module(at) => {
+                    let (id, module) = by_at[&at];
+                    pending.extend(
+                        providers
+                            .get(&at)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .map(CreationNeed::Module),
+                    );
+                    let reference = pbps_model::object_ref::ObjectRef {
+                        root: pbps_model::object_ref::Root::Module(id.clone()),
+                        part: pbps_model::object_ref::Selector::Whole,
+                    };
+                    // Without typed edges, retain each legacy transition's body.
+                    if prerequisites
+                        .dependencies
+                        .get(&reference)
+                        .is_some_and(|p| !p.is_empty())
+                    {
+                        pending.push(CreationNeed::Reference(reference));
+                    }
+                    let text = named_text(module, dialect, scratch);
+                    reader |= dialect.generation_names_table(&text, name)
+                        && !dialect.generation_table_name_only(&text, name);
+                }
+                CreationNeed::Reference(reference) => {
+                    if let Some(column) = prerequisites.columns.get(&reference) {
+                        required.insert(column.clone());
+                    }
+                    if let pbps_model::object_ref::Root::Module(id) = &reference.root {
+                        pending.extend(
+                            by_id
+                                .get(id)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .map(CreationNeed::Module),
+                        );
+                    }
+                    pending.extend(
+                        prerequisites
+                            .dependencies
+                            .get(&reference)
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(CreationNeed::Reference),
+                    );
+                }
             }
         }
-        modules
-            .iter()
-            .filter(|(i, _, _)| reached.contains(i))
-            .any(|(_, _, module)| {
-                let text = named_text(module, dialect, scratch);
-                dialect.generation_names_table(&text, name)
-                    && !dialect.generation_table_name_only(&text, name)
-            })
+        (reader, required)
     } else {
-        false
+        (false, BTreeSet::new())
     };
-    let split = if scratch {
+    let split = if !demanded.is_empty() || !required_columns.is_empty() {
+        dialect.annotation_parts(
+            &planned.change,
+            ids,
+            &functions,
+            table_reader,
+            demanded,
+            &required_columns,
+        )
+    } else if scratch {
         dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
-    } else if !demanded.is_empty() {
-        dialect.annotation_parts(&planned.change, ids, &functions, table_reader, demanded)
     } else {
         dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
     };
@@ -386,6 +460,9 @@ fn parts_in(
     } else {
         parts
     };
+    if !scratch && !demanded.is_empty() && parts.len() == 1 && parts[0] == planned.change {
+        return Ok(None);
+    }
     Ok(Some(
         parts
             .into_iter()
@@ -411,6 +488,110 @@ fn parts_in(
             })
             .collect(),
     ))
+}
+
+/// The same UID/membership write boundary governs empty creation effects and
+/// their contextual risks. A rename or a partition write cannot restore emptiness.
+fn first_writes(
+    cs: &ChangeSet,
+    names: Option<&pbps_model::plan_names::PlanNames>,
+) -> BTreeMap<pbps_model::Uid, usize> {
+    use pbps_model::plan_names::{At, Holder};
+    let mut first_write = BTreeMap::new();
+    let mut parents = BTreeMap::new();
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Some(names) = names else { continue };
+        // A row written through a partition is also a row of every ancestor.
+        // Resolve membership by UID so a rename cannot restore emptiness.
+        let membership = if let Change::CreateTable { uid, table, .. } = &p.change {
+            table.partition_of.as_ref().map(|of| (uid, &of.parent))
+        } else if let Change::AttachPartition { uid, parent, .. } = &p.change {
+            Some((uid, parent))
+        } else {
+            None
+        };
+        if let Some((child, parent)) = membership
+            && let Holder::Tracked(parent) = names.holder(parent, At::Before(at))
+        {
+            parents.insert(child.clone(), parent.clone());
+        }
+        for table in table_use(&p.change).writes {
+            // A move from DEFAULT writes the newly created child too.
+            let boundary = if matches!(&p.change, Change::CreateTable { name, .. } if name == table)
+            {
+                At::After(at)
+            } else {
+                At::Before(at)
+            };
+            if let Holder::Tracked(owner) = names.holder(table, boundary) {
+                let mut owner = owner;
+                let mut visited = BTreeSet::new();
+                while visited.insert(owner.clone()) {
+                    first_write.entry(owner.clone()).or_insert(at);
+                    let Some(parent) = parents.get(owner) else {
+                        break;
+                    };
+                    owner = parent;
+                }
+            }
+        }
+        if let Change::DetachPartition { uid, .. } | Change::DropTable { uid, .. } = &p.change {
+            parents.remove(uid);
+        }
+    }
+    first_write
+}
+
+fn creation_sources<'a>(
+    cs: &'a ChangeSet,
+    names: Option<&pbps_model::plan_names::PlanNames>,
+    first_write: &BTreeMap<pbps_model::Uid, usize>,
+) -> Vec<Option<&'a Change>> {
+    use pbps_model::plan_names::{At, Holder};
+    let mut created = BTreeMap::new();
+    cs.changes
+        .iter()
+        .enumerate()
+        .map(|(at, planned)| {
+            if let Change::CreateTable {
+                uid,
+                table,
+                beside_default: None,
+                ..
+            } = &planned.change
+                && table.partition_of.is_none()
+            {
+                created.insert(uid, &planned.change);
+            }
+            let Holder::Tracked(owner) = names?.holder(planned.change.table()?, At::Before(at))
+            else {
+                return None;
+            };
+            if first_write.get(owner).is_some_and(|write| *write < at) {
+                return None;
+            }
+            created.get(owner).copied()
+        })
+        .collect()
+}
+
+/// Column DDL before an empty root's first write has no values to rewrite.
+/// Object existence and generation input boundaries remain independently required.
+pub(super) fn empty_columns(cs: &ChangeSet, ids: &IdsFile) -> BTreeSet<usize> {
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids).ok();
+    let writes = first_writes(cs, names.as_ref());
+    creation_sources(cs, names.as_ref(), &writes)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, source)| {
+            (source.is_some()
+                && matches!(
+                    cs.changes[at].change,
+                    Change::AddColumn { .. } | Change::AlterColumnExpression { .. }
+                ))
+            .then_some(at)
+        })
+        .collect()
 }
 
 /// Derive contextual risks from typed ownership, never diagnostic provenance.
@@ -467,48 +648,8 @@ pub fn risks(
         }
     }
     let replacements: BTreeSet<_> = dropped.intersection(&installed).cloned().collect();
-    let mut first_write = BTreeMap::new();
-    let mut parents = BTreeMap::new();
-    for (at, p) in cs.changes.iter().enumerate() {
-        let Some(names) = &names else { continue };
-        // A row written through a partition is also a row of every ancestor.
-        // Resolve membership by UID so a rename cannot restore emptiness.
-        let membership = if let Change::CreateTable { uid, table, .. } = &p.change {
-            table.partition_of.as_ref().map(|of| (uid, &of.parent))
-        } else if let Change::AttachPartition { uid, parent, .. } = &p.change {
-            Some((uid, parent))
-        } else {
-            None
-        };
-        if let Some((child, parent)) = membership
-            && let Holder::Tracked(parent) = names.holder(parent, At::Before(at))
-        {
-            parents.insert(child.clone(), parent.clone());
-        }
-        for table in table_use(&p.change).writes {
-            // A move from DEFAULT writes the newly created child too.
-            let boundary = if matches!(&p.change, Change::CreateTable { name, .. } if name == table)
-            {
-                At::After(at)
-            } else {
-                At::Before(at)
-            };
-            if let Holder::Tracked(owner) = names.holder(table, boundary) {
-                let mut owner = owner;
-                let mut visited = BTreeSet::new();
-                while visited.insert(owner.clone()) {
-                    first_write.entry(owner.clone()).or_insert(at);
-                    let Some(parent) = parents.get(owner) else {
-                        break;
-                    };
-                    owner = parent;
-                }
-            }
-        }
-        if let Change::DetachPartition { uid, .. } | Change::DropTable { uid, .. } = &p.change {
-            parents.remove(uid);
-        }
-    }
+    let first_write = first_writes(cs, names.as_ref());
+    let sources = creation_sources(cs, names.as_ref(), &first_write);
     let installations: BTreeSet<_> = cs
         .changes
         .iter()
@@ -542,10 +683,23 @@ pub fn risks(
         .iter()
         .enumerate()
         .map(|(at, part)| {
+            // NOT NULL finishes a column of this empty table without granting
+            // an exemption to any other generation installation.
+            let completes_nullability = matches!(
+                part.change,
+                Change::AlterColumnNullability {
+                    to_nullable: false,
+                    ..
+                }
+            );
             let source = || {
                 if !matches!(
                     &part.change,
                     Change::AddColumn { .. }
+                        | Change::AlterColumnNullability {
+                            to_nullable: false,
+                            ..
+                        }
                         | Change::AlterColumnExpression { .. }
                         | Change::AlterColumnDefault { from: None, .. }
                         | Change::SetPrimaryKey {
@@ -566,17 +720,10 @@ pub fn risks(
                 else {
                     return None;
                 };
-                if !installations.contains(owner)
-                    || first_write.get(owner).is_some_and(|write| *write < at)
-                {
+                if !installations.contains(owner) && !completes_nullability {
                     return None;
                 }
-                cs.changes[..at].iter().find_map(|p| {
-                    matches!(&p.change, Change::CreateTable {
-                        uid, table, beside_default: None, ..
-                    } if uid == owner && table.partition_of.is_none())
-                    .then_some(&p.change)
-                })
+                sources[at]
             };
             let mut risks = dialect.change_risks(source().unwrap_or(&part.change));
             if policy_keys
@@ -615,8 +762,21 @@ pub(super) fn expand_in(
         let demanded = plan
             .annotations
             .as_ref()
-            .map_or_else(BTreeSet::new, |a| a.demands(&p.change));
-        match parts_in(p, ids, &plan.changes, deps, dialect, scratch, &demanded)? {
+            .map_or_else(BTreeSet::new, |a| a.demands(&p.change, origin));
+        let prerequisites = plan
+            .annotations
+            .as_ref()
+            .map_or_else(Default::default, |a| a.prerequisites(origin));
+        match parts_in(
+            p,
+            ids,
+            &plan.changes,
+            deps,
+            dialect,
+            scratch,
+            &demanded,
+            &prerequisites,
+        )? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
@@ -879,7 +1039,26 @@ pub fn constraints(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Constraint> {
-    constraints_in(cs, declared, deps, dialect, false)
+    constraints_in(cs, declared, deps, dialect, false, false)
+}
+
+/// The transient annotation contract opts into exact facet prerequisites;
+/// unannotated recipes retain their existing constraints and proof bytes.
+pub(super) fn plan_constraints<S>(
+    plan: &super::PlanningPlan<S>,
+    declared: &Schema,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<Constraint> {
+    constraints_in(
+        plan,
+        declared,
+        deps,
+        dialect,
+        scratch,
+        plan.annotations.as_ref().is_some_and(|a| a.extended),
+    )
 }
 
 /// [`constraints`], and when `scratch` the rules only the resolver's scratch
@@ -892,6 +1071,7 @@ pub(super) fn constraints_in(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
+    demanded: bool,
 ) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
@@ -929,11 +1109,27 @@ pub(super) fn constraints_in(
             .enumerate()
             .filter(|(_, p)| is_part(p) && p.change.table() == Some(name))
             .collect();
+        let replacements: Vec<_> = own
+            .iter()
+            .filter_map(|(at, p)| {
+                if let Change::AlterColumnExpression { column, to, .. } = &p.change {
+                    Some((*at, column, to))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mixed = !replacements.is_empty()
+            && own
+                .iter()
+                .any(|(_, p)| matches!(p.change, Change::AddColumn { .. }));
+        let independent = mixed || (demanded && !replacements.is_empty());
         let mut previous = first;
         for column in full.columns.keys() {
             for (i, p) in &own {
                 if matches!(&p.change, Change::AddColumn { name, .. } if name == column)
-                    || matches!(&p.change, Change::AlterColumnExpression { column: c, .. } if &c.name == column)
+                    || (!independent
+                        && matches!(&p.change, Change::AlterColumnExpression { column: c, .. } if &c.name == column))
                 {
                     edge(&mut out, previous, *i);
                     previous = *i;
@@ -952,7 +1148,63 @@ pub(super) fn constraints_in(
                 }
             }
         }
-        let complete = previous;
+        for (key_at, key) in &own {
+            if let Change::SetPrimaryKey {
+                to: Some(primary), ..
+            } = &key.change
+            {
+                for (at, part) in &own {
+                    if matches!(&part.change, Change::AlterColumnNullability { column, to_nullable: false, .. } if primary.columns.contains(&column.name))
+                    {
+                        edge(&mut out, *at, *key_at);
+                    }
+                }
+            }
+        }
+        // A placeholder's final definition is not a physical append. Keep
+        // legacy unmixed chains byte-identical, but let a demanded recipe install
+        // each expression after its actual inputs, not its declaration slot.
+        let mut complete = vec![previous];
+        if independent {
+            for (at, column, text) in &replacements {
+                for (input, p) in &own {
+                    if let Change::AddColumn { name, .. } = &p.change
+                        && (name == &column.name || dialect.generation_may_read_column(text, name))
+                    {
+                        edge(&mut out, *input, *at);
+                    }
+                }
+                complete.push(*at);
+            }
+        }
+        let mut providers: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (at, part) in &own {
+            let column = match &part.change {
+                Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } => {
+                    Some(name)
+                }
+                _ => None,
+            };
+            if let Some(column) = column {
+                providers.entry(column).or_default().insert(*at);
+            }
+        }
+        let finish = |out: &mut Schedule, after| {
+            for &before in &complete {
+                edge(out, before, after);
+            }
+        };
+        let inputs = |out: &mut Schedule, after, change: &Change| {
+            if demanded && let Some(columns) = inputs::columns(change, name, full, dialect) {
+                for column in &columns {
+                    for &before in providers.get(column).into_iter().flatten() {
+                        edge(out, before, after);
+                    }
+                }
+            } else {
+                finish(out, after);
+            }
+        };
         // The prefix holds every column the table declares, computed ones
         // included, so the first part is already the complete shape.
         let whole = prefix.columns.len() == full.columns.len()
@@ -966,7 +1218,7 @@ pub(super) fn constraints_in(
                     | Change::AddComputedColumn { .. }
                     | Change::AlterColumnExpression { .. }
             ) {
-                edge(&mut out, complete, *i);
+                inputs(&mut out, *i, &p.change);
             }
             if let Change::SetReplicaIdentity {
                 to: Some(target), ..
@@ -1041,11 +1293,14 @@ pub(super) fn constraints_in(
             let uses = table_use(&p.change);
             // Creation parts have their own column/validator chain above.
             // Every other structural consumer must wait for that chain.
-            if uses.complete.contains(&name) && !own.iter().any(|(part, _)| *part == i) {
-                edge(&mut out, complete, i);
+            if uses.complete.contains(&name)
+                && !own.iter().any(|(part, _)| *part == i)
+                && !(demanded && matches!(p.change, Change::AddForeignKey { .. }))
+            {
+                finish(&mut out, i);
             }
             if uses.seed == Some(name) {
-                edge(&mut out, complete, i);
+                finish(&mut out, i);
                 for (part, p) in &own {
                     match &p.change {
                         Change::AddColumn { .. }
@@ -1074,8 +1329,13 @@ pub(super) fn constraints_in(
                 let name_only = references
                     .iter()
                     .all(|text| dialect.generation_table_name_only(text, name));
-                let shape = if name_only || whole { first } else { complete };
-                guess(&mut out, shape, i);
+                if name_only || whole {
+                    guess(&mut out, first, i);
+                } else {
+                    for &shape in &complete {
+                        guess(&mut out, shape, i);
+                    }
+                }
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -1084,7 +1344,8 @@ pub(super) fn constraints_in(
             } = &p.change
             {
                 if table == name || &constraint.references_table == name {
-                    edge(&mut out, complete, i);
+                    edge(&mut out, first, i);
+                    inputs(&mut out, i, &p.change);
                 }
                 if &constraint.references_table == name {
                     for (key, part) in &own {
@@ -1108,7 +1369,13 @@ pub(super) fn constraints_in(
                 if let Some(columns) = reads(dialect, &[&text], name) {
                     wait_for(dialect, &mut out, first, &own, &columns, *i, guessed);
                 } else {
-                    guess(&mut out, if whole { first } else { complete }, *i);
+                    if whole {
+                        guess(&mut out, first, *i);
+                    } else {
+                        for &shape in &complete {
+                            guess(&mut out, shape, *i);
+                        }
+                    }
                 }
             }
         }
@@ -1334,7 +1601,8 @@ pub fn settle(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), String> {
-    let edges = constraints(plan, declared, deps, dialect);
+    let mut edges = plan_constraints(plan, declared, deps, dialect, false);
+    edges.extend(plan.annotation_edges()?);
     if edges.is_empty() {
         return Ok(());
     }

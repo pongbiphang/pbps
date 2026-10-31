@@ -105,7 +105,7 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     changes.annotations = input.annotations.clone();
     super::generated::expand_in(&mut changes, ids, dependencies, dialect, true)?;
     let mut edges =
-        super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
+        super::generated::plan_constraints(&changes, &declared, dependencies, dialect, true);
     edges.extend(changes.annotation_edges()?);
     if changes.annotations.as_ref().is_some_and(|a| a.extended) {
         for edge in &mut edges {
