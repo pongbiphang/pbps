@@ -26,8 +26,9 @@ pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
     for_tests::{
-        externals_for_test, hop_release, reset_for_test, stop_after_cleanup, sweep_cluster_on,
-        take_release_trace, trace_release,
+        clear_release_roles_hop, externals_for_test, hop_release, hop_release_roles,
+        reset_for_test, stop_after_cleanup, sweep_cluster_on, take_release_roles_trace,
+        take_release_trace, trace_release, trace_release_roles,
     },
     release_run_owned,
 };

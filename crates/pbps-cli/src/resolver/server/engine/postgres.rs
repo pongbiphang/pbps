@@ -131,6 +131,7 @@ pub(super) mod for_tests {
     }
 
     pub(super) async fn release_phase(conn: &mut Conn, database: &str) {
+        release_role_phase(conn, database, false).await;
         let enabled = RELEASE_PHASES.lock().unwrap().contains_key(database);
         if !enabled {
             return;
@@ -159,6 +160,109 @@ pub(super) mod for_tests {
 
     pub(in crate::resolver::server) fn take_release_trace(database: &str) -> Vec<ReleasePhase> {
         RELEASE_PHASES.lock().unwrap().remove(database).unwrap()
+    }
+
+    #[derive(Debug)]
+    pub(in crate::resolver::server) struct ReleaseRolePhase {
+        pub principal: String,
+        pub pid: String,
+        pub transaction: String,
+        pub locks: i64,
+    }
+
+    struct RoleTrace {
+        watched: Vec<i64>,
+        phases: Vec<ReleaseRolePhase>,
+    }
+
+    static ROLE_PHASES: std::sync::Mutex<BTreeMap<String, RoleTrace>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    static ROLE_HOPS: std::sync::Mutex<BTreeMap<String, Conn>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    pub(in crate::resolver::server) fn trace_release_roles(database: &str, watched: Vec<i64>) {
+        assert!(!watched.is_empty() && watched.iter().all(|oid| *oid > 0));
+        assert!(
+            ROLE_PHASES
+                .lock()
+                .unwrap()
+                .insert(
+                    database.into(),
+                    RoleTrace {
+                        watched,
+                        phases: Vec::new(),
+                    }
+                )
+                .is_none()
+        );
+    }
+
+    pub(in crate::resolver::server) fn take_release_roles_trace(
+        database: &str,
+    ) -> Vec<ReleaseRolePhase> {
+        ROLE_PHASES.lock().unwrap().remove(database).unwrap().phases
+    }
+
+    pub(in crate::resolver::server) fn hop_release_roles(database: &str, next: Conn) {
+        assert!(
+            ROLE_HOPS
+                .lock()
+                .unwrap()
+                .insert(database.into(), next)
+                .is_none()
+        );
+    }
+
+    pub(in crate::resolver::server) fn clear_release_roles_hop(database: &str) {
+        ROLE_HOPS.lock().unwrap().remove(database);
+    }
+
+    pub(super) async fn release_role_phase(conn: &mut Conn, database: &str, after_commit: bool) {
+        if after_commit {
+            if let Some(next) = ROLE_HOPS.lock().unwrap().remove(database) {
+                *conn = next;
+            }
+            return;
+        }
+        let watched = ROLE_PHASES
+            .lock()
+            .unwrap()
+            .get(database)
+            .map(|trace| trace.watched.clone());
+        let Some(watched) = watched else {
+            return;
+        };
+        // Capture OIDs before DROP ROLE: its own transaction no longer sees
+        // their catalog rows, but their object locks must remain observable.
+        let ids = watched
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = conn
+            .query(&format!(
+                "SELECT current_user::text AS principal, pg_catalog.pg_backend_pid()::text AS pid, \
+             pg_catalog.pg_current_xact_id()::text AS transaction, \
+             (SELECT count(*) FROM pg_catalog.pg_locks WHERE pid = pg_catalog.pg_backend_pid() \
+              AND locktype = 'object' AND classid = 'pg_catalog.pg_authid'::regclass \
+              AND objid IN ({ids})) AS locks"
+            ))
+            .await
+            .unwrap();
+        let value = |name| rows[0].try_get::<&str>(name).unwrap().unwrap().to_owned();
+        let phase = ReleaseRolePhase {
+            principal: value("principal"),
+            pid: value("pid"),
+            transaction: value("transaction"),
+            locks: rows[0].try_get::<i64>("locks").unwrap().unwrap(),
+        };
+        ROLE_PHASES
+            .lock()
+            .unwrap()
+            .get_mut(database)
+            .unwrap()
+            .phases
+            .push(phase);
     }
 
     // Key the fault to the borrowed connection, without adding an observation

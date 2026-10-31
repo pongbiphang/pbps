@@ -5579,6 +5579,16 @@ an individually refused standard statement is named and does not conceal
 other repair or verification results. A failed or unknown backend check never
 becomes an empty database, a verified standard or permission to remove a claim.
 
+Run-local roles retain DEC-2049.1's `ROLE_BATCH` transaction bound. Savepoint
+release does not release their object locks, so standard restoration commits
+before role cleanup. Each role batch, each independent retry after a failed
+batch, and final claim removal begin with a fresh check of the original
+backend. A role failure preserves completed repairs and the claim; a backend
+refusal stops later writes. The final claim is removed only after every named
+obligation has been discharged. Native controls observe the real held role
+locks and transaction IDs, and refuse hops between batches or before claim
+removal.
+
 This closes an unsafe write after the existing backend refusal; it does not
 qualify transaction-pooling proxies as supported resolver layouts or change
 the operator's session-pinning obligation in DEC-1685.1. Native positive and

@@ -2439,6 +2439,8 @@
         "resolver::server::scratch::live_tests::release1731_tests::an_unanswerable_backend_preserves_standard_and_objects",
         "resolver::server::scratch::live_tests::release1731_tests::restoration_keeps_one_transaction_and_retains_partial_repairs",
         "resolver::server::scratch::live_tests::release1731_tests::a_refused_rehearsal_role_keeps_the_claim_without_undoing_other_cleanup",
+        "resolver::server::scratch::live_tests::release1731_tests::role_cleanup_releases_its_bounded_lock_sets",
+        "resolver::server::scratch::live_tests::release1731_tests::backend_hops_between_role_batches_and_before_claim_removal_are_terminal",
         "resolver::server::scratch::live_tests::resolver_repairs_a_supplied_scratch_an_interrupted_run_left_changed",
         "resolver::server::scratch::live_tests::resolver_run_owned_compiles_under_the_declared_standard",
         "resolver::server::scratch::live_tests::resolver_run_owned_keeps_what_the_reproduction_put_on_its_database",
