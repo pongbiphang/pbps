@@ -2965,6 +2965,24 @@
         "consumer_effective_columns::sibling_domain_default_losses_use_the_same_rule_in_alter_and_rebuild_plans",
         "consumer_effective_columns::sibling_default_losses_follow_partition_trees_without_removing_existing_refusals"
       ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "consumer_effective_columns::partition_membership_attachment_keeps_the_reader_bound_to_its_effective_column",
+        "consumer_effective_columns::partition_membership_detachment_keeps_domain_nullability_visible_to_readers"
+      ]
     }
   ]
 }

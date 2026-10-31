@@ -34,6 +34,14 @@ fn setup(d: &Demo, connection: &str) {
     succeeds(d.run(&["bootstrap", "--db", connection]));
 }
 fn check(d: &Demo, connection: &str, expected: i32) -> Option<pbps_model::SavedPlan> {
+    check_entry(d, connection, expected, None)
+}
+fn check_entry(
+    d: &Demo,
+    connection: &str,
+    expected: i32,
+    entry: Option<&str>,
+) -> Option<pbps_model::SavedPlan> {
     let path = d.dir.join("effective.json");
     if path.exists() {
         std::fs::remove_file(&path).unwrap();
@@ -58,6 +66,17 @@ fn check(d: &Demo, connection: &str, expected: i32) -> Option<pbps_model::SavedP
                 .any(|f| f["id"] == "consumer.unproven"),
             "{report}"
         );
+        if let Some(entry) = entry {
+            assert!(
+                report["findings"].as_array().unwrap().iter().any(|f| {
+                    f["id"] == "consumer.unproven"
+                        && f["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains(&format!("consumers.client.uses: {entry}")))
+                }),
+                "{report}"
+            );
+        }
         assert!(!path.exists(), "a refused plan must not be published");
         None
     } else {
@@ -494,6 +513,133 @@ fn sibling_default_losses_follow_partition_trees_without_removing_existing_refus
             // The final case deliberately pins the pre-existing conservative
             // refusal even though NULL remains legal; #2453 only adds protection.
             nullable_write(c, "INSERT INTO app.leaf(a) VALUES(1)", !rejects_insert);
+        }
+    });
+}
+
+// The same declared leaf moves between ordinary and inherited column identity.
+fn membership(d: &Demo, attached: bool, ty: &str, required: bool) {
+    let local = if required {
+        "    columns:\n      v: {nullable: false}\n"
+    } else {
+        ""
+    };
+    let partitions = if attached {
+        format!("partitions:\n  leaf:\n    default: true\n{local}")
+    } else {
+        "partitions: {}\n".into()
+    };
+    d.table(&format!("table: app.t\ncolumns:\n  id: {{type: integer}}\n  v: {{type: {ty}}}\npartition_by: [id]\n{partitions}"));
+    let leaf = d.dir.join("schema/leaf.yml");
+    if attached {
+        if leaf.exists() {
+            std::fs::remove_file(leaf).unwrap();
+        }
+    } else {
+        std::fs::write(leaf, format!("table: app.leaf\ncolumns:\n  id: {{type: integer}}\n  v: {{type: {ty}, nullable: {}}}\n", !required)).unwrap();
+    }
+}
+fn membership_uids(d: &Demo, attached: bool) -> (pbps_model::Uid, pbps_model::Uid) {
+    let ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let leaf = "app.leaf".parse().unwrap();
+    let local: pbps_model::ColumnRef = "app.leaf.v".parse().unwrap();
+    assert_eq!(ids.column_uid(&local).is_none(), attached);
+    let source = if attached {
+        "app.t.v".parse().unwrap()
+    } else {
+        local
+    };
+    (
+        ids.table_uid(&leaf).unwrap().clone(),
+        ids.column_uid(&source).unwrap().clone(),
+    )
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn partition_membership_attachment_keeps_the_reader_bound_to_its_effective_column() {
+    engines(|server| {
+        for required_domain in [false, true] {
+            let own = OwnDatabase::new(server, "pair_attach2528");
+            let c = own.connection();
+            let d = Demo::new("pair-attach");
+            domain(&d, "d", "integer", "not_null: true\n");
+            let ty = if required_domain { "app.d" } else { "integer" };
+            membership(&d, false, ty, true);
+            setup(&d, c);
+            let before = membership_uids(&d, false);
+            rejects_null(c, "INSERT INTO app.leaf(id, v) VALUES(1, NULL)");
+            membership(&d, true, ty, false);
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let after = membership_uids(&d, true);
+            assert_eq!(before.0, after.0, "table identity survives attachment");
+            assert_ne!(
+                before.1, after.1,
+                "ordinary UID retires for inherited source UID"
+            );
+            for entry in ["app.leaf", "app.leaf.v"] {
+                config(&d, Some((entry, false)));
+                check_entry(&d, c, if required_domain { 0 } else { 2 }, Some(entry));
+            }
+            config(&d, None);
+            let saved = check(&d, c, 0).unwrap();
+            let json = serde_json::to_string(&saved).unwrap();
+            assert!(
+                json.contains("attach_partition") && json.contains("set_partition_not_null"),
+                "{json}"
+            );
+            apply(&d, c);
+            nullable_write(
+                c,
+                "INSERT INTO app.leaf(id, v) VALUES(1, NULL)",
+                !required_domain,
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn partition_membership_detachment_keeps_domain_nullability_visible_to_readers() {
+    engines(|server| {
+        for local_required in [false, true] {
+            let own = OwnDatabase::new(server, "pair_detach2528");
+            let c = own.connection();
+            let d = Demo::new("pair-detach");
+            domain(&d, "d", "integer", "not_null: true\n");
+            membership(&d, true, "app.d", local_required);
+            setup(&d, c);
+            let before = membership_uids(&d, true);
+            rejects_null(c, "INSERT INTO app.leaf(id, v) VALUES(1, NULL)");
+            membership(&d, false, "app.d", local_required);
+            domain(&d, "d", "integer", "not_null: false\n");
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let after = membership_uids(&d, false);
+            assert_eq!(before.0, after.0, "table identity survives detachment");
+            assert_ne!(
+                before.1, after.1,
+                "detachment assigns an ordinary column UID"
+            );
+            for entry in ["app.leaf", "app.leaf.v"] {
+                config(&d, Some((entry, false)));
+                check_entry(&d, c, if local_required { 0 } else { 2 }, Some(entry));
+            }
+            config(&d, None);
+            let saved = check(&d, c, 0).unwrap();
+            let json = serde_json::to_string(&saved).unwrap();
+            assert!(
+                json.contains("detach_partition") && json.contains("alter_domain"),
+                "{json}"
+            );
+            apply(&d, c);
+            nullable_write(
+                c,
+                "INSERT INTO app.leaf(id, v) VALUES(1, NULL)",
+                !local_required,
+            );
         }
     });
 }
