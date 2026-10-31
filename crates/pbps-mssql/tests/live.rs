@@ -41,6 +41,9 @@ mod drop_requirements2400;
 #[path = "live/predicate2400.rs"]
 mod predicate2400;
 
+#[path = "live/default_holders2455.rs"]
+mod default_holders2455;
+
 #[path = "live/binding_releases.rs"]
 mod binding_releases;
 

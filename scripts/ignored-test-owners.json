@@ -1722,6 +1722,7 @@
         "commutation::a_row_written_before_and_after_the_column_it_fills_fails_the_row_check",
         "commutation::schema_bound_callers_block_reversed_edits_and_plain_callers_commute",
         "binding_releases::binding_release_and_an_independent_computed_rebuild_both_apply",
+        "default_holders2455::default_holder_capture_is_complete_deduplicated_and_never_hides_unreadable_evidence",
         "commutation::pairs_the_effects_call_independent_commute_on_the_engine",
         "annotations2469::module_to_object_annotations_drive_installs_and_removals",
         "annotations2469::in_place_provider_keeps_availability_and_releases_old_dependencies"
@@ -3017,6 +3018,8 @@
         "darwin"
       ],
       "cases": [
+        "default_holders2455::default_holders_survive_routine_rebuilds_with_and_without_writer_contracts",
+        "default_holders2455::reference_inserts_and_updates_take_the_restored_function_default",
         "consumer_contracts::consumer_writers_keep_defaults_needed_by_other_existing_columns"
       ]
     },

@@ -382,6 +382,25 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         // (#1553).
         after_the_rows_that_leave(&mut cs, declared.schema).map_err(Refusal::module_passes)?;
         settle_public_execution(&mut cs, decisions);
+    } else if let Some(found) = facts.module_dependents {
+        // Explicit SQL Server routine drops have the same DEFAULT obligations.
+        added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
+            .map_err(Refusal::module_passes)?;
+        // Normalization invalidates positional proof. Restore the weave's
+        // edges together with the requirements of its restored holders:
+        // moving a DEFAULT without its consumers can silently write NULL.
+        let mut handovers = crate::order::Schedule::new(cs.changes.len());
+        crate::order::row_security::module_constraints(
+            &mut handovers,
+            super::module_order(&cs, found, declared.schema, declared.sources, dialect)
+                .map_err(Refusal::module_passes)?,
+        )
+        .map_err(Refusal)?;
+        keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+        cs = handovers
+            .settle(cs.clone())
+            .map_err(|why| Refusal(why.describe(&cs)))?
+            .changes;
     }
     // The differ sorted the role drops before it could know who holds whom;
     // once the members are in, a role holding another dropped role goes
@@ -541,8 +560,8 @@ fn refuse_type_slots(
     Ok(())
 }
 
-/// A sinking claimer must take its dependents with it. Read those edges from
-/// the effects rather than listing FK/key pairs: the same requirement can
+/// A sinking claimer or restored holder takes its dependents with it. Read
+/// those edges from the effects rather than listing FK/key pairs: the same requirement can
 /// belong to another operation, or itself have readers (DEC-2100.3).
 fn keep_handover_dependents(
     cs: &ChangeSet,
@@ -556,13 +575,23 @@ fn keep_handover_dependents(
     let mut pending: BTreeSet<_> = handovers
         .constraints()
         .iter()
-        .filter(|edge| edge.after < edge.before)
+        .filter(|edge| {
+            edge.after < edge.before
+                || edge.reason == pbps_model::resolver::OrderReason::Restoration
+        })
         .map(|edge| edge.after)
         .collect();
     if pending.is_empty() {
         return Ok(());
     }
-    let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
+    let operations = Operations::of_plan(
+        &cs.changes,
+        if dialect.rebuilds_modules() {
+            ModuleEdits::Rebuilt
+        } else {
+            ModuleEdits::InPlace
+        },
+    );
     let names = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)
         .map_err(|error| Refusal(error.to_string()))?;
     let owners = PlanOwners::new(names, declared.sources.before.ids, declared.sources.after);

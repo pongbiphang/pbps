@@ -903,6 +903,102 @@ pub async fn matching_table_names(
     Ok(found)
 }
 
+/// DEFAULT holders of routines the plan actually drops (DEC-2455.1).
+/// The same facts feed planning's weave and apply's saved-order check. Constraint
+/// objects own these edges; computed/module expression edges do not include them.
+pub async fn module_default_dependents(
+    conn: &mut Conn,
+    roots: &[pbps_model::ModuleId],
+) -> Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_diff::order::catalog::Dependent>>, DbError> {
+    use pbps_diff::order::catalog::{Dependent, Holds, Part};
+    if roots.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    prove_referrers_visible(
+        conn,
+        &ReferrerTargets {
+            functions: roots
+                .iter()
+                .map(pbps_model::ModuleId::object_name)
+                .collect(),
+            computed_columns: Vec::new(),
+        },
+    )
+    .await?;
+    let values = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| {
+            let name = root.object_name();
+            format!(
+                "({i}, {}, {})",
+                crate::ident::literal(&name.schema),
+                crate::ident::literal(&name.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT w.i, r.object_id AS root_id, h.parent_object_id,
+                s.name AS table_schema, t.name AS table_name, c.name AS column_name
+           FROM (VALUES {values}) AS w(i, schema_name, object_name)
+           LEFT JOIN sys.schemas rs ON rs.name = w.schema_name COLLATE CATALOG_DEFAULT
+           LEFT JOIN sys.objects r ON r.schema_id = rs.schema_id
+                                  AND r.name = w.object_name COLLATE CATALOG_DEFAULT
+           LEFT JOIN (
+                SELECT DISTINCT d.referenced_id, dc.parent_object_id, dc.parent_column_id
+                  FROM sys.sql_expression_dependencies d
+                  JOIN sys.default_constraints dc ON dc.object_id = d.referencing_id
+                 WHERE d.referencing_class = 1 AND d.referenced_class = 1
+           ) h ON h.referenced_id = r.object_id
+           LEFT JOIN sys.tables t ON t.object_id = h.parent_object_id
+           LEFT JOIN sys.schemas s ON s.schema_id = t.schema_id
+           LEFT JOIN sys.columns c ON c.object_id = h.parent_object_id
+                                  AND c.column_id = h.parent_column_id
+          ORDER BY w.i, s.name, t.name, c.name;"
+    );
+    let mut found: BTreeMap<_, Vec<_>> = roots.iter().cloned().map(|r| (r, Vec::new())).collect();
+    for row in conn.query(&sql).await? {
+        let root = usize::try_from(get::<i32>(&row, "i")?)
+            .ok()
+            .and_then(|i| roots.get(i))
+            .ok_or_else(|| {
+                DbError::Refused("the DEFAULT dependency read returned an unknown routine".into())
+            })?;
+        if opt::<i32>(&row, "root_id")?.is_none() {
+            return Err(DbError::Refused(format!(
+                "routine `{}` could not be read while checking its DEFAULT holders; restore catalog visibility and plan again",
+                root.shown()
+            )));
+        }
+        if opt::<i32>(&row, "parent_object_id")?.is_none() {
+            continue;
+        }
+        let table = TableName::new(
+            get::<&str>(&row, "table_schema")?,
+            get::<&str>(&row, "table_name")?,
+        );
+        let column: pbps_model::ColumnName = get::<&str>(&row, "column_name")?.into();
+        found
+            .get_mut(root)
+            .expect("requested routine")
+            .push(Dependent {
+                // The shared dependent projection escapes this raw description once.
+                described: format!(
+                    "default for {}.{}.{}",
+                    table.schema,
+                    table.name,
+                    column.raw()
+                ),
+                holds: Holds::TablePart {
+                    table,
+                    part: Part::Default(column),
+                },
+            });
+    }
+    Ok(found)
+}
+
 /// One edge of `sys.sql_expression_dependencies` (#1431): what an object's
 /// stored text names, as the engine resolved it when it stored the text.
 ///
