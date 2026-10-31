@@ -893,6 +893,24 @@ async fn still_usable(
     Ok(Some(format!("schema {schema}, through {sources}")))
 }
 
+/// A backend refusal is terminal; a statement failure on the confirmed
+/// backend can still be followed by checked restoration (DEC-1731.1).
+#[derive(Debug, thiserror::Error)]
+pub enum DropOwnedError {
+    #[error("the cleanup could not confirm its checked backend ({0})")]
+    BackendUnconfirmed(pbps_db::DbError),
+    #[error("{0}")]
+    Statement(pbps_db::DbError),
+}
+
+impl DropOwnedError {
+    pub fn into_error(self) -> pbps_db::DbError {
+        match self {
+            Self::BackendUnconfirmed(error) | Self::Statement(error) => error,
+        }
+    }
+}
+
 /// Removes everything the scratch login owns in the supplied database, so
 /// the next run finds it empty. Shared objects are untouched; the database
 /// itself stays, owned by the login (`owns_database`).
@@ -915,36 +933,52 @@ async fn still_usable(
 pub async fn drop_owned(
     conn: &mut impl ExecuteConnection,
     checked: &Backend,
-) -> Result<(Vec<String>, usize), DbError> {
-    conn.execute("ROLLBACK").await?;
-    conn.execute("SET ROLE NONE").await?;
-    conn.execute("BEGIN").await?;
-    let bound = on_backend(conn, checked).await;
-    if !matches!(bound, Ok(true)) {
+) -> Result<(Vec<String>, usize), DropOwnedError> {
+    let bound = async {
         conn.execute("ROLLBACK").await?;
-        bound?;
-        return Err(DbError::BadRow(
-            "the connection now reaches another backend than the one the run checked".into(),
-        ));
+        conn.execute("SET ROLE NONE").await?;
+        conn.execute("BEGIN").await?;
+        on_backend(conn, checked).await
     }
-    // The claim is the run's record, removed last by the release: it goes
-    // through the cleanup and comes back before the commit (DEC-2410.1).
-    let claim = match super::recovery::comment(conn).await {
-        Ok(claim) => claim.flatten(),
-        Err(error) => {
+    .await;
+    if !matches!(bound, Ok(true)) {
+        let cause = match bound {
+            Ok(false) => DbError::BadRow(
+                "the connection now reaches another backend than the one the run checked".into(),
+            ),
+            Err(error) => error,
+            Ok(true) => unreachable!(),
+        };
+        let error = match conn.execute("ROLLBACK").await {
+            Ok(()) => cause,
+            Err(error) => {
+                error.context("the unconfirmed backend's cleanup transaction could not end")
+            }
+        };
+        return Err(DropOwnedError::BackendUnconfirmed(error));
+    }
+    async {
+        // The claim is the run's record, removed last by the release: it goes
+        // through the cleanup and comes back before the commit (DEC-2410.1).
+        let claim = match super::recovery::comment(conn).await {
+            Ok(claim) => claim.flatten(),
+            Err(error) => {
+                conn.execute("ROLLBACK").await?;
+                return Err(error);
+            }
+        };
+        conn.execute("DROP OWNED BY SESSION_USER").await?;
+        if let Some(comment) = &claim
+            && let Err(error) = super::recovery::create(conn, comment).await
+        {
             conn.execute("ROLLBACK").await?;
             return Err(error);
         }
-    };
-    conn.execute("DROP OWNED BY SESSION_USER").await?;
-    if let Some(comment) = &claim
-        && let Err(error) = super::recovery::create(conn, comment).await
-    {
-        conn.execute("ROLLBACK").await?;
-        return Err(error);
+        conn.execute("COMMIT").await?;
+        objects(conn, claim.is_some()).await
     }
-    conn.execute("COMMIT").await?;
-    objects(conn, claim.is_some()).await
+    .await
+    .map_err(DropOwnedError::Statement)
 }
 
 #[cfg(test)]
@@ -1206,7 +1240,9 @@ mod tests {
                 ] {
                     login.execute(statement).await?;
                 }
-                let left = drop_owned(&mut login, &checked).await?;
+                let left = drop_owned(&mut login, &checked)
+                    .await
+                    .map_err(DropOwnedError::into_error)?;
                 let after = login_defaults(&mut login).await?;
                 Ok::<_, DbError>((
                     left,

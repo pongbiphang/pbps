@@ -20,6 +20,7 @@ use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod recovery;
+mod release;
 
 use pbps_pg::resolver::session::{Reset, SessionState};
 
@@ -88,6 +89,180 @@ pub(super) mod for_tests {
 
     pub(super) fn stopped_after_cleanup(database: &str) -> bool {
         STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
+    }
+
+    static RELEASE_HOPS: std::sync::Mutex<BTreeMap<String, Conn>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in crate::resolver::server) struct ReleasePhase {
+        pub principal: String,
+        pub pid: String,
+        pub transaction: String,
+    }
+
+    static RELEASE_PHASES: std::sync::Mutex<BTreeMap<String, Vec<ReleasePhase>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    pub(in crate::resolver::server) fn hop_release(database: &str, next: Conn) {
+        assert!(
+            RELEASE_HOPS
+                .lock()
+                .unwrap()
+                .insert(database.into(), next)
+                .is_none()
+        );
+    }
+
+    pub(super) fn release_after_cleanup(conn: &mut Conn, database: &str) {
+        if let Some(next) = RELEASE_HOPS.lock().unwrap().remove(database) {
+            *conn = next;
+        }
+    }
+
+    pub(in crate::resolver::server) fn trace_release(database: &str) {
+        assert!(
+            RELEASE_PHASES
+                .lock()
+                .unwrap()
+                .insert(database.into(), Vec::new())
+                .is_none()
+        );
+    }
+
+    pub(super) async fn release_phase(conn: &mut Conn, database: &str) {
+        release_role_phase(conn, database, false).await;
+        let enabled = RELEASE_PHASES.lock().unwrap().contains_key(database);
+        if !enabled {
+            return;
+        }
+        // A real assigned transaction ID distinguishes a checked transaction
+        // from separately committed statements; a backend PID alone does not.
+        let rows = conn
+            .query(
+                "SELECT current_user::text AS principal, pg_catalog.pg_backend_pid()::text AS pid, \
+             pg_catalog.pg_current_xact_id()::text AS transaction",
+            )
+            .await
+            .unwrap();
+        let value = |name| rows[0].try_get::<&str>(name).unwrap().unwrap().to_owned();
+        RELEASE_PHASES
+            .lock()
+            .unwrap()
+            .get_mut(database)
+            .unwrap()
+            .push(ReleasePhase {
+                principal: value("principal"),
+                pid: value("pid"),
+                transaction: value("transaction"),
+            });
+    }
+
+    pub(in crate::resolver::server) fn take_release_trace(database: &str) -> Vec<ReleasePhase> {
+        RELEASE_PHASES.lock().unwrap().remove(database).unwrap()
+    }
+
+    #[derive(Debug)]
+    pub(in crate::resolver::server) struct ReleaseRolePhase {
+        pub principal: String,
+        pub pid: String,
+        pub transaction: String,
+        pub locks: i64,
+    }
+
+    struct RoleTrace {
+        watched: Vec<i64>,
+        phases: Vec<ReleaseRolePhase>,
+    }
+
+    static ROLE_PHASES: std::sync::Mutex<BTreeMap<String, RoleTrace>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    static ROLE_HOPS: std::sync::Mutex<BTreeMap<String, Conn>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    pub(in crate::resolver::server) fn trace_release_roles(database: &str, watched: Vec<i64>) {
+        assert!(!watched.is_empty() && watched.iter().all(|oid| *oid > 0));
+        assert!(
+            ROLE_PHASES
+                .lock()
+                .unwrap()
+                .insert(
+                    database.into(),
+                    RoleTrace {
+                        watched,
+                        phases: Vec::new(),
+                    }
+                )
+                .is_none()
+        );
+    }
+
+    pub(in crate::resolver::server) fn take_release_roles_trace(
+        database: &str,
+    ) -> Vec<ReleaseRolePhase> {
+        ROLE_PHASES.lock().unwrap().remove(database).unwrap().phases
+    }
+
+    pub(in crate::resolver::server) fn hop_release_roles(database: &str, next: Conn) {
+        assert!(
+            ROLE_HOPS
+                .lock()
+                .unwrap()
+                .insert(database.into(), next)
+                .is_none()
+        );
+    }
+
+    pub(in crate::resolver::server) fn clear_release_roles_hop(database: &str) {
+        ROLE_HOPS.lock().unwrap().remove(database);
+    }
+
+    pub(super) async fn release_role_phase(conn: &mut Conn, database: &str, after_commit: bool) {
+        if after_commit {
+            if let Some(next) = ROLE_HOPS.lock().unwrap().remove(database) {
+                *conn = next;
+            }
+            return;
+        }
+        let watched = ROLE_PHASES
+            .lock()
+            .unwrap()
+            .get(database)
+            .map(|trace| trace.watched.clone());
+        let Some(watched) = watched else {
+            return;
+        };
+        // Capture OIDs before DROP ROLE: its own transaction no longer sees
+        // their catalog rows, but their object locks must remain observable.
+        let ids = watched
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = conn
+            .query(&format!(
+                "SELECT current_user::text AS principal, pg_catalog.pg_backend_pid()::text AS pid, \
+             pg_catalog.pg_current_xact_id()::text AS transaction, \
+             (SELECT count(*) FROM pg_catalog.pg_locks WHERE pid = pg_catalog.pg_backend_pid() \
+              AND locktype = 'object' AND classid = 'pg_catalog.pg_authid'::regclass \
+              AND objid IN ({ids})) AS locks"
+            ))
+            .await
+            .unwrap();
+        let value = |name| rows[0].try_get::<&str>(name).unwrap().unwrap().to_owned();
+        let phase = ReleaseRolePhase {
+            principal: value("principal"),
+            pid: value("pid"),
+            transaction: value("transaction"),
+            locks: rows[0].try_get::<i64>("locks").unwrap().unwrap(),
+        };
+        ROLE_PHASES
+            .lock()
+            .unwrap()
+            .get_mut(database)
+            .unwrap()
+            .phases
+            .push(phase);
     }
 
     // Key the fault to the borrowed connection, without adding an observation
@@ -833,107 +1008,7 @@ pub(in crate::resolver::server) async fn release_run_owned(
     remaining
 }
 
-/// Empties the supplied database and puts it back into its standard state,
-/// on the checked connection, never a new one, and only on the checked
-/// backend: see `Run::supplied`. `Err` names exactly what may remain.
-pub(in crate::resolver::server) async fn release_supplied(
-    admin: &mut Conn,
-    backend: &sql::Backend,
-    declared: &Standard,
-    database: &str,
-    defaults: &BTreeSet<(String, String)>,
-    acl: &BTreeSet<standard::Entry>,
-) -> Result<(), Vec<String>> {
-    let cleaned = sql::drop_owned(admin, backend).await;
-    #[cfg(test)]
-    if for_tests::stopped_after_cleanup(database) {
-        return Err(vec!["stopped after the cleanup, as a kill would".into()]);
-    }
-    let mut remaining = match cleaned {
-        Ok((_, 0)) => Ok(()),
-        // Owned by another role a definition switched to, which
-        // `DROP OWNED BY SESSION_USER` does not reach; never an
-        // empty database (see `sql::drop_owned`).
-        Ok((named, total)) => Err(vec![format!(
-            "{total} object(s) in database {database} owned by a role other than \
-             the scratch account ({})",
-            described_list(&named)
-        )]),
-        Err(error) => Err(vec![format!(
-            "every object the scratch account owns in database {database} ({error})"
-        )]),
-    }
-    .err()
-    .unwrap_or_default();
-    // Back into the standard state, and the ACL back to what the run
-    // found, then read again whole: what differs is named, never reported
-    // as a clean release (#1708).
-    let put_back = standard::enforce(admin, declared, Some(acl)).await;
-    match standard::verify(admin, declared, Some(acl)).await {
-        Ok(left) if left.is_empty() => {}
-        Ok(left) => {
-            remaining.extend(left.into_iter().map(|difference| {
-                format!("database {database} not back in its standard state: {difference}")
-            }));
-            match put_back {
-                Ok(failed) => {
-                    remaining.extend(failed.into_iter().map(|why| format!("refused: {why}")));
-                }
-                Err(error) => remaining.push(format!("refused: {error}")),
-            }
-        }
-        Err(error) => remaining.push(format!(
-            "database {database}'s standard state, unreadable after the run ({error})"
-        )),
-    }
-    // A definition may have changed the login's own defaults, which outlive
-    // the database's contents (see `sql::login_defaults`). Named, never left
-    // unread.
-    match sql::login_defaults(admin).await {
-        Ok(after) => remaining.extend(
-            sql::changed_defaults(defaults, &after)
-                .into_iter()
-                .map(|change| format!("the scratch account's own default {change}")),
-        ),
-        Err(error) => remaining.push(format!(
-            "the scratch account's own defaults, unreadable after the run ({error})"
-        )),
-    }
-    // The roles a rehearsal made are the cluster's, not the database's, so
-    // emptying the database did not reach them; the claim names them, and the
-    // privileges they held went with the objects.
-    match record::read_claim(admin).await {
-        Ok(Some(Ok(claim))) => {
-            let roles: Vec<_> = claim
-                .roles
-                .iter()
-                .map(|role| role.as_str().into())
-                .collect();
-            remaining.extend(
-                pbps_pg::resolver::drop_roles(admin, &roles)
-                    .await
-                    .into_iter()
-                    .map(|role| format!("role {}", role.shown())),
-            );
-        }
-        Ok(None | Some(Err(_))) => {}
-        Err(error) => remaining.push(format!(
-            "the roles in the scratch database's claim, unreadable ({error})"
-        )),
-    }
-    // The record goes last: until every step above has succeeded it lets a
-    // later run finish them (DEC-2410.1).
-    if remaining.is_empty()
-        && let Err(error) = record::remove(admin).await
-    {
-        remaining.push(format!("the scratch database's claim ({error})"));
-    }
-    if remaining.is_empty() {
-        Ok(())
-    } else {
-        Err(remaining)
-    }
-}
+pub(in crate::resolver::server) use release::supplied as release_supplied;
 
 /// Puts the scratch database into `standard`, or refuses naming what the
 /// scratch account cannot apply or cannot put back, before anything is

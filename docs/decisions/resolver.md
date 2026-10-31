@@ -5558,3 +5558,39 @@ Capture rule `postgres-catalog-inputs-v3` names this ownership/coverage contract
 The adapter's exact rule check rejects v2 evidence rather than interpreting an
 old opening inventory using the new authority. The enclosing evidence, plan,
 state and public schema formats do not change.
+
+
+<a id="dec-1731-1"></a>
+
+**DEC-1731.1. A supplied release performs no restoration on an unconfirmed backend.**
+A failed checked-backend cleanup does not authorize restoration. The release
+keeps backend refusal distinct from a cleanup statement's error; it does not
+classify an error by its display text. A changed or unreadable backend stops
+restoring writes and retains the named recovery obligation.
+
+A successful cleanup commit does not pin the transaction that follows it.
+Restoration therefore begins a fresh transaction, verifies the original
+backend there, and keeps restoration and its verification in that same
+transaction. Required later cleanup writes retain an equivalent checked
+boundary. No new connection is a replacement for the checked supplied one.
+
+The standard's existing partial-repair behavior is preserved with savepoints:
+an individually refused standard statement is named and does not conceal
+other repair or verification results. A failed or unknown backend check never
+becomes an empty database, a verified standard or permission to remove a claim.
+
+Run-local roles retain DEC-2049.1's `ROLE_BATCH` transaction bound. Savepoint
+release does not release their object locks, so standard restoration commits
+before role cleanup. Each role batch, each independent retry after a failed
+batch, and final claim removal begin with a fresh check of the original
+backend. A role failure preserves completed repairs and the claim; a backend
+refusal stops later writes. The final claim is removed only after every named
+obligation has been discharged. Native controls observe the real held role
+locks and transaction IDs, and refuse hops between batches or before claim
+removal.
+
+This closes an unsafe write after the existing backend refusal; it does not
+qualify transaction-pooling proxies as supported resolver layouts or change
+the operator's session-pinning obligation in DEC-1685.1. Native positive and
+negative controls cover both refusal before cleanup and a backend change
+after cleanup, together with same-backend repair and retained recovery names.

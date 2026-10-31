@@ -6194,3 +6194,5 @@ mod acceptance621_tests;
 mod fill2134_tests;
 
 mod cancellation1519_tests;
+
+mod release1731_tests;

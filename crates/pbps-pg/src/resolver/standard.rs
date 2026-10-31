@@ -486,6 +486,17 @@ pub async fn enforce(
     enforce_in(conn, standard, acl, false).await
 }
 
+/// Applies the standard inside the caller's already checked transaction.
+/// Each statement has a savepoint, so an expected privilege refusal does not
+/// abort the remaining restoration or its verification (DEC-1731.1).
+pub async fn enforce_in_transaction(
+    conn: &mut impl ExecuteConnection,
+    standard: &Standard,
+    acl: Option<&BTreeSet<Entry>>,
+) -> Result<Vec<String>, DbError> {
+    enforce_in(conn, standard, acl, true).await
+}
+
 /// Puts `standard` on inside a transaction that is always rolled back, and
 /// reads the database back there: whatever the engine refuses (a value it
 /// cannot parse, a privilege the login lacks) and whatever reads back
