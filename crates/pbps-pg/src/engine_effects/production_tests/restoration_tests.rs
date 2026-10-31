@@ -270,3 +270,40 @@ fn a_partition_not_null_restoration_checks_its_output_before_reusing_the_goal() 
     });
     assert!(clauses.iter().any(|c| matches!(c, Clause::Require(_))));
 }
+
+#[test]
+fn a_function_restoration_uses_only_matching_read_binding_evidence() {
+    let s = inherited();
+    let binding = BoundInput {
+        input: ObjectKey::Module("app.f(integer)".parse().unwrap()),
+        incarnation: Incarnation::Final,
+    };
+    for (proof, known) in [
+        (Some("app.f(3)"), true),
+        (Some("app.f(4)"), false),
+        (None, false),
+    ] {
+        let clauses = inspect(
+            &s,
+            default(None, Some("app.f(3)")),
+            Origin::Whole(1),
+            |f, key| {
+                let cell = f.goal.cells.get_mut(key).unwrap();
+                cell.value = proof.map_or(Fact::Unread, |expression| {
+                    let Fact::Known(mut value) = facts::definition(expression) else {
+                        unreachable!()
+                    };
+                    value.bindings.insert(binding.clone());
+                    Fact::Known(value)
+                });
+            },
+        );
+        if known {
+            let value = restored(&clauses).value.known().unwrap();
+            assert_eq!(value.datum, Datum::Definition("app.f(3)".into()));
+            assert_eq!(value.bindings, [binding.clone()].into());
+        } else {
+            assert_eq!(restored(&clauses).value, Fact::Unread);
+        }
+    }
+}

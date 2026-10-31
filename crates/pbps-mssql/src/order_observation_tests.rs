@@ -171,6 +171,7 @@ fn assert_observational(shape: Shape) {
         },
         &Mssql,
         &ModuleDeps::new(),
+        None,
     )
     .unwrap();
     let at = |id: &ModuleId| {

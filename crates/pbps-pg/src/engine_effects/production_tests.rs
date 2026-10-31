@@ -867,6 +867,8 @@ fn a_detached_default_restores_the_transferred_property() {
     );
 }
 
+mod class;
+mod meeting_golden;
 mod scenes_tests;
 
 #[test]

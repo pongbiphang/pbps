@@ -81,6 +81,9 @@ pub fn carry_inserts<S>(
         end,
         dialect,
         None,
+        // This release observation has no catalog read; missing membership
+        // bindings remain obligations rather than an empty known inventory.
+        None,
         plan,
         &plan.annotation_edges()?,
     );

@@ -2269,7 +2269,8 @@
         "default_rebuild::a_retyped_defaults_binding_and_assignment_are_measured_before_rebuild_rules",
         "annotations2469::module_to_object_annotations_drive_installs_and_removals",
         "annotations2469::rebuilt_provider_waits_for_annotated_consumer_removal",
-        "annotations2469::partition_default_annotations_follow_the_module_across_ancestor_depths"
+        "annotations2469::partition_default_annotations_follow_the_module_across_ancestor_depths",
+        "annotations2469::an_annotated_partition_column_meeting_keeps_its_edge_and_values"
       ]
     },
     {
@@ -2969,7 +2970,15 @@
       "cases": [
         "consumer_contracts::consumer_writers_keep_defaults_needed_by_other_existing_columns",
         "consumer_effective_columns::sibling_domain_default_losses_use_the_same_rule_in_alter_and_rebuild_plans",
-        "consumer_effective_columns::sibling_default_losses_follow_partition_trees_without_removing_existing_refusals"
+        "consumer_effective_columns::sibling_default_losses_follow_partition_trees_without_removing_existing_refusals",
+        "a_default_rebuild_with_rename_and_attach_keeps_each_declaration",
+        "a_default_rebuild_with_rename_and_attach_keeps_each_declaration_before_postgres_17",
+        "column_meeting_probes_follow_the_certified_row_contributions",
+        "a_pending_column_meeting_keeps_unrelated_renamed_default_sources",
+        "all_measured_partition_move_d_profiles_have_live_product_dispositions",
+        "all_measured_partition_move_d_profiles_have_live_product_dispositions_before_postgres_17",
+        "matching_owned_sequence_types_keep_the_existing_continuation_contract",
+        "parent_column_and_address_moves_apply_at_their_proved_boundaries"
       ]
     }
   ]

@@ -65,6 +65,34 @@ pub(super) fn default_value(
         }
     }
 }
+/// Reuse a read binding only for the exact expression this statement writes.
+/// A known goal is no evidence for a different restoration payload.
+pub(super) fn bound_default(
+    pg: &Postgres,
+    expression: Option<&str>,
+    table: &TableName,
+    name: &str,
+    proof: Option<&Cell>,
+) -> Fact<Value> {
+    let output = default_value(
+        pg,
+        &expression.map_or(ValueSource::None, |e| ValueSource::Default(e.into())),
+        table,
+        name,
+    );
+    match (output, expression, proof.map(|c| &c.value)) {
+        (Fact::Unread, Some(expression), Some(Fact::Known(proof)))
+            if proof.datum == Datum::Definition(pg.normalize_definition(expression)) =>
+        {
+            Fact::Known(Value {
+                ownership: Ownership::Own,
+                ..proof.clone()
+            })
+        }
+        (output, _, _) => output,
+    }
+}
+
 /// ATTACH compares the complete type form, including generation/identity.
 /// Ordinary DEFAULT and sequence ownership are independent properties.
 pub(super) fn type_value(

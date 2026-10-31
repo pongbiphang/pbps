@@ -1560,7 +1560,7 @@ pub(crate) fn diff_partial_rebuilding(
     refuse_temporal_changes(base, declared, &changes, &mut errs);
     refuse_unjoinable_foreign_keys(declared.schema, dialect, &changes, &mut errs);
     refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
-    refuse_partition_changes(base, declared, &index, hints, &changes, &mut errs);
+    refuse_partition_changes(base, declared, &index, hints, dialect, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -4976,6 +4976,7 @@ fn refuse_partition_changes(
     declared: Side<'_>,
     index: &Indexes<'_>,
     hints: &Hints,
+    dialect: &(impl Dialect + ?Sized),
     changes: &[Change],
     errs: &mut Vec<DiffError>,
 ) {
@@ -5398,8 +5399,11 @@ fn refuse_partition_changes(
                     ),
                 );
             } else if let Some(tables) = moving.get(table)
+                && !dialect.partition_meetings()
                 && !matches!(change, Change::SetColumnDeprecated { .. })
             {
+                // The capability's canonical symbolic schedule proves this
+                // cut; engines without that contract keep the guard (DEC-2296.12).
                 // An attach or a detach meets the parent's columns as they
                 // stand at that statement, and the table on its other side
                 // holds them as declared at the other end of the plan: each
@@ -5432,7 +5436,7 @@ fn refuse_partition_changes(
                 .flatten()
                 .map(|name| name.shown().to_string())
                 .collect();
-            if !tables.is_empty() {
+            if !tables.is_empty() && !dialect.partition_meetings() {
                 changes_meet_moves.insert(to.clone());
                 refuse(
                     to,
@@ -27397,7 +27401,7 @@ mod meeting_shape_tests {
         }
     }
     #[test]
-    fn meeting_addresses_follow_capability_and_uid_while_guards_remain() {
+    fn meeting_addresses_follow_capability_and_uid() {
         use pbps_model::{Column, PartitionBound, PartitionBy, PartitionOf};
         let p: TableName = "app.p".parse().unwrap();
         let q: TableName = "app.q".parse().unwrap();
@@ -27465,9 +27469,11 @@ mod meeting_shape_tests {
                         &engine,
                         &Hints::default(),
                     );
-                    assert!(
-                        !d.errors.is_empty(),
-                        "the retained parent-rename guard is still active"
+                    assert_eq!(
+                        d.errors.is_empty(),
+                        enabled,
+                        "{label}/{enabled}: {:?}",
+                        d.errors
                     );
                     let boundary = d.changes.changes.iter().find_map(|p| match &p.change {
                         Change::AttachPartition { parent, .. }

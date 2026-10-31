@@ -305,3 +305,77 @@ async fn rebuilt_provider_waits_for_annotated_consumer_removal() {
     db.conn.execute("COMMIT").await.unwrap();
     db.drop().await;
 }
+
+#[path = "annotation_meetings.rs"]
+mod meetings;
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn an_annotated_partition_column_meeting_keeps_its_edge_and_values() {
+    let mut db = TestDb::create("annotation_meeting2296").await;
+    db.conn
+        .execute(
+            "BEGIN; CREATE SCHEMA app;
+        CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$;
+        CREATE TABLE app.p(k integer NOT NULL,d integer DEFAULT app.f(1)) PARTITION BY RANGE(k);
+        CREATE TABLE app.a(k integer NOT NULL,d integer DEFAULT 9);
+        INSERT INTO app.a(k) VALUES(1);",
+        )
+        .await
+        .unwrap();
+    let scene = meetings::scene();
+    let version = db
+        .conn
+        .query("SELECT current_setting('server_version_num') AS v")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("v")
+        .unwrap()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let catalog = pbps_pg::modules::dependencies::references(
+        &mut db.conn,
+        Snapshot {
+            schema: &scene.before,
+            ids: &scene.base,
+        },
+        &scene.base.tables.keys().cloned().collect(),
+    )
+    .await
+    .unwrap();
+    let column = "app.p.d".parse().unwrap();
+    assert_eq!(
+        catalog.columns[&column].routines,
+        scene.stored.columns[&column].routines
+    );
+    let plan = meetings::canonical(&scene, version, Some(&catalog)).unwrap();
+    let engine = Postgres::new().with_server_version(version);
+    for step in &plan.changes {
+        for statement in engine.fixture_emit(&step.change, step.strategy).unwrap() {
+            db.conn.execute(&statement.sql).await.unwrap();
+        }
+    }
+    let rows = db
+        .conn
+        .query("SELECT d::text AS d, pg_typeof(d)::text AS ty FROM app.v")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].try_get::<&str>("d").unwrap(), Some("9"));
+    assert_eq!(rows[0].try_get::<&str>("ty").unwrap(), Some("bigint"));
+    db.conn
+        .execute("INSERT INTO app.a(k) VALUES(2)")
+        .await
+        .unwrap();
+    let rows = db
+        .conn
+        .query("SELECT d::text AS d FROM app.a WHERE k=2")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<&str>("d").unwrap(), Some("9"));
+    let rows = db.conn.query("SELECT inhparent::regclass::text AS parent FROM pg_inherits WHERE inhrelid='app.a'::regclass").await.unwrap();
+    assert_eq!(rows[0].try_get::<&str>("parent").unwrap(), Some("app.p"));
+    db.conn.execute("COMMIT").await.unwrap();
+    db.drop().await;
+}

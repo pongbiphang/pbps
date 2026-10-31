@@ -87,6 +87,7 @@ fn settle(before: &Schema, after: &Schema, plan: ChangeSet) -> Result<ChangeSet,
         },
         &Mssql,
         &Default::default(),
+        None,
     )
     .map(|plan| plan.changes().clone())
 }
@@ -327,6 +328,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
         },
         &Mssql,
         &Default::default(),
+        None,
     )
     .unwrap();
     assert_eq!(result, original);
@@ -397,6 +399,7 @@ fn binding_releases_leave_computed_column_rebuilds_for_the_connected_stage() {
             },
             &Mssql,
             &Default::default(),
+            None,
         )
         .unwrap();
         assert_eq!(

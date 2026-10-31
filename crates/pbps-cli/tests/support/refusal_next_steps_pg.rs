@@ -28,6 +28,20 @@ fn partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_c
             .replace("partitions:\n  p1: {from: [0], to: [10]}\n", ""),
     );
     succeeds(d.run(&["drop-table", "app.p1", "--reason", "retired partition"]));
+    let columns = succeeds(d.run(&["plan", "--no-dev"]));
+    assert!(!stderr(&columns).contains("issue #2296"));
+    assert!(!stderr(&columns).contains("issue #2298"));
+    // PART meetings still need their own producer; retain the tracking-issue
+    // refusal while the column-only case above now reaches canonical planning.
+    d.table(
+        &base
+            .replace("  bucket:", "  extra: {type: integer}\n  bucket:")
+            .replace(
+                "partition_by: [k]",
+                "checks:\n  positive: bucket >= 0\npartition_by: [k]",
+            )
+            .replace("partitions:\n  p1: {from: [0], to: [10]}\n", ""),
+    );
     let transition = d.run(&["plan", "--no-dev"]);
     assert_eq!(code(&transition), 1, "{}", stderr(&transition));
     assert!(stderr(&transition).contains("separate plans"));

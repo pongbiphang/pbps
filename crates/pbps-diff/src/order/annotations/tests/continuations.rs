@@ -534,3 +534,52 @@ fn tracked_in_place_module_edits_keep_annotation_removal_boundaries() {
             .any(|e| e.before == 0 && e.after == 1)
     );
 }
+
+#[test]
+fn planning_shadow_readers_propagate_annotation_projection_errors() {
+    let mut f = Fixture::new();
+    f.after
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .columns["x"]
+        .value_source = pbps_model::ValueSource::Default("1".into());
+    let goal = dependencies(&[("table::app.t", &["default::app.t.x"])]);
+    let mut changes = f.creates();
+    changes.push(Change::InsertRow {
+        table: "app.t".parse().unwrap(),
+        key_column: "x".into(),
+        identity_key: false,
+        key: pbps_model::RowKey::from("1"),
+        row: Default::default(),
+        defaults: Default::default(),
+        types: Default::default(),
+    });
+    let plan = f.plan(changes, &ObjectDeps::default(), &goal).unwrap();
+    let expected = plan.annotation_edges().unwrap_err();
+    assert!(expected.contains("internal creation cycle"), "{expected}");
+    let before = crate::Side {
+        schema: &f.before,
+        ids: &f.base,
+    };
+    let after = crate::Side {
+        schema: &f.after,
+        ids: &f.ids,
+    };
+    let pg = pbps_dialect::MinimalDialect;
+    let rewrite =
+        crate::order::before_rewrites(plan.clone(), before, after, &pg, &Default::default(), None)
+            .unwrap_err();
+    assert_eq!(rewrite, expected);
+    let release = crate::order::release_inputs::carry_inserts(
+        &plan,
+        Schedule::new(plan.changes.len()),
+        &std::collections::BTreeSet::from([2]),
+        before,
+        after,
+        &pg,
+        &Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(release, expected);
+}

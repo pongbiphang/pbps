@@ -15,8 +15,9 @@ pub fn before_rewrites(
     after: crate::Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
 ) -> Result<super::PlanningPlan, String> {
-    settle_requirements(changes, before, after, dialect, declared, None, &[])
+    settle_requirements(changes, before, after, dialect, declared, None, stored, &[])
 }
 
 /// Settle requirements refined by connected name comparisons before the final
@@ -38,10 +39,12 @@ pub fn catalog_requirements<S: Clone>(
         dialect,
         declared,
         Some(catalog),
+        None,
         precedence,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_requirements<S: Clone>(
     changes: super::PlanningPlan<S>,
     before: crate::Side<'_>,
@@ -49,6 +52,7 @@ fn settle_requirements<S: Clone>(
     dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
     catalog: Option<&CatalogFacts>,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
     precedence: &[(Change, Change)],
 ) -> Result<super::PlanningPlan<S>, String> {
     let names = pbps_model::plan_names::PlanNames::of(
@@ -86,6 +90,7 @@ fn settle_requirements<S: Clone>(
         end,
         dialect,
         catalog,
+        stored,
         &changes,
         &changes.annotation_edges()?,
     );
@@ -188,9 +193,14 @@ fn settle_requirements<S: Clone>(
             previous = Some(at);
         }
     }
-    let mut settled = schedule
-        .settle(changes.clone())
-        .map_err(|refusal| refusal.describe(&changes))?;
+    let mut settled = schedule.settle(changes.clone()).map_err(|refusal| {
+        let message = refusal.describe(&changes);
+        if stored.is_none() && !changes.boundaries.is_empty() {
+            format!("membership boundary: {message}")
+        } else {
+            message
+        }
+    })?;
     if !settled.changes.boundaries.is_empty() {
         let operations = super::reordered_operations(&operations, &settled.sequence);
         settled.changes.identities = Some(operations);

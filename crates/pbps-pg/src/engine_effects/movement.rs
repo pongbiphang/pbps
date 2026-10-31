@@ -1,11 +1,11 @@
 //! Membership and restoration keys come only from the endpoint lineage.
 use super::{columns, facts};
 use crate::Postgres;
+use pbps_model::Change;
 use pbps_model::operation::{
     ColumnKey, End, Family, Lineage, ObjectKey, Operation, OwnerError, Owners, Recorded, Role,
     Snapshot, Standing, symbolic::*,
 };
-use pbps_model::{Change, ValueSource};
 
 fn require(reason: impl Into<String>) -> Vec<Clause> {
     vec![columns::unsupported(reason, None)]
@@ -264,14 +264,15 @@ impl Context<'_> {
                 };
                 // emit::SetPartitionDefault writes to, then fallback, or drops
                 // the default. A teardown has the same payload precedence.
-                let output = facts::default_value(
+                let output = facts::bound_default(
                     self.pg,
-                    &to.as_ref()
-                        .or(fallback.as_ref())
-                        .cloned()
-                        .map_or(ValueSource::None, ValueSource::Default),
+                    to.as_deref().or(fallback.as_deref()),
                     name,
                     slot.name.raw(),
+                    self.facts
+                        .goal
+                        .cells
+                        .get(&(child.clone(), goal_property.clone())),
                 );
                 if op.role() == Role::Teardown {
                     output
