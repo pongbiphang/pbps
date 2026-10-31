@@ -25,7 +25,10 @@ pub(super) use keeper::{keep_and_mark, keeper_seen};
 pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
-    for_tests::{externals_for_test, reset_for_test, stop_after_cleanup, sweep_cluster_on},
+    for_tests::{
+        externals_for_test, hop_release, reset_for_test, stop_after_cleanup, sweep_cluster_on,
+        take_release_trace, trace_release,
+    },
     release_run_owned,
 };
 
