@@ -290,3 +290,11 @@ attributes; every array boundary starts a separate value context for NOT NULL
 and opaque CHECKs. Ordinary edits, domain edits and rebuilds use the same
 before/after projection. Effective DEFAULT changes remain distinct from physical
 restorations, whose equivalence stays with the existing differ callback.
+
+<a id="dec-2536-1"></a>
+
+**DEC-2536.1. DEFAULT matching uses the bound column or table (#2536).** The
+shared predicate owns the effective pair's direct match; a table hit alone
+wrongly includes uncontracted nullable siblings. The required-sibling rule
+still follows written partition trees and the effective after-side source,
+with restoration equivalence left to the differ.

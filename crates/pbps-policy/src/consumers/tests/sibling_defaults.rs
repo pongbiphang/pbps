@@ -164,8 +164,16 @@ fn column_writers_keep_required_sibling_defaults_without_broadening_other_edits(
 }
 
 #[test]
-fn required_defaults_follow_the_written_partition_tree_and_keep_existing_local_matches() {
+fn partition_defaults_distinguish_direct_contracts_from_siblings() {
     for (label, local, nullable, parent_default, entry, count) in [
+        (
+            "nullable local sibling of leaf writer",
+            true,
+            true,
+            None,
+            "app.leaf.a",
+            0,
+        ),
         (
             "parent loss affects leaf writer",
             false,
@@ -191,30 +199,63 @@ fn required_defaults_follow_the_written_partition_tree_and_keep_existing_local_m
             1,
         ),
         (
-            "local fallback supplies sibling",
+            "local loss affects leaf writer",
+            true,
+            false,
+            None,
+            "app.leaf.a",
+            1,
+        ),
+        (
+            "parent writer keeps inherited source",
             true,
             false,
             Some("7"),
             "app.t.a",
             0,
         ),
-        ("nullable local sibling", true, true, None, "app.t.a", 0),
         (
-            "existing nullable local match",
-            true,
-            true,
-            None,
-            "app.leaf.a",
-            1,
-        ),
-        (
-            "existing fallback local match",
+            "leaf writer keeps inherited source",
             true,
             false,
             Some("7"),
             "app.leaf.a",
+            0,
+        ),
+        (
+            "nullable local sibling of parent writer",
+            true,
+            true,
+            None,
+            "app.t.a",
+            0,
+        ),
+        ("direct nullable column", true, true, None, "app.leaf.b", 1),
+        (
+            "table writer covers nullable column",
+            true,
+            true,
+            None,
+            "app.leaf",
             1,
         ),
+        (
+            "direct changed fallback",
+            true,
+            false,
+            Some("7"),
+            "app.leaf.b",
+            1,
+        ),
+        (
+            "table writer covers changed fallback",
+            true,
+            false,
+            Some("7"),
+            "app.leaf",
+            1,
+        ),
+        ("unrelated writer", true, false, None, "app.other.a", 0),
     ] {
         let (mut before, mut ids) = fixture();
         let b = before
