@@ -110,7 +110,10 @@ Read before changing things:
 - Before queueing a full gate, confirm the head merges cleanly with
   `origin/master`. Rebase a conflicting head first.
 - Use the Python version CI pins.
-- Register every new `#[ignore]` test in `scripts/ignored-test-owners.json`.
+- A new `#[ignore]` test in a covered target/module needs no registry edit.
+  For an uncovered module, add a unique rule to `scripts/ignored-test-rules.json`.
+  Python-driven and child-helper owners retain legacy exact entries; see
+  `docs/TEST-EXECUTION.md`.
 - Never run two live suites against the same containers at once. Each makes
   the other fail, and the failure reads like a product bug.
 

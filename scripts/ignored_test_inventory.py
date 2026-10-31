@@ -946,7 +946,46 @@ def owner_selectors(root, owner, fixtures=None):
     raise InventoryError(f"unknown selector kind: {kind}")
 
 
-def validate(root, inventory, targets, platform):
+def rule_assignments(owners, rules, cases, platform):
+    """Match namespace boundaries, with no longest-prefix or file-order priority."""
+    require(isinstance(rules, dict) and rules.get("version") == 1,
+            "unsupported ownership rules version")
+    require(isinstance(rules.get("rules"), list), "ownership rules must be a list")
+    indexed = {}
+    matched = set()
+    for index, rule in enumerate(rules["rules"]):
+        require(isinstance(rule, dict) and set(rule) == {"target", "prefix", "owner"},
+                f"invalid ownership rule {index}: expected target, prefix and owner")
+        target, prefix, owner = rule["target"], rule["prefix"], rule["owner"]
+        require(isinstance(target, list) and len(target) == 3 and
+                all(isinstance(value, str) and value for value in target),
+                f"invalid rule target: {target!r}")
+        require(isinstance(prefix, str) and (not prefix or
+                prefix.endswith("::") and all(part.removeprefix("r#").isidentifier()
+                    for part in prefix[:-2].split("::"))),
+                f"rule prefix must end at a module boundary: {prefix!r}")
+        require(isinstance(owner, str) and owner in owners, f"unknown rule owner: {owner!r}")
+        require(not any(key in owners[owner] for key in ("script", "selection", "parent")),
+                f"Python-driven and child owners require legacy exact entries: {owner}")
+        indexed.setdefault(tuple(target), []).append((index, prefix, owner))
+    assignments = {}
+    for case in sorted(cases):
+        matches = [(index, owner) for index, prefix, owner in indexed.get(case[:3], [])
+                   if case[3].startswith(prefix)]
+        require(len(matches) <= 1, f"ambiguous ownership rules for {case}: {matches}")
+        if matches:
+            index, owner = matches[0]
+            matched.add(index)
+            assignments[case] = owner
+    for index, rule in enumerate(rules["rules"]):
+        # Other-platform cfg cases may not exist here. Their owner's platform
+        # remains the authoritative stale-mapping check, as for legacy entries.
+        if owners[rule["owner"]]["platform"] == platform:
+            require(index in matched, f"ownership rule matches no cases: {rule}")
+    return assignments
+
+
+def validate(root, inventory, targets, platform, rules=None):
     require(inventory.get("version") == 1, "unsupported inventory version")
     require(platform in ("linux", "win32", "darwin"), f"unsupported discovery platform: {platform}")
     owners = inventory["owners"]
@@ -963,9 +1002,29 @@ def validate(root, inventory, targets, platform):
                 require(key in targets and name in targets[key]["all"], f"stale case/target mapping: {case}")
             if key in targets and name in targets[key]["all"]:
                 require((name in targets[key]["ignored"]) == (platform in group["ignored_on"]), f"changed ignore condition: {case}")
+    groups = list(inventory["groups"])
+    cases = set(entries) | {(*key, name) for key, target in targets.items() for name in target["ignored"]}
+    assignments = rule_assignments(owners, rules if rules is not None else {"version": 1, "rules": []},
+                                   cases, platform)
+    for case, owner in assignments.items():
+        if case in entries:
+            require(entries[case]["owner"] == owner,
+                    f"rule and legacy owners disagree for {case}: {owner} != {entries[case]['owner']}")
+        else:
+            # Rules add live cases without weakening any legacy ignore condition.
+            # Newly discovered cases retain the same owner-platform/CI audit below.
+            group = {"target": list(case[:3]), "owner": owner, "validate_on": owners[owner]["platform"],
+                     "ignored_on": ["linux", "win32", "darwin"], "cases": [case[3]]}
+            entries[case] = group
+            groups.append(group)
+            used.add(owner)
     for key, target in targets.items():
         for name in target["ignored"]:
-            require((*key, name) in entries, f"ignored case has no execution owner: {(*key, name)}")
+            prefix = name.rpartition("::")[0] + "::" if "::" in name else ""
+            require((*key, name) in entries,
+                    f"ignored case has no execution owner: {(*key, name)}; add a rule in "
+                    f"scripts/ignored-test-rules.json: target={list(key)!r}, prefix={prefix!r}, "
+                    "owner=<existing owner> (mixed root cases need an owned module)")
     pending = list(used)
     while pending:
         parent = owners[pending.pop()].get("parent")
@@ -1010,7 +1069,7 @@ def validate(root, inventory, targets, platform):
         visiting.remove(owner_id)
         return cache[owner_id]
     for owner_id in owners: check_owner(owner_id)
-    for group in inventory["groups"]:
+    for group in groups:
         key = tuple(group["target"]); owner = owners[group["owner"]]
         require(group["validate_on"] == owner["platform"], f"owner platform cannot discover its cases: {group['owner']}")
         require(not owner.get("ordinary") or owner["platform"] not in group["ignored_on"],
@@ -1051,10 +1110,20 @@ def main():
     root = Path(__file__).resolve().parents[1]
     try:
         inventory = json.loads((root / "scripts/ignored-test-owners.json").read_text(encoding="utf-8"))
-        count = validate(root, inventory, discover(root), sys.platform)
+        rules = json.loads((root / "scripts/ignored-test-rules.json").read_text(encoding="utf-8"))
+        require(isinstance(rules, dict), "ownership rules must be an object")
+        targets = discover(root)
+        count = validate(root, inventory, targets, sys.platform, rules)
+        legacy = {(*group["target"], name): group["owner"]
+                  for group in inventory["groups"] for name in group["cases"]}
+        cases = set(legacy) | {(*key, name) for key, target in targets.items() for name in target["ignored"]}
+        assigned = rule_assignments(inventory["owners"], rules, cases, sys.platform)
+        covered = len(legacy.keys() & assigned.keys())
     except (InventoryError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         raise SystemExit(f"ignored-test inventory failed: {error}") from error
-    print(f"Ignored-test execution ownership verified ({count} registered cases, {sys.platform}).")
+    print(f"Ignored-test execution ownership verified ({count} owned cases, {sys.platform}).")
+    print(f"Additive migration: {len(rules['rules'])} rules; {len(legacy)} legacy owners unchanged; "
+          f"{covered} rule-covered legacy cases; {len(legacy) - covered} legacy-only cases.")
 
 
 if __name__ == "__main__":

@@ -1574,3 +1574,26 @@ inconsistent lists, an unselected test, incomplete execution or a failed test
 fail the gate. The resolver job and its audit retain the pull-request omission;
 every other CI event requires them. Merge-group job durations and the listed
 versus executed union provide the final timing and membership evidence.
+
+
+<a id="dec-2562-1"></a>
+
+**DEC-2562.1. Ignored-test module rules add ownership without rewriting the legacy
+inventory.** Per-case additions to shared arrays made independent live-test PRs
+conflict. A separate rules file maps a compiled target and literal module prefix
+to an existing owner. Empty prefix means the whole target; nonempty prefixes end
+at `::`. Matching must be unique, even for equal owners; no specificity or file
+order can hide overlap. A rule/legacy disagreement names the case and fails.
+Uncovered cases name the rule to add, and dead rules fail on the owner's platform,
+which retains authority over cfg availability. Legacy platform/ignore conditions,
+Cargo artifact discovery, list-only execution and CI selector proofs remain.
+
+The selector audit consumes each owner's rule-matched and legacy cases. Python
+fixture and nested-child owners retain exact entries and their DEC-1413.1
+source/witness contract. Uniform module subtrees are derived from current owners;
+mixed roots and indivisible mixed modules keep exact fallback without moving
+tests. The migration test proves that every legacy case retains its owner under
+the combined assignment. New ignored cases in covered modules need no file edit;
+uncovered modules get a rule. The legacy file is unchanged in this PR so existing
+branches may still append entries; covered entries can be removed in a separate
+cleanup. DEC-1370.1's complete CI selection guarantee remains unchanged.
