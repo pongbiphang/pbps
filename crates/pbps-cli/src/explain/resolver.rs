@@ -542,7 +542,7 @@ mod tests {
         Prerequisite {
             object,
             ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
-            canonicalization: "postgres-catalog-inputs-v2".into(),
+            canonicalization: "postgres-catalog-inputs-v3".into(),
             properties: "11".repeat(32),
             bindings: Vec::new(),
         }

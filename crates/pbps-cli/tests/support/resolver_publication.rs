@@ -1955,3 +1955,6 @@ mod trigger_when1907;
 
 #[path = "object_grants1454.rs"]
 mod object_grants1454;
+
+#[path = "partition1566.rs"]
+mod partition1566;

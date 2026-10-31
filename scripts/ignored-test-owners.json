@@ -1819,6 +1819,7 @@
         "resolver::reconstruct::trial_tests::genuine_syntax_is_refused_with_its_original_diagnosis",
         "resolver::reconstruct::trial_tests::retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects",
         "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",
+        "resolver::capture::nodes::partition1566::actual_partition_bounds_have_closed_layouts_on_both_majors",
         "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges"
       ]
     },
@@ -2938,6 +2939,8 @@
         "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg18",
         "resolver_publication::trigger_when1907::when_overload_rebuilds_only_the_trigger_that_binds_it_on_pg16",
         "resolver_publication::object_grants1454::an_object_grant_moves_the_sealed_authorization_on_pg18",
+        "resolver_publication::partition1566::a_populated_partition_detach_seals_its_carried_columns_on_pg18",
+        "resolver_publication::partition1566::a_populated_partition_detach_seals_its_carried_columns_on_pg16",
         "resolver_publication::object_grants1454::an_object_grant_moves_the_sealed_authorization_on_pg16"
       ]
     },

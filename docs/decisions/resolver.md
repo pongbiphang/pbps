@@ -5526,3 +5526,35 @@ account for membership topology rather than projecting changes onto the
 current flattened closure, and qualify the resulting bindings on the engine
 before claiming those transitions are supported. No format changes or new
 role-transition support are introduced here.
+
+<a id="dec-1566-1"></a>
+
+**DEC-1566.1. Carry a partition's inherited columns under its own table UID.**
+A partition declaration has no independent column declarations. Its validated
+ancestor chain supplies the root's recorded column shape; a captured user
+attribute of that exact partition, with readable physical provenance, belongs
+to the partition's recorded table surface. An extra physical column outside
+that shape stays unqualified. Missing ancestors, cycles, missing recorded UID
+authority and unreadable provenance cannot supply ownership. An automatic
+PostgreSQL 18 NOT NULL constraint inherits this qualified user column's owner
+only through its exact column and relation; system attributes, normal edges,
+ordinary constraints and defaults acquire no new authority.
+
+Measured on PostgreSQL 16 and 18, detach preserves each inherited column's
+physical address and data while making it local. The existing table detach
+transition already includes its qualified children. Its opening and closing
+inventories therefore carry these addresses while their owner kind changes;
+they are not fresh installations. Transition validation still refuses an
+opening record relabelled as an unaccounted installation.
+
+That public acceptance first needs partition-bound capture. The closed node
+layouts admit PARTITIONBOUNDSPEC and PARTITIONRANGEDATUM on those two majors
+only, with every field required and no unknown field accepted. Their nested
+values use the existing recursive type/collation reference and qualified datum
+output checks. No Datum or Var decoder rule changes. Real RANGE, LIST, HASH
+and DEFAULT bounds and unknown/missing-field mutations qualify these layouts.
+
+Capture rule `postgres-catalog-inputs-v3` names this ownership/coverage contract.
+The adapter's exact rule check rejects v2 evidence rather than interpreting an
+old opening inventory using the new authority. The enclosing evidence, plan,
+state and public schema formats do not change.

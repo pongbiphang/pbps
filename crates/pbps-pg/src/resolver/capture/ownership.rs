@@ -95,6 +95,30 @@ fn direct(
     Ok(())
 }
 
+fn physical_attribute(
+    capture: &CapturedInputs,
+    child: &ObjectIdentity,
+    parent: &ObjectIdentity,
+) -> Result<i32, Uncovered> {
+    let fail = || Uncovered::object(child, "physical attribute provenance is unreadable");
+    let number = *capture.attribute_numbers.get(child).ok_or_else(fail)?;
+    let input = capture.inputs.get(child).ok_or_else(fail)?;
+    let relation: ObjectIdentity =
+        serde_json::from_value(input.properties.get("attrelid").cloned().ok_or_else(fail)?)
+            .map_err(|_| fail())?;
+    if number == 0
+        || child.signature.len() != 1
+        || child.name.len() != 1
+        || relation != *parent
+        || input.properties.get("attname").and_then(Value::as_str)
+            != child.name.first().map(String::as_str)
+        || input.properties.get("attisdropped") != Some(&Value::Bool(false))
+    {
+        return Err(fail());
+    }
+    Ok(number)
+}
+
 /// Only physical attributes of an independently owned relation inherit its
 /// typed surface. A referenced column on some other relation grants nothing.
 fn physical_attributes(
@@ -109,22 +133,7 @@ fn physical_attributes(
         .keys()
         .filter(|id| id.class == "column" && id.signature.first() == Some(parent))
     {
-        let fail = || Uncovered::object(child, "physical attribute provenance is unreadable");
-        let number = *capture.attribute_numbers.get(child).ok_or_else(fail)?;
-        let input = capture.inputs.get(child).ok_or_else(fail)?;
-        let relation: ObjectIdentity =
-            serde_json::from_value(input.properties.get("attrelid").cloned().ok_or_else(fail)?)
-                .map_err(|_| fail())?;
-        if number == 0
-            || child.signature.len() != 1
-            || child.name.len() != 1
-            || relation != *parent
-            || input.properties.get("attname").and_then(Value::as_str)
-                != child.name.first().map(String::as_str)
-            || input.properties.get("attisdropped") != Some(&Value::Bool(false))
-        {
-            return Err(fail());
-        }
+        let number = physical_attribute(capture, child, parent)?;
         if (number < 0) == system {
             assign(owned, child.clone(), surface.clone())?;
         }
@@ -145,6 +154,7 @@ pub(super) fn classify(
         .validate()
         .map_err(|_| Uncovered::class("recorded-uid", "recorded managed identities are invalid"))?;
     let mut owned = BTreeMap::new();
+    let mut inherited_columns = BTreeSet::new();
     // Asked once per declared table and column (#1870).
     let recorded_names = recorded.ids.index();
     // Each declared `serial`'s exact sequence, by the column that owns it
@@ -176,6 +186,48 @@ pub(super) fn classify(
         )?;
         if owned.get(&table_id) == Some(&table_owner) {
             physical_attributes(capture, &mut owned, &table_id, &table_owner, true)?;
+            if table.partition_of.is_some() {
+                // DEC-1566.1: a partition has no declared columns of its own.
+                // Its root's shape authorizes only these physical user columns,
+                // under this partition's table UID, never an extra catalog row.
+                let chain = pbps_model::partitions::ancestor_chain(name, &recorded.schema.tables)
+                    .ok_or_else(|| {
+                    Uncovered::object(&table_id, "partition ancestry is unreadable")
+                })?;
+                if chain
+                    .iter()
+                    .any(|(ancestor, _)| recorded_names.table_uid(ancestor).is_none())
+                {
+                    return Err(Uncovered::object(
+                        &table_id,
+                        "partition ancestor lacks its recorded UID",
+                    ));
+                }
+                let (root_name, root) = chain.last().expect("ancestry includes the current table");
+                for column in root.columns.keys() {
+                    if recorded_names
+                        .column_uid(&root_name.column(column))
+                        .is_none()
+                    {
+                        return Err(Uncovered::object(
+                            &table_id,
+                            "inherited column lacks its root's recorded UID",
+                        ));
+                    }
+                    let child =
+                        identity("column", vec![column.raw().into()], vec![table_id.clone()]);
+                    if capture.inputs.contains_key(&child) {
+                        if physical_attribute(capture, &child, &table_id)? <= 0 {
+                            return Err(Uncovered::object(
+                                &child,
+                                "inherited user column has a non-user attribute number",
+                            ));
+                        }
+                        assign(&mut owned, child.clone(), table_owner.clone())?;
+                        inherited_columns.insert(child);
+                    }
+                }
+            }
         }
         // A policy is an exact declared child of this UID-proven table,
         // not a new binding surface (#1172, #595). Its dependency rows
@@ -540,13 +592,15 @@ pub(super) fn classify(
             };
             let allowed = if kind == "a" {
                 // PostgreSQL 18's not-null constraint has an automatic edge
-                // to the exact column, and a declared `serial`'s sequence one
+                // to the exact independently qualified column, including a
+                // partition's inherited user column (DEC-1566.1), and a
+                // declared `serial`'s sequence one
                 // to the column it is declared on. Other automatic edges,
                 // including ordinary indexes and triggers, never convey
                 // ownership.
                 (made.class == "pg_constraint"
                     && maker.class == "column"
-                    && matches!(owner, Surface::Column(_))
+                    && (matches!(owner, Surface::Column(_)) || inherited_columns.contains(maker))
                     && property(capture, made, "contype")? == Some("n")
                     && made.signature.get(1) == maker.signature.first())
                     || (serials.get(made) == Some(maker)

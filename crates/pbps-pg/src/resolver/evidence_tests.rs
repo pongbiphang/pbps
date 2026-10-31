@@ -68,14 +68,18 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
     let json = serde_json::to_value(&supported).unwrap();
     for (path, value) in [
         // v1 fingerprinted owners and ACLs; its closing manifests cannot be
-        // compared under the v2 property rule.
+        // compared under the current property rule.
         (
             "/before/adapter",
             serde_json::json!("postgres-catalog-inputs-v1"),
         ),
         (
             "/before/adapter",
-            serde_json::json!("postgres-catalog-inputs-v3"),
+            serde_json::json!("postgres-catalog-inputs-v2"),
+        ),
+        (
+            "/before/adapter",
+            serde_json::json!("postgres-catalog-inputs-v4"),
         ),
         ("/before/engine_major", serde_json::json!(17)),
         ("/authorization/rule", serde_json::json!("pg-auth-v1")),
