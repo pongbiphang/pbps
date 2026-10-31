@@ -23,6 +23,30 @@ and per-run schema names excluded. Actual default INSERTs and parent-tree
 (k,d) duplicate-group probes supply independent observations. These counts
 are measurement evidence, not durable test-count or engine-version policy.
 
+The live D-profile oracle is stored separately in
+`crates/pbps-cli/tests/fixtures/partition-moves-2296.json`. Its `helpers` SQL
+appears once. Each of its 38 `fixtures` stores one distinct SQL scene and the
+public identity `intents`, with a `profiles` list of `(major, motion, profile)`
+entries. Expansion retains the original 72 keys (40 COLUMN, 32 PART) and every
+original SQL byte; the native matrix and evidence hashes below are unchanged.
+
+Each profile has an explicit `expected` observation: `native: different` means
+both orders execute and their catalog/row/default-INSERT observations differ;
+`product` records two outcomes, **change first / move first**. Outcomes distinguish
+successful apply/verify/empty-replan from refusal during goal recording,
+baseline recording or validation, adoption, local-flag validation, planning,
+and the retained identity capability/reader route. The driver checks the exact
+stage reached. An earlier refusal cannot substitute for the recorded result,
+and COLUMN/PART labels do not choose the expectation. Companion numbering and
+issue controls use the same driver with their own recorded expectations.
+
+The coverage test compares the expanded keys with every D/D cell in this
+appendix, checks tuple uniqueness and the full count, and pins independent
+payload and outcome fingerprints characterized from the pre-deduplication
+oracle. Corrupt expectations, omitted profiles and duplicate tuples are negative
+controls. The one-off field-by-field expansion comparison lives in the PR 8
+report rather than keeping a second fixture in the repository.
+
 | Change payload/control | PG16 attach | PG16 detach | PG16 drop | PG18 attach | PG18 detach | PG18 drop |
 | --- | --- | --- | --- | --- | --- | --- |
 | column-add (`AddColumn`) | base: R42804/A; final: A/R42804 | member: D/D | member: A/A | base: R42804/A; final: A/R42804 | member: D/D | member: A/A |
