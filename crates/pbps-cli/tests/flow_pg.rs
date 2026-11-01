@@ -28403,6 +28403,9 @@ fn a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+#[path = "support/trigger_restoration2464.rs"]
+mod trigger_restoration2464;
+
 /// DEC-1118.1: across skipped revisions `app.target` is dropped and `app.old`
 /// is renamed into its name. The trigger and the grant keyed by that name
 /// belong to the new occupant after the plan: the trigger declared on it is
@@ -28411,18 +28414,24 @@ fn a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone() {
 #[test]
 #[ignore = "needs live PostgreSQL"]
 fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        eprintln!("trigger restoration handoff: {variable}");
+        trigger_handoff_on_server(&std::env::var(variable).unwrap());
+    }
+}
+
+fn trigger_handoff_on_server(server: &str) {
     struct Role(String, String);
     impl Drop for Role {
         fn drop(&mut self) {
             let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
         }
     }
-    let server = server();
     let role = Role(
-        server.clone(),
+        server.to_owned(),
         format!("pbps_reader_1118_{}", std::process::id()),
     );
-    let own = OwnDatabase::new(&server, "handsdependents1118");
+    let own = OwnDatabase::new(server, "handsdependents1118");
     let connection = own.connection();
     on_server(
         connection,
@@ -28504,6 +28513,8 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
         "adopt the trigger",
     ]));
 
+    let before = latest_snapshot(connection);
+
     // v2: `target` goes, with its trigger and its grant. Never deployed.
     declare("app.target.yml", None);
     declare(&trigger_file, None);
@@ -28534,6 +28545,14 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
         "--allow",
         "rename,destructive,revoke",
     ]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    trigger_restoration2464::check(
+        &before,
+        &latest_snapshot(connection),
+        &saved.changes,
+        &pbps_pg::Postgres::default(),
+    );
     on_server(connection, "INSERT INTO app.target (id) VALUES (1)");
     assert_eq!(
         scalar(

@@ -22384,6 +22384,9 @@ fn column_names_change_hands(slug: &str, reclaimed: bool) {
     assert!(stdout(&o).contains("No changes"), "{slug}: {}", stdout(&o));
 }
 
+#[path = "support/trigger_restoration2464.rs"]
+mod trigger_restoration2464;
+
 /// DEC-1118.1 on SQL Server: `dbo.target` is dropped and `dbo.old` renamed
 /// into its name across skipped revisions. The trigger declared on the name
 /// is created on the new occupant, and the role's grants on the name are the
@@ -22430,6 +22433,22 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
     let o = d.run(&["bootstrap", "--db", connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let snapshot = || {
+        rt.block_on(async {
+            let mut conn = connect_live(connection).await.unwrap();
+            pbps_mssql::state::latest(&mut conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot
+        })
+    };
+    let before = snapshot();
+
     declare("dbo.target.yml", None);
     declare("dbo.audit.trigger.yml", None);
     declare("reader.yml", Some(grants("  dbo.old: [insert]\n")));
@@ -22461,6 +22480,9 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
         "rename,destructive,revoke",
     ]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    trigger_restoration2464::check(&before, &snapshot(), &saved.changes, &pbps_mssql::Mssql);
     on_server(connection, "INSERT INTO dbo.target (id) VALUES (1)");
     assert_eq!(
         text_on_server(

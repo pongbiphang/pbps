@@ -7726,6 +7726,13 @@ fn names_changing_hands(base: Side<'_>, declared: Side<'_>) -> BTreeSet<TableNam
         .collect()
 }
 
+// A trigger's table name can stay equal while its owner UID changes. Both
+// the differ and restoration exemption must recognize that boundary (DEC-1118.1).
+fn trigger_changes_hands(id: &ModuleId, changing_hands: &BTreeSet<TableName>) -> bool {
+    matches!(id, ModuleId::Trigger { on, .. }
+        if changing_hands.contains(&TableName::new(on.schema.clone(), on.name.clone())))
+}
+
 /// The logical module change, shared with plan-time consumers (SPEC §8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleDelta {
@@ -7797,6 +7804,7 @@ pub fn restoration_comparison<'a>(
     dialect: &'a (impl Dialect + ?Sized),
 ) -> impl Fn(&Change, Option<&Uid>) -> bool + 'a {
     let renames = renames_of(base, declared);
+    let changing_hands = names_changing_hands(base, declared);
     let index = Indexes {
         base: base.ids.index(),
         declared: declared.ids.index(),
@@ -7855,12 +7863,13 @@ pub fn restoration_comparison<'a>(
             return uid.is_some_and(|u| partition_defaults.contains(&(u.clone(), column.clone())));
         }
         if let Some(id) = change.module_id() {
-            return base
-                .schema
-                .modules
-                .get(id)
-                .zip(declared.schema.modules.get(id))
-                .is_some_and(|(b, d)| module_delta(b, d, dialect) == ModuleDelta::Unchanged);
+            return !trigger_changes_hands(id, &changing_hands)
+                && base
+                    .schema
+                    .modules
+                    .get(id)
+                    .zip(declared.schema.modules.get(id))
+                    .is_some_and(|(b, d)| module_delta(b, d, dialect) == ModuleDelta::Unchanged);
         }
         let Some(part) = change.constraints() else {
             return false;
@@ -7906,10 +7915,7 @@ fn diff_modules(
             // plan declares on the new occupant. The first goes before the
             // table changes and the second is created after them, exactly as
             // for a trigger that changes kind (DEC-1118.1).
-            Some(before)
-                if matches!(id, ModuleId::Trigger { on, .. }
-                    if changing_hands.contains(&TableName::new(on.schema.clone(), on.name.clone()))) =>
-            {
+            Some(before) if trigger_changes_hands(id, changing_hands) => {
                 changes.push(Change::DropModule {
                     id: id.clone(),
                     kind: before.kind,
@@ -20138,6 +20144,113 @@ mod tests {
         // The same trigger on a table that keeps its identity is untouched.
         let cs = run(&declared, &declared, &[]);
         assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    }
+
+    fn assert_trigger_restoration_identity(case: &str) {
+        let id = ModuleId::Trigger {
+            on: "app.target".parse().unwrap(),
+            name: "audit".into(),
+        };
+        let module = Module {
+            kind: pbps_model::ModuleKind::Trigger,
+            definition: "AFTER INSERT AS SELECT 1".into(),
+            description: None,
+            options: Default::default(),
+        };
+        let mut before = two_tables(
+            ("app.target", Table::default()),
+            ("app.other", Table::default()),
+        );
+        before.modules.insert(id.clone(), module.clone());
+        let old_owner: Uid = "t_aaaaaa".parse().unwrap();
+        let other_owner: Uid = "t_bbbbbb".parse().unwrap();
+        let new_owner: Uid = "t_cccccc".parse().unwrap();
+        let old = IdsFile {
+            tables: [
+                (old_owner.clone(), "app.target".parse().unwrap()),
+                (other_owner.clone(), "app.other".parse().unwrap()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        let mut new = old.clone();
+        let handoff = match case {
+            "drop" => {
+                new.tables.remove(&old_owner);
+                new.tables.insert(new_owner, "app.target".parse().unwrap());
+                true
+            }
+            "rename-away" => {
+                new.tables.insert(old_owner, "app.retired".parse().unwrap());
+                new.tables.insert(new_owner, "app.target".parse().unwrap());
+                after
+                    .tables
+                    .insert("app.retired".parse().unwrap(), Table::default());
+                true
+            }
+            "retained" => false,
+            "unrelated-handoff" => {
+                new.tables.remove(&other_owner);
+                new.tables.insert(new_owner, "app.other".parse().unwrap());
+                false
+            }
+            _ => unreachable!(),
+        };
+        let base = Side {
+            schema: &before,
+            ids: &old,
+        };
+        let declared = Side {
+            schema: &after,
+            ids: &new,
+        };
+        let mut changes = Vec::new();
+        diff_modules(
+            &before,
+            &after,
+            &names_changing_hands(base, declared),
+            &MinimalDialect,
+            &mut changes,
+        );
+        let physical = vec![
+            Change::DropModule {
+                id: id.clone(),
+                kind: module.kind,
+            },
+            Change::CreateModule {
+                id,
+                module: Box::new(module),
+            },
+        ];
+        if handoff {
+            assert_eq!(
+                changes, physical,
+                "{case}: the old trigger goes before the new one"
+            );
+        } else {
+            assert!(changes.is_empty(), "{case}: {changes:?}");
+        }
+        let unchanged = restoration_comparison(base, declared, &MinimalDialect);
+        for change in &physical {
+            assert_eq!(unchanged(change, None), !handoff, "{case}: {change:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_tables_replacement_trigger_is_not_an_unchanged_restoration() {
+        assert_trigger_restoration_identity("drop");
+    }
+
+    #[test]
+    fn a_renamed_away_tables_replacement_trigger_is_not_an_unchanged_restoration() {
+        assert_trigger_restoration_identity("rename-away");
+    }
+
+    #[test]
+    fn a_retained_tables_trigger_keeps_its_restoration_exemption() {
+        assert_trigger_restoration_identity("retained");
+        assert_trigger_restoration_identity("unrelated-handoff");
     }
 
     /// DEC-1118.1: a grant keyed by a name that passes to another table is
