@@ -7,6 +7,7 @@
 //! They are random rather than sequential so that two branches adding a column
 //! each cannot be handed the same number.
 
+use schemars::JsonSchema;
 use std::fmt;
 use std::str::FromStr;
 
@@ -67,7 +68,16 @@ impl UidKind {
 /// `Ord` is plain string order, so UIDs of the same kind sort together and the
 /// identity file's diff reads better.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub struct Uid(String);

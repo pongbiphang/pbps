@@ -836,3 +836,71 @@ fn diagnostic_references_escape_controls_once_without_changing_identity() {
 }
 
 mod partitions;
+
+/// The wire form a selector has, written as the type the schema is derived
+/// from. The match is exhaustive on purpose: a new selector or part key does
+/// not compile here until the schema mirror has an arm for it (#2412).
+fn mirror(selector: &Selector) -> SelectorWire {
+    let named = |n: &str| n.to_owned();
+    match selector {
+        Selector::Whole => SelectorWire::Whole,
+        Selector::Default => SelectorWire::Default,
+        Selector::Generation => SelectorWire::Generation,
+        Selector::Sequence => SelectorWire::Sequence,
+        Selector::NotNull => SelectorWire::NotNull,
+        Selector::Part(part) => match part {
+            PartKey::PrimaryKey => SelectorWire::PrimaryKey,
+            PartKey::RowSecurity => SelectorWire::RowSecurity,
+            PartKey::Unique(n) => SelectorWire::Unique(named(n.raw())),
+            PartKey::ForeignKey(n) => SelectorWire::ForeignKey(named(n.raw())),
+            PartKey::Check(n) => SelectorWire::Check(named(n.raw())),
+            PartKey::Index(n) => SelectorWire::Index(named(n.raw())),
+            PartKey::Computed(n) => SelectorWire::Computed(named(n.raw())),
+            PartKey::Policy(n) => SelectorWire::Policy(n.clone()),
+        },
+    }
+}
+
+fn every_selector() -> Vec<Selector> {
+    let n = |s: &str| s.into();
+    vec![
+        Selector::Whole,
+        Selector::Default,
+        Selector::Generation,
+        Selector::Sequence,
+        Selector::NotNull,
+        Selector::Part(PartKey::PrimaryKey),
+        Selector::Part(PartKey::RowSecurity),
+        Selector::Part(PartKey::Unique(n("u"))),
+        Selector::Part(PartKey::ForeignKey(n("f"))),
+        Selector::Part(PartKey::Check(n("c"))),
+        Selector::Part(PartKey::Index(n("i"))),
+        Selector::Part(PartKey::Computed("k".into())),
+        Selector::Part(PartKey::Policy("p".into())),
+    ]
+}
+
+/// The mirror is what the published schema of a selector is derived from, so
+/// it has to be the codec's own output. A kind named in the codec and not in
+/// the mirror would be a selector the fingerprint cannot see.
+#[test]
+fn a_selectors_schema_describes_what_its_codec_writes() {
+    for selector in every_selector() {
+        let wire = serde_json::to_value(&selector).unwrap();
+        assert_eq!(wire, serde_json::to_value(mirror(&selector)).unwrap());
+        assert_eq!(serde_json::from_value::<Selector>(wire).unwrap(), selector);
+    }
+}
+
+#[test]
+fn a_selectors_schema_has_one_branch_per_wire_form() {
+    let schema = schemars::schema_for!(Selector).to_value();
+    let branches = schema["oneOf"].as_array().expect("an enum schema");
+    // Seven kinds with no name share one `enum` branch; six carry a name.
+    assert_eq!(branches.len(), 1 + 6, "{schema}");
+    let unit = branches
+        .iter()
+        .find_map(|b| b["enum"].as_array())
+        .expect("the nameless kinds are one enum");
+    assert_eq!(unit.len(), 7, "{schema}");
+}

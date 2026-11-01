@@ -10,13 +10,23 @@
 //! flag. So findings live **beside** risks on a planned change, and beside the
 //! declarations for the rules `validate` runs, and neither reads the other.
 
+use schemars::JsonSchema;
 use std::fmt;
 use std::str::FromStr;
 
 /// How seriously a finding is taken — the same three levels the findings
 /// envelope carries, with the same meaning: only `error` changes an exit code.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -56,7 +66,7 @@ impl FromStr for Severity {
 }
 
 /// One thing a rule found.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Finding {
     /// The rule's id (`naming.column`, `change.expand-contract`): stable, and

@@ -1,11 +1,12 @@
 //! The internal exclusive source keeps the historical, checksum-pinned spelling.
 //! Raw options exist only while reading or writing this boundary.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Collation, Column, ColumnType, Generated, Identity, OwnedSequence, Text, ValueSource};
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct ColumnRef<'a> {
     #[serde(rename = "type")]
     ty: &'a ColumnType,
@@ -51,7 +52,7 @@ impl Serialize for Column {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ColumnWire {
     #[serde(rename = "type")]
@@ -114,7 +115,7 @@ impl<'de> Deserialize<'de> for Column {
 
 /// A source on its own, as a change carries one (#1889): the column's keys
 /// for it, at most one of them, and an empty map for none.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct SourceRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     default: Option<&'a str>,
@@ -145,7 +146,7 @@ impl Serialize for ValueSource {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SourceWire {
     #[serde(default, deserialize_with = "present")]
@@ -179,6 +180,35 @@ impl<'de> Deserialize<'de> for ValueSource {
     }
 }
 
+/// A hand-written `Serialize` and `Deserialize` have no derive to read, so the
+/// schema of each is that of the wire struct it goes through. The two sides
+/// are different structs on purpose (the reader tells an explicit `null` from
+/// an absent key), and a format fingerprint hashes both contracts (#2412).
+macro_rules! wire_json_schema {
+    ($ty:ident, $read:ty, $write:ty) => {
+        impl schemars::JsonSchema for $ty {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($ty).into()
+            }
+
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                concat!(module_path!(), "::", stringify!($ty)).into()
+            }
+
+            fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                if generator.contract().is_deserialize() {
+                    <$read>::json_schema(generator)
+                } else {
+                    <$write>::json_schema(generator)
+                }
+            }
+        }
+    };
+}
+
+wire_json_schema!(Column, ColumnWire, ColumnRef<'static>);
+wire_json_schema!(ValueSource, SourceWire, SourceRef<'static>);
+
 #[cfg(test)]
 mod tests {
     use crate::{Identity, OwnedSequence, ValueSource};
@@ -186,6 +216,68 @@ mod tests {
     /// A numbering change carries both sources in the saved plan (#1889):
     /// each round-trips in the column's own spelling, none as an empty map,
     /// and two at once are refused rather than one silently kept.
+    fn properties(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Both codecs are hand-written, so a derive has nothing to read. The
+    /// schemas come from the wire structs instead, and this is what ties them
+    /// to the codecs: every key a column or a source is written with is in the
+    /// write schema, every key the write schema names is written by some
+    /// column, and the reader names the same set (#2412).
+    #[test]
+    fn a_columns_and_a_sources_schemas_name_exactly_the_keys_their_codecs_use() {
+        use crate::fingerprint::contract_schemas;
+        use crate::{Collation, Column, ColumnType, Generated};
+
+        let sources = [
+            ValueSource::None,
+            ValueSource::Default("0".into()),
+            ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+                options: Default::default(),
+            }),
+            ValueSource::Sequence(OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: None,
+                options: Default::default(),
+            }),
+            ValueSource::Generated(Generated {
+                expression: "n".into(),
+                stored: false,
+            }),
+        ];
+        let [read, write] = contract_schemas::<ValueSource>();
+        let mut used = std::collections::BTreeSet::new();
+        for source in &sources {
+            let wire = serde_json::to_value(source).unwrap();
+            used.extend(wire.as_object().unwrap().keys().cloned());
+        }
+        assert_eq!(used, properties(&write));
+        assert_eq!(properties(&read), properties(&write));
+
+        let [read, write] = contract_schemas::<Column>();
+        let mut used = std::collections::BTreeSet::new();
+        for source in sources {
+            let mut column = Column::new("int".parse::<ColumnType>().unwrap()).not_null();
+            column.value_source = source;
+            column.collation = Some(Collation::new("C"));
+            column.description = Some("d".into());
+            column.deprecated = Some("r".into());
+            let wire = serde_json::to_value(&column).unwrap();
+            used.extend(wire.as_object().unwrap().keys().cloned());
+        }
+        assert_eq!(used, properties(&write));
+        assert_eq!(properties(&read), properties(&write));
+    }
+
     #[test]
     fn a_value_source_round_trips_alone_and_refuses_two() {
         for source in [

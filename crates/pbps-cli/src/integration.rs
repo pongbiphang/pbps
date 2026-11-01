@@ -270,6 +270,51 @@ pub fn schema(kind: SchemaKind) -> serde_json::Value {
     v
 }
 
+/// The published documents, each under the file it is archived and checked in as.
+const PUBLISHED: [(SchemaKind, &str); 3] = [
+    (SchemaKind::Declaration, "declaration.schema.json"),
+    (SchemaKind::Config, "pbps.yml.schema.json"),
+    (SchemaKind::Envelope, "envelope.schema.json"),
+];
+
+/// The fingerprint of the published schema set (#2412): a hash of the content
+/// of every published document, computed from the binary's own definitions.
+///
+/// The two stamps are left out. The tool version names a build and the schema
+/// version is the number this fingerprint is compared with, so neither can be
+/// part of what is compared. Everything else is: unlike the persisted formats,
+/// the `description` of a published schema is content an editor shows, and the
+/// versioning rule above counts it (DECISIONS 465). Key order is not, so the
+/// fingerprint follows the same rule as the archive comparison.
+//
+// Nothing outside the tests calls it until the writers record it (#2412 PR 2).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller lands with #2412 PR 2")
+)]
+pub fn schema_set_fingerprint() -> String {
+    set_fingerprint(PUBLISHED.map(|(kind, file)| (file, schema(kind))))
+}
+
+fn set_fingerprint<'a>(
+    documents: impl IntoIterator<Item = (&'a str, serde_json::Value)>,
+) -> String {
+    let documents: Vec<_> = documents
+        .into_iter()
+        .map(|(file, mut document)| {
+            if let Some(object) = document.as_object_mut() {
+                object.remove("x-pbps-tool-version");
+                object.remove("x-pbps-schema-version");
+            }
+            (file, document)
+        })
+        .collect();
+    pbps_model::fingerprint::fingerprint(
+        documents.iter().map(|(file, document)| (*file, document)),
+        pbps_model::fingerprint::Docs::Keep,
+    )
+}
+
 /// The bytes written both by `pbps schema` and by the checked-in copies.
 ///
 /// One function, so the file in the repository and the command's output cannot
@@ -701,6 +746,107 @@ mod tests {
                 "{file} changed under published schema version {SCHEMA_VERSION}; \
                  bump the schema-set version and add its archive, keeping existing archives"
             );
+        }
+    }
+
+    /// The archive at the current number is the set's content by definition
+    /// (SPEC §14.2), so its fingerprint is the binary's. This ties the new
+    /// mechanism to the rule it will replace: while the two agree, "same
+    /// number" and "same fingerprint" say the same thing about published
+    /// content.
+    #[test]
+    fn the_archived_set_at_the_current_number_has_the_binarys_fingerprint() {
+        let archived = set_fingerprint(
+            PUBLISHED.map(|(_, file)| (file, archived_schema(SCHEMA_VERSION, file))),
+        );
+        assert_eq!(archived, schema_set_fingerprint());
+    }
+
+    fn mutated(edit: impl Fn(&mut serde_json::Value)) -> String {
+        set_fingerprint(PUBLISHED.map(|(kind, file)| {
+            let mut document = schema(kind);
+            if kind == SchemaKind::Config {
+                edit(&mut document);
+            }
+            (file, document)
+        }))
+    }
+
+    #[test]
+    fn the_stamps_and_the_key_order_are_not_part_of_the_published_fingerprint() {
+        let current = schema_set_fingerprint();
+        assert_eq!(
+            current,
+            mutated(|d| d["x-pbps-tool-version"] = "99.0.0".into())
+        );
+        assert_eq!(
+            current,
+            mutated(|d| d["x-pbps-schema-version"] = 9999.into())
+        );
+        assert_eq!(
+            current,
+            mutated(|d| {
+                // Reverse the top-level keys.
+                let object = d.as_object_mut().unwrap();
+                let entries: Vec<_> = std::mem::take(object).into_iter().collect();
+                object.extend(entries.into_iter().rev());
+            })
+        );
+    }
+
+    #[test]
+    fn a_change_of_published_content_moves_the_fingerprint_even_a_description() {
+        let current = schema_set_fingerprint();
+        for (what, edit) in [
+            (
+                "a new description",
+                Box::new(|d: &mut serde_json::Value| d["description"] = "reworded".into())
+                    as Box<dyn Fn(&mut serde_json::Value)>,
+            ),
+            (
+                "a new property",
+                Box::new(|d| {
+                    d["properties"]["added_by_the_test"] = serde_json::json!({"type": "string"})
+                }),
+            ),
+            (
+                "a renamed property",
+                Box::new(|d| {
+                    let properties = d["properties"].as_object_mut().unwrap();
+                    let name = properties.keys().next().unwrap().clone();
+                    let value = properties.shift_remove(&name).unwrap();
+                    properties.insert(format!("{name}_renamed"), value);
+                }),
+            ),
+            (
+                "a retyped property",
+                Box::new(|d| {
+                    let properties = d["properties"].as_object_mut().unwrap();
+                    let first = properties.values_mut().next().unwrap();
+                    *first = serde_json::json!({"type": "boolean"});
+                }),
+            ),
+        ] {
+            assert_ne!(current, mutated(edit), "{what}");
+        }
+    }
+
+    #[test]
+    fn the_three_documents_are_each_part_of_the_published_fingerprint() {
+        let current = schema_set_fingerprint();
+        for changed in [
+            SchemaKind::Declaration,
+            SchemaKind::Config,
+            SchemaKind::Envelope,
+        ] {
+            let edited = set_fingerprint(PUBLISHED.map(|(kind, file)| {
+                let mut document = schema(kind);
+                if kind == changed {
+                    document["description"] = "reworded".into();
+                }
+                (file, document)
+            }));
+            assert_ne!(current, edited);
         }
     }
 

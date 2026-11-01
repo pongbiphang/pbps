@@ -6,6 +6,7 @@
 //! stored here — the YAML already has them, and duplicating them would only
 //! create two sources of truth that can disagree.
 
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::name::{ColumnRef, TableName};
@@ -85,7 +86,7 @@ impl std::ops::Deref for ValidIds {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdsFile {
     pub version: u32,
@@ -155,7 +156,7 @@ impl Default for IdsFile {
 /// and whether the table is small enough to move in one transaction, is not
 /// in the declarations or the catalog, so it is recorded intent, as a drop's
 /// reason is (SPEC §6).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Move {
     /// The most rows the move may take. A count seen when planning does not
@@ -182,7 +183,7 @@ pub struct Move {
 /// applies to exactly the change it was written for: an environment on another
 /// type is refused by name and never converted under an expression written for
 /// a different starting point.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Conversion {
     pub from: String,
@@ -199,7 +200,7 @@ pub struct Conversion {
 /// Tombstones live in the identity file rather than in the declaration files, so
 /// the declarations only ever contain what you want and never accumulate zombie
 /// columns over the years (SPEC §4.4).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Tombstone {
     /// The full name at the moment of deletion. An audit has to be able to answer
@@ -214,7 +215,7 @@ pub struct Tombstone {
 }
 
 /// Human intent, kept outside schema equality and sealed with the tombstone.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DropRequirement {
     /// The owning identity, not the address at which the intent was recorded.
@@ -225,7 +226,7 @@ pub struct DropRequirement {
 }
 
 /// Derived before certification; consumers must execute this check or refuse.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DropGuard {
     pub table_uid: Uid,

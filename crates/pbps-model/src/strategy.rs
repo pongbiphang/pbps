@@ -20,6 +20,7 @@
 //! always operate online" stays true across every future revision — so `fmt`
 //! preserves it.
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use crate::name::TableName;
@@ -30,7 +31,9 @@ use crate::name::TableName;
 /// are rejected at load time rather than ignored: a typo that silently became a
 /// no-op would leave the user believing a large table is being altered online
 /// when it is not.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Strategy {
     /// Emit `WITH (ONLINE = ON)` where the dialect and the statement support it.

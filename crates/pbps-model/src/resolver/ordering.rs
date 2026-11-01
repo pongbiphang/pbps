@@ -2,11 +2,14 @@
 
 use super::{Binding, ObjectIdentity};
 use crate::{ChangeSet, ColumnRef, ModuleId, TableName};
+use schemars::JsonSchema;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// A managed surface the existing typed changes can remove or establish.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(
     tag = "kind",
     content = "subject",
@@ -35,7 +38,7 @@ pub enum Surface {
 /// One actual observation. `managed_inputs` is the adapter's mapping of
 /// logical targets to declared identities; it does not parse SQL or invent
 /// an identity decision. The complete logical bindings remain in `bindings`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundSurface {
     pub object: ObjectIdentity,
@@ -43,25 +46,36 @@ pub struct BoundSurface {
     pub managed_inputs: BTreeSet<Surface>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceResolution {
     pub surface: Surface,
     /// None means this surface does not exist, not that a read failed.
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<BoundSurface>"
+    )]
     pub current: Option<BoundSurface>,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<BoundSurface>"
+    )]
     pub desired: Option<BoundSurface>,
 }
 
-fn required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
-    d: D,
-) -> Result<Option<T>, D::Error> {
-    <Option<T> as serde::Deserialize>::deserialize(d)
-}
-
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum OrderReason {
@@ -73,7 +87,9 @@ pub enum OrderReason {
     Restoration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct OrderEdge {
     pub before: usize,
@@ -83,7 +99,7 @@ pub struct OrderEdge {
 
 /// Positions name the final sealed sequence, not a transient planner graph.
 /// Consumers validate this proof against their ChangeSet; they never reorder it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrderingProof {
     version: u32,

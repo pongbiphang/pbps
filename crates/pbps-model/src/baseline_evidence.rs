@@ -2,6 +2,7 @@
 //! No oid accessor exists: callers can record an opaque value or ask this one
 //! check, never use catalog numbers to match identities in a diff or plan.
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use crate::{Schema, TableName};
@@ -14,7 +15,7 @@ use crate::{Schema, TableName};
 ///     let _ = &evidence.tables;
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BaselineEvidence {
     system_identifier: String,

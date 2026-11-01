@@ -8,6 +8,7 @@
 //! The payoff of drawing the line here is that a `Schema` can be parsed,
 //! compared and serialized without any dialect being present at all.
 
+use schemars::JsonSchema;
 use std::fmt;
 use std::str::FromStr;
 
@@ -62,7 +63,16 @@ pub enum TypeParseError {
 /// ```
 ///
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TypeArg {
@@ -140,7 +150,16 @@ impl fmt::Display for RawTypeArg<'_> {
 /// ```
 ///
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub struct ColumnType {
@@ -518,6 +537,8 @@ impl<'de> serde::Deserialize<'de> for CollationName {
         text.parse().map_err(serde::de::Error::custom)
     }
 }
+
+string_json_schema!(TypeRef, CollationName);
 
 impl TypeRef {
     /// A reference from two parts exactly as the engine keeps them, with no

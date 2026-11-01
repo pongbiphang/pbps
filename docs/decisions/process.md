@@ -1687,3 +1687,56 @@ rule cannot see is the same lines landing where master changed their meaning; th
 is the interaction every unrebased pull request already carries to the merge group
 (DECISIONS 502), and a miss costs one ejection, against an observed 1.8 % rate of
 live failures after a full local gate (5 of 271 merge-group runs).
+
+<a id="dec-2412-1"></a>
+
+**DEC-2412.1. A persisted format's fingerprint is a hash of its generated JSON Schema.**
+The three formats that carry a hand-incremented number (the saved plan, the ledger
+snapshot, the published schema set) get a second identity that no one maintains:
+`pbps_model::fingerprint` hashes the JSON Schema that `schemars` generates from the
+types, so a change to a format moves it without anyone remembering to, and no source
+literal exists for two pull requests to collide on. This entry is the mechanism only;
+no version constant, writer or reader changes with it, and the increment rule, the
+recorded fingerprint and the per-release numbers follow in #2412's later pull
+requests. Choices that decide what the fingerprint can and cannot see:
+
+- **Both serde contracts are hashed.** `try_from` and `into` and the hand-written
+  codecs describe one shape for the reader and another for the writer; hashing only
+  one would let a change to the other pass.
+- **Documentation is ignored for the persisted formats and kept for the published
+  schemas.** A doc comment describes code, not a file, so it must not move the
+  fingerprint of a plan. The published documents are content an editor shows and
+  DECISIONS 465 already counts a changed description, so `pbps-cli` hashes them
+  with their descriptions and without the two stamps.
+- **The hashed form is canonical.** Keys, `required` and string-enum values are
+  sorted, the branches of a tagged enum (`oneOf`) are sorted, and the unit variants
+  of an enum are merged into one `enum` whether or not one of them is documented,
+  because schemars writes those two ways. The order of an untagged enum (`anyOf`) is
+  kept, since serde tries its variants in order.
+- **Definitions are inlined**, so renaming a Rust type does not move the fingerprint.
+  Only a type that contains itself keeps a name.
+- **Wire strings say so.** Types that cross JSON as one string are `string` in the
+  schema, by derive where they use `try_from`/`into` and by `string_json_schema!`
+  where `Serialize` is hand-written. `Selector`, `Column` and `ValueSource` have
+  hand-written codecs and take their schema from a mirror of the wire shape, tied to
+  the codec by a test that compares the keys or the output.
+- **Presence is not nullability.** `serde` demands the key of a field with a custom
+  deserializer unless it has a default, whatever its type, and `schemars` cannot see
+  inside the deserializer, so a required-but-nullable field (`required_option`) read
+  as optional and dropping the requirement left the fingerprint unmoved. Such a field
+  carries `crate::presence`'s pair, `schemars(required, schema_with = ..)`: `required`
+  alone would also drop `null` from the type. A test reads the model's sources and
+  fails any `deserialize_with` field without a default or the marker, so a new use
+  cannot drift; a fixture and the real plan and snapshot pin the schema to the codec.
+- **What it cannot see** is a change of meaning that keeps the shape (a string that
+  now means something else, a checksum algorithm), and anything behind
+  `#[schemars(with = "serde_json::Value")]`. The first is the pinned plan checksum's
+  job in the increment-rule test; for the second, a test fails if a covered format
+  gains an opaque field.
+
+The fingerprint is measured by mutation, not asserted: fixture formats with a field
+added, removed, renamed, retyped, made optional or defaulted, a serde tag renamed or
+removed, and a variant added, removed or renamed each move it, and doc comments,
+field order, helper code and type names do not. The same edits applied to every site
+of a fixture schema, and to a sample of the sites of the real plan and snapshot
+schemas, move the hash.
