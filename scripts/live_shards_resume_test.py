@@ -238,6 +238,8 @@ class PlainRun(Harness):
             for field in ("tree", "inputs", "carried"):
                 del row[field]
             path.write_text(json.dumps(row))
+        for directory in output.glob("pg/*/expected"):
+            shutil.rmtree(directory)  # old outputs predate durable assignments too
         result, _ = self.shards_audit(output)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"failed": 0, "passed": 18, "union": "exact"})
@@ -310,10 +312,58 @@ class Automatic(Harness):
         _, output = self.once(env={"FAKE_KILL_PROXY": "1"}, check=0)
         summary, rerun = self.metadata(output)
         original = output / "original"
-        self.assertEqual(self.summary(original)["pg"]["error"], "a shard is empty for the whole suite")
+        self.assertIn("missing invocation receipt", self.summary(original)["pg"]["error"])
         self.assertEqual((summary["pg"]["passed"], summary["pg"]["union"]), (18, "exact"))
         self.assertTrue(all(row["valid"] for row in self.receipts(original).values()))
         self.assertEqual(len({e["run"] for e in self.events()}), 2)
+
+    def test_single_shard_loss_keeps_the_assignment_without_any_result_receipt(self):
+        # Earlier work completes, but the next invocation has no receipt in
+        # any shard. Its durable obligation must still drive the one rerun.
+        for suite in ("pg", "mssql"):
+            with self.subTest(suite=suite):
+                _, output = self.once(shards=1, suite=suite, die="b02",
+                                      env={"FAKE_KILL_PROXY": "1"}, check=0)
+                summary, rerun = self.metadata(output)
+                original = output / "original" / suite / "0"
+                rows = [json.loads(p.read_text()) for p in original.glob("*.json")]
+                self.assertEqual(len(rows), 1, "only the earlier invocation has a receipt")
+                expected = {p.stem: json.loads(p.read_text()) for p in (original / "expected").glob("*.json")}
+                lost = next(key for key, row in expected.items() if "--test" in row["args"])
+                self.assertEqual(expected[lost]["assigned"], B_NAMES)
+                self.assertFalse((original / (lost + ".json")).exists())
+                self.assertIn(lost, self.summary(output / "original")[suite]["error"])
+                self.assertEqual(rerun["names"][suite][lost], B_NAMES)
+                self.assertEqual(summary[suite]["union"], "exact")
+                self.assertEqual(summary[suite]["passed"], 18)
+                self.assertEqual([e["names"] for e in self.events() if e["run"] == rerun["rerun_run_id"] and e["event"] == "start"],
+                                 [B_NAMES])
+
+    def test_assignment_is_not_a_pass_and_disagreement_refuses_a_resume(self):
+        _, output = self.drive(shards=1, check=0)
+        directory = output / "pg/0"
+        path = next(directory.glob("*.json"))
+        key = path.stem
+        original = path.read_text()
+        expected = directory / "expected" / path.name
+        assignment = expected.read_text()
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "missing invocation receipt " + key):
+            self.shards.audit(output / "pg", 1)
+        gaps = {}
+        checked, _ = self.shards.audit(output / "pg", 1, missing=gaps)
+        self.assertEqual(gaps[key], json.loads(expected.read_text())["assigned"])
+        self.assertLess(checked["passed"], 18)
+        # Corrupt or disagreeing assignments are errors, never a missing result.
+        for value in ("{", json.dumps(dict(json.loads(expected.read_text()), inputs="different"))):
+            expected.write_text(value)
+            result, _ = self.drive("--resume", str(output))
+            self.assertNotEqual(result.returncode, 0)
+        expected.write_text(assignment)
+        path.write_text(json.dumps(dict(json.loads(original), listed=["wrong"])))
+        result, _ = self.drive("--resume", str(output))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("receipt disagrees with invocation assignment", result.stderr)
 
     def test_loss_after_the_last_printed_ok_still_proves_nothing_without_a_valid_summary(self):
         _, output = self.once(die="a11", check=0)
@@ -727,6 +777,10 @@ class Chain(Harness):
             if "--lib" in row["args"]:  # every shard agrees, so only the snapshot can contradict them
                 row["carried"]["a98"] = {"status": "ok", "seconds": 1, "run": "x"}
                 path.write_text(json.dumps(row))
+                assignment = path.parent / "expected" / path.name
+                expected = json.loads(assignment.read_text())
+                expected["carried"] = row["carried"]
+                assignment.write_text(json.dumps(expected))
         result, _ = self.drive("--resume", str(second))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("never proved", result.stderr)

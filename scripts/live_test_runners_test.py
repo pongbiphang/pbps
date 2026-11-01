@@ -281,6 +281,49 @@ else:
 
 
 class ShardedExecution(unittest.TestCase):
+    def test_an_exited_leaders_survivor_is_drained_before_ownership_is_retired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child"
+            cleaned = root / "cleaned"
+            command = [sys.executable, "-c", r"""
+import os, signal, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+if os.fork() == 0:
+    def cleanup(*_):
+        (root / "cleaned").touch()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    (root / "child").write_text(str(os.getpid()))
+    while True:
+        time.sleep(0.01)
+while not (root / "child").exists():
+    time.sleep(0.001)
+os._exit(0)
+""", str(root)]
+            fixture = SHARDS.FixtureRun([])
+            try:
+                with mock.patch.object(SHARDS, "container_names", return_value=set()), \
+                     mock.patch.object(SHARDS, "RUNNER_STOP_GRACE_SECONDS", 1):
+                    with fixture:
+                        self.assertEqual(fixture.run(command), 0)
+                        self.assertTrue(cleaned.exists(), "the first-pass writer must finish before reuse")
+                        self.assertEqual(fixture.processes, [])
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(int(child.read_text()), 0)
+            finally:
+                # Test failure must not leave the regression's own sleeper.
+                if child.exists():
+                    try:
+                        os.kill(int(child.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_unconfirmed_group_exit_fails_and_retains_ownership(self):
+        with self.assertRaisesRegex(ValueError, "owned runner process groups did not exit: 1000"):
+            self.stop_fake_runners(["unconfirmed"])
+
     def test_descendant_cleanup_finishes_after_its_runner_leader_exits(self):
         events, elapsed, _ = self.stop_fake_runners(["cleanup"])
         kinds = [event[0] for event in events]
@@ -298,9 +341,11 @@ class ShardedExecution(unittest.TestCase):
 
     def test_runner_shutdown_uses_one_deadline_and_releases_the_registry_lock(self):
         events, elapsed, _ = self.stop_fake_runners(["blocked", "blocked"])
-        self.assertEqual([event[0] for event in events], ["term", "term", "wait", "wait", "kill", "kill"])
+        self.assertEqual([event[0] for event in events], ["term", "term", "wait", "wait", "kill", "kill",
+                                                            "wait", "leader-exit", "wait", "leader-exit"])
         waits = [event[2] for event in events if event[0] == "wait"]
-        self.assertEqual(waits, [0.2, 0])
+        self.assertEqual(waits[:2], [0.2, 0])
+        self.assertEqual(waits[2:], [0.2, 0.2])
         self.assertAlmostEqual(elapsed, 0.2)
 
     def test_already_gone_runner_groups_need_no_escalation(self):
@@ -323,7 +368,7 @@ class ShardedExecution(unittest.TestCase):
                 group["term"] = clock[0]
             elif sig == signal.SIGKILL:
                 events.append(("kill", pid, clock[0]))
-                group["alive"] = False
+                group["alive"] = group["behavior"] == "unconfirmed"
                 return
             elif group["behavior"] == "cleanup" and group["term"] is not None:
                 if clock[0] >= group["term"] + 0.05:
@@ -338,9 +383,11 @@ class ShardedExecution(unittest.TestCase):
             self.assertTrue(fixture.lock.acquire(blocking=False))
             try:
                 self.assertTrue(fixture.stopped)
+                if groups[process.pid].get("reaped"):
+                    return 0
                 events.append(("wait", process.pid, timeout))
-                if groups[process.pid]["behavior"] != "blocked":
-                    fixture.processes.remove(process)
+                if groups[process.pid]["behavior"] != "blocked" or not groups[process.pid]["alive"]:
+                    groups[process.pid]["reaped"] = True
                     events.append(("leader-exit", process.pid, clock[0]))
                     return 0
             finally:
@@ -361,7 +408,11 @@ class ShardedExecution(unittest.TestCase):
              mock.patch.object(SHARDS.os, "killpg", side_effect=send), \
              mock.patch.object(SHARDS.time, "monotonic", side_effect=lambda: clock[0]), \
              mock.patch.object(SHARDS.time, "sleep", side_effect=sleep):
-            fixture.stop()
+            try:
+                fixture.stop()
+            except ValueError:
+                self.assertEqual([p.pid for p in fixture.processes], list(groups))
+                raise
         return events, clock[0], fixture
 
     def test_default_ports_avoid_ephemeral_and_canonical_runner_ports(self):

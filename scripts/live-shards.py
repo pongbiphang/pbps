@@ -127,6 +127,7 @@ class FixtureRun:
         self.names = set(names)
         self.processes = []
         self.lock = Lock()
+        self.draining = Lock()
         self.stopped = False
         self.handlers = {}
 
@@ -145,15 +146,34 @@ class FixtureRun:
             process = subprocess.Popen(command, start_new_session=True, **kwargs)
             self.processes.append(process)
         try:
-            return process.wait()
+            # Leave the leader waitable until draining starts: its PID still
+            # anchors ownership of the group even when only descendants run.
+            try:
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            except ChildProcessError:
+                pass  # stop() already drained and reaped this owned group.
         finally:
-            with self.lock:
-                self.processes.remove(process)
+            self.drain([process])
+        return process.wait()
 
     def stop(self):
         with self.lock:
             self.stopped = True
             processes = list(self.processes)
+        self.drain(processes)
+
+    def drain(self, processes):
+        # Workers and signal cleanup can observe the same exited leader. Only
+        # one drainer may signal it; retirement requires confirmed group exit.
+        with self.draining:
+            with self.lock:
+                processes = [p for p in processes if p in self.processes]
+            self.drain_groups(processes)
+            with self.lock:
+                for process in processes:
+                    self.processes.remove(process)
+
+    def drain_groups(self, processes):
         if not processes:
             return
         deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
@@ -170,6 +190,25 @@ class FixtureRun:
         # A runner can exit before its TLS helper finishes removing its own
         # container. Keep the whole group alive for cleanup (DEC-2366.1).
         groups = [process.pid for process in processes]
+        groups = self.wait_groups(groups, deadline)
+        for pid in groups:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        killed_deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
+        for process in processes:
+            if process.pid in groups:
+                try:
+                    process.wait(timeout=max(0, killed_deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+        remaining = self.wait_groups(groups, killed_deadline)
+        require(not remaining, "owned runner process groups did not exit: "
+                + ", ".join(map(str, remaining)))
+
+    @staticmethod
+    def wait_groups(groups, deadline):
         while groups:
             remaining = []
             for pid in groups:
@@ -183,11 +222,7 @@ class FixtureRun:
             if not groups or delay <= 0:
                 break
             time.sleep(min(0.05, delay))
-        for pid in groups:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        return groups
 
     def interrupt(self, sig, frame):
         for handled in self.handlers:
@@ -388,6 +423,28 @@ def check_row(row, path):
             f"malformed result in receipt {path}")
 
 
+def shard_rows(directory):
+    """Receipts plus durable pre-execution obligations (DEC-2584.1)."""
+    rows = {p.stem: read_json(p, "receipt") for p in directory.glob("*.json")}
+    for path in (directory / "expected").glob("*.json"):
+        expected = read_json(path, "invocation assignment")
+        fields = {"args", "identity", "listed", "groups", "assigned", "pinned", "tree", "inputs", "carried"}
+        require(isinstance(expected, dict) and set(expected) == fields,
+                f"malformed invocation assignment {path}")
+        pending = dict(expected, reported={}, seconds=0.0, valid=False, interrupted=True)
+        check_row(pending, path)
+        row = rows.get(path.stem)
+        if row is not None:
+            check_row(row, path.parent.parent / path.name)
+            require(row["tree"] == expected["tree"] and row["inputs"] == expected["inputs"],
+                    f"receipt {path.stem} was written for another head or inputs")
+        require(row is None or all(row.get(k) == v for k, v in expected.items()),
+                f"receipt disagrees with invocation assignment {path}")
+        if row is None:
+            rows[path.stem] = dict(pending, pending=True)
+    return rows
+
+
 def load_inherited(previous, manifest, tree, inputs, suites):
     """The evidence a resumed run was itself given, so a chain keeps every link.
 
@@ -462,12 +519,14 @@ def load_resume(previous, tree, inputs, suites, flakes):
                     continue
                 raise ValueError(f"unconfirmed TLS fixture removal: {pending}")
         rows = {}
-        for path in sorted(directory.glob("*/*.json")):
-            row = read_json(path, "receipt")
-            check_row(row, path)
-            require(row["tree"] == tree and row["inputs"] == inputs,
-                    f"receipt {path} was written for another head or inputs")
-            rows.setdefault(path.stem, []).append(row)
+        for shard in sorted(directory.iterdir()):
+            if not shard.is_dir():
+                continue
+            for key, row in shard_rows(shard).items():
+                check_row(row, shard / key)
+                require(row["tree"] == tree and row["inputs"] == inputs,
+                        f"receipt {shard / key} was written for another head or inputs")
+                rows.setdefault(key, []).append(row)
         before = inherited.get(suite, {})
         for key, group in rows.items():
             first = group[0]
@@ -606,7 +665,8 @@ def cargo_proxy(args):
     invocation = invocation_id(args)
     # TLS repeats one exact command with three different trust inputs. Preserve
     # each occurrence as its own obligation instead of overwriting its receipt.
-    occurrence = len(list(root.glob(invocation + "-*.json")))
+    occurrence = len(set(p.stem for directory in (root, root / "expected")
+                         for p in directory.glob(invocation + "-*.json")))
     key = f"{invocation}-{occurrence}"
     enumeration = subprocess.run([real, *cargo, *listing, "--list", "--format=pretty", "--color=never"],
                                  text=True, stdout=subprocess.PIPE)
@@ -619,6 +679,16 @@ def cargo_proxy(args):
     groups = partition(remaining, count, identity, read_weights(env.get("PBPS_LIVE_WEIGHTS")), pinned)
     verify_express(groups)
     assigned = groups[index]
+    # Publish the obligation before a test (or its proxy) can be killed. A
+    # missing final receipt must remain visible even on a single-shard run.
+    tree = tree_identity(ROOT)
+    expected = {"args": args, "identity": identity, "listed": names, "groups": groups,
+                "assigned": assigned, "pinned": pinned,
+                "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
+                "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried}
+    directory = root / "expected"
+    directory.mkdir(exist_ok=True)
+    write_atomic(directory / (key + ".json"), json.dumps(expected, indent=2) + "\n")
     print(f"shard {index}/{count} {key}: {len(assigned)}/{len(names)} tests", flush=True)
     if carried and not assigned:
         # A caller that checks per-test output sees nothing for a name proven
@@ -718,8 +788,7 @@ def shard(suite, extra):
 
 
 def audit(suite_root, count, *, expected_invocations=None, missing=None):
-    receipts = [{p.stem: json.loads(p.read_text()) for p in (suite_root / str(i)).glob("*.json")}
-                for i in range(count)]
+    receipts = [shard_rows(suite_root / str(i)) for i in range(count)]
     if expected_invocations is not None:
         require(all(len(shard) == expected_invocations for shard in receipts),
                 "unexpected invocation receipt count")
@@ -757,6 +826,8 @@ def audit(suite_root, count, *, expected_invocations=None, missing=None):
             require(row["assigned"] == row["groups"][index], "assignment differs from partition")
             lost = (not row["valid"] and row.get("interrupted") is True
                     and bool(row["assigned"]) and set(row["reported"]) <= set(row["assigned"]))
+            require(missing is not None or not row.get("pending"),
+                    f"missing invocation receipt {key}: " + ", ".join(row["assigned"]))
             require(row["valid"] or missing is not None and lost,
                     "libtest reports or summary are incomplete")
             require(set(row["reported"]) <= set(row["assigned"]), "unassigned test reported a result")
