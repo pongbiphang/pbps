@@ -5211,11 +5211,19 @@ fn cmd_plan(
 
         if !json {
             println!("Baseline: {}", base.description);
+            let revision = match source {
+                baseline::Source::Git { rev } => {
+                    base.git_sha.as_ref().map(|sha| (rev.as_str(), sha.raw()))
+                }
+                baseline::Source::File(_) | baseline::Source::Empty => None,
+            };
             print!(
                 "{}",
-                report::plan(
+                report::offline_plan(
                     &cs,
-                    &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?
+                    &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?,
+                    revision,
+                    &base.description,
                 )
             );
             // What the target's catalog would add to the order, and an offline

@@ -1113,6 +1113,33 @@ pub fn summary(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
     out
 }
 
+/// An empty offline comparison describes a revision, not a deployed target.
+/// Keep the ordinary formatter shared with connected plans unchanged.
+pub fn offline_plan(
+    cs: &ChangeSet,
+    names: &PlanNames<'_>,
+    revision: Option<(&str, &str)>,
+    description: &str,
+) -> String {
+    if !cs.is_empty() {
+        return plan(cs, names);
+    }
+    let comparison = match revision {
+        Some((name, sha)) => format!(
+            "{} ({})",
+            Escaped(name),
+            Escaped(&sha.chars().take(7).collect::<String>())
+        ),
+        None => Escaped(description).to_string(),
+    };
+    format!(
+        "No changes against {comparison}.\n\
+         A deployed environment may be behind. Compare from its deployed commit with \
+         `pbps plan --since <commit>`, or query it with `pbps plan --db <connection>` \
+         / `pbps plan --env <name>`.\n"
+    )
+}
+
 pub fn plan(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
     if cs.is_empty() {
         return "No changes.\n".to_owned();
@@ -3378,5 +3405,67 @@ mod tests {
                 assert_eq!(change.table(), Some(&table));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod offline_base_tests {
+    use super::*;
+
+    #[test]
+    fn offline_no_change_text_names_and_escapes_its_comparison() {
+        let cs = ChangeSet::default();
+        let ids = pbps_model::IdsFile::default();
+        let names = PlanNames::of(&cs.changes, &ids).unwrap();
+        for revision in ["HEAD", "release\nforged\u{1b}[31m"] {
+            let text = offline_plan(&cs, &names, Some((revision, "1234567890abcdef")), "unused");
+            assert!(
+                text.starts_with(&format!(
+                    "No changes against {} (1234567).",
+                    Escaped(revision)
+                )),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 2, "{text}");
+            assert!(!text.contains('\u{1b}'));
+            for needed in [
+                "A deployed environment may be behind",
+                "--since <commit>",
+                "plan --db",
+                "plan --env",
+            ] {
+                assert!(text.contains(needed), "{needed}: {text}");
+            }
+        }
+        let snapshot = offline_plan(&cs, &names, None, "snapshot\nfile");
+        assert!(
+            snapshot.starts_with("No changes against snapshot\\nfile."),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("HEAD"), "{snapshot}");
+    }
+
+    #[test]
+    fn connected_no_change_text_and_nonempty_offline_text_keep_the_existing_formatter() {
+        let ids = pbps_model::IdsFile::default();
+        let cs = ChangeSet::default();
+        let names = PlanNames::of(&cs.changes, &ids).unwrap();
+        assert_eq!(plan(&cs, &names), "No changes.\n");
+
+        let cs = ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::CreateRole {
+                uid: "r_aaaaaa".parse().unwrap(),
+                name: "reader".into(),
+            })],
+        };
+        let mut role_ids = pbps_model::IdsFile::default();
+        role_ids
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "reader".into());
+        let names = PlanNames::of(&cs.changes, &role_ids).unwrap();
+        assert_eq!(
+            offline_plan(&cs, &names, Some(("HEAD", "abcdef0123")), "unused"),
+            plan(&cs, &names)
+        );
     }
 }

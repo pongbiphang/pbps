@@ -2191,7 +2191,11 @@ fn respelling_a_type_produces_no_plan() {
     d.table("table: dbo.t\ncolumns:\n  id: {type: BIGINT, nullable: false}\n");
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("No changes against HEAD ("),
+        "{}",
+        stdout(&o)
+    );
 }
 
 /// The offline plan loads its declarations before it knows the dialect, and
@@ -2220,7 +2224,11 @@ fn an_offline_plan_spells_a_routine_the_same_way_on_both_sides() {
     f("int");
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("No changes against HEAD ("),
+        "{}",
+        stdout(&o)
+    );
 
     // And a signature that only differs in spelling from another's is a
     // collision the offline plan reports, not a second module it plans for.
@@ -7741,7 +7749,11 @@ fn reformatting_a_definition_is_not_a_change() {
     );
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("No changes."), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("No changes against HEAD ("),
+        "{}",
+        stdout(&o)
+    );
 }
 
 /// SQL Server keeps tables and modules in one namespace per schema, so a view
@@ -24013,4 +24025,98 @@ fn deployment_services1165_offline_bytes_and_early_refusals_stay_unchanged() {
 #[ignore = "needs live SQL Server"]
 fn deployment_services1165_command_contracts_on_mssql() {
     deployment_services1165::connected(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+mod offline_comparison_base {
+    use super::*;
+
+    fn succeeds(output: Output) -> Output {
+        assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+        output
+    }
+
+    #[test]
+    fn offline_plan_comparison_base_is_named_with_deployment_alternatives() {
+        let d = Demo::new("offline-base2603");
+        d.table(ONE_COLUMN);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&d.root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", stderr(&out));
+            stdout(&out).trim().to_owned()
+        };
+        let base = git(&["rev-parse", "HEAD"]);
+        let out = succeeds(d.run(&["plan", "--no-dev"]));
+        assert!(
+            stdout(&out).contains(&format!("No changes against HEAD ({}).", &base[..7])),
+            "{}",
+            stdout(&out)
+        );
+        // Move HEAD without changing the schema: --since must show the requested
+        // older commit, rather than whichever commit is current when rendered.
+        std::fs::write(d.root.join("notes.txt"), "later commit\n").unwrap();
+        d.commit();
+        let since = &base[..12];
+        for args in [
+            vec!["plan", "--no-dev"],
+            vec!["plan", "--no-dev", "--since", since],
+        ] {
+            let out = succeeds(d.run(&args));
+            let text = stdout(&out);
+            let (label, sha) = if args.len() > 2 {
+                (since.to_owned(), base.clone())
+            } else {
+                ("HEAD".into(), git(&["rev-parse", "HEAD"]))
+            };
+            assert!(
+                text.contains(&format!("No changes against {label} ({}).", &sha[..7])),
+                "{text}"
+            );
+            for needed in [
+                "A deployed environment may be behind",
+                "--since <commit>",
+                "plan --db",
+                "plan --env",
+            ] {
+                assert!(text.contains(needed), "{needed}: {text}");
+            }
+            let mut json_args = args.clone();
+            json_args.extend(["--format", "json"]);
+            let value: serde_json::Value =
+                serde_json::from_str(&stdout(&succeeds(d.run(&json_args)))).unwrap();
+            assert_eq!(
+                value["data"],
+                serde_json::json!({
+                    "baseline": format!("git {label} (1 objects)"),
+                    "changes": 0, "tables": 0, "modules": 0, "roles": 0, "risks": []
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_plan_with_changes_does_not_add_no_change_comparison_advice() {
+        let d = Demo::new("offline-changes2603");
+        d.table(ONE_COLUMN);
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  label: {type: varchar(20)}\n");
+        let out = succeeds(d.run(&["plan", "--no-dev"]));
+        let text = stdout(&out);
+        assert!(
+            text.contains("1 change(s)") && text.contains("label"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No changes") && !text.contains("A deployed environment may be behind"),
+            "{text}"
+        );
+    }
 }
