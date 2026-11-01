@@ -153,6 +153,10 @@ is why the pipeline has two plan-shaped stages rather than one:
   queried. It answers *what will this do to prod?* The artifact it produces is
   what the approver reads, and `apply` runs only that artifact.
 
+For PostgreSQL deployments after merging parallel schema branches, select a
+resolver and keep connected rehearsal on; see the
+[merge workflow and late-bound body limit](../README.md#merging-parallel-schema-branches).
+
 `apply` is manual, and what the human confirms is the deployment-layer plan —
 not whether the change is a good idea. That was settled in the merge request.
 

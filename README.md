@@ -164,6 +164,70 @@ also need failed attempts opt into `on_apply_attempt`; its payload starts with
 ledger entry or error. The separate key is the migration boundary, so enabling
 failed-attempt auditing cannot change what an existing deployment hook receives.
 
+### Merging parallel schema branches
+
+Merge the YAML and `schema.ids.json`, resolve conflicts, then commit the result.
+One connected plan compares all merged declarations against the target. Git
+conflicts on different edits to the same UID's line; `validate` rejects two UIDs
+naming one object. When coalescing identical additions, retain the identity
+already deployed. When Git provenance is available, the
+[deployed-commit ancestry guard](docs/decisions/plan.md#dec-2397-1) requires HEAD
+to contain the target's deployed commit before management removals. A statement
+failure in transactional apply rolls back the whole plan.
+
+After merging, run `validate`, then a connected plan with a resolver selected
+and rehearsal on. This PostgreSQL server setup was measured on 16 and 18:
+
+```yaml
+dialect: postgres
+resolve_with: scratch
+resolvers:
+  scratch:
+    kind: server
+    url_env: SCRATCH_URL
+environments:
+  prod:
+    url_env: PROD_URL
+    fingerprint_key_env: PROD_FINGERPRINT_KEY
+    rehearse: true
+```
+
+Set `PROD_URL` to the target connection and `SCRATCH_URL` to a separate scratch
+cluster. The measured setup used a superuser on that scratch cluster for
+run-owned cleanup. See [resolver setup](docs/SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
+for account layouts and fingerprint keys; connected rehearsal itself needs no
+fingerprint key.
+
+```bash
+pbps validate
+pbps plan --env prod --resolve-with scratch --out plan.json --sql plan.sql
+```
+
+Measured on PostgreSQL 16 and 18, connected rehearsal rejected a new view
+reading a column renamed by another branch, and a new SQL-standard `RETURN`
+function reading a dropped column, before writing plan or SQL files. For example:
+
+```text
+error: the rehearsal scratch rejected statement 2 of the plan:
+...
+column "name" does not exist
+```
+
+Rehearsal defaults on for a selected PostgreSQL resolver. `rehearse: false` or
+`--no-rehearse` turns it off. It is separate from the `--dev` preview path; see
+[connected rehearsal](docs/SPEC.md#the-connected-rehearsal-postgresql).
+
+A plain offline `pbps plan` defaults to HEAD: after committing the merge it can
+report `No changes.` Use `pbps plan --since <deployed-commit>` for an offline
+comparison, or the connected plan above for the actual target.
+
+Late-bound references in PL/pgSQL bodies can still pass rehearsal, apply and
+`verify`, then fail on the first call. Exercise application entry points in your
+own tests, including SQL Server's [procedure references deferred until execution](docs/RESOLVER-MSSQL.md#1-what-binds-at-creation-and-where-it-is-recorded).
+
+UID-aware Git merging for `schema.ids.json` is tracked in
+[#2600](https://github.com/pongbiphang/pbps/issues/2600).
+
 ## What pbps deliberately does not do
 
 Every item here is a request that arrives sounding reasonable. They are refused
@@ -246,8 +310,8 @@ from `pbps.yml`, overriding environment/project defaults. Reach for a
 `kind: docker` entry first: pbps starts a scratch PostgreSQL from its image
 for the run and removes it afterwards. A `kind: server` entry, a scratch
 server you supply, is for targets no community image matches and for CI
-without a container runtime. A resolver runs only when a plan needs it; its
-plan is published after a fresh recheck of the target, and existing planning
+without a container runtime. Binding resolution runs only when a plan needs it;
+its plan is published after a fresh recheck of the target, and existing planning
 checks apply to it as to any other. `pbps explain --plan` shows its evidence
 from the file alone: which entry ran, on what scratch, and what it sealed.
 `pbps apply --plan` applies it with the ordinary approval command, rechecking
@@ -255,6 +319,9 @@ that evidence on the target before its first statement and after its last;
 it needs no resolver, scratch or Docker (#616). See
 [SPEC §9.3.2](docs/SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 for configuration and [the delivery steps](docs/RESOLVER-DELIVERY.md).
+
+For the post-merge workflow and connected rehearsal, see
+[Merging parallel schema branches](#merging-parallel-schema-branches).
 
 For PostgreSQL authorization, prefer these layouts in order:
 
