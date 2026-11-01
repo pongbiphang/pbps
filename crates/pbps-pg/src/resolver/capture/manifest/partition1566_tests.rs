@@ -246,3 +246,136 @@ fn inherited_not_null_ownership_requires_the_exact_qualified_user_column() {
         ObjectOwnership::Unqualified
     );
 }
+
+fn default_record(captured: &mut CapturedInputs, table: &TableName) -> ObjectIdentity {
+    let column = identity("column", &["id"], vec![relation_identity(table)]);
+    let attrdef = identity("pg_attrdef", &[], vec![column.clone()]);
+    captured
+        .inputs
+        .insert(attrdef.clone(), input(BTreeMap::new()));
+    captured.inputs.insert(
+        identity("pg_depend", &["a"], vec![attrdef.clone(), column]),
+        input(BTreeMap::new()),
+    );
+    attrdef
+}
+
+#[test]
+fn partition_own_defaults_have_independent_surface_ownership() {
+    for major in [16, 18] {
+        let (mut captured, mut schema, ids) = fixture(major);
+        let root = TableName::new("app", "root");
+        let leaf = TableName::new("app", "leaf");
+        schema
+            .tables
+            .get_mut(&root)
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("4".into());
+        schema
+            .tables
+            .get_mut(&leaf)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .entry("id".into())
+            .or_default()
+            .default = Some("app.f(1)".into());
+        let parent_default = default_record(&mut captured, &root);
+        let own_default = default_record(&mut captured, &leaf);
+        let owners = classify_attrdefs(&captured, &schema, &ids).unwrap();
+        assert_eq!(
+            owners[&parent_default],
+            ObjectOwnership::Surface(Surface::Default(root.column("id")))
+        );
+        let owner = ObjectOwnership::Surface(Surface::Default(leaf.column("id")));
+        assert_eq!(owners[&own_default], owner);
+        let column = identity("column", &["id"], vec![relation_identity(&leaf)]);
+        assert_eq!(
+            owners[&identity("pg_depend", &["a"], vec![own_default, column.clone()])],
+            owner
+        );
+        assert_eq!(
+            owners[&column],
+            ObjectOwnership::Surface(Surface::Table(leaf))
+        );
+    }
+}
+
+#[test]
+fn inherited_default_copies_keep_the_partition_table_owner_without_an_own_surface() {
+    for major in [16, 18] {
+        let (mut captured, mut schema, ids) = fixture(major);
+        let root = TableName::new("app", "root");
+        let leaf = TableName::new("app", "leaf");
+        schema
+            .tables
+            .get_mut(&root)
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("4".into());
+        let copied = default_record(&mut captured, &leaf);
+        let owners = classify_attrdefs(&captured, &schema, &ids).unwrap();
+        assert_eq!(
+            owners[&copied],
+            ObjectOwnership::Surface(Surface::Table(leaf.clone()))
+        );
+        assert!(
+            !owners.values().any(
+                |owner| *owner == ObjectOwnership::Surface(Surface::Default(leaf.column("id")))
+            )
+        );
+
+        // No declared expression in the ancestry means no authority for an
+        // extra catalog default, even on a qualified inherited column.
+        schema
+            .tables
+            .get_mut(&root)
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::None;
+        assert_eq!(
+            classify_attrdefs(&captured, &schema, &ids).unwrap()[&copied],
+            ObjectOwnership::Unqualified
+        );
+    }
+}
+
+#[test]
+fn partition_defaults_require_the_recorded_and_physical_column_root() {
+    for major in [16, 18] {
+        let (mut captured, mut schema, mut ids) = fixture(major);
+        let leaf = TableName::new("app", "leaf");
+        schema
+            .tables
+            .get_mut(&leaf)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .entry("id".into())
+            .or_default()
+            .default = Some("3".into());
+        default_record(&mut captured, &leaf);
+        let column = identity("column", &["id"], vec![relation_identity(&leaf)]);
+        let physical = captured.inputs.remove(&column).unwrap();
+        assert!(classify_attrdefs(&captured, &schema, &ids).is_err());
+        captured.inputs.insert(column.clone(), physical);
+        captured.inputs.get_mut(&column).unwrap().properties.insert(
+            "attrelid".into(),
+            json!(relation_identity(&TableName::new("app", "foreign"))),
+        );
+        assert!(classify_attrdefs(&captured, &schema, &ids).is_err());
+        ids.columns.clear();
+        assert!(classify_attrdefs(&captured, &schema, &ids).is_err());
+    }
+}

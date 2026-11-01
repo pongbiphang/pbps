@@ -5721,3 +5721,23 @@ change the catalog property rules or their version, bind desired definitions,
 or add an execution or scratch lifecycle boundary. Native contracts cover
 direct/role/public hiding, off-path schema controls, security-definition
 blindness, genuine absence and restoration on both scratch routes.
+
+
+<a id="dec-1587-1"></a>
+
+**DEC-1587.1. A partition's own default has its own binding surface; an
+inherited copy belongs to its partition's table.** Capture ownership consumes
+`Table::expression_columns`, as the other resolver inventories already do.
+Its `pg_attrdef` address is qualified through its recorded column or the
+validated inherited-column root, then owned as `Surface::Default` at that
+partition and column. The internal/automatic dependency cannot replace this
+explicit surface with its containing column's owner.
+
+Without an own expression, a captured copy authorized by an ancestor's
+expression belongs to the partition's table UID, following DEC-1566.1 for
+inherited columns. It creates no independent default surface. An extra
+default without that declared ancestry remains unqualified; missing column
+provenance or UID authority supplies no ownership. Ordinary defaults and
+generated expressions use the same inventory, while a serial's engine-owned
+`nextval` keeps its column owner. This changes ownership of existing captured
+rows, not their properties, decoder coverage or wire formats.

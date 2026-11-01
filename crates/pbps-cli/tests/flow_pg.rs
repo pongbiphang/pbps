@@ -1363,6 +1363,12 @@ fn resolver_publishes_its_rechecked_plan_in_the_exact_order() {
 }
 
 #[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn resolver_captures_partition_own_defaults_without_inventing_inherited_surfaces() {
+    resolver_publication::partition_own_default_bindings(&server());
+}
+
+#[test]
 #[ignore = "needs live postgres"]
 fn resolver_plans_pass_the_ordinary_connected_checks() {
     resolver_publication::ordinary_checks(&old_server(), true);

@@ -1992,3 +1992,158 @@ mod object_grants1454;
 
 #[path = "partition1566.rs"]
 mod partition1566;
+
+/// An arriving overload changes an own default's binding while a sibling's
+/// inherited copy remains part of that sibling's table, never a new surface.
+pub fn partition_own_default_bindings(server: &str) {
+    use pbps_model::resolver::{ObjectIdentity, ObjectOwnership, PlanAnalysis, Surface};
+    use pbps_model::{SavedPlan, TableName};
+
+    let own = OwnDatabase::new(server, "partition-own-default-1587");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1; \
+         CREATE TABLE app.tree(k integer NOT NULL,n numeric DEFAULT 4) PARTITION BY RANGE(k); \
+         CREATE TABLE app.p PARTITION OF app.tree FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE app.p ALTER COLUMN n SET DEFAULT app.f(1); \
+         CREATE TABLE app.q PARTITION OF app.tree FOR VALUES FROM (10) TO (20)",
+    );
+    let scratch = Confined::new(server);
+    let d = Demo::new("partition-own-default-1587");
+    successful(run(&d, &["pull", "--db", connection], None));
+    d.commit();
+    successful(run(
+        &d,
+        &[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt partition defaults",
+        ],
+        None,
+    ));
+    // Pull preserves the old overload's inserted numeric cast. State the
+    // uncast call the arriving integer overload is meant to capture.
+    std::fs::write(
+        d.dir.join("schema/app.tree.yml"),
+        "table: app.tree\ncolumns:\n  k: {type: integer, nullable: false}\n  n: {type: numeric, default: '4'}\npartition_by: [k]\npartitions:\n  p:\n    from: [0]\n    to: [10]\n    columns:\n      n: {default: app.f(1)}\n  q:\n    from: [10]\n    to: [20]\n",
+    ).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.f%28integer%29.function.yml"),
+        "function: app.f(integer)\npublic_execute: true\ndefinition: |-\n  \
+         (integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1 * 10\n",
+    )
+    .unwrap();
+    successful(run(&d, &["plan", "--no-dev"], None));
+    d.commit();
+    configure(&d);
+    successful(run(
+        &d,
+        &[
+            "key",
+            "generate",
+            "--out",
+            d.dir.join("key").to_str().unwrap(),
+        ],
+        None,
+    ));
+    let targets = Targets {
+        target: connection,
+        scratch: &scratch.connection,
+    };
+    let artifact = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
+    let saved: SavedPlan = serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+    let PlanAnalysis::Resolved(evidence) = &saved.analysis else {
+        panic!("not resolved: {saved:?}")
+    };
+    evidence.validate(&saved.changes).unwrap();
+    let p = TableName::new("app", "p");
+    let q = TableName::new("app", "q");
+    let surface = Surface::Default(p.column("n"));
+    let resolved = evidence
+        .surfaces()
+        .iter()
+        .find(|r| r.surface == surface)
+        .unwrap();
+    let created: ObjectIdentity = serde_json::from_value(serde_json::json!({
+        "class": "pg_proc", "name": ["app", "f"], "signature": [{
+            "class": "pg_type", "name": ["pg_catalog", "int4"], "signature": []
+        }]
+    }))
+    .unwrap();
+    assert!(
+        resolved
+            .desired
+            .as_ref()
+            .unwrap()
+            .bindings
+            .iter()
+            .any(|b| b.target == created)
+    );
+    assert!(
+        !resolved
+            .current
+            .as_ref()
+            .unwrap()
+            .bindings
+            .iter()
+            .any(|b| b.target == created)
+    );
+    assert!(
+        !evidence
+            .surfaces()
+            .iter()
+            .any(|r| r.surface == Surface::Default(q.column("n"))),
+        "an inherited copy has no own binding surface: {saved:?}"
+    );
+    let attrdef = |name: &str| -> ObjectIdentity {
+        serde_json::from_value(serde_json::json!({
+            "class": "pg_attrdef", "name": [], "signature": [{
+                "class": "column", "name": ["n"], "signature": [{
+                    "class": "pg_class", "name": ["app", name], "signature": []
+                }]
+            }]
+        }))
+        .unwrap()
+    };
+    for manifest in [evidence.before(), evidence.after()] {
+        for (name, owner) in [
+            ("p", ObjectOwnership::Surface(surface.clone())),
+            ("q", ObjectOwnership::Surface(Surface::Table(q.clone()))),
+        ] {
+            let record = manifest
+                .prerequisites()
+                .iter()
+                .find(|r| r.object == attrdef(name))
+                .unwrap();
+            assert_eq!(record.ownership, owner, "{name}: {saved:?}");
+        }
+    }
+    successful(run(
+        &d,
+        &[
+            "apply",
+            "--env",
+            "prod",
+            "--plan",
+            artifact.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&artifact),
+            "--allow",
+            "constraint",
+        ],
+        Some(&targets),
+    ));
+    on_server(
+        connection,
+        "INSERT INTO app.p(k) VALUES (1); INSERT INTO app.q(k) VALUES (11)",
+    );
+    assert_eq!(scalar(connection, "SELECT n::bigint FROM app.p"), 10);
+    assert_eq!(scalar(connection, "SELECT n::bigint FROM app.q"), 4);
+    successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
+}
