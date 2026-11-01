@@ -30,26 +30,56 @@ A_NAMES = [f"a{i:02}" for i in range(12)]
 B_NAMES = [f"b{i:02}" for i in range(6)]
 
 FAKE_CARGO = '''#!{python}
-import json, os, sys
+import json, os, signal, sys, time
+from pathlib import Path
 args = sys.argv[1:]
 names = json.loads(os.environ["FAKE_A"]) if "--lib" in args else json.loads(os.environ["FAKE_B"])
 if "--test" in args and args[args.index("--test") + 1] == "tls":
     names = [args[args.index("--exact") + 1]]
 if "--list" in args:
+    if args[args.index("-p") + 1] != "demo":
+        names = json.loads(os.environ.get("FAKE_EXPRESS", "{{}}"))[args[args.index("-p") + 1]]
     print("\\n".join(n + ": test" for n in names))
     print(f"\\n{{len(names)}} tests, 0 benchmarks")
     sys.exit(0)
 ran = args[args.index("--color=never") + 1:]
 fail = set(json.loads(os.environ.get("FAKE_FAIL", "[]")))
 die = os.environ.get("FAKE_DIE")
+state = (Path(os.environ["FAKE_LOSS_STATE"] + "-" + os.environ["PBPS_LIVE_SUITE"])
+         if os.environ.get("FAKE_LOSS_STATE") else None)
+rerun = state is not None and state.exists() and state.read_text() != os.environ["PBPS_LIVE_RUN"]
+if rerun:
+    if os.environ.get("FAKE_FAIL_ONCE"):
+        fail.clear()
+    fail |= set(json.loads(os.environ.get("FAKE_FAIL_AFTER_LOSS", "[]")))
+trace = os.environ.get("FAKE_TRACE")
+def record(event):
+    if trace:
+        with open(trace, "a") as log:
+            log.write(json.dumps({{"event": event, "at": time.monotonic(), "run": os.environ["PBPS_LIVE_RUN"],
+                                  "suite": os.environ["PBPS_LIVE_SUITE"], "shard": os.environ["PBPS_LIVE_SHARD"],
+                                  "names": ran}}) + "\\n")
+record("start")
 print(f"\\nrunning {{len(ran)}} tests", flush=True)
 for name in ran:
     print(f"test {{name}} ... {{'FAILED' if name in fail else 'ok'}}", flush=True)
-    if name == die:
+    if name == die and (not state or not state.exists() or os.environ.get("FAKE_DIE_AGAIN")):
+        if state and not state.exists():
+            state.write_text(os.environ["PBPS_LIVE_RUN"])
+        record("lost")
+        if os.environ.get("FAKE_KILL_PROXY"):
+            if os.environ.get("FAKE_WAIT_FAILED_LOG"):
+                log=Path(os.environ["PBPS_LIVE_SHARD_DIR"]).parent/(os.environ["PBPS_LIVE_SHARD"].split("/")[0]+".log")
+                deadline=time.monotonic()+5
+                while "test a05 ... FAILED" not in log.read_text() and time.monotonic()<deadline:
+                    time.sleep(0.001)
+                assert "test a05 ... FAILED" in log.read_text()
+            os.kill(os.getppid(), signal.SIGKILL)
         os._exit(137)
 bad = sum(n in fail for n in ran)
 print(f"\\ntest result: {{'FAILED' if bad else 'ok'}}. {{len(ran) - bad}} passed; {{bad}} failed; "
       "0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+record("end")
 sys.exit(101 if bad else 0)
 '''
 
@@ -107,6 +137,7 @@ class Harness(unittest.TestCase):
         for name in SCRIPTS:
             shutil.copy(ROOT / "scripts" / name, cls.repo / "scripts" / name)
         (cls.repo / "scripts/live-tests-pg.sh").write_text(RUNNER)
+        (cls.repo / "scripts/live-tests.sh").write_text(RUNNER.replace("shard pg", "shard mssql"))
         (cls.repo / "scripts/known-flakes.json").write_text('{"version": 1, "flakes": []}\n')
         (cls.repo / ".gitignore").write_text("target/\n__pycache__/\n")
         git(cls.repo, "init", "-q", "-b", "main")
@@ -130,7 +161,7 @@ class Harness(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def drive(self, *options, fail=(), die=None, shards=2, output=None, check=None, env=None, a_names=A_NAMES):
+    def drive(self, *options, fail=(), die=None, shards=2, output=None, check=None, env=None, a_names=A_NAMES, suite="pg"):
         """Run the driver; returns (CompletedProcess, output directory)."""
         type(self).counter += 1
         output = output or self.runs / f"run{self.counter}"
@@ -138,12 +169,16 @@ class Harness(unittest.TestCase):
                            FAKE_A=json.dumps(a_names), FAKE_B=json.dumps(B_NAMES), FAKE_FAIL=json.dumps(list(fail)))
         for key in [k for k in process_env if k.startswith(("PBPS_LIVE_", "PBPS_TEST_"))]:
             del process_env[key]
+        self.trace = self.runs / f"trace{self.counter}.jsonl"
+        process_env["FAKE_TRACE"] = str(self.trace)
+        process_env["FAKE_EXPRESS"] = json.dumps({cargo[2]: sorted(names)
+                                                for cargo, names in self.shards.EXPRESS_INVENTORY.items()})
         process_env.update(env or {})
         env = process_env
         if die:
             env["FAKE_DIE"] = die
         result = subprocess.run(
-            [sys.executable, "scripts/live-shards.py", "--suite", "pg", "--pg-shards", str(shards),
+            [sys.executable, "scripts/live-shards.py", "--suite", suite, "--pg-shards", str(shards), "--mssql-shards", str(shards),
              "--prefix", "s2553", "--output", str(output), "--flakes-ref", "HEAD", *options],
             cwd=self.repo, env=env, text=True, capture_output=True, timeout=120)
         if check is not None:
@@ -156,7 +191,9 @@ class Harness(unittest.TestCase):
     def stopped_run(self, **options):
         result, output = self.drive(die=options.pop("die", "a05"), **options)
         self.assertNotEqual(result.returncode, 0)
-        return output
+        # Legacy resume tests inspect the stopped pass, independently of the
+        # new driver's one bounded attempt to finish it in this invocation.
+        return output / "original" if (output / "original").exists() else output
 
     def receipts(self, output):
         return {p: json.loads(p.read_text()) for p in sorted(output.glob("pg/*/*.json"))}
@@ -201,6 +238,8 @@ class PlainRun(Harness):
             for field in ("tree", "inputs", "carried"):
                 del row[field]
             path.write_text(json.dumps(row))
+        for directory in output.glob("pg/*/expected"):
+            shutil.rmtree(directory)  # old outputs predate durable assignments too
         result, _ = self.shards_audit(output)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"failed": 0, "passed": 18, "union": "exact"})
@@ -215,6 +254,242 @@ class PlainRun(Harness):
         _, output = self.drive(check=0)
         self.assertIsNone(json.loads((output / "manifest.json").read_text())["tree"])
         self.assertTrue(all(row["tree"] is None for row in self.receipts(output).values()))
+
+
+class Automatic(Harness):
+    """The same real resume/proxy path, with one controlled process loss."""
+
+    def once(self, *options, **kwargs):
+        state = self.runs / f"loss{self.counter}"
+        env = dict(FAKE_LOSS_STATE=str(state), **kwargs.pop("env", {}))
+        return self.drive(*options, die=kwargs.pop("die", "a05"), env=env, **kwargs)
+
+    def events(self):
+        return [json.loads(line) for line in self.trace.read_text().splitlines()]
+
+    def metadata(self, output):
+        summary = self.summary(output)
+        self.assertIn("automatic_rerun", summary["run"],
+                      "both passes must remain recorded even when the continuation fails")
+        return summary, summary["run"]["automatic_rerun"]
+
+    def test_a_killed_shards_unproven_names_rerun_once_and_the_combined_union_is_exact(self):
+        _, output = self.once(check=0)
+        summary, rerun = self.metadata(output)
+        original = output / "original"
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["failed"], summary["pg"]["union"]),
+                         (18, 0, "exact"))
+        self.assertEqual(summary["run"]["shards"], {"pg": 1})
+        self.assertEqual(rerun["missed_definition"], "no valid receipt")
+        self.assertEqual(rerun["original_run_id"], self.summary(original)["run"]["run_id"])
+        self.assertEqual(rerun["rerun_run_id"], summary["run"]["run_id"])
+        self.assertNotEqual(rerun["original_run_id"], rerun["rerun_run_id"])
+        self.assertEqual(Path(rerun["original_summary"]), original / "summary.json")
+        proven = {n for row in self.receipts(original).values() if row["valid"] for n in row["reported"]}
+        ran = [n for row in self.receipts(output).values() for n in row["reported"]]
+        self.assertCountEqual(ran, (set(A_NAMES) | set(B_NAMES)) - proven)
+        # a05 printed ok, but its invocation never supplied a valid summary.
+        self.assertIn("a05", ran)
+        self.assertNotIn("a05", proven)
+        self.assertCountEqual(ran, [n for ns in rerun["names"]["pg"].values() for n in ns])
+        events = self.events()
+        self.assertEqual({e["run"] for e in events}, {rerun["original_run_id"], rerun["rerun_run_id"]})
+        self.assertTrue(all(e["shard"] == "0/1" for e in events if e["run"] == rerun["rerun_run_id"]))
+        audited, _ = PlainRun.shards_audit(self, output, count=1)
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["resumed_from"]["summary_sha256"],
+                         hashlib.sha256((original / "summary.json").read_bytes()).hexdigest())
+        self.assertGreaterEqual(summary["run"]["seconds"], self.summary(original)["run"]["seconds"])
+        self.assertLessEqual(summary["run"]["minimum_available_gib"],
+                             self.summary(original)["run"]["minimum_available_gib"])
+        # The final output remains the usual resumable format, not a new chain mechanism.
+        _, again = self.drive("--resume", str(output), check=0)
+        self.assertEqual(self.summary(again)["pg"]["carried"], 18)
+        self.assertFalse(any(row["reported"] for row in self.receipts(again).values()))
+
+    def test_a_killed_proxy_without_a_receipt_reuses_the_resume_path(self):
+        _, output = self.once(env={"FAKE_KILL_PROXY": "1"}, check=0)
+        summary, rerun = self.metadata(output)
+        original = output / "original"
+        self.assertIn("missing invocation receipt", self.summary(original)["pg"]["error"])
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["union"]), (18, "exact"))
+        self.assertTrue(all(row["valid"] for row in self.receipts(original).values()))
+        self.assertEqual(len({e["run"] for e in self.events()}), 2)
+
+    def test_single_shard_loss_keeps_the_assignment_without_any_result_receipt(self):
+        # Earlier work completes, but the next invocation has no receipt in
+        # any shard. Its durable obligation must still drive the one rerun.
+        for suite in ("pg", "mssql"):
+            with self.subTest(suite=suite):
+                _, output = self.once(shards=1, suite=suite, die="b02",
+                                      env={"FAKE_KILL_PROXY": "1"}, check=0)
+                summary, rerun = self.metadata(output)
+                original = output / "original" / suite / "0"
+                rows = [json.loads(p.read_text()) for p in original.glob("*.json")]
+                self.assertEqual(len(rows), 1, "only the earlier invocation has a receipt")
+                expected = {p.stem: json.loads(p.read_text()) for p in (original / "expected").glob("*.json")}
+                lost = next(key for key, row in expected.items() if "--test" in row["args"])
+                self.assertEqual(expected[lost]["assigned"], B_NAMES)
+                self.assertFalse((original / (lost + ".json")).exists())
+                self.assertIn(lost, self.summary(output / "original")[suite]["error"])
+                self.assertEqual(rerun["names"][suite][lost], B_NAMES)
+                self.assertEqual(summary[suite]["union"], "exact")
+                self.assertEqual(summary[suite]["passed"], 18)
+                self.assertEqual([e["names"] for e in self.events() if e["run"] == rerun["rerun_run_id"] and e["event"] == "start"],
+                                 [B_NAMES])
+
+    def test_assignment_is_not_a_pass_and_disagreement_refuses_a_resume(self):
+        _, output = self.drive(shards=1, check=0)
+        directory = output / "pg/0"
+        path = next(directory.glob("*.json"))
+        key = path.stem
+        original = path.read_text()
+        expected = directory / "expected" / path.name
+        assignment = expected.read_text()
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "missing invocation receipt " + key):
+            self.shards.audit(output / "pg", 1)
+        gaps = {}
+        checked, _ = self.shards.audit(output / "pg", 1, missing=gaps)
+        self.assertEqual(gaps[key], json.loads(expected.read_text())["assigned"])
+        self.assertLess(checked["passed"], 18)
+        # Corrupt or disagreeing assignments are errors, never a missing result.
+        for value in ("{", json.dumps(dict(json.loads(expected.read_text()), inputs="different"))):
+            expected.write_text(value)
+            result, _ = self.drive("--resume", str(output))
+            self.assertNotEqual(result.returncode, 0)
+        expected.write_text(assignment)
+        path.write_text(json.dumps(dict(json.loads(original), listed=["wrong"])))
+        result, _ = self.drive("--resume", str(output))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("receipt disagrees with invocation assignment", result.stderr)
+
+    def test_loss_after_the_last_printed_ok_still_proves_nothing_without_a_valid_summary(self):
+        _, output = self.once(die="a11", check=0)
+        summary, rerun = self.metadata(output)
+        lost = [r for r in self.receipts(output / "original").values() if not r["valid"]]
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(set(lost[0]["reported"]), set(lost[0]["assigned"]))
+        ran = {n for r in self.receipts(output).values() for n in r["reported"]}
+        self.assertTrue(set(lost[0]["assigned"]) <= ran)
+        self.assertEqual(summary["pg"]["union"], "exact")
+
+    def test_missing_and_present_weight_files_keep_the_resume_path_usable(self):
+        for present in (False, True):
+            with self.subTest(present=present):
+                weights = self.runs / f"weights{self.counter}.json"
+                if present:
+                    weights.write_text('{"old:case": 1}')
+                _, output = self.once("--weights", str(weights), check=0)
+                self.assertEqual(self.summary(output)["pg"]["union"], "exact")
+
+    def test_failed_result_survives_a_killed_proxy_without_a_final_receipt(self):
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                if registered:
+                    self.set_register([{"test": "a05", "cargo": CARGO, "issue": 1,
+                                        "expires": Resume.soon(self)}])
+                result, output = self.once(fail=["a05"], check=1, env={
+                    "FAKE_KILL_PROXY": "1", "FAKE_WAIT_FAILED_LOG": "1", "FAKE_FAIL_ONCE": "1"})
+                self.assertFalse((output / "original").exists())
+                self.assertEqual(len({e["run"] for e in self.events()}), 1)
+                failed = [row for row in self.receipts(output).values()
+                          if row["reported"].get("a05", {}).get("status") == "FAILED"]
+                self.assertEqual(len(failed), 1)
+                self.assertFalse(failed[0]["valid"], "an unfinished invocation proves no ok names")
+                self.assertEqual(self.summary(output)["pg"]["failed"], 1)
+                self.assertIn("test a05 ... FAILED", "".join(p.read_text() for p in output.glob("pg/*.log")))
+
+    def test_a_missed_name_failed_on_rerun_stays_failed_and_is_named(self):
+        result, output = self.once(env={"FAKE_FAIL_AFTER_LOSS": '["a05"]'})
+        self.assertNotEqual(result.returncode, 0)
+        summary, rerun = self.metadata(output)
+        self.assertEqual((summary["pg"]["failed"], summary["pg"]["union"]), (1, "exact"))
+        failed = [n for row in self.receipts(output).values() for n, r in row["reported"].items()
+                  if r["status"] == "FAILED"]
+        self.assertEqual(failed, ["a05"])
+        self.assertIn("test a05 ... FAILED", (output / "pg/0.log").read_text())
+        self.assertEqual(len({e["run"] for e in self.events()}), 2)
+        self.assertFalse((output / "original/original").exists())
+
+    def test_a_second_loss_fails_without_a_third_pass(self):
+        result, output = self.once(env={"FAKE_DIE_AGAIN": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        summary, rerun = self.metadata(output)
+        self.assertEqual(summary["pg"]["union"], "failed")
+        self.assertIn("a05", [n for ns in rerun["names"]["pg"].values() for n in ns])
+        self.assertEqual(len({e["run"] for e in self.events()}), 2)
+        self.assertFalse((output / "original/original").exists())
+
+    def test_any_first_pass_failed_forbids_the_rerun_even_if_registered_or_also_lost(self):
+        for registered in (False, True):
+            if registered:
+                self.set_register([{"test": "a03", "cargo": CARGO, "issue": 1,
+                                    "expires": Resume.soon(self)}])
+            for lost in (False, True):
+                with self.subTest(registered=registered, lost=lost):
+                    result, output = self.drive(fail=["a03"], die="a05" if lost else None)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((output / "original").exists())
+                    self.assertNotIn("automatic_rerun", self.summary(output)["run"])
+                    self.assertEqual(len({e["run"] for e in self.events()}), 1)
+
+    def test_a_complete_pass_launches_nothing_extra_and_keeps_the_summary_shape(self):
+        _, output = self.drive(check=0)
+        self.assertFalse((output / "original").exists())
+        summary = self.summary(output)
+        self.assertEqual(set(summary), {"pg", "run"})
+        self.assertEqual(set(summary["pg"]), {"passed", "failed", "union", "seconds", "shards", "exits",
+                                             "shard_seconds", "start_seconds", "end_seconds"})
+        self.assertEqual(set(summary["run"]), {"seconds", "available_gib", "shards", "minimum_available_gib",
+                                              "memory_samples", "memory_sample_seconds", "memory_errors",
+                                              "run_id", "tree", "inputs", "resumed_from", "express_tests_on_shard_zero"})
+        self.assertEqual(len({e["run"] for e in self.events()}), 1)
+
+    def test_both_engines_continue_serially_with_one_shard_each(self):
+        _, output = self.once(suite="all", check=0)
+        summary, rerun = self.metadata(output)
+        self.assertEqual(summary["run"]["shards"], {"mssql": 1, "pg": 1})
+        for suite in ("mssql", "pg"):
+            self.assertEqual((summary[suite]["passed"], summary[suite]["union"]), (18, "exact"))
+        events = [e for e in self.events() if e["run"] == rerun["rerun_run_id"]]
+        self.assertTrue(events)
+        self.assertTrue(all(e["shard"] == "0/1" for e in events))
+        starts = {s: min(e["at"] for e in events if e["suite"] == s) for s in ("mssql", "pg")}
+        ends = {s: max(e["at"] for e in events if e["suite"] == s) for s in ("mssql", "pg")}
+        self.assertLess(ends["mssql"], starts["pg"])
+
+    def test_disagreeing_unreadable_or_invalid_receipts_are_not_loss(self):
+        original = self.stopped_run()
+        manifest = json.loads((original / "manifest.json").read_text())
+        def edited(directory, **changes):
+            path = next(p for p, row in self.receipts(directory).items() if not row["valid"])
+            row = json.loads(path.read_text())
+            row.update(changes)
+            path.write_text(json.dumps(row))
+        def memory_error(directory):
+            path = directory / "summary.json"
+            summary = json.loads(path.read_text())
+            summary["run"]["memory_errors"] = ["unreadable memory"]
+            path.write_text(json.dumps(summary))
+        mutations = {
+            "memory error": memory_error,
+            "disagreement": lambda d: edited(d, listed=["other"]),
+            "malformed summary": lambda d: edited(d, interrupted=False),
+            "extra result": lambda d: edited(d, reported={"extra": {"status": "ok", "seconds": 1}}),
+            "unreadable receipt": lambda d: next(iter(self.receipts(d))).write_text("{"),
+            "identity": lambda d: edited(d, tree="0" * 40),
+            "inputs": lambda d: edited(d, inputs="1" * 64),
+            "invalid completion": lambda d: edited(d, valid=True),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                copy = self.copy(original)
+                mutate(copy)
+                with self.assertRaises((ValueError, KeyError)):
+                    self.shards.lost_tests(copy, self.summary(copy), manifest["tree"], manifest["inputs"])
+                self.assertFalse((copy / "original").exists())
 
 
 class Resume(Harness):
@@ -502,6 +777,10 @@ class Chain(Harness):
             if "--lib" in row["args"]:  # every shard agrees, so only the snapshot can contradict them
                 row["carried"]["a98"] = {"status": "ok", "seconds": 1, "run": "x"}
                 path.write_text(json.dumps(row))
+                assignment = path.parent / "expected" / path.name
+                expected = json.loads(assignment.read_text())
+                expected["carried"] = row["carried"]
+                assignment.write_text(json.dumps(expected))
         result, _ = self.drive("--resume", str(second))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("never proved", result.stderr)
@@ -547,6 +826,19 @@ class Tls(Harness):
         self.assertTrue(self.TLS_NAMES <= carried)
         audited, _ = PlainRun.shards_audit(self, output)
         self.assertEqual(json.loads(audited.stdout)["union"], "exact")
+
+    def test_automatic_continuation_discovers_later_pinned_tls_occurrences(self):
+        state = self.runs / f"tls-loss{self.counter}"
+        _, output = self.drive(die="a00", env={"FAKE_LOSS_STATE": str(state)}, check=0)
+        summary = self.summary(output)
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["union"]), (self.TOTAL, "exact"))
+        self.assertFalse(any("tls" in row["args"] for row in self.receipts(output / "original").values()))
+        tls_keys = {p.stem for p, row in self.receipts(output).items() if "tls" in row["args"]}
+        self.assertEqual(len(tls_keys), 4)
+        names = summary["run"]["automatic_rerun"]["names"]["pg"]
+        self.assertEqual(set(names) & tls_keys, tls_keys)
+        self.assertCountEqual([n for key in tls_keys for n in names[key]],
+                              ["tls_verified", "tls_untrusted", "tls_untrusted", "tls_untrusted"])
 
     def test_a_run_without_resume_prints_no_attestation_and_finishes(self):
         _, output = self.drive(check=0)
@@ -639,6 +931,81 @@ class Tls(Harness):
         transport = self.transport()
         for key in (first, second, third):
             self.run_case(transport, env, self.line(key), "tls_untrusted")
+
+
+class TlsCleanup(Harness):
+    """The real TLS lifecycle, with external Docker/PKI operations substituted."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        header, second = RUNNER.rsplit("cargo test", 1)
+        (cls.repo / "scripts/live-tests-pg.sh").write_text(header + '''if [[ ${PBPS_LIVE_SHARD%%/*} == 0 ]]; then
+    PBPS_LIVE_PINNED=1 python3 scripts/tls_fixture.py
+fi
+''' + "cargo test" + second)
+        (cls.repo / "scripts/tls_fixture.py").write_text('''import importlib.util, json, os, subprocess
+from pathlib import Path
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location("transport", Path(__file__).with_name("live-transport.py"))
+transport = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(transport)
+state = Path(os.environ["FAKE_TLS_RESOURCES"])
+state.mkdir(exist_ok=True)
+real_run, real_case = subprocess.run, transport.run_case
+
+def probe(command, **kwargs):
+    if command[:2] == ["docker", "exec"]:
+        return subprocess.CompletedProcess(command, 0)
+    return real_run(command, **kwargs)
+
+def run(*args, **kwargs):
+    if args[:2] == ("docker", "create"):
+        (state / args[args.index("--name") + 1]).touch()
+    if args[:2] == ("docker", "rm"):
+        if os.environ.get("FAKE_TLS_REMOVE_FAIL") and not (state / "failed-once").exists():
+            (state / "failed-once").touch()
+            raise subprocess.CalledProcessError(1, args)
+        (state / args[-1]).unlink()
+    return subprocess.CompletedProcess(args, 0, json.dumps({"5432/tcp": [{"HostPort": "54321"}]}))
+
+def case(command, name, env):
+    real_case(["cargo", "test", "-p", "demo", "--test", "tls", "--"], name, env)
+
+with patch.object(transport, "run", side_effect=run), patch.object(transport.subprocess, "run", side_effect=probe), patch.object(transport, "run_case", side_effect=case), patch("sys.argv", ["live-transport.py", "pg"]):
+    transport.main()
+''')
+        git(cls.repo, "add", "-A")
+        git(cls.repo, "commit", "-q", "-m", "real TLS lifecycle with controlled engine operations")
+
+    def test_failed_tls_removal_blocks_automatic_and_manual_continuation_by_marker_name(self):
+        resources = self.runs / "leaked-tls"
+        env = {"FAKE_TLS_RESOURCES": str(resources), "FAKE_TLS_REMOVE_FAIL": "1"}
+        result, output = self.drive(env=env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        marker = output / "pg/0/tls-cleanup.pending"
+        self.assertIn(str(marker), result.stdout + result.stderr)
+        self.assertFalse((output / "original").exists())
+        self.assertTrue((resources / marker.read_text().strip()).exists())
+        logs = "".join(p.read_text() for p in output.glob("pg/*.log"))
+        self.assertIn("CalledProcessError", logs)
+        result, resumed = self.drive("--resume", str(output), env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(marker), result.stderr)
+        self.assertFalse(resumed.exists())
+
+    def test_confirmed_tls_removal_allows_the_exact_missing_only_continuation(self):
+        resources = self.runs / "cleaned-tls"
+        env = {"FAKE_TLS_RESOURCES": str(resources), "FAKE_LOSS_STATE": str(self.runs / "loss")}
+        _, output = self.drive(die="b03", env=env, check=0)
+        summary = self.summary(output)
+        self.assertIn("automatic_rerun", summary["run"])
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["union"]), (22, "exact"))
+        self.assertFalse(list(output.rglob("tls-cleanup.pending")))
+        self.assertFalse(list(resources.iterdir()))
+        # A subsequent manual resume still accepts the clean evidence chain.
+        _, resumed = self.drive("--resume", str(output), env=env, check=0)
+        self.assertEqual(self.summary(resumed)["pg"]["union"], "exact")
 
 
 class Flakes(Harness):
