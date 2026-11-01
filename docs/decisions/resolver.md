@@ -5594,3 +5594,126 @@ qualify transaction-pooling proxies as supported resolver layouts or change
 the operator's session-pinning obligation in DEC-1685.1. Native positive and
 negative controls cover both refusal before cleanup and a backend change
 after cleanup, together with same-backend repair and retained recovery names.
+
+<a id="dec-2541-1"></a>
+
+**DEC-2541.1. Chained consumer facts are finite creation-order hints, not
+binding evidence: structural identities, qualified references, and nearest
+bare FROM/JOIN names in views and inline TVFs (#2541).** The maintainer chose
+the narrowed lexical producer (A-prime), rather than a desired-definition
+engine probe. A probe cannot compile a desired view before its inputs exist
+with the right shape; stubs would need an independent fidelity proof and a
+second namespace would add a lifecycle obligation. The final scratch catalog
+read remains the authority for the binding that is compared and recorded.
+The hints only place a renderer before a managed creation that needs it.
+
+- **Creation need is narrower than runtime reference.** Measured on pinned
+  SQL Server 17, a view or inline TVF fails to CREATE without its relation;
+  a procedure, DML trigger, scalar function or multi-statement TVF body can
+  name that absent relation and still CREATE. Those four bodies therefore
+  add no lexical consumer edge, even for qualified names. A trigger's
+  `attached_to` identity is still a structural prerequisite, as is a foreign
+  key's referenced table. The exact captured foreign-key key/index binding
+  and the provider distinction in DEC-2376.3 are unchanged.
+- **Three finite tiers.** Structural identities come first. The existing
+  dialect qualified-name scan covers two-part function calls, schema-bound
+  references and expressions in computed/default/check changes. Bare names
+  are admitted only immediately after FROM/JOIN in non-schema-bound views
+  and inline TVFs. A function is classified by its header's depth-zero
+  RETURNS clause, with AS, RETURN or BEGIN as the body boundary; a
+  parameter name cannot supply SCHEMABINDING. Module headers,
+  comments and literals do not supply body consumers. Three- and four-part
+  references add no local edge; the two-part suffix of one is not local.
+- **One lookup policy.** DECISIONS 317's `bare_name_rank` selects the nearest
+  candidate with that leaf: the module schema, then dbo. The domain includes
+  managed creations and both prefix and chained external roots, rather than
+  just the chain being placed. An object of another kind occupies its name
+  too. The consumer itself is not an occupant that exists before its own
+  creation. An explicit qualified reference does not use the bare rank.
+- **The limit is named.** Unreadable lexical text and an unclassifiable
+  function header refuse with the managed declaration (and the external
+  identity for a consumer hint), a reason and a correction remedy, never
+  source text. The shared Lexicon
+  still supplies comment/string rules and the dialect's comparison. This is
+  no general SQL parser: a FROM/JOIN CTE name can over-include an external;
+  an alias used only in a projection cannot. An over-inclusion that closes a
+  hard cycle is refused by name. A missed edge fails the engine's CREATE,
+  and no accepted capture is produced from that failed reconstruction.
+- **The boundary stays logical.** Scanned source and emitter observations
+  are discarded before the SQL-free blueprint. Existing logical operation
+  and external-root coordinates feed the same single shared settlement;
+  renderer templates lower afterward. No fake Change, UID or managed origin,
+  additional probe namespace, resource owner or production NOEXEC is added.
+  DEC-2376.1's case-(a) execution and DEC-2465 trial boundaries are unchanged.
+
+The creation-need table is independently checked by a test-only NOEXEC
+differential: the actual reconstruction's predicted position is compared
+with the engine compiling the same consumer with and without its external.
+The oracle verifies that NOEXEC creates no consumer, resets the setting
+after a failed compile, and rejects a deliberately missing positive
+prediction. Native contracts cover supplied and Docker scratch, the original
+one-part refusal, competing managed/prefix namespaces, deferred function
+bodies, alias/CTE controls, named refusal and successful reuse after failure.
+The existing chained contracts retain transitive consumers, exact keys,
+managed traversal boundaries, shape comparison, cleanup and placement data.
+
+
+<a id="dec-2541-2"></a>
+
+**DEC-2541.2. Prepare the target candidate domain before deriving chained
+roots; complete it by fresh whole reads, never by joining observations
+(#2541).** A one-part non-schema-bound reference is still a runtime name,
+not an id-bound reference. Its membership alone was not a survey request:
+the original `dbo.c -> v -> dbo.t` case consequently had no external root
+and failed CREATE with 208. The desired view/inline-TVF FROM/JOIN scan now
+asks both the module schema and dbo, even when the target's old definition
+has no such reference. This uses the same private lexical producer as the
+creation hints, including delimited identifiers and named refusals.
+
+Candidate sets use the existing catalog capture to materialize members and
+their ordinary binding closure. Runtime questions reached through external
+members enlarge that request until closed. Obsolete managed target bodies
+do not enlarge the desired domain. Each expansion discards its
+observations and captures the entire enlarged domain again. Only the final
+complete capture supplies roots and prerequisites. Only metadata visibility covering the requested namespace can prove
+absence; an empty membership cannot certify that an unreadable object is
+absent. No cached definition or membership is merged into a later
+read, and an unrelated module is never a reason to survey the whole database.
+This is target preparation, not a change to runtime binding classification,
+recorded evidence, trial settlement or scratch resource ownership.
+
+The contracts require desired-only questions, transitive materialization, irrelevant
+and absent names, hidden definitions and restored visibility, and changes to
+already-read definitions between passes. The original one-part case must
+reach native reconstruction on both supplied and Docker scratch. Test-only
+NOEXEC remains an independent creation-need oracle, never a production probe.
+
+
+<a id="dec-2541-3"></a>
+
+**DEC-2541.3. Target preparation proves absence only with a readable effective
+DENY inventory on the name-resolution path (#2541).** The maintainer approved
+the narrow DENY-aware proof after measurements on SQL Server 17. Database
+VIEW DEFINITION remains required by capture. Effective database VIEW SECURITY
+DEFINITION is also required before interpreting the DENY inventory: denying it
+can hide direct DENY rows even while database VIEW DEFINITION remains effective.
+A missing permission refuses by name, never as an empty inventory.
+
+The current `sys.user_token` supplies the direct, nested-role and public
+grantees. Object, schema and database DENY entries for VIEW DEFINITION, VIEW
+PERFORMANCE DEFINITION and CONTROL can hide metadata. The path consists of the
+principal's default schema, dbo, and the plan-named schemas, compared by SQL
+Server under its database collation. A resolved schema outside that path is
+ignored. An on-path DENY, or an object DENY whose schema is unreadable, refuses
+with its grantee, permission and securable; an unreadable name is reported as
+a hidden major_id, never filled from an owner's privileged observation. Both
+remedies are named: lift the DENY for the pbps principal only, or use a separate
+catalog-reader account. A genuine empty membership without such a DENY stays
+absent. Catalog errors remain unreadable, distinct from an empty list.
+
+The proof precedes the initial managed-name survey and brackets every fresh
+target capture, including every enlarged-domain read. No DENY inventory is cached across passes. It does not grant permissions,
+change the catalog property rules or their version, bind desired definitions,
+or add an execution or scratch lifecycle boundary. Native contracts cover
+direct/role/public hiding, off-path schema controls, security-definition
+blindness, genuine absence and restoration on both scratch routes.

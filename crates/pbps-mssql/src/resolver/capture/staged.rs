@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod names;
+mod target;
 
 use names::Names;
 
@@ -383,6 +384,17 @@ pub struct ExternalInputs {
 }
 
 impl ExternalInputs {
+    pub(in crate::resolver) fn module_names(
+        module: &pbps_model::Module,
+    ) -> Result<target::CreationNames, &'static str> {
+        target::CreationNames::module(module)
+    }
+    pub(in crate::resolver) fn statement_names(
+        text: &str,
+    ) -> Result<target::CreationNames, &'static str> {
+        target::CreationNames::statement(text)
+    }
+
     pub fn managed(&self) -> &BTreeSet<ObjectIdentity> {
         &self.managed
     }
@@ -430,10 +442,12 @@ pub async fn required_externals_declared(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<ExternalInputs, CaptureError> {
     let schemas: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
+    target::prove(target, &schemas).await?;
     let managed = Managed::read(target, &schemas).await?;
     let mut scope = cascade_scope_for(target, &managed, key).await?;
     scope.retained.extend(managed.objects.iter().cloned());
-    let captured = super::capture_declared(target, &scope, declarations, key).await?;
+    let captured =
+        target::prepare(target, scope, &schemas, &managed.objects, declarations, key).await?;
     let roots = captured
         .inputs
         .iter()

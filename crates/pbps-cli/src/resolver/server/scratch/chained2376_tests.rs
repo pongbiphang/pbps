@@ -41,7 +41,7 @@ fn declared() -> Declared {
     }
 }
 
-async fn observe(
+pub(super) async fn observe(
     target: &str,
     scratch: &str,
     declared: &Declared,
@@ -80,7 +80,22 @@ async fn observe(
     )
     .unwrap();
     let request = super::super::super::ScopeRequest {
-        schemas: vec!["dbo".into()],
+        schemas: declared
+            .desired
+            .tables
+            .keys()
+            .map(|id| id.schema.clone())
+            .chain(
+                declared
+                    .desired
+                    .modules
+                    .keys()
+                    .map(|id| id.schema().to_owned()),
+            )
+            .chain(["dbo".to_owned()])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         ..Default::default()
     };
     let binding = BindingRequest {
@@ -119,7 +134,7 @@ async fn observe(
     )
     .await
     .map_err(|e| Error::Binding(e.to_string()))?;
-    let result = async {
+    let result = Box::pin(async {
         let mut prepared = state
             .prepare(
                 provisioning,
@@ -166,7 +181,7 @@ async fn observe(
         assert!(changed.is_empty(), "{changed:?}");
         let roots = prepared.staged.compared().clone();
         Ok((roots, placements))
-    }
+    })
     .await;
     state
         .release(&mut admin)

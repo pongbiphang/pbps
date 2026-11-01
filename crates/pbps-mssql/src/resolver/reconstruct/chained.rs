@@ -1,7 +1,8 @@
 //! Logical placement facts only. Templates are lowered after settlement.
 use super::*;
-use pbps_dialect::Dialect;
 use pbps_diff::order::scratch::{Auxiliary, Node, Prepared};
+
+mod consumers;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -87,21 +88,7 @@ pub(super) fn blueprint(
                 .filter_map(|id| chain_ids.get(id).copied())
                 .map(Node::Auxiliary),
         );
-        // The emitter probe is discarded. Only the finite lexical answer
-        // enters the blueprint, just as for the generated parts' readers.
-        let before: Vec<_> = steps
-            .iter()
-            .filter(|step| {
-                let [schema, name] = id.name.as_slice() else {
-                    return false;
-                };
-                crate::emit::emit(&step.change.change, step.change.strategy).is_ok_and(|sql| {
-                    sql.iter()
-                        .any(|s| Mssql.may_name_qualified(&s.sql, schema, name))
-                })
-            })
-            .map(|step| Node::Operation(step.operation))
-            .collect();
+        let before = consumers::before(steps, inputs, &id)?;
         auxiliary.push(Auxiliary {
             name: format!("external {id:?}"),
             after,
