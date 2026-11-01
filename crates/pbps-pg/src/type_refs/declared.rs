@@ -1313,6 +1313,7 @@ mod label_tests {
                     from: "sad".into(),
                     to: "blue".into(),
                     ordinal: 0,
+                    retained: Vec::new(),
                     definition: Box::new(enumeration(&["blue", "ok"])),
                 },
                 Change::AddEnumValue {

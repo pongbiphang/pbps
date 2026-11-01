@@ -4307,3 +4307,72 @@ reason naming the expression. Vetting remains mandatory, and ordinary
 conversion probes still evaluate admitted stable/volatile expressions. PG16/18
 cases pin `random()`, `now()`, SQL clock primitives, settings, assignment and
 I/O casts beside the immutable orphan/matching controls.
+
+<a id="dec-2354-1"></a>
+
+**DEC-2354.1. Retained enum-label CHECKs advance their authored record only after target-bound equality.**
+With a selected resolver, a separate unsealed scratch goal creates the before
+type graph and empty carriers, binds the live CHECKs, emits the approved type
+and label renames, and binds the declared expressions on those same carriers.
+The complete covered node trees compare with constant values preserved and
+only source locations ignored. Binding-only capture still discards Datum
+bytes; its AST equality is never expression equality. Unsupported trees,
+unavailable scratch or TEMP, changed bindings and absent routines retain the
+ordinary rebuild. No SQL literal is forwarded through a label rename.
+
+The differ consumes neutral answers before constructing its immutable plan.
+A retained expression carries its logical target, exact before/after authored
+text and rename anchors on RenameEnumValue. Plan 58 and schema set 83 carry
+this contract, after master's published schema set 82. Admission validates the
+target and anchors. Apply holds ACCESS SHARE on each retained table before
+DDL, independently binds the saved new expression on an empty target TEMP
+carrier after the rename, and compares it with the same validated local
+CHECK's identity and tree. Only that verified expression loses closing byte
+comparison; routine pins and every other field stay enforced. A failed
+comparison rolls back without advancing the record. Staged checkpoints keep
+the old declaration; closure rechecks in a transaction holding the relation
+lock through recording, including a closing-only resume.
+
+This first part retains CHECKs only. Defaults keep AlterColumnDefault and its
+ordinary table lock. Offline and unproved plans keep DropCheck/AddCheck.
+The ledger stores the actual read-back and advances only the approved
+expression payload, so applying a saved plan needs no checkout or resolver.
+
+
+<a id="dec-2354-2"></a>
+
+**DEC-2354.2. Retention compares logical column identities across physical attribute layouts.**
+A real table and an empty carrier assign attribute numbers independently.
+Reordering and dropped-column holes must not turn a valid CHECK retention into
+an apply refusal. Candidate admission matches the existing column names and
+UIDs without requiring physical order. Each bound expression carries its
+logical table and the live catalog's positive, non-dropped attribute-to-name
+map. Equality maps both `varattno` and `varattnosyn` through these identities;
+it never discards either field. Missing attributes, system/whole-row variables,
+or another relation/query level cannot prove equality. Type, collation, value
+and all other covered fields remain significant. Scratch rebinding and fresh
+target verification share this mapping; the latter still pins the same CHECK
+OID and raw tree while holding its relation lock. These transient observations
+change neither the saved plan nor the authored record format.
+
+
+<a id="dec-2354-3"></a>
+
+**DEC-2354.3. Retained-expression binding executes exactly one statement.**
+A retained CHECK is a declaration expression, not an approved SQL batch.
+Embedding it in a simple-query batch can execute trailing statements or COMMIT
+that the emitted plan never shows. Scratch and fresh apply verification share
+the emitter's command boundaries and the shared PostgreSQL executor
+(DEC-2520.1), using the extended protocol with an empty parameter list: the
+server parses exactly one statement before executing any of it. The common
+executor sets and restores the write search_path as separate commands and
+attempts cleanup even after refusal; never send the wrapper through batch_execute. A refused bind names
+its table, and apply names the retained CHECK. Failed scratch proof keeps the
+ordinary named DropCheck/AddCheck plan or refuses; it cannot endorse retention.
+
+A semicolon inside a string literal is ordinary expression text. A comment-only
+tail is accepted only when it leaves a complete single wrapper statement;
+a line comment that swallows the wrapper's closing syntax refuses. This uses
+the engine's parser, without SQL splitting or a text blacklist. Apply rebinds
+before recording and rolls back on refusal. Neither the payload nor any format
+version changes.

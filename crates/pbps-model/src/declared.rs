@@ -357,6 +357,17 @@ impl Declared {
                 .collect()
         };
         for planned in &changes.changes {
+            if let Change::RenameEnumValue { retained, .. } = &planned.change {
+                for expression in retained {
+                    let crate::ExpressionTarget::Check { table, name, .. } = &expression.target;
+                    self.expressions
+                        .checks
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(name.clone(), expression.after.clone());
+                    remove_nested(&mut self.bindings.checks, table, name);
+                }
+            }
             match &planned.change {
                 Change::RebuildPartitionedTable(_)
                 | Change::BuildPartitionedIndex(_)

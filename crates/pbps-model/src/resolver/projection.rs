@@ -1041,6 +1041,7 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
                 ordinal: 0,
+                retained: Vec::new(),
                 definition: definition(),
             },
             rebuild(crate::EnumRebuildStep::Create {

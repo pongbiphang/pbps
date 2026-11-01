@@ -6772,3 +6772,36 @@ pub async fn rebuild_window(
 }
 
 pub type RebuildVerification = pbps_pg::rebuild::Verification;
+
+/// Retention is a connected engine guard, never a second plan emitter.
+pub async fn hold_retained(
+    conn: &mut Conn,
+    changes: &pbps_model::ChangeSet,
+    authored: Option<&pbps_model::Schema>,
+) -> anyhow::Result<Option<pbps_pg::retained::Held>> {
+    if pbps_model::retained::expressions(changes).next().is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        conn.driver() == pbps_db::Driver::Postgres,
+        "retained expressions require PostgreSQL"
+    );
+    pbps_pg::retained::hold(conn, changes, authored)
+        .await
+        .map(Some)
+        .map_err(anyhow::Error::msg)
+}
+pub async fn verify_retained(
+    conn: &mut Conn,
+    held: Option<&pbps_pg::retained::Held>,
+    after: &pbps_model::Schema,
+) -> anyhow::Result<Option<pbps_pg::retained::Verified>> {
+    match held {
+        Some(held) => held
+            .verify(conn, &pbps_pg::Postgres::new(), after)
+            .await
+            .map(Some)
+            .map_err(anyhow::Error::msg),
+        None => Ok(None),
+    }
+}

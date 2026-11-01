@@ -39,6 +39,7 @@ pub mod domain;
 pub mod preview;
 pub mod recovery;
 pub mod rehearse;
+pub mod retained;
 mod supervised;
 
 /// One run of the resolver for a connected plan. `scratch`

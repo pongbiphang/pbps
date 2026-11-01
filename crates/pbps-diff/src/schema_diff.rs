@@ -832,8 +832,13 @@ pub(crate) fn diff_partial_rebuilding(
         });
     }
 
-    let (label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
+    let (mut label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
+    let comparison = crate::retained::comparison(base, declared, hints, &mut label_changes);
+    let base = Side {
+        schema: &comparison,
+        ids: base.ids,
+    };
     // The domains rebuilt under their uid: for a changed base or collation, as
     // the replacement of the type they are built on follows, or for an array
     // that blocks an in-place check (DEC-1635.9). They get no alteration.
@@ -8828,6 +8833,7 @@ mod tests {
             from: "a".into(),
             to: "b".into(),
             ordinal: 0,
+            retained: Vec::new(),
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["b".into()],
             }),

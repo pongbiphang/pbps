@@ -36,6 +36,7 @@ pub(super) enum Value {
     List(Vec<Value>),
     Node(Node),
     Datum,
+    DatumBytes { length: usize, bytes: Vec<u8> },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -58,6 +59,7 @@ struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
     items: usize,
+    values: bool,
 }
 
 impl Reader<'_> {
@@ -149,7 +151,8 @@ impl Reader<'_> {
                         let Value::Atom(length) = &value else {
                             return Err(Uncovered::Malformed);
                         };
-                        length.parse::<usize>().map_err(|_| Uncovered::Malformed)?;
+                        let length = length.parse::<usize>().map_err(|_| Uncovered::Malformed)?;
+                        let mut bytes = Vec::new();
                         self.position += 1;
                         while self.peek() != Some(b']') {
                             let byte = self
@@ -159,9 +162,19 @@ impl Reader<'_> {
                             if !(-128..=255).contains(&byte) {
                                 return Err(Uncovered::Malformed);
                             }
+                            if self.values {
+                                if bytes.len() >= 1_000_000 {
+                                    return Err(Uncovered::Limit);
+                                }
+                                bytes.push(byte as u8);
+                            }
                         }
                         self.take(b']')?;
-                        value = Value::Datum;
+                        value = if self.values {
+                            Value::DatumBytes { length, bytes }
+                        } else {
+                            Value::Datum
+                        };
                     }
                     if fields.insert(key, value).is_some() {
                         return Err(Uncovered::Malformed);
@@ -194,6 +207,13 @@ impl Reader<'_> {
 }
 
 pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
+    decode_values(text, major, false)
+}
+
+fn decode_values(text: &str, major: u32, values: bool) -> Result<Value, Uncovered> {
+    if values && text.len() > 1_048_576 {
+        return Err(Uncovered::Limit);
+    }
     if !matches!(major, 16 | 18) {
         return Err(Uncovered::Version);
     }
@@ -204,6 +224,7 @@ pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
         bytes: text.as_bytes(),
         position: 0,
         items: 0,
+        values,
     };
     let value = reader.value(0)?;
     if reader.peek().is_some() || matches!(value, Value::Null | Value::Atom(_) | Value::Datum) {
@@ -212,11 +233,86 @@ pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
     Ok(value)
 }
 
+/// Equality is a separate observation from binding coverage: every Datum is
+/// retained, and only a covered source-location field is discarded.
+pub(super) fn equal(
+    left: &str,
+    right: &str,
+    major: u32,
+    left_columns: &BTreeMap<u32, String>,
+    right_columns: &BTreeMap<u32, String>,
+) -> Result<bool, Uncovered> {
+    fn prepare(
+        text: &str,
+        major: u32,
+        columns: &BTreeMap<u32, String>,
+    ) -> Result<Value, Uncovered> {
+        let mut value = decode_values(text, major, true)?;
+        references(&value, major)?;
+        fn normalize(value: &mut Value, columns: &BTreeMap<u32, String>) -> Result<(), Uncovered> {
+            match value {
+                Value::Node(node) => {
+                    if node.tag == "CONST" {
+                        let valid = match (&node.fields["constisnull"], &node.fields["constvalue"])
+                        {
+                            (Value::Atom(null), Value::Null) => null == "true",
+                            (Value::Atom(null), Value::DatumBytes { length, bytes }) => {
+                                let byval = matches!(&node.fields["constbyval"], Value::Atom(v) if v == "true");
+                                let byref = matches!(&node.fields["constbyval"], Value::Atom(v) if v == "false");
+                                null == "false"
+                                    && ((byval
+                                        && matches!(*length, 1 | 2 | 4 | 8)
+                                        && bytes.len() == 8)
+                                        || (byref && *length == bytes.len()))
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(Uncovered::Malformed);
+                        }
+                    }
+                    if node.tag == "VAR" {
+                        if node.number("varno")? != 1
+                            || node.number("varnosyn")? != 1
+                            || node.number("varlevelsup")? != 0
+                        {
+                            return Err(Uncovered::Reference);
+                        }
+                        for field in ["varattno", "varattnosyn"] {
+                            let column = columns
+                                .get(&node.number(field)?)
+                                .ok_or(Uncovered::Reference)?;
+                            node.fields
+                                .insert(field.into(), Value::Atom(column.clone()));
+                        }
+                    }
+                    node.fields.remove("location");
+                    for child in node.fields.values_mut() {
+                        normalize(child, columns)?;
+                    }
+                }
+                Value::List(values) => {
+                    for child in values {
+                        normalize(child, columns)?;
+                    }
+                }
+                Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
+            }
+            Ok(())
+        }
+        normalize(&mut value, columns)?;
+        Ok(value)
+    }
+    Ok(prepare(left, major, left_columns)? == prepare(right, major, right_columns)?)
+}
+
 impl Value {
     pub(super) fn number(&self) -> Result<u32, Uncovered> {
         match self {
             Self::Atom(value) => value.parse().map_err(|_| Uncovered::Reference),
-            Self::Null | Self::List(_) | Self::Node(_) | Self::Datum => Err(Uncovered::Reference),
+            Self::Null | Self::List(_) | Self::Node(_) | Self::Datum | Self::DatumBytes { .. } => {
+                Err(Uncovered::Reference)
+            }
         }
     }
 }
@@ -283,7 +379,10 @@ fn walk(
                                     path.pop();
                                 }
                             }
-                            Value::Atom(_) | Value::Node(_) | Value::Datum => {
+                            Value::Atom(_)
+                            | Value::Node(_)
+                            | Value::Datum
+                            | Value::DatumBytes { .. } => {
                                 return Err(Uncovered::Reference);
                             }
                         }
@@ -303,7 +402,7 @@ fn walk(
                 path.pop();
             }
         }
-        Value::Null | Value::Atom(_) | Value::Datum => {}
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
     }
     Ok(())
 }
@@ -477,7 +576,7 @@ mod tests {
                     nodes_with_tag(value, tag, found);
                 }
             }
-            Value::Null | Value::Atom(_) | Value::Datum => {}
+            Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
         }
     }
 
@@ -837,6 +936,96 @@ mod tests {
                     assert!(seen.contains(tag), "{major}/{tag}");
                 }
             }
+        }
+    }
+    #[test]
+    fn retained2354_values_locations_and_unknown_coverage_are_distinct() {
+        let equal = |left: &str, right: &str, major| {
+            super::equal(left, right, major, &BTreeMap::new(), &BTreeMap::new())
+        };
+        let left = "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location 5 :constvalue 7 [ 28 0 0 0 115 97 100 ]}";
+        let changed = left.replace("115 97 100", "109 97 100");
+        for major in [16, 18] {
+            assert!(
+                decode(left, major).unwrap() == decode(&changed, major).unwrap(),
+                "binding-only decoding intentionally ignores constant values"
+            );
+            assert_eq!(equal(left, &changed, major), Ok(false));
+            assert_eq!(
+                equal(left, &left.replace(":location 5", ":location 99"), major),
+                Ok(true)
+            );
+            assert!(
+                equal(
+                    left,
+                    &left.replace(":consttype", ":future 1 :consttype"),
+                    major
+                )
+                .is_err()
+            );
+            assert!(equal(left, &left.replace("7 [", "6 ["), major).is_err());
+        }
+        assert!(equal(left, left, 17).is_err());
+        assert!(equal("{FUTURE :value 1}", left, 18).is_err());
+        let collation = left.replace(":constcollid 100", ":constcollid 950");
+        assert_eq!(equal(left, &collation, 18), Ok(false));
+    }
+    #[test]
+    fn retained2354_vars_keep_column_identity_across_physical_layouts() {
+        let left_columns = BTreeMap::from([(1, "m".into()), (3, "n".into())]);
+        let right_columns = BTreeMap::from([(2, "m".into()), (1, "n".into())]);
+        for major in [16, 18] {
+            let variable = |att| {
+                format!(
+                    "{{VAR :varno 1 :varattno {att} :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 {}:varnosyn 1 :varattnosyn {att} :location 0}}",
+                    if major == 18 {
+                        ":varreturningtype 0 "
+                    } else {
+                        ""
+                    }
+                )
+            };
+            let left = variable(1);
+            let right = variable(2);
+            let compare = |a: &str, b: &str| equal(a, b, major, &left_columns, &right_columns);
+            assert_eq!(compare(&left, &right), Ok(true));
+            assert_eq!(
+                compare(&left, &variable(1)),
+                Ok(false),
+                "m and n remain distinct"
+            );
+            for field in ["varattno", "varattnosyn"] {
+                for number in [-1, 0, 9] {
+                    assert!(
+                        compare(
+                            &left,
+                            &right.replace(&format!(":{field} 2"), &format!(":{field} {number}"))
+                        )
+                        .is_err()
+                    );
+                }
+                assert_eq!(
+                    compare(
+                        &left,
+                        &right.replace(&format!(":{field} 2"), &format!(":{field} 1"))
+                    ),
+                    Ok(false)
+                );
+            }
+            for (field, old, new) in [("varno", 1, 2), ("varnosyn", 1, 2), ("varlevelsup", 0, 1)] {
+                assert!(
+                    compare(
+                        &left,
+                        &right.replace(&format!(":{field} {old}"), &format!(":{field} {new}"))
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                compare(&left, &right.replace(":vartype 23", ":vartype 25")),
+                Ok(false)
+            );
+            assert!(equal(&left, &left, major, &BTreeMap::new(), &BTreeMap::new()).is_err());
         }
     }
 }
