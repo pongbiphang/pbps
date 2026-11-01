@@ -1,4 +1,5 @@
-//! A foreign key a type change leaves unjoinable (#2359, DEC-2359.1).
+//! A foreign key this plan introduces or retypes into unjoinable types
+//! (#2359, #2395, DEC-2359.1, DEC-2395.1).
 //!
 //! A type change on a column that takes part in a foreign key is either made
 //! with the key down (the dialect's `retype_dependents` says when, and
@@ -7,7 +8,8 @@
 //! the engine cannot join once the plan has run: one end retyped and the
 //! other left as it was, or both retyped to types that do not meet. Such a plan
 //! applies up to the key and is rolled back at the statement that adds it
-//! again, so it is named at plan time instead, with the next step.
+//! again, so it is named at plan time instead, with the next step. Added keys
+//! and inline keys of created tables ask the same question of the after-state.
 //!
 //! Nothing here reads a database. The answer is the dialect's own table
 //! (`Dialect::foreign_key_types_compatible`), and a dialect with no table says
@@ -29,8 +31,11 @@ pub struct Unjoinable {
     pub referencing: (ColumnRef, ColumnType),
     /// The referenced column and its declared type.
     pub referenced: (ColumnRef, ColumnType),
-    /// Which of the two ends this plan retypes, so that the next step can say
-    /// which one was left behind.
+    /// Endpoints selected by the existing repair diagnostic. Retypes select
+    /// the changed ends so it can name the one left behind. For a new key
+    /// with neither end retyped,
+    /// both are true to select the existing neutral "declare types that join"
+    /// repair rather than inventing an end the plan changed.
     pub referencing_retyped: bool,
     pub referenced_retyped: bool,
 }
@@ -49,14 +54,14 @@ fn declared_type(
     dialect.normalize_type(ty).ok()
 }
 
-/// The foreign keys of `declared` that a type change of `changes` touches and
+/// The foreign keys of `declared` that `changes` introduces or retypes and
 /// whose two declared column types the dialect knows it cannot join.
 ///
 /// Every key is read from the declarations and not from the plan's own drop
 /// and add of it: the plan may keep a key it also rebuilds around the change,
-/// and what has to hold is the key that stands at the end. A key none of whose
-/// columns is retyped is left alone, because it is not this plan's change and
-/// the engine already holds it. The column names are the ones the plan ends
+/// and what has to hold is the key that stands at the end. An existing key
+/// with no retyped column and no introducing change is left alone: the engine
+/// already holds it. The column names are the ones the plan ends
 /// with, as a change spells them.
 pub fn unjoinable(
     changes: &[Change],
@@ -73,18 +78,28 @@ pub fn unjoinable(
             }
         })
         .collect();
-    if retyped.is_empty() {
+    let mut introduced = BTreeSet::new();
+    for change in changes {
+        if let Change::AddForeignKey { table, name, .. } = change {
+            introduced.insert((table, name));
+        }
+        if let Change::CreateTable { name, table, .. } = change {
+            introduced.extend(table.foreign_keys.keys().map(|key| (name, key)));
+        }
+    }
+    if retyped.is_empty() && introduced.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     for (table, t) in &declared.tables {
         for (constraint, fk) in &t.foreign_keys {
+            let new_key = introduced.contains(&(table, constraint));
             for (local, remote) in fk.columns.iter().zip(&fk.references_columns) {
                 let referencing = table.column(local);
                 let referenced = fk.references_table.column(remote);
                 let referencing_retyped = retyped.contains(&referencing);
                 let referenced_retyped = retyped.contains(&referenced);
-                if !referencing_retyped && !referenced_retyped {
+                if !referencing_retyped && !referenced_retyped && !new_key {
                     continue;
                 }
                 let (Some(child), Some(parent)) = (
@@ -94,13 +109,16 @@ pub fn unjoinable(
                     continue;
                 };
                 if dialect.foreign_key_types_compatible(&child, &parent) == Some(false) {
+                    let neutral_repair = !referencing_retyped && !referenced_retyped;
                     out.push(Unjoinable {
                         table: table.clone(),
                         constraint: constraint.clone(),
                         referencing: (referencing, child),
                         referenced: (referenced, parent),
-                        referencing_retyped,
-                        referenced_retyped,
+                        // Reuse the neutral repair when no type change can
+                        // identify a "left behind" end (DEC-2395.1).
+                        referencing_retyped: referencing_retyped || neutral_repair,
+                        referenced_retyped: referenced_retyped || neutral_repair,
                     });
                 }
             }
@@ -237,6 +255,17 @@ mod tests {
         )
         .unwrap()
         .ids;
+        let declared_ids = crate::resolve(
+            declared,
+            &ids,
+            &[],
+            &Context {
+                operator: "leon".into(),
+                today: "2026-10-26".into(),
+            },
+        )
+        .unwrap()
+        .ids;
         diff(
             Side {
                 schema: base,
@@ -244,7 +273,7 @@ mod tests {
             },
             Side {
                 schema: declared,
-                ids: &ids,
+                ids: &declared_ids,
             },
             dialect,
             &Hints::default(),
@@ -277,6 +306,87 @@ mod tests {
                 .filter(|c| matches!(c, Change::AddForeignKey { .. }))
                 .count(),
         )
+    }
+
+    #[test]
+    fn created_and_added_keys_with_unjoinable_types_use_the_existing_neutral_repair() {
+        let declared = keyed("text", "integer");
+        let mut existing = declared.clone();
+        existing
+            .tables
+            .get_mut(&"app.c".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .clear();
+        for base in [Schema::default(), existing] {
+            let errors = plan(&base, &declared, &Keyed).unwrap_err();
+            let messages = refusals(errors);
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            for needed in [
+                "fk_c_p",
+                "app.c.pid",
+                "app.p.id",
+                "`integer`",
+                "`text`",
+                "Declare types for app.c.pid and app.p.id that a key can join",
+            ] {
+                assert!(messages[0].contains(needed), "{needed}: {}", messages[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn created_and_added_joinable_or_unplaced_keys_still_plan() {
+        for (parent, child) in [("bigint", "integer"), ("numeric", "integer")] {
+            let declared = keyed(parent, child);
+            let mut existing = declared.clone();
+            existing
+                .tables
+                .get_mut(&"app.c".parse::<TableName>().unwrap())
+                .unwrap()
+                .foreign_keys
+                .clear();
+            for base in [Schema::default(), existing] {
+                let changes = plan(&base, &declared, &Keyed).unwrap();
+                assert!(
+                    !changes.is_empty(),
+                    "the fixture must plan an introducing change"
+                );
+            }
+        }
+        assert!(
+            plan(
+                &Schema::default(),
+                &keyed("text", "integer"),
+                &MinimalDialect
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_pair_of_a_new_composite_key_uses_the_declared_after_state() {
+        let mut declared = keyed("bigint", "integer");
+        let parent = declared
+            .tables
+            .get_mut(&"app.p".parse::<TableName>().unwrap())
+            .unwrap();
+        parent
+            .columns
+            .insert("other".into(), Column::new("text".parse().unwrap()));
+        let child = declared
+            .tables
+            .get_mut(&"app.c".parse::<TableName>().unwrap())
+            .unwrap();
+        child
+            .columns
+            .insert("other".into(), Column::new("integer".parse().unwrap()));
+        let key = child.foreign_keys.get_mut("fk_c_p").unwrap();
+        key.columns.push("other".into());
+        key.references_columns.push("other".into());
+        let messages = refusals(plan(&Schema::default(), &declared, &Keyed).unwrap_err());
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("app.c.other") && messages[0].contains("app.p.other"));
     }
 
     #[test]
@@ -376,8 +486,9 @@ mod tests {
 
     #[test]
     fn a_key_the_plan_does_not_retype_is_not_judged() {
-        // The key's own columns stay as they were; another column is retyped.
-        let mut base = keyed("integer", "integer");
+        // Deliberately unjoinable, so judging this unchanged fixture key
+        // would refuse an unrelated change. No database is asked to hold it.
+        let mut base = keyed("text", "integer");
         let mut other = Table::default();
         other
             .columns

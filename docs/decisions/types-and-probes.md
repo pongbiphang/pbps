@@ -4376,3 +4376,18 @@ a line comment that swallows the wrapper's closing syntax refuses. This uses
 the engine's parser, without SQL splitting or a text blacklist. Apply rebinds
 before recording and rolls back on refusal. Neither the payload nor any format
 version changes.
+
+<a id="dec-2395-1"></a>
+
+**DEC-2395.1. The existing FK type-compatibility refusal also covers added
+keys and keys carried by created tables (#2395).** This completes the new-key
+case DEC-2359.1 left to apply. The same dialect fact and declared after-state
+column lookup decide every pair; no second compatibility table or engine read
+is introduced. A key with neither a retyped end nor an introducing change is
+left alone, rather than revalidating the whole stored schema.
+
+With neither end retyped, the existing diagnostic asks both declarations to
+agree. Its endpoint flags select that neutral repair; retype findings retain
+their directional flags and wording. This keeps the schema differ's sole
+call site unchanged. Unknown type pairs (including the existing array/domain
+policy) and dialects without a compatibility fact still refuse nothing.

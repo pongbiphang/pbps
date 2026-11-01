@@ -60,6 +60,9 @@ mod drop_requirements2400;
 #[path = "support/conversions2359.rs"]
 mod conversions2359;
 
+#[path = "support/foreign_keys2395.rs"]
+mod foreign_keys2395;
+
 #[path = "support/census2444.rs"]
 mod census2444;
 
