@@ -35,13 +35,6 @@ use crate::db::{self, Target};
 mod checkout;
 mod guard;
 mod services;
-#[cfg_attr(
-    any(not(test), not(target_os = "linux")),
-    expect(
-        dead_code,
-        reason = "#1165 D2b consumes the owned adapter; only Linux builds its lifecycle tests"
-    )
-)]
 pub(crate) mod test_run;
 
 use services::{Attempt, apply_identified};

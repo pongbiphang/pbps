@@ -2,6 +2,7 @@
 use crate::output::{Finding, Report};
 use schemars::JsonSchema;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +30,7 @@ pub(crate) struct Phase {
     pub started: bool,
     pub entry: Option<i64>,
     pub risks: Vec<String>,
+    pub unavailable: BTreeMap<String, String>,
 }
 impl Phase {
     pub fn new(phase: &str, identity: impl Into<String>) -> Self {
@@ -38,6 +40,41 @@ impl Phase {
             ..Self::default()
         }
     }
+    /// Refreshing grants may add time and findings to an already completed
+    /// phase; it must not erase that phase's measured cost or stronger outcome.
+    pub(crate) fn record<T>(
+        &mut self,
+        started: std::time::Instant,
+        id: &str,
+        result: &anyhow::Result<T>,
+    ) {
+        self.elapsed_ms = self
+            .elapsed_ms
+            .saturating_add(super::execution::elapsed(started));
+        match result {
+            Ok(_) if matches!(self.outcome, Status::Skipped) => self.outcome = Status::Passed,
+            Ok(_) => {}
+            Err(error) => {
+                let unknown = id == "test.infrastructure" || unanswerable(error);
+                self.outcome = if unknown || matches!(self.outcome, Status::Unanswerable) {
+                    Status::Unanswerable
+                } else {
+                    Status::Failed
+                };
+                self.findings.push(Finding::error(id, format!("{error:#}")));
+            }
+        }
+    }
+}
+fn unanswerable(error: &anyhow::Error) -> bool {
+    if let Some(db) = error.downcast_ref::<pbps_db::DbError>() {
+        return db.server_error_code().is_none_or(|c| {
+            ["08", "53", "58", "XX"].iter().any(|p| c.starts_with(p)) || c == "57014"
+        });
+    }
+    error
+        .chain()
+        .any(|e| e.is::<tokio::time::error::Elapsed>() || e.is::<std::io::Error>())
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct Column {
@@ -93,10 +130,12 @@ impl Assertion {
 pub(crate) struct TestData {
     pub operation: String,
     pub input: Option<super::InputIdentity>,
+    pub observed_input: super::ObservedInputs,
+    pub inputs_reverified: bool,
     pub run_id: Option<String>,
     pub acquired_image: Option<String>,
     pub engine_build: Option<String>,
-    pub unavailable_reason: Option<String>,
+    pub unavailable: BTreeMap<String, String>,
     pub recovery_removed: Vec<String>,
     pub recovery_live: Vec<String>,
     pub phases: Vec<Phase>,
@@ -124,7 +163,53 @@ impl TestData {
         };
         p.findings.push(Finding::error(id, message));
     }
+    pub(crate) fn startup_failure(&mut self, phase: usize, error: &crate::test_scratch::Error) {
+        if let crate::test_scratch::Error::StartCleanup { cleanup, .. } = error {
+            self.run_id = Some(cleanup.run_id.clone());
+            let mut p = Phase::new("cleanup", &cleanup.run_id);
+            p.outcome = Status::Unanswerable;
+            p.findings
+                .push(Finding::error("test.cleanup", cleanup.to_string()).remedy(&cleanup.remedy));
+            self.phases.push(p);
+        }
+        self.failure(phase, "test.infrastructure", error.to_string(), true);
+    }
+    pub(crate) fn reverify(&mut self, inputs: &super::Inputs) {
+        let mut phase = Phase::new("input", "final input verification");
+        let started = std::time::Instant::now();
+        match inputs.reverify() {
+            Ok(()) => {
+                self.inputs_reverified = true;
+                phase.outcome = Status::Passed;
+            }
+            Err(refusals) => {
+                phase.outcome = Status::Unanswerable;
+                phase.findings.extend(
+                    refusals
+                        .into_iter()
+                        .map(|r| Finding::error("test.input", r.to_string())),
+                );
+            }
+        }
+        phase.elapsed_ms = super::execution::elapsed(started);
+        self.phases.push(phase);
+    }
     pub fn finish(mut self) -> Report<Self> {
+        if self.input.is_some()
+            && !self.inputs_reverified
+            && !self
+                .phases
+                .iter()
+                .any(|p| matches!(p.outcome, Status::Failed | Status::Unanswerable))
+        {
+            let mut phase = Phase::new("input", "final input verification");
+            phase.outcome = Status::Unanswerable;
+            phase.findings.push(Finding::error(
+                "test.input",
+                "the frozen inputs were not reverified; the result cannot be qualified",
+            ));
+            self.phases.push(phase);
+        }
         if self.run_id.is_some() && !self.cleanup_confirmed {
             let mut cleanup = Phase::new("cleanup", "owned resource confirmation");
             cleanup.outcome = Status::Unanswerable;
@@ -134,11 +219,80 @@ impl TestData {
             ));
             self.phases.push(cleanup);
         }
+        for (field, absent, reason) in [
+            (
+                "input",
+                self.input.is_none(),
+                "input validation did not establish a complete input identity",
+            ),
+            (
+                "run_id",
+                self.run_id.is_none(),
+                "scratch acquisition did not identify an owned run",
+            ),
+            (
+                "acquired_image",
+                self.acquired_image.is_none(),
+                "the acquired image was not observed",
+            ),
+            (
+                "engine_build",
+                self.engine_build.is_none(),
+                "the owned server build was not observed",
+            ),
+            (
+                "candidate_sealed_checksum",
+                self.candidate_sealed_checksum.is_none(),
+                "no sealed candidate checksum was observed",
+            ),
+            (
+                "candidate_accepted_checksum",
+                self.candidate_accepted_checksum.is_none(),
+                "candidate admission was not observed",
+            ),
+            (
+                "candidate_executed_checksum",
+                self.candidate_executed_checksum.is_none(),
+                "candidate statement execution was not observed",
+            ),
+        ] {
+            if absent {
+                self.unavailable.insert(
+                    field.into(),
+                    if self.operation == "cleanup" {
+                        "not applicable to cleanup-only operation"
+                    } else {
+                        reason
+                    }
+                    .into(),
+                );
+            }
+        }
+        self.observed_input.files.sort();
+        self.observed_input.files.dedup();
+        for p in &mut self.phases {
+            for (field, absent) in [
+                ("from", p.from.is_none()),
+                ("to", p.to.is_none()),
+                ("distance", p.distance.is_none()),
+                ("changes", p.changes.is_none()),
+                ("statements", p.statements.is_none()),
+                ("checksum", p.checksum.is_none()),
+                ("entry", p.entry.is_none()),
+            ] {
+                if absent {
+                    p.unavailable.insert(
+                        field.into(),
+                        format!("not produced by the {} phase ({:?})", p.phase, p.outcome),
+                    );
+                }
+            }
+        }
         let unknown = self
             .phases
             .iter()
             .any(|p| matches!(p.outcome, Status::Unanswerable));
-        let findings = self
+        let findings: Vec<Finding> = self
             .phases
             .iter()
             .flat_map(|p| p.findings.clone())

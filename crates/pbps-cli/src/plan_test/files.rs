@@ -14,7 +14,7 @@ use super::{Change, ConsumedFile, Problem, Refusal, Revision, Role};
 struct Read {
     resolved: PathBuf,
     project_path: String,
-    text: String,
+    text: Result<String, Problem>,
     sha256: String,
 }
 
@@ -76,7 +76,7 @@ fn read(root: &Path, path: &Path) -> Result<Read, Problem> {
         }
     })?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let text = String::from_utf8(bytes).map_err(|_| Problem::NotUtf8)?;
+    let text = String::from_utf8(bytes).map_err(|_| Problem::NotUtf8);
     Ok(Read {
         resolved,
         project_path,
@@ -101,7 +101,16 @@ fn input(role: Role, name: Option<&str>, path: &str, problem: Problem) -> Refusa
 /// Entry paths are relative to the manifest's directory. The manifest itself
 /// must also be inside the project, or its own path would have no project
 /// name to report.
+#[cfg(test)]
 pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen, Vec<Refusal>> {
+    freeze_recorded(project_root, manifest_path, &mut Vec::new())
+}
+
+pub(super) fn freeze_recorded(
+    project_root: &Path,
+    manifest_path: &Path,
+    observed: &mut Vec<ConsumedFile>,
+) -> Result<Frozen, Vec<Refusal>> {
     let shown = manifest_path.to_string_lossy();
     let root = project_root.canonicalize().map_err(|e| {
         vec![input(
@@ -113,18 +122,23 @@ pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen
     })?;
     let manifest_read = read(&root, manifest_path)
         .map_err(|problem| vec![input(Role::Manifest, None, &shown, problem)])?;
-    let manifest = TestManifest::parse(&manifest_read.text).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(Refusal::Manifest)
-            .collect::<Vec<_>>()
-    })?;
     let manifest_file = ConsumedFile {
         path: manifest_read.project_path.clone(),
         revision: Revision::Working,
         role: Role::Manifest,
         sha256: manifest_read.sha256.clone(),
     };
+    observed.push(manifest_file.clone());
+    let text = manifest_read
+        .text
+        .as_ref()
+        .map_err(|problem| vec![input(Role::Manifest, None, &shown, problem.clone())])?;
+    let manifest = TestManifest::parse(text).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(Refusal::Manifest)
+            .collect::<Vec<_>>()
+    })?;
     // Resolved, so a manifest reached through a symlink names the directory
     // its entries are relative to the same way the recheck will.
     let dir = manifest_read
@@ -146,6 +160,20 @@ pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen
                     continue;
                 }
             };
+            let file = ConsumedFile {
+                path: read.project_path.clone(),
+                revision: Revision::Working,
+                role,
+                sha256: read.sha256,
+            };
+            observed.push(file.clone());
+            let text = match read.text {
+                Ok(text) => text,
+                Err(problem) => {
+                    refusals.push(input(role, Some(name), spelling, problem));
+                    continue;
+                }
+            };
             if let Some(first) = seen.insert(read.resolved.clone(), name) {
                 refusals.push(Refusal::DuplicateFile {
                     list,
@@ -157,13 +185,8 @@ pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen
             }
             out.push(FrozenSql {
                 name: name.to_owned(),
-                file: ConsumedFile {
-                    path: read.project_path,
-                    revision: Revision::Working,
-                    role,
-                    sha256: read.sha256,
-                },
-                text: read.text,
+                file,
+                text,
                 source,
                 resolved: read.resolved,
             });
@@ -226,6 +249,9 @@ impl Frozen {
         let recheck = |file: &ConsumedFile, source: &Path, resolved: &Path| {
             let change = match read(&self.root, source) {
                 Err(problem) => Change::Unusable(problem),
+                Ok(Read {
+                    text: Err(problem), ..
+                }) => Change::Unusable(problem),
                 Ok(now) if now.resolved != resolved => Change::Retargeted,
                 Ok(now) if now.sha256 != file.sha256 => Change::Edited,
                 Ok(_) => return None,
