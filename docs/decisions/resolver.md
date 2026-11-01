@@ -5849,6 +5849,22 @@ so a scope that no transition explains cannot be sealed. Equal scopes behave as
 before, which PostgreSQL's runs always satisfy; a PostgreSQL plan that drops a
 managed view was measured to seal unchanged.
 
-A created table with typed columns still does not seal: its columns bind
-built-in types that neither the opening capture reached nor the plan installs.
-That boundary is open in #2143 and not decided here.
+<a id="dec-2143-6"></a>
+
+**DEC-2143.6. The opening capture also reads the engine's own records that the
+compiled closure binds to (#2143).** A created table's columns bind built-in
+types such as `sys.int`. The target holds them on every instance, but its
+opening capture never reached them when no standing object used them, and the
+plan does not install them, so the closing manifest had nowhere to put them and
+a created table could not be sealed. The maintainer chose to read them on the
+target rather than to relax the closing projection or to refuse such plans.
+
+A built-in is a type the engine ships (`user_defined` false) or an engine-owned
+object; a user-defined type is never one, and stays unresolved unless a capture
+or the externals file reads it. The compiled capture names its built-ins and
+the producer adds them to both scopes as retained roots, so they are kept
+records in the opening and the closing manifest and are compared for real at
+apply. One that is missing on the target is a compiled-only root no transition
+installs, and the projection refuses it. The tests cover a created table over
+`int`, a changed built-in record refused at closing, and the exclusion of a
+user-defined type.

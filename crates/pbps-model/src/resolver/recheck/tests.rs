@@ -417,3 +417,41 @@ fn an_installed_record_something_binds_to_cannot_vanish() {
         Vec::<String>::new()
     );
 }
+
+/// An engine-shipped record the plan's closure binds to is a kept record like
+/// any other: if the target's differs at closing, apply refuses (DEC-2143.6).
+#[test]
+fn a_kept_engine_built_in_record_that_changed_is_refused_at_closing() {
+    let int = ObjectIdentity {
+        class: "sys.types".into(),
+        name: vec!["sys".into(), "int".into()],
+        signature: vec![],
+    };
+    let column = object("sys.columns", "c");
+    let sealed = manifest(
+        vec![record(&int, "09", &[]), record(&column, "0a", &[&int])],
+        &[],
+        None,
+        "03",
+    );
+    let same = manifest(
+        vec![record(&int, "09", &[]), record(&column, "0a", &[&int])],
+        &[],
+        None,
+        "03",
+    );
+    assert_eq!(sealed.closing_differences(&same, &[]), Vec::<String>::new());
+    let changed = manifest(
+        vec![record(&int, "0b", &[]), record(&column, "0a", &[&int])],
+        &[],
+        None,
+        "03",
+    );
+    let found = sealed.closing_differences(&changed, &[]);
+    assert!(
+        found
+            .iter()
+            .any(|d| d.contains("changed") && d.contains("int")),
+        "{found:?}"
+    );
+}
