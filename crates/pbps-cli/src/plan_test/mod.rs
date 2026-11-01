@@ -12,10 +12,10 @@
 
 mod chain;
 #[cfg_attr(
-    not(target_os = "linux"),
+    all(not(target_os = "linux"), not(test)),
     expect(
         dead_code,
-        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
+        reason = "D2b2 consumes the owned services; unit tests use every execution method"
     )
 )]
 pub(crate) mod execution;
