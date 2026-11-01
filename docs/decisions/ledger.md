@@ -1243,3 +1243,38 @@ snapshot ID already observed. The planning shortcut uses the same method;
 no reporting checkout can replace deployed-commit evidence (DEC-2397.1).
 Drift/verify and ordinary baseline reads still use the newest managed snapshot.
 A data-work outcome does not acquire failed-deployment or resume semantics.
+
+
+<a id="dec-964-1"></a>
+
+**DEC-964.1. Distinct environments cannot share a declared fingerprint-key
+source or a successfully loaded KeyId (#964; completes DEC-952.1).**
+Configuration rejects repeated variable names and repeated file addresses after
+joining the declared file to the config directory. Comparison ignores harmless
+dots and separators, keeps native path identity and parent components, and
+never opens or canonicalizes a key. Only a mixed relative/absolute comparison
+needs a once-captured absolute base; failure to establish it is a configuration
+error, not evidence that sources differ. Runtime Project roots and loading paths
+remain unchanged. Symlinks, hard links, copied files and other address aliases
+are not an inode-identity proof.
+
+The rule is parser-wide, including configuration read from history. Historical
+shared-source YAML is refused with its original cause; valid historical distinct
+sources do not require their key files to exist. Do not silently substitute
+today's paths or add a historical bypass.
+
+Doctor loads each requested environment once, discards each secret after
+obtaining its public KeyId, and groups only successful IDs. Every member of a
+shared group gets an `environment.shared-fingerprint-key` Error naming all
+members in sorted order, replacing its ordinary key Note. Independent load
+errors, unconfigured sources and unique successful IDs retain their findings.
+The requested order is preserved. This implements the specified public-ID
+comparison; a truncated ID is not mathematical proof of equal secret bytes.
+
+Selection stays local: no selected target checks all configured environments,
+`--env` checks only that environment, and bare `--db` checks no named key. This
+diagnostic never opens unselected secrets to make an estate-wide uniqueness
+claim. It changes neither key generation/loading nor HMAC domains or persisted
+formats, and rotates no key. Sharing is an ordinary Error/exit-2 finding when
+the diagnosis is otherwise answerable; an independently unreadable environment
+retains doctor's exit-1 precedence.
