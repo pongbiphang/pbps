@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 83;
+pub const SCHEMA_VERSION: u32 = 84;
+// 84: retained column DEFAULT writebacks (#2354, DEC-2354.4).
 // 83: retained CHECK writebacks (#2354).
 // 82: PostgreSQL resolver authorization reproduction status and notice (#2570).
 // 78: named SQL Server database layouts in project configuration (#2501).

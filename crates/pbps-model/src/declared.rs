@@ -359,13 +359,24 @@ impl Declared {
         for planned in &changes.changes {
             if let Change::RenameEnumValue { retained, .. } = &planned.change {
                 for expression in retained {
-                    let crate::ExpressionTarget::Check { table, name, .. } = &expression.target;
-                    self.expressions
-                        .checks
-                        .entry(table.clone())
-                        .or_default()
-                        .insert(name.clone(), expression.after.clone());
-                    remove_nested(&mut self.bindings.checks, table, name);
+                    match &expression.target {
+                        crate::ExpressionTarget::Check { table, name, .. } => {
+                            self.expressions
+                                .checks
+                                .entry(table.clone())
+                                .or_default()
+                                .insert(name.clone(), expression.after.clone());
+                            remove_nested(&mut self.bindings.checks, table, name);
+                        }
+                        crate::ExpressionTarget::ColumnDefault { column, .. } => {
+                            self.expressions
+                                .defaults
+                                .entry(column.table.clone())
+                                .or_default()
+                                .insert(column.name.clone(), expression.after.clone());
+                            remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
+                        }
+                    }
                 }
             }
             match &planned.change {

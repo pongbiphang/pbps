@@ -72,3 +72,4 @@ DECISIONS 465).
 - `78/` adds the explicit SQL Server per-database project layout (#2501).
 - `82/` adds the PostgreSQL resolver compilation-identity status and supplied-login notice in plan and explain output (#2570).
 - `83/` adds retained CHECK writebacks to plan explanations (#2354 PR 1).
+- `84/` adds retained column DEFAULT writebacks to plan explanations (#2354 PR 2).
