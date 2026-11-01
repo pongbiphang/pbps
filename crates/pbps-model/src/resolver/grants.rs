@@ -1,18 +1,23 @@
 //! Source-free object-grant questions, separate from binding inputs.
 
 use crate::{Change, ChangeSet, GrantTarget, Permission, RoleName};
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A target incarnation absent at an endpoint differs from a present target
 /// with no requested grants. Unreadable observations never make this value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GrantTargetState {
     Absent,
     Present { target: GrantTarget },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GrantPrincipal {
     Absent,
@@ -22,7 +27,7 @@ pub enum GrantPrincipal {
 
 /// A keyed answer to one typed question, not an exported ACL or an
 /// authorization recipe. The target and principal are included in its seal.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrantPhase {
     pub target: GrantTargetState,
@@ -32,7 +37,7 @@ pub struct GrantPhase {
 
 /// One approved change's grant postcondition. The change supplies the
 /// permissions and direction; repeating or omitting a change is invalid.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationGrant {
     pub change: usize,

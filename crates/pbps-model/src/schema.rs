@@ -15,6 +15,7 @@
 //! annotation happened to be present.
 
 use crate::{ColumnName, ObjectLocalName};
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
@@ -25,7 +26,9 @@ use crate::name::TableName;
 use crate::types::ColumnType;
 
 /// The complete desired state of a project.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
@@ -415,7 +418,9 @@ impl Table {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,7 +549,9 @@ pub struct Table {
 }
 
 /// FORCE is meaningful state even while row security is disabled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RowSecurity {
     #[serde(default)]
@@ -560,7 +567,9 @@ impl RowSecurity {
 }
 
 /// A policy's name belongs to its table's map, not its definition.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RowPolicy {
     #[serde(default)]
@@ -624,7 +633,9 @@ impl RowPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyCommand {
     #[default]
@@ -648,7 +659,9 @@ impl PolicyCommand {
 }
 
 /// PUBLIC is a target, never a sentinel role name (ADR-0010 §5).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyRoles {
     #[default]
@@ -658,7 +671,7 @@ pub enum PolicyRoles {
 
 /// `PARTITION BY RANGE | LIST | HASH (…)` over plain columns (#1170,
 /// #1632).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionBy {
     /// How rows are routed to partitions. `RANGE` is written as nothing, so
@@ -678,7 +691,9 @@ pub struct PartitionBy {
 }
 
 /// How a partitioned table routes rows (#1632, DEC-1632.1).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionStrategy {
     /// By ranges of the key, with an optional DEFAULT partition.
@@ -707,7 +722,7 @@ impl PartitionStrategy {
 }
 
 /// A partition's parent and the rows it takes (#1170).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionOf {
     pub parent: TableName,
@@ -724,7 +739,9 @@ pub struct PartitionOf {
 /// One column's own default and NOT NULL on a partition (#1578). Each is an
 /// override of what the parent's column has, so neither repeats the parent's:
 /// `None` and `false` are the parent's.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionColumn {
     /// The partition's own default, where it differs from the parent's.
@@ -739,7 +756,7 @@ pub struct PartitionColumn {
 /// one key value (inclusive) to another (exclusive), one datum per key
 /// column, a list of the key's values, or the rows whose key hashes to a
 /// remainder of a modulus (#1632).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionBound {
     Default,
@@ -776,7 +793,9 @@ impl PartitionBound {
 
 /// One value of a LIST partition: the engine's own text for it, unquoted,
 /// or `NULL`, which a LIST partition may take and a range may not.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ListDatum {
     Null,
@@ -795,7 +814,7 @@ impl std::fmt::Display for ListDatum {
 
 /// One key column's end of a range: the engine's own text for a value,
 /// unquoted, or one of the two unbounded ends.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BoundDatum {
     MinValue,
@@ -834,7 +853,7 @@ impl BoundDatum {
 /// The period's two columns stay in [`Table::columns`], which holds their
 /// type, nullability and place; this names them. The engine writes both on
 /// every change to a row, so neither is a column a declared row can write.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SystemTime {
     /// `GENERATED ALWAYS AS ROW START`.
@@ -861,7 +880,7 @@ impl SystemTime {
 /// `SYSTEM_VERSIONING = ON`: the engine keeps every replaced row in a history
 /// table. The history is part of its table, with no identity of its own: its
 /// columns follow the table's, and the engine builds its layout (DEC-1176.1).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SystemVersioning {
     /// Always a name, even where the engine chose one: a table recreated
@@ -873,7 +892,7 @@ pub struct SystemVersioning {
 }
 
 /// A finite `HISTORY_RETENTION_PERIOD`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {
     /// Positive: the engine refuses zero.
@@ -881,7 +900,7 @@ pub struct Retention {
     pub unit: RetentionUnit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionUnit {
     Day,
@@ -952,7 +971,9 @@ impl std::str::FromStr for Retention {
 /// that object is a drop and an add under the new name (constraints and
 /// indexes are never renamed in place), so the selector follows it by being
 /// written with the new name; nothing else holds the name a second time.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Clustered {
     /// No clustered index, although the table has a primary key: the key is
@@ -982,7 +1003,9 @@ pub enum Clustered {
 /// let identity = pbps_model::ReplicaIdentity::Index("ix".into());
 /// let _ = identity.to_string();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaIdentity {
     /// `REPLICA IDENTITY FULL`: every column of the old row.
@@ -1181,7 +1204,7 @@ fn has_explicit_null_semantics(expression: &str, continues_ident: fn(char) -> bo
 /// own spelling. Kept as written, and compared without ASCII case, so a
 /// declaration spelled one way and a read-back spelled the other are the one
 /// schema they are (constraint 1) instead of a change planned forever.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Collation(String);
 
@@ -1233,7 +1256,7 @@ impl std::fmt::Display for Collation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
     pub seed: i64,
@@ -1265,7 +1288,9 @@ impl Identity {
 /// the type and keeps an explicit one, so `None` is not the same as the
 /// number it stands for today. A bound declared equal to its default is
 /// refused by validation, so each sequence has one spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1319,7 +1344,7 @@ impl SequenceOptions {
 /// name the engine gave it, and is not compared: a column or table rename
 /// keeps the sequence's name, so the generated one stops matching the
 /// declaration the first time either is renamed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OwnedSequence {
     pub start: i64,
@@ -1357,7 +1382,7 @@ impl OwnedSequence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrimaryKey {
     /// The constraint name. `None` leaves the database to name it.
@@ -1373,7 +1398,7 @@ pub struct PrimaryKey {
     pub storage_parameters: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UniqueConstraint {
     pub columns: Vec<ColumnName>,
@@ -1386,7 +1411,7 @@ pub struct UniqueConstraint {
     pub storage_parameters: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForeignKey {
     pub columns: Vec<ColumnName>,
@@ -1407,15 +1432,7 @@ pub struct ForeignKey {
 /// Mirroring the variants in `pbps-load` to avoid the derive would recreate the
 /// drift the generation exists to prevent.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    schemars::JsonSchema,
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ReferentialAction {
@@ -1431,14 +1448,14 @@ pub enum ReferentialAction {
     SetDefault,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckConstraint {
     /// The check expression, kept verbatim.
     pub expression: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Index {
     pub columns: Vec<IndexColumn>,
@@ -1502,7 +1519,7 @@ impl Index {
     Hash,
     serde::Serialize,
     serde::Deserialize,
-    schemars::JsonSchema,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum IndexMethod {
@@ -1528,7 +1545,7 @@ impl IndexMethod {
 }
 
 /// How a generated column is computed (DEC-1168.1).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Generated {
     /// The generation expression, kept verbatim as a default's is.
@@ -1540,7 +1557,7 @@ pub struct Generated {
 }
 
 /// A SQL Server computed column (#1174, DEC-1174.1).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComputedColumn {
     /// The expression, kept verbatim as a default's is.
@@ -1572,7 +1589,7 @@ impl ComputedColumn {
 }
 
 /// One key of an index, in the index's order.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(try_from = "RawIndexColumn", into = "RawIndexColumn")]
 pub struct IndexColumn {
     pub key: IndexKey,
@@ -1638,7 +1655,7 @@ impl IndexColumn {
 /// key was before expressions existed, so an older file reads unchanged and a
 /// column key writes byte for byte what it always did; `expression` for an
 /// expression. One and only one of the two.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RawIndexColumn {
     #[serde(default, skip_serializing_if = "Option::is_none")]

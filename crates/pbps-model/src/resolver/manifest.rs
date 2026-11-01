@@ -1,9 +1,12 @@
 use super::ObjectOwnership;
+use schemars::JsonSchema;
 use std::collections::BTreeSet;
 
 /// A logical address, independent of any particular database's object numbers.
 /// Components stay separate: a dot inside an identifier is not qualification.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectIdentity {
     pub class: String,
@@ -58,7 +61,9 @@ impl std::fmt::Debug for ObjectIdentity {
 
 /// One occurrence in an engine-observed binding tree. Keeping its node/path
 /// distinguishes swapping two same-typed arguments from an unchanged target set.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub node: String,
@@ -68,7 +73,9 @@ pub struct Binding {
 
 /// All overloads of a name, all names in a namespace, or the whole class.
 /// An empty membership is a required absence, never an omitted predicate.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateSet {
     pub class: String,
@@ -78,14 +85,14 @@ pub struct CandidateSet {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadScope {
     pub retained: BTreeSet<ObjectIdentity>,
     pub candidates: BTreeSet<CandidateSet>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Membership {
     pub predicate: CandidateSet,
@@ -94,7 +101,9 @@ pub struct Membership {
 
 /// The binding of a DROP signature under its own write path, observed in the
 /// same snapshot as candidates. This is a typed lookup, never executable SQL.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineLookup {
     pub signature: String,
@@ -119,7 +128,7 @@ const NO_FINGERPRINT: &str = "00000000000000000000000000000000000000000000000000
 /// Complete properties under `canonicalization`, including definitions and
 /// literals, reduced by the adapter to an environment-keyed HMAC. Bindings are
 /// logical addresses only. Neither a raw property map nor SQL can be stored here.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Prerequisite {
     pub object: ObjectIdentity,
@@ -150,7 +159,7 @@ impl Prerequisite {
 /// no serde defaults: unreadable and absent evidence cannot become an empty set.
 /// Construction and deserialization apply the same structural checks; adapter
 /// version support and scope derivation remain the engine reader's obligations.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(try_from = "ManifestWire")]
 pub struct InputManifest {
     version: u32,
@@ -166,7 +175,7 @@ pub struct InputManifest {
     identifications: Vec<RoutineLookup>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ManifestWire {
     version: u32,

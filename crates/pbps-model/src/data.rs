@@ -18,6 +18,7 @@
 //! declaration.
 
 use crate::ColumnName;
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -25,7 +26,7 @@ use crate::name::TableName;
 use crate::schema::Table;
 
 /// The declared contents of one table.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TableData {
     pub mode: DataMode,
@@ -40,7 +41,16 @@ pub struct TableData {
 
 /// How completely the declaration describes the table (ADR-0004).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum DataMode {
@@ -78,7 +88,16 @@ impl fmt::Display for DataMode {
 /// The emitter renders the key according to that column — the one place that
 /// knows how a `varchar` and an `int` differ — so there is exactly one answer.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(transparent)]
 pub struct RowKey(pub String);
@@ -116,7 +135,9 @@ impl fmt::Display for RowKey {
 /// table; it would also break ADR-0004's argument that a row can be recreated
 /// losslessly, which is why rows need no identity machinery. `validate`
 /// therefore refuses a row that omits a `NOT NULL` column with no default.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Row(pub BTreeMap<ColumnName, Value>);
 
@@ -158,7 +179,9 @@ impl FromIterator<(ColumnName, Value)> for Row {
 /// column's declared type — the same rule [`RowKey`] follows, and the same
 /// treatment defaults and check expressions already get: keep it verbatim,
 /// never parse it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Value {
     Null,
@@ -212,7 +235,9 @@ impl fmt::Display for Value {
 /// they happen to evaluate the same — and an `UPDATE` has to say `DEFAULT`,
 /// not `NULL`, or a `NOT NULL` column with a default fails on a row that
 /// `validate` had passed.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Cell {
     Value(Value),
@@ -269,7 +294,7 @@ pub fn cell(row: &Row, column: &str, spec: Option<&crate::schema::Column>) -> Ce
 /// notion of which of them are declared. The scope comes from a declaration or
 /// from a recorded state, and it is what turns "the table holds these rows"
 /// into a [`TableData`] the differ can compare.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DataScope {
     pub mode: DataMode,

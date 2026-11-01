@@ -1,11 +1,14 @@
 //! A human's explanation for new audit intent, separate from historical text.
 
+use schemars::JsonSchema;
 use std::{fmt, str::FromStr};
 
 /// A reason must explain something; whitespace alone cannot supply intent.
 /// Historical tombstones and snapshots keep `String` so records written by
 /// older versions remain readable (DEC-1796.1).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct Reason(String);
 

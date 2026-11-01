@@ -23,6 +23,31 @@
 //! layout of `CREATE TABLE` — an order equality ignores, and which
 //! [`state_checksum`] therefore sorts away before hashing (DECISIONS 238).
 
+/// The published schema of a type that crosses JSON as one bare string.
+///
+/// Written out for types whose `Serialize` is hand-written, where a derive
+/// would describe a shape the wire never has. The fingerprint of the persisted
+/// formats (`format_fingerprint`) hashes these schemas, so a type that is a
+/// string on the wire must say so (#2412).
+macro_rules! string_json_schema {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl schemars::JsonSchema for $ty {
+            fn inline_schema() -> bool {
+                <String as schemars::JsonSchema>::inline_schema()
+            }
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                <String as schemars::JsonSchema>::schema_name()
+            }
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                <String as schemars::JsonSchema>::schema_id()
+            }
+            fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                <String as schemars::JsonSchema>::json_schema(generator)
+            }
+        }
+    )+};
+}
+
 pub mod baseline_evidence;
 pub mod change;
 mod column_wire;
@@ -34,6 +59,7 @@ pub mod diagnostic;
 pub mod drift;
 pub mod escape;
 pub mod finding;
+pub mod fingerprint;
 pub mod ids;
 pub mod intent;
 pub mod managed_type;

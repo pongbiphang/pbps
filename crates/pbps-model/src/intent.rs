@@ -23,13 +23,16 @@
 use crate::ColumnName;
 use crate::Reason;
 use crate::name::{ColumnRef, TableName};
+use schemars::JsonSchema;
 
 /// One piece of human-supplied intent.
 ///
 /// There are three sources, and they are exactly equivalent (SPEC §6): CLI
 /// commands such as `pbps rename`, transient annotations in the declaration
 /// files, and the interactive prompt. All of them end up in the identity file.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(tag = "intent", rename_all = "snake_case")]
 pub enum Intent {
     RenameType {

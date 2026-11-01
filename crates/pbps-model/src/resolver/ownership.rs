@@ -2,12 +2,13 @@
 
 use super::Surface;
 use crate::{Change, ChangeSet};
+use schemars::JsonSchema;
 
 /// Catalog capture alone does not prove which managed surface may change a
 /// record. A qualified adapter maps engine-proved ownership into this typed
 /// fact; references to an object are not ownership of it (SPEC 9.3.2).
 /// Unqualified records remain valid read prerequisites, never write authority.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(
     tag = "kind",
     content = "surface",

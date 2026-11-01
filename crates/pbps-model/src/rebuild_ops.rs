@@ -1,10 +1,11 @@
 //! Typed, non-executable blocking-rewrite inputs (DEC-2298.1).
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use crate::{Collation, ColumnRef, ColumnType, Rebuild, Table, TableName, Uid};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RebuildPartitionedTable {
     pub table: TableName,
@@ -114,7 +115,7 @@ impl RebuildPartitionedTable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RebuildRelation {
     pub uid: Uid,
@@ -123,7 +124,7 @@ pub struct RebuildRelation {
 }
 
 /// A bound source value, including its type for the dialect's conversion risk.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CopySource {
     pub column: ColumnRef,
@@ -131,7 +132,7 @@ pub struct CopySource {
     pub collation: Option<Collation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CopyStage {
     pub input: crate::ColumnName,
@@ -142,7 +143,7 @@ pub struct CopyStage {
     pub using: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CopyColumn {
     /// An added destination column has no source; it receives a typed NULL.
@@ -155,7 +156,7 @@ pub struct CopyColumn {
     pub stages: Vec<CopyStage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CopyTableRows {
     pub source: RebuildRelation,
@@ -167,7 +168,7 @@ pub struct CopyTableRows {
     pub max_rows: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeTableTree {
     pub parent: RebuildRelation,
@@ -183,7 +184,7 @@ pub struct IntermediateAddress {
 
 /// Parent-only construction, explicit leaf builds and attachment (DEC-2298.8).
 /// A key clone includes a same-named leaf constraint before attachment.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuildPartitionedIndex {
     pub parent: RebuildRelation,
@@ -193,7 +194,7 @@ pub struct BuildPartitionedIndex {
     pub clones: Vec<PartitionIndexClone>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionIndexDefinition {
     Index(crate::Index),
@@ -201,7 +202,7 @@ pub enum PartitionIndexDefinition {
     Unique(crate::UniqueConstraint),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionIndexClone {
     pub leaf: RebuildRelation,

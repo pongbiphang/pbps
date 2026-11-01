@@ -1,11 +1,12 @@
 //! Declared shared types (DEC-1635.1). Names belong to `Schema::types`.
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use crate::{CollationName, ColumnType, ObjectLocalName};
 
 /// The definition, without catalog identity, ownership or one-shot intent.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedType {
     Enum {
@@ -74,7 +75,16 @@ impl ManagedType {
 /// check is dropped before the plan's rows and added after them, as a table's
 /// is, so the two directions are two changes.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DomainHalf {
@@ -187,7 +197,7 @@ impl<'a> DomainDelta<'a> {
 }
 
 /// The neighbour already exists at this operation's position (DEC-1635.6).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(
     tag = "position",
     content = "value",
@@ -205,7 +215,7 @@ pub enum EnumPlacement {
 /// The replacement exists under a pbps-chosen name until `Swap`; the columns
 /// move to it one at a time, so every intermediate state is a state the
 /// per-statement checks can name.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "step", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnumRebuildStep {
     /// `CREATE TYPE <tmp> AS ENUM (<final labels>)`, or `CREATE DOMAIN <tmp>

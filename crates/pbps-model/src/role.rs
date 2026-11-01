@@ -25,6 +25,7 @@
 //! emitter renders `GRANT` and `REVOKE`; nothing here knows how either is
 //! spelled (constraint 3).
 
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -34,7 +35,9 @@ use crate::name::NameError;
 
 /// One database role: what it is granted. Its name is the key in
 /// [`crate::Schema::roles`] (constraint 2).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Role {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,7 +86,16 @@ impl Role {
 /// a grant has to be able to name which one. On SQL Server nothing overloads,
 /// so nothing there writes it.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub enum GrantTarget {
@@ -223,7 +235,17 @@ impl From<GrantTarget> for String {
 /// New words are appended: the derived order is the order `fmt` writes a
 /// grant's permissions in, and inserting one would reorder every role file.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {

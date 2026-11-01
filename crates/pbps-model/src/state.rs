@@ -10,6 +10,7 @@ use crate::declared::Declared;
 use crate::ids::IdsFile;
 use crate::module::ModuleDeps;
 use crate::schema::Schema;
+use schemars::JsonSchema;
 
 /// The current state-snapshot format version.
 ///
@@ -227,7 +228,7 @@ pub const CURRENT_VERSION: u32 = 35;
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StateKind {
     /// A plan was applied normally.
@@ -308,7 +309,7 @@ impl std::fmt::Display for StateKind {
 /// The whole schema is stored, not a delta or a checksum: that is what lets
 /// drift detection compare in full, what makes the snapshot usable as a backup,
 /// and what lets it answer "what did this table look like three months ago?".
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateSnapshot {
     pub version: u32,
@@ -380,7 +381,7 @@ pub struct StateSnapshot {
 /// rolls back, so the only honest way to make a mid-way failure visible rather
 /// than mysterious is to record each completed statement as it completes —
 /// which is also what lets `--resume` know where to start.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StagedProgress {
     /// How many of the plan's statements have run. The resume point.
