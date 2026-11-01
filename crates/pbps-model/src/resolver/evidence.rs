@@ -458,6 +458,8 @@ impl ResolverEvidence {
             return Err(EvidenceError::Incomplete);
         }
         self.ordering.validate(changes)?;
+        // A SQL Server filter binds nothing at creation (DEC-2143.2).
+        let filter_binds = !self.qualification.rule.starts_with("mssql-");
         // The artifact must at least cover every explicitly changed binding
         // surface. Unchanged managed surfaces come from the producer's complete
         // schema inventory; their required membership is pinned by the seal.
@@ -477,7 +479,7 @@ impl ResolverEvidence {
                         });
                     }
                     for (index, spec) in &table.indexes {
-                        if spec.holds_expression() {
+                        if spec.holds_expression_when(filter_binds) {
                             surfaces.push(super::Surface::Index {
                                 table: name.clone(),
                                 name: index.clone(),
@@ -518,7 +520,7 @@ impl ResolverEvidence {
                 }
                 Change::AddIndex {
                     table, name, index, ..
-                } if index.holds_expression() => vec![super::Surface::Index {
+                } if index.holds_expression_when(filter_binds) => vec![super::Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
                 }],

@@ -175,6 +175,7 @@ pub(super) fn constraints(
     observations: &[SurfaceResolution],
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
+    filter_binds: bool,
 ) -> BTreeSet<Constraint> {
     // Asked once per step and observation: indexed once (#1870).
     let base_names = base.ids.index();
@@ -335,7 +336,7 @@ pub(super) fn constraints(
     // UID: a dropped table and the one that takes its name are two owners,
     // and the renamed table's removal is spelled by its final name
     // (DEC-1498.1).
-    let opening = super::prepare::surfaces(base.schema);
+    let opening = super::prepare::surfaces(base.schema, filter_binds);
     let owned = |i: usize, owner: Option<&Uid>| match (&owners[i], owner) {
         (Some(a), Some(b)) => a == b,
         _ => true,

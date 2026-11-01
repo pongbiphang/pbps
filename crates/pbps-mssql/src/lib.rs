@@ -213,6 +213,10 @@ impl pbps_dialect::PlanDialect for Mssql {
 }
 
 impl Dialect for Mssql {
+    fn filter_binds_expression(&self) -> bool {
+        false
+    }
+
     fn validate_plan_analysis(
         &self,
         plan: &pbps_model::SavedPlan,
