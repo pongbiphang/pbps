@@ -24,6 +24,7 @@
 //! would be theatre. `apply` rejects a preview outright and says to run
 //! `plan --db`.
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -281,7 +282,7 @@ pub const CURRENT_VERSION: u32 = 59;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanOrigin {
     /// Computed offline, against a git revision or a state file. A preview for
@@ -308,7 +309,9 @@ impl PlanOrigin {
 /// [`PlanMode::Staged`] adds is a way through for the operation a transaction
 /// cannot hold at all — isolated in a deployment of its own, applied statement
 /// by statement with each completion recorded, and resumable.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMode {
     /// One plan, one transaction, all or nothing.
@@ -339,7 +342,7 @@ impl std::fmt::Display for PlanMode {
 }
 
 /// What the plan was computed against.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanBaseline {
     /// Human-readable, for the approver reading the plan at the gate: "prod as
@@ -371,7 +374,7 @@ pub struct PlanBaseline {
 }
 
 /// A plan as written to disk by `pbps plan --out`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SavedPlan {
     /// Declared cross-database assumptions and their plan-time comparison.
@@ -487,9 +490,7 @@ pub struct SavedPlan {
 }
 
 /// Complete catalog source of a reviewed input-path root (DEC-2181.2).
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeRoutine {
     pub oid: i64,
@@ -500,7 +501,7 @@ pub struct TypeRoutine {
 }
 
 /// Definitions are pinned by the plan checksum; a new type has no before-state.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredTypePin {
     pub uid: crate::Uid,
@@ -509,7 +510,7 @@ pub struct DeclaredTypePin {
     pub before: Option<DeclaredTypeBefore>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredTypeBefore {
     pub name: crate::TypeRef,
@@ -517,7 +518,7 @@ pub struct DeclaredTypeBefore {
 }
 
 /// A referenced type's identity and unkeyed canonical-definition digest.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypePin {
     pub schema: String,
@@ -532,7 +533,7 @@ pub struct TypePin {
 /// Each digest is an HMAC under the environment's fingerprint key over one
 /// routine as the catalog holds it. The key is not in the file (DEC-952.1), and
 /// without it a digest tests no guess about a body.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutinePins {
     /// The identifier of the key the digests were made under. `apply` under
@@ -549,7 +550,7 @@ pub struct RoutinePins {
 }
 
 /// One pinned routine.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutinePin {
     /// The routine's schema-qualified name and argument types at plan time.

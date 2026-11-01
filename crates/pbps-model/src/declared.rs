@@ -21,6 +21,7 @@
 //! before; on one that respells, the object is restated once, and the apply
 //! records what it declared (DECISIONS 208).
 use crate::ColumnName;
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, ChangeSet};
@@ -32,7 +33,9 @@ use crate::schema::{Schema, ValueSource};
 ///
 /// Keyed by table and then by the column, constraint or index name, as the
 /// schema is: containers hold names, elements do not.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredExpressions {
     /// `ValueSource::Default`, by table and column.
@@ -60,7 +63,9 @@ pub struct DeclaredExpressions {
     pub policies: BTreeMap<TableName, BTreeMap<String, DeclaredPolicyExpressions>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredPolicyExpressions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,7 +121,9 @@ fn declared_keys(index: &crate::schema::Index) -> Option<Vec<Option<String>>> {
 /// Server has none — an unqualified name binds to the caller's default schema
 /// at execution, which is a property of the session and not of the object —
 /// so it records nothing here (DECISIONS 209).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     /// The name as written in the declaration, to the qualified identities it
@@ -126,7 +133,9 @@ pub struct Binding {
 
 /// The recorded bindings of every managed object that carries a body or an
 /// expression the engine resolves at creation (ADR-0013 §3).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Bindings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -154,7 +163,9 @@ impl Bindings {
 /// three move together: an apply advances all of them by the plan it ran, a
 /// baseline leaves all of them empty, and the differ overlays all of them on
 /// the read-back it compares against.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Declared {
     /// Applied type declarations, keyed by their current name. Only domain

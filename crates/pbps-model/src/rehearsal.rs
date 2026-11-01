@@ -18,13 +18,14 @@
 //! way to say "asked and declined".
 
 use crate::resolver::{ScratchLayout, ScratchSource};
+use schemars::JsonSchema;
 
 /// How a plan was rehearsed, or that it was not.
 ///
 /// Externally tagged on purpose: serde's internally tagged unit variant drops
 /// the fields it does not know, where this one refuses them (the same trap
 /// [`ScratchSource::Server`] documents).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Rehearsal {
     /// The plan's statements ran in order on a scratch engine and the result
@@ -55,7 +56,7 @@ pub enum Rehearsal {
 /// row-security policies (#2379).
 ///
 /// Externally tagged, as [`Rehearsal`] is.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizationRehearsal {
     /// They ran, on roles made for the run in place of the target's, and were

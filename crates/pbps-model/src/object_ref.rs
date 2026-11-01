@@ -5,10 +5,11 @@ pub use registry::{BoundRoot, ObjectDeps, Problem, Registry};
 
 use crate::operation::PartKey;
 use crate::{ColumnRef, ModuleId, RoleName, TableName, TypeRef};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Root {
     Table(TableName),
@@ -30,7 +31,7 @@ pub enum Selector {
 
 /// The same address type is used for named declarations and bound UID roots.
 /// Its JSON codec is only a lossless *reference spelling*, not a saved-plan field.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectRef<R = Root> {
     pub root: R,
@@ -104,6 +105,46 @@ impl Serialize for Selector {
             Some(name) => std::collections::BTreeMap::from([(kind, name)]).serialize(s),
             None => kind.serialize(s),
         }
+    }
+}
+
+/// What a [`Selector`] looks like on the wire, for the schema alone: a bare
+/// string for a kind with no name and a one-entry map for a kind with one.
+/// That is exactly serde's external tagging, so the mirror derives what the
+/// hand-written codec writes. `mirror` below ties the two together: a new
+/// selector does not compile in the tests until it has an arm here, and the
+/// tests compare the codec's output with the mirror's (#2412).
+#[derive(JsonSchema)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code, reason = "only its schema is read"))]
+enum SelectorWire {
+    Whole,
+    Default,
+    Generation,
+    Sequence,
+    NotNull,
+    PrimaryKey,
+    RowSecurity,
+    Unique(String),
+    ForeignKey(String),
+    Check(String),
+    Index(String),
+    Computed(String),
+    Policy(String),
+}
+
+impl schemars::JsonSchema for Selector {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Selector".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::Selector").into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        SelectorWire::json_schema(generator)
     }
 }
 

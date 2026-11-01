@@ -5,6 +5,7 @@
 //! declaration files would make one file point at different tables depending on
 //! the connection.
 
+use schemars::JsonSchema;
 use std::fmt;
 use std::str::FromStr;
 
@@ -357,7 +358,16 @@ pub fn check_segment(part: &str) -> Result<(), NameError> {
 /// let _ = name.to_string();
 /// ```
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub struct TableName {
@@ -438,7 +448,16 @@ impl FromStr for TableName {
 /// let _ = name.to_string();
 /// ```
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub struct ColumnRef {

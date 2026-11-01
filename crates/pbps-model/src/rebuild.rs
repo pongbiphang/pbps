@@ -1,5 +1,6 @@
 //! The lineage of a blocking table rewrite (DEC-2298.1, DEC-2298.12).
 
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 
 use crate::{Collation, ColumnRef, ColumnType, IdsFile, Reason, TableName, Uid};
@@ -7,7 +8,7 @@ use crate::{Collation, ColumnRef, ColumnType, IdsFile, Reason, TableName, Uid};
 /// Both ends of one approved rewrite. The source identities are tombstones in
 /// the file that holds the record and the replacement ones are live (or later
 /// retired like any other), so neither end is a state of its own.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RebuildIdentities {
     pub tables: BTreeMap<Uid, TableName>,
@@ -29,7 +30,7 @@ impl RebuildIdentities {
 /// declarations into the identity file; the audit fields follow `Move`'s git
 /// record. The record stays after the rewrite: it is how an environment that
 /// still holds the source learns what to rebuild.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Rebuild {
     pub source: RebuildIdentities,
@@ -64,7 +65,7 @@ pub struct Rebuild {
 }
 
 /// A replacement column's type and collation at approval.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnShape {
     pub ty: ColumnType,

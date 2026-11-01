@@ -19,6 +19,7 @@ pub use columns::{ColumnProperty, ColumnTransition, ColumnValue};
 
 use crate::ColumnName;
 use crate::ObjectLocalName;
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -40,7 +41,17 @@ use crate::uid::Uid;
 /// today's data happens to be safe — inspecting data is a runtime concern and has
 /// no place in the declarative layer.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
@@ -202,7 +213,7 @@ impl std::str::FromStr for RiskClass {
 /// What a detached partition's clone of one of its parent's objects is
 /// called after the detach (#1544): found through the parent's object, which
 /// the plan knows by name, and renamed to the declaration's.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DetachedName {
     pub kind: DetachedKind,
@@ -219,7 +230,16 @@ pub struct DetachedName {
 /// constraint or a foreign key is found through `conparentid`, an index
 /// through `pg_inherits`; a CHECK is inherited under its parent's name.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DetachedKind {
@@ -232,7 +252,7 @@ pub enum DetachedKind {
 
 /// Every variant carries the UID of the object it affects, so that applying a
 /// plan never has to match on names — names are exactly what may be changing.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
     /// Planning-only until the complete rebuild route is admitted.
@@ -984,7 +1004,7 @@ pub enum Change {
 /// An enum rather than a bool for the reason [`RoutineOrigin`] is one: the two
 /// are different decisions about who may run the routine, not a flag, and a
 /// `true` in that position is a mistake that compiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicAccess {
     /// The engine's default goes away: the plan writes the `REVOKE`. The
@@ -1005,7 +1025,7 @@ pub enum PublicAccess {
 /// execute this a moment ago, because it did not exist" and "somebody may
 /// have been able to, and nothing offline can see whether they were" are
 /// different facts, and a `true` in that position is a mistake that compiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineOrigin {
     /// The plan creates the routine. No principal held `EXECUTE` on it a
@@ -1065,7 +1085,7 @@ impl<'a> From<&'a Cell> for CellAfter<'a> {
 
 /// Whether the owning table is created in this plan, verified by UID on admission.
 /// Standing-table edits carry access risks even while RLS is disabled (DEC-1173.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RowSecurityOrigin {
     Created,
@@ -1157,7 +1177,9 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
 /// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
 /// sets: the primary key's, a unique constraint's (which carries the
 /// constraint's name), or a standalone index's (#1442).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexPart {
     PrimaryKey,
@@ -3287,7 +3309,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
 
 /// A change together with the risks that have been determined for it, and the
 /// execution strategy it is to be carried out with.
-#[derive(Debug, Clone, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub struct PlannedChange {
     #[serde(flatten)]
     pub change: Change,
@@ -3403,7 +3425,9 @@ impl PlannedChange {
 /// The order of `changes` is the order of application. Producing that order
 /// (drop indexes before dropping columns, and so on) is the planner's job; the
 /// model only guarantees the order is preserved.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeSet {
     pub changes: Vec<PlannedChange>,
@@ -4322,7 +4346,7 @@ mod tests {
 }
 
 /// Why a [`Change::DeleteRow`] is in the plan (ADR-0004).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteCause {
     /// The table declares `mode: exact` and this row is not among the declared

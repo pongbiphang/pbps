@@ -19,7 +19,9 @@
 /// (`UTC` and `Etc/UTC`) compare unequal, and a check that compares them
 /// refuses: a spelling difference costs a DBA one `ALTER`, while a real
 /// difference accepted would store every offset-less value at another instant.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct SessionZone(String);
 

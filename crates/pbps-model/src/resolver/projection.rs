@@ -3,12 +3,13 @@
 use super::ownership::{at_endpoint, transition_at_endpoint};
 use super::{InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, Surface};
 use crate::{Change, ChangeSet, GrantTarget, ModuleId};
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The adapter's logical inventory of the catalog records owned by one
 /// managed surface. Internal dependents (for example a relation's row type)
 /// belong here only when the engine proved their ownership.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectTransition {
     pub surface: Surface,
