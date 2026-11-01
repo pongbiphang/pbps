@@ -72,6 +72,7 @@ pub mod partitions;
 pub mod physical_sources;
 pub mod plan;
 pub mod plan_names;
+mod presence;
 pub mod project;
 pub mod reason;
 pub mod rebuild;

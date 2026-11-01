@@ -51,16 +51,18 @@ pub struct BoundSurface {
 pub struct SurfaceResolution {
     pub surface: Surface,
     /// None means this surface does not exist, not that a read failed.
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<BoundSurface>"
+    )]
     pub current: Option<BoundSurface>,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<BoundSurface>"
+    )]
     pub desired: Option<BoundSurface>,
-}
-
-fn required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
-    d: D,
-) -> Result<Option<T>, D::Error> {
-    <Option<T> as serde::Deserialize>::deserialize(d)
 }
 
 #[derive(

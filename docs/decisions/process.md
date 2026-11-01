@@ -1720,6 +1720,14 @@ requests. Choices that decide what the fingerprint can and cannot see:
   where `Serialize` is hand-written. `Selector`, `Column` and `ValueSource` have
   hand-written codecs and take their schema from a mirror of the wire shape, tied to
   the codec by a test that compares the keys or the output.
+- **Presence is not nullability.** `serde` demands the key of a field with a custom
+  deserializer unless it has a default, whatever its type, and `schemars` cannot see
+  inside the deserializer, so a required-but-nullable field (`required_option`) read
+  as optional and dropping the requirement left the fingerprint unmoved. Such a field
+  carries `crate::presence`'s pair, `schemars(required, schema_with = ..)`: `required`
+  alone would also drop `null` from the type. A test reads the model's sources and
+  fails any `deserialize_with` field without a default or the marker, so a new use
+  cannot drift; a fixture and the real plan and snapshot pin the schema to the codec.
 - **What it cannot see** is a change of meaning that keeps the shape (a string that
   now means something else, a checksum algorithm), and anything behind
   `#[schemars(with = "serde_json::Value")]`. The first is the pinned plan checksum's
