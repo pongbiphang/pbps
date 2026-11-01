@@ -43,11 +43,20 @@ pub async fn read_planned_principals(
             "SELECT type,USER_NAME(owning_principal_id) AS owner FROM sys.database_principals WHERE name={};",
             literal(name.raw())
         )).await?;
-        let [row] = rows.as_slice() else {
-            return Err(DbError::Refused(format!(
-                "the kind of planned principal {} is unreadable",
-                name.shown()
-            )));
+        let row = match rows.as_slice() {
+            [row] => row,
+            // The deployer's catalog view hides a principal it holds no
+            // permission on, while USER_ID still resolves it (measured by
+            // recon726). Its kind is not part of what the deployer can
+            // observe either, so it stays unrecorded, as before this read
+            // existed. More than one row is a catalog that contradicts itself.
+            [] => continue,
+            _ => {
+                return Err(DbError::Refused(format!(
+                    "the kind of planned principal {} is unreadable",
+                    name.shown()
+                )));
+            }
         };
         let kind = if required(row, "type", "a planned principal's kind")? == "R" {
             PrincipalKind::Role
