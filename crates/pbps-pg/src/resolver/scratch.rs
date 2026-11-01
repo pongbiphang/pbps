@@ -22,27 +22,7 @@ pub async fn extension_prerequisites(
         return Ok(Vec::new());
     }
     // One static read also keeps this seam Send for owned scratch workers.
-    let rows = conn.query("SELECT e.extname::text AS name, n.nspname::text AS schema, e.extversion::text AS version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace").await?;
-    let mut installed = std::collections::BTreeMap::new();
-    for row in rows {
-        let name = text(&row, "name")?;
-        let schema = text(&row, "schema")?;
-        let version = text(&row, "version")?;
-        if name.is_empty() || schema.is_empty() || version.is_empty() {
-            return Err(DbError::BadRow(
-                "scratch extension inventory has an empty required field".into(),
-            ));
-        }
-        if installed
-            .insert(name.clone(), pbps_model::Extension { schema, version })
-            .is_some()
-        {
-            return Err(DbError::BadRow(format!(
-                "scratch extension `{}` has duplicate inventory rows",
-                Escaped(&name)
-            )));
-        }
-    }
+    let installed = crate::extension_provider::installed(conn).await?;
     let mut problems = Vec::new();
     for (name, expected) in required {
         let expectation = format!(
@@ -64,6 +44,64 @@ pub async fn extension_prerequisites(
         }
     }
     Ok(problems)
+}
+
+/// Why the scratch cannot install the packages a plan would create, with the
+/// same sentences the target's own check gives. `wanted` are packages absent
+/// from the scratch: a prerequisite must be one of them (pinned) or already
+/// installed, since the scratch never installs a default (DEC-2447.4).
+pub async fn extension_requirements(
+    conn: &mut pbps_db::Conn,
+    wanted: &std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+) -> Result<Vec<String>, DbError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let available = crate::extension_provider::available(conn).await?;
+    let mut known = crate::extension_provider::installed(conn).await?;
+    known.extend(
+        wanted
+            .iter()
+            .map(|(name, definition)| (name.raw().to_owned(), definition.clone())),
+    );
+    Ok(wanted
+        .iter()
+        .flat_map(|(name, definition)| {
+            crate::extension_provider::requirement_problems(
+                "scratch",
+                name.raw(),
+                definition,
+                &available,
+                &known,
+            )
+        })
+        .collect())
+}
+
+/// What each named package owns on the scratch, read after the plan's
+/// statements ran there. A package the scratch does not hold is refused, not
+/// returned as an empty manifest.
+pub async fn extension_manifests(
+    conn: &mut pbps_db::Conn,
+    names: &[&pbps_model::ObjectLocalName],
+) -> Result<
+    std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionProvider>,
+    DbError,
+> {
+    let mut all = crate::extension_provider::providers(conn).await?;
+    names
+        .iter()
+        .map(|name| {
+            all.remove(name.raw())
+                .map(|provider| ((*name).clone(), provider))
+                .ok_or_else(|| {
+                    DbError::Refused(format!(
+                        "scratch extension `{}` is absent, so its members cannot be captured",
+                        name.shown()
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// What the keeper session sets so the engine notices a vanished client

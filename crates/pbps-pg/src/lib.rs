@@ -47,6 +47,7 @@ pub mod doctor;
 mod drop_impact;
 mod emit;
 pub mod engine_effects;
+pub mod extension_provider;
 pub mod resolver;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):

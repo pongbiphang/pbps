@@ -4539,3 +4539,42 @@ adoptions. Missing managed packages on scratch/reconstruction refuse by name:
 provision the exact version/schema externally. Logical scope cuts must project
 both definitions and identities together. PR A installs no package and infers
 no default version; lifecycle and provider-code support remain later slices.
+
+<a id="dec-2447-4"></a>
+
+**DEC-2447.4. A package's provider manifest is logical, one snapshot, and carries no owner.**
+
+The first half of #2447 PR B adds the reusable evidence a later pinned CREATE
+needs, and no executable capability: no Change, no risk class and no format
+change. `pbps_model::ExtensionProvider` records a package's schema, exact
+version, prerequisite names and member closure. A member is the engine's own
+rendering of an object address (class, name parts, argument types) for the
+direct `e` members and their internal and automatic subsidiaries, the closure
+the census already projects out of independent declarations. A user routine
+that only `DEPENDS ON EXTENSION` (an `x` edge) and an ordinary object in the
+package's schema are not members.
+
+It holds no object number, no owner and no library path. A number means
+nothing on the other server, an owner depends on who installed the package
+(measured on PostgreSQL 16 and 18: a trusted install by a non-superuser leaves
+the members owned by the bootstrap superuser), and a path is not a content
+digest. Owner and relocation proof belong to the UPDATE and SET SCHEMA slices.
+Differences are sentences naming the changed field or the missing and
+unexpected members; a renamed member is a removal plus an addition.
+
+One static statement reads every package with its prerequisites and members, so
+the closure is one snapshot. Absent, empty and unreadable stay distinct: a
+member the engine can no longer name is a refusal that asks for a rerun, never
+a smaller closure. Installable versions come from
+`pg_available_extension_versions`, not from update paths, whose endpoints can
+lack an installation script. A pin is installable only when that exact
+version is listed. A fixed control schema must equal the declared one, and a
+prerequisite must be declared with a pin or already installed: the scratch and
+the target never choose a default for it, as `CREATE EXTENSION ... CASCADE`
+would. The same sentences serve the target and the scratch.
+
+The scratch gains two functions that nothing executable calls yet: the
+requirements a plan's new packages place on it, and the manifests read from it
+after the plan's statements ran there. The existing exact-prerequisite check
+now shares the inventory read with the catalog batch. Installer privileges are
+not part of this slice because they decide a CREATE, not a comparison.
