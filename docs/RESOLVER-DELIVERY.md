@@ -29,6 +29,9 @@ execution. #2488 owns plaintext/dictionary trace controls; #2489 follows #2144
 for the final cross-engine run audit and #595 close-out. An accepted pending
 cell remains open; a named test or a green job that skipped it does not fill it.
 
+For user setup and the measured PostgreSQL post-merge checks, see
+[Merging parallel schema branches](../README.md#merging-parallel-schema-branches).
+
 The sections below record each delivered step as it shipped. Where one
 describes containment, process observation, executable identity or verified
 channels, it describes the measured profiles #1636 removed.
