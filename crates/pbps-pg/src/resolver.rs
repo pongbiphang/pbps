@@ -54,6 +54,35 @@ pub fn validate_evidence(
     Ok(())
 }
 
+/// The PostgreSQL catalog which owns each creation-time binding surface.
+pub fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]> {
+    use pbps_model::{ModuleId, resolver::Surface};
+    match surface {
+        Surface::Default(_) => Some(&["pg_attrdef"]),
+        Surface::Check { .. } => Some(&["pg_constraint"]),
+        Surface::Index { .. } => Some(&["pg_index"]),
+        Surface::Module(ModuleId::Named(_)) => Some(&["pg_rewrite"]),
+        Surface::Module(ModuleId::Routine(_)) => Some(&["pg_proc"]),
+        Surface::Module(ModuleId::Trigger { .. }) => Some(&["pg_trigger"]),
+        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Type(_) => None,
+    }
+}
+
+/// A dependency's physical row is a separately captured logical record.
+pub fn dependent_object(
+    object: &pbps_model::resolver::ObjectIdentity,
+    _: &[pbps_model::resolver::Binding],
+    reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
+) -> Option<pbps_model::resolver::ObjectIdentity> {
+    (object.class == "pg_depend"
+        && object
+            .signature
+            .get(1)
+            .is_some_and(|id| reached.contains(id)))
+    .then(|| object.signature.first().cloned())
+    .flatten()
+}
+
 /// Both target-side reads of an analysis scope in one `REPEATABLE READ READ
 /// ONLY` snapshot: the catalog facts and the deployer's authorization are
 /// sealed and compared together, so they must describe one catalog state. As

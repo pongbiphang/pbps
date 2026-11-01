@@ -1066,7 +1066,7 @@ async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recover
                     let inputs = Inputs::overload();
                     let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
                     let identity = sql::cluster_identity(&mut planning).await.unwrap();
-                    super::super::produce(
+                    super::super::produce::<pbps_pg::Postgres>(
                         Driver::Postgres,
                         &scratch,
                         &target,

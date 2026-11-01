@@ -27,15 +27,15 @@ pub(super) struct Request {
 
 // Even a result already sent into the channel needs an owner. A receiver
 // dropped before observing it must not silently lose a cleanup failure.
-struct Reply(Option<Result<Unsealed, ProduceError>>);
+struct Reply<D = pbps_pg::Postgres>(Option<Result<Unsealed<D>, ProduceError>>);
 
-impl Reply {
-    fn receive(mut self) -> Result<Unsealed, ProduceError> {
+impl<D> Reply<D> {
+    fn receive(mut self) -> Result<Unsealed<D>, ProduceError> {
         self.0.take().expect("a supervisor reply is received once")
     }
 }
 
-impl Drop for Reply {
+impl<D> Drop for Reply<D> {
     fn drop(&mut self) {
         if let Some(Err(ProduceError::Cleanup(names))) = self.0.take() {
             super::recovery::cancelled_cleanup(names);
@@ -44,14 +44,16 @@ impl Drop for Reply {
 }
 
 impl Request {
-    pub async fn start(self) -> Result<Unsealed, ProduceError> {
+    pub async fn start<D: super::super::PlanningDialect>(
+        self,
+    ) -> Result<Unsealed<D>, ProduceError> {
         let (sender, receiver) = oneshot::channel();
         #[cfg(test)]
         let context = TestContext::capture();
         // Dropping a JoinHandle detaches it. Runtime shutdown can still stop
         // this owner before release; durable recovery covers that boundary.
         tokio::spawn(async move {
-            let work = self.execute();
+            let work = self.execute::<D>();
             #[cfg(test)]
             let result = context.run(work).await;
             #[cfg(not(test))]
@@ -66,7 +68,7 @@ impl Request {
             .receive()
     }
 
-    async fn execute(self) -> Result<Unsealed, ProduceError> {
+    async fn execute<D: super::super::PlanningDialect>(self) -> Result<Unsealed<D>, ProduceError> {
         let Self {
             driver,
             scratch,
@@ -133,7 +135,7 @@ impl Request {
         // through acquisition. Complete resolution before releasing on the
         // same checked connection, even when nobody awaits the result.
         let result = run
-            .resolve(
+            .resolve::<D>(
                 provisioning,
                 &mut target,
                 &mut admin,
@@ -209,7 +211,7 @@ mod tests {
         // retain exact names. Observing the error keeps the ordinary API path.
         for delivered in [false, true] {
             let (sender, receiver) = oneshot::channel();
-            let reply = Reply(Some(Err(ProduceError::Cleanup(names.clone()))));
+            let reply = Reply::<pbps_pg::Postgres>(Some(Err(ProduceError::Cleanup(names.clone()))));
             if delivered {
                 assert!(sender.send(reply).is_ok());
                 drop(receiver);
@@ -223,7 +225,9 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
         assert!(
             sender
-                .send(Reply(Some(Err(ProduceError::Cleanup(names.clone())))))
+                .send(Reply::<pbps_pg::Postgres>(Some(Err(
+                    ProduceError::Cleanup(names.clone())
+                ))))
                 .is_ok()
         );
         let result = receiver

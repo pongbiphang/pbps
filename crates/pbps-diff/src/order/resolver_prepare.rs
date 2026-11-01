@@ -12,7 +12,7 @@ pub(crate) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
         // Generated expressions use the same binding surface as defaults;
         // omitting them rejects qualified evidence (DEC-1168.1). A
         // partition's own default is one too (DEC-1578.1).
-        for column in definition.expression_columns() {
+        for column in definition.binding_columns() {
             result.insert(Surface::Default(table.column(column)));
         }
         for name in definition.checks.keys() {

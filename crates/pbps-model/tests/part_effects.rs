@@ -203,3 +203,48 @@ fn dropped_policy_corpus_cases_remove_the_named_policy_and_its_declaration() {
     }
     assert_eq!(seen, 3);
 }
+
+/// A SQL Server computed column is the column and its expression, as a
+/// generated one is; it was in no inventory before (DEC-2143.2).
+#[test]
+fn a_computed_column_creates_and_removes_its_column_and_generated_parts() {
+    use pbps_model::{Change, ComputedColumn, TableName};
+    let table = TableName::new("app", "t");
+    let computed = ComputedColumn {
+        expression: "id * 2".into(),
+        persisted: false,
+        not_null: false,
+    };
+    let add = Change::AddComputedColumn {
+        table: table.clone(),
+        name: "c".into(),
+        computed: computed.clone(),
+    };
+    let drop = Change::DropComputedColumn {
+        table: table.clone(),
+        name: "c".into(),
+        computed,
+    };
+    let column = table.column("c");
+    for (change, effect) in [(add, Effect::Created), (drop, Effect::Removed)] {
+        let effects = change.part_effects();
+        assert!(
+            effects
+                .iter()
+                .any(|e| e.part == Part::Column(column.clone()) && e.effect == effect),
+            "{effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| e.part == Part::Generated(column.clone()) && e.effect == effect),
+            "{effects:?}"
+        );
+        // Another column of the table is not touched.
+        assert!(
+            !effects.iter().any(|e| matches!(&e.part,
+                Part::Column(c) | Part::Generated(c) if c != &column)),
+            "{effects:?}"
+        );
+    }
+}

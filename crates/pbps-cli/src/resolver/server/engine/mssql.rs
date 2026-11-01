@@ -55,6 +55,9 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     locked: bool,
     chained: Option<capture::ExternalInputs>,
     deferred: bool,
+    /// The compared reported facts the run's first scratch session read
+    /// (DEC-2143.4). Every later session must read the same.
+    reported: std::sync::Mutex<Option<CatalogFacts>>,
 }
 
 pub(in crate::resolver::server) struct Prepared {
@@ -101,7 +104,22 @@ impl Prepared {
 
     /// A copy of what reopens the scratch: `Prepared` holds the deployer's
     /// connection, so a borrow of it cannot be held across an await.
-    pub(super) fn reach(&self) -> Reach {
+    pub(super) async fn authorization_condition(
+        &mut self,
+        target: &mut Conn,
+    ) -> Result<Box<auth::Condition>, Error> {
+        let scope::Principals::Mssql(map) = &self.map else {
+            return Err(Error::Scope(
+                "the SQL Server principal map belongs to another engine".into(),
+            ));
+        };
+        auth::capture_condition(target, &mut self.compile, map, &self.chaining.context)
+            .await
+            .map(Box::new)
+            .map_err(read)
+    }
+
+    pub(in crate::resolver::server) fn reach(&self) -> Reach {
         self.reach.clone()
     }
 }
@@ -109,17 +127,59 @@ impl Prepared {
 /// What reaches the scratch database again, bounded as the sandbox is:
 /// every fact `Scratch::bounded` re-verifies on a fresh connection.
 #[derive(Clone)]
-pub(super) struct Reach {
+pub(in crate::resolver::server) struct Reach {
     connection: String,
     mark: sql::SessionMark,
     acquired: Option<sql::Database>,
     database: String,
     sandbox: String,
     databases: Vec<String>,
+    reported: Option<CatalogFacts>,
+}
+
+/// The facts `compare_reported` weighs, read by one session. Visibility is
+/// left out: it follows the principal and the grants the plan itself changes.
+async fn reported(conn: &mut Conn) -> Result<CatalogFacts, Error> {
+    resolver::environment::read(conn, &resolver::environment::Scope { schemas: &[] })
+        .await
+        .map_err(read)
+}
+
+/// A reconnect may land on a backend that differs from the one the run began
+/// on (a proxy, a failover, a changed database option). The marker and the
+/// database identity cannot tell; the compared facts can (DEC-2143.4).
+fn same_backend(first: &CatalogFacts, now: &CatalogFacts) -> Result<(), Error> {
+    let differing: Vec<&str> = first
+        .observations
+        .keys()
+        .chain(now.observations.keys())
+        .filter(|key| first.observations.get(*key) != now.observations.get(*key))
+        .chain(
+            first
+                .settings
+                .keys()
+                .chain(now.settings.keys())
+                .filter(|key| first.settings.get(*key) != now.settings.get(*key)),
+        )
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if differing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Unusable(format!(
+        "a scratch reconnect reached a backend whose compared facts differ from the run's first session: {}",
+        differing.join(", ")
+    )))
 }
 
 impl Reach {
-    async fn open(&self) -> Result<Conn, Error> {
+    pub(in crate::resolver::server) async fn open(&self) -> Result<Conn, Error> {
+        Ok(self.open_reading().await?.0)
+    }
+
+    async fn open_reading(&self) -> Result<(Conn, CatalogFacts), Error> {
         let mut conn = Conn::connect(Driver::Mssql, &self.connection)
             .await
             .map_err(read)?;
@@ -142,7 +202,11 @@ impl Reach {
         sql::sandbox_checks(&mut conn, &self.databases, &self.database)
             .await
             .map_err(read)?;
-        Ok(conn)
+        let now = reported(&mut conn).await?;
+        if let Some(first) = &self.reported {
+            same_backend(first, &now)?;
+        }
+        Ok((conn, now))
     }
 }
 
@@ -180,6 +244,7 @@ pub(in crate::resolver::server) async fn preview<'a>(
         created: Created::Nothing,
         entered: false,
         visibility: None,
+        reported: Default::default(),
         acquired: None,
         externals: None,
         request,
@@ -326,6 +391,7 @@ pub(super) async fn scratch<'a>(
             created: Created::Nothing,
             entered: false,
             visibility: None,
+            reported: Default::default(),
             acquired: None,
             externals,
             request,
@@ -650,6 +716,18 @@ impl Scratch<'_> {
                 ));
             }
         };
+        auth::read_planned_principals(
+            target_connection,
+            &mut context,
+            &self
+                .request
+                .planned
+                .iter()
+                .map(|g| g.principal.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(read)?;
         let external_scope = capture::CaptureScope {
             retained: required.roots().clone(),
             candidates: BTreeSet::new(),
@@ -864,7 +942,12 @@ impl Scratch<'_> {
         sandbox: &str,
         databases: &[String],
     ) -> Result<Conn, Error> {
-        self.reach(database, sandbox, databases).open().await
+        let reach = self.reach(database, sandbox, databases);
+        let (conn, now) = reach.open_reading().await?;
+        if reach.reported.is_none() {
+            *self.reported.lock().expect("the reported facts lock") = Some(now);
+        }
+        Ok(conn)
     }
 
     fn reach(&self, database: &str, sandbox: &str, databases: &[String]) -> Reach {
@@ -875,6 +958,11 @@ impl Scratch<'_> {
             database: database.to_owned(),
             sandbox: sandbox.to_owned(),
             databases: databases.to_vec(),
+            reported: self
+                .reported
+                .lock()
+                .expect("the reported facts lock")
+                .clone(),
         }
     }
 
@@ -1298,6 +1386,54 @@ mod tests {
             settings: BTreeMap::new(),
             visibility: BTreeMap::new(),
         }
+    }
+
+    fn with_setting(mut base: CatalogFacts, name: &str, value: &str) -> CatalogFacts {
+        base.settings.insert(
+            name.to_owned(),
+            pbps_db::resolver::environment::SettingFact {
+                value: value.to_owned(),
+                source: "effective".into(),
+                context: "session".into(),
+            },
+        );
+        base
+    }
+
+    #[test]
+    fn a_reconnect_to_an_equal_backend_is_not_refused() {
+        let first = with_setting(
+            facts(&[("product_version", Some("17.0.4075.5"))]),
+            "language",
+            "us_english",
+        );
+        assert!(same_backend(&first, &first.clone()).is_ok());
+    }
+
+    #[test]
+    fn a_reconnect_to_a_backend_differing_in_a_compared_fact_names_the_fact() {
+        let first = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("database_compatibility_level", Some("170")),
+        ]);
+        let other_level = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("database_compatibility_level", Some("160")),
+        ]);
+        let Err(Error::Unusable(reason)) = same_backend(&first, &other_level) else {
+            panic!("a differing compatibility level must refuse");
+        };
+        assert!(reason.contains("database_compatibility_level"), "{reason}");
+        assert!(!reason.contains("product_version"), "{reason}");
+        // A setting is a compared fact too, and a fact only one side reports differs.
+        let language = |value| with_setting(first.clone(), "language", value);
+        let Err(Error::Unusable(reason)) =
+            same_backend(&language("us_english"), &language("Deutsch"))
+        else {
+            panic!("a differing session language must refuse");
+        };
+        assert!(reason.contains("language"), "{reason}");
+        assert!(same_backend(&first, &language("us_english")).is_err());
     }
 
     // A key file's owner-only permission is provable only on Unix, and the

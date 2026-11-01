@@ -1566,7 +1566,7 @@ fn a_surface_removed_after_its_rename_is_named_as_its_removal_names_it() {
         record("pg_constraint", "c", check.clone()),
         record("pg_attrdef", "id", default.clone()),
     ];
-    let resolutions = super::resolution::from_sides(
+    let resolutions = super::resolution::from_sides::<pbps_pg::Postgres>(
         pbps_diff::Side {
             schema: &base,
             ids: &base_ids,
@@ -1663,7 +1663,7 @@ fn a_reused_name_keeps_two_removed_surfaces_distinct() {
         }),
         bindings: vec![],
     };
-    let resolutions = super::resolution::from_sides(
+    let resolutions = super::resolution::from_sides::<pbps_pg::Postgres>(
         pbps_diff::Side {
             schema: &base,
             ids: &base_ids,

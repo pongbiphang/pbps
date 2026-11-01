@@ -10,6 +10,7 @@ use pbps_db::resolver::ScratchNames;
 
 pub(crate) mod engine;
 mod producer;
+pub use engine::PlanningDialect;
 pub(crate) use producer::CLUSTER_RULE;
 pub use producer::{ProduceError, Rechecked, Refused, Unsealed};
 mod resolution;

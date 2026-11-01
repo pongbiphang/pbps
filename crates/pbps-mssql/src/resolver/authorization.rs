@@ -33,7 +33,9 @@ use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod condition;
 mod sandbox;
+pub use condition::{Condition, capture_condition, read_planned_principals};
 mod schema_domain;
 pub(crate) use sandbox::enter_cleanup_owner;
 mod staged;

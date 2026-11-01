@@ -90,6 +90,15 @@ pub struct OwnerPartition {
 }
 
 impl OwnerPartition {
+    pub(super) fn for_authorization(context: &AuthorizationContext) -> Self {
+        Self {
+            owners: context
+                .staged
+                .iter()
+                .map(|(id, object)| (Subject::Securable(id.clone()), object.owner.clone()))
+                .collect(),
+        }
+    }
     /// A capture follows bindings through managed objects before they exist
     /// on scratch. Those roots and their implicit children are not staged
     /// authorization subjects; explicitly requested external barriers are.

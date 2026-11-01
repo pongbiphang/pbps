@@ -41,7 +41,9 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 86;
+pub const SCHEMA_VERSION: u32 = 87;
+// 87: resolver authorization reproduction and assessment descriptions name both engines;
+// an empty explain `approve_with` for evidence this build cannot enforce (#2143 c1).
 // 86: owned PostgreSQL test results (issue #1165).
 // 85: exact read-only PostgreSQL extension declarations/state (#2447 PR A).
 // 84: retained column DEFAULT writebacks (#2354, DEC-2354.4).

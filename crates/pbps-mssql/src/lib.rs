@@ -223,11 +223,7 @@ impl Dialect for Mssql {
                 .qualification()
                 .runtime
                 .validate_dependencies("mssql", plan.dependencies.keys())?;
-            // Full evidence admission belongs to #2143; checking placements
-            // must not prematurely authorize an unsupported artifact.
-            return Err(pbps_dialect::PlanAnalysisError::Unsupported(
-                plan.dialect.clone(),
-            ));
+            resolver::validate_evidence(evidence)?;
         }
         Ok(())
     }

@@ -1317,7 +1317,7 @@ fn a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply() {
 }
 
 // Exercise the shared artifact carrier and presentation through the existing
-// reader fixture. SQL Server qualification/reader admission remains #2143.
+// reader fixture; SQL Server's reader is `pbps_mssql::resolver::validate_evidence`.
 #[test]
 fn same_instance_is_explained_and_tampering_fails_the_approved_checksum() {
     for policy in [SameInstance::Refused, SameInstance::Allowed] {

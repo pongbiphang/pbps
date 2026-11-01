@@ -59,6 +59,7 @@ pub(super) struct Sealing {
     pub target_catalog: pbps_db::resolver::environment::CatalogFacts,
     pub scratch_catalog: pbps_db::resolver::environment::CatalogFacts,
     pub authorization: scope::Authorization,
+    pub authorization_condition: Option<Box<pbps_mssql::resolver::authorization::Condition>>,
     pub schemas: Vec<String>,
     pub write_path_extras: Vec<String>,
     pub identity: Identity,
@@ -83,7 +84,7 @@ pub(super) struct Identity {
 
 /// Seals `changes`, the plan in its final order, with `proof` over that
 /// order.
-pub(super) fn seal<S>(
+pub(super) fn seal<D: super::PlanningDialect, S>(
     key: &EnvironmentFingerprintKey,
     sealed: Sealing,
     changes: pbps_diff::order::PlanningPlan<S>,
@@ -98,6 +99,7 @@ pub(super) fn seal<S>(
         target_catalog,
         scratch_catalog,
         authorization,
+        authorization_condition,
         schemas,
         write_path_extras,
         identity,
@@ -118,11 +120,13 @@ pub(super) fn seal<S>(
         ));
     }
     let persisted = authorization
-        .persisted(key, &changes, object_grants)
+        .persisted_after(
+            key,
+            &changes,
+            object_grants,
+            authorization_condition.as_deref(),
+        )
         .map_err(Error::Scope)?;
-    if matches!(authorization, scope::Authorization::Mssql(_)) {
-        return Err(Error::Scope("SQL Server evidence is unsupported".into()));
-    }
     let compiled_records = producer
         .compiled
         .planning_records()
@@ -131,7 +135,7 @@ pub(super) fn seal<S>(
     // scratch capture is sealed exactly once under the selected key.
     let opening_records = super::resolution::records(&opening);
     let transitions =
-        transitions::derive(&changes, base, desired, &opening_records, &compiled_records)?;
+        transitions::derive_for::<D>(&changes, base, desired, &opening_records, &compiled_records)?;
     let compiled = producer
         .compiled
         .seal_for_plan()
@@ -139,6 +143,14 @@ pub(super) fn seal<S>(
     let catalog = |facts| {
         crate::resolver::sealing::target_catalog_fingerprint(key, facts)
             .map_err(|reason| Error::Scope(reason.into()))
+    };
+    let (channels_rule, cluster_rule, cluster_component) = match D::DRIVER {
+        pbps_db::Driver::Postgres => ("pbps/pg-channels/v1", CLUSTER_RULE, "system-identifier"),
+        pbps_db::Driver::Mssql => (
+            "pbps/mssql-channels/v1",
+            "pbps/mssql-instance-identity/v1",
+            "family-guid",
+        ),
     };
     let qualification = Qualification {
         rule: identity.rule.into(),
@@ -149,21 +161,26 @@ pub(super) fn seal<S>(
         resolver_build: identity.resolver_build,
         channels: fingerprint(
             key,
-            "pbps/pg-channels/v1",
+            channels_rule,
             "qualified-connections",
             identity.channels.as_bytes(),
         ),
         authorization: {
-            // SQL Server evidence is refused above. Only the PostgreSQL
-            // run-owned layout actually compiled as the reproduced deployer.
             let ResolverRuntime::Scratch { layout, .. } = &identity.runtime;
-            pbps_model::resolver::AuthorizationReproduction::for_postgres_layout(*layout)
+            match D::DRIVER {
+                pbps_db::Driver::Postgres => {
+                    pbps_model::resolver::AuthorizationReproduction::for_postgres_layout(*layout)
+                }
+                pbps_db::Driver::Mssql => {
+                    pbps_model::resolver::AuthorizationReproduction::Reproduced
+                }
+            }
         },
         runtime: identity.runtime,
         target_cluster: fingerprint(
             key,
-            CLUSTER_RULE,
-            "system-identifier",
+            cluster_rule,
+            cluster_component,
             identity.target_cluster.as_bytes(),
         ),
         limitations: identity
@@ -195,10 +212,9 @@ pub(super) fn seal<S>(
 /// [`Unsealed::changes`], [rechecks](Unsealed::recheck) the target, then
 /// [seals](Rechecked::seal) the plan in its final order, so the sealed order
 /// already holds whatever those passes added or moved (DEC-1516.1).
-pub struct Unsealed {
+pub struct Unsealed<D = pbps_pg::Postgres> {
     pub(super) key: EnvironmentFingerprintKey,
-    pub(super) ordered:
-        pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>,
+    pub(super) ordered: pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>,
     pub(super) sealing: Sealing,
     pub(super) opening: Opening,
 }
@@ -216,9 +232,9 @@ pub(super) struct Opening {
     pub planned_identity: String,
 }
 
-impl Unsealed {
+impl<D: super::PlanningDialect> Unsealed<D> {
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<pbps_pg::Postgres> {
+    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<D> {
         &self.ordered.changes
     }
 
@@ -233,7 +249,10 @@ impl Unsealed {
     /// The run moves into the [`Rechecked`] it returns, the one value that
     /// can seal it: a recheck of one run cannot seal another (#1516
     /// review). A refusal hands the run back with its reason.
-    pub async fn recheck(self, target: &mut pbps_db::Conn) -> Result<Rechecked, Box<Refused>> {
+    pub async fn recheck(
+        self,
+        target: &mut pbps_db::Conn,
+    ) -> Result<Rechecked<D>, Box<Refused<D>>> {
         match self.differences(target).await {
             Ok(changed) if changed.is_empty() => {
                 // The caller can still add grant steps in its final passes.
@@ -310,6 +329,14 @@ impl Unsealed {
         if !authorization.same_context(&self.sealing.authorization) {
             changed.push("the target deployer's authorization".to_owned());
         }
+        if let Some(condition) = &self.sealing.authorization_condition
+            && !condition
+                .recheck(target)
+                .await
+                .map_err(read("authorization condition"))?
+        {
+            changed.push("the target's staged authorization condition".into());
+        }
         changed.extend(
             self.opening
                 .history
@@ -359,14 +386,14 @@ impl Unsealed {
 ///     Rechecked(other)
 /// }
 /// ```
-pub struct Rechecked(Unsealed, Option<Box<pbps_db::catalog::Pulled>>);
+pub struct Rechecked<D = pbps_pg::Postgres>(Unsealed<D>, Option<Box<pbps_db::catalog::Pulled>>);
 
-impl Rechecked {
+impl<D: super::PlanningDialect> Rechecked<D> {
     /// Seals `changes`, the resolver's plan after the caller's passes. Every
     /// edge the resolver ordered must still hold in the final order, and no
     /// change it ordered may be gone: a pass that undoes the resolver's
     /// order is a defect, refused here rather than sealed (#1516).
-    pub fn seal<D: pbps_dialect::Dialect + ?Sized>(
+    pub fn seal(
         self,
         changes: pbps_diff::order::CanonicalPlan<D>,
         base: pbps_diff::Side<'_>,
@@ -378,14 +405,15 @@ impl Rechecked {
                 .map_err(Error::Binding)?;
         let proof = changes.proof().clone();
         let object_grants = if matches!(run.sealing.authorization, scope::Authorization::Mssql(_)) {
-            // Preserve the existing named unsupported-MSSQL refusal below;
-            // no PostgreSQL grant reader runs on that engine.
+            // SQL Server's object permissions are part of the engine-read
+            // authorization context (DEC-2143.1); no PostgreSQL grant reader
+            // runs on that engine.
             Vec::new()
         } else {
             scope::object_grants::seal(&run.key, &changes, desired.ids, grants.as_deref())
                 .map_err(Error::Scope)?
         };
-        seal(
+        seal::<D, _>(
             &run.key,
             run.sealing,
             changes,
@@ -397,15 +425,15 @@ impl Rechecked {
     }
 
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<pbps_pg::Postgres> {
+    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<D> {
         self.0.changes()
     }
 }
 
 /// A recheck that did not pass: why, and the run it leaves unsealed.
-pub struct Refused {
+pub struct Refused<D = pbps_pg::Postgres> {
     pub error: Error,
-    pub unsealed: Unsealed,
+    pub unsealed: Unsealed<D>,
 }
 
 #[cfg(test)]
