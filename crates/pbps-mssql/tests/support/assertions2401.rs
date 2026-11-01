@@ -678,3 +678,79 @@ async fn usable_linked_server_mappings_refuse_before_assertion_sql() {
     admin.execute(&format!("IF EXISTS(SELECT 1 FROM sys.servers WHERE name=N'{cleanup}') EXEC sys.sp_dropserver @server=N'{cleanup}',@droplogins=N'droplogins'")).await.unwrap();
     result.unwrap().finish().await;
 }
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_frame_words2401").await;
+    let matrix: serde_json::Value =
+        serde_json::from_str(include_str!("../live/assertions2401-framing.json")).unwrap();
+    // Bare table references must resolve in the same schema as the qualified
+    // forms. Every table/column name, accepted or reserved, is created quoted.
+    f.db.conn
+        .execute(&format!(
+            "ALTER USER [{}] WITH DEFAULT_SCHEMA=app; GRANT SELECT ON SCHEMA::app TO [{}]",
+            f.role, f.role
+        ))
+        .await
+        .unwrap();
+    for case in matrix["words"].as_array().unwrap() {
+        let word = case["word"].as_str().unwrap();
+        f.db.conn
+            .execute(&format!("CREATE TABLE app.[{word}]([{word}] int)"))
+            .await
+            .unwrap();
+    }
+    let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+    let mut cells = 0;
+    for case in matrix["words"].as_array().unwrap() {
+        let word = case["word"].as_str().unwrap();
+        for shape in matrix["shapes"].as_array().unwrap() {
+            let sql = shape["sql"].as_str().unwrap().replace("{word}", word);
+            let accepted =
+                case["unquoted"].as_bool().unwrap() || shape["quoted"].as_bool().unwrap();
+            match caller.query(&sql).await {
+                Ok(rows) => assert!(
+                    accepted && rows.is_empty(),
+                    "unexpected native acceptance: {sql}"
+                ),
+                Err(error) => assert!(
+                    !accepted && error.server_error_code().as_deref() == Some("156"),
+                    "{sql}: {error:?}"
+                ),
+            }
+            let result = f.run(&sql).await.unwrap();
+            assert!(
+                if accepted {
+                    matches!(result, AssertionResult::Pass(_))
+                } else {
+                    matches!(result, AssertionResult::InvalidResult { .. })
+                },
+                "{}: {sql}: {result:?}",
+                shape["name"]
+            );
+            cells += 1;
+        }
+        let second = case["second"].as_str().unwrap();
+        for delimiter in ["; ", " "] {
+            if delimiter == " " && case["delimiter_required"] == true {
+                continue;
+            }
+            let sql = format!("SELECT 1 WHERE 1=0{delimiter}{second}");
+            assert!(
+                matches!(
+                    f.run(&sql).await.unwrap(),
+                    AssertionResult::InvalidResult { .. }
+                ),
+                "batch reached execution: {word}: {sql}"
+            );
+        }
+    }
+    println!(
+        "native identifier matrix: {cells} cells; every deny-list word plus real batch negatives"
+    );
+    assert_eq!(cells, 300);
+    drop(caller);
+    f.finish().await;
+}

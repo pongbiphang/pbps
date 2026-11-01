@@ -1,6 +1,39 @@
 //! Framing is not a read-only boundary; effective credentials supply that.
 use pbps_dialect::Dialect as _;
 
+const STATEMENT_WORDS: &[&str] = &[
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "EXEC",
+    "EXECUTE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "GRANT",
+    "DENY",
+    "REVOKE",
+    "COMMIT",
+    "ROLLBACK",
+    "BEGIN",
+    "END",
+    "SET",
+    "WAITFOR",
+    "DECLARE",
+    "PRINT",
+    "RAISERROR",
+    "THROW",
+    "DBCC",
+    "USE",
+    "BACKUP",
+    "RESTORE",
+    "KILL",
+    "RECONFIGURE",
+    "IF",
+];
+
 pub(super) fn single_query(sql: &str) -> bool {
     let lexicon = crate::Mssql.lexicon();
     let code = lexicon.code_only(sql);
@@ -84,10 +117,13 @@ pub(super) fn single_query(sql: &str) -> bool {
             }
             "UNION" | "INTERSECT" | "EXCEPT" => set_op = true,
             "ALL" | "DISTINCT" if set_op => {}
-            "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "EXEC" | "EXECUTE" | "CREATE" | "ALTER"
-            | "DROP" | "TRUNCATE" | "GRANT" | "DENY" | "REVOKE" | "COMMIT" | "ROLLBACK"
-            | "BEGIN" | "END" | "SET" | "WAITFOR" | "DECLARE" | "PRINT" | "RAISERROR" | "THROW"
-            | "DBCC" | "USE" | "BACKUP" | "RESTORE" | "KILL" | "RECONFIGURE" | "IF" => {
+            // Only reserved words cannot be bare names in these positions.
+            // Reuse the dialect's measured classification rather than making
+            // a statement word an identifier ban. A real non-reserved command
+            // here needs a delimiter, already refused by the framing pass.
+            word if STATEMENT_WORDS.contains(&word)
+                && (lexicon.reserved)(&word.to_ascii_lowercase()) =>
+            {
                 return false;
             }
             _ => set_op = false,
@@ -135,6 +171,41 @@ mod tests {
         }
         assert!(!single_query("SELECT 1 AS 名UPDATE; COMMIT"));
         assert!(!single_query("SELECT 1 AS 名SELECT SELECT 2"));
+    }
+    #[test]
+    fn every_statement_word_keeps_its_native_identifier_and_batch_shapes() {
+        let matrix: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/live/assertions2401-framing.json"))
+                .unwrap();
+        let words = matrix["words"].as_array().unwrap();
+        assert_eq!(
+            words
+                .iter()
+                .map(|w| w["word"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            STATEMENT_WORDS
+        );
+        for case in words {
+            let word = case["word"].as_str().unwrap();
+            for shape in matrix["shapes"].as_array().unwrap() {
+                let sql = shape["sql"].as_str().unwrap().replace("{word}", word);
+                let accepted =
+                    case["unquoted"].as_bool().unwrap() || shape["quoted"].as_bool().unwrap();
+                assert_eq!(single_query(&sql), accepted, "{}: {sql}", shape["name"]);
+            }
+            let second = case["second"].as_str().unwrap();
+            assert!(
+                !single_query(&format!("SELECT 1 WHERE 1=0; {second}")),
+                "{word}: delimited batch"
+            );
+            if case["delimiter_required"] != true {
+                // END closes a BEGIN block; it is not an independent command.
+                assert!(
+                    !single_query(&format!("SELECT 1 WHERE 1=0 {second}")),
+                    "{word}: implicit boundary"
+                );
+            }
+        }
     }
     #[test]
     fn a_second_statement_or_client_batch_never_reaches_the_driver() {

@@ -1769,7 +1769,8 @@
         "assertions2401::procedure_execute_is_write_capable_even_through_ownership_chaining",
         "assertions2401::access_to_another_user_database_refuses_before_assertion_sql",
         "assertions2401::user_clr_assemblies_refuse_even_through_function_and_view_wrappers",
-        "assertions2401::usable_linked_server_mappings_refuse_before_assertion_sql"
+        "assertions2401::usable_linked_server_mappings_refuse_before_assertion_sql",
+        "assertions2401::every_framing_word_preserves_native_identifiers_and_refuses_batches"
       ]
     },
     {
