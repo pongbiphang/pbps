@@ -242,6 +242,15 @@ pub(crate) fn command(
     let inputs = if cleanup {
         None
     } else {
+        // A relative walk stops at the working directory, missing a project above it.
+        let start = match std::path::absolute(start) {
+            Ok(start) => start,
+            Err(error) => {
+                data.phases[0].elapsed_ms = elapsed(started);
+                data.failure(0, "test.input", error.to_string(), true);
+                return publish(data.finish(), json);
+            }
+        };
         // Locate, but do not parse configuration twice or lose its hash on a refusal.
         let root = start
             .ancestors()
@@ -249,13 +258,7 @@ pub(crate) fn command(
                 let found = std::fs::symlink_metadata(p.join(pbps_config::CONFIG_FILE));
                 !matches!(found, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
             })
-            .unwrap_or(start);
-        // A bare relative descendant ends its ancestor walk at the current directory.
-        let root = if root.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            root
-        };
+            .unwrap_or(&start);
         let manifest = root.join(
             manifest.unwrap_or_else(|| Path::new(pbps_config::test_manifest::DEFAULT_MANIFEST)),
         );

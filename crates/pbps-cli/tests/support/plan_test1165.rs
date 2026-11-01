@@ -285,36 +285,53 @@ fn relative_project_spellings_freeze_the_same_input_before_runtime() {
     std::fs::create_dir(p.0.dir.join("child")).unwrap();
     p.write("blocked-state", "not a directory");
     let before = p.bytes();
+    let child = p.0.dir.join("child");
+    let absolute_manifest = p.0.dir.join("tests/pbps-tests.yml");
     let mut identity = None;
-    for project in [
-        p.0.dir.as_path(),
-        Path::new("."),
-        Path::new("./child"),
-        Path::new("child"),
+    for (cwd, project) in [
+        (p.0.dir.as_path(), p.0.dir.as_path()),
+        (p.0.dir.as_path(), Path::new(".")),
+        (p.0.dir.as_path(), Path::new("./child")),
+        (p.0.dir.as_path(), Path::new("child")),
+        (p.0.dir.as_path(), child.as_path()),
+        (child.as_path(), Path::new(".")),
+        (child.as_path(), Path::new("..")),
+        (child.as_path(), Path::new("../child")),
+        (child.as_path(), child.as_path()),
     ] {
-        let out = Command::new(BIN)
-            .current_dir(&p.0.dir)
-            .arg("--project")
-            .arg(project)
-            .args(["test", "--format", "json"])
-            // Refuse before Docker: this test concerns only project discovery.
-            .env("XDG_STATE_HOME", p.0.dir.join("blocked-state"))
-            .output()
-            .unwrap();
-        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
-        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert!(!v["data"]["input"].is_null(), "{project:?}: {v}");
-        let expected = identity.get_or_insert_with(|| v["data"]["input"].clone());
-        assert_eq!(&v["data"]["input"], expected, "{project:?}");
-        assert!(v["data"]["run_id"].is_null());
-        assert!(
-            v["findings"].as_array().unwrap().iter().any(|f| {
-                f["id"] == "test.cleanup"
-                    && f["message"].as_str().unwrap().contains("blocked-state")
-            }),
-            "{v}"
-        );
-        assert_eq!(p.bytes(), before);
+        for manifest in [
+            None,
+            Some(Path::new("tests/pbps-tests.yml")),
+            Some(absolute_manifest.as_path()),
+        ] {
+            let context = format!("cwd={cwd:?}, project={project:?}, manifest={manifest:?}");
+            let mut command = Command::new(BIN);
+            command
+                .current_dir(cwd)
+                .arg("--project")
+                .arg(project)
+                .args(["test", "--format", "json"])
+                // Refuse before Docker: this test concerns only project discovery.
+                .env("XDG_STATE_HOME", p.0.dir.join("blocked-state"));
+            if let Some(manifest) = manifest {
+                command.arg("--manifest").arg(manifest);
+            }
+            let out = command.output().unwrap();
+            assert_eq!(code(&out), 1, "{context}: {}{}", stdout(&out), stderr(&out));
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(!v["data"]["input"].is_null(), "{context}: {v}");
+            let expected = identity.get_or_insert_with(|| v["data"]["input"].clone());
+            assert_eq!(&v["data"]["input"], expected, "{context}");
+            assert!(v["data"]["run_id"].is_null());
+            assert!(
+                v["findings"].as_array().unwrap().iter().any(|f| {
+                    f["id"] == "test.cleanup"
+                        && f["message"].as_str().unwrap().contains("blocked-state")
+                }),
+                "{context}: {v}"
+            );
+            assert_eq!(p.bytes(), before);
+        }
     }
     assert!(!p.state().exists());
 }
