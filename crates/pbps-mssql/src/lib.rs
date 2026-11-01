@@ -1326,5 +1326,5 @@ mod script_oracle {
     ));
 }
 
-/// Reviewed one-query observations at plan time (ADR-0019 §7).
+/// Reviewed one-result-set observations at plan time (ADR-0019 §7).
 pub mod assertions;

@@ -394,9 +394,10 @@ on arbitrary sequences. Neither engine's fixtures may reset allocators by DDL.
 
 ## 7. Assertion contract, shared with target planning
 
-An assertion entry names one UTF-8 SQL file containing **one query** in the
-selected dialect. It must return exactly one tabular result set with **at least
-one output column**. A zero-column result is an invalid
+An assertion entry names one UTF-8 SQL file in the selected dialect. PostgreSQL
+accepts one query through the extended protocol below; SQL Server accepts a
+batch, including non-result statements. Either must return exactly one tabular
+result set with **at least one output column**. A zero-column result is an invalid
 assertion, whether it contains zero rows or any rows; it is neither pass nor
 violation. Refuse it with the remedy `SELECT 1 ...` (DEC-1165.1). With a valid
 result shape, zero rows is pass. Any returned row is a violation, including a
@@ -466,10 +467,13 @@ including apply, fixture and capture clients. From the provisioning connection
 to master, set that database READ_ONLY with a bounded wait and verify the mode.
 Do **not** use ROLLBACK IMMEDIATE: there should be no connection to evict.
 A remaining connection/timeout is a setup failure, not permission to kill it.
-Only then open assertion-login connections and execute one query/file. Use
-dialect-aware framing to refuse multiple top-level statements; do not treat
-framing or a SELECT prefix as enforcement of read-only behavior. Require the
-one-result-set shape and consume driver errors as above.
+Only then open assertion-login connections and execute the file as one native
+batch. Do not recognize SQL statements lexically: require exactly one result
+set and consume driver errors as above, within the deadline. Non-result
+statements are allowed; READ_ONLY is the scratch write boundary. An author can
+already write a vacuous zero-row query, so framing cannot protect assertion
+meaning. GO and sqlcmd metacommands are not interpreted and remain engine/driver
+errors. An error after a result is an error, never pass (DEC-2401.2).
 
 READ_ONLY blocks persistent writes even through an owner-executing procedure
 or administrator, while temporary objects in tempdb remain writable. Snapshots
@@ -520,8 +524,11 @@ without server VIEW ANY DEFINITION; require that read permission before treating
 a visible server's mapping inventory as complete. A mapped remote identity can
 write through OPENQUERY or EXEC AT, even when the outer query returns zero rows.
 
-Verify and report these effective privileges; framing is not read-only
-enforcement and the target is never switched to scratch READ_ONLY mode. No user SQL
+Verify and report these effective privileges before any assertion SQL. As in
+scratch, SQL Server accepts a batch with exactly one result set, including
+non-result statements, with a deadline and complete-stream error handling; no
+lexical statement recognition runs. Effective privileges are the target write
+boundary, and the target is never switched to scratch READ_ONLY mode. No user SQL
 runs during apply. Target assertion hashes/outcomes enter the plan checksum,
 `explain` and ledger (#2401); failures/errors write no plan. The accepted
 plan-to-apply window is closed only for the specific predicates covered by

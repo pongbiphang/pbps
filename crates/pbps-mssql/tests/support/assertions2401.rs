@@ -187,9 +187,35 @@ async fn an_assertion_login_is_checked_by_effective_object_column_and_ddl_permis
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
-async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_framing() {
+async fn target_batches_distinguish_rows_result_shapes_and_complete_stream_errors() {
     let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_query2401").await;
+    // R1 (parenthesized operands/Unicode), R3 (keyword identifiers) and
+    // R6 (a CTE followed by parenthesized operands) are native SQL, not
+    // additional statements to recognize. Non-result statements are allowed.
+    for sql in [
+        "WITH c AS (SELECT 1 n) (SELECT n FROM c WHERE n=0) UNION ALL (SELECT n FROM c WHERE n=0)",
+        "(SELECT 1 n WHERE 1=0) UNION ALL (SELECT 2 n WHERE 1=0)",
+        "SELECT 1 AS 名UPDATE WHERE 1=0",
+        "SELECT 1 AS THROW WHERE 1=0",
+        "SET NOCOUNT ON; DECLARE @n int=1; SELECT @n WHERE @n=0; PRINT N'after'; RETURN;",
+    ] {
+        let caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+        let evidence = caller.query_bounded(sql, DEADLINE).await.unwrap();
+        assert!(
+            matches!(
+                AssertionResult::from_evidence(evidence),
+                AssertionResult::Pass(_)
+            ),
+            "native control: {sql}"
+        );
+        let result = f.run(sql).await.unwrap();
+        assert!(
+            matches!(result, AssertionResult::Pass(_)),
+            "target batch: {sql}: {result:?}"
+        );
+        println!("native and target accepted: {sql}");
+    }
     for sql in [
         "SELECT 1 WHERE 1=0",
         "SELECT id FROM app.orders WHERE total<0",
@@ -227,72 +253,29 @@ async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_frami
         "SELECT * FROM app.missing",
         "INSERT INTO app.orders VALUES(2,2)",
         "SELECT 1 n INTO app.forbidden",
+        "SELECT 1 WHERE 1=0; THROW 50000,N'after result',1;",
+        "SELECT 1 WHERE 1=0\nGO\nSELECT 2",
+        ":r missing.sql",
+        "!! echo client-command",
     ] {
+        let result = f.run(sql).await.unwrap();
         assert!(
-            matches!(f.run(sql).await.unwrap(), AssertionResult::SqlError(_)),
-            "{sql}"
+            matches!(result, AssertionResult::SqlError(_)),
+            "{sql}: {result:?}"
         );
     }
     for sql in [
         "",
+        "SET NOCOUNT ON; PRINT N'no result'",
+        "SELECT 1 WHERE 1=0; SELECT 2 WHERE 1=0",
         "SELECT 1; SELECT 2",
-        "SELECT 1 WHERE 1=0; SELECT 1/0",
         "SELECT 1 SELECT 2",
-        "COMMIT; INSERT INTO app.orders VALUES(2,2)",
-        "SELECT 1; EXEC app.writer",
-        "SELECT 1\nGO\nSELECT 2",
+        "SELECT 1 WHERE 1=0; SELECT 1/0",
     ] {
+        let result = f.run(sql).await.unwrap();
         assert!(
-            matches!(
-                f.run(sql).await.unwrap(),
-                AssertionResult::InvalidResult { .. }
-            ),
-            "{sql}"
-        );
-    }
-    for (name, body) in [
-        (
-            "many",
-            "BEGIN SELECT 1 n WHERE 1=0; SELECT 2 n WHERE 1=0; END",
-        ),
-        ("none", "RETURN 0"),
-    ] {
-        f.db.conn
-            .execute(&format!("CREATE PROCEDURE dbo.{name} AS {body}"))
-            .await
-            .unwrap();
-        let admin = format!("{};Database={}", conn_str(), f.db.name);
-        let evidence = Conn::connect(Driver::Mssql, &admin)
-            .await
-            .unwrap()
-            .query_bounded(&format!("EXEC dbo.{name}"), DEADLINE)
-            .await
-            .unwrap();
-        assert!(matches!(
-            AssertionResult::from_evidence(evidence),
-            AssertionResult::InvalidResult { .. }
-        ));
-    }
-    // Native controls establish that these are valid single tabular queries;
-    // target framing must accept the same zero-row result, not parse names
-    // or a parenthesized query operand as a new statement.
-    for sql in [
-        "(SELECT 1 n WHERE 1=0) UNION ALL (SELECT 2 n WHERE 1=0)",
-        "SELECT 1 AS 名UPDATE WHERE 1=0",
-    ] {
-        let caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
-        let evidence = caller.query_bounded(sql, DEADLINE).await.unwrap();
-        assert!(
-            matches!(
-                AssertionResult::from_evidence(evidence),
-                AssertionResult::Pass(_)
-            ),
-            "native control: {sql}"
-        );
-        println!("native single query accepted: {sql}");
-        assert!(
-            matches!(f.run(sql).await.unwrap(), AssertionResult::Pass(_)),
-            "target framing: {sql}"
+            matches!(result, AssertionResult::InvalidResult { .. }),
+            "{sql}: {result:?}"
         );
     }
     let row =
@@ -302,6 +285,36 @@ async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_frami
             .unwrap();
     assert_eq!(row[0].try_get::<i32>("n").unwrap(), Some(1));
     f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn multi_statement_writes_are_refused_by_permissions_before_execution() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_batch_write2401").await;
+    let sql = "SELECT 1 WHERE 1=0; INSERT INTO app.orders VALUES(2,2); PRINT N'after'";
+    // An admitted login still cannot write through a batch: the engine denies
+    // INSERT, and an empty earlier result never hides that error.
+    let result = f.run(sql).await.unwrap();
+    assert!(matches!(result, AssertionResult::SqlError(_)), "{result:?}");
+    f.db.conn
+        .execute(&format!("GRANT INSERT ON app.orders TO [{}]", f.role))
+        .await
+        .unwrap();
+    // With effective INSERT, the oracle must refuse before any assertion SQL.
+    // Finish even on a revert witness so the deliberately enabled writer leaves
+    // no fixture state behind for another case.
+    let result = f.run(sql).await;
+    let rows =
+        f.db.conn
+            .query("SELECT COUNT(*) AS n FROM app.orders WHERE id=2")
+            .await
+            .unwrap();
+    let writes = rows[0].try_get::<i32>("n").unwrap();
+    f.finish().await;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("INSERT"), "{error:?}");
+    assert_eq!(writes, Some(0));
 }
 
 #[tokio::test]
@@ -707,11 +720,11 @@ async fn usable_linked_server_mappings_refuse_before_assertion_sql() {
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
-async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
+async fn native_identifier_positions_are_decided_by_the_engine() {
     let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_frame_words2401").await;
     let matrix: serde_json::Value =
-        serde_json::from_str(include_str!("../live/assertions2401-framing.json")).unwrap();
+        serde_json::from_str(include_str!("../live/assertions2401-identifiers.json")).unwrap();
     // Bare table references must resolve in the same schema as the qualified
     // forms. Every table/column name, accepted or reserved, is created quoted.
     f.db.conn
@@ -731,7 +744,6 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
     let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
     let mut cells = 0;
     let mut admitted = 0;
-    let mut batches = 0;
     for case in matrix["words"].as_array().unwrap() {
         let word = case["word"].as_str().unwrap();
         for shape in matrix["shapes"].as_array().unwrap() {
@@ -748,10 +760,9 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
                     "{sql}: {error:?}"
                 ),
             }
-            // Every cell is measured on the native grammar above and pinned
-            // by the shared unit matrix. Only valid identifiers need a full
-            // target admission; repeating four database audits for invalid
-            // syntax adds no evidence about the framing decision.
+            // The engine alone decides syntax. Keep the complete native
+            // identifier controls from the former lexer, but audit privileges
+            // only for valid SQL; invalid cells cannot establish a false refusal.
             if accepted {
                 let result = f.run(&sql).await.unwrap();
                 assert!(
@@ -763,26 +774,9 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
             }
             cells += 1;
         }
-        let second = case["second"].as_str().unwrap();
-        for delimiter in ["; ", " "] {
-            if delimiter == " " && case["delimiter_required"] == true {
-                continue;
-            }
-            let sql = format!("SELECT 1 WHERE 1=0{delimiter}{second}");
-            batches += 1;
-            assert!(
-                matches!(
-                    f.run(&sql).await.unwrap(),
-                    AssertionResult::InvalidResult { .. }
-                ),
-                "batch reached execution: {word}: {sql}"
-            );
-        }
     }
-    println!(
-        "native identifier matrix: {cells} cells; {admitted} valid admissions; {batches} real batch negatives"
-    );
-    assert_eq!((cells, admitted, batches), (300, 39, 59));
+    println!("native identifier matrix: {cells} cells; {admitted} valid admissions");
+    assert_eq!((cells, admitted), (300, 39));
     drop(caller);
     f.finish().await;
 }

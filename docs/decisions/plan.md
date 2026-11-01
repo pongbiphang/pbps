@@ -762,8 +762,8 @@ engine establishes its own boundary (#2401 PR A).** Target-only entry points
 verify database identity and effective write/DDL permissions on the fresh
 assertion session before user SQL. PostgreSQL reuses the owned READ ONLY
 transaction runner unchanged; SQL Server consumes a bounded native result stream
-and relies on the separate credential, never a target mode change. Its framing
-is not read-only enforcement. Effective EXECUTE on a procedure-like object
+and relies on the separate credential, never a target mode change. Result shape
+is not read-only enforcement (DEC-2401.2). Effective EXECUTE on a procedure-like object
 (`P`, `PC`, `X`, `RF`) is write-capable even through ordinary ownership chaining;
 refuse it by object name, including inherited schema/database grants. Any
 user-defined CLR assembly refuses by name, regardless of permission_set or direct permissions:
@@ -785,3 +785,17 @@ Intrinsic session-setting rights and control of the login's own principal do
 not confer target data/DDL rights; native controls retain those ordinary logins.
 The existing PostgreSQL API stays available to #1165. CLI selection and saved
 plan/ledger observations follow in PR B; no assertion runs during apply.
+
+<a id="dec-2401-2"></a>
+
+**DEC-2401.2. SQL Server assertions use native result shape, not lexical
+statement recognition (#2401).** Three review findings exposed false refusals:
+R1's parenthesized query operands and Unicode identifiers, R3's unquoted keyword
+identifiers (THROW), and R6's CTE with parenthesized query operands. Delete the
+parallel SQL recognizer instead of extending it. Target and scratch accept a
+native batch with exactly one tabular result set; zero or multiple sets are
+InvalidResult, and errors after a result never pass. Keep the deadline and the
+write boundary: effective privileges on a target, READ_ONLY on scratch.
+Non-result statements are allowed: an author can already write a vacuous
+zero-row assertion, so framing did not protect its meaning. GO/sqlcmd commands
+remain engine/driver errors. This supersedes #2598's statement-count proposal.

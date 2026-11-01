@@ -3,7 +3,6 @@
 pub use pbps_db::query::AssertionResult;
 use pbps_db::{Conn, DbError, Driver};
 use std::time::Duration;
-mod frame;
 
 /// Actual database identity plus the planning principal, not endpoint spelling.
 #[derive(Debug)]
@@ -67,12 +66,8 @@ pub async fn run_target(
             ));
         }
         privileges(&mut conn).await?;
-        if !frame::single_query(sql) {
-            return Ok(AssertionResult::InvalidResult {
-                message: "an assertion must contain one query, without GO or client commands"
-                    .into(),
-            });
-        }
+        // DEC-2401.2: the engine parses the batch. Result shape and the
+        // deadline bound execution; effective privileges establish read-only.
         Ok(
             match conn
                 .query_bounded(
