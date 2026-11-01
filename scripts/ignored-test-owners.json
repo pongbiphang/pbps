@@ -1766,7 +1766,10 @@
         "assertions2401::target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_framing",
         "assertions2401::wrong_targets_and_incomplete_metadata_are_refused_before_assertion_sql",
         "assertions2401::bounded_results_and_driver_timeouts_do_not_collect_or_pass_partial_streams",
-        "assertions2401::procedure_execute_is_write_capable_even_through_ownership_chaining"
+        "assertions2401::procedure_execute_is_write_capable_even_through_ownership_chaining",
+        "assertions2401::access_to_another_user_database_refuses_before_assertion_sql",
+        "assertions2401::user_clr_assemblies_refuse_even_through_function_and_view_wrappers",
+        "assertions2401::usable_linked_server_mappings_refuse_before_assertion_sql"
       ]
     },
     {

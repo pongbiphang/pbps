@@ -765,8 +765,14 @@ transaction runner unchanged; SQL Server consumes a bounded native result stream
 and relies on the separate credential, never a target mode change. Its framing
 is not read-only enforcement. Effective EXECUTE on a procedure-like object
 (`P`, `PC`, `X`, `RF`) is write-capable even through ordinary ownership chaining;
-refuse it by object name, including inherited schema/database grants. Function
-EXECUTE remains allowed.
+refuse it by object name, including inherited schema/database grants. Any
+user-defined CLR assembly refuses by name, regardless of permission_set or direct permissions:
+ownership-chained wrappers can execute it; CAS is not a boundary under CLR
+strict security. Without CLR, T-SQL functions retain allowed execution rights.
+Refuse access to another user database or a linked-server mapping for this login/all logins, naming the database or
+server. Require VIEW ANY DATABASE for complete database access reads and VIEW
+ANY DEFINITION before a visible server's missing mapping is conclusive. Unknown
+answers refuse; neither hidden metadata nor a zero-row query proves no writes.
 Intrinsic session-setting rights and control of the login's own principal do
 not confer target data/DDL rights; native controls retain those ordinary logins.
 The existing PostgreSQL API stays available to #1165. CLI selection and saved

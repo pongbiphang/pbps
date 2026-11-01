@@ -488,11 +488,26 @@ PostgreSQL retains the owned READ ONLY transaction protocol above. A SQL Server
 target cannot be switched read-only: **its boundary is the least-privilege login
 only**. Refuse effective EXECUTE on procedure-like objects (`P`, `PC`, `X`,
 `RF`), including grants inherited from roles, schemas or the database: ordinary
-ownership chaining can persist a procedure's writes without EXECUTE AS or
-caller table DML. Name the procedure in the refusal. EXECUTE on functions stays
-allowed; they cannot change persistent database state. Verify and report these
-effective privileges; framing is not read-only enforcement and the target is
-never switched to scratch READ_ONLY mode. No user SQL
+ownership chaining can persist writes without EXECUTE AS or caller table DML.
+Name the procedure in the refusal. Refuse any user-defined assembly in the
+target database (`sys.assemblies.is_user_defined = 1`), naming it; an unreadable
+answer refuses. Do not trust permission_set: CAS is not a boundary under CLR
+strict security. Over-refusing databases with CLR is accepted because
+ownership-chained T-SQL function/view wrappers can execute CLR without direct
+CLR grants. Without CLR, T-SQL functions (`FN`, `IF`, `TF`) retain their allowed
+execution rights; T-SQL functions cannot change persistent database state.
+
+The assertion login must have no access to any other user database on the
+instance. Check HAS_DBACCESS for every other user database, by database id;
+unreadable answers refuse. Server VIEW ANY DATABASE is required so a hidden
+accessible database cannot appear absent. Refuse a linked server with a mapping
+for the login or all logins, naming the server. A default mapping is hidden
+without server VIEW ANY DEFINITION; require that read permission before treating
+a visible server's mapping inventory as complete. A mapped remote identity can
+write through OPENQUERY or EXEC AT, even when the outer query returns zero rows.
+
+Verify and report these effective privileges; framing is not read-only
+enforcement and the target is never switched to scratch READ_ONLY mode. No user SQL
 runs during apply. Target assertion hashes/outcomes enter the plan checksum,
 `explain` and ledger (#2401); failures/errors write no plan. The accepted
 plan-to-apply window is closed only for the specific predicates covered by
@@ -501,8 +516,9 @@ constraints or recorded drop preconditions, not arbitrary target assertions.
 #2401 PR A supplies the target engine entry points; the CLI selection and saved
 observation fields follow in PR B. SQL Server's assertion credential also needs
 `VIEW DEFINITION` on the target database so hidden securables cannot appear to
-have no write permissions. Unknown identity or permission reads refuse before
-assertion SQL; no grants are added by the runner. The existing PostgreSQL
+have no write permissions. The server metadata requirements above likewise
+prevent hidden databases or default linked-server mappings from reading empty.
+Unknown identity or permission reads refuse before assertion SQL; no grants are added by the runner. The existing PostgreSQL
 scratch entry point and its transaction protocol remain unchanged.
 
 ## 8. Measurements supporting the boundaries

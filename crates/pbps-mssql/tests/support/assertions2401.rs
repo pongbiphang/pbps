@@ -4,6 +4,8 @@ use pbps_db::{Driver, query::EvidenceCell};
 use pbps_mssql::assertions::{AssertionResult, Target, run_target};
 use std::time::Duration;
 const DEADLINE: Duration = Duration::from_secs(10);
+// A default linked-server mapping affects every login on the fixture.
+static TARGET_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Fixture {
     db: TestDb,
     role: String,
@@ -71,6 +73,7 @@ impl Fixture {
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn an_assertion_login_is_checked_by_effective_object_column_and_ddl_permissions() {
+    let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_priv2401").await;
     assert!(matches!(
         f.run("SELECT 1 WHERE 1=0").await.unwrap(),
@@ -159,6 +162,7 @@ async fn an_assertion_login_is_checked_by_effective_object_column_and_ddl_permis
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_framing() {
+    let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_query2401").await;
     for sql in [
         "SELECT 1 WHERE 1=0",
@@ -277,6 +281,7 @@ async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_frami
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn wrong_targets_and_incomplete_metadata_are_refused_before_assertion_sql() {
+    let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_target2401").await;
     let mut other = Fixture::new("assert_other2401").await;
     let target = other.target().await;
@@ -322,6 +327,7 @@ async fn wrong_targets_and_incomplete_metadata_are_refused_before_assertion_sql(
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn bounded_results_and_driver_timeouts_do_not_collect_or_pass_partial_streams() {
+    let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_bounds2401").await;
     let AssertionResult::Violation(e) = f
         .run("SELECT TOP (1000) a.object_id FROM sys.all_objects a CROSS JOIN sys.all_objects b")
@@ -363,6 +369,7 @@ async fn bounded_results_and_driver_timeouts_do_not_collect_or_pass_partial_stre
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn procedure_execute_is_write_capable_even_through_ownership_chaining() {
+    let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_proc2401").await;
     // Neither module changes execution identity. The procedure shares dbo
     // ownership with app.orders, so its caller needs no direct INSERT grant.
@@ -460,4 +467,214 @@ async fn procedure_execute_is_write_capable_even_through_ownership_chaining() {
         .unwrap();
     assert_eq!(mode[0].try_get::<&str>("mode").unwrap(), Some("READ_WRITE"));
     f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn access_to_another_user_database_refuses_before_assertion_sql() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_other_access2401").await;
+    let mut other = TestDb::create("assert_writable_elsewhere2401").await;
+    let role = f.role.clone();
+    other.conn.execute(&format!("CREATE USER [{role}] FOR LOGIN [{role}]; CREATE TABLE dbo.writes(id int); GRANT INSERT ON dbo.writes TO [{role}]")).await.unwrap();
+    let write = format!("INSERT [{}].dbo.writes VALUES(2401)", other.name);
+    let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+    caller.execute(&write).await.unwrap();
+    drop(caller);
+    let rows = other
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.writes")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].try_get::<i32>("n").unwrap(),
+        Some(1),
+        "native three-part write"
+    );
+    other.conn.execute("DELETE FROM dbo.writes").await.unwrap();
+    for sql in [write.as_str(), "SELECT 1/0", "SELECT 1 WHERE 1=0"] {
+        let error = f.run(sql).await.unwrap_err();
+        assert!(error.to_string().contains(&other.name), "{error:?}");
+    }
+    let rows = other
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.writes")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0));
+    // A hidden accessible database must not become an empty inventory.
+    f.db.conn
+        .execute(&format!(
+            "USE master; DENY VIEW ANY DATABASE TO [{role}]; USE [{}]",
+            f.db.name
+        ))
+        .await
+        .unwrap();
+    let error = f.run("SELECT 1 WHERE 1=0").await.unwrap_err();
+    assert!(error.to_string().contains("VIEW ANY DATABASE"), "{error:?}");
+    f.db.conn
+        .execute(&format!(
+            "USE master; REVOKE VIEW ANY DATABASE FROM [{role}]; USE [{}]",
+            f.db.name
+        ))
+        .await
+        .unwrap();
+    other
+        .conn
+        .execute(&format!("DENY CONNECT TO [{role}]"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.run("SELECT 1 WHERE 1=0").await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    other.drop().await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn user_clr_assemblies_refuse_even_through_function_and_view_wrappers() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_clr2401").await;
+    let binary = include_str!("../live/scratch2236-provider.hex").trim();
+    for ddl in [
+        "CREATE FUNCTION dbo.fn2401() RETURNS int AS BEGIN RETURN 1 END",
+        "CREATE FUNCTION dbo.if2401() RETURNS TABLE AS RETURN SELECT 1 AS value",
+        "CREATE FUNCTION dbo.tf2401() RETURNS @r TABLE(value int) AS BEGIN INSERT @r VALUES(1); RETURN END",
+    ] {
+        f.db.conn.execute(ddl).await.unwrap();
+    }
+    let role = f.role.clone();
+    f.db.conn.execute(&format!("GRANT EXECUTE ON dbo.fn2401 TO [{role}]; GRANT SELECT ON dbo.if2401 TO [{role}]; GRANT SELECT ON dbo.tf2401 TO [{role}]")).await.unwrap();
+    for sql in [
+        "SELECT dbo.fn2401() n WHERE 1=0",
+        "SELECT * FROM dbo.if2401() WHERE 1=0",
+        "SELECT * FROM dbo.tf2401() WHERE 1=0",
+    ] {
+        assert!(
+            matches!(f.run(sql).await.unwrap(), AssertionResult::Pass(_)),
+            "{sql}"
+        );
+    }
+    let rows = f.db.conn.query(&format!("SELECT COUNT_BIG(*) AS n FROM sys.trusted_assemblies WHERE hash=HASHBYTES('SHA2_512',0x{binary})")).await.unwrap();
+    let added_trust = rows[0].try_get::<i64>("n").unwrap() == Some(0);
+    let rows = f.db.conn.query("SELECT CONVERT(int,value_in_use) AS enabled FROM sys.configurations WHERE name='clr enabled'").await.unwrap();
+    let enabled = rows[0].try_get::<i32>("enabled").unwrap().unwrap();
+    if added_trust {
+        f.db.conn.execute(&format!("DECLARE @hash varbinary(64)=HASHBYTES('SHA2_512',0x{binary}); EXEC sys.sp_add_trusted_assembly @hash=@hash,@description=N'pbps2401 CLR admission fixture'")).await.unwrap();
+    }
+    // Restore server configuration and owned trust even when a revert witness
+    // panics. The assembly itself belongs to this disposable database.
+    let result = tokio::spawn(async move {
+        f.db.conn.execute("EXEC sys.sp_configure 'clr enabled',1; RECONFIGURE").await.unwrap();
+        f.db.conn.execute(&format!("CREATE ASSEMBLY assertions2401 FROM 0x{binary} WITH PERMISSION_SET=SAFE")).await.unwrap();
+        // Even an unused SAFE assembly refuses; neither permission_set nor
+        // direct object permissions can rule out ownership-chained execution.
+        let mut observations = vec![("unused SAFE assembly", f.run("SELECT 1 WHERE 1=0").await)];
+        for ddl in [
+            "CREATE FUNCTION dbo.clr2401() RETURNS int AS EXTERNAL NAME assertions2401.Provider.Value",
+            "CREATE FUNCTION dbo.wrapper2401() RETURNS int AS BEGIN RETURN dbo.clr2401() END",
+            "CREATE VIEW dbo.wrapped2401 AS SELECT dbo.clr2401() AS value",
+        ] {
+            f.db.conn.execute(ddl).await.unwrap();
+        }
+        f.db.conn.execute(&format!("GRANT EXECUTE ON dbo.wrapper2401 TO [{role}]; GRANT SELECT ON dbo.wrapped2401 TO [{role}]")).await.unwrap();
+        let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+        let Err(error) = caller.query("SELECT dbo.clr2401() AS value").await else { panic!("direct CLR call unexpectedly permitted") };
+        assert_eq!(error.server_error_code().as_deref(), Some("229"), "no direct CLR EXECUTE");
+        for sql in ["SELECT dbo.wrapper2401() AS value", "SELECT value FROM dbo.wrapped2401"] {
+            let rows = caller.query(sql).await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(1), "native ownership-chained wrapper: {sql}");
+            println!("native wrapper executes without CLR grant: {sql}");
+            let observation = f.run(sql).await;
+            println!("target wrapper admission: {sql}: {observation:?}");
+            observations.push((sql, observation));
+        }
+        drop(caller);
+        f.db.conn.execute("DROP VIEW dbo.wrapped2401; DROP FUNCTION dbo.wrapper2401; DROP FUNCTION dbo.clr2401; DROP ASSEMBLY assertions2401").await.unwrap();
+        assert!(matches!(f.run("SELECT dbo.fn2401() n WHERE 1=0").await.unwrap(), AssertionResult::Pass(_)));
+        for (sql, observation) in observations {
+            let error = observation.unwrap_err();
+            assert!(error.to_string().contains("assertions2401"), "{sql}: {error:?}");
+        }
+        f
+    }).await;
+    let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await.unwrap();
+    admin
+        .execute(&format!(
+            "EXEC sys.sp_configure 'clr enabled',{enabled}; RECONFIGURE"
+        ))
+        .await
+        .unwrap();
+    if added_trust {
+        admin.execute(&format!("DECLARE @hash varbinary(64)=HASHBYTES('SHA2_512',0x{binary}); EXEC sys.sp_drop_trusted_assembly @hash=@hash")).await.unwrap();
+    }
+    drop(admin);
+    result.unwrap().finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn usable_linked_server_mappings_refuse_before_assertion_sql() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_linked2401").await;
+    let server = format!("{}_linked", f.db.name);
+    let cleanup = server.clone();
+    let admin_connection = conn_str();
+    // Use the fixture password, not the local runner's password: CI differs.
+    let password = admin_connection
+        .split(';')
+        .find_map(|p| {
+            let (key, value) = p.split_once('=')?;
+            matches!(key.trim().to_ascii_lowercase().as_str(), "password" | "pwd")
+                .then(|| value.replace('\'', "''"))
+        })
+        .unwrap();
+    let result = tokio::spawn(async move {
+        let role = f.role.clone();
+        let database = f.db.name.clone();
+        f.db.conn.execute(&format!("USE master; EXEC sys.sp_addlinkedserver @server=N'{server}',@srvproduct=N'',@provider=N'MSOLEDBSQL',@datasrc=N'localhost,1433',@provstr=N'User ID=sa;Encrypt=Optional;TrustServerCertificate=Yes'; EXEC sys.sp_droplinkedsrvlogin @rmtsrvname=N'{server}',@locallogin=NULL; EXEC sys.sp_serveroption @server=N'{server}',@optname=N'rpc out',@optvalue=N'true'; GRANT VIEW ANY DEFINITION TO [{role}]; USE [{database}]")).await.unwrap();
+        assert!(matches!(f.run("SELECT 1 WHERE 1=0").await.unwrap(), AssertionResult::Pass(_)), "a server without a usable mapping is allowed");
+        let write = format!("EXEC ('INSERT [{}].app.orders VALUES(2,2); SELECT 1 n WHERE 1=0') AT [{server}]", f.db.name);
+        let select_write = format!("SELECT * FROM OPENQUERY([{server}],'SET NOCOUNT ON; INSERT [{}].app.orders VALUES(2,2); COMMIT; SELECT 1 AS n') WHERE n<0", f.db.name);
+        for local in [format!("N'{role}'"), "NULL".into()] {
+            f.db.conn.execute(&format!("USE master; EXEC sys.sp_addlinkedsrvlogin @rmtsrvname=N'{server}',@useself=N'false',@locallogin={local},@rmtuser=N'sa',@rmtpassword=N'{password}'; USE [{database}]")).await.unwrap();
+            let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+            caller.execute(&write).await.unwrap();
+            drop(caller);
+            let rows = f.db.conn.query("SELECT COUNT(*) AS n FROM app.orders WHERE id=2").await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1), "native remote write: {local}");
+            f.db.conn.execute("DELETE FROM app.orders WHERE id=2").await.unwrap();
+            let caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+            let evidence = caller.query_bounded(&select_write, DEADLINE).await.unwrap();
+            assert!(matches!(AssertionResult::from_evidence(evidence), AssertionResult::Pass(_)), "a native empty SELECT can commit through the remote mapping");
+            let rows = f.db.conn.query("SELECT COUNT(*) AS n FROM app.orders WHERE id=2").await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1));
+            f.db.conn.execute("DELETE FROM app.orders WHERE id=2").await.unwrap();
+            for sql in [select_write.as_str(), write.as_str(), "SELECT 1/0", "SELECT 1 WHERE 1=0"] {
+                let error = f.run(sql).await.unwrap_err();
+                assert!(error.to_string().contains(&server), "{error:?}");
+            }
+            let rows = f.db.conn.query("SELECT COUNT(*) AS n FROM app.orders WHERE id=2").await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0));
+            if local=="NULL" {
+                f.db.conn.execute(&format!("USE master; REVOKE VIEW ANY DEFINITION FROM [{role}]; USE [{database}]")).await.unwrap();
+                let error = f.run("SELECT 1 WHERE 1=0").await.unwrap_err();
+                assert!(error.to_string().contains("VIEW ANY DEFINITION") && error.to_string().contains(&server), "{error:?}");
+                f.db.conn.execute(&format!("USE master; GRANT VIEW ANY DEFINITION TO [{role}]; USE [{database}]")).await.unwrap();
+            }
+            f.db.conn.execute(&format!("USE master; EXEC sys.sp_droplinkedsrvlogin @rmtsrvname=N'{server}',@locallogin={local}; USE [{database}]")).await.unwrap();
+            assert!(matches!(f.run("SELECT 1 WHERE 1=0").await.unwrap(), AssertionResult::Pass(_)));
+        }
+        // A mapping for another principal is not a mapping for this caller.
+        f.db.conn.execute(&format!("USE master; EXEC sys.sp_addlinkedsrvlogin @rmtsrvname=N'{server}',@useself=N'false',@locallogin=N'sa',@rmtuser=N'sa',@rmtpassword=N'{password}'; USE [{database}]")).await.unwrap();
+        assert!(matches!(f.run("SELECT 1 WHERE 1=0").await.unwrap(), AssertionResult::Pass(_)));
+        f
+    }).await;
+    // A default mapping must never leak into another target case, including
+    // after the intentional panic in a revert witness.
+    let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await.unwrap();
+    admin.execute(&format!("IF EXISTS(SELECT 1 FROM sys.servers WHERE name=N'{cleanup}') EXEC sys.sp_dropserver @server=N'{cleanup}',@droplogins=N'droplogins'")).await.unwrap();
+    result.unwrap().finish().await;
 }

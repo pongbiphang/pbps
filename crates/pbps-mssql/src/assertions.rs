@@ -99,7 +99,7 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
     // A SELECT grant can hide every unrelated object. Demand complete metadata
     // before an empty permission inventory could mean "no write capability".
     let rows = conn
-        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(),'DATABASE','VIEW DEFINITION') AS visible")
+        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(),'DATABASE','VIEW DEFINITION') AS visible, HAS_PERMS_BY_NAME(NULL,NULL,'VIEW ANY DATABASE') AS databases_visible")
         .await?;
     if rows
         .first()
@@ -109,6 +109,54 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
         != Some(1)
     {
         return Err(DbError::Refused("assertion permission checks require database VIEW DEFINITION; hidden objects are not an empty permission inventory".into()));
+    }
+    // Ownership-chained T-SQL functions and views can call CLR without a
+    // direct CLR grant. SAFE/CAS is not a boundary under CLR strict security.
+    // Complete database metadata above makes an empty assembly read conclusive.
+    if let Some(row) = conn
+        .query("SELECT TOP(1) name FROM sys.assemblies WHERE is_user_defined=1 ORDER BY name")
+        .await?
+        .first()
+    {
+        let name = row
+            .try_get::<&str>("name")?
+            .ok_or_else(|| DbError::BadRow("unreadable assertion CLR assembly name".into()))?;
+        return Err(DbError::Refused(format!(
+            "assertion target contains user-defined CLR assembly {}; ownership-chained wrappers can execute CLR without direct grants",
+            pbps_model::escape::Escaped(name)
+        )));
+    }
+    // An accessible database can be hidden from sys.databases without this
+    // read permission. Hidden databases cannot count as a confined login.
+    if rows
+        .first()
+        .map(|r| r.try_get::<i32>("databases_visible"))
+        .transpose()?
+        .flatten()
+        != Some(1)
+    {
+        return Err(DbError::Refused("assertion permission checks require server VIEW ANY DATABASE; hidden databases are not an empty access inventory".into()));
+    }
+    for row in conn.query("SELECT name,HAS_DBACCESS(name) AS accessible FROM sys.databases WHERE database_id>4 AND database_id<>DB_ID()").await? {
+        let name = row.try_get::<&str>("name")?.ok_or_else(|| DbError::BadRow("unreadable assertion database name".into()))?;
+        match row.try_get::<i32>("accessible")? {
+            Some(0) => {},
+            Some(1) => return Err(DbError::Refused(format!("assertion login can access other user database {}; require a separate login confined to the planning database", pbps_model::escape::Escaped(name)))),
+            _ => return Err(DbError::BadRow(format!("unreadable assertion access to database {}", pbps_model::escape::Escaped(name)))),
+        }
+    }
+    // A default mapping is hidden without server VIEW ANY DEFINITION. Only
+    // a complete answer can establish that a visible server has no usable
+    // mapping; an own-principal mapping already proves the capability.
+    for row in conn.query("SELECT s.name,HAS_PERMS_BY_NAME(NULL,NULL,'VIEW ANY DEFINITION') AS visible,CASE WHEN EXISTS(SELECT 1 FROM sys.linked_logins l WHERE l.server_id=s.server_id AND l.local_principal_id IN (0,SUSER_ID())) THEN 1 ELSE 0 END AS mapped FROM sys.servers s WHERE s.is_linked=1").await? {
+        let name = row.try_get::<&str>("name")?.ok_or_else(|| DbError::BadRow("unreadable assertion linked-server name".into()))?;
+        let mapped = row.try_get::<i32>("mapped")?;
+        if mapped == Some(1) {
+            return Err(DbError::Refused(format!("assertion login has a usable mapping for linked server {}; require a separate login without linked-server mappings", pbps_model::escape::Escaped(name))));
+        }
+        if mapped != Some(0) || row.try_get::<i32>("visible")? != Some(1) {
+            return Err(DbError::Refused(format!("assertion permission checks require server VIEW ANY DEFINITION to read all mappings for linked server {}; hidden mappings are not an empty inventory", pbps_model::escape::Escaped(name))));
+        }
     }
     let safe = "'SELECT','EXECUTE','CONNECT','VIEW DEFINITION','VIEW SECURITY DEFINITION','VIEW PERFORMANCE DEFINITION','VIEW DATABASE STATE','VIEW DATABASE SECURITY STATE','VIEW DATABASE PERFORMANCE STATE','VIEW CHANGE TRACKING','VIEW ANY COLUMN ENCRYPTION KEY DEFINITION','VIEW ANY COLUMN MASTER KEY DEFINITION','UNMASK','SHOWPLAN','CONNECT SQL','VIEW ANY DATABASE','VIEW ANY DEFINITION','VIEW ANY SECURITY DEFINITION','VIEW ANY PERFORMANCE DEFINITION','VIEW SERVER STATE','VIEW SERVER SECURITY STATE','VIEW SERVER PERFORMANCE STATE','SELECT ALL USER SECURABLES'";
     let mut parts = vec![
@@ -238,9 +286,8 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
             "SELECT QUOTENAME(name) AS name FROM sys.external_libraries",
         ),
     ] {
-        // EXECUTE is safe for functions, but a procedure can write through
-        // ordinary ownership chaining. The per-object oracle also includes
-        // EXECUTE inherited from a role, schema or database grant and DENY.
+        // Procedure EXECUTE can persist writes through ownership chaining.
+        // The oracle includes inherited rights and DENY, not just grant rows.
         let permission = if class == "OBJECT" {
             "CASE WHEN p.permission_name='EXECUTE' AND i.type IN ('P','PC','X','RF') THEN 'EXECUTE (procedure)' ELSE p.permission_name END"
         } else {
