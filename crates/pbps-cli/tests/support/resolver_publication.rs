@@ -148,6 +148,29 @@ pub fn published(server: &str) {
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved["origin"], "resolved_database", "{saved}");
+    assert_eq!(saved["analysis"]["evidence"]["version"], 8, "{saved}");
+    assert_eq!(
+        saved["analysis"]["evidence"]["qualification"]["authorization"], "login_standin",
+        "{saved}"
+    );
+    let assessment = &value["data"]["resolver_assessment"];
+    assert_eq!(assessment["authorization"], "login_standin", "{value}");
+    let notice = assessment["authorization_notice"].as_str().unwrap();
+    assert!(
+        notice.contains("Authorization was not reproduced"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("https://github.com/pongbiphang/pbps/issues/1163"),
+        "{notice}"
+    );
+    // Text plan output must carry the same notice as JSON and offline explain.
+    let text_artifact = d.dir.join("text-plan.json");
+    let text_sql = d.dir.join("text-plan.sql");
+    let mut text_args = plan_args(&text_artifact, &text_sql);
+    text_args.truncate(text_args.len() - 2);
+    let text = stdout(&successful(run(&d, &text_args, Some(&targets))));
+    assert!(text.contains(notice), "{text}");
     let typed: pbps_model::SavedPlan = serde_json::from_value(saved.clone()).unwrap();
     let keys: Vec<_> = typed
         .changes
@@ -297,6 +320,16 @@ fn assert_explained(d: &Demo, artifact: &std::path::Path) {
     ));
     let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
     let resolver = &value["data"]["resolver"];
+    assert_eq!(resolver["authorization"], "login_standin", "{resolver}");
+    let notice = resolver["authorization_notice"].as_str().unwrap();
+    assert!(
+        notice.contains("Authorization was not reproduced"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("https://github.com/pongbiphang/pbps/issues/1163"),
+        "{notice}"
+    );
     assert_eq!(
         (
             &resolver["entry"],
@@ -372,6 +405,7 @@ fn assert_explained(d: &Demo, artifact: &std::path::Path) {
         text.contains("  resolver    scratch (server scratch, supplied)\n"),
         "{text}"
     );
+    assert!(text.contains(notice), "{text}");
     let block = text
         .split_once("\n  surfaces\n")
         .and_then(|(_, rest)| rest.split_once("\n  prerequisites "))

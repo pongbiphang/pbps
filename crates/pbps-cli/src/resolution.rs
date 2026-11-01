@@ -92,6 +92,11 @@ pub struct ResolverAssessment {
     pub unaffected: usize,
     /// Kept surfaces the plan recreates from their declarations anyway.
     pub rebuilt: usize,
+    /// The identity actually used by the successful PostgreSQL resolver run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<pbps_model::resolver::AuthorizationReproduction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_notice: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -104,12 +109,35 @@ pub enum ResolutionNeed {
     Resolved,
 }
 
+/// Shared by plan and offline explain, from the sealed status rather than
+/// the current profile: selecting a supplied server need not run it (#2570).
+pub fn authorization_notice(
+    status: pbps_model::resolver::AuthorizationReproduction,
+) -> Option<&'static str> {
+    match status {
+        pbps_model::resolver::AuthorizationReproduction::Reproduced => None,
+        pbps_model::resolver::AuthorizationReproduction::LoginStandin => Some(
+            "Authorization was not reproduced: supplied PostgreSQL scratch compiled as its login (login_standin), which can have more privileges than the deployer. Prefer Docker or run-owned scratch on another cluster. Verified deployer-role support is planned in #2570. Account layout guidance: https://github.com/pongbiphang/pbps/issues/1163.",
+        ),
+    }
+}
+
 impl ResolverAssessment {
+    pub fn record_authorization(
+        &mut self,
+        status: pbps_model::resolver::AuthorizationReproduction,
+    ) {
+        self.authorization = Some(status);
+        self.authorization_notice = authorization_notice(status);
+    }
+
     pub fn not_needed(assessment: &Assessment) -> Self {
         Self {
             need: ResolutionNeed::NotNeeded,
             unaffected: assessment.count(Answer::Unaffected),
             rebuilt: assessment.count(Answer::Rebuild),
+            authorization: None,
+            authorization_notice: None,
         }
     }
 
@@ -1135,6 +1163,8 @@ mod tests {
                 need: ResolutionNeed::NotNeeded,
                 unaffected: 1,
                 rebuilt: 0,
+                authorization: None,
+                authorization_notice: None,
             }
         );
     }
@@ -1183,5 +1213,42 @@ mod tests {
             panic!("an arriving routine is a binding question");
         };
         assert_eq!(named(&assessment), "app.v");
+    }
+}
+
+#[cfg(test)]
+mod authorization_notice_tests {
+    use super::*;
+    use pbps_model::resolver::AuthorizationReproduction;
+
+    #[test]
+    fn only_a_successful_supplied_postgres_run_has_an_authorization_notice() {
+        let mut report = ResolverAssessment {
+            need: ResolutionNeed::NotNeeded,
+            unaffected: 0,
+            rebuilt: 0,
+            authorization: None,
+            authorization_notice: None,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("authorization").is_none());
+        assert!(json.get("authorization_notice").is_none());
+        report.need = ResolutionNeed::Resolved;
+        report.record_authorization(AuthorizationReproduction::LoginStandin);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["authorization"], "login_standin");
+        let notice = json["authorization_notice"].as_str().unwrap();
+        for expected in [
+            "Authorization was not reproduced",
+            "Docker",
+            "run-owned",
+            "https://github.com/pongbiphang/pbps/issues/1163",
+        ] {
+            assert!(notice.contains(expected), "{notice}");
+        }
+        report.record_authorization(AuthorizationReproduction::Reproduced);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["authorization"], "reproduced");
+        assert!(json.get("authorization_notice").is_none());
     }
 }

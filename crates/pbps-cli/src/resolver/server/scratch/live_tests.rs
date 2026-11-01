@@ -590,6 +590,11 @@ fn assert_layout(plan: &ResolvedPlan, layout: pbps_model::resolver::ScratchLayou
     let pbps_model::resolver::ResolverRuntime::Scratch { layout: sealed, .. } =
         &plan.evidence.qualification().runtime;
     assert_eq!(*sealed, layout);
+    assert_eq!(
+        plan.evidence.qualification().authorization,
+        pbps_model::resolver::AuthorizationReproduction::for_postgres_layout(layout),
+        "the actual layout determines which identity compiled the plan"
+    );
 }
 
 #[tokio::test]

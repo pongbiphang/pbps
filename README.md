@@ -256,6 +256,23 @@ it needs no resolver, scratch or Docker (#616). See
 [SPEC §9.3.2](docs/SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 for configuration and [the delivery steps](docs/RESOLVER-DELIVERY.md).
 
+For PostgreSQL authorization, prefer these layouts in order:
+
+1. Docker, or a superuser scratch server on another cluster (run-owned): the
+   resolver reproduces the deployer and compiles as that identity.
+2. Supplied scratch with a verified deployer role: planned in
+   [#2570](https://github.com/pongbiphang/pbps/issues/2570). The `deployer_role`
+   field and admission will ship with the `SET ROLE` compilation that uses it;
+   this build does not accept that field.
+3. Supplied scratch without that role: the login stands in for the deployer.
+   It can have privileges the deployer lacks, so authorization was not
+   reproduced. Plans seal `authorization: login_standin`; `plan` and offline
+   `explain` show the same notice. Existing target-side apply checks still run.
+
+Production account-layout guidance belongs to the
+[release runbook #1163](https://github.com/pongbiphang/pbps/issues/1163), which
+tracks the full scratch preference and provisioning guidance.
+
 [Resolver acceptance](docs/RESOLVER-ACCEPTANCE.md) records planning, offline
 explanation and resolved apply separately for each engine/build, scratch kind
 and platform. A compiled resolver, another engine's pass or a compact core

@@ -29,7 +29,7 @@ pub use grants::{AuthorizationGrant, GrantPhase, GrantPrincipal, GrantTargetStat
 
 mod evidence;
 pub use evidence::{
-    AuthorizationCondition, BindingCoverage, DependencyPlacement, DependencyShape, EvidenceError,
-    EvidenceHandling, OutsideWrites, PlanAnalysis, Qualification, ResolverEvidence,
-    ResolverRuntime, SameInstance, ScratchLayout, ScratchSource, TargetScope,
+    AuthorizationCondition, AuthorizationReproduction, BindingCoverage, DependencyPlacement,
+    DependencyShape, EvidenceError, EvidenceHandling, OutsideWrites, PlanAnalysis, Qualification,
+    ResolverEvidence, ResolverRuntime, SameInstance, ScratchLayout, ScratchSource, TargetScope,
 };

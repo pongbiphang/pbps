@@ -24,6 +24,7 @@ fn evidence() -> ResolverEvidence {
         &changes,
         Qualification {
             rule: compatibility::REPORTED_RULE.into(),
+            authorization: AuthorizationReproduction::LoginStandin,
             target_environment: "04".repeat(32),
             target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
