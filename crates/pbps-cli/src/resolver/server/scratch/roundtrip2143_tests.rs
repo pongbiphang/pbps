@@ -351,3 +351,69 @@ async fn mssql_a_plan_that_drops_objects_releases_their_roots() {
     }
     both(case).await;
 }
+
+/// A created table binds the engine's built-in types, which exist on every
+/// instance: the opening capture reads them on the target too, so the plan
+/// seals and reads back (DEC-2143.6).
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_plan_that_creates_a_typed_table_seals_and_reads_back() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut declared = declared(&[module(
+                ModuleKind::View,
+                "dbo.v2143",
+                "SELECT id FROM dbo.t2143",
+            )]);
+            let (name, mut table) = table("dbo.t2143");
+            table.columns.get_mut("id").unwrap().nullable = false;
+            declared.desired.tables.insert(name, table);
+            let plan = plan(target, scratch, &declared).await;
+            plan.evidence.validate(&plan.changes).unwrap();
+            let (opening, closing) = (roots(plan.evidence.before()), roots(plan.evidence.after()));
+            assert!(
+                opening.contains("sys.int"),
+                "the built-in type is read on the target: {opening:?}"
+            );
+            assert!(!opening.contains("dbo.t2143"), "{opening:?}");
+            assert!(
+                closing.contains("dbo.t2143") && closing.contains("sys.int"),
+                "{closing:?}"
+            );
+            pbps_mssql::Mssql
+                .validate_plan_analysis(&saved(&plan))
+                .unwrap();
+        })
+    }
+    both(case).await;
+}
+
+/// Only what the engine ships is admitted that way: a user-defined type the
+/// opening capture never read stays unresolved, however it is spelled.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_user_defined_type_absent_from_opening_is_not_admitted_as_a_built_in() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(target, &["CREATE TYPE dbo.amount2143 FROM int NOT NULL;"]).await;
+            let mut declared = Declared::default();
+            let (name, mut table) = table("dbo.t2143");
+            table
+                .columns
+                .insert("id".into(), Column::new("dbo.amount2143".parse().unwrap()));
+            declared.desired.tables.insert(name, table);
+            let outcome = declared_plan(target, scratch, &declared, None).await;
+            assert!(
+                outcome.is_err(),
+                "a user type no capture read must not be sealed as a built-in"
+            );
+        })
+    }
+    both(case).await;
+}

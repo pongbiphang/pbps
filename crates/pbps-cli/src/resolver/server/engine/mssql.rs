@@ -1299,6 +1299,11 @@ impl Binding {
                 .map_err(super::catalog_read_failed)?;
             let mut next = on_scratch.runtime_scope();
             next.candidates.extend(on_target.runtime_scope().candidates);
+            // What the compiled closure binds to that the engine ships is
+            // read on the target too, so a created object's built-in types
+            // are in the opening manifest and compared at closing, not a
+            // record the opening never saw (DEC-2143.6).
+            next.retained.extend(on_scratch.engine_builtins());
             if next == scope {
                 settled = Some((held(&scope, &on_scratch), held(&scope, &on_target)));
                 break;
