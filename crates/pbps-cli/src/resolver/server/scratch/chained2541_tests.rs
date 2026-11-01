@@ -759,5 +759,60 @@ async fn mssql_chain2541_target_domain_closes_freshly_and_hidden_is_not_absent()
     reconstruct2374::both(case).await;
 }
 
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_chain2541_schema_bound_functions_keep_qualified_creation_dependencies() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut owner = connection(target).await;
+            const PROVIDER: &str = "() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN 17; END";
+            owner
+                .execute(&format!("CREATE FUNCTION dbo.provider2541{PROVIDER};"))
+                .await
+                .unwrap();
+            // UNION ALL keeps the real view non-indexable, like the shape
+            // template, while preserving its managed function prerequisite.
+            owner
+                .execute("CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT dbo.provider2541() AS i UNION ALL SELECT dbo.provider2541() AS i;")
+                .await
+                .unwrap();
+            for body in [
+                "() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT MAX(i) FROM dbo.v); END",
+                "() RETURNS @r TABLE(i int) WITH SCHEMABINDING AS BEGIN INSERT @r SELECT i FROM dbo.v; RETURN; END",
+                "() RETURNS int WITH EXECUTE AS CALLER, SCHEMABINDING AS BEGIN RETURN (SELECT MAX(i) FROM dbo.v); END",
+            ] {
+                let mut schema = declared(ModuleKind::Function, "dbo", body);
+                schema.desired.tables.clear();
+                // Both target definitions are real. The external view requires
+                // the managed provider, so it must be finalized before the
+                // schema-bound consumer can hold a reference to it.
+                install(target, &schema.desired).await;
+                schema.desired.modules.insert(
+                    "dbo.provider2541()".parse().unwrap(),
+                    Module {
+                        kind: ModuleKind::Function,
+                        definition: PROVIDER.into(),
+                        description: None,
+                        options: Default::default(),
+                    },
+                );
+                schema.base = schema.desired.clone();
+                for file in [None, Some("-- pbps:deferred\nSELECT 1;")] {
+                    let roots = observe(target, scratch, &schema, file).await.unwrap();
+                    assert!(roots.contains(&capture::object("dbo", "v")), "{roots:?}");
+                }
+                owner
+                    .execute("DROP FUNCTION dbo.consumer2541;")
+                    .await
+                    .unwrap();
+            }
+        })
+    }
+    reconstruct2374::both(case).await;
+}
+
 #[path = "chained2541_visibility_tests.rs"]
 mod visibility;

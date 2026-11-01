@@ -71,31 +71,40 @@ fn tokens(text: &str) -> Result<Vec<Token>, &'static str> {
 }
 
 /// Only the RETURNS clause at header depth zero classifies a function.
-/// A parameter/quoted name or a body keyword cannot supply the answer.
+/// A parameter/return-type name or a body keyword cannot supply an option.
+/// EXECUTE AS belongs to the header; only the later AS starts its body.
 fn function_body(tokens: &[Token]) -> Result<Option<(usize, bool)>, &'static str> {
     let mut depth = 0usize;
     let mut returns = None;
     let mut bound = false;
     for (at, token) in tokens.iter().enumerate() {
+        let previous = at.checked_sub(1).and_then(|at| tokens.get(at));
         if token.word("(") {
             depth += 1;
         } else if token.word(")") {
             depth = depth.saturating_sub(1);
-        } else if depth == 0 && token.word("SCHEMABINDING") {
+        } else if depth == 0
+            && token.word("SCHEMABINDING")
+            && previous.is_some_and(|t| t.word("WITH") || t.word(","))
+        {
             bound = true;
         } else if depth == 0 && token.word("RETURNS") {
             returns = Some(at + 1);
-        } else if depth == 0 && (token.word("AS") || token.word("RETURN") || token.word("BEGIN")) {
+        } else if depth == 0
+            && ((token.word("AS") && !previous.is_some_and(|t| t.word("EXECUTE")))
+                || token.word("RETURN")
+                || token.word("BEGIN"))
+        {
             let returned = returns.and_then(|at| tokens.get(at));
-            return match returned {
-                Some(t) if t.word("TABLE") => Ok(Some((at + 1, bound))),
+            let inline = match returned {
+                Some(t) if t.word("TABLE") => true,
                 Some(t)
                     if t.text.starts_with('@')
                         && returns
                             .and_then(|at| tokens.get(at + 1))
                             .is_some_and(|t| t.word("TABLE")) =>
                 {
-                    Ok(None)
+                    false
                 }
                 Some(t)
                     if !t.word("AS")
@@ -103,12 +112,17 @@ fn function_body(tokens: &[Token]) -> Result<Option<(usize, bool)>, &'static str
                         && !t.word("RETURN")
                         && (t.quoted || t.text.chars().next().is_some_and(char::is_alphabetic)) =>
                 {
-                    Ok(None)
+                    false
                 }
-                _ => Err(
-                    "the function header cannot be classified for creation ordering; correct the declaration text",
-                ),
+                _ => {
+                    return Err(
+                        "the function header cannot be classified for creation ordering; correct the declaration text",
+                    );
+                }
             };
+            // Schema binding makes every function's references creation-bound;
+            // only an ordinary scalar/MSTVF body can defer those references.
+            return Ok((inline || bound).then_some((at + 1, bound)));
         }
     }
     Err(

@@ -60,6 +60,48 @@ fn only_creation_bound_module_bodies_consume_an_external() {
             false,
             false,
         ),
+        (
+            ModuleKind::Function,
+            "() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT COUNT(*) FROM dbo.v); END",
+            false,
+            true,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT COUNT(*) FROM v); END",
+            false,
+            false,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS @t TABLE(i int) WITH SCHEMABINDING AS BEGIN INSERT @t SELECT i FROM dbo.v; RETURN; END",
+            false,
+            true,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS @t TABLE(i int) WITH SCHEMABINDING AS BEGIN INSERT @t SELECT i FROM v; RETURN; END",
+            false,
+            false,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS int WITH EXECUTE AS OWNER, SCHEMABINDING AS BEGIN RETURN (SELECT COUNT(*) FROM dbo.v); END",
+            false,
+            true,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS @t TABLE(i int) WITH EXECUTE AS OWNER, SCHEMABINDING AS BEGIN INSERT @t SELECT i FROM dbo.v; RETURN; END",
+            false,
+            true,
+        ),
+        (
+            ModuleKind::Function,
+            "() RETURNS dbo.schemabinding AS BEGIN RETURN (SELECT COUNT(*) FROM dbo.v); END",
+            false,
+            false,
+        ),
         (ModuleKind::View, "SELECT i FROM dbo.v", true, true),
         (ModuleKind::View, "SELECT i FROM v", true, false),
         (

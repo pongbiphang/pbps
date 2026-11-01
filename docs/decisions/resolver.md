@@ -5609,9 +5609,12 @@ The hints only place a renderer before a managed creation that needs it.
 
 - **Creation need is narrower than runtime reference.** Measured on pinned
   SQL Server 17, a view or inline TVF fails to CREATE without its relation;
-  a procedure, DML trigger, scalar function or multi-statement TVF body can
-  name that absent relation and still CREATE. Those four bodies therefore
-  add no lexical consumer edge, even for qualified names. A trigger's
+  an ordinary procedure, DML trigger, or non-schema-bound scalar function or
+  multi-statement TVF body can name that absent relation and still CREATE.
+  Those deferred bodies add no lexical consumer edge, even for qualified
+  names. Schema-bound scalar functions and multi-statement TVFs instead need
+  their referents at CREATE and retain the same qualified-reference tier;
+  they never gain bare-name hints. A trigger's
   `attached_to` identity is still a structural prerequisite, as is a foreign
   key's referenced table. The exact captured foreign-key key/index binding
   and the provider distinction in DEC-2376.3 are unchanged.
@@ -5621,7 +5624,8 @@ The hints only place a renderer before a managed creation that needs it.
   are admitted only immediately after FROM/JOIN in non-schema-bound views
   and inline TVFs. A function is classified by its header's depth-zero
   RETURNS clause, with AS, RETURN or BEGIN as the body boundary; a
-  parameter name cannot supply SCHEMABINDING. Module headers,
+  parameter or return-type name cannot supply SCHEMABINDING; EXECUTE AS
+  stays in the header until the actual body boundary. Module headers,
   comments and literals do not supply body consumers. Three- and four-part
   references add no local edge; the two-part suffix of one is not local.
 - **One lookup policy.** DECISIONS 317's `bare_name_rank` selects the nearest
