@@ -119,7 +119,12 @@ async fn exec(url: &str, statements: &[&str]) {
 /// A login and its user in the target database, with the rights the
 /// declarations need and no more than each case names. The resolver reads
 /// the target as this principal, so it may read the dependency catalog.
-async fn deployer(server_url: &str, target: &str, purpose: &str, user_setup: &str) -> String {
+pub(super) async fn deployer(
+    server_url: &str,
+    target: &str,
+    purpose: &str,
+    user_setup: &str,
+) -> String {
     let database = sql::database(&mut connection(target).await)
         .await
         .unwrap()

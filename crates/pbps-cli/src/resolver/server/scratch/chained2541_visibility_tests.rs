@@ -30,8 +30,9 @@ async fn fixture(target: &str) -> (pbps_db::Conn, pbps_db::Conn, Schema, String)
     );
     install(target, &plan.desired).await;
     plan.desired.modules.values_mut().next().unwrap().definition = "SELECT i FROM v".into();
-    let login = format!("dep2374_deny2541_{:016x}", rand::random::<u64>());
-    owner.execute(&format!("CREATE LOGIN [{login}] WITH PASSWORD=N'Pbps!Test12345', CHECK_POLICY=OFF; CREATE USER [{login}] FOR LOGIN [{login}] WITH DEFAULT_SCHEMA=app; GRANT VIEW DEFINITION TO [{login}]; GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; CREATE ROLE deny_role2541; CREATE ROLE deny_parent2541; ALTER ROLE deny_role2541 ADD MEMBER [{login}]; ALTER ROLE deny_parent2541 ADD MEMBER deny_role2541; CREATE USER other2541 WITHOUT LOGIN;")).await.unwrap();
+    let login =
+        reconstruct2374::deployer(target, target, "deny2541", "WITH DEFAULT_SCHEMA=app").await;
+    owner.execute(&format!("CREATE ROLE deny_role2541; CREATE ROLE deny_parent2541; ALTER ROLE deny_role2541 ADD MEMBER [{login}]; ALTER ROLE deny_parent2541 ADD MEMBER deny_role2541; CREATE USER other2541 WITHOUT LOGIN;")).await.unwrap();
     let reader = connection(&format!("{target};User Id={login};Password=Pbps!Test12345")).await;
     (owner, reader, plan.desired, login)
 }

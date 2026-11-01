@@ -649,8 +649,12 @@ async fn mssql_chain2541_target_domain_closes_freshly_and_hidden_is_not_absent()
             );
             // A separate login fixes the principal for every driver call;
             // a batch-local EXECUTE AS is not evidence about later reads.
-            let login = format!("dep2374_hidden2541_{:016x}", rand::random::<u64>());
-            conn.execute(&format!("CREATE LOGIN [{login}] WITH PASSWORD=N'Pbps!Test12345', CHECK_POLICY=OFF; CREATE USER [{login}] FOR LOGIN [{login}]; GRANT VIEW DEFINITION TO [{login}]; GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; DENY VIEW DEFINITION ON OBJECT::dbo.v TO [{login}];")).await.unwrap();
+            let login = reconstruct2374::deployer(target, target, "hidden2541", "").await;
+            conn.execute(&format!(
+                "DENY VIEW DEFINITION ON OBJECT::dbo.v TO [{login}];"
+            ))
+            .await
+            .unwrap();
             let mut reader =
                 connection(&format!("{target};User Id={login};Password=Pbps!Test12345")).await;
             let physical = conn.query("SELECT CONVERT(int,CASE WHEN OBJECT_ID(N'dbo.v') IS NOT NULL THEN 1 ELSE 0 END) AS present, CONVERT(int,CASE WHEN OBJECT_ID(N'dbo.absent2541') IS NULL THEN 1 ELSE 0 END) AS absent;").await.unwrap();
