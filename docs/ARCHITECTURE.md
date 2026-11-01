@@ -303,3 +303,11 @@ has a home, the entry links there instead of repeating its content.
    `tiberius`, `pbps-db::postgres` names `tokio_postgres`, and nothing else in
    the workspace names either — `pbps-db::Conn` dispatches between them and
    holds no driver type ([decision 225](decisions/connection.md#decision-225)).
+
+Typed portable creation demands stay in planning state (DEC-2469.4).
+`pbps-dialect::creation` selects facets and refines engine-provided recipes using
+existing Changes; engine capability and legal group decisions stay in each
+dialect. The annotation identity wrapper remains shared above `creation_parts`.
+`pbps-diff::order::deployment::schedule::diff_annotated` admits the annotated
+comparison only after canonical scheduling; connected computed-call collation
+checks remain in the SQL Server planning adapter. No persisted model changes.

@@ -303,6 +303,8 @@ fn cursor_parameter_types(tokens: &[Token<'_>]) -> Vec<std::ops::Range<usize>> {
 }
 
 mod parts;
+pub(crate) use parts::demanded;
+pub(crate) use parts::inline;
 pub(crate) use parts::parts;
 
 /// A consumer binds the full row shape even when it mentions no suffix

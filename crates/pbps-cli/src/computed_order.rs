@@ -313,6 +313,7 @@ fn functions_changed(cs: &ChangeSet) -> Vec<(TableName, &'static str)> {
 /// A computed column this plan adds, new or again, and the two-part names
 /// its expression calls.
 struct AddedCall {
+    at: usize,
     table: TableName,
     column: pbps_model::ColumnName,
     names: Vec<(String, String)>,
@@ -352,7 +353,7 @@ fn added_calls(
             .unwrap_or_default()
     };
     let mut out = Vec::new();
-    for p in &cs.changes {
+    for (at, p) in cs.changes.iter().enumerate() {
         if let Change::AddComputedColumn {
             table,
             name,
@@ -360,6 +361,7 @@ fn added_calls(
         } = &p.change
         {
             out.push(AddedCall {
+                at,
                 table: table.clone(),
                 column: name.clone(),
                 names: dialect.qualified_calls(&computed.expression),
@@ -369,6 +371,7 @@ fn added_calls(
         if let Change::CreateTable { name, table, .. } = &p.change {
             for (column, computed) in &table.computed {
                 out.push(AddedCall {
+                    at,
                     table: name.clone(),
                     column: column.clone(),
                     names: dialect.qualified_calls(&computed.expression),
@@ -431,15 +434,74 @@ pub(crate) fn added_call_spellings(
 /// that name exists the engine rejects the call as ambiguous (327), and one
 /// created after the add leaves the table's computed columns unloadable
 /// (474), so an alter or a create still refuses.
+/// Only a checked annotation, current order, and complete collation facts can
+/// discharge the old class-order guard. This grants no scheduling authority.
+// Only the creation/function transitions below grant this capability.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn refuse_added_calls_in<S>(
+    plan: &PlanningPlan<S>,
+    declared: &pbps_model::Schema,
+    dialect: &dyn pbps_dialect::Dialect,
+    alike: &Alike,
+) -> Result<(), String> {
+    let mut last = std::collections::BTreeMap::new();
+    for (at, p) in plan.changes.iter().enumerate() {
+        match &p.change {
+            Change::CreateModule { id, module } | Change::AlterModule { id, module }
+                if module.kind == pbps_model::ModuleKind::Function =>
+            {
+                last.insert(id.object_name(), (at, true));
+            }
+            Change::DropModule { id, kind } if *kind == pbps_model::ModuleKind::Function => {
+                last.insert(id.object_name(), (at, false));
+            }
+            _ => {}
+        }
+    }
+    let mut allowed = BTreeSet::new();
+    for edge in plan.annotation_edges()? {
+        if edge.before >= edge.after {
+            continue;
+        }
+        if let Change::CreateModule {
+            id: pbps_model::ModuleId::Named(name),
+            module,
+        }
+        | Change::AlterModule {
+            id: pbps_model::ModuleId::Named(name),
+            module,
+        } = &plan.changes[edge.before].change
+            && module.kind == pbps_model::ModuleKind::Function
+        {
+            let function = TableName::new(&name.schema, &name.name);
+            if last.get(&function) == Some(&(edge.before, true)) {
+                allowed.insert((edge.after, function));
+            }
+        }
+    }
+    refuse_added_calls_with(plan, declared, dialect, alike, &allowed)
+}
+
+#[cfg(test)]
 pub(crate) fn refuse_added_calls(
     cs: &ChangeSet,
     declared: &pbps_model::Schema,
     dialect: &dyn pbps_dialect::Dialect,
     alike: &Alike,
 ) -> Result<(), String> {
+    refuse_added_calls_with(cs, declared, dialect, alike, &BTreeSet::new())
+}
+fn refuse_added_calls_with(
+    cs: &ChangeSet,
+    declared: &pbps_model::Schema,
+    dialect: &dyn pbps_dialect::Dialect,
+    alike: &Alike,
+    allowed: &BTreeSet<(usize, TableName)>,
+) -> Result<(), String> {
     let functions = functions_changed(cs);
     let mut refused = Vec::new();
     for AddedCall {
+        at,
         table,
         column,
         names,
@@ -448,11 +510,28 @@ pub(crate) fn refuse_added_calls(
     {
         for (schema, name) in &names {
             let a_method = receivers.iter().any(|c| alike.same(schema, c.raw()));
+            let matching: BTreeSet<_> = functions
+                .iter()
+                .filter(|(function, _)| {
+                    alike.same(schema, &function.schema) && alike.same(name, &function.name)
+                })
+                .map(|(function, _)| function)
+                .collect();
             for (function, what) in &functions {
                 if *what == "drops" && a_method {
                     continue;
                 }
                 if alike.same(schema, &function.schema) && alike.same(name, &function.name) {
+                    let known = [schema, name, &function.schema, &function.name]
+                        .iter()
+                        .all(|s| alike.0.contains(&((*s).clone(), (*s).clone())));
+                    if !a_method
+                        && known
+                        && matching.len() == 1
+                        && allowed.contains(&(at, function.clone()))
+                    {
+                        continue;
+                    }
                     refused.push(format!(
                         "computed column {table}.{column} calls `{function}` as `{schema}.{name}` \
                          under the database's collation, and this plan {what} it. Apply the \
@@ -1183,3 +1262,7 @@ mod plan_name_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "computed_order/annotations_tests.rs"]
+pub(crate) mod annotations_tests;

@@ -39,6 +39,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod creation;
 pub mod drop_requirements;
 pub mod engine_effects;
 pub mod estimate;
@@ -2766,7 +2767,38 @@ pub trait Dialect {
         ids: &pbps_model::IdsFile,
         functions: &[pbps_model::ModuleId],
         needs_complete_shape: bool,
-        _demanded: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        _demanded: creation::Request<'_>,
+        _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        self.creation_parts(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            _demanded,
+            _required_columns,
+        )
+    }
+
+    /// Surfaces required in a table's CREATE by this engine's options/kind.
+    /// This is transient recipe metadata, never persisted annotation intent.
+    fn creation_inline(
+        &self,
+        _name: &pbps_model::TableName,
+        _table: &pbps_model::Table,
+    ) -> creation::Inline {
+        creation::Inline::default()
+    }
+
+    /// Engine-owned demand recipe, beneath the shared annotation identity seam.
+    fn creation_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+        _demanded: creation::Request<'_>,
+        _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         self.scratch_table_parts(change, ids, functions, needs_complete_shape)
     }
@@ -2825,6 +2857,13 @@ pub trait Dialect {
     /// callee. Module bodies may call by a bare name and keep the leaf test.
     fn generation_calls(&self, text: &str, function: &pbps_model::ModuleId) -> bool {
         self.generation_may_call(text, function.name())
+    }
+
+    /// The same local-column scan used by the engine's generation recipe.
+    /// Expression installation can read a column added later in the declaration
+    /// without itself appending a physical column (DEC-1503.2).
+    fn generation_may_read_column(&self, text: &str, column: &pbps_model::ColumnName) -> bool {
+        self.may_name(text, column.raw())
     }
 
     /// The names `text` may read as columns of `table`, for an engine that

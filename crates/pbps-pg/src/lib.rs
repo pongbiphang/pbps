@@ -1314,6 +1314,44 @@ impl Dialect for Postgres {
         "postgres"
     }
 
+    fn creation_inline(&self, name: &TableName, table: &Table) -> pbps_dialect::creation::Inline {
+        generated::inline(name, table)
+    }
+
+    fn creation_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+        request: pbps_dialect::creation::Request<'_>,
+        required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        let mut demand = pbps_dialect::creation::Demand::for_request(change, request, self);
+        demand.required_columns = required_columns.clone();
+        if matches!(
+            change,
+            Change::CreateTable {
+                beside_default: Some(_),
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        let parts = generated::demanded(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            self.server_version_num,
+            &mut demand,
+        )?
+        .unwrap_or_else(|| vec![change.clone()]);
+        Ok(Some(pbps_dialect::creation::expose(
+            parts, ids, &demand, self,
+        )?))
+    }
+
     fn generated_table_parts(
         &self,
         change: &Change,
@@ -1346,6 +1384,10 @@ impl Dialect for Postgres {
             self.server_version_num,
             true,
         )
+    }
+
+    fn generation_may_read_column(&self, text: &str, column: &pbps_model::ColumnName) -> bool {
+        generated::may_read(text, column.raw())
     }
 
     fn generation_may_call(&self, text: &str, name: &str) -> bool {

@@ -43,6 +43,9 @@ mod dependencies_tests;
 #[path = "support/alias_batches.rs"]
 mod alias_batches;
 
+#[path = "support/creation2469.rs"]
+mod creation2469;
+
 #[path = "support/annotations2469.rs"]
 mod annotations2469;
 

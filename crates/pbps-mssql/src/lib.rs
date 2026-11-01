@@ -246,6 +246,36 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
+    fn creation_inline(&self, name: &TableName, table: &Table) -> pbps_dialect::creation::Inline {
+        generated::inline(name, table)
+    }
+
+    fn creation_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        _needs_complete_shape: bool,
+        request: pbps_dialect::creation::Request<'_>,
+        _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        let mut demand = pbps_dialect::creation::Demand::for_request(change, request, self);
+        if matches!(
+            change,
+            Change::CreateTable {
+                beside_default: Some(_),
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        let parts = generated::demanded(self, change, ids, functions, &mut demand)?
+            .unwrap_or_else(|| vec![change.clone()]);
+        Ok(Some(pbps_dialect::creation::expose(
+            parts, ids, &demand, self,
+        )?))
+    }
+
     fn generated_table_parts(
         &self,
         change: &Change,

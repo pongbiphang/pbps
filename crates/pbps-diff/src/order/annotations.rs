@@ -2,6 +2,7 @@
 //! The index describes immutable groups; it supplies no ordering preference.
 mod contract;
 pub use contract::Contract;
+pub(crate) use contract::Creation;
 
 use std::collections::{BTreeMap, BTreeSet};
 

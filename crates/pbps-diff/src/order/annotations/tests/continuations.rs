@@ -57,9 +57,14 @@ impl Dialect for Probe {
         ids: &IdsFile,
         _: &[pbps_model::ModuleId],
         _: bool,
-        demanded: &BTreeSet<ObjectRef>,
+        demanded: pbps_dialect::creation::Request<'_>,
+        _: &BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
-        assert!(demanded.contains(&"default::app.t.x".parse().unwrap()));
+        assert!(
+            demanded
+                .references
+                .contains(&"default::app.t.x".parse().unwrap())
+        );
         self.requests.fetch_add(1, Ordering::SeqCst);
         let Change::CreateTable { name, table, .. } = change else {
             return Ok(None);

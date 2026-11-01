@@ -10,6 +10,38 @@
 
 use pbps_dialect::DialectError;
 use pbps_model::{Change, ColumnName, ColumnRef, IdsFile, ModuleId, ValueSource};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Partition key columns belong to CREATE; their defaults/keys need not.
+pub(crate) fn inline(
+    name: &pbps_model::TableName,
+    table: &pbps_model::Table,
+) -> pbps_dialect::creation::Inline {
+    let mut inline = pbps_dialect::creation::Inline::default();
+    for (column, spec) in &table.columns {
+        if matches!(spec.value_source, ValueSource::Identity(_)) {
+            inline.column_not_null.insert(
+                column.clone(),
+                "PostgreSQL identity needs NOT NULL in its column installation",
+            );
+        }
+    }
+    // A sub-partition inherits these columns; only locally declared columns
+    // can be extracted from this CREATE. The model's ancestry owns the rest.
+    for column in table
+        .partition_by
+        .iter()
+        .flat_map(|key| &key.columns)
+        .filter(|c| table.columns.contains_key(*c))
+    {
+        inline.column(
+            name,
+            column,
+            "PostgreSQL PARTITION BY needs its partition-key columns",
+        );
+    }
+    inline
+}
 
 pub(crate) fn parts(
     change: &Change,
@@ -18,6 +50,44 @@ pub(crate) fn parts(
     needs_complete_shape: bool,
     version: Option<i64>,
     scratch: bool,
+) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(
+        change,
+        ids,
+        functions,
+        needs_complete_shape,
+        version,
+        scratch,
+        &mut Default::default(),
+    )
+}
+
+pub(crate) fn demanded(
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    needs_complete_shape: bool,
+    version: Option<i64>,
+    demand: &mut pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(
+        change,
+        ids,
+        functions,
+        needs_complete_shape,
+        version,
+        demand.scratch,
+        demand,
+    )
+}
+fn parts_in(
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    needs_complete_shape: bool,
+    version: Option<i64>,
+    scratch: bool,
+    demand: &mut pbps_dialect::creation::Demand,
 ) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
@@ -29,34 +99,74 @@ pub(crate) fn parts(
     else {
         return Ok(None);
     };
+    // Clamp against the same required group before full-shape selection; a
+    // held earlier demand must not absorb another demand's legal late suffix.
+    demand.resolve_suffix(name, table);
+    let ordinary_columns = demand.columns.clone();
     let calls = |text: &str| functions.iter().any(|id| super::may_call(text, id.name()));
-    let calling = table.columns.values().position(|c| {
-        matches!(&c.value_source,
-        ValueSource::Generated(g) if calls(&g.expression))
+    let calling = table.columns.iter().position(|(column, c)| {
+        demand.columns.contains(column)
+            || matches!(&c.value_source,
+        ValueSource::Generated(g) if !demand.inline.keeps_generation(name,column) && (calls(&g.expression) || demand.generation.contains(column)))
     });
     // A table that generates nothing from a planned function is split only
     // on scratch, and then there is no suffix.
-    let Some(cut) = calling.or(scratch.then_some(table.columns.len())) else {
+    let partition_default = table
+        .partition_of
+        .iter()
+        .flat_map(|of| &of.columns)
+        .any(|(column, own)| own.default.is_some() && demand.wants_default(column));
+    let Some(cut) = calling.or((scratch || partition_default).then_some(table.columns.len()))
+    else {
         return Ok(None);
     };
     let suffix: Vec<_> = table.columns.keys().skip(cut).cloned().collect();
-    // Prefix generations also lose suffix inputs. A forward read within
-    // the retained prefix is safe because CREATE still supplies both columns
-    // together (DEC-1503.2).
-    let later_input = table
+    // The same input graph decides whether the suffix needs placeholders
+    // and which prefix/suffix expressions lose an input when it is extracted.
+    let positions: BTreeMap<_, _> = table
         .columns
-        .iter()
+        .keys()
         .enumerate()
-        .any(|(at, (_, c))| {
-            matches!(&c.value_source, ValueSource::Generated(g) if table.columns.keys().skip(cut.max(at + 1))
-            .any(|column| super::may_read(&g.expression, column.raw())))
-        });
-    let partition_key = table
-        .partition_by
-        .as_ref()
-        .is_some_and(|key| key.columns.iter().any(|c| suffix.contains(c)));
-    let placeholder = partition_key || later_input || needs_complete_shape;
+        .map(|(at, c)| (c, at))
+        .collect();
+    let mut consumers: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    let mut later_input = false;
+    for (generated, spec) in &table.columns {
+        if let ValueSource::Generated(g) = &spec.value_source {
+            for input in table
+                .columns
+                .keys()
+                .filter(|c| super::may_read(&g.expression, c.raw()))
+            {
+                later_input |= positions[input] >= cut.max(positions[generated] + 1);
+                consumers.entry(input).or_default().insert(generated);
+            }
+        }
+    }
+    let required = inline(name, table);
+    let partition_key = required.holds_columns(name, suffix.iter())
+        || demand.inline.holds_columns(name, suffix.iter());
+    let full_shape = partition_key
+        || needs_complete_shape
+        || suffix.iter().any(|c| demand.required_columns.contains(c));
+    let placeholder = full_shape || later_input;
+    let ordinary_demand = !demand.columns.is_empty();
     let held = placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN);
+    if held
+        && ((ordinary_demand
+            && table
+                .columns
+                .values()
+                .any(|c| matches!(c.value_source, ValueSource::Generated(_))))
+            || !demand.generation.is_empty()
+            || (!demand.required_columns.is_empty()
+                && table
+                    .columns
+                    .values()
+                    .any(|c| matches!(c.value_source, ValueSource::Generated(_)))))
+    {
+        return Err(DialectError::Unsupported { dialect: "postgres", feature: "the demanded generation needs a complete-table placeholder and SET EXPRESSION, unavailable before PostgreSQL 17".into() });
+    }
     if held && !scratch {
         return Ok(None);
     }
@@ -67,19 +177,36 @@ pub(crate) fn parts(
     } else {
         (cut, suffix, placeholder)
     };
-    let pending = if placeholder {
-        table
-            .columns
-            .iter()
-            .filter_map(|(column, c)| {
-                matches!(&c.value_source, ValueSource::Generated(g) if calls(&g.expression))
-                    .then_some(column.clone())
-            })
-            .collect::<Vec<_>>()
+    // Only this recipe chooses the columns that portable extraction may
+    // move. Whole-row and partition requirements retain the physical group;
+    // known column prerequisites can follow their actual AddColumn boundary.
+    // Partition keys have already clamped the physical suffix; their placeholder
+    // requirement does not pull an unrelated later ordinary demand into CREATE.
+    demand.columns = if ordinary_demand && !needs_complete_shape && !held {
+        ordinary_columns
     } else {
-        suffix
+        BTreeSet::new()
     };
-    let late_column = |column: &ColumnName| pending.iter().any(|c| c == column);
+    let pending: BTreeSet<ColumnName> = if placeholder {
+        let mut pending = demand.columns.clone();
+        pending.extend(table.columns.iter().filter_map(|(column, spec)| {
+            matches!(&spec.value_source, ValueSource::Generated(g)
+                if !demand.inline.keeps_generation(name,column) && (calls(&g.expression) || demand.generation.contains(column)))
+            .then_some(column.clone())
+        }));
+        let mut queue: VecDeque<_> = pending.iter().cloned().collect();
+        while let Some(input) = queue.pop_front() {
+            for generated in consumers.get(&input).into_iter().flatten() {
+                if pending.insert((*generated).clone()) {
+                    queue.push_back((*generated).clone());
+                }
+            }
+        }
+        pending
+    } else {
+        suffix.into_iter().collect()
+    };
+    let late_column = |column: &ColumnName| pending.contains(column);
     let late_text = |text: &str| {
         scratch
             || calls(text)
@@ -102,7 +229,7 @@ pub(crate) fn parts(
     if placeholder {
         for (column, spec) in &mut bare.columns {
             if let ValueSource::Generated(g) = &mut spec.value_source
-                && calls(&g.expression)
+                && late_column(column)
             {
                 let from = crate::emit::generation_placeholder(&spec.ty)?;
                 tail.push(Change::AlterColumnExpression {
@@ -130,11 +257,12 @@ pub(crate) fn parts(
     }
     // Prefix-only validators already have their inputs in CREATE. Splitting
     // them would add statements without exposing another needed name.
-    if bare
-        .primary_key
-        .as_ref()
-        .is_some_and(|key| key.columns.iter().any(&late_column))
-    {
+    if bare.primary_key.as_ref().is_some_and(|key| {
+        !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::PrimaryKey)
+            && key.columns.iter().any(&late_column)
+    }) {
         tail.push(Change::SetPrimaryKey {
             table: name.clone(),
             from: None,
@@ -143,7 +271,11 @@ pub(crate) fn parts(
         });
     }
     for (key, constraint) in std::mem::take(&mut bare.unique) {
-        if constraint.columns.iter().any(&late_column) {
+        if !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::Unique(key.clone()))
+            && constraint.columns.iter().any(&late_column)
+        {
             tail.push(Change::AddUnique {
                 table: name.clone(),
                 clustered: table.unique_is_clustered(key.raw()),
@@ -156,14 +288,25 @@ pub(crate) fn parts(
     }
     // The differ already separates foreign keys from every new table.
     for (key, constraint) in std::mem::take(&mut bare.foreign_keys) {
-        tail.push(Change::AddForeignKey {
-            table: name.clone(),
-            name: key,
-            constraint: Box::new(constraint),
-        });
+        if demand.inline.keeps_part(
+            name,
+            &pbps_model::operation::PartKey::ForeignKey(key.clone()),
+        ) {
+            bare.foreign_keys.insert(key, constraint);
+        } else {
+            tail.push(Change::AddForeignKey {
+                table: name.clone(),
+                name: key,
+                constraint: Box::new(constraint),
+            });
+        }
     }
     for (key, constraint) in std::mem::take(&mut bare.checks) {
-        if late_text(&constraint.expression) {
+        if !demand
+            .inline
+            .keeps_part(name, &pbps_model::operation::PartKey::Check(key.clone()))
+            && late_text(&constraint.expression)
+        {
             tail.push(Change::AddCheck {
                 table: name.clone(),
                 name: key,
@@ -178,7 +321,11 @@ pub(crate) fn parts(
             c.key.column().is_some_and(late_column) || c.key.expression().is_some_and(late_text)
         }) || index.include.iter().any(&late_column)
             || index.filter.as_deref().is_some_and(late_text);
-        if deferred {
+        if deferred
+            && !demand
+                .inline
+                .keeps_part(name, &pbps_model::operation::PartKey::Index(key.clone()))
+        {
             tail.push(Change::AddIndex {
                 table: name.clone(),
                 clustered: table.index_is_clustered(key.raw()),
@@ -207,6 +354,7 @@ pub(crate) fn parts(
     for (column, spec) in &mut bare.columns {
         if let ValueSource::Default(text) = &mut spec.value_source
             && (scratch || calls(text))
+            && !demand.inline.keeps_default(name, column)
         {
             let to = std::mem::take(text);
             spec.value_source = ValueSource::None;
@@ -228,16 +376,17 @@ pub(crate) fn parts(
     }
     // A partition's own default is set after its parent's, which reaches
     // every partition (DEC-1578.1), so it is a part of its own too.
-    if scratch {
-        for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns) {
-            if let Some(default) = own.default.take() {
-                tail.push(Change::AlterColumnDefault {
-                    uid: uid.clone(),
-                    column: name.column(column),
-                    from: None,
-                    to: Some(default),
-                });
-            }
+    for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns) {
+        if (scratch || demand.wants_default(column) || own.default.as_deref().is_some_and(calls))
+            && !demand.inline.keeps_default(name, column)
+            && let Some(default) = own.default.take()
+        {
+            tail.push(Change::AlterColumnDefault {
+                uid: uid.clone(),
+                column: name.column(column),
+                from: None,
+                to: Some(default),
+            });
         }
     }
 
@@ -272,5 +421,6 @@ pub(crate) fn parts(
         moves_at_most: *moves_at_most,
     }];
     parts.extend(tail);
+    demand.inline.check(&parts, "postgres")?;
     Ok(Some(parts))
 }

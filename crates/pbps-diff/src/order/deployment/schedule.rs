@@ -207,6 +207,137 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Compares and schedules declarations with typed dependency annotations.
+/// Unlike `diff` followed by `schedule`, this can discharge an added computed
+/// column's class-order refusal: no intermediate deferred plan escapes.
+/// Catalog collation checks still judge new calls on the connected path.
+// Only the creation/function transitions below grant this capability.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn diff_annotated<D: Dialect>(
+    base: crate::Side<'_>,
+    declared: &Declarations<'_>,
+    hints: &pbps_model::Hints,
+    before: &pbps_model::object_ref::ObjectDeps,
+    goal: &pbps_model::object_ref::ObjectDeps,
+    facts: &Facts<'_>,
+    dialect: &D,
+) -> Result<Scheduled<crate::order::Differ, D>, String> {
+    let after = crate::Side {
+        schema: declared.schema,
+        ids: declared.sources.after,
+    };
+    let mut diff = crate::diff_partial(base, after, dialect, hints);
+    let mut deferred = Vec::new();
+    diff.errors.retain(|error| {
+        if let crate::DiffError::ComputedFunctionChanged { .. } = error {
+            deferred.push(error.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !diff.errors.is_empty() {
+        return Err(diff
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let input = crate::schema_diff::finish_diff(base, after, dialect, diff.changes)
+        .with_annotations(
+            pbps_model::operation::Snapshot {
+                schema: base.schema,
+                ids: base.ids,
+            },
+            pbps_model::operation::Snapshot {
+                schema: after.schema,
+                ids: after.ids,
+            },
+            before,
+            goal,
+            if dialect.rebuilds_modules() {
+                pbps_model::operation::ModuleEdits::Rebuilt
+            } else {
+                pbps_model::operation::ModuleEdits::InPlace
+            },
+        )?;
+    let result = schedule(input, declared, facts, dialect).map_err(|e| e.to_string())?;
+    let edges: BTreeSet<_> = result
+        .changes
+        .annotation_edges()?
+        .iter()
+        .map(|e| (e.before, e.after))
+        .collect();
+    let changes = &result.changes.changes().changes;
+    let mut owners = BTreeMap::new();
+    let mut transitions: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for (at, p) in changes.iter().enumerate() {
+        match &p.change {
+            Change::AddComputedColumn {
+                table,
+                name,
+                computed,
+            } => {
+                owners.insert(table.column(name), (at, &computed.expression));
+            }
+            Change::CreateTable { name, table, .. } => {
+                for (column, computed) in &table.computed {
+                    owners.insert(name.column(column), (at, &computed.expression));
+                }
+            }
+            _ => {}
+        }
+        let (id, kind, installed) = match &p.change {
+            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                (id, module.kind, true)
+            }
+            Change::DropModule { id, kind } => (id, *kind, false),
+            _ => continue,
+        };
+        if kind == pbps_model::ModuleKind::Function {
+            let name = id.object_name();
+            transitions
+                .entry(name.name.clone())
+                .or_default()
+                .push((at, name, installed));
+        }
+    }
+    let mut checked_pairs = BTreeSet::new();
+    for error in deferred {
+        let crate::DiffError::ComputedFunctionChanged {
+            ref computed,
+            ref function,
+            ..
+        } = error
+        else {
+            unreachable!()
+        };
+        // Multiple schema spellings can produce the same lexical refusal.
+        if !checked_pairs.insert((computed.clone(), function.clone())) {
+            continue;
+        }
+        let Some(&(owner, expression)) = owners.get(computed) else {
+            return Err(error.to_string());
+        };
+        // Every matching transition must finish before installation. A later
+        // alter/drop or an unannotated alias cannot borrow another edge's proof.
+        let mut checked = false;
+        for (at, name, installed) in transitions.get(function).into_iter().flatten() {
+            if dialect.may_name_qualified(expression, &name.schema, &name.name) {
+                if !installed || *at >= owner || !edges.contains(&(*at, owner)) {
+                    return Err(error.to_string());
+                }
+                checked = true;
+            }
+        }
+        if !checked {
+            return Err(error.to_string());
+        }
+    }
+    Ok(result)
+}
+
 /// Finishes the order of `changes`: every pass that reorders a plan after the
 /// differ, in the order `plan --db` runs them. A pass that needs a fact `facts`
 /// does not hold is skipped and named in [`Scheduled::skipped`]; it is never
@@ -243,6 +374,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
         .map_err(Refusal)?;
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
+    crate::order::generated::inline_contexts(&mut cs, dialect);
     // Explicit operation proposals use this route too; they carry the same
     // boundary obligations as a proposal produced by the guarded differ.
     if dialect.partition_meetings() {
@@ -382,25 +514,47 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         // (#1553).
         after_the_rows_that_leave(&mut cs, declared.schema).map_err(Refusal::module_passes)?;
         settle_public_execution(&mut cs, decisions);
-    } else if let Some(found) = facts.module_dependents {
-        // Explicit SQL Server routine drops have the same DEFAULT obligations.
-        added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
+    } else {
+        // Expose annotation demands before any catalog-holder settlement;
+        // an indivisible prefix can otherwise manufacture an annotation cycle.
+        if cs.annotations.as_ref().is_some_and(|a| a.extended) {
+            // Use the existing creation expansion/settlement seam on SQL Server
+            // too. Empty demand retains its historical ordinary route exactly.
+            split += crate::order::generated::expand(
+                &mut cs,
+                declared.sources.after,
+                declared.module_deps,
+                dialect,
+            )
             .map_err(Refusal::module_passes)?;
-        // Normalization invalidates positional proof. Restore the weave's
-        // edges together with the requirements of its restored holders:
-        // moving a DEFAULT without its consumers can silently write NULL.
-        let mut handovers = crate::order::Schedule::new(cs.changes.len());
-        crate::order::row_security::module_constraints(
-            &mut handovers,
-            super::module_order(&cs, found, declared.schema, declared.sources, dialect)
-                .map_err(Refusal::module_passes)?,
-        )
-        .map_err(Refusal)?;
-        keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
-        cs = handovers
-            .settle(cs.clone())
-            .map_err(|why| Refusal(why.describe(&cs)))?
-            .changes;
+            crate::order::generated::settle(
+                &mut cs,
+                declared.schema,
+                declared.module_deps,
+                dialect,
+            )
+            .map_err(Refusal::module_passes)?;
+        }
+        if let Some(found) = facts.module_dependents {
+            // Explicit SQL Server routine drops have the same DEFAULT obligations.
+            added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
+                .map_err(Refusal::module_passes)?;
+            // Normalization invalidates positional proof. Restore the weave's
+            // edges together with the requirements of its restored holders:
+            // moving a DEFAULT without its consumers can silently write NULL.
+            let mut handovers = crate::order::Schedule::new(cs.changes.len());
+            crate::order::row_security::module_constraints(
+                &mut handovers,
+                super::module_order(&cs, found, declared.schema, declared.sources, dialect)
+                    .map_err(Refusal::module_passes)?,
+            )
+            .map_err(Refusal)?;
+            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+            cs = handovers
+                .settle(cs.clone())
+                .map_err(|why| Refusal(why.describe(&cs)))?
+                .changes;
+        }
     }
     // The differ sorted the role drops before it could know who holds whom;
     // once the members are in, a role holding another dropped role goes

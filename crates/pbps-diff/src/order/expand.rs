@@ -164,6 +164,11 @@ pub fn expand<E: Expansion>(
         origins: (0..plan.changes.len()).map(Origin::Whole).collect(),
         changes: plan.payload.changes,
         proof: input.proof.clone(),
+        creation_contexts: input
+            .annotations
+            .as_ref()
+            .map(|a| a.inline.clone())
+            .unwrap_or_default(),
     };
     // The operations the plan asks for: its own, and one per obligation it
     // states before any rewrite. Weave asks for a teardown or a restoration
@@ -304,6 +309,7 @@ fn list<T: fmt::Display>(items: &[T]) -> String {
 }
 
 struct State {
+    creation_contexts: std::collections::BTreeMap<pbps_model::Uid, String>,
     changes: Vec<PlannedChange>,
     /// Beside each step, what it is to the plan's logical changes.
     origins: Vec<Origin>,
@@ -469,6 +475,7 @@ impl State {
         let changes = ChangeSet {
             changes: std::mem::take(&mut self.changes),
         };
+        schedule.inline_contexts(&changes, &self.creation_contexts);
         let settled = schedule
             .settle_raw(changes.clone())
             .map_err(|r| r.describe(&changes))?;
