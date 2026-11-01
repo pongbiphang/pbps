@@ -1,7 +1,7 @@
 //! The declarations compile on scratch, as the reproduced deployer (#2374).
 //!
-//! Every case runs once on a supplied `server` scratch and once on a
-//! `docker` one. A run that succeeds still ends in an error, the planning
+//! Every case runs on the warm separate-instance scratch fixture. A successful
+//! run still ends in an error, the planning
 //! boundary (#2143), so reaching exactly that error is the proof that the
 //! compile and both captures passed; each negative names what refused.
 
@@ -14,46 +14,21 @@ const PASSWORD: &str = "Pbps!Test12345";
 
 type Case = for<'a> fn(&'a str, &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-/// A target database to seed for each scratch it is run against: the second
-/// instance, and a container the run starts itself. Whatever a case does, the
-/// database and every login it made are removed.
+/// A fresh target for the warm separate-instance scratch. The runner keeps
+/// cases serial; the outer audit catches release leaks before recovering them.
 pub(super) async fn both(case: Case) {
     let primary = server("PBPS_TEST_DB");
     let supplied = server("PBPS_TEST_MSSQL_SCRATCH_DB");
-    let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
-    for docker in [false, true] {
+    let servers = [primary.clone(), supplied.clone()];
+    warm2585::run(&[&servers[0], &servers[1]], async move {
         let (name, target) = create_database(&primary).await;
-        let identity = sql::cluster_identity(&mut connection(&target).await)
-            .await
-            .unwrap();
-        let outcome = tokio::spawn({
-            let (target, supplied, image) = (target.clone(), supplied.clone(), image.clone());
-            async move {
-                if docker {
-                    let seeded = target.clone();
-                    super::super::container::with_container(
-                        Driver::Mssql,
-                        &target,
-                        &identity,
-                        &image,
-                        pbps_config::resolver::PullPolicy::Never,
-                        async move |url: &str| {
-                            case(&seeded, url).await;
-                            Ok(())
-                        },
-                    )
-                    .await
-                    .unwrap();
-                } else {
-                    case(&target, &supplied).await;
-                }
-            }
-        })
-        .await;
+        let outcome = tokio::spawn(async move { case(&target, &supplied).await }).await;
         drop_database(&primary, &name).await;
-        drop_logins(&primary).await;
+        drop_logins(&primary, &name).await;
         outcome.unwrap();
-    }
+    })
+    .await
+    .unwrap();
 }
 
 async fn run(target: &str, deployer: Option<&str>, scratch: &str, declared: &Declared) -> String {
@@ -144,7 +119,17 @@ async fn exec(url: &str, statements: &[&str]) {
 /// A login and its user in the target database, with the rights the
 /// declarations need and no more than each case names. The resolver reads
 /// the target as this principal, so it may read the dependency catalog.
-async fn deployer(server_url: &str, target: &str, login: &str, user_setup: &str) {
+pub(super) async fn deployer(
+    server_url: &str,
+    target: &str,
+    purpose: &str,
+    user_setup: &str,
+) -> String {
+    let database = sql::database(&mut connection(target).await)
+        .await
+        .unwrap()
+        .name;
+    let login = format!("dep2374_{database}_{purpose}");
     exec(
         server_url,
         &[&format!(
@@ -161,16 +146,21 @@ async fn deployer(server_url: &str, target: &str, login: &str, user_setup: &str)
         ],
     )
     .await;
+    login
 }
 
-async fn drop_logins(server_url: &str) {
+async fn drop_logins(server_url: &str, database: &str) {
+    let prefix = format!("dep2374_{database}_");
     let mut admin = connection(server_url).await;
     let leftover = admin
-        .query("SELECT name FROM sys.server_principals WHERE name LIKE N'dep2374[_]%';")
+        .query("SELECT name FROM sys.server_principals;")
         .await
         .unwrap();
     for row in &leftover {
         let login = row.try_get::<&str>("name").unwrap().unwrap().to_owned();
+        if !login.starts_with(&prefix) {
+            continue;
+        }
         admin
             .execute(&format!("DROP LOGIN [{login}];"))
             .await
@@ -279,7 +269,7 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
 /// in the default schema only: each lands where it does on the target, and the
 /// two land apart, so a scratch that fixed one schema for both would fail.
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_scratch_reproduces_the_deployers_default_schema() {
     fn case<'a>(
         target: &'a str,
@@ -287,14 +277,13 @@ async fn mssql_scratch_reproduces_the_deployers_default_schema() {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             let primary = server("PBPS_TEST_DB");
-            let (home, other) = ("dep2374_app", "dep2374_other");
-            deployer(&primary, target, home, "WITH DEFAULT_SCHEMA = [app]").await;
+            let home = deployer(&primary, target, "app", "WITH DEFAULT_SCHEMA = [app]").await;
             exec(
                 target,
                 &[&format!("CREATE SCHEMA app AUTHORIZATION [{home}]")],
             )
             .await;
-            deployer(&primary, target, other, "WITH DEFAULT_SCHEMA = [other]").await;
+            let other = deployer(&primary, target, "other", "WITH DEFAULT_SCHEMA = [other]").await;
             exec(
                 target,
                 &[
@@ -308,7 +297,7 @@ async fn mssql_scratch_reproduces_the_deployers_default_schema() {
             )
             .await;
             let mut landed = Vec::new();
-            for login in [home, other] {
+            for login in [home.as_str(), other.as_str()] {
                 let url = format!("{target};User Id={login};Password={PASSWORD}");
                 let mut on_target = connection(&url).await;
                 let there = schema_of_probe(&mut on_target).await;
@@ -327,7 +316,7 @@ async fn mssql_scratch_reproduces_the_deployers_default_schema() {
 /// A managed view over an external table compiles, whether the file or the
 /// renderer stages the table; neither is a refusal naming both objects.
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_managed_view_over_an_external_table_compiles_and_a_missing_one_refuses() {
     fn case<'a>(
         target: &'a str,
@@ -391,7 +380,7 @@ async fn mssql_managed_view_over_an_external_table_compiles_and_a_missing_one_re
 /// target, with the engine's own error: 262 for a view it may not create and
 /// 2760 for a table in a schema it may not alter.
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_a_statement_the_deployer_may_not_run_refuses_on_scratch_as_on_the_target() {
     fn case<'a>(
         target: &'a str,
@@ -399,9 +388,8 @@ async fn mssql_a_statement_the_deployer_may_not_run_refuses_on_scratch_as_on_the
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             let primary = server("PBPS_TEST_DB");
-            let login = "dep2374_limited";
             exec(target, &["CREATE SCHEMA locked", "CREATE SCHEMA mine"]).await;
-            deployer(&primary, target, login, "WITH DEFAULT_SCHEMA = [mine]").await;
+            let login = deployer(&primary, target, "limited", "WITH DEFAULT_SCHEMA = [mine]").await;
             exec(
                 target,
                 &[
@@ -426,7 +414,7 @@ async fn mssql_a_statement_the_deployer_may_not_run_refuses_on_scratch_as_on_the
             assert_eq!(in_locked.server_error_code().as_deref(), Some("2760"));
             let view_refused = run(
                 target,
-                Some(login),
+                Some(&login),
                 scratch,
                 &declared(&[module(ModuleKind::View, "mine.v", "SELECT 1 AS a")]),
             )
@@ -437,7 +425,7 @@ async fn mssql_a_statement_the_deployer_may_not_run_refuses_on_scratch_as_on_the
             );
             let mut locked = Declared::default();
             locked.desired.tables.extend([table("locked.t")]);
-            let table_refused = run(target, Some(login), scratch, &locked).await;
+            let table_refused = run(target, Some(&login), scratch, &locked).await;
             assert!(
                 table_refused.contains("table locked.t") && table_refused.contains("(code: 2760"),
                 "{table_refused}"
@@ -452,7 +440,7 @@ async fn mssql_a_statement_the_deployer_may_not_run_refuses_on_scratch_as_on_the
 /// both. The same declarations as the deployer who may run them reach the
 /// boundary, so the refusals above are the deployer's and nothing else's.
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_declarations_the_deployer_may_run_compile_in_dependency_order() {
     fn case<'a>(
         target: &'a str,
@@ -482,7 +470,7 @@ async fn mssql_declarations_the_deployer_may_run_compile_in_dependency_order() {
 /// never reads. Its candidates must still be in the scope both captures are
 /// sealed under, or the plan that drops it is refused by the capture.
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_a_module_the_plan_drops_does_not_refuse_the_capture() {
     fn case<'a>(
         target: &'a str,
@@ -509,4 +497,45 @@ async fn mssql_a_module_the_plan_drops_does_not_refuse_the_capture() {
         })
     }
     both(case).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_warm_case_removes_only_its_own_deployer_logins() {
+    let primary = server("PBPS_TEST_DB");
+    warm2585::run(&[&primary], async {}).await.unwrap();
+    let baseline = format!("dep2374_another_case_{:032x}", rand::random::<u128>());
+    exec(
+        &primary,
+        &[&format!(
+            "CREATE LOGIN [{baseline}] WITH PASSWORD=N'{PASSWORD}',CHECK_POLICY=OFF;"
+        )],
+    )
+    .await;
+    let (database, target) = create_database(&primary).await;
+    let owned = deployer(&primary, &target, "owned", "").await;
+    drop_database(&primary, &database).await;
+    drop_logins(&primary, &database).await;
+    let rows = connection(&primary)
+        .await
+        .query("SELECT name FROM sys.server_principals;")
+        .await
+        .unwrap();
+    let names = rows
+        .iter()
+        .map(|row| row.try_get::<&str>("name").unwrap().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for login in [&baseline, &owned] {
+        if names.contains(login) {
+            exec(&primary, &[&format!("DROP LOGIN [{login}];")]).await;
+        }
+    }
+    assert!(
+        names.contains(&baseline),
+        "another case's deployer was swept"
+    );
+    assert!(
+        !names.contains(&owned),
+        "the owned deployer was not released"
+    );
 }

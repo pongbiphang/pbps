@@ -1,4 +1,4 @@
-//! The #2375 contract, on server and Docker scratch, including refusals.
+//! The #2375 contract, on warm server scratch, including refusals.
 
 use super::*;
 use pbps_db::resolver::capture::{CaptureError, Verdict};

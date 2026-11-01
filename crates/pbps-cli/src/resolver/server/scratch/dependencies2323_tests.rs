@@ -25,6 +25,24 @@ where
 {
     let target_server = server("PBPS_TEST_DB");
     let scratch_server = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let servers = [target_server.clone(), scratch_server.clone()];
+    warm2585::run(&[&servers[0], &servers[1]], async move {
+        fixture_inner(kind, unreadable, check, target_server, scratch_server).await;
+    })
+    .await
+    .unwrap();
+}
+
+async fn fixture_inner<F, Fut>(
+    kind: DependencyKind,
+    unreadable: bool,
+    check: F,
+    target_server: String,
+    scratch_server: String,
+) where
+    F: FnOnce(Case) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let (target_name, target_admin) = create_database(&target_server).await;
     let (other_name, other) = create_database(&target_server).await;
     absent(&scratch_server, &other_name).await;

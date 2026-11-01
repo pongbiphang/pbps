@@ -2772,7 +2772,16 @@
         "resolver::server::scratch::mssql_live_tests::dependencies2323::same_instance_binds_the_real_shape_and_leaves_the_other_database_untouched",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::readable_mismatches_and_undeclared_references_refuse_by_name",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::a_companion_collision_never_replaces_or_drops_the_existing_database",
-        "resolver::server::scratch::mssql_live_tests::dependencies2323::supplied_scratch_on_another_instance_refuses_the_named_dependency"
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::supplied_scratch_on_another_instance_refuses_the_named_dependency",
+      "resolver::server::scratch::mssql_live_tests::mssql_docker_acquisition_keeps_the_run_owned_contract",
+      "resolver::server::scratch::mssql_live_tests::reconstruct2374::a_warm_case_removes_only_its_own_deployer_logins",
+      "resolver::server::scratch::mssql_live_tests::warm2585::a_dirty_warm_instance_refuses_before_its_case_can_run",
+        "resolver::server::scratch::mssql_live_tests::warm2585::a_warm_case_reports_changed_builtin_state_against_its_own_snapshot",
+      "resolver::server::scratch::mssql_live_tests::warm2585::a_warm_case_recovers_its_owned_resources_after_a_callback_panic",
+      "resolver::server::scratch::mssql_live_tests::warm2585::a_warm_case_reports_and_recovers_database_and_login_leaks_without_touching_a_baseline",
+      "resolver::server::scratch::mssql_live_tests::warm2585::limited_catalog_visibility_never_counts_as_an_empty_warm_inventory",
+      "resolver::server::scratch::mssql_live_tests::warm2585::the_warm_model_is_restored_before_a_callback_panic_is_reported",
+      "resolver::server::scratch::mssql_live_tests::warm2585::the_warm_system_context_is_restored_before_a_callback_panic_is_reported"
       ]
     },
     {

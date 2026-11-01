@@ -99,16 +99,7 @@ async fn session(db: &TestDb) -> Conn {
 /// ends asynchronously, and `DROP LOGIN` refuses a login still logged in
 /// (15434), so the wait is for the engine, not for the client.
 async fn drop_login(admin: &mut Conn, login: &str) {
-    let open = format!(
-        "SELECT CONVERT(bigint, COUNT(*)) FROM sys.dm_exec_sessions WHERE login_name = N'{login}';"
-    );
-    for _ in 0..100 {
-        if number(admin, &open).await == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    run(admin, &[&*format!("DROP LOGIN [{login}];")]).await;
+    super::drop_login_when_idle(admin, login).await.unwrap();
 }
 
 /// What each object reference of `referencing` names when the catalog is

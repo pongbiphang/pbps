@@ -370,6 +370,15 @@ async fn supplied_contract(target: &str, server: &str) {
     let rechecked = sql::inventory::read(&mut dirty, None).await.unwrap();
     drop(dirty);
     let mut system_refusals = Vec::new();
+    let guest_before = warm2585::guest_context(server).await;
+    assert!(
+        !guest_before
+            .iter()
+            .any(|entry| entry.starts_with("permission:0:0:0:CONTROL:")
+                || entry == "role:SQLAgentOperatorRole"
+                || entry == "schema:pbps2236_guest_owned"),
+        "the warm msdb guest context is already occupied: {guest_before:?}"
+    );
     for (change, restore) in [
         (
             "USE msdb; GRANT CONTROL TO guest;",
@@ -384,11 +393,13 @@ async fn supplied_contract(target: &str, server: &str) {
             "USE msdb; DROP SCHEMA pbps2236_guest_owned;",
         ),
     ] {
-        admin.execute(change).await.unwrap();
-        let refusal = refusal(target, &supplied).await.to_string();
-        let restored = admin.execute(restore).await;
-        restored.unwrap();
-        system_refusals.push(refusal);
+        let (target, supplied) = (target.to_owned(), supplied.clone());
+        let result = warm2585::restoring(server, change, restore, async move {
+            refusal(&target, &supplied).await.to_string()
+        })
+        .await;
+        assert_eq!(warm2585::guest_context(server).await, guest_before);
+        system_refusals.push(result.unwrap());
     }
     drop_database(server, &name).await;
     admin
@@ -442,19 +453,15 @@ async fn supplied_contract(target: &str, server: &str) {
 async fn inherited_model_refusal(target: &str, server: &str) {
     let name = format!("pbps2236_inherited_{:032x}", rand::random::<u128>());
     let mut admin = connection(server).await;
-    admin
-        .execute(&format!(
-            "EXEC(N'USE model; CREATE TABLE dbo.{name}(i int);');"
-        ))
-        .await
-        .unwrap();
     let target = target.to_owned();
     let source = server.to_owned();
-    let result = tokio::spawn(async move { refusal(&target, &source).await }).await;
-    let restored = admin
-        .execute(&format!("EXEC(N'USE model; DROP TABLE dbo.{name};');"))
-        .await;
-    restored.unwrap();
+    let result = warm2585::restoring(
+        server,
+        &format!("EXEC(N'USE model; CREATE TABLE dbo.{name}(i int);');"),
+        &format!("EXEC(N'USE model; DROP TABLE dbo.{name};');"),
+        async move { refusal(&target, &source).await },
+    )
+    .await;
     let row = admin
         .query(&format!(
             "SELECT OBJECT_ID(N'model.dbo.{name}') AS remaining;"
@@ -473,14 +480,45 @@ async fn mssql_supplied_owner_needs_no_creation_and_changed_visibility_or_system
     supplied_contract(&primary, &primary).await;
 }
 
+// Keep the historical identity in receipts; its full SQL contract is now warm.
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let same = refusal(scratch, scratch).await;
+            assert!(
+                matches!(same, ProduceError::Run(Error::Unusable(ref reason))
+                if reason.contains("target database")),
+                "{same}"
+            );
+            let owned = refusal(target, scratch).await;
+            assert!(
+                matches!(owned, ProduceError::Run(Error::Binding(ref reason))
+                if reason.contains("#2143")),
+                "{owned}"
+            );
+            supplied_contract(target, scratch).await;
+            inherited_model_refusal(target, scratch).await;
+        })
+    }
+    reconstruct2374::both(case).await;
+}
+
+/// Docker acquisition still gets a real witness; SQL semantics need no repeat.
 #[tokio::test]
 #[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
-async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
+async fn mssql_docker_acquisition_keeps_the_run_owned_contract() {
     let target = server("PBPS_TEST_DB");
     let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
     let identity = sql::cluster_identity(&mut connection(&target).await)
         .await
         .unwrap();
+    let hostname = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let recorded = hostname.clone();
     let target_for_run = target.clone();
     super::container::with_container(
         Driver::Mssql,
@@ -489,23 +527,59 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
         &image,
         pbps_config::resolver::PullPolicy::Never,
         async move |url: &str| {
-            let same=refusal(url,url).await;
-            assert!(matches!(
-            same,
-            ProduceError::Run(Error::Unusable(ref reason)) if reason.contains("target database")
-        ),"{same}");
-            let owned=refusal(&target_for_run,url).await;
-            assert!(matches!(
-            owned,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
-        ),"{owned}");
-            supplied_contract(&target_for_run, url).await;
-            inherited_model_refusal(&target_for_run,url).await;
+            let rows = connection(url)
+                .await
+                .query("SELECT CONVERT(nvarchar(128),SERVERPROPERTY('ServerName')) AS name;")
+                .await
+                .unwrap();
+            *recorded.lock().await = rows[0].try_get::<&str>("name").unwrap().unwrap().to_owned();
+            let scratch = url.to_owned();
+            warm2585::run(&[url], async move {
+                let same = refusal(&scratch, &scratch).await;
+                assert!(
+                    matches!(same, ProduceError::Run(Error::Unusable(ref reason))
+                    if reason.contains("target database")),
+                    "{same}"
+                );
+                let owned = refusal(&target_for_run, &scratch).await;
+                assert!(
+                    matches!(owned, ProduceError::Run(Error::Binding(ref reason))
+                    if reason.contains("#2143")),
+                    "{owned}"
+                );
+                supplied_contract(&target_for_run, &scratch).await;
+                inherited_model_refusal(&target_for_run, &scratch).await;
+            })
+            .await
+            .unwrap();
             Ok(())
         },
     )
     .await
     .unwrap();
+    // A failed inspect is not proof of absence: enumerate successfully, then
+    // reject the exact server identity observed inside this container.
+    let hostname = hostname.lock().await.clone();
+    assert!(
+        hostname.len() >= 12 && hostname.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{hostname}"
+    );
+    let listed = tokio::process::Command::new("docker")
+        .args(["ps", "-a", "--no-trunc", "--format", "{{.ID}}"])
+        .output()
+        .await
+        .unwrap();
+    assert!(listed.status.success(), "{:?}", listed.status);
+    for id in String::from_utf8(listed.stdout).unwrap().lines() {
+        assert!(
+            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{id}"
+        );
+        assert!(
+            !id.starts_with(hostname.as_str()),
+            "owned container survived release: {id}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1363,3 +1437,6 @@ mod chained2376;
 
 #[path = "chained2541_tests.rs"]
 mod chained2541;
+
+#[path = "warm2585_tests.rs"]
+mod warm2585;

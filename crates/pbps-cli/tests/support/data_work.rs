@@ -612,9 +612,8 @@ fn denied_column(server: &str, connection: &str, d: &Demo, pg: bool, checksum: &
                     super::try_on_server(self.connection, &format!("DROP OWNED BY {}", self.name));
                 let _ = super::try_on_server(self.server, &format!("DROP ROLE {}", self.name));
             } else {
-                let _ =
-                    super::try_on_server(self.connection, &format!("DROP USER [{}]", self.name));
-                let _ = super::try_on_server(self.server, &format!("DROP LOGIN [{}]", self.name));
+                super::on_server(self.connection, &format!("DROP USER [{}]", self.name));
+                drop_test_login(self.server, &self.name);
             }
         }
     }
@@ -896,4 +895,21 @@ pub fn cli_boundaries(pg: bool) {
     assert_eq!(report["command"], "state record-data-work");
     assert_eq!(report["result"], "unanswerable");
     assert_eq!(report["findings"][0]["id"], "project.undiscoverable");
+}
+
+/// A warm fixture must not leave server principals for a later case. The child
+/// has exited; wait only for SQL Server to finish closing its session (15434).
+pub(super) fn drop_test_login(connection: &str, login: &str) {
+    let quoted = login.replace(']', "]]");
+    let literal = login.replace('\'', "''");
+    super::on_server(
+        connection,
+        &format!(
+            "USE master; DECLARE @deadline datetime2 = DATEADD(second,30,SYSUTCDATETIME()); \
+         WHILE 1=1 BEGIN BEGIN TRY DROP LOGIN [{quoted}]; BREAK; END TRY \
+         BEGIN CATCH IF ERROR_NUMBER()<>15434 OR SYSUTCDATETIME()>=@deadline THROW; \
+         WAITFOR DELAY '00:00:00.100'; END CATCH END; \
+         IF SUSER_ID(N'{literal}') IS NOT NULL THROW 51000,'owned login was not removed',1;"
+        ),
+    );
 }

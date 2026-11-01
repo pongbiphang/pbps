@@ -129,15 +129,6 @@ fn environment_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
     key
 }
 
-async fn drop_login(db: &mut TestDb, login: &str) {
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
-}
-
 /// Case 2: each surface gets the engine's answer. Id-bound references —
 /// two-part names, schema-bound ones, the function a computed column,
 /// DEFAULT or CHECK calls, and every type — are bindings. A one-part name in
@@ -396,7 +387,7 @@ async fn mssql_unreadable_dependency_metadata_never_verifies() {
     drop(both);
 
     for login in [first, second, third] {
-        drop_login(&mut db, &login).await;
+        super::drop_login(&login).await;
     }
     db.drop().await;
 }

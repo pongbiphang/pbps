@@ -1,4 +1,4 @@
-//! Native chained staging, on supplied and Docker scratch (#2376).
+//! Native chained staging, on warm server scratch (#2376).
 use super::*;
 use pbps_model::{Column, ForeignKey, PrimaryKey, ReferentialAction, Table, TableName};
 use pbps_mssql::resolver::capture;
@@ -191,7 +191,7 @@ pub(super) async fn observe(
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_native_chain_is_compared_and_merged_for_renderer_and_deferred_file() {
     fn case<'a>(
         target: &'a str,
@@ -317,7 +317,7 @@ async fn mssql_native_chain_is_compared_and_merged_for_renderer_and_deferred_fil
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_chain_missing_managed_shape_template_or_matching_shape_refuses_by_name() {
     fn case<'a>(
         target: &'a str,
@@ -403,7 +403,7 @@ async fn mssql_chain_missing_managed_shape_template_or_matching_shape_refuses_by
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_deferred_duplicate_marker_and_failed_statement_refuse_and_cleanup() {
     fn case<'a>(
         target: &'a str,
@@ -444,7 +444,7 @@ async fn mssql_deferred_duplicate_marker_and_failed_statement_refuse_and_cleanup
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_dependency_placement_records_real_catalog_and_declared_rehearsals() {
     use pbps_model::dependency::DependencyKind;
     use pbps_model::resolver::{DependencyPlacement, DependencyShape};
@@ -488,34 +488,13 @@ async fn mssql_dependency_placement_records_real_catalog_and_declared_rehearsals
             .await
             .unwrap();
             assert_eq!(placements[&name], expected);
-            let identity = sql::cluster_identity(&mut connection(&case.target).await)
-                .await
-                .unwrap();
-            let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
-            super::super::container::with_container(
-                Driver::Mssql,
-                &case.target,
-                &identity,
-                &image,
-                pbps_config::resolver::PullPolicy::Never,
-                async |url: &str| {
-                    let (_, placements) =
-                        observe(&case.target, url, &declared, None, &dependencies)
-                            .await
-                            .unwrap();
-                    assert_eq!(placements[&name], expected);
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
         })
         .await;
     }
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_unnamed_chained_roots_keep_the_producers_key_in_both_file_modes() {
     fn case<'a>(
         target: &'a str,
@@ -554,7 +533,7 @@ async fn mssql_unnamed_chained_roots_keep_the_producers_key_in_both_file_modes()
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
     fn case<'a>(
         target: &'a str,

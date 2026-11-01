@@ -266,7 +266,17 @@ async fn scrub_inner(scratch: &str, databases: &[String], logins: &[String]) {
         let _ = record::drop_database(&mut admin, database, true).await;
     }
     for login in logins {
-        let _ = record::drop_login(&mut admin, login).await;
+        record::drop_login(&mut admin, login).await.unwrap();
+        assert!(
+            admin
+                .query(&format!(
+                    "SELECT 1 AS present FROM sys.server_principals WHERE name=N'{login}';"
+                ))
+                .await
+                .unwrap()
+                .is_empty(),
+            "leaked login {login}"
+        );
     }
 }
 

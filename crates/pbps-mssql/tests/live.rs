@@ -1282,9 +1282,22 @@ async fn drop_login_when_idle(conn: &mut Conn, login: &str) -> Result<(), pbps_d
             {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            other => return other,
+            other => {
+                other?;
+                break;
+            }
         }
     }
+    let rows = conn
+        .query(&format!("SELECT SUSER_ID(N'{login}') AS login_id;"))
+        .await?;
+    assert_eq!(rows.len(), 1, "verify removal of {login}");
+    assert_eq!(
+        rows[0].try_get::<i32>("login_id").unwrap(),
+        None,
+        "leaked login {login}"
+    );
+    Ok(())
 }
 
 /// Emits and executes every change of a plan, in plan order.
@@ -2766,12 +2779,7 @@ async fn a_temporal_column_is_added_with_alter_on_both_schemas_and_no_control() 
     let u_cur = columns[0].try_get::<i32>("u_cur").unwrap().unwrap();
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 
     assert!(!control, "the premise: the login holds no CONTROL on app.t");
     outcome[0]
@@ -7614,12 +7622,7 @@ async fn a_schema_scoped_account_reads_what_depends_on_what() {
 
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// A module's reference into another database is not an edge to the local
@@ -7779,6 +7782,7 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         ))
         .await
         .expect("deny");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let (gaps, _) = schema_scoped_report(&mut lp).await;
     assert_eq!(
@@ -7811,6 +7815,7 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
 
     // The referencing-entities function, read only by an apply that renames:
     // advice, and that rename's impact read refuses by name (#1717).
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let (_, advice) = schema_scoped_report(&mut lp).await;
     assert!(!advice.iter().any(|a| a == referencing), "{advice:?}");
@@ -7823,6 +7828,7 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         ))
         .await
         .expect("deny");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let (gaps, advice) = schema_scoped_report(&mut lp).await;
     assert_eq!(gaps, Vec::<String>::new());
@@ -7850,6 +7856,7 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         ))
         .await
         .expect("deny");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let refused = pbps_mssql::catalog::introspect(&mut lp)
         .await
@@ -7866,17 +7873,19 @@ async fn a_denied_dependency_function_is_a_readiness_gap() {
         .expect("revoke the deny");
 
     // Negative: with the denies gone, ready again.
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert_eq!(schema_scoped_report(&mut lp).await.0, Vec::<String>::new());
     drop(lp);
     db.drop().await;
     let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
+    admin
         .execute(&format!(
-            "USE master; IF USER_ID('{login}') IS NOT NULL DROP USER [{login}]; \
-             IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+            "USE master; IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}];"
         ))
-        .await;
+        .await
+        .expect("drop owned master user");
+    drop_login(&login).await;
 }
 
 /// `doctor`'s gaps and advice for a login managing `dbo` only, each as
@@ -8020,6 +8029,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("grant the advised");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8046,6 +8056,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8079,6 +8090,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke alter");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     // As a project that manages `app`, so the gap can only be the ledger's own
     // creation requirement and not the ordinary managed-schema `ALTER`.
@@ -8121,6 +8133,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("grant on the ledger objects");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8154,6 +8167,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         .execute(&format!("USE [{0}]; DROP TABLE dbo.__pbps_state;", db.name))
         .await
         .expect("drop the state table");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8217,6 +8231,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
         ))
         .await
         .expect("revoke alter again");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8301,12 +8316,7 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
     drop(lp);
     let name = db.name.clone();
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     let _ = name;
 }
 
@@ -8562,6 +8572,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("grant the DML on the table");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &exact).await;
     assert!(
@@ -8593,6 +8604,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("grant the schema and deny the table");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &exact).await;
     assert!(
@@ -8636,6 +8648,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
         ))
         .await
         .expect("revoke the schema DML");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = data_permissions(&mut lp, &unbuilt).await;
     assert_eq!(
@@ -8649,15 +8662,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
     );
 
     drop(lp);
-    // Best-effort, like the other login tests here: the server may still count
-    // a just-closed session as logged in, and a tidy-up that failed must not
-    // be reported as this test failing. The container is throwaway.
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -8775,6 +8780,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
         ))
         .await
         .expect("grant the schema and deny the object's current name");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -8813,6 +8819,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
         .execute("EXEC sp_rename 'app.old_name', 'new_name';")
         .await
         .expect("rename the table");
+    drop(lp);
     let mut lp = connect_live(&as_login)
         .await
         .expect("reconnect after the rename");
@@ -8825,15 +8832,7 @@ async fn a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_on
     );
 
     drop(lp);
-    // Best-effort, like the other login tests here: the server may still count
-    // a just-closed session as logged in, and a tidy-up that failed must not
-    // be reported as this test failing. The container is throwaway.
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -8968,12 +8967,7 @@ async fn a_renamed_and_a_reused_name_keep_their_own_distinct_demands() {
     );
 
     drop(lp);
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -9084,12 +9078,7 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
     );
 
     drop(lp);
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -9218,12 +9207,7 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     );
 
     drop(lp);
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -9656,15 +9640,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         assert_eq!(n, 1, "{state}: the hidden child was cascaded away");
     }
 
-    // Best-effort, like the other login tests here: the server may still count
-    // a just-closed session as logged in, and a tidy-up that failed must not be
-    // reported as this test failing. The container is throwaway.
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -9819,6 +9795,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
         ))
         .await
         .expect("revoke one column");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         lp.execute("UPDATE app.t SET note = N'X' WHERE code = 'a';")
@@ -9850,6 +9827,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
     )]
     .into_iter()
     .collect();
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         pbps_mssql::doctor::missing(&data_permissions(&mut lp, &declared).await).is_empty(),
@@ -9867,6 +9845,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
         .execute("ALTER TABLE app.t ADD extra nvarchar(50) NULL;")
         .await
         .expect("add the column the declaration names");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         lp.execute("UPDATE app.t SET extra = N'X' WHERE code = 'a';")
@@ -9886,6 +9865,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
         ))
         .await
         .expect("grant UPDATE on the object");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.execute("UPDATE app.t SET extra = N'X' WHERE code = 'a';")
         .await
@@ -9894,15 +9874,7 @@ async fn a_column_level_grant_is_seen_where_the_object_level_answer_is_zero() {
     assert!(gaps.is_empty(), "{gaps:?}");
 
     drop(lp);
-    // Best-effort, like the other login tests here: the server may still count
-    // the session, and a login this container will drop with it must not be
-    // reported as this test failing.
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -10129,6 +10101,7 @@ async fn every_explicitly_referenced_column_needs_its_grant() {
         ))
         .await
         .expect("revoke one column");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = referenced_permissions(&mut lp, &referenced).await;
     assert_eq!(
@@ -10138,12 +10111,7 @@ async fn every_explicitly_referenced_column_needs_its_grant() {
     );
 
     drop(lp);
-    let _ = db
-        .conn
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
     db.drop().await;
 }
 
@@ -10241,6 +10209,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
         .execute(&format!("DENY ALTER ON SCHEMA::app TO [{login}];"))
         .await
         .expect("deny");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -10278,12 +10247,7 @@ async fn a_deny_beats_control_and_the_readiness_check_sees_it() {
 
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// A lock table the caller may not read is not an absent one.
@@ -10382,6 +10346,7 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
         .execute("DROP TABLE dbo.__pbps_lock;")
         .await
         .expect("drop the lock table");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         pbps_mssql::state::lock_holder(&mut lp)
@@ -10392,12 +10357,7 @@ async fn a_lock_table_that_cannot_be_read_is_not_an_absent_one() {
 
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// The ledger table has the same metadata-visibility fault the lock table had.
@@ -10517,12 +10477,7 @@ async fn a_ledger_that_cannot_be_read_is_not_an_uninitialized_one() {
     drop(none);
     fresh.drop().await;
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// A foreign key into a schema the project does not manage.
@@ -10656,6 +10611,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
         ))
         .await
         .expect("grant on the object");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -10677,12 +10633,7 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
 
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// ADR-0004 against the engine: the DML the emitter writes, in the order the
@@ -14183,10 +14134,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
 
     drop(lp);
     db.drop().await;
-    let mut master = connect_live(&conn_str()).await.expect("connect");
-    let _ = master
-        .execute(&format!("USE master; DROP LOGIN [{login}];"))
-        .await;
+    drop_login(&login).await;
 }
 
 /// A revision that retypes a column *and* changes one of its declared rows
@@ -15825,12 +15773,7 @@ async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json
 
     drop(lp);
     db.drop().await;
-    let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    drop_login(&login).await;
 }
 
 /// Builds a login that can read and write `dbo.__pbps_state` and
@@ -15883,11 +15826,10 @@ async fn login_without_alter(db: &mut TestDb, login: &str, password: &str) -> St
 
 async fn drop_login(login: &str) {
     let mut admin = connect_live(&conn_str()).await.expect("connect");
-    let _ = admin
-        .execute(&format!(
-            "USE master; IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
-        ))
-        .await;
+    admin.execute("USE master;").await.expect("use master");
+    drop_login_when_idle(&mut admin, login)
+        .await
+        .unwrap_or_else(|error| panic!("remove owned login {login}: {error}"));
 }
 
 /// Condition 4's ruling, pinned: a login that can read and write the ledger

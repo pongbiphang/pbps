@@ -58,16 +58,16 @@ impl Drop for Account {
     fn drop(&mut self) {
         // OwnDatabase drops afterwards; its sessions go first, and the login
         // cannot be dropped while it owns the database.
-        after_test_on_server(
+        on_server(
             &self.server,
             &format!(
                 "USE master; ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
                  DECLARE @sql nvarchar(max)=N'ALTER AUTHORIZATION ON DATABASE::[{0}] TO '+\
-                 QUOTENAME(SUSER_SNAME()); EXEC(@sql); DROP LOGIN [{1}];",
-                self.database.name(),
-                self.login
+                 QUOTENAME(SUSER_SNAME()); EXEC(@sql);",
+                self.database.name()
             ),
         );
+        super::drop_test_login(&self.database.server, &self.login);
     }
 }
 
