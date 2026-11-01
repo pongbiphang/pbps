@@ -181,6 +181,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Test a candidate in an owned disposable PostgreSQL database; writes no plan file
+    Test {
+        #[arg(long, conflicts_with = "cleanup")]
+        manifest: Option<PathBuf>,
+        /// Reconcile owned leftovers without loading project or SQL inputs
+        #[arg(long)]
+        cleanup: bool,
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
     /// Record several explicit rename/drop decisions together, or none
     // Keep large argument construction in its own frame, as for drop options:
     // clap startup must fit Windows' 1 MiB main stack (#2493, #2523).
@@ -584,6 +594,7 @@ impl Command {
     /// eleven review rounds.
     fn json_envelope(&self) -> Option<&'static str> {
         let (name, format) = match self {
+            Command::Test { format, .. } => ("test", *format),
             Command::Plan { format, .. } => ("plan", *format),
             Command::Doctor { format, .. } => ("doctor", *format),
             Command::Validate { format, .. } => ("validate", *format),
@@ -982,7 +993,8 @@ fn run() -> anyhow::Result<()> {
         | Command::Ui
         | Command::Unlock { .. }
         | Command::Key { .. }
-        | Command::State { .. } => {}
+        | Command::State { .. }
+        | Command::Test { .. } => {}
     }
     // Validate the heterogeneous option pairs before even discovering a
     // project. A blank reason in the last pair must not admit an earlier one.
@@ -1114,6 +1126,19 @@ fn run() -> anyhow::Result<()> {
             *format == OutputFormat::Json,
         );
     }
+    if let Command::Test {
+        manifest,
+        cleanup,
+        format,
+    } = &cli.command
+    {
+        return plan_test::command(
+            &start,
+            manifest.as_deref(),
+            *cleanup,
+            *format == OutputFormat::Json,
+        );
+    }
     // Discovery is the one failure no command body can catch: it happens before
     // dispatch, so `validate --format json` in a directory with no readable
     // `pbps.yml` printed nothing at all and the converter reported its own
@@ -1131,6 +1156,7 @@ fn run() -> anyhow::Result<()> {
     };
 
     match cli.command {
+        Command::Test { .. } => unreachable!("test dispatches before target discovery"),
         Command::Ui => {
             use base64::Engine as _;
             use sha2::Digest as _;

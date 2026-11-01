@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 83;
+pub const SCHEMA_VERSION: u32 = 84;
+// 84: owned PostgreSQL test results (issue #1165).
 // 83: retained CHECK writebacks (#2354).
 // 82: PostgreSQL resolver authorization reproduction status and notice (#2570).
 // 78: named SQL Server database layouts in project configuration (#2501).
@@ -147,6 +148,7 @@ pub const SCHEMA_VERSION: u32 = 83;
 macro_rules! envelope_branches {
     ($mac:ident) => {
         $mac! {
+            "test" => crate::plan_test::report::TestData,
             "plan" => crate::PlanData,
             "validate" => crate::ValidateData,
             "fmt" => crate::FmtData,
@@ -789,6 +791,10 @@ mod tests {
                 "Discovery/properties/observations",
                 "Discovery/properties/qualification",
                 "Explanation/properties/dependencies",
+                // Input labels map only to resolved, validated commit identities.
+                "ObservedInputs/properties/resolved_commits",
+                // Phase-specific missing evidence always has a textual reason.
+                "Phase/properties/unavailable",
                 "PlanData/properties/dependencies",
                 "PlannedDependency",
                 "PublicGrant",
@@ -796,6 +802,8 @@ mod tests {
                 "ResolverProfile/oneOf/0",
                 "ResolverProfile/oneOf/1",
                 "ScratchStandard",
+                // Missing run identities always have a textual reason.
+                "TestData/properties/unavailable",
                 "TypeRoutine",
             ]
         );

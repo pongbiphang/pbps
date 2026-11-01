@@ -4,6 +4,9 @@
   "description": "One findings envelope per reporting command (SPEC 9.8). `command` selects which branch applies, and `data` is that command's own payload.",
   "oneOf": [
     {
+      "$ref": "#/$defs/envelope.test"
+    },
+    {
       "$ref": "#/$defs/envelope.plan"
     },
     {
@@ -129,6 +132,587 @@
       "required": [
         "file"
       ]
+    },
+    "TestData": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_input": {
+          "$ref": "#/$defs/ObservedInputs"
+        },
+        "inputs_reverified": {
+          "type": "boolean"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acquired_image": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_build": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unavailable": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "recovery_removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recovery_live": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "phases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Phase"
+          }
+        },
+        "assertions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Assertion"
+          }
+        },
+        "candidate_sealed_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_accepted_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_executed_checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replay_hops": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "replay_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cleanup_confirmed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation",
+        "observed_input",
+        "inputs_reverified",
+        "unavailable",
+        "recovery_removed",
+        "recovery_live",
+        "phases",
+        "assertions",
+        "replay_hops",
+        "replay_ms",
+        "cleanup_confirmed"
+      ]
+    },
+    "InputIdentity": {
+      "description": "What a run was given, with no password, connection string or plan in it.",
+      "type": "object",
+      "properties": {
+        "tool_version": {
+          "type": "string"
+        },
+        "manifest_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "dialect": {
+          "$ref": "#/$defs/DialectName"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ConsumedFile"
+        },
+        "base": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "pins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Pin"
+          }
+        },
+        "candidate": {
+          "$ref": "#/$defs/CandidateIdentity"
+        },
+        "image": {
+          "description": "The image as the manifest asks for it; the acquired identity is the\nrunner's to record.",
+          "type": "string"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts"
+        },
+        "files": {
+          "description": "Every consumed file, sorted by path, revision, role and hash.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsumedFile"
+          }
+        }
+      },
+      "required": [
+        "tool_version",
+        "manifest_version",
+        "dialect",
+        "manifest",
+        "base",
+        "pins",
+        "candidate",
+        "image",
+        "timeouts",
+        "files"
+      ]
+    },
+    "DialectName": {
+      "description": "The target database dialect.\n\nA project is bound to exactly one dialect. \"Supports multiple databases\" means\nthe tool can drive different databases, not that one set of declarations\ndeploys to both (SPEC §1.3).",
+      "type": "string",
+      "enum": [
+        "mssql",
+        "postgres"
+      ]
+    },
+    "ConsumedFile": {
+      "description": "One file the run consumed: its path relative to the project root (`/`\nseparated), and the SHA-256 of its raw bytes, with no newline or SQL\nnormalization.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision",
+        "role",
+        "sha256"
+      ]
+    },
+    "Revision": {
+      "description": "Where a file's bytes came from: the working tree as it is, or one commit.\nAn uncommitted working tree is `Working` even when its bytes happen to\nequal `HEAD`'s: it does not claim that git supplied them.",
+      "type": "string"
+    },
+    "Role": {
+      "description": "What a consumed file is for. Hints live in the declaration files.",
+      "type": "string",
+      "enum": [
+        "manifest",
+        "fixture",
+        "assertion",
+        "config",
+        "declaration",
+        "ids"
+      ]
+    },
+    "CommitId": {
+      "description": "A full object id. A branch, a tag or an abbreviation names whatever the\nrepository calls it today; a pin has to keep naming one commit.",
+      "type": "string"
+    },
+    "Pin": {
+      "type": "object",
+      "properties": {
+        "fixture": {
+          "type": "string"
+        },
+        "commit": {
+          "$ref": "#/$defs/CommitId"
+        }
+      },
+      "required": [
+        "fixture",
+        "commit"
+      ]
+    },
+    "CandidateIdentity": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CandidateKind"
+        },
+        "uncommitted": {
+          "type": "boolean"
+        },
+        "commit": {
+          "description": "The captured `HEAD` of a working tree, or the resolved commit.",
+          "$ref": "#/$defs/CommitId"
+        }
+      },
+      "required": [
+        "kind",
+        "uncommitted",
+        "commit"
+      ]
+    },
+    "CandidateKind": {
+      "description": "How the candidate is named in a report. A working tree stays uncommitted\neven when its bytes match `HEAD`: it does not claim that git supplied them.",
+      "type": "string",
+      "enum": [
+        "working_tree",
+        "commit"
+      ]
+    },
+    "Timeouts": {
+      "description": "Positive millisecond bounds (ADR-0019 §2). Every one is always present, so\na consumer never has to know the defaults.",
+      "type": "object",
+      "properties": {
+        "startup_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "step_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "fixture_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "assertion_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "run_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "cleanup_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "startup_ms",
+        "step_ms",
+        "fixture_ms",
+        "assertion_ms",
+        "run_ms",
+        "cleanup_ms"
+      ]
+    },
+    "ObservedInputs": {
+      "description": "Observations survive a later refusal; they never certify a partial input set.",
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsumedFile"
+          }
+        },
+        "resolved_commits": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/CommitId"
+          }
+        }
+      },
+      "required": [
+        "files",
+        "resolved_commits"
+      ]
+    },
+    "Phase": {
+      "type": "object",
+      "properties": {
+        "phase": {
+          "type": "string"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Status"
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "distance": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "changes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "statements": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accepted": {
+          "type": "boolean"
+        },
+        "started": {
+          "type": "boolean"
+        },
+        "entry": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unavailable": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "phase",
+        "identity",
+        "outcome",
+        "elapsed_ms",
+        "findings",
+        "accepted",
+        "started",
+        "risks",
+        "unavailable"
+      ]
+    },
+    "Status": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "unanswerable",
+        "skipped"
+      ]
+    },
+    "Assertion": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/Cell"
+            }
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "sha256",
+        "outcome",
+        "columns",
+        "rows",
+        "truncated"
+      ]
+    },
+    "Column": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "Cell": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "value",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "unrenderable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "unrenderable"
+          ]
+        }
+      ]
+    },
+    "envelope.test": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "test"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
     },
     "PlanData": {
       "description": "What `plan` produced, for `--format json`.\n\nThe changes are counted rather than listed: the typed change set is what\n`--out` writes, and `explain` is what renders it. Two spellings of the same\nlist, one of them abbreviated, is how a consumer comes to read the wrong one.",
@@ -3002,6 +3586,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 83,
+  "x-pbps-schema-version": 84,
   "x-pbps-tool-version": "0.0.0"
 }

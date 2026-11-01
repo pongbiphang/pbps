@@ -126,7 +126,6 @@ impl<'a> Session<'a> {
     // future union would make those future roles unmanaged in an earlier hop.
     pub async fn prepare(&self, schema: &Schema) -> anyhow::Result<()> {
         let mut conn = self.admin().await?;
-        let apply = &self.roles[0];
         // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
         // Only this owned cluster's administrator supplies those prerequisites;
         // roles keep their ordinary scope and existing image roles stay untouched.
@@ -138,6 +137,11 @@ impl<'a> Session<'a> {
             ))
             .await?;
         }
+        self.namespaces(schema).await
+    }
+    pub async fn namespaces(&self, schema: &Schema) -> anyhow::Result<()> {
+        let mut conn = self.admin().await?;
+        let apply = &self.roles[0];
         // Namespaces are provisioning prerequisites of ordinary bootstrap,
         // not managed changes. Reuse its inventory in this fresh owned database.
         for namespace in crate::deploy::schemas_declared(schema).into_keys() {
