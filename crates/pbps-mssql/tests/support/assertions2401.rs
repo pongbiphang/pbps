@@ -3,7 +3,9 @@ use super::*;
 use pbps_db::{Driver, query::EvidenceCell};
 use pbps_mssql::assertions::{AssertionResult, Target, run_target};
 use std::time::Duration;
-const DEADLINE: Duration = Duration::from_secs(10);
+// Admission now audits every accessible system database as well as the target.
+// Give the native fixture room on shared hosts; the 200 ms timeout case is separate.
+const DEADLINE: Duration = Duration::from_secs(30);
 // A default linked-server mapping affects every login on the fixture.
 static TARGET_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Fixture {
@@ -16,6 +18,11 @@ impl Fixture {
         let mut db = TestDb::create(tag).await;
         let role = format!("{}_reader", db.name);
         db.conn.execute(&format!("CREATE LOGIN [{role}] WITH PASSWORD='OnlyAssert!2401',CHECK_POLICY=OFF; CREATE USER [{role}] FOR LOGIN [{role}]; GRANT VIEW DEFINITION TO [{role}]")).await.unwrap();
+        // A mapped read-only user avoids guest's implicit schema ownership
+        // (including permanent CREATE SEQUENCE) in accessible system databases.
+        for system in ["master", "msdb", "tempdb"] {
+            db.conn.execute(&format!("USE [{system}]; CREATE USER [{role}] FOR LOGIN [{role}]; GRANT VIEW DEFINITION TO [{role}]; DENY EXECUTE TO [{role}]; USE [{}]",db.name)).await.unwrap();
+        }
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
         db.conn.execute(&format!("CREATE TABLE app.orders(id int,total int); INSERT INTO app.orders VALUES(1,2401); GRANT SELECT ON app.orders TO [{role}]")).await.unwrap();
         let base = conn_str();
@@ -63,6 +70,13 @@ impl Fixture {
     async fn finish(self) {
         self.db.drop().await;
         let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await.unwrap();
+        for system in ["master", "msdb", "tempdb"] {
+            admin
+                .execute(&format!("USE [{system}]; DROP USER [{}]", self.role))
+                .await
+                .unwrap();
+        }
+        admin.execute("USE master").await.unwrap();
         admin
             .execute(&format!("DROP LOGIN [{}]", self.role))
             .await
@@ -704,6 +718,8 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
     }
     let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
     let mut cells = 0;
+    let mut admitted = 0;
+    let mut batches = 0;
     for case in matrix["words"].as_array().unwrap() {
         let word = case["word"].as_str().unwrap();
         for shape in matrix["shapes"].as_array().unwrap() {
@@ -720,16 +736,19 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
                     "{sql}: {error:?}"
                 ),
             }
-            let result = f.run(&sql).await.unwrap();
-            assert!(
-                if accepted {
-                    matches!(result, AssertionResult::Pass(_))
-                } else {
-                    matches!(result, AssertionResult::InvalidResult { .. })
-                },
-                "{}: {sql}: {result:?}",
-                shape["name"]
-            );
+            // Every cell is measured on the native grammar above and pinned
+            // by the shared unit matrix. Only valid identifiers need a full
+            // target admission; repeating four database audits for invalid
+            // syntax adds no evidence about the framing decision.
+            if accepted {
+                let result = f.run(&sql).await.unwrap();
+                assert!(
+                    matches!(result, AssertionResult::Pass(_)),
+                    "{}: {sql}: {result:?}",
+                    shape["name"]
+                );
+                admitted += 1;
+            }
             cells += 1;
         }
         let second = case["second"].as_str().unwrap();
@@ -738,6 +757,7 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
                 continue;
             }
             let sql = format!("SELECT 1 WHERE 1=0{delimiter}{second}");
+            batches += 1;
             assert!(
                 matches!(
                     f.run(&sql).await.unwrap(),
@@ -748,9 +768,163 @@ async fn every_framing_word_preserves_native_identifiers_and_refuses_batches() {
         }
     }
     println!(
-        "native identifier matrix: {cells} cells; every deny-list word plus real batch negatives"
+        "native identifier matrix: {cells} cells; {admitted} valid admissions; {batches} real batch negatives"
     );
-    assert_eq!(cells, 300);
+    assert_eq!((cells, admitted, batches), (300, 39, 59));
     drop(caller);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn system_database_writes_are_refused_before_sql_and_session_temps_stay_allowed() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_systems2401").await;
+    let audit = format!("{}_audit", f.db.name);
+    let role = f.role.clone();
+    let target = f.db.name.clone();
+    let read = "SELECT * FROM app.orders WHERE id<0";
+    // Legacy DEFAULT/RULE nominal object rights are not executable rights;
+    // only a schema/parent grant permits their DDL. Private temps from another
+    // session are visible metadata, not a permanent-write capability either.
+    f.db.conn
+        .execute("CREATE TABLE #admin_session2401(n int)")
+        .await
+        .unwrap();
+    f.db.conn.execute("USE master").await.unwrap();
+    f.db.conn
+        .execute(&format!("CREATE DEFAULT dbo.[{audit}_default] AS 0"))
+        .await
+        .unwrap();
+    f.db.conn
+        .execute(&format!("CREATE RULE dbo.[{audit}_rule] AS @n>0"))
+        .await
+        .unwrap();
+    f.db.conn
+        .execute(&format!("CREATE TYPE dbo.[{audit}_type] AS TABLE(n int)"))
+        .await
+        .unwrap();
+    f.db.conn.execute(&format!("USE [{target}]")).await.unwrap();
+    assert!(matches!(
+        f.run(read).await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    for system in ["master", "msdb", "tempdb"] {
+        f.db.conn
+            .execute(&format!(
+                "USE [{system}]; CREATE TABLE dbo.[{audit}](n int); USE [{target}]"
+            ))
+            .await
+            .unwrap();
+        f.db.conn
+            .execute(&format!(
+                "USE [{system}]; GRANT INSERT ON dbo.[{audit}] TO [{role}]; USE [{target}]"
+            ))
+            .await
+            .unwrap();
+        let write =
+            format!("EXEC(N'INSERT [{system}].dbo.[{audit}] VALUES(2401); SELECT 1 WHERE 1=0')");
+        // Bypassing admission really persists a write from this same login.
+        let caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+        let evidence = caller.query_bounded(&write, DEADLINE).await.unwrap();
+        assert!(matches!(
+            AssertionResult::from_evidence(evidence),
+            AssertionResult::Pass(_)
+        ));
+        let rows =
+            f.db.conn
+                .query(&format!(
+                    "SELECT COUNT(*) AS n FROM [{system}].dbo.[{audit}]"
+                ))
+                .await
+                .unwrap();
+        assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(1));
+        f.db.conn
+            .execute(&format!("DELETE FROM [{system}].dbo.[{audit}]"))
+            .await
+            .unwrap();
+        for sql in [write.as_str(), "SELECT 1/0", read] {
+            let error = f.run(sql).await.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("INSERT") && message.contains(system) && message.contains(&audit),
+                "{sql}: {error:?}"
+            );
+        }
+        let rows =
+            f.db.conn
+                .query(&format!(
+                    "SELECT COUNT(*) AS n FROM [{system}].dbo.[{audit}]"
+                ))
+                .await
+                .unwrap();
+        assert_eq!(
+            rows[0].try_get::<i32>("n").unwrap(),
+            Some(0),
+            "refused before assertion SQL"
+        );
+        f.db.conn.execute(&format!("USE [{system}]; REVOKE INSERT ON dbo.[{audit}] FROM [{role}]; DROP TABLE dbo.[{audit}]; USE [{target}]")).await.unwrap();
+        // The audit must restore the original database on its checked session.
+        assert!(matches!(
+            f.run(read).await.unwrap(),
+            AssertionResult::Pass(_)
+        ));
+    }
+    f.db.conn
+        .execute(&format!(
+            "USE tempdb; GRANT CREATE TABLE TO [{role}]; USE [{target}]"
+        ))
+        .await
+        .unwrap();
+    let error = f.run("SELECT 1/0").await.unwrap_err();
+    assert!(
+        error.to_string().contains("CREATE TABLE") && error.to_string().contains("tempdb"),
+        "{error:?}"
+    );
+    f.db.conn
+        .execute(&format!(
+            "USE tempdb; REVOKE CREATE TABLE FROM [{role}]; USE [{target}]"
+        ))
+        .await
+        .unwrap();
+    f.db.conn
+        .execute(&format!(
+            "USE master; GRANT CONTROL ON TYPE::dbo.[{audit}_type] TO [{role}]; USE [{target}]"
+        ))
+        .await
+        .unwrap();
+    let error = f.run("SELECT 1/0").await.unwrap_err();
+    // CONTROL expands to multiple effective rights; their enumeration order
+    // is not contractual. Pin the TYPE namespace and the actual securable.
+    assert!(
+        error.to_string().contains("permission on TYPE")
+            && error.to_string().contains(&format!("{audit}_type"))
+            && error.to_string().contains("master"),
+        "{error:?}"
+    );
+    f.db.conn.execute(&format!("USE master; REVOKE CONTROL ON TYPE::dbo.[{audit}_type] FROM [{role}]; DROP TYPE dbo.[{audit}_type]; USE [{target}]")).await.unwrap();
+    let temporary = "EXEC(N'CREATE TABLE #session2401(n int); INSERT #session2401 VALUES(1); SELECT n FROM #session2401 WHERE n<0')";
+    assert!(matches!(
+        f.run(temporary).await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    f.db.conn
+        .execute(&format!(
+            "USE master; GRANT ALTER ON SCHEMA::dbo TO [{role}]; USE [{target}]"
+        ))
+        .await
+        .unwrap();
+    let error = f.run("SELECT 1/0").await.unwrap_err();
+    assert!(
+        error.to_string().contains("permission on SCHEMA")
+            && error.to_string().contains("[dbo]")
+            && error.to_string().contains("master"),
+        "{error:?}"
+    );
+    f.db.conn.execute(&format!("USE master; REVOKE ALTER ON SCHEMA::dbo FROM [{role}]; DROP DEFAULT dbo.[{audit}_default]; DROP RULE dbo.[{audit}_rule]; USE [{target}]; DROP TABLE #admin_session2401")).await.unwrap();
+    assert!(matches!(
+        f.run(read).await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
     f.finish().await;
 }

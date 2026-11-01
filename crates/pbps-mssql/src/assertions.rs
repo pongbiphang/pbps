@@ -96,36 +96,14 @@ pub async fn run_target(
 }
 
 async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
-    // A SELECT grant can hide every unrelated object. Demand complete metadata
-    // before an empty permission inventory could mean "no write capability".
-    let rows = conn
-        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(),'DATABASE','VIEW DEFINITION') AS visible, HAS_PERMS_BY_NAME(NULL,NULL,'VIEW ANY DATABASE') AS databases_visible")
-        .await?;
-    if rows
+    let rows = conn.query("SELECT DB_NAME() AS name,HAS_PERMS_BY_NAME(NULL,NULL,'VIEW ANY DATABASE') AS databases_visible").await?;
+    let database = rows
         .first()
-        .map(|r| r.try_get::<i32>("visible"))
-        .transpose()?
-        .flatten()
-        != Some(1)
-    {
-        return Err(DbError::Refused("assertion permission checks require database VIEW DEFINITION; hidden objects are not an empty permission inventory".into()));
-    }
-    // Ownership-chained T-SQL functions and views can call CLR without a
-    // direct CLR grant. SAFE/CAS is not a boundary under CLR strict security.
-    // Complete database metadata above makes an empty assembly read conclusive.
-    if let Some(row) = conn
-        .query("SELECT TOP(1) name FROM sys.assemblies WHERE is_user_defined=1 ORDER BY name")
-        .await?
-        .first()
-    {
-        let name = row
-            .try_get::<&str>("name")?
-            .ok_or_else(|| DbError::BadRow("unreadable assertion CLR assembly name".into()))?;
-        return Err(DbError::Refused(format!(
-            "assertion target contains user-defined CLR assembly {}; ownership-chained wrappers can execute CLR without direct grants",
-            pbps_model::escape::Escaped(name)
-        )));
-    }
+        .ok_or_else(|| DbError::BadRow("missing assertion database".into()))?
+        .try_get::<&str>("name")?
+        .ok_or_else(|| DbError::BadRow("unreadable assertion database name".into()))?
+        .to_owned();
+    privileges_here(conn, &database).await?;
     // An accessible database can be hidden from sys.databases without this
     // read permission. Hidden databases cannot count as a confined login.
     if rows
@@ -157,6 +135,60 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
         if mapped != Some(0) || row.try_get::<i32>("visible")? != Some(1) {
             return Err(DbError::Refused(format!("assertion permission checks require server VIEW ANY DEFINITION to read all mappings for linked server {}; hidden mappings are not an empty inventory", pbps_model::escape::Escaped(name))));
         }
+    }
+    // Guest access is not a refusal. Audit the same effective capabilities
+    // wherever the login can enter a system database, then restore the target
+    // before user SQL. A failed audit consumes this connection without SQL.
+    for row in conn.query("SELECT name,HAS_DBACCESS(name) AS accessible FROM sys.databases WHERE database_id BETWEEN 1 AND 4 AND database_id<>DB_ID()").await? {
+        let name = row.try_get::<&str>("name")?.ok_or_else(|| DbError::BadRow("unreadable assertion system database name".into()))?;
+        match row.try_get::<i32>("accessible")? {
+            Some(0) => continue,
+            Some(1) => {},
+            _ => return Err(DbError::BadRow(format!("unreadable assertion access to system database {}",pbps_model::escape::Escaped(name)))),
+        }
+        let quoted = crate::ident::quote(name).map_err(|e| DbError::Refused(e.to_string()))?;
+        conn.execute(&format!("USE {quoted}")).await?;
+        privileges_here(conn, name).await?;
+    }
+    let quoted = crate::ident::quote(&database).map_err(|e| DbError::Refused(e.to_string()))?;
+    conn.execute(&format!("USE {quoted}")).await?;
+    Ok(())
+}
+
+async fn privileges_here(conn: &mut Conn, database: &str) -> Result<(), DbError> {
+    // A SELECT grant can hide every unrelated object. Demand complete metadata
+    // before an empty permission inventory could mean "no write capability".
+    let rows = conn
+        .query("SELECT HAS_PERMS_BY_NAME(DB_NAME(),'DATABASE','VIEW DEFINITION') AS visible")
+        .await?;
+    if rows
+        .first()
+        .map(|r| r.try_get::<i32>("visible"))
+        .transpose()?
+        .flatten()
+        != Some(1)
+    {
+        return Err(DbError::Refused(format!(
+            "assertion permission checks require database VIEW DEFINITION on {}; hidden objects are not an empty permission inventory",
+            pbps_model::escape::Escaped(database)
+        )));
+    }
+    // Ownership-chained T-SQL functions and views can call CLR without a
+    // direct CLR grant. SAFE/CAS is not a boundary under CLR strict security.
+    // Complete database metadata above makes an empty assembly read conclusive.
+    if let Some(row) = conn
+        .query("SELECT TOP(1) name FROM sys.assemblies WHERE is_user_defined=1 ORDER BY name")
+        .await?
+        .first()
+    {
+        let name = row
+            .try_get::<&str>("name")?
+            .ok_or_else(|| DbError::BadRow("unreadable assertion CLR assembly name".into()))?;
+        return Err(DbError::Refused(format!(
+            "assertion target contains user-defined CLR assembly {} in database {}; ownership-chained wrappers can execute CLR without direct grants",
+            pbps_model::escape::Escaped(name),
+            pbps_model::escape::Escaped(database)
+        )));
     }
     let safe = "'SELECT','EXECUTE','CONNECT','VIEW DEFINITION','VIEW SECURITY DEFINITION','VIEW PERFORMANCE DEFINITION','VIEW DATABASE STATE','VIEW DATABASE SECURITY STATE','VIEW DATABASE PERFORMANCE STATE','VIEW CHANGE TRACKING','VIEW ANY COLUMN ENCRYPTION KEY DEFINITION','VIEW ANY COLUMN MASTER KEY DEFINITION','UNMASK','SHOWPLAN','CONNECT SQL','VIEW ANY DATABASE','VIEW ANY DEFINITION','VIEW ANY SECURITY DEFINITION','VIEW ANY PERFORMANCE DEFINITION','VIEW SERVER STATE','VIEW SERVER SECURITY STATE','VIEW SERVER PERFORMANCE STATE','SELECT ALL USER SECURABLES'";
     let mut parts = vec![
@@ -199,11 +231,14 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
     // and DENY. Reading raw grant rows or role names would not do that.
     for (class, inventory) in [
         ("SCHEMA", "SELECT QUOTENAME(name) AS name FROM sys.schemas"),
-        // S/IT are engine base/internal tables, not OBJECT permission
-        // securables (native oracle returns no rows). Keep shipped procedures.
+        // S/IT are not OBJECT securables; legacy DEFAULT/RULE report nominal
+        // rights even when the engine denies DROP/GRANT (native 3701/4606).
+        // Their real DDL capability is on the schema/parent; table types use
+        // the TYPE inventory, not OBJECT. Session temporary objects are not
+        // permanent tempdb writes. Keep shipped procedures.
         (
             "OBJECT",
-            "SELECT QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name) AS name,type FROM sys.objects WHERE type NOT IN ('S','IT')",
+            "SELECT QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name) AS name,type FROM sys.objects WHERE type NOT IN ('S','IT','D','R','TT') AND (DB_ID()<>2 OR name NOT LIKE '#%')",
         ),
         (
             "TYPE",
@@ -300,16 +335,21 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
         parts.join(" UNION ALL ")
     );
     if let Some(row) = conn.query(&sql).await?.first() {
-        let permission = row
-            .try_get::<&str>("permission_name")?
-            .ok_or_else(|| DbError::BadRow("unreadable assertion privilege".into()))?;
         let object = row
             .try_get::<&str>("object")?
             .ok_or_else(|| DbError::BadRow("unreadable assertion privilege object".into()))?;
+        let permission = row.try_get::<&str>("permission_name")?.ok_or_else(|| {
+            DbError::BadRow(format!(
+                "unreadable assertion privilege on {} in database {}",
+                pbps_model::escape::Escaped(object),
+                pbps_model::escape::Escaped(database)
+            ))
+        })?;
         return Err(DbError::Refused(format!(
-            "assertion login has {} permission on {}; require a separate login without write or DDL permissions",
+            "assertion login has {} permission on {} in database {}; require a separate login without write or DDL permissions",
             pbps_model::escape::Escaped(permission),
-            pbps_model::escape::Escaped(object)
+            pbps_model::escape::Escaped(object),
+            pbps_model::escape::Escaped(database)
         )));
     }
     Ok(())

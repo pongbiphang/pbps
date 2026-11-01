@@ -497,6 +497,17 @@ ownership-chained T-SQL function/view wrappers can execute CLR without direct
 CLR grants. Without CLR, T-SQL functions (`FN`, `IF`, `TF`) retain their allowed
 execution rights; T-SQL functions cannot change persistent database state.
 
+Audit the same effective privilege inventory in every accessible system
+database (`master`, `msdb`, `model`, `tempdb`) before returning to the target.
+Guest access itself is allowed; write-capable rights on permanent objects and
+CREATE TABLE refuse by database and object/permission name. Ordinary temporary
+objects stay allowed. Complete metadata is required in every audited database;
+map a read-only user there, grant VIEW DEFINITION, and deny inherited procedure
+EXECUTE. Default guest ownership can include permanent CREATE SEQUENCE and is refused as a real capability.
+Legacy DEFAULT/RULE object permission rows are nominal: native DROP and GRANT
+are denied without schema rights, which the same inventory still checks. Table
+types are checked in the TYPE namespace rather than as OBJECT securables.
+
 The assertion login must have no access to any other user database on the
 instance. Check HAS_DBACCESS for every other user database, by database id;
 unreadable answers refuse. Server VIEW ANY DATABASE is required so a hidden

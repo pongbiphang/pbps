@@ -773,6 +773,12 @@ Refuse access to another user database or a linked-server mapping for this login
 server. Require VIEW ANY DATABASE for complete database access reads and VIEW
 ANY DEFINITION before a visible server's missing mapping is conclusive. Unknown
 answers refuse; neither hidden metadata nor a zero-row query proves no writes.
+Reuse this oracle in accessible system databases too, including permanent tempdb
+objects and CREATE TABLE. Access alone is allowed; complete metadata and the
+same effective permission checks are required. Session temporary objects and
+nominal legacy DEFAULT/RULE object rights are excluded; real schema/parent DDL
+rights remain checked; table types use the TYPE oracle. Restore the target
+before assertion SQL.
 Intrinsic session-setting rights and control of the login's own principal do
 not confer target data/DDL rights; native controls retain those ordinary logins.
 The existing PostgreSQL API stays available to #1165. CLI selection and saved
