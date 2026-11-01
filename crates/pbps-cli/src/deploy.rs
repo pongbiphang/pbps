@@ -8063,10 +8063,14 @@ async fn plan_db_async(
                     target_identity: identity.as_deref(),
                 };
                 let asked = crate::resolution::named(&assessment);
-                match crate::resolution::resolve(
+                // Boxed like the retained comparison above: the resolver's
+                // future is the largest in this block, and the bootstrap
+                // prerequisites (DEC-2447.2) it now carries tipped the owned
+                // lifecycle tests' native thread stacks over their limit.
+                match Box::pin(crate::resolution::resolve(
                     &request,
                     scratch.as_mut().expect("a required resolution selected an entry"),
-                ).await {
+                )).await {
                     Ok(unsealed) => {
                         resolver_assessment =
                             Some(crate::resolution::ResolverAssessment::resolved(&assessment));
