@@ -80,6 +80,9 @@ fn unsupported_unmanaged_grants_are_report_only_on_pg16() {
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/plan_test1165.rs"]
+mod plan_test1165;
+
 #[path = "support/drop_intent2414.rs"]
 mod drop_intent2414;
 

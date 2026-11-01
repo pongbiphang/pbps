@@ -2275,6 +2275,7 @@ full state.
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
+| `pbps test`, `pbps test --cleanup` | Test fixtures and a candidate in owned PostgreSQL scratch, or reconcile owned leftovers (§9.9) |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state list` | This environment's history, newest first |
 | `pbps state record-data-work` | Record self-reported external work after a retained successful expand apply; never execute it |
@@ -3747,8 +3748,8 @@ unconfirmed cleanup makes the overall result `unanswerable` (exit `1`), even
 when every assertion passed; assertion violations are `findings` (exit `2`).
 Driver timeouts, unreadable results and transport loss never count as empty
 successful assertions. [ADR-0019 §9](ADR-0019-plan-tests.md#9-results-and-ci-semantics)
-defines phase classification and requires the implementation's schema-set bump
-and complete archive per DECISIONS 465; this design change alone bumps no schema.
+defines phase classification. The PostgreSQL command publishes its typed results
+in the envelope schema and complete schema-set archive (DECISIONS 465).
 
 A connected plan reports change counts, named capability checks, cost estimates
 and typed findings (DECISIONS 429). This summary is distinct from the
@@ -3896,7 +3897,8 @@ the third system copies and edits it (14.3).
 candidate declaration change using SQL fixtures and assertions in a scratch
 **it created**. The accepted contract is
 [ADR-0019](ADR-0019-plan-tests.md); implementation is #1165 (PostgreSQL first,
-then SQL Server, both required). It accepts no `--db`, `--env`, supplied server
+then SQL Server, both required). The PostgreSQL run and `test --cleanup` commands
+are implemented; verified re-pin and SQL Server execution remain pending. It accepts no `--db`, `--env`, supplied server
 or production plan, and writes **no applyable plan file**. The result reports
 the exact executed test-plan checksum, not a promise that a future production
 plan will have identical bytes. §9.3's preview/rehearsal remains separate.
