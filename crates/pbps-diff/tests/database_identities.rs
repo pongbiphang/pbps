@@ -7,6 +7,14 @@ fn live() -> Schema {
         .insert("id".into(), Column::new("int".parse().unwrap()));
     Schema {
         tables: [("dbo.same".parse().unwrap(), table)].into(),
+        extensions: [(
+            "package".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.0".into(),
+            },
+        )]
+        .into(),
         ..Default::default()
     }
 }
@@ -35,6 +43,10 @@ fn shared_observed_reservations_separate_equal_names_and_are_deterministic() {
         a.column_uid(&"dbo.same.id".parse().unwrap()),
         b.column_uid(&"dbo.same.id".parse().unwrap())
     );
+    assert_ne!(
+        a.extension_uid(&"package".into()),
+        b.extension_uid(&"package".into())
+    );
     assert_eq!(result, observed());
 }
 
@@ -51,4 +63,14 @@ fn a_shared_observation_never_reuses_a_foreign_recorded_identity() {
     let mut pool = UidReservations::from_files(&maps).unwrap();
     let result = maps.map(|_, ids| observed_ids_with_reservations(&live(), ids, &mut pool));
     assert!(UidReservations::from_files(&result).is_ok());
+    assert_ne!(
+        result
+            .get(&"alpha".parse().unwrap())
+            .unwrap()
+            .extension_uid(&"package".into()),
+        result
+            .get(&"beta".parse().unwrap())
+            .unwrap()
+            .extension_uid(&"package".into())
+    );
 }

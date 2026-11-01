@@ -67,6 +67,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut s = String::new();
     let _ = write!(
@@ -97,6 +98,19 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    if !extensions.is_empty() {
+        s.push_str("<h2>Extensions</h2>\n<table><tr><th>Name</th><th>Schema</th><th>Exact version</th></tr>\n");
+        for (name, definition) in extensions {
+            let _ = writeln!(
+                s,
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                code(name.raw()),
+                code(&definition.schema),
+                code(&definition.version)
+            );
+        }
+        s.push_str("</table>\n");
+    }
     types_section(&mut s, types);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);

@@ -39,6 +39,24 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+/// A scratch baseline may assume only package state the scratch actually holds.
+pub async fn require_scratch_extensions(
+    conn: &mut Conn,
+    required: &BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
+) -> anyhow::Result<()> {
+    let problems = match conn.driver() {
+        Driver::Postgres => {
+            pbps_pg::resolver::scratch::extension_prerequisites(conn, required).await?
+        }
+        Driver::Mssql if required.is_empty() => Vec::new(),
+        Driver::Mssql => {
+            anyhow::bail!("PostgreSQL extension prerequisites are unsupported on SQL Server")
+        }
+    };
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
+    Ok(())
+}
+
 pub async fn compare_dependencies(
     conn: &mut Conn,
     declarations: &pbps_model::dependency::Dependencies,

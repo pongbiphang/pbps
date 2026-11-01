@@ -2733,7 +2733,18 @@ async fn managed_state_full(
         scoped,
         limitations,
         permission_advisories,
-        catalog_notices: pulled.catalog_notices.clone(),
+        catalog_notices: pulled
+            .catalog_notices
+            .iter()
+            .cloned()
+            .chain(
+                pulled
+                    .extension_notices
+                    .iter()
+                    .filter(|(name, _)| ids.extension_uid(name).is_none())
+                    .map(|(_, message)| message.clone()),
+            )
+            .collect(),
         unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
@@ -3648,8 +3659,13 @@ pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (name, definition) in extensions {
+        out.entry(definition.schema.clone())
+            .or_insert_with(|| format!("the schema of extension `{}`", name.shown()));
+    }
     for (name, role) in roles {
         for target in role.grants.keys() {
             if let pbps_model::GrantTarget::Schema(s) = target {
@@ -4862,6 +4878,19 @@ fn refuse_pinned_movement(
         };
         if let Some(name) = old {
             expected_types.entry(name).or_insert(None);
+        }
+    }
+    // Both reads are already scoped to held identities. PR A admits no
+    // extension lifecycle change (DEC-2447.1), so every admitted plan keeps
+    // each exact definition, at checkpoints as well as at the closing read.
+    let extensions: BTreeSet<_> = before
+        .extensions
+        .keys()
+        .chain(after.extensions.keys())
+        .collect();
+    for name in extensions {
+        if before.extensions.get(name) != after.extensions.get(name) {
+            bail!("extension `{}` changed during {label}", name.shown());
         }
     }
     let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
@@ -6344,6 +6373,15 @@ pub fn cmd_baseline(
                     read,
                 )
                 .await?;
+                // Adoption certifies only the selected exact packages, never
+                // a different installed version or an unheld discovery (DEC-2447.3).
+                refuse_extension_prerequisite_drift(
+                    &scoped.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                    "baseline",
+                )?;
                 report_missing(&scoped);
                 refuse_unexpressible(&scoped, &target.label, "baseline again")?;
                 // A partition a drop intent names is out of the working identity
@@ -6522,11 +6560,18 @@ fn refuse_unidentified_bootstrap_objects(schema: &Schema, ids: &IdsFile) -> anyh
         types,
         modules: _,
         roles,
+        extensions,
     } = schema;
-    let unidentified: Vec<String> = tables
+    let unidentified: Vec<String> = extensions
         .keys()
-        .filter(|name| ids.table_uid(name).is_none())
-        .map(|name| name.shown().to_string())
+        .filter(|name| ids.extension_uid(name).is_none())
+        .map(|name| format!("extension {}", name.shown()))
+        .chain(
+            tables
+                .keys()
+                .filter(|name| ids.table_uid(name).is_none())
+                .map(|name| name.shown().to_string()),
+        )
         .chain(
             roles
                 .keys()
@@ -6574,6 +6619,7 @@ fn refuse_nonempty_bootstrap(
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let names: Vec<String> = tables
         .keys()
@@ -6588,6 +6634,14 @@ fn refuse_nonempty_bootstrap(
                 .map(|(name, _)| format!("role {}", name.shown())),
         )
         .chain(types.keys().map(|name| format!("type {}", name.shown())))
+        .chain(
+            extensions
+                .keys()
+                // Exact PostgreSQL packages are separately checked prerequisites,
+                // like standing cluster roles, not objects we create (DEC-2447.2).
+                .filter(|_| dialect.name() != "postgres")
+                .map(|name| format!("extension {}", name.shown())),
+        )
         // Omitted definitions still occupy names in the managed set.
         .chain(limitations.iter().cloned())
         .collect();
@@ -6599,6 +6653,45 @@ fn refuse_nonempty_bootstrap(
             names.len(),
             names.join(", "),
             label = pbps_model::escape::Escaped(label),
+        );
+    }
+    Ok(())
+}
+
+/// Bootstrap may adopt packages it verifies, but cannot install or change them.
+fn refuse_extension_prerequisite_drift(
+    installed: &Schema,
+    desired: &Schema,
+    ids: &IdsFile,
+    dialect: &dyn Dialect,
+    operation: &str,
+) -> anyhow::Result<()> {
+    for name in desired.extensions.keys() {
+        anyhow::ensure!(
+            ids.extension_uid(name).is_some(),
+            "extension `{}` has no identity; select it with `pbps pull --extension` before {operation}",
+            name.shown()
+        );
+    }
+    let errors = pbps_diff::extension_differences(
+        pbps_diff::Side {
+            schema: installed,
+            ids,
+        },
+        pbps_diff::Side {
+            schema: desired,
+            ids,
+        },
+        dialect.name(),
+    );
+    if !errors.is_empty() {
+        bail!(
+            "{operation} extension prerequisites differ:\n{}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     Ok(())
@@ -6700,11 +6793,16 @@ async fn bootstrap_async(
         }
         let declared_modules = managed_modules(None, Some(&loaded.schema));
 
-        // Bootstrap is the plan from nothing: every declared table is created.
+        // Every ordinary object is created; exact preinstalled packages are
+        // prerequisites, checked under the lock and at read-back (DEC-2447.2).
+        let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(pbps_diff::Side {
+            schema: &loaded.schema,
+            ids: &ids,
+        });
         let cs = pbps_diff::diff(
             pbps_diff::Side {
-                schema: &Schema::default(),
-                ids: &IdsFile::default(),
+                schema: &prerequisites,
+                ids: &prerequisite_ids,
             },
             pbps_diff::Side {
                 schema: &loaded.schema,
@@ -6940,6 +7038,13 @@ async fn bootstrap_async(
                 // instead of refusing (measured on 17.0, #1176).
                 refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
 
+                refuse_extension_prerequisite_drift(
+                    &existing.scoped.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                    "bootstrap",
+                )?;
                 refuse_nonempty_bootstrap(
                     &existing.scoped.schema,
                     &existing.limitations,
@@ -6998,6 +7103,13 @@ async fn bootstrap_async(
                 // A database-side trigger can add a privilege during the build.
                 // Never commit a snapshot that silently omits it (110, 147).
                 refuse_unexpressible(&built, &target.label, "bootstrap again")?;
+                refuse_extension_prerequisite_drift(
+                    &built.schema,
+                    &loaded.schema,
+                    &ids,
+                    dialect.as_ref(),
+                    "bootstrap",
+                )?;
                 crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
                 // And it can take one back. `ddl_command_end` fires on `GRANT`
                 // and on `REVOKE` (measured), so a trigger already in the
@@ -7013,10 +7125,11 @@ async fn bootstrap_async(
                 // those as held would make the next plan skip them (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
-                let held = ids
+                let mut held = ids
                     .without(&built.missing)
                     .without_roles(&gone)
                     .without_types(&built.missing_types);
+                held.extensions.clone_from(&prerequisite_ids.extensions);
                 crate::engine::recheck_type_prerequisites(
                     &mut conn,
                     &bootstrap_pins,
@@ -7379,6 +7492,31 @@ async fn plan_db_async(
         // identity, and this plan must be computed against what was reviewed
         // (DEC-2331.1).
         pbps_diff::conversion::prune(&mut resolved.ids, &loaded.schema, dialect.as_ref());
+        // Diagnose an unsupported package action before the generic stale-ids
+        // gate: CREATE/DROP themselves change the tentative identity section.
+        if let Ok((_, entry)) = &checked_target {
+            let errors = pbps_diff::extension_differences(
+                pbps_diff::Side {
+                    schema: &entry.snapshot.schema,
+                    ids: &entry.snapshot.ids,
+                },
+                pbps_diff::Side {
+                    schema: &loaded.schema,
+                    ids: &resolved.ids,
+                },
+                dialect.name(),
+            );
+            if !errors.is_empty() {
+                bail!(
+                    "{}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
         if resolved.ids != ids {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
@@ -7925,10 +8063,14 @@ async fn plan_db_async(
                     target_identity: identity.as_deref(),
                 };
                 let asked = crate::resolution::named(&assessment);
-                match crate::resolution::resolve(
+                // Boxed like the retained comparison above: the resolver's
+                // future is the largest in this block, and the bootstrap
+                // prerequisites (DEC-2447.2) it now carries tipped the owned
+                // lifecycle tests' native thread stacks over their limit.
+                match Box::pin(crate::resolution::resolve(
                     &request,
                     scratch.as_mut().expect("a required resolution selected an entry"),
-                ).await {
+                )).await {
                     Ok(unsealed) => {
                         resolver_assessment =
                             Some(crate::resolution::ResolverAssessment::resolved(&assessment));
@@ -9136,6 +9278,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     if plan.changes.is_empty()
         && original_ids.roles == plan.ids.roles
         && original_ids.types == plan.ids.types
+        && original_ids.extensions == plan.ids.extensions
     {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
@@ -11681,6 +11824,53 @@ mod tests {
             );
             assert_eq!(snapshot.declared.overlay(&snapshot.schema), loaded.schema);
         }
+    }
+
+    #[test]
+    fn bootstrap_extensions_are_exact_prerequisites_but_ordinary_objects_must_be_absent() {
+        let name = "vendor_default".into();
+        let package = pbps_model::Extension {
+            schema: "pg_catalog".into(),
+            version: "1.0".into(),
+        };
+        let mut schema = Schema {
+            extensions: [(name, package)].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "vendor_default".into())].into(),
+            ..Default::default()
+        };
+        let pg = pbps_pg::Postgres::new();
+        refuse_nonempty_bootstrap(&schema, &[], &pg, "target").unwrap();
+        refuse_extension_prerequisite_drift(&schema, &schema, &ids, &pg, "bootstrap").unwrap();
+        assert!(refuse_nonempty_bootstrap(&schema, &[], &pbps_mssql::Mssql, "target").is_err());
+        for changed in [
+            Schema::default(),
+            {
+                let mut changed = schema.clone();
+                changed
+                    .extensions
+                    .get_mut("vendor_default")
+                    .unwrap()
+                    .version = "2.0".into();
+                changed
+            },
+            {
+                let mut changed = schema.clone();
+                changed.extensions.get_mut("vendor_default").unwrap().schema = "other".into();
+                changed
+            },
+        ] {
+            let error =
+                refuse_extension_prerequisite_drift(&changed, &schema, &ids, &pg, "bootstrap")
+                    .unwrap_err();
+            assert!(error.to_string().contains("vendor_default"));
+        }
+        schema
+            .tables
+            .insert(TableName::new("app", "ordinary"), Default::default());
+        assert!(refuse_nonempty_bootstrap(&schema, &[], &pg, "target").is_err());
     }
 
     #[test]
@@ -17034,6 +17224,7 @@ mod tests {
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
+            extension_notices: BTreeMap::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -23113,6 +23304,7 @@ mod tests {
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
+            extension_notices: BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![
@@ -25000,5 +25192,109 @@ mod data_work_failure_tests {
         assert!(
             pbps_model::StateSnapshot::from_json(&serde_json::to_string(&failed).unwrap()).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_guard_tests {
+    use super::*;
+
+    #[test]
+    fn exact_extensions_are_required_at_every_read_back() {
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: "app.new".parse().unwrap(),
+                    table: Box::default(),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )],
+        };
+        for (schema, version) in [("ext", "1.4"), ("other", "1.6")] {
+            let mut before = Schema::default();
+            before.extensions.insert(
+                "package".into(),
+                pbps_model::Extension {
+                    schema: schema.into(),
+                    version: version.into(),
+                },
+            );
+            let mut expected = before.clone();
+            expected
+                .tables
+                .insert("app.new".parse().unwrap(), Default::default());
+            let ids = guard::fixture_ids(&changes, &before);
+            let plan = guard::Plan {
+                changes: &changes,
+                ids: &ids,
+            };
+            let staged = guard::Staged::new(plan).unwrap();
+            for read in [
+                None,
+                Some(StagedRead::Checkpoint {
+                    completed: 1,
+                    total: 2,
+                }),
+                Some(StagedRead::Checkpoint {
+                    completed: 2,
+                    total: 2,
+                }),
+                Some(StagedRead::Closing { total: 2 }),
+            ] {
+                let check = |after: &Schema| {
+                    let read = match read {
+                        None => guard::Read::transactional(plan),
+                        Some(read) => staged.read(read),
+                    };
+                    refuse_pinned_movement(
+                        &pbps_pg::Postgres::new(),
+                        read,
+                        &before,
+                        after,
+                        "fixture",
+                    )
+                };
+                // The ordinary change succeeds with the exact managed values
+                // it was approved over; no lifecycle exemption is invented.
+                check(&expected).unwrap();
+                for case in ["schema", "version", "missing", "renamed", "added"] {
+                    let mut moved = expected.clone();
+                    match case {
+                        "schema" => moved
+                            .extensions
+                            .get_mut("package")
+                            .unwrap()
+                            .schema
+                            .push('x'),
+                        "version" => moved
+                            .extensions
+                            .get_mut("package")
+                            .unwrap()
+                            .version
+                            .push('x'),
+                        "missing" => {
+                            moved.extensions.remove("package");
+                        }
+                        "renamed" => {
+                            let definition = moved.extensions.remove("package").unwrap();
+                            moved.extensions.insert("renamed".into(), definition);
+                        }
+                        "added" => {
+                            moved
+                                .extensions
+                                .insert("new".into(), before.extensions["package"].clone());
+                        }
+                        _ => unreachable!(),
+                    }
+                    let error = check(&moved).unwrap_err().to_string();
+                    assert!(
+                        error.contains("extension `") && error.contains("changed during fixture"),
+                        "{case}: {error}"
+                    );
+                }
+            }
+        }
     }
 }

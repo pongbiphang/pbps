@@ -80,6 +80,11 @@ pub fn role_path(dir: &Path, name: &pbps_model::RoleName) -> anyhow::Result<Path
     Ok(path)
 }
 
+pub fn extension_path(dir: &Path, name: &pbps_model::ObjectLocalName) -> PathBuf {
+    let encoded = escape_reserved_stem(component(name.raw()));
+    dir.join("extensions").join(format!("{encoded}.yml"))
+}
+
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     filename_of(&name.schema, &name.name, kind)
 }
@@ -192,6 +197,12 @@ pub fn paths_of(
     schema: &pbps_model::Schema,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
+    for name in schema.extensions.keys() {
+        out.push((
+            format!("extension {}", name.shown()),
+            extension_path(directory, name),
+        ));
+    }
     for name in schema.types.keys() {
         out.push((
             format!("type {}", name.shown()),

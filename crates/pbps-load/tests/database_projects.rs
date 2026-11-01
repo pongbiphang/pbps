@@ -330,3 +330,63 @@ fn flat_directory_links_keep_the_existing_loader_behavior() {
         1
     );
 }
+
+#[test]
+fn declared_extensions_and_held_identities_stay_in_their_database() {
+    let dir = Dir::new();
+    let paths = dir.paths();
+    for (name, uid, schema, version) in [
+        ("alpha", "e_aaaaaa", "ext", "1.4"),
+        ("beta", "e_bbbbbb", "other", "1.6"),
+    ] {
+        let path = paths.get(&db(name)).unwrap();
+        std::fs::write(
+            path.join("package.yml"),
+            format!("extension: package\nschema: {schema}\nversion: '{version}'\n"),
+        )
+        .unwrap();
+        write_ids(
+            &paths,
+            name,
+            &IdsFile {
+                extensions: [(uid.parse().unwrap(), "package".into())].into(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut project = load_database_dirs(&paths).unwrap();
+    assert_eq!(
+        project
+            .loaded()
+            .get(&db("alpha"))
+            .unwrap()
+            .schema
+            .extensions["package"]
+            .schema,
+        "ext"
+    );
+    assert_eq!(
+        project.loaded().get(&db("beta")).unwrap().schema.extensions["package"].version,
+        "1.6"
+    );
+    for (name, uid) in [("alpha", "e_aaaaaa"), ("beta", "e_bbbbbb")] {
+        assert_eq!(
+            project
+                .ids()
+                .get(&db(name))
+                .unwrap()
+                .extension_uid(&"package".into()),
+            Some(&uid.parse().unwrap())
+        );
+        assert!(project.reservations().contains(&uid.parse().unwrap()));
+    }
+    write_ids(
+        &paths,
+        "beta",
+        &project.ids().get(&db("alpha")).unwrap().clone(),
+    );
+    let error = load_database_dirs(&paths).unwrap_err().to_string();
+    for name in ["alpha", "beta", "e_aaaaaa"] {
+        assert!(error.contains(name), "{error}");
+    }
+}

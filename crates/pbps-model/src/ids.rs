@@ -105,6 +105,10 @@ pub struct IdsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<Uid, crate::TypeRef>,
 
+    /// Compatible version-one evolution, like roles and types (DEC-2447.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<Uid, crate::ObjectLocalName>,
+
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
 
@@ -138,6 +142,7 @@ impl Default for IdsFile {
             columns: BTreeMap::new(),
             roles: BTreeMap::new(),
             types: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
             rebuilds: BTreeMap::new(),
@@ -246,6 +251,14 @@ impl IdsFile {
     /// declaration's deletion, and ledger recording has its own boundary
     /// (DEC-1797.1, DEC-1600.1).
     pub fn check_held_by(&self, schema: &crate::Schema) -> Result<(), IdsError> {
+        for (uid, name) in &self.extensions {
+            if !schema.extensions.contains_key(name) {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: name.raw().to_owned(),
+                });
+            }
+        }
         for (uid, name) in &self.types {
             if !schema.types.contains_key(name) {
                 return Err(IdsError::NotHeld {
@@ -353,6 +366,13 @@ impl IdsFile {
         self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
 
+    pub fn extension_uid(&self, name: &crate::ObjectLocalName) -> Option<&Uid> {
+        self.extensions
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(u, _)| u)
+    }
+
     pub fn type_uid(&self, name: &crate::TypeRef) -> Option<&Uid> {
         self.types.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
@@ -368,6 +388,7 @@ impl IdsFile {
             || self.columns.contains_key(uid)
             || self.roles.contains_key(uid)
             || self.types.contains_key(uid)
+            || self.extensions.contains_key(uid)
             || self.tombstones.contains_key(uid)
     }
 
@@ -469,6 +490,11 @@ impl IdsFile {
             }
         }
 
+        for uid in self.extensions.keys() {
+            if uid.kind() != UidKind::Extension {
+                return Err(IdsError::KindMismatch { uid: uid.clone() });
+            }
+        }
         for uid in self.types.keys() {
             if uid.kind() != UidKind::Type {
                 return Err(IdsError::KindMismatch { uid: uid.clone() });
@@ -488,6 +514,7 @@ impl IdsFile {
                 || self.columns.contains_key(uid)
                 || self.roles.contains_key(uid)
                 || self.types.contains_key(uid)
+                || self.extensions.contains_key(uid)
             {
                 return Err(IdsError::LiveAndTombstoned { uid: uid.clone() });
             }
@@ -497,6 +524,7 @@ impl IdsFile {
         check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
         check_unique(self.roles.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
         check_unique(self.types.iter().map(|(u, n)| (u, n.raw().to_string())))?;
+        check_unique(self.extensions.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -1442,5 +1470,98 @@ mod managed_type_tests {
             ids.validate(),
             Err(IdsError::LiveAndTombstoned { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    #[test]
+    fn extension_identities_are_compatible_but_strict_about_ownership() {
+        let mut ids: IdsFile = serde_json::from_value(
+            serde_json::json!({"version": CURRENT_VERSION, "tables": {}, "columns": {}}),
+        )
+        .unwrap();
+        assert!(ids.extensions.is_empty());
+        assert!(!serde_json::to_string(&ids).unwrap().contains("extensions"));
+        let uid: Uid = "e_000001".parse().unwrap();
+        assert_eq!(uid.kind(), UidKind::Extension);
+        ids.extensions.insert(uid.clone(), "citext".into());
+        ids.validate().unwrap();
+        assert!(ids.contains_uid(&uid));
+        assert_eq!(ids.extension_uid(&"citext".into()), Some(&uid));
+        assert!(ids.check_held_by(&crate::Schema::default()).is_err());
+        let mut schema = crate::Schema::default();
+        schema.extensions.insert(
+            "citext".into(),
+            crate::Extension {
+                schema: "public".into(),
+                version: "1.4".into(),
+            },
+        );
+        ids.check_held_by(&schema).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IdsFile>(&serde_json::to_string(&ids).unwrap()).unwrap(),
+            ids
+        );
+        let mut bad = ids.clone();
+        bad.extensions
+            .insert("e_000002".parse().unwrap(), "citext".into());
+        assert!(matches!(
+            bad.validate(),
+            Err(IdsError::DuplicateName { .. })
+        ));
+        let mut bad = ids.clone();
+        bad.extensions
+            .insert("y_000002".parse().unwrap(), "hstore".into());
+        assert!(matches!(bad.validate(), Err(IdsError::KindMismatch { .. })));
+        ids.tombstones.insert(
+            uid,
+            Tombstone {
+                was: "citext".into(),
+                dropped_at: "2026-10-29".into(),
+                reason: "retired".into(),
+                operator: "operator".into(),
+                require: None,
+            },
+        );
+        assert!(matches!(
+            ids.validate(),
+            Err(IdsError::LiveAndTombstoned { .. })
+        ));
+    }
+
+    #[test]
+    fn old_snapshots_own_no_extensions_and_new_checksums_pin_exact_packages() {
+        let old = crate::StateSnapshot::new(
+            crate::StateKind::Baseline,
+            crate::Schema::default(),
+            IdsFile::default(),
+            "operator",
+        );
+        let mut json = serde_json::to_value(&old).unwrap();
+        json["version"] = (crate::state::CURRENT_VERSION - 1).into();
+        let back = crate::StateSnapshot::from_json(&json.to_string()).unwrap();
+        assert!(back.schema.extensions.is_empty());
+        assert!(back.ids.extensions.is_empty());
+        let mut new = old.clone();
+        new.schema.extensions.insert(
+            "citext".into(),
+            crate::Extension {
+                schema: "public".into(),
+                version: "1.4".into(),
+            },
+        );
+        new.ids
+            .extensions
+            .insert("e_000001".parse().unwrap(), "citext".into());
+        assert_ne!(
+            crate::plan::state_checksum(&old.schema, &old.ids),
+            crate::plan::state_checksum(&new.schema, &new.ids)
+        );
+        let back = crate::StateSnapshot::from_json(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.schema, new.schema);
+        assert_eq!(back.version, crate::state::CURRENT_VERSION);
     }
 }

@@ -4421,3 +4421,121 @@ Plan 59 adds the column-default target. Schema set 84 archives the complete
 published set over PR 1's set 83. Existing archives remain unchanged. The state
 format stays unchanged because declared defaults already have their own
 expression and binding maps.
+
+<a id="dec-2447-1"></a>
+
+**DEC-2447.1. Exact installed extensions are read-only managed state.**
+
+PR A adopts a database-global immutable extension name with an `e_` UID,
+explicit schema and required nonempty quoted version. Version text is opaque
+and exact. Rename annotations are refused. The neutral Schema owns definitions;
+ids version 1 adds a default-empty, skip-empty extensions map. State version 36
+records it, and supported older snapshots own none. Empty maps preserve older
+serialized state/checksum shapes. Published schemas advance as a complete set;
+this slice adds no executable Change and does not advance the plan format.
+
+PostgreSQL reads every installed package, including system bootstrap plpgsql,
+in the same catalog snapshot. Missing, malformed, duplicate and empty required
+fields refuse; a read failure never becomes an absent package. Full pull writes
+all installed packages and preserves existing identities. Connected comparison
+and verify keep the recorded managed scope. An installed unheld package requires
+explicit pull/baseline adoption; declaring it alone cannot claim ownership.
+
+CREATE, DROP, UPDATE and SET SCHEMA differences use the differ's existing named
+unexpressible-drift/refusal channel. No successful executable plan can discard
+one of these differences. Extension code risk, required rehearsal, drop intent,
+member evidence, lifecycle operations and provider-type support belong to the
+remaining approved #2447 slices rather than placeholder executable operations.
+
+The census carries extension notices by raw package identity beside ordinary
+unheld notices. Full pull represents them as declarations; connected planning
+reports packages outside recorded extension ids. Unsupported extension comments
+remain notices. The existing system-OID and direct-e plus internal/automatic
+member projection rules remain in force: plpgsql is pulled but does not become
+an unheld-system advisory, while unrelated objects sharing a package schema
+stay visible. Real PostgreSQL 16/18 tests pin adoption, no-op comparison, native
+version/schema/missing-package drift, lifecycle refusals, old scope, members
+and comments. Type-provider acceptance and executable extension transitions
+are deliberately not claimed by this read-only contract.
+
+
+Scratch bootstrap is not a requested lifecycle transition. Its comparison base
+retains the exact adopted extension definitions and identities, but no ordinary
+managed objects. Before compiling those objects, both resolver and rehearsal
+require each package to be installed on the isolated scratch at the exact
+version and schema. The operator provisions it through the existing externals
+file on run-owned or supplied scratch; PR A never installs or alters a package
+itself. An
+absent or mismatching prerequisite refuses by name, without substituting a
+server default or skipping the package. The existing environment compatibility
+check still requires target versions to be available on scratch. This rule
+keeps extension code execution/provider certification in the later slices;
+real-target CREATE/DROP/UPDATE/SET SCHEMA differences keep their refusals.
+
+
+<a id="dec-2447-2"></a>
+
+**DEC-2447.2. Installed inventory is not ownership; bootstrap verifies package prerequisites.**
+
+A raw PostgreSQL read includes all installed packages, while a programmatic
+model or a managed-scope cut can omit unheld packages. Compare extension
+lifecycle only for names held by an extension UID on either side. Inventory
+alone cannot request CREATE or DROP, including when it appears only on the
+read-back side. An explicit adoption, identity replacement, removal, version
+change or relocation remains subject to DEC-2447.1's named refusal in an
+ordinary plan. Neither a package name, a system schema, an OID nor an available
+server-default version grants ownership or exempts a managed difference.
+
+Measured on pinned PostgreSQL 16 and 18, template0 starts with plpgsql only.
+The available default for citext differs across the two majors; hstore and
+citext installed with their server defaults, including citext in pg_catalog,
+are inherited exactly when their database is used as a template. Thus being
+preinstalled is a property of the target, not a hard-coded package category.
+Full pull continues to declare every installed package with exact metadata.
+
+Connected bootstrap is an explicit adoption into an empty ordinary managed
+set. As with standing cluster roles and scratch bootstrap, its declared
+extensions must already exist. Form its ordinary-object plan over just the
+adopted package prerequisites, then verify exact name/schema/version under
+the deployment lock and again in the read-back being recorded. Record only
+the declared package identities after those checks. Missing or mismatching
+packages refuse before object creation; standing ordinary objects still refuse.
+Bootstrap never installs, upgrades, moves or drops a package. A --sql script
+checks the same exact metadata on its replay target before any managed DDL.
+An initial offline authoring preview with no historical model carries only
+assumed package prerequisites and says they are unverified; it does not mint
+permission for lifecycle DDL or an executable deployment plan.
+State, plan and published-schema formats do not change.
+
+
+<a id="dec-2447-3"></a>
+
+**DEC-2447.3. Extension management requires explicit selection before adoption.**
+
+This amends the sentences in DEC-2447.1 and DEC-2447.2 that full pull declares
+all installed packages. Pull still reads the complete installed inventory
+strictly, but selects new packages only through repeatable `--extension NAME`.
+Existing extension declarations and held identities remain selected and refresh
+on later pulls, forced ones included. Unknown or uninstalled selections refuse
+by name before any publication; unreadable declarations, identity history or
+inventory cannot become an empty scope. `init --from` has no package selector
+and leaves installed packages unselected as well.
+
+Installed unselected packages gain neither declarations nor identities. Pull
+prints their names and exact versions on one line, followed by a command to
+opt one in; both lines are absent when every installed package is selected.
+Pull has no JSON output. Selection writes desired files, not adoption into
+database history: only explicit baseline or checked bootstrap records the
+selected packages, after exact name/schema/version verification. Neither
+operation discovers additional packages. Ordinary planning still refuses
+unheld adoption before that recording.
+
+Measured on PostgreSQL 16 and 18, stock plpgsql can be reinstalled with a new
+OID, citext can occupy pg_catalog, and arbitrary packages can be inherited from
+a template. Thus neither name, OID, namespace nor server-default version
+expresses management intent. Already minted identities remain managed; there
+is no reliable provenance that permits silently releasing earlier automatic
+adoptions. Missing managed packages on scratch/reconstruction refuse by name:
+provision the exact version/schema externally. Logical scope cuts must project
+both definitions and identities together. PR A installs no package and infers
+no default version; lifecycle and provider-code support remain later slices.

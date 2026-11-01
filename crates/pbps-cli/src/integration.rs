@@ -41,11 +41,13 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 84;
+pub const SCHEMA_VERSION: u32 = 85;
+// 85: exact read-only PostgreSQL extension declarations/state (#2447 PR A).
 // 84: retained column DEFAULT writebacks (#2354, DEC-2354.4).
 // 83: retained CHECK writebacks (#2354).
 // 82: PostgreSQL resolver authorization reproduction status and notice (#2570).
 // 78: named SQL Server database layouts in project configuration (#2501).
+// 77: chained SQL Server staged resolver evidence (#2376).
 // 74: guarded drop row requirements in plan explanations (#2400).
 // 71: report-only catalog census policy (#2444).
 // 70: report-only unmanaged-grant policy (#2446).

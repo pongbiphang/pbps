@@ -328,6 +328,16 @@ fn resolve_with_provenance(
     };
     let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
+    // Immutable global names never enter rename inference (DEC-2447.1).
+    r.ids
+        .extensions
+        .retain(|_, name| declared.extensions.contains_key(name));
+    for name in declared.extensions.keys() {
+        if r.ids.extension_uid(name).is_none() {
+            let uid = fresh_uid(&r.ids, UidKind::Extension);
+            r.ids.extensions.insert(uid, name.clone());
+        }
+    }
 
     resolve_types(
         declared,

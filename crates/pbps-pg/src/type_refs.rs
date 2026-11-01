@@ -6,6 +6,7 @@ pub mod renames;
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
+use pbps_model::escape::Escaped;
 use pbps_model::{
     Change, ChangeSet, Column, ColumnName, ColumnType, ModuleKind, Schema, TypePin, TypeRef,
     ValueSource,
@@ -615,7 +616,7 @@ pub fn bootstrap_guard(
         .into_iter()
         .filter(|r| !schema.types.contains_key(r))
         .collect();
-    if refs.is_empty() && trusted.is_empty() {
+    if refs.is_empty() && trusted.is_empty() && schema.extensions.is_empty() {
         return Ok(None);
     }
     let mut sql = String::from("BEGIN\n");
@@ -636,6 +637,20 @@ pub fn bootstrap_guard(
         ));
         sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname={name}) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
     }
+    // A bootstrap script does not install packages. Verify on its replay
+    // target before any managed-object DDL, just as connected bootstrap does.
+    for (name, definition) in &schema.extensions {
+        let package = crate::emit::literal(name.raw());
+        let namespace = crate::emit::literal(&definition.schema);
+        let version = crate::emit::literal(&definition.version);
+        let message = crate::emit::literal(&format!(
+            "required extension `{}` must already be installed at exact version `{}` in schema `{}`",
+            name.shown(),
+            Escaped(&definition.version),
+            Escaped(&definition.schema),
+        ));
+        sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace WHERE e.extname={package} AND n.nspname={namespace} AND e.extversion={version}) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
+    }
     sql.push_str("END");
     let tag = crate::emit::dollar_tag(&sql);
     Ok(Some(format!("DO {tag}\n{sql}\n{tag};")))
@@ -644,6 +659,37 @@ pub fn bootstrap_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_package_guards_pin_exact_metadata_and_quote_opaque_versions() {
+        let schema = Schema {
+            extensions: [(
+                "vendor".into(),
+                pbps_model::Extension {
+                    schema: "pg_catalog".into(),
+                    version: "v'$pbps$\nnext".into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let sql = bootstrap_guard(&schema, &BTreeSet::new()).unwrap().unwrap();
+        for expected in [
+            "pg_catalog.pg_extension",
+            "e.extname=",
+            "n.nspname=",
+            "e.extversion=",
+            "required extension",
+            "DO $pbps1$",
+        ] {
+            assert!(sql.contains(expected), "{sql}");
+        }
+        assert!(!sql.contains("CREATE EXTENSION"));
+        assert_eq!(
+            bootstrap_guard(&Schema::default(), &BTreeSet::new()).unwrap(),
+            None
+        );
+    }
 
     fn declared_default_schema(definition: pbps_model::ManagedType, array: bool) -> Schema {
         let reference = "app.value".parse().unwrap();

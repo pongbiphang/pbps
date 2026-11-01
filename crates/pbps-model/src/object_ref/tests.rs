@@ -79,6 +79,7 @@ fn fixture() -> Schema {
     let mut view = module(ModuleKind::View);
     view.options.indexes = t.indexes.clone();
     Schema {
+        extensions: Default::default(),
         tables: [("app.t".parse().unwrap(), t)].into(),
         types: [(
             "app.d".parse().unwrap(),

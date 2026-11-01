@@ -474,6 +474,10 @@ enum Command {
         /// repeatable. pg_partman's parents are found without it
         #[arg(long = "partitions-external", value_name = "TABLE")]
         partitions_external: Vec<String>,
+
+        /// Select this installed extension for management (exact schema/version); repeatable
+        #[arg(long = "extension", value_name = "NAME")]
+        extensions: Vec<String>,
     },
 
     /// Run a saved plan against the environment it was computed for
@@ -1538,7 +1542,15 @@ fn run() -> anyhow::Result<()> {
             force,
             data,
             partitions_external,
-        } => cmd_pull(&project, &target, force, &data, &partitions_external),
+            extensions,
+        } => cmd_pull(
+            &project,
+            &target,
+            force,
+            &data,
+            &partitions_external,
+            &extensions,
+        ),
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
             let json = format == OutputFormat::Json;
@@ -1697,6 +1709,7 @@ fn cmd_pull(
     force: bool,
     data: &[String],
     partitions_external: &[String],
+    extensions: &[String],
 ) -> anyhow::Result<()> {
     // 1. Parsed before anything else: a misspelt table name is a fact about
     // the command line alone, and it should cost neither a look at the
@@ -1768,6 +1781,7 @@ fn cmd_pull(
                 || !ids.columns.is_empty()
                 || !ids.roles.is_empty()
                 || !ids.types.is_empty()
+                || !ids.extensions.is_empty()
                 || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
@@ -1780,6 +1794,10 @@ fn cmd_pull(
         }
     }
 
+    let protected_inputs = [project.ids_file(), project.config_file()];
+    let extension_scope =
+        adopt::extension_scope(&dir, existing_ids.as_ref(), extensions, &protected_inputs)?;
+
     // Annotated because `db::connect` widens the block's error to `anyhow`:
     // it carries the "cannot connect to the database" context every other
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
@@ -1789,7 +1807,7 @@ fn cmd_pull(
     // project already said: it reads the environment's `url_env` variable,
     // which is the one thing here that depends on the machine.
     let target = target.resolve(project)?;
-    let pulled = db::runtime()?.block_on(async {
+    let mut pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(&target).await?;
         let mut pulled =
             crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
@@ -1891,6 +1909,7 @@ fn cmd_pull(
         Ok::<_, anyhow::Error>(pulled)
     })?;
 
+    let extension_notices = adopt::select_extensions(&mut pulled.schema, &extension_scope)?;
     for notice in &pulled.onboarding_notices {
         eprintln!("warning: {}", notice);
     }
@@ -2036,19 +2055,7 @@ fn cmd_pull(
     // Force replaces declarations, never config or identity inputs reached
     // through an output name or one of the entries about to be removed.
     for path in written.iter().chain(&present) {
-        for protected in [project.ids_file(), project.config_file()] {
-            anyhow::ensure!(
-                !paths::same_file(path, &protected)?,
-                "`{}` aliases protected project input `{}`",
-                pbps_model::Text::new(path.display().to_string()).shown(),
-                pbps_model::Text::new(protected.display().to_string()).shown()
-            );
-        }
-        anyhow::ensure!(
-            paths::absolute(path)?.starts_with(&root),
-            "`{}` resolves outside the declaration directory",
-            pbps_model::Text::new(path.display().to_string()).shown()
-        );
+        paths::refuse_declaration_path(path, &root, &protected_inputs)?;
     }
     // Identity validation/serialization remains a semantic prerequisite for
     // declaration publication. Keep unchanged JSON byte-exact.
@@ -2083,12 +2090,16 @@ fn cmd_pull(
     }
 
     println!(
-        "Pulled {} table(s), {} module(s) and {} type(s) into `{}`.",
+        "Pulled {} table(s), {} module(s), {} type(s) and {} extension(s) into `{}`.",
         pulled.schema.tables.len(),
         pulled.schema.modules.len(),
         pulled.schema.types.len(),
+        pulled.schema.extensions.len(),
         dir.display()
     );
+    for notice in extension_notices {
+        println!("{notice}");
+    }
     let left_out =
         pulled.warnings.len() + pulled.catalog_notices.len() + pulled.unexpressible.len();
     if left_out > 0 {
@@ -2129,8 +2140,17 @@ fn cmd_pull(
     let minted = res.created_tables.len()
         + res.added_columns.len()
         + res.created_roles.len()
-        + res.ids.types.len().saturating_sub(ids.types.len());
-    let kept = ids.tables.len() + ids.columns.len() + ids.roles.len() + ids.types.len();
+        + res.ids.types.len().saturating_sub(ids.types.len())
+        + res
+            .ids
+            .extensions
+            .len()
+            .saturating_sub(ids.extensions.len());
+    let kept = ids.tables.len()
+        + ids.columns.len()
+        + ids.roles.len()
+        + ids.types.len()
+        + ids.extensions.len();
     println!("Preserved {kept} existing identities; minted {minted} new identities.");
     println!(
         "Next: review and commit these files. Pull does not update database history or accept \
@@ -3334,6 +3354,7 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
                 }
                 other @ (pbps_model::diagnostic::Declaration::Table(_)
                 | pbps_model::diagnostic::Declaration::Module(_)
+                | pbps_model::diagnostic::Declaration::Extension(_)
                 | pbps_model::diagnostic::Declaration::Type(_)
                 | pbps_model::diagnostic::Declaration::Role(_)) => other,
             };
@@ -3382,8 +3403,21 @@ fn declaration_problems_with_sources(
         types,
         modules,
         roles,
+        extensions,
     } = schema;
     let mut out = dependencies::problems(&loaded.dependencies, dialect);
+    if dialect.name() != "postgres" {
+        for name in extensions.keys() {
+            out.push((
+                "dialect.rejected",
+                format!(
+                    "extension `{}`: PostgreSQL extensions are unsupported on {}",
+                    name.shown(),
+                    dialect.name()
+                ),
+            ));
+        }
+    }
     for (name, definition) in types {
         for error in dialect.validate_type(name, definition) {
             out.push((
@@ -4022,6 +4056,9 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Role(r)) => {
                 declared.roles.insert(r.name, r.role);
             }
+            Ok(pbps_load::LoadedFile::Extension(e)) => {
+                declared.extensions.insert(e.name, e.definition);
+            }
             Ok(pbps_load::LoadedFile::Type(t)) => {
                 declared.types.insert(t.name, t.definition);
             }
@@ -4210,6 +4247,11 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Role(r) => {
                 declared.roles.insert(r.name.clone(), r.role.clone());
             }
+            pbps_load::LoadedFile::Extension(e) => {
+                declared
+                    .extensions
+                    .insert(e.name.clone(), e.definition.clone());
+            }
             pbps_load::LoadedFile::Type(t) => {
                 declared.types.insert(t.name.clone(), t.definition.clone());
             }
@@ -4227,6 +4269,10 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
             pbps_load::LoadedFile::Dependency(d) => (
                 pbps_load::render_dependency(&d.name, &d.declaration),
+                Vec::new(),
+            ),
+            pbps_load::LoadedFile::Extension(e) => (
+                pbps_load::render_extension(&e.name, &e.definition),
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Type(t) => {
@@ -4997,10 +5043,16 @@ fn cmd_plan(
         }
 
         if base.is_empty_fallback {
-            let message = format!(
+            let mut message = format!(
                 "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
                 base.description
             );
+            if !loaded.schema.extensions.is_empty() {
+                message = format!(
+                    "the baseline is empty ({}). Ordinary objects are listed as newly created; extension declarations are unverified prerequisites. This is not a real plan against an existing database.",
+                    base.description
+                );
+            }
             if json {
                 findings.push(output::Finding::warning("baseline.empty", message));
             } else {
@@ -5031,6 +5083,19 @@ fn cmd_plan(
         // nothing and the overlay leaves it as it is.
         hints.record_row_defaults(&base.schema);
         let mut base_schema = base.declared.overlay(&base.schema);
+        let mut base_ids = (*base.ids).clone();
+        if base.is_empty_fallback {
+            // With no historical model this is an authoring preview, not a
+            // request to install packages. Connected commands must verify the
+            // exact prerequisites before recording them (DEC-2447.2).
+            let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(Side {
+                schema: &loaded.schema,
+                ids: &res.ids,
+            });
+            base_schema.extensions = prerequisites.extensions;
+            base_ids.extensions = prerequisite_ids.extensions;
+        }
+        let base_ids = base_ids.validated()?;
         // A snapshot is a read, which knows the sequence names it leaves out; a
         // git baseline is declarations, which do not (#1631).
         if let baseline::Source::File(_) = source {
@@ -5039,7 +5104,7 @@ fn cmd_plan(
         let cs = pbps_diff::diff(
             Side {
                 schema: &base_schema,
-                ids: &base.ids,
+                ids: &base_ids,
             },
             Side {
                 schema: &loaded.schema,
@@ -5150,7 +5215,7 @@ fn cmd_plan(
                     sources: dependents::Sources {
                         before: Side {
                             schema: &base_schema,
-                            ids: &base.ids,
+                            ids: &base_ids,
                         },
                         after: &res.ids,
                     },
@@ -5164,7 +5229,7 @@ fn cmd_plan(
         let skipped = scheduled.skipped;
         let mut cs = scheduled.changes;
         findings.extend(deploy::type_replacement_warnings(
-            &base.ids,
+            &base_ids,
             &res.ids,
             cs.changes(),
             json,
@@ -5181,7 +5246,7 @@ fn cmd_plan(
             false,
             Side {
                 schema: &base_schema,
-                ids: &base.ids,
+                ids: &base_ids,
             },
             Side {
                 schema: &loaded.schema,
@@ -5386,8 +5451,12 @@ fn cmd_plan(
                 "rehearsal.unavailable",
                 dev::rehearse(
                     &spec,
-                    &base.schema,
-                    &base.ids,
+                    if base.is_empty_fallback {
+                        &base_schema
+                    } else {
+                        &base.schema
+                    },
+                    &base_ids,
                     &base.hints,
                     &loaded.schema,
                     &res.ids,

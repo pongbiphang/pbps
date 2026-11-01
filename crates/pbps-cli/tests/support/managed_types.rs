@@ -2632,9 +2632,9 @@ fn enum_label_renames_keep_rows_and_rebuild_updated_checks_and_defaults() {
                 ]));
             }
             // A retained check and default both bind the renamed constants.
-            for path in std::fs::read_dir(d.dir.join("schema"))
+            for path in pbps_load::schema_files(&d.dir.join("schema"))
                 .unwrap()
-                .map(|e| e.unwrap().path())
+                .into_iter()
             {
                 if path != file {
                     let text = std::fs::read_to_string(&path)
@@ -2746,9 +2746,9 @@ fn enum_label_renames_keep_rows_and_rebuild_updated_checks_and_defaults() {
             "--reason",
             "adopt enum array defaults and checks",
         ]));
-        for path in std::fs::read_dir(d.dir.join("schema"))
+        for path in pbps_load::schema_files(&d.dir.join("schema"))
             .unwrap()
-            .map(|e| e.unwrap().path())
+            .into_iter()
         {
             let text = std::fs::read_to_string(&path)
                 .unwrap()

@@ -75,6 +75,30 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// An existing declaration candidate is also a publication destination. Reject
+/// foreign aliases before decoding it (DEC-2447.3), and recheck all destinations
+/// before publication; protected inputs remain protected under force (DEC-2351.1).
+pub(crate) fn refuse_declaration_path(
+    path: &Path,
+    root: &Path,
+    protected: &[PathBuf],
+) -> anyhow::Result<()> {
+    for input in protected {
+        anyhow::ensure!(
+            !same_file(path, input)?,
+            "`{}` aliases protected project input `{}`",
+            pbps_model::Text::new(path.display().to_string()).shown(),
+            pbps_model::Text::new(input.display().to_string()).shown()
+        );
+    }
+    anyhow::ensure!(
+        absolute(path)?.starts_with(root),
+        "`{}` resolves outside the declaration directory",
+        pbps_model::Text::new(path.display().to_string()).shown()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

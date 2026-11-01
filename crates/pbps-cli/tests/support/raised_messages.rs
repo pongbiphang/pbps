@@ -95,9 +95,9 @@ pub fn check(server: &str, pg: bool) {
                 ),
             )
             .unwrap();
-            let table = std::fs::read_dir(d.dir.join("schema"))
+            let table = pbps_load::schema_files(&d.dir.join("schema"))
                 .unwrap()
-                .map(|entry| entry.unwrap().path())
+                .into_iter()
                 .find(|path| std::fs::read_to_string(path).unwrap().starts_with("table:"))
                 .unwrap();
             let declared = format!(
