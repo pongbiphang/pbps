@@ -24116,3 +24116,42 @@ mod offline_comparison_base {
         );
     }
 }
+
+#[test]
+fn test_input_refusals_use_the_published_envelope_without_runtime_acquisition() {
+    let d = Demo::new("test1165-envelope");
+    let out = d.run(&["test", "--format", "json"]);
+    assert_eq!(code(&out), 2);
+    let validator = jsonschema::validator_for(&envelope_schema()).unwrap();
+    envelope_matches_schema(&validator, "test", &out);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(value["data"]["run_id"].is_null());
+    assert!(value["data"]["input"].is_null());
+    assert!(value["data"]["unavailable"]["run_id"].is_string());
+    assert!(value["data"].get("plan").is_none());
+    let previous = serde_json::from_str(include_str!(
+        "fixtures/published-schemas/82/envelope.schema.json"
+    ))
+    .unwrap();
+    assert!(
+        !jsonschema::validator_for(&previous)
+            .unwrap()
+            .is_valid(&value),
+        "the new command requires DEC-1734.1's new archive floor"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn test_cleanup_refuses_an_unsupported_ownership_platform_with_an_envelope() {
+    let d = Demo::new("test1165-platform");
+    let out = Command::new(BIN)
+        .args(["test", "--cleanup", "--format", "json"])
+        .env("XDG_STATE_HOME", &d.dir)
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["result"], "unanswerable");
+    assert_eq!(value["data"]["cleanup_confirmed"], false);
+}

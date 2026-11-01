@@ -147,12 +147,149 @@ pub(crate) struct TestData {
     pub replay_ms: u64,
     pub cleanup_confirmed: bool,
 }
+// Preserve the JSON findings while showing optional values and lists plainly to people.
+fn summary_values<I>(values: I, human: bool) -> String
+where
+    I: IntoIterator + std::fmt::Debug,
+    I::Item: std::fmt::Display,
+{
+    if !human {
+        return format!("{values:?}");
+    }
+    let values: Vec<_> = values
+        .into_iter()
+        .map(|v| pbps_model::escape::Escaped(&v.to_string()).to_string())
+        .collect();
+    if values.is_empty() {
+        "none".into()
+    } else {
+        values.join(", ")
+    }
+}
 impl TestData {
     pub fn new(cleanup: bool) -> Self {
         Self {
             operation: if cleanup { "cleanup" } else { "run" }.into(),
             ..Self::default()
         }
+    }
+    pub(crate) fn summary(&self, human: bool) -> Vec<Finding> {
+        use pbps_model::escape::Escaped;
+        let mut notes = Vec::new();
+        if let Some(input) = &self.input {
+            notes.push(Finding::note(
+                "test.identity",
+                format!(
+                    "{} candidate at {}; base {}; image {}",
+                    if input.candidate.uncommitted {
+                        "uncommitted working-tree"
+                    } else {
+                        "committed"
+                    },
+                    input.candidate.commit,
+                    input.base,
+                    input.image
+                ),
+            ));
+        }
+        notes.push(Finding::note(
+            "test.runtime",
+            format!(
+                "run {}; acquired image {}; engine {}",
+                summary_values(&self.run_id, human),
+                summary_values(&self.acquired_image, human),
+                summary_values(&self.engine_build, human)
+            ),
+        ));
+        let files = self
+            .input
+            .as_ref()
+            .map_or(&self.observed_input.files, |i| &i.files);
+        for f in files {
+            notes.push(Finding::note(
+                "test.input.hash",
+                format!(
+                    "{} `{}` at {}: {}",
+                    f.role,
+                    Escaped(&f.path),
+                    f.revision,
+                    f.sha256
+                ),
+            ));
+        }
+        for (label, commit) in &self.observed_input.resolved_commits {
+            notes.push(Finding::note(
+                "test.input.commit",
+                format!("{}: {commit}", Escaped(label)),
+            ));
+        }
+        for p in &self.phases {
+            let outcome = if human {
+                match p.outcome {
+                    Status::Passed => "passed",
+                    Status::Failed => "failed",
+                    Status::Unanswerable => "unanswerable",
+                    Status::Skipped => "skipped",
+                }
+                .into()
+            } else {
+                format!("{:?}", p.outcome)
+            };
+            notes.push(Finding::note(
+                "test.phase",
+                format!(
+                    concat!(
+                        "{} `{}`: {}, {} ms; checksum {}; accepted {}; started {}; ",
+                        "from {} to {}, distance {}; changes {}; statements {}; ",
+                        "entry {}; risks {}"
+                    ),
+                    p.phase,
+                    Escaped(&p.identity),
+                    outcome,
+                    p.elapsed_ms,
+                    summary_values(&p.checksum, human),
+                    p.accepted,
+                    p.started,
+                    summary_values(&p.from, human),
+                    summary_values(&p.to, human),
+                    summary_values(p.distance, human),
+                    summary_values(p.changes, human),
+                    summary_values(p.statements, human),
+                    summary_values(p.entry, human),
+                    summary_values(&p.risks, human)
+                ),
+            ));
+        }
+        for (field, reason) in self
+            .unavailable
+            .iter()
+            .chain(self.phases.iter().flat_map(|p| p.unavailable.iter()))
+        {
+            notes.push(Finding::note(
+                "test.unavailable",
+                format!("{}: {reason}", Escaped(field)),
+            ));
+        }
+        for assertion in &self.assertions {
+            let evidence =
+                serde_json::to_string(assertion).expect("typed test evidence serializes");
+            notes.push(Finding::note("test.assertion.evidence", evidence));
+        }
+        notes.push(Finding::note(
+            "test.cleanup",
+            format!(
+                concat!(
+                    "cleanup confirmed: {}; replay hops: {}, {} ms; ",
+                    "recovered {}; live {}"
+                ),
+                self.cleanup_confirmed,
+                self.replay_hops,
+                self.replay_ms,
+                summary_values(&self.recovery_removed, human),
+                summary_values(&self.recovery_live, human)
+            ),
+        ));
+        notes
     }
     pub fn failure(&mut self, phase: usize, id: &str, message: String, unknown: bool) {
         let p = &mut self.phases[phase];

@@ -11,32 +11,13 @@
 //! the same facts as text or JSON and cannot reach a database past one.
 
 mod chain;
-#[cfg_attr(
-    all(not(target_os = "linux"), not(test)),
-    expect(
-        dead_code,
-        reason = "D2b2 consumes the owned services; unit tests use every execution method"
-    )
-)]
+mod runner;
+pub(crate) use runner::command;
 pub(crate) mod execution;
 mod files;
 mod git;
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(
-        dead_code,
-        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
-    )
-)]
 pub(crate) mod report;
 pub(crate) mod revision;
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(
-        dead_code,
-        reason = "D2b2 consumes the owned services; live lifecycle tests require Linux"
-    )
-)]
 pub(crate) mod session;
 
 use std::collections::BTreeMap;
