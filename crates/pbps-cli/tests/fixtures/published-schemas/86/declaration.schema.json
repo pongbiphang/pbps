@@ -4,6 +4,9 @@
   "description": "One pbps declaration file: a table, module, role, enum or domain.\nThe leading key is both the kind and the name.",
   "anyOf": [
     {
+      "$ref": "#/$defs/ExtensionDto"
+    },
+    {
       "$ref": "#/$defs/DependencyDto"
     },
     {
@@ -23,6 +26,28 @@
     }
   ],
   "$defs": {
+    "ExtensionDto": {
+      "description": "Exact PostgreSQL package declaration. Rename is deliberately not a field.",
+      "type": "object",
+      "properties": {
+        "extension": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "extension",
+        "schema",
+        "version"
+      ]
+    },
     "DependencyDto": {
       "type": "object",
       "properties": {

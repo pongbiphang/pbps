@@ -957,7 +957,7 @@
           "minimum": 0
         },
         "authorization": {
-          "description": "The identity actually used by the successful PostgreSQL resolver run.",
+          "description": "The identity actually used by the successful resolver run.",
           "anyOf": [
             {
               "$ref": "#/$defs/AuthorizationReproduction"
@@ -995,7 +995,7 @@
       ]
     },
     "AuthorizationReproduction": {
-      "description": "The identity used to compile supported PostgreSQL resolver evidence.\nTarget-side authorization fingerprints still describe their own checks;\nthey cannot prove that a supplied scratch login reproduced the deployer.",
+      "description": "The identity used to compile supported resolver evidence.\nTarget-side authorization fingerprints still describe their own checks;\nthey cannot prove that a supplied scratch login reproduced the deployer.",
       "type": "string",
       "enum": [
         "reproduced",
@@ -1360,7 +1360,7 @@
           }
         },
         "approve_with": {
-          "description": "The exact command that approves this plan, `--allow` included — or, for\na preview, the command that produces an applyable plan instead. Which\none it is is [`Explanation::applyable`].",
+          "description": "The exact command that approves this plan, `--allow` included — or, for\na preview, the command that produces an applyable plan instead. Which\none it is is [`Explanation::applyable`]. Empty when this build cannot\nenforce the plan's resolver evidence at apply, which no new plan changes.",
           "type": "string"
         },
         "plan_path": {
@@ -3002,6 +3002,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 85,
+  "x-pbps-schema-version": 86,
   "x-pbps-tool-version": "0.0.0"
 }
