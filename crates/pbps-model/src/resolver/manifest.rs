@@ -79,9 +79,17 @@ pub struct Binding {
 #[serde(deny_unknown_fields)]
 pub struct CandidateSet {
     pub class: String,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<String>"
+    )]
     pub namespace: Option<String>,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<String>"
+    )]
     pub name: Option<String>,
 }
 
@@ -109,14 +117,12 @@ pub struct RoutineLookup {
     pub signature: String,
     pub search_path: String,
     pub kind: String,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "crate::presence::required_option")]
+    #[schemars(
+        required,
+        schema_with = "crate::presence::required_option_schema::<ObjectIdentity>"
+    )]
     pub resolved: Option<ObjectIdentity>,
-}
-
-fn required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
-    d: D,
-) -> Result<Option<T>, D::Error> {
-    <Option<T> as serde::Deserialize>::deserialize(d)
 }
 
 /// A closing record of an object the plan itself installs. Only its identity

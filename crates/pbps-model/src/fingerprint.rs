@@ -1298,4 +1298,335 @@ mod tests {
             }
         }
     }
+
+    // --- Presence is not nullability ------------------------------------------
+
+    fixture!(optional_field {
+        #[derive(Serialize, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct Root {
+            pub a: Option<String>,
+        }
+    });
+
+    fixture!(required_nullable_field {
+        #[derive(Serialize, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct Root {
+            #[serde(deserialize_with = "crate::presence::required_option")]
+            #[schemars(
+                required,
+                schema_with = "crate::presence::required_option_schema::<String>"
+            )]
+            pub a: Option<String>,
+        }
+    });
+
+    // The marker alone drops `null` from the type: the key is required, and the
+    // codec accepts a null, so the schema would be wrong the other way.
+    fixture!(required_only {
+        #[derive(Serialize, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct Root {
+            #[serde(deserialize_with = "crate::presence::required_option")]
+            #[schemars(required)]
+            pub a: Option<String>,
+        }
+    });
+
+    #[test]
+    fn a_required_nullable_field_and_an_optional_one_have_different_fingerprints() {
+        assert_ne!(
+            fp::<optional_field::Root>(),
+            fp::<required_nullable_field::Root>()
+        );
+    }
+
+    #[test]
+    fn the_schema_of_a_required_nullable_field_agrees_with_its_codec_on_both_sides() {
+        // The codec: a missing key is refused, an explicit null is accepted.
+        assert!(serde_json::from_value::<required_nullable_field::Root>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<required_nullable_field::Root>(json!({"a": null})).is_ok()
+        );
+        assert!(serde_json::from_value::<optional_field::Root>(json!({})).is_ok());
+
+        // The schema says the same on the reading side, and the two fields are
+        // written alike (null included), so the writing side does not differ.
+        let [read_optional, write_optional] = contract_schemas::<optional_field::Root>();
+        let [read_required, write_required] = contract_schemas::<required_nullable_field::Root>();
+        assert_eq!(read_required["required"], json!(["a"]));
+        assert!(read_optional.get("required").is_none());
+        assert_eq!(write_required["required"], json!(["a"]));
+        assert_eq!(write_optional["required"], json!(["a"]));
+        assert_eq!(
+            canonical(&write_required, Docs::Ignore),
+            canonical(&write_optional, Docs::Ignore)
+        );
+        // And the key stays nullable on both sides.
+        for schema in [&read_required, &write_required] {
+            let kinds = canonical(&schema["properties"]["a"], Docs::Ignore);
+            assert_eq!(kinds["type"], json!(["null", "string"]));
+        }
+    }
+
+    #[test]
+    fn the_required_marker_without_its_schema_function_would_forbid_a_null() {
+        let [read, write] = contract_schemas::<required_only::Root>();
+        for schema in [read, write] {
+            assert_eq!(schema["properties"]["a"]["type"], json!("string"));
+        }
+        assert_ne!(
+            fp::<required_only::Root>(),
+            fp::<required_nullable_field::Root>()
+        );
+    }
+
+    /// The attribute blocks that put a field behind a custom deserializer
+    /// without saying so to the schema. `serde` demands the key of such a field
+    /// unless it has a default, however its type reads, and `schemars` cannot
+    /// see inside the deserializer; `schemars(required, schema_with = ..)` tells it.
+    fn unmarked_custom_deserializers(source: &str) -> Vec<String> {
+        // Only the code of a line counts: brackets inside a string, as in a
+        // `regex(pattern = "^[a-z]")`, are not part of the nesting.
+        fn depth_change(line: &str) -> i32 {
+            let mut quoted = false;
+            let mut depth = 0;
+            for c in line.chars() {
+                match c {
+                    '"' => quoted = !quoted,
+                    '(' | '[' if !quoted => depth += 1,
+                    ')' | ']' if !quoted => depth -= 1,
+                    _ => {}
+                }
+            }
+            depth
+        }
+        fn offending(block: &str) -> bool {
+            let has = |word: &str| {
+                block
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|token| token == word)
+            };
+            has("deserialize_with")
+                && !has("default")
+                && !block.replace(' ', "").contains("schemars(required")
+        }
+
+        let mut found = Vec::new();
+        let mut block = String::new();
+        let mut depth = 0;
+        for line in source.lines().map(str::trim) {
+            if depth == 0 && !line.starts_with("#[") {
+                // Comments may sit between the attributes of one field.
+                if line.starts_with("//") {
+                    continue;
+                }
+                if offending(&block) {
+                    found.push(block.clone());
+                }
+                block.clear();
+                continue;
+            }
+            block.push_str(line);
+            block.push(' ');
+            depth += depth_change(line);
+        }
+        found
+    }
+
+    #[test]
+    fn a_custom_deserializer_without_a_default_must_be_marked_required() {
+        let marked = r#"
+            #[derive(Deserialize)]
+            struct A {
+                /// Null is allowed; absence is not.
+                #[serde(deserialize_with = "required_option")]
+                #[schemars(
+                    required,
+                    schema_with = "required_option_schema::<String>"
+                )]
+                a: Option<String>,
+                #[serde(
+                    default,
+                    skip_serializing_if = "Option::is_none",
+                    deserialize_with = "names"
+                )]
+                #[schemars(regex(pattern = "^[a-z]+$"))]
+                b: Option<String>,
+                c: Option<String>,
+            }
+        "#;
+        assert_eq!(unmarked_custom_deserializers(marked), Vec::<String>::new());
+
+        let unmarked = r#"
+            struct A {
+                #[serde(deserialize_with = "required_option")]
+                a: Option<String>,
+                #[serde(
+                    skip_serializing_if = "Option::is_none",
+                    deserialize_with = "names"
+                )]
+                #[schemars(regex(pattern = "^[a-z]+$"))]
+                b: Option<String>,
+            }
+        "#;
+        assert_eq!(unmarked_custom_deserializers(unmarked).len(), 2);
+    }
+
+    #[test]
+    fn every_custom_deserializer_of_the_model_is_marked_required_or_has_a_default() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the source directory is readable") {
+                let path = entry.expect("a directory entry is readable").path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 30, "only {} source files found", files.len());
+
+        let mut found = Vec::new();
+        for file in files {
+            // This file's own fixtures and samples show the shape on purpose.
+            if file.file_name().is_some_and(|n| n == "fingerprint.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("a source file is readable");
+            for block in unmarked_custom_deserializers(&text) {
+                found.push(format!("{}: {block}", file.display()));
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "serde requires the key of these fields, which the schema calls optional; \
+             add the marker of `presence.rs`: {found:#?}"
+        );
+    }
+
+    /// Every object schema, at any depth, that has all of the named properties.
+    fn objects_with<'a>(schema: &'a Value, properties: &[&str], found: &mut Vec<&'a Value>) {
+        if let Value::Object(map) = schema {
+            if let Some(Value::Object(own)) = map.get("properties")
+                && properties.iter().all(|name| own.contains_key(*name))
+            {
+                found.push(schema);
+            }
+            for value in map.values() {
+                objects_with(value, properties, found);
+            }
+        } else if let Value::Array(list) = schema {
+            for value in list {
+                objects_with(value, properties, found);
+            }
+        }
+    }
+
+    /// The same schema with `names` no longer required where the object has all
+    /// of `properties`.
+    fn loosened(schema: &Value, properties: &[&str], names: &[&str]) -> Value {
+        let mut out = schema.clone();
+        fn walk(value: &mut Value, properties: &[&str], names: &[&str]) {
+            if let Value::Object(map) = value {
+                let hit = matches!(map.get("properties"), Some(Value::Object(own))
+                    if properties.iter().all(|name| own.contains_key(*name)));
+                if hit && let Some(Value::Array(required)) = map.get_mut("required") {
+                    required.retain(|r| !names.iter().any(|n| r.as_str() == Some(*n)));
+                }
+                for child in map.values_mut() {
+                    walk(child, properties, names);
+                }
+            } else if let Value::Array(list) = value {
+                for child in list {
+                    walk(child, properties, names);
+                }
+            }
+        }
+        walk(&mut out, properties, names);
+        out
+    }
+
+    #[test]
+    fn the_required_nullable_fields_of_the_real_formats_are_required_and_move_the_fingerprint() {
+        use crate::resolver::CandidateSet;
+
+        // The codec first: the key of `name` is demanded even when it is null.
+        let present = json!({"class": "table", "namespace": null, "name": null});
+        assert!(serde_json::from_value::<CandidateSet>(present).is_ok());
+        let missing = json!({"class": "table", "namespace": null});
+        assert!(serde_json::from_value::<CandidateSet>(missing).is_err());
+
+        let formats = [
+            ("SavedPlan", contract_schemas::<SavedPlan>()),
+            ("StateSnapshot", contract_schemas::<StateSnapshot>()),
+        ];
+        let fields: [(&str, &[&str], &[&str]); 3] = [
+            (
+                "CandidateSet",
+                &["class", "namespace", "name"],
+                &["namespace", "name"],
+            ),
+            (
+                "RoutineLookup",
+                &["signature", "search_path", "kind", "resolved"],
+                &["resolved"],
+            ),
+            (
+                "SurfaceResolution",
+                &["surface", "current", "desired"],
+                &["current", "desired"],
+            ),
+        ];
+        for (type_name, properties, nullable) in fields {
+            for side in 0..2 {
+                let mut reached = 0;
+                for (format, schemas) in &formats {
+                    let schema = &schemas[side];
+                    let mut found = Vec::new();
+                    objects_with(schema, properties, &mut found);
+                    for object in &found {
+                        let required: Vec<&str> = object["required"]
+                            .as_array()
+                            .expect("an object with required fields lists them")
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        for name in nullable {
+                            assert!(
+                                required.contains(name),
+                                "{type_name}.{name} is required by serde but not by the \
+                                 {format} schema (side {side})"
+                            );
+                            // Required, yet still allowed to be null.
+                            let kinds = object["properties"][*name].to_string();
+                            assert!(
+                                kinds.contains("null"),
+                                "{type_name}.{name} lost its null in {format} (side {side}): {kinds}"
+                            );
+                        }
+                    }
+                    if !found.is_empty() {
+                        let before = fingerprint([("s", schema)], Docs::Ignore);
+                        let after = fingerprint(
+                            [("s", &loosened(schema, properties, nullable))],
+                            Docs::Ignore,
+                        );
+                        assert_ne!(before, after, "{type_name} in {format} (side {side})");
+                    }
+                    reached += found.len();
+                }
+                assert!(
+                    reached > 0,
+                    "{type_name} is in neither format (side {side})"
+                );
+            }
+        }
+    }
 }
