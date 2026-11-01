@@ -25,6 +25,10 @@ pub struct ResolverDetail {
     /// `run-owned`: a login and database the run created and dropped.
     /// `supplied`: the database the entry names, emptied after the run.
     pub layout: &'static str,
+    /// The compilation identity recorded in the plan, independent of config.
+    pub authorization: pbps_model::resolver::AuthorizationReproduction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_notice: Option<&'static str>,
     /// Whether the externals file's writes outside the scratch database were
     /// `refused` or `allowed` (and then not checked).
     pub outside_writes: &'static str,
@@ -171,6 +175,8 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
             ScratchLayout::RunOwned => "run-owned",
             ScratchLayout::Supplied => "supplied",
         },
+        authorization: q.authorization,
+        authorization_notice: crate::resolution::authorization_notice(q.authorization),
         outside_writes: match outside_writes {
             OutsideWrites::Refused => "refused",
             OutsideWrites::Allowed => "allowed",
@@ -322,6 +328,13 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
     out.push_str(&format!("  rule        {}\n", Escaped(&detail.rule)));
     out.push_str(&format!("  key id      {}\n", Escaped(&detail.key_id)));
     out.push_str(&format!(
+        "  authorization {}\n",
+        detail.authorization.as_str()
+    ));
+    if let Some(notice) = detail.authorization_notice {
+        out.push_str(&format!("  notice      {notice}\n"));
+    }
+    out.push_str(&format!(
         "  sealed      {} (keyed fingerprints; values not shown)\n",
         detail.sealed.join(", ")
     ));
@@ -472,6 +485,8 @@ mod tests {
             scratch,
             image: image.map(Into::into),
             layout: "run-owned",
+            authorization: pbps_model::resolver::AuthorizationReproduction::Reproduced,
+            authorization_notice: None,
             outside_writes: writes,
             same_instance: None,
             dependencies: Vec::new(),

@@ -156,6 +156,34 @@ impl SameInstance {
     }
 }
 
+/// The identity used to compile supported PostgreSQL resolver evidence.
+/// Target-side authorization fingerprints still describe their own checks;
+/// they cannot prove that a supplied scratch login reproduced the deployer.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationReproduction {
+    Reproduced,
+    LoginStandin,
+}
+
+impl AuthorizationReproduction {
+    pub fn for_postgres_layout(layout: ScratchLayout) -> Self {
+        match layout {
+            ScratchLayout::RunOwned => Self::Reproduced,
+            ScratchLayout::Supplied => Self::LoginStandin,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reproduced => "reproduced",
+            Self::LoginStandin => "login_standin",
+        }
+    }
+}
+
 /// Environment-keyed fingerprints of the complete qualified observations.
 /// Paths, source-bearing settings and executable metadata are not exported.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -171,6 +199,9 @@ pub struct Qualification {
     pub resolver_build: String,
     pub channels: String,
     pub runtime: ResolverRuntime,
+    /// Required even when authorization was reproduced: absence cannot hide
+    /// the supplied-login limitation in a saved artifact (#2570).
+    pub authorization: AuthorizationReproduction,
     /// The `system_identifier` the planning read recorded, keyed with the
     /// project key as the other fingerprints are, never in clear (#1516).
     /// The publication recheck holds its session to it, and apply holds
@@ -225,8 +256,9 @@ pub enum BindingCoverage {
 /// cluster identity and the accepted limitations to the qualification
 /// (#1516, #1700); 4, the resolver entry and scratch layout to the runtime
 /// (#1517); 6, the declared type as a surface of its own (#2407); 7,
-/// independently keyed object-grant postconditions (#1454).
-pub const EVIDENCE_VERSION: u32 = 7;
+/// independently keyed object-grant postconditions (#1454); 8, whether
+/// PostgreSQL compiled as the deployer or a supplied login stand-in (#2570).
+pub const EVIDENCE_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -364,7 +396,15 @@ impl ResolverEvidence {
         {
             return Err(EvidenceError::Incomplete);
         }
-        let ResolverRuntime::Scratch { entry, scratch, .. } = &q.runtime;
+        let ResolverRuntime::Scratch {
+            entry,
+            scratch,
+            layout,
+            ..
+        } = &q.runtime;
+        if q.authorization != AuthorizationReproduction::for_postgres_layout(*layout) {
+            return Err(EvidenceError::Incomplete);
+        }
         let qualified = !entry.is_empty()
             && match scratch {
                 ScratchSource::Server {} => true,
@@ -739,6 +779,7 @@ mod tests {
             &changes,
             Qualification {
                 rule: "fixture-environment-v1".into(),
+                authorization: AuthorizationReproduction::LoginStandin,
                 target_environment: "01".repeat(32),
                 target_environment_after: "01".repeat(32),
                 resolver_environment: "02".repeat(32),
@@ -1235,6 +1276,7 @@ mod tests {
     fn a_docker_scratch_is_recorded_by_its_entry_image_and_layout() {
         let plan = plan();
         let mut evidence = resolved(&plan);
+        evidence.qualification.authorization = AuthorizationReproduction::Reproduced;
         evidence.qualification.runtime = ResolverRuntime::Scratch {
             entry: "ci".into(),
             scratch: ScratchSource::Docker {
@@ -1419,3 +1461,6 @@ mod chained_rename_tests;
 
 #[cfg(test)]
 mod qualification_phase_tests;
+
+#[cfg(test)]
+mod authorization_status_tests;

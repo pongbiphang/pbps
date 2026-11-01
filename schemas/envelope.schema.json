@@ -955,6 +955,23 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "authorization": {
+          "description": "The identity actually used by the successful PostgreSQL resolver run.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorizationReproduction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authorization_notice": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -975,6 +992,14 @@
           "type": "string",
           "const": "resolved"
         }
+      ]
+    },
+    "AuthorizationReproduction": {
+      "description": "The identity used to compile supported PostgreSQL resolver evidence.\nTarget-side authorization fingerprints still describe their own checks;\nthey cannot prove that a supplied scratch login reproduced the deployer.",
+      "type": "string",
+      "enum": [
+        "reproduced",
+        "login_standin"
       ]
     },
     "RehearsalDetail": {
@@ -1506,6 +1531,16 @@
           "description": "`run-owned`: a login and database the run created and dropped.\n`supplied`: the database the entry names, emptied after the run.",
           "type": "string"
         },
+        "authorization": {
+          "description": "The compilation identity recorded in the plan, independent of config.",
+          "$ref": "#/$defs/AuthorizationReproduction"
+        },
+        "authorization_notice": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "outside_writes": {
           "description": "Whether the externals file's writes outside the scratch database were\n`refused` or `allowed` (and then not checked).",
           "type": "string"
@@ -1572,6 +1607,7 @@
         "entry",
         "scratch",
         "layout",
+        "authorization",
         "outside_writes",
         "rule",
         "key_id",
@@ -2966,6 +3002,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 78,
+  "x-pbps-schema-version": 82,
   "x-pbps-tool-version": "0.0.0"
 }

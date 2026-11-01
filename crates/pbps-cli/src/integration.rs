@@ -41,7 +41,9 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 78;
+pub const SCHEMA_VERSION: u32 = 82;
+// 82: PostgreSQL resolver authorization reproduction status and notice (#2570).
+// 79-81 are coordinated with pending #2502, #2521 and #2525 publications.
 // 78: named SQL Server database layouts in project configuration (#2501).
 // 74: guarded drop row requirements in plan explanations (#2400).
 // 71: report-only catalog census policy (#2444).

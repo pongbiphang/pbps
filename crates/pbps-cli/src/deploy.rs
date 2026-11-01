@@ -8529,6 +8529,10 @@ async fn plan_db_async(
                          this is a bug in pbps, please report it"
                         )
                     })?;
+                resolver_assessment
+                    .as_mut()
+                    .expect("a successful resolver run has an assessment")
+                    .record_authorization(sealed.evidence.qualification().authorization);
                 cs = sealed.changes;
                 Some(Resolution {
                     name,
@@ -8749,6 +8753,13 @@ async fn plan_db_async(
                  target was rechecked after its run.",
                     resolution.name, resolution.asked
                 );
+                if let Some(notice) = data
+                    .resolver_assessment
+                    .as_ref()
+                    .and_then(|a| a.authorization_notice)
+                {
+                    println!("Notice: {notice}");
+                }
             } else if let (Some(selection), Some(assessment)) =
                 (&data.resolver_selection, &data.resolver_assessment)
             {

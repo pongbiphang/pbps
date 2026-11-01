@@ -13,6 +13,8 @@ use std::process::{Command, Output};
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
+const AUTHORIZATION_NOTICE: &str = "Authorization was not reproduced: supplied PostgreSQL scratch compiled as its login (login_standin), which can have more privileges than the deployer. Prefer Docker or run-owned scratch on another cluster. Verified deployer-role support is planned in #2570. Account layout guidance: https://github.com/pongbiphang/pbps/issues/1163.";
+
 fn resolved_plan() -> SavedPlan {
     resolved_plan_with(Default::default())
 }
@@ -81,6 +83,10 @@ fn sealed(
         &changes,
         Qualification {
             rule: rule.into(),
+            authorization: {
+                let ResolverRuntime::Scratch { layout, .. } = &runtime;
+                AuthorizationReproduction::for_postgres_layout(*layout)
+            },
             target_environment: "04".repeat(32),
             target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
@@ -264,6 +270,8 @@ fn a_resolved_plan_explains_its_provenance_and_sealed_qualification() {
             "entry": "scratch",
             "scratch": "server",
             "layout": "supplied",
+            "authorization": "login_standin",
+            "authorization_notice": AUTHORIZATION_NOTICE,
             "outside_writes": "refused",
             "rule": pbps_pg::resolver::compatibility::REPORTED_RULE,
             "key_id": "01".repeat(8),
@@ -295,14 +303,15 @@ fn a_resolved_plan_explains_its_provenance_and_sealed_qualification() {
     assert_eq!(
         section,
         format!(
-            "\nResolver evidence\n  rule        {}\n  key id      {}\n  sealed      \
+            "\nResolver evidence\n  rule        {}\n  key id      {}\n  authorization login_standin\n  notice      {}\n  sealed      \
              target environment, target environment after the plan's grants, resolver \
              environment, target build, resolver build, channels, target cluster identity \
              (keyed fingerprints; values not shown)\n  limitations accepted, not refused:\n    \
              build:server_version: the scratch reports another build string of the same \
              version\n  surfaces\n",
             pbps_pg::resolver::compatibility::REPORTED_RULE,
-            "01".repeat(8)
+            "01".repeat(8),
+            AUTHORIZATION_NOTICE,
         )
     );
     // No fingerprint value is shown, in either form.
@@ -1706,5 +1715,129 @@ fn explain_refuses_a_rehearsal_record_it_cannot_read() {
         let out = Artifact::new(&plan).explain("text");
         assert_eq!(out.status.code(), Some(1), "{what}: {out:?}");
         assert!(out.stdout.is_empty(), "{what}: {out:?}");
+    }
+}
+
+#[test]
+fn supplied_login_authorization_notice_comes_from_the_saved_plan_alone() {
+    let plan = resolved_plan();
+    let value = serde_json::to_value(&plan).unwrap();
+    assert_eq!(value["analysis"]["evidence"]["version"], 8);
+    assert_eq!(
+        value["analysis"]["evidence"]["qualification"]["authorization"],
+        "login_standin"
+    );
+    let artifact = Artifact::new(&value);
+    // A later, unreadable project cannot erase a limitation sealed in the file.
+    std::fs::write(
+        artifact.0.join("pbps.yml"),
+        "resolvers: [this is not a valid project",
+    )
+    .unwrap();
+    let json = artifact.explain("json");
+    assert!(json.status.success(), "{json:?}");
+    assert!(json.stderr.is_empty(), "{json:?}");
+    let value = report(&json);
+    assert_eq!(value["data"]["resolver"]["authorization"], "login_standin");
+    assert_eq!(
+        value["data"]["resolver"]["authorization_notice"],
+        AUTHORIZATION_NOTICE
+    );
+    let served = pbps_ui::contract::parse("explain", &json.stdout, 0).unwrap();
+    let served: serde_json::Value = serde_json::from_slice(&served).unwrap();
+    assert_eq!(served["data"]["resolver"]["authorization"], "login_standin");
+    assert_eq!(
+        served["data"]["resolver"]["authorization_notice"],
+        AUTHORIZATION_NOTICE
+    );
+    let text = artifact.explain("text");
+    assert!(text.status.success(), "{text:?}");
+    assert!(text.stderr.is_empty(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(AUTHORIZATION_NOTICE), "{text}");
+    assert!(text.contains("authorization login_standin"), "{text}");
+}
+
+#[test]
+fn run_owned_authorization_is_reproduced_without_a_supplied_login_notice() {
+    for scratch in [
+        ScratchSource::Server {},
+        ScratchSource::Docker {
+            image: "postgres:18".into(),
+        },
+    ] {
+        let plan = sealed(
+            pbps_pg::resolver::compatibility::REPORTED_RULE,
+            Default::default(),
+            ChangeSet::default(),
+            ResolverRuntime::Scratch {
+                entry: "scratch".into(),
+                scratch,
+                layout: ScratchLayout::RunOwned,
+                outside_writes: OutsideWrites::Refused,
+                same_instance: SameInstance::NotApplicable,
+                dependencies: Default::default(),
+            },
+            IdsFile::default(),
+        );
+        let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
+        let json = artifact.explain("json");
+        assert!(json.status.success(), "{json:?}");
+        let value = report(&json);
+        assert_eq!(value["data"]["resolver"]["authorization"], "reproduced");
+        assert!(
+            value["data"]["resolver"]
+                .get("authorization_notice")
+                .is_none()
+        );
+        let text = artifact.explain("text");
+        assert!(text.status.success(), "{text:?}");
+        let text = String::from_utf8(text.stdout).unwrap();
+        assert!(text.contains("authorization reproduced"), "{text}");
+        assert!(!text.contains("login_standin"), "{text}");
+        assert!(!text.contains("Authorization was not reproduced"), "{text}");
+    }
+}
+
+#[test]
+fn missing_unknown_or_contradictory_authorization_evidence_is_not_explained() {
+    let original = serde_json::to_value(resolved_plan()).unwrap();
+    for status in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!("verified_role")),
+        Some(serde_json::json!("reproduced")),
+    ] {
+        let mut edited = original.clone();
+        let qualification = edited["analysis"]["evidence"]["qualification"]
+            .as_object_mut()
+            .unwrap();
+        match status {
+            Some(value) => {
+                qualification.insert("authorization".into(), value);
+            }
+            None => {
+                qualification.remove("authorization");
+            }
+        }
+        let artifact = Artifact::new(&edited);
+        for format in ["text", "json"] {
+            let output = artifact.explain(format);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            if format == "json" {
+                let value = report(&output);
+                assert_eq!(value["result"], "unanswerable");
+                assert!(value.get("data").is_none_or(serde_json::Value::is_null));
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+            }
+        }
+    }
+    for version in [7, 9] {
+        let mut edited = original.clone();
+        edited["analysis"]["evidence"]["version"] = version.into();
+        let artifact = Artifact::new(&edited);
+        assert_eq!(artifact.explain("text").status.code(), Some(1));
+        assert_eq!(artifact.explain("json").status.code(), Some(1));
     }
 }

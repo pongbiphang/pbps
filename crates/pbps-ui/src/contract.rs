@@ -199,6 +199,12 @@ pub struct Resolver {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     pub layout: String,
+    // Keep the viewer independent of the model crate while retaining the
+    // CLI's sealed authorization status and notice (#2570).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_notice: Option<String>,
     pub outside_writes: String,
     pub rule: String,
     pub key_id: String,

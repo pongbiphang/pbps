@@ -153,6 +153,12 @@ pub(super) fn seal<S>(
             "qualified-connections",
             identity.channels.as_bytes(),
         ),
+        authorization: {
+            // SQL Server evidence is refused above. Only the PostgreSQL
+            // run-owned layout actually compiled as the reproduced deployer.
+            let ResolverRuntime::Scratch { layout, .. } = &identity.runtime;
+            pbps_model::resolver::AuthorizationReproduction::for_postgres_layout(*layout)
+        },
         runtime: identity.runtime,
         target_cluster: fingerprint(
             key,
