@@ -735,6 +735,7 @@
         "conversions2359::a_recorded_conversion_on_both_ends_of_a_key_applies_with_the_key_validated",
         "conversions2359::an_ordinary_retype_across_the_types_a_key_joins_takes_the_key_down_the_same_way",
         "conversions2359::nonrepeatable_recorded_self_references_apply_with_an_explicit_unchecked_reason",
+        "foreign_keys2395::new_unjoinable_keys_are_refused_before_ddl_and_joinable_keys_apply",
         "conversions2359::a_default_and_a_key_on_one_converted_column_are_both_taken_down_and_put_back",
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
