@@ -1,5 +1,5 @@
 #[path = "../../../pbps-diff/tests/fixtures/creation2469_inline.rs"]
-mod required;
+pub(super) mod required;
 use super::*;
 use pbps_dialect::lower::lower_all;
 use pbps_model::{Change, PlanMode};

@@ -71,6 +71,7 @@ impl Inline {
         request: Request<'_>,
         dialect: &(impl Dialect + ?Sized),
     ) {
+        let tightening = super::not_null_prerequisites(full, dialect);
         let mut queue: VecDeque<_> = self.required.iter().map(|(r, w)| (r.clone(), *w)).collect();
         let mut seen = BTreeSet::new();
         while let Some((reference, why)) = queue.pop_front() {
@@ -151,6 +152,12 @@ impl Inline {
                     }
                 }
                 (Root::Table(_), Selector::Part(part)) => {
+                    for column in tightening.get(part).into_iter().flatten() {
+                        add(ObjectRef {
+                            root: Root::Column(name.column(column)),
+                            part: Selector::NotNull,
+                        });
+                    }
                     let change = match part {
                         PartKey::PrimaryKey => {
                             full.primary_key.as_ref().map(|key| Change::SetPrimaryKey {

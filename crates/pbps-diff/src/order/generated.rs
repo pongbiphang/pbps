@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{Constraint, Schedule, Source};
 use pbps_dialect::Dialect;
 use pbps_model::TableName;
+use pbps_model::operation::PartKey;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
     AddedRole, Change, ChangeSet, IdsFile, Module, ModuleDeps, ModuleId, ModuleKind, PlannedChange,
@@ -1191,13 +1192,18 @@ pub(super) fn constraints_in(
                 }
             }
         }
+        let tightening = pbps_dialect::creation::not_null_prerequisites(full, dialect);
         for (key_at, key) in &own {
-            if let Change::SetPrimaryKey {
-                to: Some(primary), ..
-            } = &key.change
-            {
+            let part = match &key.change {
+                Change::SetPrimaryKey { to: Some(_), .. } => Some(PartKey::PrimaryKey),
+                Change::AddUnique { name, .. } => Some(PartKey::Unique(name.clone())),
+                Change::AddIndex { name, .. } => Some(PartKey::Index(name.clone())),
+                Change::AddCheck { name, .. } => Some(PartKey::Check(name.clone())),
+                _ => None,
+            };
+            if let Some(columns) = part.as_ref().and_then(|part| tightening.get(part)) {
                 for (at, part) in &own {
-                    if matches!(&part.change, Change::AlterColumnNullability { column, to_nullable: false, .. } if primary.columns.contains(&column.name))
+                    if matches!(&part.change, Change::AlterColumnNullability { column, to_nullable: false, .. } if columns.contains(&column.name))
                     {
                         edge(&mut out, *at, *key_at);
                     }

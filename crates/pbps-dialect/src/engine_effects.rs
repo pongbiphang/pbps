@@ -152,6 +152,41 @@ pub fn retype_blockers(
     };
     let t = table.table;
     let replaced = pbps_model::operation::final_table(after, &table);
+    let gone = local_column_blockers(dialect, t, name, dependents, replaced);
+    for part in gone {
+        fx.requires.push(Requirement::Absent(table.part(part)));
+    }
+    if dependents.foreign_keys {
+        for other_name in before.schema.tables.keys() {
+            let Some(other) = pbps_model::operation::base_table_named(owners, before, other_name)
+            else {
+                continue;
+            };
+            for (n, fk) in &other.table.foreign_keys {
+                let local = other_name == table.name && fk.columns.iter().any(|c| c.raw() == name);
+                let referenced = fk.references_table == *table.name
+                    && fk.references_columns.iter().any(|c| c.raw() == name);
+                if local || referenced {
+                    fx.requires.push(Requirement::Absent(
+                        other.part(PartKey::ForeignKey(n.clone())),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(fx)
+}
+
+/// Local table parts that must be absent for an ALTER COLUMN. Creation uses
+/// the same exact key/INCLUDE and lexical predicate matching as engine effects;
+/// a final replacement may release only a text dependency (DEC-1998.1).
+pub fn local_column_blockers(
+    dialect: &(impl Dialect + ?Sized),
+    t: &pbps_model::Table,
+    name: &str,
+    dependents: RetypeDependents,
+    replaced: Option<&pbps_model::Table>,
+) -> Vec<PartKey> {
     let mut gone: Vec<PartKey> = Vec::new();
     if dependents.keys_and_indexes {
         if t.primary_key
@@ -205,26 +240,5 @@ pub fn retype_blockers(
             }
         }
     }
-    for part in gone {
-        fx.requires.push(Requirement::Absent(table.part(part)));
-    }
-    if dependents.foreign_keys {
-        for other_name in before.schema.tables.keys() {
-            let Some(other) = pbps_model::operation::base_table_named(owners, before, other_name)
-            else {
-                continue;
-            };
-            for (n, fk) in &other.table.foreign_keys {
-                let local = other_name == table.name && fk.columns.iter().any(|c| c.raw() == name);
-                let referenced = fk.references_table == *table.name
-                    && fk.references_columns.iter().any(|c| c.raw() == name);
-                if local || referenced {
-                    fx.requires.push(Requirement::Absent(
-                        other.part(PartKey::ForeignKey(n.clone())),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(fx)
+    gone
 }

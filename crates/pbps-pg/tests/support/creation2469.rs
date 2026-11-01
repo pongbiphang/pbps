@@ -24,6 +24,7 @@ async fn demanded_facets_preserve_native_values_and_declared_column_order() {
         .unwrap();
     let version = rows[0].try_get::<i32>("version").unwrap().unwrap() as i64;
     let engine = Postgres::new().with_server_version(version);
+    native_nullability_blockers(&engine).await;
     for facet in FACETS {
         let mut db = TestDb::create(&format!("creation2469_{facet}")).await;
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
@@ -618,4 +619,29 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
     assert_eq!(rows[0].try_get::<bool>("nn").unwrap(), Some(true));
     db.conn.execute("COMMIT").await.unwrap();
     db.drop().await;
+}
+
+#[path = "../../../pbps-diff/tests/fixtures/creation2469_nullability.rs"]
+mod nullability_blockers;
+
+async fn native_nullability_blockers(engine: &Postgres) {
+    for kind in nullability_blockers::BLOCKERS {
+        let f = nullability_blockers::fixture(kind, "postgres");
+        let plan = f.compile(engine).unwrap();
+        nullability_blockers::assert_order(plan.changes(), kind, "postgres");
+        let mut db = TestDb::create(&format!("creation2469_nn_{kind}")).await;
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        execute(&mut db, plan, engine).await;
+        db.conn
+            .execute("INSERT INTO app.t(anchor,x) VALUES(1,7)")
+            .await
+            .unwrap();
+        assert!(
+            db.conn
+                .execute("INSERT INTO app.t(anchor,x) VALUES(2,NULL)")
+                .await
+                .is_err()
+        );
+        db.drop().await;
+    }
 }

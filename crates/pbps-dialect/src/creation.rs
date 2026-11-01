@@ -9,6 +9,42 @@ mod inline;
 pub mod inputs;
 pub use inline::Inline;
 
+/// Install these table parts after their columns' extracted NOT NULL. The
+/// dialect already defines what blocks tightening; PKs additionally require
+/// NOT NULL on engines that allow tightening under other indexes.
+pub fn not_null_prerequisites(
+    table: &pbps_model::Table,
+    dialect: &(impl Dialect + ?Sized),
+) -> BTreeMap<PartKey, BTreeSet<ColumnName>> {
+    let mut prerequisites: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for (name, column) in &table.columns {
+        if column.nullable {
+            continue;
+        }
+        let mut blockers = crate::engine_effects::local_column_blockers(
+            dialect,
+            table,
+            name.raw(),
+            dialect.nullability_dependents(false),
+            None,
+        );
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|key| key.columns.contains(name))
+        {
+            blockers.push(PartKey::PrimaryKey);
+        }
+        for blocker in blockers {
+            prerequisites
+                .entry(blocker)
+                .or_default()
+                .insert(name.clone());
+        }
+    }
+    prerequisites
+}
+
 /// Transient annotation intent, using the existing typed dependency graph.
 #[derive(Clone, Copy)]
 pub struct Request<'a> {
@@ -279,12 +315,20 @@ pub fn expose(
                         },
                     ));
                 }
+                let tightening = not_null_prerequisites(&full, engine);
                 for (key, facet) in facets {
                     let affected = inputs::columns(&facet, name, &full, engine)
                         .map_or(!moved_columns.is_empty(), |columns| {
                             !columns.is_disjoint(&moved_columns)
                         });
-                    let nullability = matches!(&facet, Change::SetPrimaryKey{to:Some(key),..} if key.columns.iter().any(|c|demand.not_null.contains(c) && !demand.inline.contains(Root::Column(name.column(c)),Selector::NotNull)));
+                    let nullability = tightening.get(&key).is_some_and(|columns| {
+                        columns.iter().any(|c| {
+                            demand.not_null.contains(c)
+                                && !demand
+                                    .inline
+                                    .contains(Root::Column(name.column(c)), Selector::NotNull)
+                        })
+                    });
                     if !demand.inline.keeps_part(name, &key)
                         && (demand.part(name, &key) || affected || nullability)
                     {

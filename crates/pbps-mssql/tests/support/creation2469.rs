@@ -65,6 +65,7 @@ async fn demanded_computed_columns_and_not_null_wait_for_the_function() {
 #[ignore = "needs live SQL Server"]
 async fn demanded_facets_preserve_native_values_and_declared_column_order() {
     let engine = Mssql;
+    native_nullability_blockers(&engine).await;
     for facet in FACETS {
         let mut db = TestDb::create(&format!("creation2469_{facet}")).await;
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
@@ -497,4 +498,57 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
     assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(false));
     db.conn.execute("COMMIT").await.unwrap();
     db.drop().await;
+}
+
+#[path = "../../../pbps-diff/tests/fixtures/creation2469_nullability.rs"]
+mod nullability_blockers;
+
+async fn native_nullability_blockers(engine: &Mssql) {
+    for kind in nullability_blockers::BLOCKERS {
+        let f = nullability_blockers::fixture(kind, "mssql");
+        let plan = f.compile(engine).unwrap();
+        nullability_blockers::assert_order(plan.changes(), kind, "mssql");
+        let mut db = TestDb::create(&format!("creation2469_nn_{kind}")).await;
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+        let changes = plan.changes().clone();
+        let ordered = plan.ordered(PlanMode::Transactional, engine);
+        let lowered =
+            lower_all(&ordered as &dyn pbps_diff::order::PlanView<Mssql>, engine).unwrap();
+        assert_eq!(changes.changes.len(), lowered.groups().len());
+        for (change, group) in changes.changes.iter().zip(lowered.groups()) {
+            for statement in group.statements() {
+                db.conn
+                    .execute(&statement.sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{kind}: {}: {e}", statement.sql));
+            }
+            if matches!(change.change, Change::CreateModule { .. }) {
+                let rows = db.conn.query("SELECT is_nullable FROM sys.columns WHERE object_id=OBJECT_ID('app.t') AND name='x'").await.unwrap();
+                assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(true));
+                let rows = db.conn.query("SELECT COUNT(*) AS n FROM sys.indexes WHERE object_id=OBJECT_ID('app.t') AND index_id>0").await.unwrap();
+                assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0));
+            }
+        }
+        db.conn
+            .execute("INSERT INTO app.t(anchor,x) VALUES(1,7)")
+            .await
+            .unwrap();
+        let rows = db.conn.query("SELECT is_nullable FROM sys.columns WHERE object_id=OBJECT_ID('app.t') AND name='x'").await.unwrap();
+        assert_eq!(rows[0].try_get::<bool>("is_nullable").unwrap(), Some(false));
+        assert!(
+            db.conn
+                .execute("INSERT INTO app.t(anchor,x) VALUES(2,NULL)")
+                .await
+                .is_err()
+        );
+        db.conn.execute("COMMIT").await.unwrap();
+        db.drop().await;
+    }
+    let f = required_groups::require(required_groups::temporal(true), "not_null::app.t.anchor");
+    let error = f.compile(engine).unwrap_err();
+    assert!(
+        error.contains("inline") && error.contains("primary key"),
+        "{error}"
+    );
 }
