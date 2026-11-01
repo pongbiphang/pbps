@@ -250,6 +250,12 @@ pub(crate) fn command(
                 !matches!(found, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
             })
             .unwrap_or(start);
+        // A bare relative descendant ends its ancestor walk at the current directory.
+        let root = if root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            root
+        };
         let manifest = root.join(
             manifest.unwrap_or_else(|| Path::new(pbps_config::test_manifest::DEFAULT_MANIFEST)),
         );
