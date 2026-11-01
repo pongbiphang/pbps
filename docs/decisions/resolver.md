@@ -5721,3 +5721,51 @@ change the catalog property rules or their version, bind desired definitions,
 or add an execution or scratch lifecycle boundary. Native contracts cover
 direct/role/public hiding, off-path schema controls, security-definition
 blindness, genuine absence and restoration on both scratch routes.
+
+
+<a id="dec-1587-1"></a>
+
+**DEC-1587.1. A partition's own default has its own binding surface; an
+inherited copy belongs to its partition's table.** Capture ownership consumes
+`Table::expression_columns`, as the other resolver inventories already do.
+Its `pg_attrdef` address is qualified through its recorded column or the
+validated inherited-column root, then owned as `Surface::Default` at that
+partition and column. The internal/automatic dependency cannot replace this
+explicit surface with its containing column's owner.
+
+Without an own expression, a captured copy authorized by an ancestor's
+expression belongs to the partition's table UID, following DEC-1566.1 for
+inherited columns. It creates no independent default surface. An extra
+default without that declared ancestry remains unqualified; missing column
+provenance or UID authority supplies no ownership. Ordinary defaults and
+generated expressions use the same inventory, while a serial's engine-owned
+`nextval` keeps its column owner. This changes ownership of existing captured
+rows, not their properties, decoder coverage or wire formats.
+
+<a id="dec-1896-2"></a>
+
+**DEC-1896.2. A resolver step that `weave` split is present through its
+expansion, and its edges name the half they concern.** `weave` turns a default
+edited in place (`AlterColumnDefault`, `SetPartitionDefault`) into a release
+half and a restoration half when the function it calls is dropped. The step the
+resolver ordered then equals nothing in the final plan, and matching by what
+a change does read that as "a planning pass removed a change the resolver
+ordered", refusing a valid plan. `resolver_remap` now places each resolver step
+once, for the proof edges and for identity restoration alike. A step the
+resolver holds as `Origin::Whole(l)` is found as the final plan's
+`Origin::SplitPart(l)` steps when no `Whole(l)` is left and the resolver holds
+no `SplitPart(l)` of its own. At least two must remain, each acting on the same
+subject; one leftover half is a removal. These are matched before the equal-change
+pass, because a half can equal another step the resolver ordered (its teardown of
+the same default).
+
+A binding edge runs from the release of the old binding to what invalidates
+its input, or from what makes the new binding's input to its creation
+(`resolver/graph.rs`). It therefore leaves a split step from its first half
+and enters it at its last. An edge of any other reason concerns the step as
+a whole, so it enters the first half and leaves from the last. Both are the
+edge's own half and never a position the final order does not hold: an
+inversion is still refused. A split step keeps no operation identity of its
+own; its halves are new steps with fresh identities, as `weave` allocated them.
+The CLI's duplicate of the matching, kept as a test oracle, is removed: its
+tests call the one function. No format, version or wire field changes.

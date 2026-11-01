@@ -416,92 +416,16 @@ tokio::task_local! {
     pub(super) static RECHECK_BUILD: Option<String>;
 }
 
+/// The test seam over the one remap, which lives in the ordering owner
+/// (`pbps_diff::order::resolver_remap`); there is no second copy to keep in
+/// step with it.
 #[cfg(test)]
 fn remap(
     before: &pbps_model::ChangeSet,
     after: &pbps_model::ChangeSet,
     edges: &BTreeSet<pbps_model::resolver::OrderEdge>,
 ) -> Result<BTreeSet<pbps_model::resolver::OrderEdge>, Error> {
-    let expected = remap_oracle(before, after, edges);
-    let actual = pbps_diff::order::resolver_remap::remap(before, after, edges, describe)
-        .map_err(Error::Binding);
-    assert_eq!(
-        actual.as_ref().map_err(ToString::to_string),
-        expected.as_ref().map_err(ToString::to_string)
-    );
-    actual
-}
-
-/// The resolver's edges, from its own order to `after`, the order the
-/// caller's passes left. A change is matched by what it does, in order
-/// among equal ones ([`same_change`]); a pass may add changes and their
-/// findings, but not remove one the resolver ordered or put one before
-/// another the resolver ordered after it.
-#[cfg(test)]
-fn remap_oracle(
-    before: &pbps_model::ChangeSet,
-    after: &pbps_model::ChangeSet,
-    edges: &BTreeSet<pbps_model::resolver::OrderEdge>,
-) -> Result<BTreeSet<pbps_model::resolver::OrderEdge>, Error> {
-    let mut taken = vec![false; after.changes.len()];
-    let mut at = Vec::with_capacity(before.changes.len());
-    for planned in &before.changes {
-        let Some(found) = after
-            .changes
-            .iter()
-            .enumerate()
-            .position(|(i, p)| !taken[i] && same_change(&planned.change, &p.change))
-        else {
-            return Err(Error::Binding(format!(
-                "a planning pass removed a change the resolver ordered: {}",
-                describe(&planned.change)
-            )));
-        };
-        taken[found] = true;
-        at.push(found);
-    }
-    edges
-        .iter()
-        .map(|edge| {
-            let (before_at, after_at) = (at[edge.before], at[edge.after]);
-            if before_at < after_at {
-                Ok(pbps_model::resolver::OrderEdge {
-                    before: before_at,
-                    after: after_at,
-                    reason: edge.reason,
-                })
-            } else {
-                Err(Error::Binding(format!(
-                    "a planning pass put `{}` before `{}`, which the resolver orders after it",
-                    describe(&after.changes[after_at].change),
-                    describe(&after.changes[before_at].change)
-                )))
-            }
-        })
-        .collect()
-}
-
-/// Whether `then`, a change the resolver ordered, is `now` after the
-/// connected passes. What a change does is all of it, except what the
-/// connected plan reads from the target and writes into it: a dropped
-/// role's members, which the resolver leaves empty (#1516 review). Every
-/// other field is the change's own, and a pass that rewrote one made
-/// another change.
-#[cfg(test)]
-fn same_change(then: &pbps_model::Change, now: &pbps_model::Change) -> bool {
-    use pbps_model::Change::DropRole;
-    if let (
-        DropRole { uid, name, members },
-        DropRole {
-            uid: now_uid,
-            name: now_name,
-            ..
-        },
-    ) = (then, now)
-    {
-        return members.is_empty() && uid == now_uid && name == now_name;
-    }
-    then == now
+    pbps_diff::order::resolver_remap::remap(before, after, edges, describe).map_err(Error::Binding)
 }
 
 /// A change as a refusal names it: its kind and what it acts on.

@@ -168,6 +168,7 @@ pub(super) fn classify(
         }
     }
     for (name, table) in &recorded.schema.tables {
+        let expressions: BTreeSet<_> = table.expression_columns().cloned().collect();
         if recorded_names.table_uid(name).is_none() {
             return Err(Uncovered::class(
                 "recorded-uid",
@@ -204,6 +205,12 @@ pub(super) fn classify(
                     ));
                 }
                 let (root_name, root) = chain.last().expect("ancestry includes the current table");
+                let inherited_expressions: BTreeSet<_> = chain
+                    .iter()
+                    .skip(1)
+                    .flat_map(|(_, ancestor)| ancestor.expression_columns())
+                    .cloned()
+                    .collect();
                 for column in root.columns.keys() {
                     if recorded_names
                         .column_uid(&root_name.column(column))
@@ -224,7 +231,17 @@ pub(super) fn classify(
                             ));
                         }
                         assign(&mut owned, child.clone(), table_owner.clone())?;
-                        inherited_columns.insert(child);
+                        inherited_columns.insert(child.clone());
+                        // The declared ancestor's expression authorizes this
+                        // physical copy under the partition's table UID, as
+                        // for its inherited column (DEC-1587.1, DEC-1566.1).
+                        // An explicit own default gets its exact surface below.
+                        if !expressions.contains(column) && inherited_expressions.contains(column) {
+                            let default = identity("pg_attrdef", Vec::new(), vec![child]);
+                            if capture.inputs.contains_key(&default) {
+                                assign(&mut owned, default, table_owner.clone())?;
+                            }
+                        }
                     }
                 }
             }
@@ -286,32 +303,30 @@ pub(super) fn classify(
                 );
             }
             let default_id = identity("pg_attrdef", Vec::new(), vec![column_id]);
-            // A generated attrdef is an explicit root too (DEC-1168.1).
-            // Its internal column edge must not broaden its exact owner.
             if capture.inputs.contains_key(&default_id)
-                // A `serial`'s attrdef is the engine's `nextval`, not text the
-                // declaration holds, as before the sources were one (#1631).
-                && ((match &declaration.value_source {
-                    ValueSource::Default(_) => true,
-                    ValueSource::None
-                    | ValueSource::Identity(_)
-                    | ValueSource::Sequence(_)
-                    | ValueSource::Generated(_) => false,
-                }) || (match &declaration.value_source {
-                    ValueSource::Generated(_) => true,
-                    ValueSource::None
-                    | ValueSource::Default(_)
-                    | ValueSource::Identity(_)
-                    | ValueSource::Sequence(_) => false,
-                }))
-            {
-                assign(&mut owned, default_id, Surface::Default(reference))?;
-            } else if capture.inputs.contains_key(&default_id)
                 && let ValueSource::Sequence(_) = &declaration.value_source
             {
                 // The column's own: it goes with the column and its sequence,
                 // and holds no text a declaration binds (#1631).
                 assign(&mut owned, default_id, Surface::Column(reference))?;
+            }
+        }
+        // One expression inventory includes defaults, generated expressions
+        // and partition overrides, while excluding serial's engine-owned text.
+        for column in &expressions {
+            let reference = name.column(column);
+            let column_id = identity("column", vec![column.raw().into()], vec![table_id.clone()]);
+            let default_id = identity("pg_attrdef", Vec::new(), vec![column_id.clone()]);
+            if capture.inputs.contains_key(&default_id) {
+                if !owned.contains_key(&column_id) {
+                    return Err(Uncovered::object(
+                        &default_id,
+                        "declared expression has no qualified column root",
+                    ));
+                }
+                // Generated attrdefs and partition overrides are independent
+                // binding surfaces; their column's owner must not replace them.
+                assign(&mut owned, default_id, Surface::Default(reference))?;
             }
         }
         for check in table.checks.keys() {
