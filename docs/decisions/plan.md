@@ -778,7 +778,9 @@ objects and CREATE TABLE. Access alone is allowed; complete metadata and the
 same effective permission checks are required. Session temporary objects and
 nominal legacy DEFAULT/RULE object rights are excluded; real schema/parent DDL
 rights remain checked; table types use the TYPE oracle. Restore the target
-before assertion SQL.
+before assertion SQL. Include `sys.system_objects` procedure securables in the
+same inventory; their object DENY is managed in master and applies across
+databases, unlike a database-wide DENY in master alone (native 4629/229).
 Intrinsic session-setting rights and control of the login's own principal do
 not confer target data/DDL rights; native controls retain those ordinary logins.
 The existing PostgreSQL API stays available to #1165. CLI selection and saved

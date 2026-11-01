@@ -23,6 +23,18 @@ impl Fixture {
         for system in ["master", "msdb", "tempdb"] {
             db.conn.execute(&format!("USE [{system}]; CREATE USER [{role}] FOR LOGIN [{role}]; GRANT VIEW DEFINITION TO [{role}]; DENY EXECUTE TO [{role}]; USE [{}]",db.name)).await.unwrap();
         }
+        // Database-wide DENY in master does not deny a server-scoped system
+        // procedure from another database. Object DENY in master does (4629
+        // forbids changing those permissions elsewhere). SQL batches still work.
+        db.conn.execute("USE master").await.unwrap();
+        let procedures=db.conn.query("SELECT QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name) AS name FROM sys.system_objects WHERE type IN ('P','PC','X','RF')").await.unwrap();
+        let mut deny = String::from("BEGIN TRANSACTION; ");
+        for row in procedures {
+            let name = row.try_get::<&str>("name").unwrap().unwrap();
+            deny.push_str(&format!("DENY EXECUTE ON OBJECT::{name} TO [{role}]; "));
+        }
+        deny.push_str(&format!("COMMIT; USE [{}]", db.name));
+        db.conn.execute(&deny).await.unwrap();
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
         db.conn.execute(&format!("CREATE TABLE app.orders(id int,total int); INSERT INTO app.orders VALUES(1,2401); GRANT SELECT ON app.orders TO [{role}]")).await.unwrap();
         let base = conn_str();
@@ -924,6 +936,65 @@ async fn system_database_writes_are_refused_before_sql_and_session_temps_stay_al
     f.db.conn.execute(&format!("USE master; REVOKE ALTER ON SCHEMA::dbo FROM [{role}]; DROP DEFAULT dbo.[{audit}_default]; DROP RULE dbo.[{audit}_rule]; USE [{target}]; DROP TABLE #admin_session2401")).await.unwrap();
     assert!(matches!(
         f.run(read).await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn system_procedure_execute_is_inventoried_without_refusing_read_only_queries() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_system_proc2401").await;
+    assert!(matches!(
+        f.run("SELECT 1 WHERE 1=0").await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    f.db.conn
+        .execute("CREATE FUNCTION dbo.read2401() RETURNS int AS BEGIN RETURN 2401 END")
+        .await
+        .unwrap();
+    f.db.conn
+        .execute(&format!("GRANT EXECUTE ON dbo.read2401 TO [{}]", f.role))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.run("SELECT dbo.read2401() WHERE 1=0").await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    // An object grant in master is effective in the target as well. Keep the
+    // other system procedures denied so the refusal pins this exact securable.
+    f.db.conn.execute(&format!("USE master; REVOKE EXECUTE TO [{}]; REVOKE EXECUTE ON OBJECT::sys.sp_executesql FROM [{}]; GRANT EXECUTE ON OBJECT::sys.sp_executesql TO [{}]; USE [{}]",f.role,f.role,f.role,f.db.name)).await.unwrap();
+    let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+    let rows=caller.query("SELECT (SELECT COUNT(*) FROM sys.objects WHERE name='sp_executesql') AS ordinary,(SELECT COUNT(*) FROM sys.system_objects WHERE name='sp_executesql') AS system,HAS_PERMS_BY_NAME('sys.sp_executesql','OBJECT','EXECUTE') AS executable").await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("ordinary").unwrap(), Some(0));
+    assert_eq!(rows[0].try_get::<i32>("system").unwrap(), Some(1));
+    assert_eq!(rows[0].try_get::<i32>("executable").unwrap(), Some(1));
+    let evidence = caller
+        .query_bounded("EXEC sys.sp_executesql N'SELECT 1 WHERE 1=0'", DEADLINE)
+        .await
+        .unwrap();
+    assert!(matches!(
+        AssertionResult::from_evidence(evidence),
+        AssertionResult::Pass(_)
+    ));
+    for sql in ["EXEC sys.sp_executesql N'SELECT 1 WHERE 1=0'", "SELECT 1/0"] {
+        let error = f.run(sql).await.unwrap_err();
+        assert!(
+            error.to_string().contains("EXECUTE")
+                && error.to_string().contains("[sys].[sp_executesql]"),
+            "{error:?}"
+        );
+    }
+    f.db.conn
+        .execute(&format!(
+            "USE master; DENY EXECUTE ON OBJECT::sys.sp_executesql TO [{}]; USE [{}]",
+            f.role, f.db.name
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.run("SELECT 1 WHERE 1=0").await.unwrap(),
         AssertionResult::Pass(_)
     ));
     f.finish().await;

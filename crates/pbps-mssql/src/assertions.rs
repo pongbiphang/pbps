@@ -235,7 +235,8 @@ async fn privileges_here(conn: &mut Conn, database: &str) -> Result<(), DbError>
         // rights even when the engine denies DROP/GRANT (native 3701/4606).
         // Their real DDL capability is on the schema/parent; table types use
         // the TYPE inventory, not OBJECT. Session temporary objects are not
-        // permanent tempdb writes. Keep shipped procedures.
+        // permanent tempdb writes. System procedures have a separate catalog;
+        // their EXECUTE check below excludes system catalog views.
         (
             "OBJECT",
             "SELECT QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name) AS name,type FROM sys.objects WHERE type NOT IN ('S','IT','D','R','TT') AND (DB_ID()<>2 OR name NOT LIKE '#%')",
@@ -330,6 +331,10 @@ async fn privileges_here(conn: &mut Conn, database: &str) -> Result<(), DbError>
         };
         parts.push(format!("SELECT {permission}, ('{class} '+i.name) COLLATE DATABASE_DEFAULT FROM ({inventory}) i OUTER APPLY sys.fn_my_permissions(i.name,'{class}') p"));
     }
+    // System procedures live outside sys.objects. Ask the engine for the one
+    // capability being refused instead of enumerating every permission for
+    // thousands of built-ins. NULL remains an unreadable inventory answer.
+    parts.push("SELECT CASE WHEN permission=1 THEN 'EXECUTE (procedure)' END AS permission_name, ('OBJECT '+name) COLLATE DATABASE_DEFAULT FROM (SELECT QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name) AS name,HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME(schema_id))+'.'+QUOTENAME(name),'OBJECT','EXECUTE') AS permission FROM sys.system_objects WHERE type IN ('P','PC','X','RF')) i WHERE permission IS NULL OR permission<>0".into());
     let sql = format!(
         "SELECT TOP(1) permission_name,object FROM ({}) p WHERE permission_name IS NULL OR permission_name NOT IN ({safe})",
         parts.join(" UNION ALL ")

@@ -503,7 +503,10 @@ Guest access itself is allowed; write-capable rights on permanent objects and
 CREATE TABLE refuse by database and object/permission name. Ordinary temporary
 objects stay allowed. Complete metadata is required in every audited database;
 map a read-only user there, grant VIEW DEFINITION, and deny inherited procedure
-EXECUTE. Default guest ownership can include permanent CREATE SEQUENCE and is refused as a real capability.
+EXECUTE. Include system procedures from `sys.system_objects` in the same
+inventory. Their object permissions are managed in master (native 4629); an
+object DENY there applies when the procedure is invoked from another database,
+whereas database-wide DENY in master alone does not. Default guest ownership can include permanent CREATE SEQUENCE and is refused as a real capability.
 Legacy DEFAULT/RULE object permission rows are nominal: native DROP and GRANT
 are denied without schema rights, which the same inventory still checks. Table
 types are checked in the TYPE namespace rather than as OBJECT securables.
