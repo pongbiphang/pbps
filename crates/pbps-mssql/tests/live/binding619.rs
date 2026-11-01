@@ -1279,7 +1279,7 @@ async fn a_login_reads_every_database_it_can_enter() {
     )
     .await;
     assert_eq!(number(&mut conn, &enters).await, 111);
-    run(&mut db.conn, &["GRANT CONNECT TO guest;"]).await;
+    let _guest = super::assertions2401::enable_guest(&mut db.conn).await;
     assert_eq!(
         number(&mut conn, &enters).await,
         1111,
@@ -1709,14 +1709,8 @@ async fn a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_adm
 
     let enters = format!("SELECT CONVERT(bigint, HAS_DBACCESS(N'{}'));", target.name);
     assert_eq!(number(&mut sandbox, &enters).await, 0);
-    run(
-        &mut target.conn,
-        &[
-            "GRANT CONNECT TO guest;",
-            "GRANT INSERT ON dbo.t TO public;",
-        ],
-    )
-    .await;
+    let _guest = super::assertions2401::enable_guest(&mut target.conn).await;
+    run(&mut target.conn, &["GRANT INSERT ON dbo.t TO public;"]).await;
     assert_eq!(
         number(&mut sandbox, &enters).await,
         1,
@@ -1948,7 +1942,7 @@ async fn rendered_ddl_on_an_empty_scratch_runs_no_body_that_reaches_a_global_tem
 async fn a_database_list_without_view_any_database_hides_the_target_and_says_so() {
     let mut scratch = TestDb::create("listscratch619").await;
     let mut target = TestDb::create("listtarget619").await;
-    run(&mut target.conn, &["GRANT CONNECT TO guest;"]).await;
+    let _guest = super::assertions2401::enable_guest(&mut target.conn).await;
     let pid = std::process::id();
     let password = "Pbps!Lister619x";
     let login = format!("pbps619_lister_{pid}");

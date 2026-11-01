@@ -6,8 +6,17 @@ use std::time::Duration;
 // Admission now audits every accessible system database as well as the target.
 // Give the native fixture room on shared hosts; the 200 ms timeout case is separate.
 const DEADLINE: Duration = Duration::from_secs(30);
-// A default linked-server mapping affects every login on the fixture.
+// Default linked-server mappings and guest-enabled databases affect every
+// login on the instance. Guest-admission controls share this case guard.
 static TARGET_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Hold the guard until the caller removes the guest-enabled database: otherwise
+// unrelated positive assertion cases correctly refuse its instance-wide access.
+pub(super) async fn enable_guest(conn: &mut Conn) -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TARGET_CASE.lock().await;
+    conn.execute("GRANT CONNECT TO guest").await.unwrap();
+    guard
+}
+
 struct Fixture {
     db: TestDb,
     role: String,
@@ -94,6 +103,35 @@ impl Fixture {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn guest_enabled_databases_do_not_overlap_target_assertion_cases() {
+    let mut other = TestDb::create("assert_guest_overlap2401").await;
+    let guest = enable_guest(&mut other.conn).await;
+    let excluded = TARGET_CASE.try_lock().is_err();
+    let mut next_case = Box::pin(async {
+        let _case = TARGET_CASE.lock().await;
+        let mut f = Fixture::new("assert_after_guest2401").await;
+        let result = f.run("SELECT 1 WHERE 1=0").await;
+        f.finish().await;
+        result
+    });
+    let waited = tokio::time::timeout(Duration::from_millis(100), &mut next_case)
+        .await
+        .is_err();
+    // Guest remains enabled while the next case is queued. Teardown must
+    // precede releasing the case guard, even when the regression fails.
+    other.drop().await;
+    drop(guest);
+    let result = next_case.await;
+    assert!(
+        excluded,
+        "guest admission must hold the assertion case guard"
+    );
+    assert!(waited, "the assertion case must wait for guest teardown");
+    assert!(matches!(result.unwrap(), AssertionResult::Pass(_)));
 }
 
 #[tokio::test]

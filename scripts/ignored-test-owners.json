@@ -1762,6 +1762,7 @@
         "commutation::pairs_the_effects_call_independent_commute_on_the_engine",
         "annotations2469::module_to_object_annotations_drive_installs_and_removals",
         "annotations2469::in_place_provider_keeps_availability_and_releases_old_dependencies",
+        "assertions2401::guest_enabled_databases_do_not_overlap_target_assertion_cases",
         "assertions2401::an_assertion_login_is_checked_by_effective_object_column_and_ddl_permissions",
         "assertions2401::multi_statement_writes_are_refused_by_permissions_before_execution",
         "assertions2401::target_batches_distinguish_rows_result_shapes_and_complete_stream_errors",
