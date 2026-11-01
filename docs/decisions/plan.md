@@ -754,3 +754,20 @@ checksum comparison under the deployment lock refuses before DDL; the failed
 attempt remains an audit record, not new deployed provenance. Rechecking the
 applying host's Git history would reject an approved plan for evidence unrelated
 to its construction and would not strengthen that checksum boundary.
+
+<a id="dec-2401-1"></a>
+
+**DEC-2401.1. Target assertions share the assertion result contract, but each
+engine establishes its own boundary (#2401 PR A).** Target-only entry points
+verify database identity and effective write/DDL permissions on the fresh
+assertion session before user SQL. PostgreSQL reuses the owned READ ONLY
+transaction runner unchanged; SQL Server consumes a bounded native result stream
+and relies on the separate credential, never a target mode change. Its framing
+is not read-only enforcement. Effective EXECUTE on a procedure-like object
+(`P`, `PC`, `X`, `RF`) is write-capable even through ordinary ownership chaining;
+refuse it by object name, including inherited schema/database grants. Function
+EXECUTE remains allowed.
+Intrinsic session-setting rights and control of the login's own principal do
+not confer target data/DDL rights; native controls retain those ordinary logins.
+The existing PostgreSQL API stays available to #1165. CLI selection and saved
+plan/ledger observations follow in PR B; no assertion runs during apply.

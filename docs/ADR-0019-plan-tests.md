@@ -486,13 +486,24 @@ variable, never fall back to the apply/planning login. Verify it identifies the
 same target database through ordinary endpoint/database identity reads.
 PostgreSQL retains the owned READ ONLY transaction protocol above. A SQL Server
 target cannot be switched read-only: **its boundary is the least-privilege login
-only**, and privileged callable routines can exceed direct SELECT rights.
-Verify and report effective assertion privileges and that weaker boundary;
-never claim scratch-strength read-only enforcement on a target. No user SQL
+only**. Refuse effective EXECUTE on procedure-like objects (`P`, `PC`, `X`,
+`RF`), including grants inherited from roles, schemas or the database: ordinary
+ownership chaining can persist a procedure's writes without EXECUTE AS or
+caller table DML. Name the procedure in the refusal. EXECUTE on functions stays
+allowed; they cannot change persistent database state. Verify and report these
+effective privileges; framing is not read-only enforcement and the target is
+never switched to scratch READ_ONLY mode. No user SQL
 runs during apply. Target assertion hashes/outcomes enter the plan checksum,
 `explain` and ledger (#2401); failures/errors write no plan. The accepted
 plan-to-apply window is closed only for the specific predicates covered by
 constraints or recorded drop preconditions, not arbitrary target assertions.
+
+#2401 PR A supplies the target engine entry points; the CLI selection and saved
+observation fields follow in PR B. SQL Server's assertion credential also needs
+`VIEW DEFINITION` on the target database so hidden securables cannot appear to
+have no write permissions. Unknown identity or permission reads refuse before
+assertion SQL; no grants are added by the runner. The existing PostgreSQL
+scratch entry point and its transaction protocol remain unchanged.
 
 ## 8. Measurements supporting the boundaries
 
@@ -850,8 +861,8 @@ successful test run.
   Removing the identity/postcheck/first-read protections makes their tests fail.
 - SQL Server closes owned clients before READ_ONLY, verifies the mode, refuses
   persistent owner-procedure writes and retains temporary-object behavior.
-  #2401 separately qualifies the weaker privilege-only target boundary; it
-  never switches the target read-only.
+  #2401 separately refuses write-capable target credentials, including
+  procedure EXECUTE through ownership chaining; it never switches target mode.
 - Zero rows, NULL row, multiple/no result sets, bounded violations, SQL errors,
   transport loss, driver timeouts and unreadable results retain distinct facts
   and correct exit codes. Cleanup failure always prevents overall success.

@@ -433,6 +433,41 @@ pub struct Conn {
     client: Client<Compat<crate::transport::BoxedStream>>,
 }
 
+// TDS values are already decoded by the driver. Unsupported non-NULL values
+// remain explicit rather than guessing an encoding or changing the query.
+fn render_cell(
+    value: &tiberius::ColumnData<'_>,
+    remaining: &mut usize,
+) -> crate::query::EvidenceCell {
+    use crate::query::{EvidenceCell, text_cell};
+    use tiberius::ColumnData::*;
+    let text = match value {
+        String(Some(text)) => return text_cell(text, remaining),
+        U8(None) | I16(None) | I32(None) | I64(None) | F32(None) | F64(None) | Bit(None)
+        | String(None) | Guid(None) | Binary(None) | Numeric(None) | Xml(None) | DateTime(None)
+        | SmallDateTime(None) | Time(None) | Date(None) | DateTime2(None)
+        | DateTimeOffset(None) => return EvidenceCell::Null,
+        U8(Some(v)) => v.to_string(),
+        I16(Some(v)) => v.to_string(),
+        I32(Some(v)) => v.to_string(),
+        I64(Some(v)) => v.to_string(),
+        F32(Some(v)) => v.to_string(),
+        F64(Some(v)) => v.to_string(),
+        Bit(Some(v)) => v.to_string(),
+        Guid(Some(v)) => v.to_string(),
+        Numeric(Some(v)) => v.to_string(),
+        Binary(Some(_))
+        | Xml(Some(_))
+        | DateTime(Some(_))
+        | SmallDateTime(Some(_))
+        | Time(Some(_))
+        | Date(Some(_))
+        | DateTime2(Some(_))
+        | DateTimeOffset(Some(_)) => return EvidenceCell::Unrenderable,
+    };
+    text_cell(&text, remaining)
+}
+
 impl From<tiberius::error::Error> for DbError {
     /// The driver's error, flattened to text and a code.
     ///
@@ -551,6 +586,63 @@ impl Conn {
             .into_iter()
             .map(Row)
             .collect())
+    }
+
+    pub(crate) async fn query_bounded(
+        mut self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::query::QueryEvidence, DbError> {
+        // Own and drop the socket on every path, including a partial TDS stream.
+        tokio::time::timeout(timeout, self.read_bounded(sql))
+            .await
+            .map_err(|_| DbError::Refused("assertion query driver timeout".into()))?
+    }
+
+    async fn read_bounded(&mut self, sql: &str) -> Result<crate::query::QueryEvidence, DbError> {
+        use crate::query::{MAX_BYTES, QueryColumn, QueryEvidence};
+        use futures_util::TryStreamExt;
+        use tiberius::QueryItem;
+        let mut result = QueryEvidence {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+        let mut sets = 0;
+        let mut remaining = MAX_BYTES;
+        let mut stream = self.client.simple_query(sql).await?;
+        while let Some(item) = stream.try_next().await? {
+            match item {
+                QueryItem::Metadata(meta) => {
+                    sets += 1;
+                    if sets != 1 || meta.columns().is_empty() || meta.columns().len() > 4096 {
+                        // An invalid result is never turned into an empty first set.
+                        result.columns.clear();
+                        return Ok(result);
+                    }
+                    result.columns = meta
+                        .columns()
+                        .iter()
+                        .map(|column| QueryColumn {
+                            name: column.name().to_owned(),
+                            type_name: format!("{:?}", column.column_type()),
+                        })
+                        .collect();
+                }
+                QueryItem::Row(row) => {
+                    result.rows.push(
+                        row.cells()
+                            .map(|(_, value)| render_cell(value, &mut remaining))
+                            .collect(),
+                    );
+                    if result.at_limit(remaining) {
+                        result.truncated = true;
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Runs one batch of statements and discards any results.

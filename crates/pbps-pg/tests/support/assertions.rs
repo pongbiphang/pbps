@@ -640,3 +640,6 @@ async fn types_without_binary_output_are_invalid_before_execution() {
         f.finish().await;
     }
 }
+
+#[path = "assertions2401.rs"]
+mod target2401;
