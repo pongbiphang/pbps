@@ -1687,3 +1687,32 @@ rule cannot see is the same lines landing where master changed their meaning; th
 is the interaction every unrebased pull request already carries to the merge group
 (DECISIONS 502), and a miss costs one ejection, against an observed 1.8 % rate of
 live failures after a full local gate (5 of 271 merge-group runs).
+
+
+<a id="dec-2584-1"></a>
+
+**DEC-2584.1. A missing-only live audit gets one serial continuation inside the
+same gate, through the ordinary resume path.** Waiting for a new gate-lock slot
+and hand-writing a continuation repeats work and makes the union harder to
+verify (#2584). After every first-pass worker and its owned-fixture cleanup has
+finished, the driver validates all receipts and partitions before deciding to
+continue. Missing invocation receipts or an interrupted libtest stream may
+leave names unproven. Here **missed means no valid receipt**, as in DEC-2553.1:
+even a printed `ok` in an invalid invocation is unproven and reruns; partial
+output is never promoted into proof. A `FAILED` in the first pass forbids the
+automatic continuation, including a registered flake. Disagreement, malformed
+evidence, identity mismatch, memory-sampling or cleanup failure also forbids it.
+Manual `--resume` retains DEC-2553.2's separate flake rules.
+
+On eligible loss the first pass's evidence is preserved unchanged under
+`original/`; the existing `--resume` path writes the final output at the
+requested root. One worker executes one shard per engine serially, under the
+same invocation and lock. The final summary records both run ids, the original
+summary path, rerun names by suite and invocation occurrence, the conservative
+meaning of missed, and elapsed time and minimum available memory across both
+passes. Its normal receipts and inherited snapshot remain manually resumable.
+A failure or another loss in the continuation fails the gate; no second
+automatic continuation is allowed. With no loss there is no continuation and
+the summary shape is unchanged. The ordinary combined audit must still prove
+DEC-2357.1's exact union; this changes neither test membership nor FAILED retry
+policy.

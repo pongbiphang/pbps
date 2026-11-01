@@ -149,7 +149,7 @@ else:
              mock.patch.object(SHARDS, "drive", side_effect=AssertionError("local driver")), \
              mock.patch.object(SHARDS.shutil, "which", return_value="/fake/cargo"), \
              mock.patch.object(SHARDS.subprocess, "run", return_value=listing) as enumerate_tests, \
-             mock.patch.object(SHARDS, "run_tests", return_value=({}, 0, 0, True)) as execute, \
+             mock.patch.object(SHARDS, "run_tests", return_value=({}, 0, 0, True, False)) as execute, \
              mock.patch.object(sys, "argv", ["live-shards.py", "ci", "0/2", "test",
                                             "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored"]), \
              redirect_stdout(io.StringIO()):

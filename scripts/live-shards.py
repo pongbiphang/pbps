@@ -537,7 +537,11 @@ def run_tests(command, assigned):
         rf"test result: {'FAILED' if failed else 'ok'}\. {passed} passed; {failed} failed; "
         r"0 ignored; 0 measured; [0-9]+ filtered out; finished in .+", summaries[0])
         and (code == 0) == (failed == 0))
-    return reported, code, time.monotonic() - started, bool(valid)
+    # A clean prefix ending without libtest's summary is a lost invocation,
+    # not proof that its printed ok names passed (DEC-2584.1).
+    interrupted = (headers == [len(assigned)] and not duplicates and not summaries
+                   and bool(assigned) and set(reported) <= set(assigned) and code != 0)
+    return reported, code, time.monotonic() - started, bool(valid), interrupted
 
 
 def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False):
@@ -561,9 +565,9 @@ def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False
     assigned = groups[index]
     print(f"ci shard {index}/{count}: {len(assigned)}/{len(names)} tests", flush=True)
     require(assigned or allow_empty, "CI shard has no assigned tests")
-    reported, code, seconds, valid = {}, 0, 0.0, True
+    reported, code, seconds, valid, interrupted = {}, 0, 0.0, True, False
     if assigned:
-        reported, code, seconds, valid = run_tests(
+        reported, code, seconds, valid, interrupted = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
              "--color=never", *assigned], assigned)
     if output is not None:
@@ -608,9 +612,9 @@ def cargo_proxy(args):
         # A caller that checks per-test output sees nothing for a name proven
         # earlier; this line is its cue to ask `carried_attestation`.
         print(CARRIED_LINE + key, flush=True)
-    reported, code, seconds, valid = {}, 0, 0.0, True
+    reported, code, seconds, valid, interrupted = {}, 0, 0.0, True, False
     if assigned:
-        reported, code, seconds, valid = run_tests(
+        reported, code, seconds, valid, interrupted = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
              "--color=never", *assigned], assigned)
     # The head the tests ran on must still be the head the driver started on.
@@ -618,7 +622,7 @@ def cargo_proxy(args):
     receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
                "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
                "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
-               "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried}
+               "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried, "interrupted": interrupted}
     write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
@@ -696,7 +700,7 @@ def shard(suite, extra):
     return result.returncode
 
 
-def audit(suite_root, count, *, expected_invocations=None):
+def audit(suite_root, count, *, expected_invocations=None, missing=None):
     receipts = [{p.stem: json.loads(p.read_text()) for p in (suite_root / str(i)).glob("*.json")}
                 for i in range(count)]
     if expected_invocations is not None:
@@ -704,14 +708,15 @@ def audit(suite_root, count, *, expected_invocations=None):
                 "unexpected invocation receipt count")
     # A resumed run may leave a shard nothing to run; it must still have receipts.
     resumed = any(row.get("carried") for shard in receipts for row in shard.values())
-    require(all(shard if resumed else any(r["assigned"] for r in shard.values()) for shard in receipts),
+    require(missing is not None and any(receipts) or
+            all(shard if resumed else any(r["assigned"] for r in shard.values()) for shard in receipts),
             "a shard is empty for the whole suite")
     passed = failed = carried_total = 0
     measured = {}
     for key in sorted(set().union(*(set(shard) for shard in receipts))):
         rows = [shard.get(key) for shard in receipts]
         reference = next(row for row in rows if row is not None)
-        require(all(row is not None for row in rows) or
+        require(missing is not None or all(row is not None for row in rows) or
                 reference["pinned"] and rows[0] is not None
                 and all(row is None for row in rows[1:]), "missing invocation receipt")
         carried = reference.get("carried", {})
@@ -719,19 +724,33 @@ def audit(suite_root, count, *, expected_invocations=None):
                                                     for r in carried.values()),
                 "a carried name is not ok")
         groups = []
+        require(len(reference["groups"]) == count, "partition has the wrong shard count")
+        absent = []
         for index, row in enumerate(rows):
             if row is None:
-                groups.append([])
+                assigned = reference["groups"][index]
+                require(not reference["pinned"] or index == 0 or not assigned,
+                        "pinned invocation assigned outside shard zero")
+                groups.append(assigned)
+                absent.extend(assigned)
                 continue
             require(all(row[k] == reference[k] for k in ("args", "identity", "listed", "groups", "pinned")),
                     "shards disagree about the invocation or partition")
             require(row.get("carried", {}) == carried, "shards disagree about the carried names")
             require(row["assigned"] == row["groups"][index], "assignment differs from partition")
-            require(row["valid"], "libtest reports or summary are incomplete")
-            require(set(row["assigned"]) == set(row["reported"]), "assigned test has no result")
+            lost = (not row["valid"] and row.get("interrupted") is True
+                    and bool(row["assigned"]) and set(row["reported"]) <= set(row["assigned"]))
+            require(row["valid"] or missing is not None and lost,
+                    "libtest reports or summary are incomplete")
+            require(set(row["reported"]) <= set(row["assigned"]), "unassigned test reported a result")
+            require(missing is not None and lost or set(row["assigned"]) == set(row["reported"]),
+                    "assigned test has no result")
             require(all(r["status"] in ("ok", "FAILED") for r in row["reported"].values()),
                     "test did not report ok/FAILED")
             groups.append(row["assigned"])
+            if missing is not None and lost:
+                # Match load_resume: an invalid receipt proves none of its names.
+                absent.extend(row["assigned"])
             for name, result in row["reported"].items():
                 passed += result["status"] == "ok"
                 failed += result["status"] == "FAILED"
@@ -740,6 +759,8 @@ def audit(suite_root, count, *, expected_invocations=None):
                 "a carried name ran again")
         verify_union(reference["listed"], [*groups, sorted(carried)])
         verify_express(groups)
+        if absent:
+            missing[key] = sorted(absent)
         passed += len(carried)
         carried_total += len(carried)
     result = {"passed": passed, "failed": failed, "union": "exact"}
@@ -796,7 +817,7 @@ def sample_memory(stop, samples, errors):
             return
 
 
-def drive(args):
+def drive(args, *, automatic=True):
     suites = list(RUNNERS) if args.suite == "all" else [args.suite]
     memory = available_gb()
     counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
@@ -894,7 +915,7 @@ def drive(args):
     with FixtureRun(used_names) as fixtures:
         try:
             sampler.start()
-            with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            with ThreadPoolExecutor(max_workers=len(tasks) if automatic else 1) as pool:
                 finished = list(pool.map(launch, tasks))
         finally:
             stop.set()
@@ -942,7 +963,72 @@ def drive(args):
         weights = weights or {}
         weights.update(measured)
         Path(args.measure).write_text(json.dumps(weights, indent=2, sort_keys=True) + "\n")
+    if failed and automatic:
+        try:
+            missing = lost_tests(output, summary, tree, inputs)
+        except (ValueError, OSError, LookupError, TypeError, AttributeError) as error:
+            print(f"no automatic rerun: {error}", flush=True)
+        else:
+            return rerun_missing(args, output, summary, missing, started)
     return int(failed)
+
+
+def lost_tests(output, summary, tree, inputs):
+    """Diagnose loss with the audit, then apply the ordinary resume proof checks."""
+    require(not summary["run"]["memory_errors"], "memory sampling failed")
+    missing = {}
+    for suite, count in summary["run"]["shards"].items():
+        gaps = {}
+        checked, _ = audit(output / suite, count, missing=gaps)
+        require(not checked["failed"], "FAILED in the first pass forbids automatic rerun")
+        require(gaps or not any(summary[suite]["exits"]), "runner failed without lost results")
+        missing[suite] = gaps
+    require(any(missing.values()), "no lost names to rerun")
+    # An empty waiver map deliberately rejects even registered flakes.
+    # This also checks every receipt's identity and inherited evidence.
+    load_resume(output, tree, inputs, list(missing), {})
+    return missing
+
+
+def rerun_missing(args, output, original_summary, missing, started):
+    """One serial use of --resume, with both immutable evidence sets (DEC-2584.1)."""
+    original = output / "original"
+    require(not original.exists(), "original evidence directory already exists")
+    original.mkdir()
+    for name in (MANIFEST, SNAPSHOT, "weights-input.json", "summary.json", *missing):
+        path = output / name
+        if path.exists():
+            path.rename(original / name)
+    options = argparse.Namespace(**vars(args))
+    options.resume = str(original)
+    options.output = str(output)
+    options.mssql_shards = options.pg_shards = 1
+    # Freeze the same weights; they select neighbours, not proof identity.
+    frozen_weights = read_json(original / "weights-input.json", "weights snapshot")
+    options.weights = str(original / "weights-input.json") if frozen_weights is not None else None
+    print("rerunning lost names once, serially; missed means no valid receipt; "
+          f"original summary {original / 'summary.json'}", flush=True)
+    code = drive(options, automatic=False)
+    final = read_json(output / "summary.json", "rerun summary")
+    before, after = original_summary["run"], final["run"]
+    # A killed shard may never have reached a later pinned invocation. Its
+    # authoritative --list appears for the first time during the continuation.
+    for suite, gaps in missing.items():
+        for path in (output / suite).glob("*/*.json"):
+            row = read_json(path, "rerun receipt")
+            if row["assigned"]:
+                gaps[path.stem] = sorted(set(gaps.get(path.stem, [])) | set(row["assigned"]))
+    after["automatic_rerun"] = {
+        "original_run_id": before["run_id"], "rerun_run_id": after["run_id"],
+        "original_summary": str((original / "summary.json").resolve()),
+        "missed_definition": "no valid receipt", "names": missing}
+    after["seconds"] = time.monotonic() - started
+    after["minimum_available_gib"] = min(before["minimum_available_gib"], after["minimum_available_gib"])
+    after["memory_samples"] += before["memory_samples"]
+    write_atomic(output / "summary.json", json.dumps(final, indent=2) + "\n")
+    print(f"combined gate: {after['seconds']:.2f}s; minimum available memory: "
+          f"{after['minimum_available_gib']:.2f} GiB; summary {output / 'summary.json'}", flush=True)
+    return code
 
 
 def main():
