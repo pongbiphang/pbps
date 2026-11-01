@@ -453,6 +453,14 @@ def load_resume(previous, tree, inputs, suites, flakes):
     for suite in suites:
         directory = previous / suite
         require(directory.is_dir(), f"the previous output has no {suite} receipts")
+        for shard in sorted(directory.iterdir()):
+            if shard.is_dir():
+                pending = shard / "tls-cleanup.pending"
+                try:
+                    pending.lstat()
+                except FileNotFoundError:
+                    continue
+                raise ValueError(f"unconfirmed TLS fixture removal: {pending}")
         rows = {}
         for path in sorted(directory.glob("*/*.json")):
             row = read_json(path, "receipt")
@@ -503,7 +511,7 @@ def load_resume(previous, tree, inputs, suites, flakes):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned):
+def run_tests(command, assigned, *, on_failure=None):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
@@ -512,7 +520,6 @@ def run_tests(command, assigned):
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None,
                           text=True, bufsize=1) as process:
         for line in process.stdout:
-            print(line, end="", flush=True)
             header = re.fullmatch(r"running ([0-9]+) tests?\n?", line)
             if header:
                 headers.append(int(header[1]))
@@ -527,8 +534,13 @@ def run_tests(command, assigned):
                 now = time.monotonic()
                 reported[name] = {"status": status, "seconds": max(now - last, 0.000001)}
                 last = now
+                if status == "FAILED" and on_failure is not None:
+                    on_failure(reported)
             if line.startswith("test result:"):
                 summaries.append(line.strip())
+            # Observed failures must reach the existing receipt protocol before
+            # the line is forwarded: the proxy can die before its final receipt.
+            print(line, end="", flush=True)
         code = process.wait()
     passed = sum(r["status"] == "ok" for r in reported.values())
     failed = len(reported) - passed
@@ -612,18 +624,23 @@ def cargo_proxy(args):
         # A caller that checks per-test output sees nothing for a name proven
         # earlier; this line is its cue to ask `carried_attestation`.
         print(CARRIED_LINE + key, flush=True)
+    def save_receipt(reported, seconds, valid, interrupted):
+        # A provisional FAILED receipt is invalid proof of ok-ness, but resume
+        # already treats its FAILED result as authoritative failure evidence.
+        tree = tree_identity(ROOT)
+        receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
+                   "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
+                   "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
+                   "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried, "interrupted": interrupted}
+        write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
+
     reported, code, seconds, valid, interrupted = {}, 0, 0.0, True, False
     if assigned:
         reported, code, seconds, valid, interrupted = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-             "--color=never", *assigned], assigned)
-    # The head the tests ran on must still be the head the driver started on.
-    tree = tree_identity(ROOT)
-    receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
-               "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
-               "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
-               "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried, "interrupted": interrupted}
-    write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
+             "--color=never", *assigned], assigned,
+            on_failure=lambda results: save_receipt(results, 0.0, False, False))
+    save_receipt(reported, seconds, valid, interrupted)
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
 

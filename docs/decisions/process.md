@@ -1699,10 +1699,17 @@ finished, the driver validates all receipts and partitions before deciding to
 continue. Missing invocation receipts or an interrupted libtest stream may
 leave names unproven. Here **missed means no valid receipt**, as in DEC-2553.1:
 even a printed `ok` in an invalid invocation is unproven and reruns; partial
-output is never promoted into proof. A `FAILED` in the first pass forbids the
-automatic continuation, including a registered flake. Disagreement, malformed
+output is never promoted into proof. Before forwarding an observed `FAILED`,
+the proxy atomically writes an invalid provisional receipt containing that
+failure. A proxy killed before its final receipt therefore cannot erase failure
+evidence; the provisional receipt proves no `ok` names. A `FAILED` in the first
+pass forbids the automatic continuation, including a registered flake. Disagreement, malformed
 evidence, identity mismatch, memory-sampling or cleanup failure also forbids it.
-Manual `--resume` retains DEC-2553.2's separate flake rules.
+Before creating an owned TLS fixture, its helper records a cleanup-pending
+marker in the shard's evidence directory, removed only after successful fixture
+removal. The shared resume loader refuses any remaining marker by name, for
+both automatic continuation and manual `--resume`; missing test results cannot
+hide unproven cleanup. Manual resume retains DEC-2553.2's separate flake rules.
 
 On eligible loss the first pass's evidence is preserved unchanged under
 `original/`; the existing `--resume` path writes the final output at the

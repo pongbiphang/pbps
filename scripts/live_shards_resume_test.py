@@ -49,6 +49,8 @@ state = (Path(os.environ["FAKE_LOSS_STATE"] + "-" + os.environ["PBPS_LIVE_SUITE"
          if os.environ.get("FAKE_LOSS_STATE") else None)
 rerun = state is not None and state.exists() and state.read_text() != os.environ["PBPS_LIVE_RUN"]
 if rerun:
+    if os.environ.get("FAKE_FAIL_ONCE"):
+        fail.clear()
     fail |= set(json.loads(os.environ.get("FAKE_FAIL_AFTER_LOSS", "[]")))
 trace = os.environ.get("FAKE_TRACE")
 def record(event):
@@ -66,6 +68,12 @@ for name in ran:
             state.write_text(os.environ["PBPS_LIVE_RUN"])
         record("lost")
         if os.environ.get("FAKE_KILL_PROXY"):
+            if os.environ.get("FAKE_WAIT_FAILED_LOG"):
+                log=Path(os.environ["PBPS_LIVE_SHARD_DIR"]).parent/(os.environ["PBPS_LIVE_SHARD"].split("/")[0]+".log")
+                deadline=time.monotonic()+5
+                while "test a05 ... FAILED" not in log.read_text() and time.monotonic()<deadline:
+                    time.sleep(0.001)
+                assert "test a05 ... FAILED" in log.read_text()
             os.kill(os.getppid(), signal.SIGKILL)
         os._exit(137)
 bad = sum(n in fail for n in ran)
@@ -325,6 +333,23 @@ class Automatic(Harness):
                     weights.write_text('{"old:case": 1}')
                 _, output = self.once("--weights", str(weights), check=0)
                 self.assertEqual(self.summary(output)["pg"]["union"], "exact")
+
+    def test_failed_result_survives_a_killed_proxy_without_a_final_receipt(self):
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                if registered:
+                    self.set_register([{"test": "a05", "cargo": CARGO, "issue": 1,
+                                        "expires": Resume.soon(self)}])
+                result, output = self.once(fail=["a05"], check=1, env={
+                    "FAKE_KILL_PROXY": "1", "FAKE_WAIT_FAILED_LOG": "1", "FAKE_FAIL_ONCE": "1"})
+                self.assertFalse((output / "original").exists())
+                self.assertEqual(len({e["run"] for e in self.events()}), 1)
+                failed = [row for row in self.receipts(output).values()
+                          if row["reported"].get("a05", {}).get("status") == "FAILED"]
+                self.assertEqual(len(failed), 1)
+                self.assertFalse(failed[0]["valid"], "an unfinished invocation proves no ok names")
+                self.assertEqual(self.summary(output)["pg"]["failed"], 1)
+                self.assertIn("test a05 ... FAILED", "".join(p.read_text() for p in output.glob("pg/*.log")))
 
     def test_a_missed_name_failed_on_rerun_stays_failed_and_is_named(self):
         result, output = self.once(env={"FAKE_FAIL_AFTER_LOSS": '["a05"]'})
@@ -852,6 +877,81 @@ class Tls(Harness):
         transport = self.transport()
         for key in (first, second, third):
             self.run_case(transport, env, self.line(key), "tls_untrusted")
+
+
+class TlsCleanup(Harness):
+    """The real TLS lifecycle, with external Docker/PKI operations substituted."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        header, second = RUNNER.rsplit("cargo test", 1)
+        (cls.repo / "scripts/live-tests-pg.sh").write_text(header + '''if [[ ${PBPS_LIVE_SHARD%%/*} == 0 ]]; then
+    PBPS_LIVE_PINNED=1 python3 scripts/tls_fixture.py
+fi
+''' + "cargo test" + second)
+        (cls.repo / "scripts/tls_fixture.py").write_text('''import importlib.util, json, os, subprocess
+from pathlib import Path
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location("transport", Path(__file__).with_name("live-transport.py"))
+transport = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(transport)
+state = Path(os.environ["FAKE_TLS_RESOURCES"])
+state.mkdir(exist_ok=True)
+real_run, real_case = subprocess.run, transport.run_case
+
+def probe(command, **kwargs):
+    if command[:2] == ["docker", "exec"]:
+        return subprocess.CompletedProcess(command, 0)
+    return real_run(command, **kwargs)
+
+def run(*args, **kwargs):
+    if args[:2] == ("docker", "create"):
+        (state / args[args.index("--name") + 1]).touch()
+    if args[:2] == ("docker", "rm"):
+        if os.environ.get("FAKE_TLS_REMOVE_FAIL") and not (state / "failed-once").exists():
+            (state / "failed-once").touch()
+            raise subprocess.CalledProcessError(1, args)
+        (state / args[-1]).unlink()
+    return subprocess.CompletedProcess(args, 0, json.dumps({"5432/tcp": [{"HostPort": "54321"}]}))
+
+def case(command, name, env):
+    real_case(["cargo", "test", "-p", "demo", "--test", "tls", "--"], name, env)
+
+with patch.object(transport, "run", side_effect=run), patch.object(transport.subprocess, "run", side_effect=probe), patch.object(transport, "run_case", side_effect=case), patch("sys.argv", ["live-transport.py", "pg"]):
+    transport.main()
+''')
+        git(cls.repo, "add", "-A")
+        git(cls.repo, "commit", "-q", "-m", "real TLS lifecycle with controlled engine operations")
+
+    def test_failed_tls_removal_blocks_automatic_and_manual_continuation_by_marker_name(self):
+        resources = self.runs / "leaked-tls"
+        env = {"FAKE_TLS_RESOURCES": str(resources), "FAKE_TLS_REMOVE_FAIL": "1"}
+        result, output = self.drive(env=env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        marker = output / "pg/0/tls-cleanup.pending"
+        self.assertIn(str(marker), result.stdout + result.stderr)
+        self.assertFalse((output / "original").exists())
+        self.assertTrue((resources / marker.read_text().strip()).exists())
+        logs = "".join(p.read_text() for p in output.glob("pg/*.log"))
+        self.assertIn("CalledProcessError", logs)
+        result, resumed = self.drive("--resume", str(output), env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(marker), result.stderr)
+        self.assertFalse(resumed.exists())
+
+    def test_confirmed_tls_removal_allows_the_exact_missing_only_continuation(self):
+        resources = self.runs / "cleaned-tls"
+        env = {"FAKE_TLS_RESOURCES": str(resources), "FAKE_LOSS_STATE": str(self.runs / "loss")}
+        _, output = self.drive(die="b03", env=env, check=0)
+        summary = self.summary(output)
+        self.assertIn("automatic_rerun", summary["run"])
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["union"]), (22, "exact"))
+        self.assertFalse(list(output.rglob("tls-cleanup.pending")))
+        self.assertFalse(list(resources.iterdir()))
+        # A subsequent manual resume still accepts the clean evidence chain.
+        _, resumed = self.drive("--resume", str(output), env=env, check=0)
+        self.assertEqual(self.summary(resumed)["pg"]["union"], "exact")
 
 
 class Flakes(Harness):
