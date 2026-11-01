@@ -407,7 +407,6 @@ async fn recovery_confirms_another_remover_started_between_listing_and_liveness(
     let dead = token();
     let (name, _) = start(&mut made, &dead).await;
     let volumes = volumes_of(&name);
-    let mut remover = None;
     let report = swept_with_observation(&token(), &dead, "removing", async |id| {
         // Make native writable-layer deletion observable, then gate on the
         // daemon's actual removing state rather than a guessed delay.
@@ -418,16 +417,14 @@ async fn recovery_confirms_another_remover_started_between_listing_and_liveness(
             "-c",
             "mkdir /pbps2513; seq 1 60000 | xargs -n 1000 sh -c 'touch \"$@\"' sh",
         ]);
-        remover = Some(
-            Command::new("docker")
-                .args(["rm", "--force", "--volumes", id])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
+        let remover = Command::new("docker")
+            .args(["rm", "--force", "--volumes", id])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
+        let removing = loop {
             let output = Command::new("docker")
                 .args(["container", "inspect", "--format", "{{json .}}", id])
                 .output()
@@ -446,11 +443,24 @@ async fn recovery_confirms_another_remover_started_between_listing_and_liveness(
                 "the other remover never started"
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        };
+        // Retain the native observation across the scheduling boundary, but
+        // establish absence before classifying it. Deleting the writable layer
+        // may outlast recovery's bounded confirmation (DEC-2513.1); the positive
+        // witness must not assume the daemon finishes within that product bound.
+        let output = remover.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            !exists(id),
+            "the fixture's remover must finish before classification"
+        );
+        assert!(
+            volumes.iter().all(|v| !volume_exists(v)),
+            "the fixture's volumes must be absent before classification"
+        );
+        removing
     })
     .await;
-    let output = remover.unwrap().wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
     assert!(!exists(&name), "{report:?}");
     assert!(volumes.iter().all(|v| !volume_exists(v)), "{volumes:?}");
     assert!(removed(&report, &name), "{report:?}");
