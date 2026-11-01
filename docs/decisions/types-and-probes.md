@@ -4262,3 +4262,48 @@ expressions do not reach the temporary DDL; the CHECK appears only in the
 approved plan. Copy USING expressions are already vetted with extended
 execution in input_path::vet_in_transaction (DEC-1635.4). Live cases pin both
 early default refusal and CHECK exclusion without executing the plan. The apply-time probe consumes the verified saved plan.
+
+
+<a id="dec-2394-1"></a>
+
+**DEC-2394.1. A foreign key re-added around a recorded conversion counts
+orphans over the converted stored rows on either side (#2394).** This amends
+DEC-2359.1's unchecked orphan probe. The stored SELECT reads the unchanged,
+vetted expression over its own table's row, with the exact assignment cast
+shared with the conversion's own probe, including the target type modifier.
+No SQL text is substituted and no guard for the old value's plain cast is
+applied to the expression's result. Vetting still precedes pre-flight; the
+empty search path and read-only framing are unchanged.
+
+Only the foreign-key stored branch opts in. Planned inserted/updated key
+values retain their unchecked policy where a recorded expression cannot be
+projected, rather than evaluating the conversion twice. Unique, primary-key,
+filtered-index and CHECK probes keep their existing policies; changing their
+admission is outside this issue. A partition inherits its parent's conversion
+expression and evaluates it against its own row. Live cases on PostgreSQL 16
+and 18 pin matching transformed keys and orphan refusal on either end before
+any ALTER TABLE, witnessed by a sequence that survives transaction rollback.
+
+
+<a id="dec-2394-2"></a>
+
+**DEC-2394.2. Recorded FK projections require apply-time immutability facts
+for the complete assignment, shared by both key ends (#2394 ready review).**
+A self-reference converted with `random()` always references its own stored
+value, but two probe evaluations need not agree. Stable expressions also run
+in a different transaction from apply. Thus DEC-2394.1's stored projection
+requires all bound function/operator calls and assignment casts to be
+IMMUTABLE. Conversion vetting reuses its existing routine-volatility read,
+includes the exact assignment projection, and records one decision per
+conversion. SQL value primitives are nonrepeatable even without a function
+OID. Type-handler dispatch reuses the existing type reach and routine reads,
+conservatively requiring all bound types' handlers, including unused ones, to
+be immutable. This may leave a safe
+expression unchecked; it cannot turn an unknown binding into a predicted value.
+
+These facts are transient, never saved-plan data. The pure preflight consumes
+the facts; absent or non-immutable conversions carry a distinct unchecked
+reason naming the expression. Vetting remains mandatory, and ordinary
+conversion probes still evaluate admitted stable/volatile expressions. PG16/18
+cases pin `random()`, `now()`, SQL clock primitives, settings, assignment and
+I/O casts beside the immutable orphan/matching controls.

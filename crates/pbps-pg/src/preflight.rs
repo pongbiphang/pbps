@@ -401,6 +401,12 @@ fn guarded(
 /// row's whole tuple against the parent row's (DECISIONS 121).
 type Moved = RowWrites<String>;
 
+#[derive(Debug, Clone)]
+struct RecordedConversion {
+    expression: String,
+    immutable: bool,
+}
+
 /// Translates the names a plan uses into the names the database still has, and
 /// records the rows the plan itself moves.
 ///
@@ -429,9 +435,9 @@ struct AsStored<'v, 'p> {
     /// rather than as a violation.
     retyped_from: BTreeMap<ColumnRef, pbps_model::ColumnType>,
     /// The retyped columns whose new value is a recorded conversion's
-    /// expression (#2331), not the stored value cast to the new type. A probe
-    /// that reads such a column would read a value the plan never stores.
-    recorded: BTreeSet<ColumnRef>,
+    /// expression (#2331), not the stored value cast to the new type. Keep
+    /// its exact text so the FK probe can bind it over the same stored row.
+    recorded: BTreeMap<ColumnRef, RecordedConversion>,
     /// Columns an enum rebuild moves onto the replacement type. Kept apart
     /// from `retyped`, whose entries drive a `CAST` to the new type: the
     /// replacement may be named by a rename the catalog does not know yet, and
@@ -587,7 +593,11 @@ impl<'v, 'p> AsStored<'v, 'p> {
         self.view
     }
 
-    fn of(view: View<'v, 'p>, partitions: &pbps_model::Partitions) -> Self {
+    fn of(
+        view: View<'v, 'p>,
+        partitions: &pbps_model::Partitions,
+        immutable: &BTreeSet<ColumnRef>,
+    ) -> Self {
         let mut this = Self {
             view,
             partitions: partitions.clone(),
@@ -689,8 +699,14 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 } => {
                     this.retyped.insert(column.clone(), to.clone());
                     this.retyped_from.insert(column.clone(), from.clone());
-                    if using.is_some() {
-                        this.recorded.insert(column.clone());
+                    if let Some(expression) = using {
+                        this.recorded.insert(
+                            column.clone(),
+                            RecordedConversion {
+                                expression: expression.clone(),
+                                immutable: immutable.contains(column),
+                            },
+                        );
                     }
                 }
                 Event::AlterColumnExpression { column, .. } => {
@@ -764,20 +780,8 @@ impl<'v, 'p> AsStored<'v, 'p> {
         reach(&mut self.retyped, partitions);
         reach(&mut self.retyped_from, partitions);
         reach(&mut self.column_types, partitions);
-        // The partitions' columns hold the parent's converted values, so a
-        // key probe over one must leave them unchecked as it does the parent's
-        // (#2331); `retyped` alone would send it a plain cast of the old text.
-        let recorded: Vec<ColumnRef> = self
-            .recorded
-            .iter()
-            .flat_map(|c| {
-                partitions
-                    .of_parent(&c.table)
-                    .iter()
-                    .map(|p| p.column(&c.name))
-            })
-            .collect();
-        self.recorded.extend(recorded);
+        // A partition reads the same conversion over its own stored row.
+        reach(&mut self.recorded, partitions);
         let recomputed: Vec<ColumnRef> = self
             .recomputed
             .iter()
@@ -2577,6 +2581,20 @@ enum Applies<'a> {
     Where(&'a str),
 }
 
+/// Only a foreign key opts into evaluating recorded conversions over stored
+/// rows. Other key probes retain their existing unchecked policy (DEC-2394.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoredConversions {
+    Unchecked,
+    Evaluate,
+}
+
+/// The exact assignment projection shared by the conversion's own probe and
+/// the foreign-key stored branch. The vetted expression is never rewritten.
+pub(crate) fn conversion_value(expression: &str, target: &pbps_model::ColumnType) -> String {
+    format!("CAST(({expression}) AS {})", target.raw())
+}
+
 /// One table's rows in `columns`, as this plan will have left them by the time
 /// the change that asks runs — a derived table whose columns are `k0`..`kn`.
 ///
@@ -2616,6 +2634,7 @@ fn rows_after(
     columns: &[ColumnName],
     alias: &str,
     applies: &Applies<'_>,
+    conversions: StoredConversions,
 ) -> Result<Option<String>, DialectError> {
     let moved = names.moved.get(table);
     let filter = match applies {
@@ -2651,12 +2670,9 @@ fn rows_after(
     // plan gives the column where it gives it one.
     let projected = |i: usize, column: &str, sql: String| -> Option<String> {
         let reference = table.column(column);
-        // A recorded conversion's value is its expression's, which is written
-        // over the table's own row and cannot be re-spelled over this alias
-        // without rewriting its text (#2331). The key is left unchecked, and
-        // the engine enforces it during the apply, as for any key this module
-        // cannot spell.
-        if names.recorded.contains(&reference) {
+        // Planned writes are already values in the new schema. Replaying a
+        // stored-row expression over them would convert them a second time.
+        if names.recorded.contains_key(&reference) {
             return None;
         }
         match (
@@ -2707,12 +2723,38 @@ fn rows_after(
                     }
                 },
             };
-            if let Some(guard) = names.raise_guard(&reference, &read) {
-                // An unknown predicate on NULL is not a failed conversion.
-                // Keep it so the primary-key probe can still count the NULL.
-                wheres.push(format!("({guard}) IS NOT TRUE"));
-            }
-            match projected(i, column.raw(), read) {
+            let projection = if let (StoredConversions::Evaluate, Some(recorded)) =
+                (conversions, names.recorded.get(&reference))
+            {
+                // A volatile/stable expression can produce different child,
+                // parent and apply values. Unknown facts stay unchecked too.
+                if !recorded.immutable {
+                    return Err(DialectError::Invalid {
+                        dialect: "postgres",
+                        message: format!(
+                            "the recorded conversion `USING {}` of {} is not certified IMMUTABLE; repeated evaluation cannot predict the stored foreign-key value",
+                            pbps_model::escape::Escaped(&recorded.expression),
+                            reference.shown(),
+                        ),
+                    });
+                }
+                let expression = &recorded.expression;
+                let Some(target) = names.retyped.get(&reference) else {
+                    return Ok(None);
+                };
+                let target = crate::types::normalize(target)?;
+                // This SELECT binds the untouched expression to this table's
+                // own row, exactly as the conversion probe does. A guard for
+                // the old value's plain cast would judge a different value.
+                Some(format!("{} AS k{i}", conversion_value(expression, &target)))
+            } else {
+                if let Some(guard) = names.raise_guard(&reference, &read) {
+                    // Keep NULL for the primary-key nullability question.
+                    wheres.push(format!("({guard}) IS NOT TRUE"));
+                }
+                projected(i, column.raw(), read)
+            };
+            match projection {
                 Some(sql) => selected.push(sql),
                 None => {
                     unspellable = true;
@@ -2901,7 +2943,14 @@ fn rows_after(
             return Ok(None);
         }
         for attached in incoming {
-            match rows_after(names, attached, columns, alias, &Applies::AllRows)? {
+            match rows_after(
+                names,
+                attached,
+                columns,
+                alias,
+                &Applies::AllRows,
+                conversions,
+            )? {
                 Some(rows) => branches.push(rows),
                 None => return Ok(None),
             }
@@ -3240,6 +3289,7 @@ fn build<'v, 'p: 'v>(
                 std::slice::from_ref(&column.name),
                 "c",
                 &Applies::AllRows,
+                StoredConversions::Unchecked,
             )?
             else {
                 return Ok(skip(change, "the planned values of the column cannot be evaluated before apply", unchecked));
@@ -3426,8 +3476,8 @@ fn build<'v, 'p: 'v>(
                             column = column.shown(),
                         ),
                         format!(
-                            "SELECT (0 * count(CAST({value} AS {target})))::int AS n FROM {table};",
-                            target = target.raw(),
+                            "SELECT (0 * count({converted}))::int AS n FROM {table};",
+                            converted = conversion_value(expression, &target),
                         ),
                     )
                     .refusing_when_it_fails(),
@@ -3604,7 +3654,7 @@ name = name.shown(),
             name,
             constraint, ..
         } => {
-            let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)?
+            let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows, StoredConversions::Unchecked)?
             else {
                 return Ok(skip(change, "the planned unique-key values cannot be evaluated before apply", unchecked));
             };
@@ -3637,7 +3687,7 @@ name = name.shown(),
                 Some(predicate) => Applies::Where(predicate),
                 None => Applies::AllRows,
             };
-            let Some(rows) = rows_after(names, table, &columns, "c", &applies)? else {
+            let Some(rows) = rows_after(names, table, &columns, "c", &applies, StoredConversions::Unchecked)? else {
                 return Ok(skip(change, "the planned index values or predicate cannot be evaluated before apply", unchecked));
             };
             Ok(vec![duplicate_probe(
@@ -3654,7 +3704,7 @@ name = name.shown(),
             to: Some(pk),
             ..
         } => {
-            let Some(rows) = rows_after(names, table, &pk.columns, "c", &Applies::AllRows)? else {
+            let Some(rows) = rows_after(names, table, &pk.columns, "c", &Applies::AllRows, StoredConversions::Unchecked)? else {
                 return Ok(skip(change, "the planned primary-key values cannot be evaluated before apply", unchecked));
             };
             let from = format!("(\n{rows}\n) AS r");
@@ -3976,7 +4026,15 @@ fn orphan_probe(
     name: &pbps_model::ObjectLocalName,
     constraint: &pbps_model::ForeignKey,
 ) -> Result<Vec<Probe>, DialectError> {
-    let Some(child) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)? else {
+    let Some(child) = rows_after(
+        names,
+        table,
+        &constraint.columns,
+        "c",
+        &Applies::AllRows,
+        StoredConversions::Evaluate,
+    )?
+    else {
         return Ok(Vec::new());
     };
     let parent_table = &constraint.references_table;
@@ -3986,6 +4044,7 @@ fn orphan_probe(
         &constraint.references_columns,
         "p",
         &Applies::AllRows,
+        StoredConversions::Evaluate,
     )?
     else {
         return Ok(Vec::new());
@@ -4234,6 +4293,7 @@ pub(crate) fn probes(
     plan_names: &PlanNames<'_>,
     partitions: &pbps_model::Partitions,
     before: Option<pbps_model::operation::Snapshot<'_>>,
+    immutable: &BTreeSet<ColumnRef>,
 ) -> Preflight {
     let facts = PlanFacts::of(plan_names);
     let mut out = Vec::new();
@@ -4243,7 +4303,7 @@ pub(crate) fn probes(
     let mut moved_out: Vec<&TableName> = Vec::new();
     for (step, p) in plan_names.changes().iter().enumerate() {
         let names = LazyCell::new(|| {
-            let mut names = AsStored::of(facts.before(step), partitions);
+            let mut names = AsStored::of(facts.before(step), partitions, immutable);
             names.reach_partitions(partitions);
             // Names and column facts belong to the preceding prefix. The
             // current DELETE also removes its own reference and cannot leave
@@ -4402,7 +4462,7 @@ pub(crate) fn probes(
             // Inline keys see the columns defined by their own CREATE. Row
             // probes still use only the statements preceding this one.
             let created_names = matches!(&p.change, Change::CreateTable { .. })
-                .then(|| AsStored::of(facts.before(step + 1), partitions));
+                .then(|| AsStored::of(facts.before(step + 1), partitions, immutable));
             let key_names = created_names.as_ref().unwrap_or(&names);
             for (table, name, constraint) in keys {
                 match key_collation_probe(key_names, table, name, constraint) {
@@ -4519,6 +4579,7 @@ pub(crate) fn probes(
         partitions,
         &mut out,
         &mut unchecked,
+        immutable,
     );
     Preflight {
         probes: out,
@@ -4539,6 +4600,7 @@ fn partition_probes(
     partitions: &pbps_model::Partitions,
     out: &mut Vec<Probe>,
     unchecked: &mut Vec<Unchecked>,
+    immutable: &BTreeSet<ColumnRef>,
 ) {
     let changes = plan_names.changes();
     // Partitions dropped so far, in plan order: by a partition's own drop,
@@ -4554,7 +4616,7 @@ fn partition_probes(
     };
     for (step, p) in changes.iter().enumerate() {
         let projection = LazyCell::new(|| {
-            let mut names = AsStored::of(facts.before(step), partitions);
+            let mut names = AsStored::of(facts.before(step), partitions, immutable);
             names.reach_partitions(partitions);
             names
         });
@@ -5878,6 +5940,171 @@ mod tests {
         crate::Postgres::new().fixture_preflight_with(changes, partitions)
     }
     use pbps_model::{Change, PlannedChange};
+
+    fn preflight_with_immutable(changes: &ChangeSet, immutable: &BTreeSet<ColumnRef>) -> Preflight {
+        let ids = plan_fixture::ids(changes);
+        let names = PlanNames::of(&changes.changes, &ids).unwrap();
+        crate::Postgres::new().preflight_with_conversions(
+            &names,
+            &Default::default(),
+            None,
+            immutable,
+        )
+    }
+
+    fn recorded_retype(column: &str, expression: &str) -> Change {
+        Change::AlterColumnType {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: column.parse().unwrap(),
+            from: "bigint".parse().unwrap(),
+            to: "smallint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: Some(expression.into()),
+        }
+    }
+
+    #[test]
+    fn foreign_keys_project_the_recorded_value_on_either_or_both_stored_ends() {
+        for (child, parent) in [(true, false), (false, true), (true, true)] {
+            let mut changes = Vec::new();
+            for (enabled, column) in [(child, "app.c.v"), (parent, "app.p.v")] {
+                if enabled {
+                    changes.push(recorded_retype(column, "v % 100 /* keep v verbatim */"));
+                }
+            }
+            changes.push(Change::AddForeignKey {
+                table: "app.c".parse().unwrap(),
+                name: "fk_recorded".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["v".into()],
+                    references_table: "app.p".parse().unwrap(),
+                    references_columns: vec!["v".into()],
+                    on_delete: pbps_model::ReferentialAction::NoAction,
+                    on_update: pbps_model::ReferentialAction::NoAction,
+                }),
+            });
+            let changes = set(changes);
+            let immutable = changes
+                .changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::AlterColumnType { column, .. } = &p.change {
+                        Some(column.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let report = preflight_with_immutable(&changes, &immutable);
+            let fk = report
+                .probes
+                .iter()
+                .find(|p| p.description.contains("fk_recorded"))
+                .expect("the orphan probe is built");
+            let converted = "CAST((v % 100 /* keep v verbatim */) AS smallint)";
+            assert_eq!(
+                fk.sql.matches(converted).count(),
+                usize::from(child) + usize::from(parent)
+            );
+            for p in report
+                .probes
+                .iter()
+                .filter(|p| p.description.starts_with("the conversion"))
+            {
+                assert!(p.sql.contains(converted), "same spelling: {}", p.sql);
+            }
+            // The stored bigint may exceed smallint while its remainder fits.
+            // A plain-cast guard must not remove that row from the FK count.
+            assert!(!fk.sql.contains("32767"), "{}", fk.sql);
+            assert!(!fk.sql.contains("CAST(c."), "{}", fk.sql);
+            assert!(!fk.sql.contains("CAST(p."), "{}", fk.sql);
+            if !child {
+                assert!(fk.sql.contains("c.\"v\" AS k0"), "{}", fk.sql);
+            }
+            if !parent {
+                assert!(fk.sql.contains("p.\"v\" AS k0"), "{}", fk.sql);
+            }
+            assert!(report.unchecked.is_empty(), "{:?}", report.unchecked);
+        }
+    }
+
+    #[test]
+    fn unproven_volatile_and_stable_recorded_values_stay_unchecked() {
+        for expression in ["random()", "now()", "v % 100"] {
+            let changes = set(vec![
+                recorded_retype("app.c.v", expression),
+                Change::AddForeignKey {
+                    table: "app.c".parse().unwrap(),
+                    name: "fk_self".into(),
+                    constraint: Box::new(pbps_model::ForeignKey {
+                        columns: vec!["v".into()],
+                        references_table: "app.c".parse().unwrap(),
+                        references_columns: vec!["v".into()],
+                        on_delete: pbps_model::ReferentialAction::NoAction,
+                        on_update: pbps_model::ReferentialAction::NoAction,
+                    }),
+                },
+            ]);
+            let report = preflight(&changes);
+            assert!(
+                report
+                    .unchecked
+                    .iter()
+                    .any(|u| u.description.contains("fk_self")
+                        && u.reason.contains(expression)
+                        && u.reason.contains("not certified IMMUTABLE")),
+                "{report:?}"
+            );
+            assert!(
+                !report
+                    .probes
+                    .iter()
+                    .any(|p| p.description.contains("rows with no matching parent")),
+                "{report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_foreign_key_projection_does_not_enable_unique_or_check_probes() {
+        let report = preflight(&set(vec![
+            recorded_retype("app.c.v", "v % 100"),
+            Change::AddUnique {
+                table: "app.c".parse().unwrap(),
+                name: "uq_recorded".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec!["v".into()],
+                    storage_parameters: Default::default(),
+                },
+                clustered: false,
+            },
+            Change::AddCheck {
+                table: "app.c".parse().unwrap(),
+                name: "ck_recorded".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "v > 0".into(),
+                },
+            },
+        ]));
+        assert_eq!(report.unchecked.len(), 2, "{:?}", report.unchecked);
+        assert!(
+            report
+                .probes
+                .iter()
+                .all(|p| !p.description.contains("uq_recorded")
+                    && !p.description.contains("ck_recorded"))
+        );
+        assert!(
+            report
+                .probes
+                .iter()
+                .any(|p| p.description.starts_with("the conversion"))
+        );
+    }
 
     #[test]
     fn narrowing_projection_reports_each_constraint_instead_of_unchecked() {

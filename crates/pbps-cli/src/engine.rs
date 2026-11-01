@@ -70,25 +70,30 @@ pub async fn execute_staged_statement(
 pub async fn vet_conversions(
     conn: &mut Conn,
     changes: &[pbps_model::PlannedChange],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ColumnRef>> {
+    let mut immutable = std::collections::BTreeSet::new();
     if conn.driver() == Driver::Mssql {
-        return Ok(());
+        return Ok(immutable);
     }
     for planned in changes {
         let pbps_model::Change::AlterColumnType {
             column,
             from,
+            to,
             using: Some(using),
             ..
         } = &planned.change
         else {
             continue;
         };
-        pbps_pg::input_path::vet_conversion(conn, column, from, using)
+        if pbps_pg::input_path::vet_conversion_for_probe(conn, column, from, to, using)
             .await
-            .map_err(|why| anyhow::anyhow!("{why}"))?;
+            .map_err(|why| anyhow::anyhow!("{why}"))?
+        {
+            immutable.insert(column.clone());
+        }
     }
-    Ok(())
+    Ok(immutable)
 }
 
 pub async fn vet_drop_requirements(
