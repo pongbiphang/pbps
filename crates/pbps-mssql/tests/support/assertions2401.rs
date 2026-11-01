@@ -243,6 +243,28 @@ async fn target_queries_distinguish_zero_rows_nulls_sql_errors_and_invalid_frami
             AssertionResult::InvalidResult { .. }
         ));
     }
+    // Native controls establish that these are valid single tabular queries;
+    // target framing must accept the same zero-row result, not parse names
+    // or a parenthesized query operand as a new statement.
+    for sql in [
+        "(SELECT 1 n WHERE 1=0) UNION ALL (SELECT 2 n WHERE 1=0)",
+        "SELECT 1 AS 名UPDATE WHERE 1=0",
+    ] {
+        let caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+        let evidence = caller.query_bounded(sql, DEADLINE).await.unwrap();
+        assert!(
+            matches!(
+                AssertionResult::from_evidence(evidence),
+                AssertionResult::Pass(_)
+            ),
+            "native control: {sql}"
+        );
+        println!("native single query accepted: {sql}");
+        assert!(
+            matches!(f.run(sql).await.unwrap(), AssertionResult::Pass(_)),
+            "target framing: {sql}"
+        );
+    }
     let row =
         f.db.conn
             .query("SELECT COUNT(*) AS n FROM app.orders")

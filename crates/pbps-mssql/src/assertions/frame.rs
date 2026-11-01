@@ -2,67 +2,55 @@
 use pbps_dialect::Dialect as _;
 
 pub(super) fn single_query(sql: &str) -> bool {
-    let code = crate::Mssql.lexicon().code_only(sql);
-    let bytes = code.as_bytes();
-    let mut at = 0;
+    let lexicon = crate::Mssql.lexicon();
+    let code = lexicon.code_only(sql);
+    let continues = lexicon.identifier_continues;
+    let mut chars = code.chars().peekable();
     let mut depth = 0usize;
     let mut words = Vec::new();
     let mut ended = false;
-    while at < bytes.len() {
-        let ch = bytes[at];
-        if ch.is_ascii_whitespace() {
-            at += 1;
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
             continue;
         }
-        if ch == b'[' || ch == b'"' {
+        if ch == '[' || ch == '"' {
             if ended {
                 return false;
             }
-            let close = if ch == b'[' { b']' } else { b'"' };
-            at += 1;
+            let close = if ch == '[' { ']' } else { '"' };
             loop {
-                if at == bytes.len() {
+                let Some(next) = chars.next() else {
                     return false;
-                }
-                if bytes[at] == close {
-                    at += 1;
-                    if bytes.get(at) == Some(&close) {
-                        at += 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    at += 1;
+                };
+                if next == close && chars.next_if_eq(&close).is_none() {
+                    break;
                 }
             }
             continue;
         }
         match ch {
-            b'(' if !ended => depth += 1,
-            b')' if !ended && depth > 0 => depth -= 1,
-            b';' if depth == 0 => {
+            '(' if !ended => depth += 1,
+            ')' if !ended && depth > 0 => depth -= 1,
+            ';' if depth == 0 => {
                 if !words.is_empty() {
                     ended = true;
                 }
             }
             _ if ended => return false,
-            _ if ch.is_ascii_alphabetic() || ch == b'_' || ch == b'@' || ch == b'#' => {
-                let start = at;
-                at += 1;
-                while bytes
-                    .get(at)
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || b"_@$#".contains(c))
-                {
-                    at += 1;
+            _ if continues(ch) => {
+                let mut word = String::from(ch);
+                while let Some(next) = chars.next_if(|c| continues(*c)) {
+                    word.push(next);
                 }
-                if depth == 0 {
-                    words.push(code[start..at].to_ascii_uppercase());
+                // A query expression may start inside parentheses. Keep its
+                // first word, then inspect only the outer statement boundary;
+                // subqueries and CTE bodies are not additional statements.
+                if depth == 0 || words.is_empty() {
+                    words.push(word.to_ascii_uppercase());
                 }
-                continue;
             }
             _ => {}
         }
-        at += 1;
     }
     if depth != 0
         || !matches!(
@@ -126,6 +114,27 @@ mod tests {
         ] {
             assert!(single_query(sql), "{sql}");
         }
+    }
+    #[test]
+    fn parenthesized_query_operands_keep_the_outer_statement_boundary() {
+        assert!(single_query(
+            "(SELECT 1 WHERE 1=0) UNION ALL (SELECT 2 WHERE 1=0)"
+        ));
+        assert!(single_query("((SELECT 1)) EXCEPT (SELECT 2);"));
+        assert!(!single_query("(SELECT 1) UNION ALL (SELECT 2); SELECT 3"));
+        assert!(!single_query("(SELECT 1) SELECT 2"));
+    }
+    #[test]
+    fn whole_dialect_identifiers_do_not_expose_ascii_keyword_suffixes() {
+        for sql in [
+            "SELECT 1 AS 名UPDATE WHERE 1=0",
+            "SELECT 1 AS 名COMMIT WHERE 1=0",
+            "SELECT 1 AS 名SELECT WHERE 1=0",
+        ] {
+            assert!(single_query(sql), "{sql}");
+        }
+        assert!(!single_query("SELECT 1 AS 名UPDATE; COMMIT"));
+        assert!(!single_query("SELECT 1 AS 名SELECT SELECT 2"));
     }
     #[test]
     fn a_second_statement_or_client_batch_never_reaches_the_driver() {
