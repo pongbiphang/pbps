@@ -968,8 +968,10 @@ first, then the rest. Only a PL/pgSQL routine's body is exempt because it binds
 at invocation. Function and procedure parameter defaults, in DEFAULT or =
 spelling, bind at creation and are checked even for PL/pgSQL. An updated
 CHECK/default ordinarily rebuilds or alters through the diff. With a selected
-resolver, a retained validated local CHECK may instead use paired bound-tree
-comparison on an empty scratch carrier (DEC-2354.1). Complete values, casts,
+resolver, a retained validated local CHECK or column DEFAULT may instead use
+paired bound-tree comparison on an empty scratch carrier (DEC-2354.1,
+DEC-2354.4). DEFAULT binding uses the target column type and assignment
+coercion, without evaluating the expression. Complete values, casts,
 collations and routine identities stay significant. Physical column attributes
 map through verified logical column names; unmapped attributes cannot prove
 equality (DEC-2354.2). Only source locations are ignored. RenameEnumValue carries
@@ -978,8 +980,9 @@ Apply independently binds that expression on an empty target TEMP carrier
 under a relation lock before recording; mismatch rolls back. No SQL literal is
 rewritten through a label rename. Unproved, offline and unavailable cases keep
 DropCheck before the rename and AddCheck after it, including its validating
-scan under ACCESS EXCLUSIVE. Defaults retain their ordinary alteration and
-table lock in this CHECK-only part. Plan-time expression
+scan under ACCESS EXCLUSIVE; DEFAULTs keep AlterColumnDefault and its table
+lock. A proved DEFAULT retains its catalog identity and tree and advances
+only its approved authored expression after fresh verification. Plan-time expression
 probes defer by the resolved enum type when its label is renamed, including
 arrays and domains. The engine enforces the declaration at apply, with the
 existing vet and readback checks.

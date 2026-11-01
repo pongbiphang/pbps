@@ -4391,3 +4391,33 @@ agree. Its endpoint flags select that neutral repair; retype findings retain
 their directional flags and wording. This keeps the schema differ's sole
 call site unchanged. Unknown type pairs (including the existing array/domain
 policy) and dialects without a compatibility fact still refuse nothing.
+
+<a id="dec-2354-4"></a>
+
+**DEC-2354.4. Column defaults share retained-expression proof and verified writeback.**
+A label rename preserves the enum value identity inside a column's bound
+DEFAULT. Measured on PostgreSQL 16 and 18, `pg_attrdef` keeps both its OID and
+`adbin`; `pg_get_expr` prints the new label for enum constants, including
+arrays, while text-to-enum casts keep their original text. Binding does not
+evaluate a volatile default. Text replacement therefore cannot prove equality.
+
+Extend the same typed target with a column UID and column reference. The
+paired scratch binder installs a DEFAULT on that column of the same empty
+carrier, so PostgreSQL applies the actual target type's assignment coercion.
+Both surfaces use the single-statement helper of DEC-2354.3. The existing
+value-preserving decoder and verified column maps compare both surfaces.
+Missing capabilities, unsupported shapes, unequal trees, unavailable resolvers
+and offline planning keep the ordinary AlterColumnDefault.
+
+Apply uses the same Held::verify and TEMP carrier, pins the observed default's
+OID and raw tree across execution, and holds ACCESS SHARE through recording.
+Only fresh equality permits the payload's authored default to advance and
+relaxes that expression's closing byte comparison. A changed default or forged
+payload cannot produce a false record. Staged checkpoints keep the old authored
+expression until verified closure, including a closing-only resume. No default
+is evaluated or altered on the real table for a proved retention.
+
+Plan 59 adds the column-default target. Schema set 84 archives the complete
+published set over PR 1's set 83. Existing archives remain unchanged. The state
+format stays unchanged because declared defaults already have their own
+expression and binding maps.

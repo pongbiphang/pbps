@@ -1,7 +1,7 @@
 //! Paired binding shares the unsealed code-goal lifecycle (DEC-2354.1).
 use super::{Provenance, Standard, domain};
 use pbps_db::Conn;
-use pbps_model::{ExpressionTarget, Hints, IdsFile, PlanMode, RetainedExpression, Schema};
+use pbps_model::{Hints, IdsFile, PlanMode, RetainedExpression, Schema};
 
 pub(super) struct Comparison<'a> {
     pub before: pbps_diff::Side<'a>,
@@ -70,19 +70,21 @@ impl Comparison<'_> {
         .map_err(|e| e.to_string())?;
         let mut trees = Vec::new();
         for (index, e) in self.requests.iter().enumerate() {
-            let ExpressionTarget::Check { table, name, .. } = &e.target;
+            let table = e.target.table();
             let result = async {
                 let shape = self
                     .live
                     .tables
                     .get(table)
                     .ok_or("the carrier table is absent")?;
-                let expr = shape.checks.get(name).ok_or("the live CHECK is absent")?;
+                let expr = e
+                    .target
+                    .expression(self.live)
+                    .ok_or("the live expression is absent")?;
                 let carrier =
                     pbps_pg::retained::create_carrier(conn, &pg, table, shape, index, false)
                         .await?;
-                let tree =
-                    pbps_pg::retained::bind(conn, &pg, table, &expr.expression, &carrier).await?;
+                let tree = pbps_pg::retained::bind(conn, &pg, &e.target, expr, &carrier).await?;
                 Ok::<_, String>((carrier, tree))
             }
             .await;
@@ -98,8 +100,8 @@ impl Comparison<'_> {
             let Some((carrier, tree)) = tree else {
                 continue;
             };
-            let ExpressionTarget::Check { table, .. } = &e.target;
-            if let Ok(wanted) = pbps_pg::retained::bind(conn, &pg, table, &e.after, &carrier).await
+            if let Ok(wanted) =
+                pbps_pg::retained::bind(conn, &pg, &e.target, &e.after, &carrier).await
                 && pbps_pg::retained::equal(conn, &tree, &wanted).await == Ok(true)
             {
                 equal.push(e.clone());

@@ -276,7 +276,8 @@ use crate::zone::SessionZone;
 /// (DEC-1635.9).
 // 57 pins per-link rebuild conversions and ordered copy stages (DEC-2298.13).
 // 58 carries typed retained-expression writebacks (DEC-2354.1).
-pub const CURRENT_VERSION: u32 = 58;
+// 59 extends retained-expression targets to column defaults (DEC-2354.4).
+pub const CURRENT_VERSION: u32 = 59;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -838,7 +839,20 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 58);
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-10-29T00:00:00Z",
+            PlanBaseline {
+                time_zone: None,
+                description: "d".into(),
+                checksum: "c".into(),
+                database_collation: None,
+            },
+            ChangeSet::default(),
+            IdsFile::default(),
+        );
+        assert_eq!(plan.version, CURRENT_VERSION);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
