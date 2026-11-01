@@ -617,12 +617,8 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
                 if reason.contains("target database")),
                 "{same}"
             );
-            let owned = refusal(target, scratch).await;
-            assert!(
-                matches!(owned, ProduceError::Run(Error::Binding(ref reason))
-                if reason.contains("#2143")),
-                "{owned}"
-            );
+            let owned = outcome(target, scratch).await;
+            assert!(owned.is_ok(), "{}", why(&owned));
             supplied_contract(target, scratch).await;
             inherited_model_refusal(target, scratch).await;
         })
