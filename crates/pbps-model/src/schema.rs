@@ -1499,7 +1499,16 @@ impl Index {
     /// it is built after the modules it may call, and observed wherever a
     /// filtered index is (DEC-1169.2).
     pub fn holds_expression(&self) -> bool {
-        self.filter.is_some() || self.columns.iter().any(|c| c.key.expression().is_some())
+        self.holds_expression_when(true)
+    }
+
+    /// [`Self::holds_expression`] for an engine whose filter may not call a
+    /// module: SQL Server's filtered-index predicate binds only its own
+    /// table's columns, so a filter alone binds nothing at creation and the
+    /// index is no resolver surface there (DEC-2143.2).
+    pub fn holds_expression_when(&self, filter_binds: bool) -> bool {
+        (filter_binds && self.filter.is_some())
+            || self.columns.iter().any(|c| c.key.expression().is_some())
     }
 
     pub fn column_keys(&self) -> Option<Vec<ColumnName>> {

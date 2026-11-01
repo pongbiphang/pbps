@@ -47,6 +47,9 @@ fn unsupported() -> Error {
 /// Configuration comes from the qualified capture, never a cross-engine cast.
 pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static {
     const DRIVER: Driver;
+    /// Whether an index filter binds at creation; see
+    /// `Dialect::filter_binds_expression`.
+    const FILTER_BINDS: bool;
     fn configured(extras: &[String], version: Option<i64>) -> Self;
     fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]>;
     fn dependent_object(
@@ -56,6 +59,7 @@ pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static
 }
 impl PlanningDialect for pbps_pg::Postgres {
     const DRIVER: Driver = Driver::Postgres;
+    const FILTER_BINDS: bool = true;
     fn configured(extras: &[String], version: Option<i64>) -> Self {
         let dialect = Self::with_write_path_extras(extras.to_vec());
         version.map_or(dialect.clone(), |v| dialect.with_server_version(v))
@@ -72,6 +76,7 @@ impl PlanningDialect for pbps_pg::Postgres {
 }
 impl PlanningDialect for pbps_mssql::Mssql {
     const DRIVER: Driver = Driver::Mssql;
+    const FILTER_BINDS: bool = false;
     fn configured(_: &[String], _: Option<i64>) -> Self {
         Self
     }

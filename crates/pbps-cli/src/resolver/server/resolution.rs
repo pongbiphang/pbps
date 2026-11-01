@@ -10,7 +10,7 @@ use pbps_model::resolver::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn required(schema: &Schema) -> BTreeSet<Surface> {
+fn required<D: super::PlanningDialect>(schema: &Schema) -> BTreeSet<Surface> {
     let mut surfaces = BTreeSet::new();
     for (table, definition) in &schema.tables {
         // Both declarations bind through pg_attrdef; their expressions
@@ -26,7 +26,7 @@ fn required(schema: &Schema) -> BTreeSet<Surface> {
             });
         }
         for (name, index) in &definition.indexes {
-            if index.holds_expression() {
+            if index.holds_expression_when(D::FILTER_BINDS) {
                 surfaces.insert(Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -144,8 +144,8 @@ fn resolve<D: super::PlanningDialect>(
     compiled: &[BindingRecord],
     assessment: &Assessment,
 ) -> Result<Vec<SurfaceResolution>, Error> {
-    let before = required(base);
-    let after = required(desired);
+    let before = required::<D>(base);
+    let after = required::<D>(desired);
     let mut resolved = Vec::new();
     for surface in before.union(&after) {
         // A removed surface is resolved by its opening spelling and named by

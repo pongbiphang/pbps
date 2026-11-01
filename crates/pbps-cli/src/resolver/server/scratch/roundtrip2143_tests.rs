@@ -417,3 +417,61 @@ async fn mssql_a_user_defined_type_absent_from_opening_is_not_admitted_as_a_buil
     }
     both(case).await;
 }
+
+/// A filtered index's predicate binds only its own table's columns on SQL
+/// Server, so an index with one is no resolver surface and the plan seals
+/// (DEC-2143.2).
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_filtered_index_is_no_resolver_surface() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut declared = view_over_table(target, SEED).await;
+            exec(
+                target,
+                &["CREATE INDEX ix2143 ON dbo.t2143(id) WHERE id > 0;"],
+            )
+            .await;
+            for schema in [&mut declared.base, &mut declared.desired] {
+                schema
+                    .tables
+                    .get_mut(&"dbo.t2143".parse().unwrap())
+                    .unwrap()
+                    .indexes
+                    .insert(
+                        "ix2143".into(),
+                        pbps_model::Index {
+                            columns: vec![pbps_model::IndexColumn {
+                                key: pbps_model::IndexKey::Column("id".into()),
+                                descending: false,
+                                opclass: None,
+                            }],
+                            include: vec![],
+                            unique: false,
+                            filter: Some("id > 0".into()),
+                            method: Default::default(),
+                            storage_parameters: Default::default(),
+                        },
+                    );
+            }
+            let plan = plan(target, scratch, &declared).await;
+            plan.evidence.validate(&plan.changes).unwrap();
+            assert!(
+                !plan
+                    .evidence
+                    .surfaces()
+                    .iter()
+                    .any(|s| matches!(s.surface, Surface::Index { .. })),
+                "{:?}",
+                plan.evidence.surfaces()
+            );
+            pbps_mssql::Mssql
+                .validate_plan_analysis(&saved(&plan))
+                .unwrap();
+        })
+    }
+    both(case).await;
+}

@@ -5807,6 +5807,10 @@ reproduced authorization and a non-empty target cluster, and answers a surface
 with no SQL Server mapping with no class instead of a guess. A computed column
 is the Default-compatible surface of its column, as a PostgreSQL generated
 column is, with `Generated` part effects for the column it creates or drops.
+A filtered index is no surface there: its predicate binds only its own table's
+columns and the capture holds no index record, so the engine's
+`filter_binds_expression` is false and an inventory skips an index whose only
+expression is its filter.
 
 <a id="dec-2143-3"></a>
 
