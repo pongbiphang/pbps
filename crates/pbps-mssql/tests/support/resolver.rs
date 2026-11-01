@@ -449,7 +449,7 @@ mod scope611 {
         drop(elsewhere);
         other.drop().await;
         let mut db = db;
-        drop_login_when_idle(&mut db.conn, &login).await.ok();
+        drop_login_when_idle(&mut db.conn, &login).await.unwrap();
         db.drop().await;
     }
 }
@@ -831,10 +831,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
     }
 
@@ -1056,10 +1053,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
     }
 
@@ -1147,10 +1141,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
     }
 
@@ -1279,10 +1270,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
     }
 
@@ -1487,10 +1475,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
         super::auth720::impersonation_answers_preserve_denials().await;
     }
@@ -1541,10 +1526,7 @@ mod recon611 {
         let mut master = connect_live(&conn_str()).await.unwrap();
         target.drop().await;
         scratch.drop().await;
-        master
-            .execute(&format!("DROP LOGIN [{run_login}];"))
-            .await
-            .unwrap();
+        drop_login_when_idle(&mut master, &run_login).await.unwrap();
     }
 
     /// #1011: a grant on a database principal (class 4) decides what the
@@ -1673,10 +1655,7 @@ mod recon611 {
         target.drop().await;
         scratch.drop().await;
         for login in [&dep, &run_login] {
-            master
-                .execute(&format!("DROP LOGIN [{login}];"))
-                .await
-                .unwrap();
+            drop_login_when_idle(&mut master, login).await.unwrap();
         }
     }
 }

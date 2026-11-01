@@ -150,8 +150,11 @@ struct Login {
 
 impl Drop for Login {
     fn drop(&mut self) {
-        let kind = if self.pg { "ROLE" } else { "LOGIN" };
-        let _ = try_on_server(&self.server, &format!("DROP {kind} {}", self.name));
+        if self.pg {
+            let _ = try_on_server(&self.server, &format!("DROP ROLE {}", self.name));
+        } else {
+            super::data_work::drop_test_login(&self.server, &self.name);
+        }
     }
 }
 

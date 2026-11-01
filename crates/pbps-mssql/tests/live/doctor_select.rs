@@ -93,6 +93,7 @@ async fn an_undeclared_foreign_key_parent_in_a_managed_schema_is_asked_about() {
         ))
         .await
         .expect("grant the read on the parent");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.query("SELECT COUNT(*) FROM app.parent;")
         .await
@@ -199,6 +200,7 @@ async fn a_column_deny_is_a_gap_under_an_object_grant_and_under_a_schema_grant()
             ))
             .await
             .expect("lift the denial");
+        drop(lp);
         let mut lp = connect_live(&as_login).await.expect("reconnect");
         lp.query("SELECT code, label FROM app.t;")
             .await
@@ -343,6 +345,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         ))
         .await
         .expect("grant the key column alone");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     assert!(
         !holds_at_object_scope(&mut lp, "app.unmanaged", "SELECT").await,
@@ -388,6 +391,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         ))
         .await
         .expect("grant the children's reads");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.query(
         "SELECT COUNT(*) FROM app.unmanaged AS ch \
@@ -422,6 +426,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         .expect("take the children's reads away again");
     let ensured: pbps_mssql::doctor::DataTables =
         [(parent.clone(), ensured_table())].into_iter().collect();
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -482,6 +487,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
     )]
     .into_iter()
     .collect();
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -506,6 +512,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         ))
         .await
         .expect("grant the destination read");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -537,6 +544,7 @@ async fn the_delete_count_demands_a_read_of_every_child_the_catalog_names() {
         ))
         .await
         .expect("take the destination read away again");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     let held = pbps_mssql::doctor::permissions(
         &mut lp,
@@ -689,6 +697,7 @@ async fn a_column_the_plan_adds_is_demanded_before_the_plan_runs() {
         ))
         .await
         .expect("grant the read on the object");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.query("SELECT code, label, extra FROM app.t;")
         .await
@@ -847,6 +856,7 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         ))
         .await
         .expect("grant what the transfer itself needs");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.execute("ALTER SCHEMA dest TRANSFER app.old_name;")
         .await
@@ -868,6 +878,7 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         ))
         .await
         .expect("grant the destination read");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.query("SELECT COUNT(*) FROM dest.old_name;")
         .await
@@ -887,6 +898,7 @@ async fn a_cross_schema_move_demands_the_destinations_read() {
         ))
         .await
         .expect("grant the destination writes");
+    drop(lp);
     let mut lp = connect_live(&as_login).await.expect("reconnect");
     lp.execute("INSERT INTO dest.old_name VALUES ('b', N'B');")
         .await

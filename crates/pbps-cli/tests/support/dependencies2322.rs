@@ -442,7 +442,7 @@ impl Login {
 }
 impl Drop for Login {
     fn drop(&mut self) {
-        after_test_on_server(&self.server, &format!("DROP LOGIN [{}];", self.name));
+        super::drop_test_login(&self.server, &self.name);
     }
 }
 

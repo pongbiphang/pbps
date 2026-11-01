@@ -146,7 +146,7 @@ fn doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap() {
     struct Login(String, String);
     impl Drop for Login {
         fn drop(&mut self) {
-            after_test_on_server(&self.0, &format!("DROP LOGIN [{}];", self.1));
+            drop_test_login(&self.0, &self.1);
         }
     }
     let _login = Login(server.clone(), name.clone());
@@ -685,6 +685,8 @@ fn on_server(connection: &str, sql: &str) {
 fn after_test_on_server(connection: &str, sql: &str) {
     let _ = try_on_server(connection, sql);
 }
+
+use data_work::drop_test_login;
 
 /// A database of this test's own, dropped when the guard goes out of scope.
 ///
@@ -4788,10 +4790,7 @@ fn a_rename_under_a_denied_referrer_function_is_refused_by_name() {
         &format!("USE master; IF USER_ID('{login}') IS NOT NULL DROP USER [{login}];"),
     );
     drop(own);
-    after_test_on_server(
-        &server,
-        &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
-    );
+    drop_test_login(&server, &login);
 }
 
 /// The connected pass reads "no edge" as none only where no referrer can be
@@ -5064,7 +5063,7 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     ok(&d.run(&["plan"]));
     d.commit();
     ok(&d.run(&["plan", "--db", &as_login]));
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
 }
 
 /// A connected plan judges a standing computed column by the catalog's
@@ -6087,7 +6086,7 @@ fn a_hidden_table_is_not_recorded_as_missing() {
     let o = d.run(&["plan", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("dbo.keep"), "{}", stdout(&o));
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
 }
 
 /// #1606: a role hidden from this login is not recorded as missing.
@@ -6184,7 +6183,7 @@ fn a_hidden_role_is_not_recorded_as_missing() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["verify", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
 }
 
 /// #1192: metadata visibility filters `sys.objects`, so a sequence this login
@@ -6315,7 +6314,7 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
     assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
 
     on_server(own.connection(), &format!("DROP USER [{login}];"));
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
 }
 
 /// A sequence or a synonym already at the name of a table this plan creates
@@ -9367,7 +9366,7 @@ fn doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_ye
     let added = diagnose();
     assert!(!on_the_table(&added).is_empty(), "{added:?}");
 
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
     drop(db);
 }
 
@@ -9537,7 +9536,7 @@ fn doctor_mssql_lock_recovery_executes_the_emitted_statement() {
         "the finding stays while the DENY does"
     );
 
-    after_test_on_server(&server, &format!("DROP LOGIN {quoted};"));
+    drop_test_login(&server, &login);
     drop(db);
 }
 
@@ -9624,7 +9623,7 @@ fn doctor_mssql_names_no_grant_for_a_lock_name_that_is_not_a_table() {
     );
     assert!(!report.to_string().contains("GRANT"), "{report}");
 
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
     drop(db);
 }
 
@@ -9749,7 +9748,7 @@ fn doctor_accepts_complete_managed_column_select_and_names_the_missing_scope() {
     );
     let object_deny = diagnose();
     let denied_probe = try_on_server(&as_login, "SELECT code, label FROM app.t;");
-    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop_test_login(&server, &login);
     drop(db);
 
     assert!(
@@ -9982,10 +9981,7 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
     );
     assert_eq!(exit, 0, "{v}");
 
-    after_test_on_server(
-        &server,
-        &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
-    );
+    drop_test_login(&server, &login);
 }
 
 /// The CLI must union every foreign key's target columns and pass the result
@@ -9996,7 +9992,7 @@ fn doctor_unions_only_the_columns_external_foreign_keys_reference() {
     struct Login(String, String);
     impl Drop for Login {
         fn drop(&mut self) {
-            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+            drop_test_login(&self.0, &self.1);
         }
     }
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
@@ -10122,7 +10118,7 @@ fn doctor_demands_a_moved_childs_destination_only_while_its_key_survives() {
     struct Login(String, String);
     impl Drop for Login {
         fn drop(&mut self) {
-            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+            drop_test_login(&self.0, &self.1);
         }
     }
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
@@ -19500,7 +19496,7 @@ fn ledger_migration_guidance_keeps_the_explicit_or_configured_target() {
     struct Login(String, String);
     impl Drop for Login {
         fn drop(&mut self) {
-            after_test_on_server(&self.0, &format!("DROP LOGIN [{}]", self.1));
+            drop_test_login(&self.0, &self.1);
         }
     }
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
