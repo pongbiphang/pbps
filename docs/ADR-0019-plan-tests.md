@@ -524,6 +524,13 @@ without server VIEW ANY DEFINITION; require that read permission before treating
 a visible server's mapping inventory as complete. A mapped remote identity can
 write through OPENQUERY or EXEC AT, even when the outer query returns zero rows.
 
+Reject grant options as write-capable authority too: inspect state W grants
+held through the login/user tokens, including object/column, schema, database
+and server permissions. A data DENY does not neutralize GRANT AS a member role;
+measure delegation independently of ordinary access (DEC-2401.3). PostgreSQL's
+existing SET/INHERIT actor closure also excludes the three host-file/program
+roles above before SQL; READ ONLY cannot contain a program's other connection.
+
 Verify and report these effective privileges before any assertion SQL. As in
 scratch, SQL Server accepts a batch with exactly one result set, including
 non-result statements, with a deadline and complete-stream error handling; no

@@ -799,3 +799,15 @@ write boundary: effective privileges on a target, READ_ONLY on scratch.
 Non-result statements are allowed: an author can already write a vacuous
 zero-row assertion, so framing did not protect its meaning. GO/sqlcmd commands
 remain engine/driver errors. This supersedes #2598's statement-count proposal.
+
+<a id="dec-2401-3"></a>
+
+**DEC-2401.3. Assertion admission includes host and delegation authority
+(#2605, fixed in #2401 PR A).** PostgreSQL excludes the three host-file/program
+roles from ADR-0019 §6 through the existing SET/INHERIT actor closure: READ ONLY
+cannot contain their external effects or connections. SQL Server checks state W
+permissions held by grant-capable user/login tokens in each audited context,
+including columns, schemas, databases and the server. Native GRANT AS role still
+succeeds when the login's data permission is denied; do not filter delegation
+through a data-right verdict. A DENY replacing the sole W grant removes that
+option; unreadable metadata still refuses. Keep ordinary non-delegable reads.

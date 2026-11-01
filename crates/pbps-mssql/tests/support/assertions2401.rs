@@ -993,3 +993,247 @@ async fn system_procedure_execute_is_inventoried_without_refusing_read_only_quer
     ));
     f.finish().await;
 }
+
+// One capability, five securable scopes. The engine's tokens supply role
+// closure; these cases pin both the grant flag and the native GRANT AS effect.
+async fn delegation_is_refused(scope: &str, expected: &str, server: bool, tag: &str) {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new(tag).await;
+    let user = f.role.clone();
+    let group = format!("{}_delegator", f.db.name);
+    let receiver = format!("{}_receiver", f.db.name);
+    let permission = if server {
+        "VIEW ANY DEFINITION"
+    } else {
+        "SELECT"
+    };
+    let context = if server {
+        "master".to_owned()
+    } else {
+        f.db.name.clone()
+    };
+    let grant = |principal: &str, option: &str| {
+        format!("USE [{context}]; GRANT {permission} {scope} TO [{principal}]{option}")
+    };
+    let revoke = |principal: &str| {
+        format!("USE [{context}]; REVOKE {permission} {scope} FROM [{principal}] CASCADE")
+    };
+    let count = if server {
+        format!(
+            "SELECT COUNT(*) AS n FROM sys.server_permissions WHERE grantee_principal_id=SUSER_ID('{receiver}') AND permission_name='{permission}'"
+        )
+    } else {
+        format!(
+            "SELECT COUNT(*) AS n FROM sys.database_permissions WHERE grantee_principal_id=DATABASE_PRINCIPAL_ID('{receiver}') AND permission_name='{permission}'"
+        )
+    };
+    if server {
+        f.db.conn.execute(&format!("CREATE SERVER ROLE [{group}]; ALTER SERVER ROLE [{group}] ADD MEMBER [{user}]; CREATE LOGIN [{receiver}] WITH PASSWORD='OnlyDelegate!2401', CHECK_POLICY=OFF")).await.unwrap();
+    } else {
+        f.db.conn.execute(&format!("CREATE ROLE [{group}]; ALTER ROLE [{group}] ADD MEMBER [{user}]; CREATE USER [{receiver}] WITHOUT LOGIN")).await.unwrap();
+    }
+    assert!(matches!(
+        f.run("SELECT id FROM app.orders WHERE id<0").await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    let mut checks = Vec::new();
+    // Direct W is unsafe even though the underlying permission is read-only.
+    f.db.conn
+        .execute(&grant(&user, " WITH GRANT OPTION"))
+        .await
+        .unwrap();
+    let sql = format!("{}; SELECT 1 WHERE 1=0", grant(&receiver, ""));
+    // The grant may have required master; target identity still comes from
+    // the fixture's actual planning database, never the admin's last context.
+    f.db.conn
+        .execute(&format!("USE [{}]", f.db.name))
+        .await
+        .unwrap();
+    let result = f.run(&sql).await;
+    let named = matches!(&result,Err(e) if e.to_string().contains("WITH GRANT OPTION") && e.to_string().contains(expected));
+    checks.push(("direct", named, format!("{result:?}")));
+    f.db.conn
+        .execute(&format!("USE [{context}]"))
+        .await
+        .unwrap();
+    let rows = f.db.conn.query(&count).await.unwrap();
+    checks.push((
+        "no assertion grant",
+        rows[0].try_get::<i32>("n").unwrap() == Some(0),
+        format!("count={:?}", rows[0].try_get::<i32>("n").unwrap()),
+    ));
+    f.db.conn.execute(&revoke(&receiver)).await.unwrap();
+    if scope == "ON OBJECT::app.orders" {
+        // A DENY on the same principal replaces its sole W row. With no
+        // delegation left, a constant read is valid and GRANT itself fails.
+        f.db.conn
+            .execute(&format!("DENY SELECT {scope} TO [{user}] CASCADE"))
+            .await
+            .unwrap();
+        let result = f.run("SELECT 1 WHERE 1=0").await;
+        checks.push((
+            "DENY replaced sole W",
+            matches!(&result, Ok(AssertionResult::Pass(_))),
+            format!("{result:?}"),
+        ));
+        let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+        let result = caller.execute(&grant(&receiver, "")).await;
+        checks.push((
+            "no delegation after replacement",
+            result.is_err(),
+            format!("{result:?}"),
+        ));
+        drop(caller);
+    }
+    f.db.conn.execute(&revoke(&user)).await.unwrap();
+    f.db.conn
+        .execute(&format!(
+            "USE [{}]; GRANT SELECT ON app.orders TO [{user}]",
+            f.db.name
+        ))
+        .await
+        .unwrap();
+    // Denying data access does not remove a role's GRANT AS authority. A
+    // database-wide SELECT DENY also makes the metadata read fail loudly.
+    f.db.conn
+        .execute(&grant(&group, " WITH GRANT OPTION"))
+        .await
+        .unwrap();
+    let inherited_sql = format!("{} AS [{group}]; SELECT 1 WHERE 1=0", grant(&receiver, ""));
+    f.db.conn
+        .execute(&format!("USE [{}]", f.db.name))
+        .await
+        .unwrap();
+    let inherited = f.run(&inherited_sql).await;
+    let named = matches!(&inherited,Err(e) if e.to_string().contains("WITH GRANT OPTION") && e.to_string().contains(expected));
+    checks.push(("inherited W without DENY", named, format!("{inherited:?}")));
+    f.db.conn
+        .execute(&format!("USE [{context}]"))
+        .await
+        .unwrap();
+    let rows = f.db.conn.query(&count).await.unwrap();
+    checks.push((
+        "no inherited assertion grant",
+        rows[0].try_get::<i32>("n").unwrap() == Some(0),
+        format!("count={:?}", rows[0].try_get::<i32>("n").unwrap()),
+    ));
+    f.db.conn.execute(&revoke(&receiver)).await.unwrap();
+    let deny_scope = if scope.contains("(total)") {
+        "ON OBJECT::app.orders"
+    } else {
+        scope
+    };
+    f.db.conn
+        .execute(&format!(
+            "USE [{context}]; DENY {permission} {deny_scope} TO [{user}]"
+        ))
+        .await
+        .unwrap();
+    let sql = format!("{} AS [{group}]; SELECT 1 WHERE 1=0", grant(&receiver, ""));
+    // The grant may have required master; target identity still comes from
+    // the fixture's actual planning database, never the admin's last context.
+    f.db.conn
+        .execute(&format!("USE [{}]", f.db.name))
+        .await
+        .unwrap();
+    let result = f.run(&sql).await;
+    // A database SELECT DENY blocks catalog reads; a server definition DENY
+    // also defeats the required database metadata grant. Neither is absence.
+    let refused = match &result {
+        Err(e)
+            if e.to_string().contains("WITH GRANT OPTION") && e.to_string().contains(expected) =>
+        {
+            true
+        }
+        Err(e) if !server && scope.is_empty() => e.server_error_code().as_deref() == Some("229"),
+        Err(e) if server => e.to_string().contains("require database VIEW DEFINITION"),
+        _ => false,
+    };
+    checks.push(("inherited W despite DENY", refused, format!("{result:?}")));
+    f.db.conn
+        .execute(&format!("USE [{context}]"))
+        .await
+        .unwrap();
+    let rows = f.db.conn.query(&count).await.unwrap();
+    checks.push((
+        "no assertion GRANT AS",
+        rows[0].try_get::<i32>("n").unwrap() == Some(0),
+        format!("count={:?}", rows[0].try_get::<i32>("n").unwrap()),
+    ));
+    // Native control proves the denied login can still persist that grant AS
+    // its role. Clear any deliberately enabled witness effect first.
+    f.db.conn.execute(&revoke(&receiver)).await.unwrap();
+    let mut caller = Conn::connect(Driver::Mssql, &f.assertion).await.unwrap();
+    caller.execute(&sql).await.unwrap();
+    drop(caller);
+    let rows = f.db.conn.query(&count).await.unwrap();
+    checks.push((
+        "native delegation",
+        rows[0].try_get::<i32>("n").unwrap() == Some(1),
+        format!("count={:?}", rows[0].try_get::<i32>("n").unwrap()),
+    ));
+    f.db.conn.execute(&revoke(&receiver)).await.unwrap();
+    f.db.conn.execute(&revoke(&group)).await.unwrap();
+    f.db.conn
+        .execute(&format!(
+            "REVOKE {permission} {deny_scope} FROM [{user}] CASCADE"
+        ))
+        .await
+        .unwrap();
+    if server {
+        f.db.conn.execute(&format!("ALTER SERVER ROLE [{group}] DROP MEMBER [{user}]; DROP SERVER ROLE [{group}]; DROP LOGIN [{receiver}]")).await.unwrap();
+    } else {
+        f.db.conn.execute(&format!("ALTER ROLE [{group}] DROP MEMBER [{user}]; DROP ROLE [{group}]; DROP USER [{receiver}]")).await.unwrap();
+    }
+    f.db.conn
+        .execute(&format!(
+            "USE [{}]; GRANT SELECT ON app.orders TO [{user}]",
+            f.db.name
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.run("SELECT id FROM app.orders WHERE id<0").await.unwrap(),
+        AssertionResult::Pass(_)
+    ));
+    f.finish().await;
+    assert!(checks.iter().all(|(_, ok, _)| *ok), "{scope}: {checks:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn object_grant_options_refuse_before_assertion_sql() {
+    delegation_is_refused(
+        "ON OBJECT::app.orders",
+        "[app].[orders]",
+        false,
+        "grantobj2401",
+    )
+    .await;
+}
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn column_grant_options_refuse_before_assertion_sql() {
+    delegation_is_refused(
+        "ON OBJECT::app.orders(total)",
+        "[total]",
+        false,
+        "grantcol2401",
+    )
+    .await;
+}
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn schema_grant_options_refuse_before_assertion_sql() {
+    delegation_is_refused("ON SCHEMA::app", "[app]", false, "grantschema2401").await;
+}
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn database_grant_options_refuse_before_assertion_sql() {
+    delegation_is_refused("", "DATABASE", false, "grantdb2401").await;
+}
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn server_grant_options_refuse_before_assertion_sql() {
+    delegation_is_refused("", "SERVER", true, "grantsrv2401").await;
+}

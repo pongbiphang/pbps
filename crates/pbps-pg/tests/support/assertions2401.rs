@@ -231,3 +231,133 @@ async fn a_different_cluster_with_the_same_database_name_is_not_the_target() {
     a.finish().await;
     b.finish().await;
 }
+
+// Keep authority reachability in admission, not in a second assertion runner.
+async fn host_capability_is_refused(capability: &str, tag: &str) {
+    for server in servers() {
+        let mut f = Fixture::new(server, tag).await;
+        let target = Target::read(&mut f.admin).await.unwrap();
+        let role = f.role.clone();
+        let parent = format!("{role}_set");
+        let leaf = format!("{role}_leaf");
+        let marker = format!("/tmp/issue-2401-{tag}-{}", std::process::id());
+        let effect = match capability {
+            "pg_read_server_files" => "PERFORM pg_read_file('/etc/hostname')".into(),
+            "pg_write_server_files" => format!("COPY (SELECT 2401) TO '{marker}'"),
+            "pg_execute_server_program" => format!(
+                "COPY (SELECT 2401) TO PROGRAM 'psql -U postgres -d {} -c \"INSERT INTO app.orders VALUES (7,2401)\"'",
+                f.database
+            ),
+            _ => unreachable!(),
+        };
+        f.admin
+            .execute(&format!("CREATE ROLE {parent}; CREATE ROLE {leaf}"))
+            .await
+            .unwrap();
+        let body = if capability == "pg_read_server_files" {
+            effect.clone()
+        } else {
+            format!("EXECUTE '{}'", effect.replace('\'', "''"))
+        };
+        f.admin.execute(&format!("CREATE FUNCTION app.host_effect() RETURNS boolean LANGUAGE plpgsql SECURITY INVOKER AS $body$ BEGIN {body}; RETURN false; END $body$")).await.unwrap();
+        let sql = "SELECT 1 WHERE app.host_effect()";
+        // Native negative: without the host capability the invoker function
+        // cannot perform the effect, even though it has ordinary EXECUTE.
+        sql_error(
+            run_target(&f.assertion, &target, sql, DEADLINE)
+                .await
+                .unwrap(),
+            "42501",
+        );
+        assert!(matches!(
+            run_target(&f.assertion, &target, "SELECT 1 WHERE false", DEADLINE)
+                .await
+                .unwrap(),
+            AssertionResult::Pass(_)
+        ));
+        let mut observations = Vec::new();
+        for (shape, grant, revoke) in [
+            (
+                "direct",
+                format!("GRANT {capability} TO {role}"),
+                format!("REVOKE {capability} FROM {role}"),
+            ),
+            (
+                "inherit only",
+                format!(
+                    "GRANT {capability} TO {leaf} WITH INHERIT TRUE, SET FALSE; GRANT {leaf} TO {role} WITH INHERIT TRUE, SET FALSE"
+                ),
+                format!("REVOKE {leaf} FROM {role}; REVOKE {capability} FROM {leaf}"),
+            ),
+            (
+                "SET then INHERIT",
+                format!(
+                    "GRANT {capability} TO {leaf} WITH INHERIT TRUE, SET FALSE; GRANT {leaf} TO {parent} WITH INHERIT TRUE, SET FALSE; GRANT {parent} TO {role} WITH INHERIT FALSE, SET TRUE"
+                ),
+                format!(
+                    "REVOKE {parent} FROM {role}; REVOKE {leaf} FROM {parent}; REVOKE {capability} FROM {leaf}"
+                ),
+            ),
+        ] {
+            f.admin.execute(&grant).await.unwrap();
+            let result = run_target(&f.assertion, &target, sql, DEADLINE).await;
+            let named = matches!(&result,Err(e) if e.to_string().contains(capability));
+            observations.push((shape, named, format!("{result:?}")));
+            f.admin.execute(&revoke).await.unwrap();
+        }
+        // A membership that permits neither SET nor inheritance is not an
+        // effective capability. Do not reject it merely for existing in a graph.
+        f.admin
+            .execute(&format!(
+                "GRANT {capability} TO {leaf}; GRANT {leaf} TO {role} WITH INHERIT FALSE, SET FALSE"
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            run_target(&f.assertion, &target, "SELECT 1 WHERE false", DEADLINE)
+                .await
+                .unwrap(),
+            AssertionResult::Pass(_)
+        ));
+        f.admin.execute(&format!("REVOKE {leaf} FROM {role}; REVOKE {capability} FROM {leaf}; DROP ROLE {parent}; DROP ROLE {leaf}")).await.unwrap();
+        let rows = f
+            .admin
+            .query("SELECT count(*)::int AS n FROM app.orders WHERE id=7")
+            .await
+            .unwrap();
+        let writes = rows[0].try_get::<i32>("n").unwrap();
+        let files = f
+            .admin
+            .query(&format!(
+                "SELECT (pg_stat_file('{marker}',true)).size IS NOT NULL AS present"
+            ))
+            .await
+            .unwrap();
+        let file_present = files[0].try_get::<bool>("present").unwrap();
+        // Revert witnesses deliberately enable effects; always clean the owned
+        // database/roles before reporting the failed pre-execution assertion.
+        f.finish().await;
+        assert!(
+            observations.iter().all(|(_, named, _)| *named),
+            "{capability}: {observations:?}"
+        );
+        assert_eq!(writes, Some(0));
+        assert_eq!(file_present, Some(false));
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+async fn read_server_files_is_refused_through_the_actor_closure() {
+    host_capability_is_refused("pg_read_server_files", "hostread2401").await;
+}
+#[tokio::test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+async fn write_server_files_is_refused_through_the_actor_closure() {
+    host_capability_is_refused("pg_write_server_files", "hostwrite2401").await;
+}
+#[tokio::test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+async fn execute_server_program_is_refused_through_the_actor_closure() {
+    host_capability_is_refused("pg_execute_server_program", "hostexec2401").await;
+}

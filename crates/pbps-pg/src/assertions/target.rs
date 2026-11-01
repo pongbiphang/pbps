@@ -72,6 +72,9 @@ async fn privileges(conn: &mut Conn) -> Result<(), DbError> {
     // SET-able identity too: SET then INHERIT need not be SET-able from the login.
     let mut parts = vec![
         "SELECT 'administrator'::text AS permission, rolname::text AS object FROM pg_catalog.pg_roles WHERE (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls) AND pg_catalog.pg_has_role(session_user, oid, 'MEMBER')".to_owned(),
+        // READ ONLY cannot contain server-file effects or another connection
+        // opened by a server program. Reuse actors for SET then INHERIT too.
+        "SELECT 'host file/program', r.rolname::text FROM pg_catalog.pg_roles r CROSS JOIN actors a WHERE r.rolname IN ('pg_read_server_files','pg_write_server_files','pg_execute_server_program') AND pg_catalog.pg_has_role(a.oid,r.oid,'USAGE') IS DISTINCT FROM false".into(),
         "SELECT 'ADMIN OPTION', r.rolname::text FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles r ON r.oid=m.roleid CROSS JOIN actors a WHERE m.admin_option AND pg_catalog.pg_has_role(a.oid,m.member,'USAGE')".into(),
         "SELECT 'ALTER SYSTEM', p.parname::text FROM pg_catalog.pg_parameter_acl p CROSS JOIN actors a WHERE pg_catalog.has_parameter_privilege(a.oid,p.parname,'ALTER SYSTEM') IS DISTINCT FROM false".into(),
         "SELECT 'CREATE', d.datname::text FROM pg_catalog.pg_database d CROSS JOIN actors a WHERE d.datname=pg_catalog.current_database() AND pg_catalog.has_database_privilege(a.oid,d.oid,'CREATE') IS DISTINCT FROM false".into(),

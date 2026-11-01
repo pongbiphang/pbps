@@ -191,6 +191,11 @@ async fn privileges_here(conn: &mut Conn, database: &str) -> Result<(), DbError>
             .to_owned(),
         "SELECT permission_name, DB_NAME() FROM sys.fn_my_permissions(NULL,'DATABASE')".into(),
     ];
+    // GRANT AS role can delegate its W permission even when this login's
+    // corresponding data access is denied (native #2605). Use grant-capable
+    // engine tokens, not fn_my_permissions' data-right verdict, for authority.
+    parts.push("SELECT (p.permission_name+' WITH GRANT OPTION') COLLATE DATABASE_DEFAULT, CASE p.class WHEN 0 THEN 'DATABASE '+QUOTENAME(DB_NAME()) WHEN 1 THEN 'OBJECT '+QUOTENAME(OBJECT_SCHEMA_NAME(p.major_id))+'.'+QUOTENAME(OBJECT_NAME(p.major_id))+CASE WHEN p.minor_id>0 THEN ' COLUMN '+QUOTENAME(COL_NAME(p.major_id,p.minor_id)) ELSE '' END WHEN 3 THEN 'SCHEMA '+QUOTENAME(SCHEMA_NAME(p.major_id)) ELSE p.class_desc+' '+CONVERT(nvarchar(20),p.major_id) END COLLATE DATABASE_DEFAULT FROM sys.database_permissions p JOIN sys.user_token t ON t.principal_id=p.grantee_principal_id WHERE p.state='W' AND t.usage='GRANT OR DENY'".into());
+    parts.push("SELECT (p.permission_name+' WITH GRANT OPTION') COLLATE DATABASE_DEFAULT, CASE WHEN p.class=100 THEN 'SERVER' ELSE p.class_desc+' '+CONVERT(nvarchar(20),p.major_id) END COLLATE DATABASE_DEFAULT FROM sys.server_permissions p JOIN sys.login_token t ON t.principal_id=p.grantee_principal_id WHERE p.state='W' AND t.usage='GRANT OR DENY'".into());
     // Self-principal CONTROL/ALTER/IMPERSONATE are implicit for ordinary logins;
     // they do not impersonate another identity or confer target write rights.
     // A permission on a server securable makes that securable visible. A complete
@@ -221,9 +226,9 @@ async fn privileges_here(conn: &mut Conn, database: &str) -> Result<(), DbError>
         parts.push(format!("SELECT permission_name, ('{class} '+i.name) COLLATE DATABASE_DEFAULT FROM ({inventory}) i CROSS APPLY sys.fn_my_permissions(i.name,'{class}') p"));
     }
     // Catalog names can use different collations (e.g. external languages);
-    // normalize only these diagnostic labels, never the queried object names.
-    // Each namespace's own oracle accounts for inherited permissions, ownership
-    // and DENY. Reading raw grant rows or role names would not do that.
+    // normalize only diagnostic columns, never the queried object names.
+    // Each namespace's own oracle accounts for inherited data permissions,
+    // ownership and DENY. Delegation authority was checked separately above.
     for (class, inventory) in [
         ("SCHEMA", "SELECT QUOTENAME(name) AS name FROM sys.schemas"),
         // S/IT are not OBJECT securables; legacy DEFAULT/RULE report nominal
