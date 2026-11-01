@@ -273,6 +273,53 @@ fn invalid_inputs_keep_observed_hashes_and_never_acquire() {
 }
 
 #[test]
+fn relative_project_spellings_freeze_the_same_input_before_runtime() {
+    let p = Project::new();
+    let base = p.commit();
+    p.manifest(
+        "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+        &base,
+        &[],
+        "SELECT 1 WHERE false",
+    );
+    std::fs::create_dir(p.0.dir.join("child")).unwrap();
+    p.write("blocked-state", "not a directory");
+    let before = p.bytes();
+    let mut identity = None;
+    for project in [
+        p.0.dir.as_path(),
+        Path::new("."),
+        Path::new("./child"),
+        Path::new("child"),
+    ] {
+        let out = Command::new(BIN)
+            .current_dir(&p.0.dir)
+            .arg("--project")
+            .arg(project)
+            .args(["test", "--format", "json"])
+            // Refuse before Docker: this test concerns only project discovery.
+            .env("XDG_STATE_HOME", p.0.dir.join("blocked-state"))
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(!v["data"]["input"].is_null(), "{project:?}: {v}");
+        let expected = identity.get_or_insert_with(|| v["data"]["input"].clone());
+        assert_eq!(&v["data"]["input"], expected, "{project:?}");
+        assert!(v["data"]["run_id"].is_null());
+        assert!(
+            v["findings"].as_array().unwrap().iter().any(|f| {
+                f["id"] == "test.cleanup"
+                    && f["message"].as_str().unwrap().contains("blocked-state")
+            }),
+            "{v}"
+        );
+        assert_eq!(p.bytes(), before);
+    }
+    assert!(!p.state().exists());
+}
+
+#[test]
 fn unsupported_engine_refuses_before_runtime_discovery() {
     let p = Project::new();
     let base = p.commit();
