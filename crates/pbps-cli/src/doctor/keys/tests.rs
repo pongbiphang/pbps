@@ -1,6 +1,5 @@
 use super::*;
-use crate::doctor::{Diagnosis, outcome, unanswerable};
-use crate::output::{self, Outcome, Report, Severity};
+use crate::output::Severity;
 use std::path::{Path, PathBuf};
 
 fn project() -> Project {
@@ -150,6 +149,8 @@ impl Drop for Directory {
 #[cfg(unix)]
 #[test]
 fn two_distinct_key_files_with_one_id_are_errors_in_the_report() {
+    use crate::doctor::{Diagnosis, outcome, unanswerable};
+    use crate::output::{self, Outcome, Report};
     use std::os::unix::fs::PermissionsExt;
     let dir = Directory::new();
     let secret = FingerprintKey::generate();
