@@ -880,6 +880,31 @@ pub async fn vet_conversion(
     from: &pbps_model::ColumnType,
     using: &str,
 ) -> Result<(), String> {
+    vet_conversion_bound(conn, column, from, using, None)
+        .await
+        .map(|_| ())
+}
+
+/// Vet once and certify repeated projections, including the assignment cast.
+/// The ordinary conversion probe may evaluate stable/volatile built-ins; an FK
+/// comparison must predict the same stored value across separate evaluations.
+pub async fn vet_conversion_for_probe(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+    from: &pbps_model::ColumnType,
+    to: &pbps_model::ColumnType,
+    using: &str,
+) -> Result<bool, String> {
+    vet_conversion_bound(conn, column, from, using, Some(to)).await
+}
+
+async fn vet_conversion_bound(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+    from: &pbps_model::ColumnType,
+    using: &str,
+    to: Option<&pbps_model::ColumnType>,
+) -> Result<bool, String> {
     if !crate::LEXICON.parentheses_balanced(using) {
         return Err(format!(
             "the conversion of {} has unbalanced parentheses; write one complete expression and re-record with `pbps convert {} --using -`",
@@ -891,6 +916,14 @@ pub async fn vet_conversion(
     let shown = shown.as_str();
     let normalized = crate::types::normalize(from)
         .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
+    let projected = to
+        .map(|to| {
+            crate::types::normalize(to)
+                .map(|target| crate::preflight::conversion_value(using, &target))
+        })
+        .transpose()
+        .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
+    let bound = projected.as_deref().unwrap_or(using);
     let ty = normalized.raw().to_string();
     let quoted = crate::quote(column.name.raw())
         .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
@@ -909,7 +942,7 @@ pub async fn vet_conversion(
         // pre-flight do, independently of the caller's session (DEC-2378.2).
         conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
             .await.map_err(|_| unvetted("could not be vetted: its resolution path could not be pinned".into()))?;
-        if let Some(inputs) = literal_inputs::before_bind(conn, using, Some(&normalized)).await.map_err(unvetted)? {
+        if let Some(inputs) = literal_inputs::before_bind(conn, bound, Some(&normalized)).await.map_err(unvetted)? {
             // Keep the original CHECK statement and its shape audit unchanged.
             // This separate empty table only supplies column types to Describe.
             conn.execute_with(&format!(
@@ -917,12 +950,13 @@ pub async fn vet_conversion(
             ), &[]).await.map_err(|_| unvetted("could not be vetted: its parameter binding table could not be created".into()))?;
             inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), false).await.map_err(unvetted)?;
         }
-        vet_in_transaction(conn, quoted, ty, using, shown, 1, false).await.map(|_| ())
+        vet_in_transaction(conn, quoted, ty, VetExpression { text: using, bound }, shown, 1, false).await.map(|v| v.immutable)
     }
     .await;
     let closed = conn.rollback(&WRITABLE).await;
-    result?;
-    closed.map_err(|_| unvetted("could not be vetted: its transaction did not close".into()))
+    let immutable = result?;
+    closed.map_err(|_| unvetted("could not be vetted: its transaction did not close".into()))?;
+    Ok(immutable)
 }
 
 /// Bind and audit one boolean expression over the actual table's columns.
@@ -979,7 +1013,7 @@ pub async fn vet_requirement(
             conn.execute_with(&format!("CREATE TEMPORARY TABLE pg_temp.pbps_conversion_input (LIKE {qualified} EXCLUDING ALL) ON COMMIT DROP"), &[]).await.map_err(|_| refused("could not be vetted: its binding table could not be created"))?;
             inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), true).await?;
         }
-        vet_in_transaction(conn, &format!("LIKE {qualified} EXCLUDING ALL"), "", predicate, &table.shown().to_string(), columns, true).await
+        vet_in_transaction(conn, &format!("LIKE {qualified} EXCLUDING ALL"), "", predicate.into(), &table.shown().to_string(), columns, true).await.map(|v| v.columns)
     }.await;
     let closed = conn.rollback(&framing).await;
     let columns = result?;
@@ -992,15 +1026,31 @@ fn expression_check(expression: &str, predicate: bool) -> String {
     format!("(({expression}) IS {test}) OR true")
 }
 
+/// The diagnostic retains the recorded text while binding its assignment.
+struct VetExpression<'a> {
+    text: &'a str,
+    bound: &'a str,
+}
+impl<'a> From<&'a str> for VetExpression<'a> {
+    fn from(text: &'a str) -> Self {
+        Self { text, bound: text }
+    }
+}
+struct VettedExpression {
+    columns: BTreeSet<pbps_model::ColumnName>,
+    immutable: bool,
+}
+
 async fn vet_in_transaction(
     conn: &mut Conn,
     column: &str,
     ty: &str,
-    using: &str,
+    expression: VetExpression<'_>,
     shown: &str,
     columns: i32,
     predicate: bool,
-) -> Result<BTreeSet<pbps_model::ColumnName>, String> {
+) -> Result<VettedExpression, String> {
+    let using = expression.text;
     let refuse = |why: &str| {
         if predicate {
             format!(
@@ -1011,7 +1061,7 @@ async fn vet_in_transaction(
             format!("the conversion `USING {using}` of {shown} {why}")
         }
     };
-    let check = expression_check(using, predicate);
+    let check = expression_check(expression.bound, predicate);
     // **One statement, by the protocol and not by reading the text** (round 3
     // review). `execute` is a simple-protocol batch, and text such as
     // `NULL) IS NULL) OR true)); COMMIT; SELECT f(); --` closes this statement
@@ -1163,7 +1213,7 @@ async fn vet_in_transaction(
             row_compares.insert((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]);
         }
     }
-    let (reasons, _, owners) = unadmitted_routines(
+    let (reasons, non_immutable, owners) = unadmitted_routines(
         conn,
         &denied,
         &functions,
@@ -1210,7 +1260,49 @@ async fn vet_in_transaction(
         ));
     }
     if !predicate {
-        return Ok(BTreeSet::new());
+        let mut immutable = !non_immutable && !bounds.iter().any(|(_, b)| b.reads_session);
+        if immutable {
+            // I/O and engine primitives can dispatch through type handlers
+            // without FuncExpr. Reuse the existing reach/routine reads and
+            // conservatively certify all handlers, including unused ones.
+            let types: BTreeSet<_> = bounds
+                .iter()
+                .flat_map(|(_, b)| b.types.iter().copied())
+                .map(Oid::from)
+                .collect();
+            let roots: Vec<_> = types.into_iter().collect();
+            let handlers = match reach(conn, &roots, true).await {
+                Ok(types)
+                    if roots
+                        .iter()
+                        .all(|root| types.iter().any(|t| t.oid == *root)) =>
+                {
+                    types
+                        .into_iter()
+                        .flat_map(|t| t.handlers)
+                        .filter(|o| *o != 0)
+                        .collect::<BTreeSet<_>>()
+                }
+                Ok(_) | Err(_) => {
+                    immutable = false;
+                    BTreeSet::new()
+                }
+            };
+            if immutable {
+                immutable = match function_rows(conn, &handlers.iter().copied().collect::<Vec<_>>())
+                    .await
+                {
+                    Ok(rows) => {
+                        rows.len() == handlers.len() && rows.values().all(|r| r.volatility == "i")
+                    }
+                    Err(_) => false,
+                };
+            }
+        }
+        return Ok(VettedExpression {
+            columns: BTreeSet::new(),
+            immutable,
+        });
     }
     let routines = function_rows(conn, &functions.keys().copied().collect::<Vec<_>>())
         .await
@@ -1222,13 +1314,18 @@ async fn vet_in_transaction(
     }
     let rows = conn.query("SELECT a.attname::pg_catalog.text AS name FROM pg_catalog.pg_constraint c CROSS JOIN LATERAL unnest(c.conkey) k(attnum) JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE c.conrelid = 'pg_temp.pbps_conversion'::pg_catalog.regclass AND c.conname = 'pbps_conversion'").await
         .map_err(|_| refuse("could not be vetted: its referenced columns are unreadable"))?;
-    rows.iter()
+    let columns = rows
+        .iter()
         .map(|r| {
             need::<&str>(r, "name")
                 .map(Into::into)
                 .map_err(|_| refuse("could not be vetted: a referenced column is unreadable"))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(VettedExpression {
+        columns,
+        immutable: false,
+    })
 }
 
 /// `server_version_num` / 10000: 16 or 18, the majors the decoder was measured
@@ -2026,7 +2123,7 @@ pub(crate) async fn vet_copy_conversion(
         conn,
         &name,
         &ty.raw().to_string(),
-        using,
+        using.into(),
         column.raw(),
         1,
         false,

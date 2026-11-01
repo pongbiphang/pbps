@@ -3680,6 +3680,21 @@ pub trait Dialect {
         self.preflight(names)
     }
 
+    /// Apply-time conversion facts, obtained from vetted bound expressions.
+    /// Missing facts grant no repeatable-value projection; they are not plan data.
+    fn preflight_with_conversions(
+        &self,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        partitions: &Partitions,
+        before: Option<pbps_model::operation::Snapshot<'_>>,
+        _immutable: &std::collections::BTreeSet<pbps_model::ColumnRef>,
+    ) -> Preflight {
+        match before {
+            Some(before) => self.preflight_with_sources(names, partitions, before),
+            None => self.preflight_with(names, partitions),
+        }
+    }
+
     /// The line that separates batches in a script for this dialect, if the
     /// dialect has batches at all.
     ///

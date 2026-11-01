@@ -2859,7 +2859,12 @@ impl Dialect for Postgres {
     /// caller reports how many could not be checked rather than counting them
     /// as passes.
     fn preflight(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> pbps_dialect::Preflight {
-        preflight::probes(names, &pbps_model::Partitions::default(), None)
+        preflight::probes(
+            names,
+            &pbps_model::Partitions::default(),
+            None,
+            &BTreeSet::new(),
+        )
     }
 
     fn partition_meetings(&self) -> bool {
@@ -2871,7 +2876,7 @@ impl Dialect for Postgres {
         names: &pbps_model::plan_names::PlanNames<'_>,
         partitions: &pbps_model::Partitions,
     ) -> pbps_dialect::Preflight {
-        preflight::probes(names, partitions, None)
+        preflight::probes(names, partitions, None, &BTreeSet::new())
     }
 
     fn preflight_with_sources(
@@ -2880,7 +2885,17 @@ impl Dialect for Postgres {
         partitions: &pbps_model::Partitions,
         before: pbps_model::operation::Snapshot<'_>,
     ) -> pbps_dialect::Preflight {
-        preflight::probes(names, partitions, Some(before))
+        preflight::probes(names, partitions, Some(before), &BTreeSet::new())
+    }
+
+    fn preflight_with_conversions(
+        &self,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        partitions: &pbps_model::Partitions,
+        before: Option<pbps_model::operation::Snapshot<'_>>,
+        immutable: &BTreeSet<pbps_model::ColumnRef>,
+    ) -> pbps_dialect::Preflight {
+        preflight::probes(names, partitions, before, immutable)
     }
 
     /// Whether an omitted cell in the read-back *means* at-default for this

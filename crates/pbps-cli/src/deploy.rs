@@ -10932,15 +10932,12 @@ async fn run_probes_observed(
     pin_session(conn, dialect).await?;
     // A recorded conversion's expression is judged before any probe evaluates
     // it: the probe would run non-built-in code as the deployer, unvetted.
-    crate::engine::vet_conversions(conn, names.changes()).await?;
+    let immutable = crate::engine::vet_conversions(conn, names.changes()).await?;
     crate::engine::vet_drop_requirements(conn, names).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
-    let report = match sources {
-        Some(before) => dialect.preflight_with_sources(names, partitions, before),
-        None => dialect.preflight_with(names, partitions),
-    };
+    let report = dialect.preflight_with_conversions(names, partitions, sources, &immutable);
     for skipped in &report.unchecked {
         unchecked += 1;
         eprintln!(

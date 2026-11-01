@@ -46,6 +46,8 @@ pub(crate) struct Bound {
     pub domain_coercions: BTreeSet<u32>,
     /// I/O coercions run the target's input function, including nested CHECKs.
     pub input_coercions: BTreeSet<u32>,
+    /// SQL value primitives read transaction/session state without a function OID.
+    pub reads_session: bool,
 }
 
 /// Where in the tree a row comparison's operator or family sits: the path to
@@ -148,10 +150,20 @@ fn bind(tree: &nodes::Value, major: u32, body: bool) -> Result<Bound, String> {
     }
     if body {
         for expression in body::expressions(tree)? {
-            input_coercions(expression, &mut bound.input_coercions, true)?;
+            input_coercions(
+                expression,
+                &mut bound.input_coercions,
+                &mut bound.reads_session,
+                true,
+            )?;
         }
     } else {
-        input_coercions(tree, &mut bound.input_coercions, false)?;
+        input_coercions(
+            tree,
+            &mut bound.input_coercions,
+            &mut bound.reads_session,
+            false,
+        )?;
     }
     Ok(bound)
 }
@@ -161,6 +173,7 @@ fn bind(tree: &nodes::Value, major: u32, body: bool) -> Result<Bound, String> {
 fn input_coercions(
     value: &nodes::Value,
     inputs: &mut BTreeSet<u32>,
+    reads_session: &mut bool,
     body: bool,
 ) -> Result<(), String> {
     use nodes::Value;
@@ -202,8 +215,8 @@ fn input_coercions(
                 // Fixed engine operations. JSON constructors expose RETURNING
                 // conversions as children; JSONEXPR does not, so it is refused
                 // below rather than treated as another constructor.
-                "SQLVALUEFUNCTION"
-                | "XMLEXPR"
+                "SQLVALUEFUNCTION" => *reads_session = true,
+                "XMLEXPR"
                 | "JSONCONSTRUCTOREXPR"
                 | "JSONFORMAT"
                 | "JSONRETURNING"
@@ -216,12 +229,12 @@ fn input_coercions(
                 }
             }
             for child in node.fields.values() {
-                input_coercions(child, inputs, body)?;
+                input_coercions(child, inputs, reads_session, body)?;
             }
         }
         Value::List(values) => {
             for child in values {
-                input_coercions(child, inputs, body)?;
+                input_coercions(child, inputs, reads_session, body)?;
             }
         }
         Value::Null | Value::Atom(_) | Value::Datum => {}

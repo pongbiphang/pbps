@@ -502,3 +502,59 @@ fn a_default_and_a_key_on_one_converted_column_are_both_taken_down_and_put_back(
         succeeds(d.run(&["verify", "--db", connection]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn nonrepeatable_recorded_self_references_apply_with_an_explicit_unchecked_reason() {
+    let before = "table: app.t\ncolumns:\n  id: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\nforeign_keys:\n  fk_self:\n    columns: [id]\n    references: app.t(id)\n";
+    for (version, url) in servers() {
+        for (case, ty, expression) in [
+            ("random", "double precision", "random()"),
+            ("now", "timestamptz", "now()"),
+            ("sqlclock", "timestamptz", "CURRENT_TIMESTAMP"),
+            (
+                "setting",
+                "double precision",
+                "current_setting('server_version_num')::double precision",
+            ),
+            (
+                "assignment",
+                "timestamptz",
+                "pg_catalog.make_timestamp(2020, 1, 1, 0, 0, 0)",
+            ),
+            ("input", "timestamptz", "id::timestamptz"),
+        ] {
+            let slug = format!("convert2394-{case}{version}");
+            let own = OwnDatabase::new(&url, &slug);
+            let connection = own.connection();
+            on_server(connection, "CREATE SCHEMA app");
+            let d = Demo::new(&slug);
+            put(&d, "app.t.yml", before);
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", connection]));
+            on_server(connection, "INSERT INTO app.t VALUES ('2020-01-01')");
+            put(&d, "app.t.yml", &declared_as(before, ty));
+            convert(&d, "app.t.id", expression);
+            let artifact = connected_artifact(&d, connection, false);
+            let applied = approved_apply(&d, connection, &artifact, GATE);
+            let text = stderr(&applied);
+            assert_eq!(code(&applied), 0, "PG{version} {case}: {text}");
+            assert!(
+                text.contains("fk_self")
+                    && text.contains(expression)
+                    && text.contains("not certified IMMUTABLE"),
+                "PG{version} {case}: {text}"
+            );
+            assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 1);
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_constraint WHERE conname = 'fk_self' AND convalidated"
+                ),
+                1
+            );
+            succeeds(d.run(&["verify", "--db", connection]));
+        }
+    }
+}

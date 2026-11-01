@@ -4283,3 +4283,27 @@ admission is outside this issue. A partition inherits its parent's conversion
 expression and evaluates it against its own row. Live cases on PostgreSQL 16
 and 18 pin matching transformed keys and orphan refusal on either end before
 any ALTER TABLE, witnessed by a sequence that survives transaction rollback.
+
+
+<a id="dec-2394-2"></a>
+
+**DEC-2394.2. Recorded FK projections require apply-time immutability facts
+for the complete assignment, shared by both key ends (#2394 ready review).**
+A self-reference converted with `random()` always references its own stored
+value, but two probe evaluations need not agree. Stable expressions also run
+in a different transaction from apply. Thus DEC-2394.1's stored projection
+requires all bound function/operator calls and assignment casts to be
+IMMUTABLE. Conversion vetting reuses its existing routine-volatility read,
+includes the exact assignment projection, and records one decision per
+conversion. SQL value primitives are nonrepeatable even without a function
+OID. Type-handler dispatch reuses the existing type reach and routine reads,
+conservatively requiring all bound types' handlers, including unused ones, to
+be immutable. This may leave a safe
+expression unchecked; it cannot turn an unknown binding into a predicted value.
+
+These facts are transient, never saved-plan data. The pure preflight consumes
+the facts; absent or non-immutable conversions carry a distinct unchecked
+reason naming the expression. Vetting remains mandatory, and ordinary
+conversion probes still evaluate admitted stable/volatile expressions. PG16/18
+cases pin `random()`, `now()`, SQL clock primitives, settings, assignment and
+I/O casts beside the immutable orphan/matching controls.
