@@ -1993,6 +1993,210 @@ mod object_grants1454;
 #[path = "partition1566.rs"]
 mod partition1566;
 
+/// The #1911 round-3/#1896 shape reaches the real producer's final remap,
+/// rather than only comparing hand-built before/after change sets.
+pub fn in_place_default_edits(server: &str, drop_function: bool) {
+    use pbps_model::{Change, SavedPlan, resolver::PlanAnalysis};
+
+    let slug = format!("in-place-default-1896-{drop_function}");
+    let own = OwnDatabase::new(server, &slug);
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t(n integer DEFAULT app.f(1)); \
+         CREATE TABLE app.tree(k integer NOT NULL,d integer DEFAULT 4) PARTITION BY RANGE(k); \
+         CREATE TABLE app.p PARTITION OF app.tree FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE app.p ALTER COLUMN d SET DEFAULT app.f(1)",
+    );
+    let scratch = Confined::new(server);
+    let d = Demo::new(&slug);
+    successful(run(&d, &["pull", "--db", connection], None));
+    d.commit();
+    successful(run(
+        &d,
+        &[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt defaults for #1896",
+        ],
+        None,
+    ));
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  n: {type: integer, default: '2'}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.tree.yml"),
+        "table: app.tree\ncolumns:\n  k: {type: integer, nullable: false}\n  \
+         d: {type: integer, default: '4'}\npartition_by: [k]\npartitions:\n  \
+         p:\n    from: [0]\n    to: [10]\n    columns:\n      d: {default: '3'}\n",
+    )
+    .unwrap();
+    if drop_function {
+        std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    }
+    let logical_path = d.dir.join("logical-plan.json");
+    successful(run(
+        &d,
+        &["plan", "--no-dev", "--out", logical_path.to_str().unwrap()],
+        None,
+    ));
+    let read = |path: &std::path::Path| -> SavedPlan {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    };
+    // Pin the input scene: each spelling begins as one edit off app.f(1),
+    // before any resolver or connected dependents expansion can split it.
+    let column_owner = pbps_model::TableName::new("app", "t");
+    let partition_owner = pbps_model::TableName::new("app", "p");
+    let edits = |plan: &SavedPlan, partition: bool| {
+        plan.changes
+            .changes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                // No wildcard arm: a new kind of change is not an edit.
+                if !partition
+                    && let Change::AlterColumnDefault {
+                        column, from, to, ..
+                    } = &p.change
+                    && column.table == column_owner
+                {
+                    return Some((i, from.clone(), to.clone()));
+                }
+                if partition
+                    && let Change::SetPartitionDefault {
+                        table, from, to, ..
+                    } = &p.change
+                    && table == &partition_owner
+                {
+                    return Some((i, from.clone(), to.clone()));
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+    };
+    let logical = read(&logical_path);
+    for (partition, to) in [(false, "2"), (true, "3")] {
+        let changes = edits(&logical, partition);
+        assert_eq!(changes.len(), 1, "{partition}: {logical:?}");
+        assert_eq!(changes[0].1.as_deref(), Some("app.f(1)"));
+        assert_eq!(changes[0].2.as_deref(), Some(to));
+    }
+    println!("logical #1896 input: {:#?}", logical.changes);
+    d.commit();
+    configure(&d);
+    successful(run(
+        &d,
+        &[
+            "key",
+            "generate",
+            "--out",
+            d.dir.join("key").to_str().unwrap(),
+        ],
+        None,
+    ));
+    let targets = Targets {
+        target: connection,
+        scratch: &scratch.connection,
+    };
+    let artifact = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
+    let saved = read(&artifact);
+    let drops: Vec<_> = saved
+        .changes
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| matches!(&p.change, Change::DropModule { .. }).then_some(i))
+        .collect();
+    assert_eq!(drops.len(), usize::from(drop_function), "{saved:?}");
+    if drop_function {
+        let PlanAnalysis::Resolved(evidence) = &saved.analysis else {
+            panic!("the drop case must pass resolver publication: {saved:?}");
+        };
+        evidence.ordering().validate(&saved.changes).unwrap();
+        for partition in [false, true] {
+            let changes = edits(&saved, partition);
+            // Every step that releases the old binding runs before the drop.
+            // The proof orders at least one of them there: the resolver's own
+            // teardown of a partition's default, or the column's release half.
+            // The edit's own release half need not have an edge of its own.
+            let releases: Vec<_> = changes
+                .iter()
+                .filter(|(_, from, _)| from.as_deref() == Some("app.f(1)"))
+                .map(|&(at, ..)| at)
+                .collect();
+            assert!(!releases.is_empty(), "no old binding release: {saved:?}");
+            assert!(releases.iter().all(|&at| at < drops[0]), "{saved:?}");
+            assert!(
+                evidence
+                    .ordering()
+                    .edges()
+                    .iter()
+                    .any(|edge| { edge.after == drops[0] && releases.contains(&edge.before) }),
+                "the proof orders a release before the drop: {saved:?}"
+            );
+        }
+    } else {
+        for (partition, to) in [(false, "2"), (true, "3")] {
+            let changes = edits(&saved, partition);
+            assert_eq!(
+                changes.len(),
+                1,
+                "an edit without a drop stays whole: {saved:?}"
+            );
+            assert_eq!(changes[0].1.as_deref(), Some("app.f(1)"));
+            assert_eq!(changes[0].2.as_deref(), Some(to));
+        }
+        if let PlanAnalysis::Resolved(evidence) = &saved.analysis {
+            evidence.ordering().validate(&saved.changes).unwrap();
+        }
+    }
+    successful(run(
+        &d,
+        &[
+            "apply",
+            "--env",
+            "prod",
+            "--plan",
+            artifact.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&artifact),
+            "--allow",
+            "destructive",
+        ],
+        Some(&targets),
+    ));
+    assert_eq!(
+        text_of(
+            connection,
+            "SELECT string_agg(c.relname||'='||pg_get_expr(d.adbin,d.adrelid),',' ORDER BY c.relname) \
+         FROM pg_attrdef d JOIN pg_class c ON c.oid=d.adrelid WHERE c.relnamespace='app'::regnamespace"
+        ),
+        "p=3,t=2,tree=4"
+    );
+    on_server(
+        connection,
+        "INSERT INTO app.t DEFAULT VALUES; INSERT INTO app.p(k) VALUES (1)",
+    );
+    assert_eq!(scalar(connection, "SELECT n::bigint FROM app.t"), 2);
+    assert_eq!(scalar(connection, "SELECT d::bigint FROM app.p"), 3);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_proc WHERE oid=to_regprocedure('app.f(integer)')"
+        ),
+        i64::from(!drop_function)
+    );
+    successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
+}
+
 /// An arriving overload changes an own default's binding while a sibling's
 /// inherited copy remains part of that sibling's table, never a new surface.
 pub fn partition_own_default_bindings(server: &str) {

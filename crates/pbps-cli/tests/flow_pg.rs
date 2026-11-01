@@ -1369,6 +1369,18 @@ fn resolver_captures_partition_own_defaults_without_inventing_inherited_surfaces
 }
 
 #[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn resolver_publishes_in_place_default_edits_before_dropping_their_function() {
+    resolver_publication::in_place_default_edits(&server(), true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn resolver_keeps_default_edits_whole_without_dropping_their_function() {
+    resolver_publication::in_place_default_edits(&server(), false);
+}
+
+#[test]
 #[ignore = "needs live postgres"]
 fn resolver_plans_pass_the_ordinary_connected_checks() {
     resolver_publication::ordinary_checks(&old_server(), true);
