@@ -1360,3 +1360,6 @@ pub(super) fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
 
 #[path = "chained2376_tests.rs"]
 mod chained2376;
+
+#[path = "chained2541_tests.rs"]
+mod chained2541;
