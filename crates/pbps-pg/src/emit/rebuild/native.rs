@@ -8,6 +8,17 @@ use pbps_model::*;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
 mod cases;
+mod snapshot {
+    include!("../../../tests/support/catalog_snapshot.rs");
+}
+
+fn owned_snapshot(
+    mut pulled: crate::introspect::Pulled,
+    role_prefix: &str,
+) -> crate::introspect::Pulled {
+    pulled.schema = snapshot::owned_roles(pulled.schema, |name| name.starts_with(role_prefix));
+    pulled
+}
 
 #[derive(Clone)]
 struct Case {
@@ -172,6 +183,8 @@ async fn owned(case: Case, failure: Option<(Selector, usize, Fault, &'static str
         let reference = format!("{db}_ref");
         let role = format!("{db}_reader");
         let denied = format!("{db}_denied");
+        let unrelated = format!("pbps_noise_{token}");
+        let role_prefix = format!("{db}_");
         let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
         for name in [&db, &reference] {
             execute(&mut admin, &format!("CREATE DATABASE {name}")).await;
@@ -185,17 +198,25 @@ async fn owned(case: Case, failure: Option<(Selector, usize, Fault, &'static str
         let ref_connection = format!("{base} dbname={reference}");
         let label = format!("{variable}: {}", case.name);
         let case = case.clone();
-        let roles = (role.clone(), denied.clone());
+        let roles = (role.clone(), denied.clone(), unrelated.clone());
         let result = tokio::task::LocalSet::new()
             .run_until(async move {
-                tokio::task::spawn_local(exercise(connection, ref_connection, roles, case, failure))
-                    .await
+                tokio::task::spawn_local(exercise(
+                    connection,
+                    ref_connection,
+                    roles,
+                    role_prefix,
+                    case,
+                    failure,
+                ))
+                .await
             })
             .await;
         for name in [&db, &reference] {
             execute(&mut admin, &format!("DROP DATABASE {name} WITH (FORCE)")).await;
         }
         execute(&mut admin, &format!("DROP ROLE {role}, {denied}")).await;
+        execute(&mut admin, &format!("DROP ROLE IF EXISTS {unrelated}")).await;
         result.unwrap_or_else(|e| panic!("{label}: {e}"));
     }
 }
@@ -224,7 +245,8 @@ async fn failure_oracle((case, selector, statement, fault, state): FailureCase) 
 async fn exercise(
     connection: String,
     reference: String,
-    (role, denied): (String, String),
+    (role, denied, unrelated): (String, String, String),
+    role_prefix: String,
     case: Case,
     failure: Option<(Selector, usize, Fault, &'static str)>,
 ) {
@@ -236,10 +258,11 @@ async fn exercise(
             include_str!("../../../tests/support/rebuild_tree.sql"),
         )
         .await;
-        let schema = crate::catalog::introspect(&mut reference)
-            .await
-            .unwrap()
-            .schema;
+        let schema = owned_snapshot(
+            crate::catalog::introspect(&mut reference).await.unwrap(),
+            &role_prefix,
+        )
+        .schema;
         execute(&mut reference, "DROP SCHEMA app CASCADE").await;
         schema
     } else {
@@ -294,8 +317,18 @@ async fn exercise(
     bootstrap(&mut conn, &before, &hints).await;
     bootstrap(&mut reference, &desired, &hints).await;
     insert(&mut conn, &case.rows).await;
-    let before = crate::catalog::introspect(&mut conn).await.unwrap().schema;
-    let expected = crate::catalog::introspect(&mut reference).await.unwrap();
+    let before = owned_snapshot(
+        crate::catalog::introspect(&mut conn).await.unwrap(),
+        &role_prefix,
+    )
+    .schema;
+    let expected = owned_snapshot(
+        crate::catalog::introspect(&mut reference).await.unwrap(),
+        &role_prefix,
+    );
+    // Deterministic witness for concurrent cluster-role churn after the reference
+    // snapshot: this role belongs to neither database fixture's namespace.
+    execute(&mut reference, &format!("CREATE ROLE {unrelated}")).await;
     let declared = desired;
     let mut desired = expected.schema.clone();
     for (name, table) in &mut desired.tables {
@@ -508,9 +541,12 @@ async fn exercise(
         assert_eq!(manifest(&mut conn, &before).await, opening);
     } else {
         assert_eq!(rows(&mut conn, &table, "src.*", false).await, expected_rows);
-        let final_state = crate::catalog::introspect_within_transaction(&mut conn)
-            .await
-            .unwrap();
+        let final_state = owned_snapshot(
+            crate::catalog::introspect_within_transaction(&mut conn)
+                .await
+                .unwrap(),
+            &role_prefix,
+        );
         assert_eq!(final_state.schema, expected.schema);
         assert_eq!(value(&mut conn, &kept_sql).await, kept_keys);
         final_contract(&mut conn, &mut reference, &done, &catalog, &root).await;
