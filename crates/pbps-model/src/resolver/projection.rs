@@ -46,11 +46,31 @@ impl InputManifest {
         if self.adapter() != compiled.adapter()
             || self.engine_major() != compiled.engine_major()
             || self.key_id() != compiled.key_id()
-            || self.scope() != compiled.scope()
+            || self.scope().candidates != compiled.scope().candidates
         {
             return Err(ManifestError::Invalid);
         }
         let (removed, installed) = self.check_transitions(changes, Some(compiled), transitions)?;
+        // The two captures read different databases, so a root the plan
+        // creates is retained only by the compiled one and a root it drops
+        // only by the opening one. Any other difference is an unexplained
+        // scope, which no transition accounts for (DEC-2143.5).
+        let opening_roots = &self.scope().retained;
+        let compiled_roots = &compiled.scope().retained;
+        if !opening_roots
+            .difference(compiled_roots)
+            .all(|root| removed.contains(root))
+        {
+            return Err(ManifestError::Invalid);
+        }
+        let created_roots: BTreeSet<_> = compiled_roots
+            .iter()
+            .filter(|root| !opening_roots.contains(*root) || removed.contains(*root))
+            .cloned()
+            .collect();
+        if !created_roots.iter().all(|root| installed.contains(root)) {
+            return Err(ManifestError::Invalid);
+        }
         for object in &installed {
             if compiled
                 .prerequisites()
@@ -94,7 +114,14 @@ impl InputManifest {
             .filter(|p| installed.contains(&p.object))
             .map(|p| (p.object.clone(), p.managed_closing()))
             .collect();
-        self.closing(&removed, &source, membership, runtime_bound, lookups)
+        self.closing(
+            &removed,
+            &source,
+            membership,
+            runtime_bound,
+            lookups,
+            &created_roots,
+        )
     }
 
     /// The reader's check that `after` is this manifest's closing manifest for
@@ -169,12 +196,26 @@ impl InputManifest {
             lookup.resolved = resolved_lookup(opening, closing, &removed, &installed)?;
             lookups.push(lookup);
         }
+        // The roots the closing manifest adds to the kept ones are ones the
+        // plan installs; the comparison below refuses any other addition,
+        // since the closing manifest is rebuilt from the plan alone.
+        let created_roots: BTreeSet<_> = after
+            .scope()
+            .retained
+            .iter()
+            .filter(|root| {
+                installed.contains(*root)
+                    && (!self.scope().retained.contains(*root) || removed.contains(*root))
+            })
+            .cloned()
+            .collect();
         Ok(&self.closing(
             &removed,
             &source,
             membership,
             after.runtime_bound().clone(),
             lookups,
+            &created_roots,
         )? == after)
     }
 
@@ -189,6 +230,7 @@ impl InputManifest {
         membership: Vec<super::Membership>,
         runtime_bound: BTreeSet<ObjectIdentity>,
         lookups: Vec<super::RoutineLookup>,
+        created_roots: &BTreeSet<ObjectIdentity>,
     ) -> Result<Self, ManifestError> {
         let mut objects: BTreeMap<_, _> = self
             .prerequisites()
@@ -213,6 +255,7 @@ impl InputManifest {
             .chain(runtime_bound.iter().cloned())
             .chain(lookups.iter().filter_map(|l| l.resolved.clone()))
             .chain(self.scope().retained.iter().cloned())
+            .chain(created_roots.iter().cloned())
             .collect();
         while let Some(object) = pending.pop() {
             if objects.contains_key(&object) {
@@ -230,6 +273,8 @@ impl InputManifest {
         // record is a retained root, so a vanished one fails the read instead
         // of reading as absent.
         let mut scope = self.scope().clone();
+        scope.retained.retain(|root| !removed.contains(root));
+        scope.retained.extend(created_roots.iter().cloned());
         scope.retained.extend(objects.keys().cloned());
         Self::new(
             self.adapter().into(),
@@ -626,15 +671,16 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         Change::DropColumn { column, .. } => {
             (WithChildren(Surface::Column(column.clone())), true, false)
         }
-        // A computed column is a column surface in the namespace, and its
-        // dependents (an index over it) go with it (#1174).
+        // A computed column is the Default-compatible surface of its column,
+        // as a generated column is (#1174, DEC-2143.2): its record is the
+        // column's own.
         Change::AddComputedColumn { table, name, .. } => (
-            WithChildren(Surface::Column(table.column(name))),
+            Exact(Surface::Default(table.column(name))),
             false,
             true,
         ),
         Change::DropComputedColumn { table, name, .. } => (
-            WithChildren(Surface::Column(table.column(name))),
+            Exact(Surface::Default(table.column(name))),
             true,
             false,
         ),
@@ -830,6 +876,8 @@ fn covers_change(c: &Change, surface: &Surface) -> bool {
                 Change::AlterColumnDefault { .. }
                     | Change::AlterColumnExpression { .. }
                     | Change::AlterColumnNumbering { .. }
+                    | Change::AddComputedColumn { .. }
+                    | Change::DropComputedColumn { .. }
             ),
             Surface::Namespace(_)
             | Surface::Table(_)
@@ -871,6 +919,11 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
             matches!(c, Change::AlterColumnDefault { column: r, .. } | Change::AlterColumnExpression { column: r, .. } | Change::AlterColumnNumbering { column: r, .. } if r == column)
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
                 || matches!(c, Change::AddColumn { table, name, .. } if &table.column(name) == column)
+                // A SQL Server computed column is the Default-compatible
+                // surface of its column (DEC-2143.2).
+                || matches!(c, Change::AddComputedColumn { table, name, .. }
+                    | Change::DropComputedColumn { table, name, .. }
+                    if &table.column(name) == column)
         }
         Surface::Check { table, name } => {
             matches!(c, Change::AddCheck { table: t, name: n, .. } | Change::DropCheck { table: t, name: n } if t == table && n == name)

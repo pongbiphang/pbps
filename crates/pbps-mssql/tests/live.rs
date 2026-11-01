@@ -56,6 +56,9 @@ mod staged2268;
 #[path = "live/externals2269.rs"]
 mod externals2269;
 
+#[path = "live/authorization2143.rs"]
+mod authorization2143;
+
 #[path = "live/deployer2267.rs"]
 mod deployer2267;
 

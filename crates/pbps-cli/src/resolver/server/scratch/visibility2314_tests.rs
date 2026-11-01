@@ -94,8 +94,8 @@ async fn lifecycle(on: String) {
             let mut fresh=connection(&on).await;
             assert!(sql::inventory::read(&mut fresh,None).await.unwrap().is_empty(),"{mutation}");
             assert_eq!(acl(&mut fresh).await,baseline,"{mutation}");
-            let again=Box::pin(refusal_policy_inner(&target,&on,None,&p)).await;
-            assert!(matches!(&again,ProduceError::Run(Error::Binding(reason)) if reason.contains("#2143")),"{again}");
+            let again=Box::pin(outcome_policy_inner(&target,&on,None,&p)).await;
+            assert!(again.is_ok(),"{}",why(&again));
         }
     }).await;
     drop_database(&server, &target_name).await;

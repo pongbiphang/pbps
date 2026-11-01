@@ -5769,3 +5769,86 @@ inversion is still refused. A split step keeps no operation identity of its
 own; its halves are new steps with fresh identities, as `weave` allocated them.
 The CLI's duplicate of the matching, kept as a test oracle, is removed: its
 tests call the one function. No format, version or wire field changes.
+
+<a id="dec-2143-1"></a>
+
+**DEC-2143.1. SQL Server's sealed authorization after-state is read from the
+verified scratch reproduction, never projected from the plan's grants (#2143).**
+The maintainer chose this over a pure row-edit projection after five cases were
+measured on SQL Server 17.0.4075.5. A GRANT under schema CONTROL records the
+schema owner as grantor, not the deployer. A GRANT that rests on WITH GRANT
+OPTION records the deployer. A plain GRANT leaves an existing WITH GRANT OPTION
+row unchanged. REVOKE of a WITH GRANT OPTION row without CASCADE is refused with
+4611. Revoking a DENY changes the effective schema, object and column access
+from false to true and adds no row. Row edits get every one of these wrong, and
+an evaluator in Rust would re-derive what Decision 521 and DEC-720.1 leave to
+the engine.
+
+The scratch reproduction executes the plan's grants through `apply_planned`
+as the reproduced deployer. The reader then captures the authorization rows and
+the effective schema, object and column permissions, and translates every
+scratch principal back to the target's name. A principal or object that cannot be
+translated refuses by name; a scratch name or identifier never reaches sealed
+evidence. The target's before-state is read in a bracket around the scratch
+read, and the publication recheck compares it again. A refused statement
+produces no condition. The five cases are live tests that compare the scratch
+after-state with a real target's, by digest.
+
+<a id="dec-2143-2"></a>
+
+**DEC-2143.2. The shared sealing and reading code asks the engine for its
+vocabulary (#2143).** The producer is typed by the planning dialect and takes
+the catalog classes of binding records, the dependency edge and the cluster and
+channel labels from the engine adapter. A literal such as `pg_attrdef` in shared
+code matches nothing on SQL Server, and "nothing found" reads as a complete
+sweep. SQL Server's reader requires the reported-scope rule, the capture
+adapter, the authorization rule, an engine major in the measured set, a
+reproduced authorization and a non-empty target cluster, and answers a surface
+with no SQL Server mapping with no class instead of a guess. A computed column
+is the Default-compatible surface of its column, as a PostgreSQL generated
+column is, with `Generated` part effects for the column it creates or drops.
+
+<a id="dec-2143-3"></a>
+
+**DEC-2143.3. A build that reads SQL Server resolver evidence but cannot
+enforce it at apply refuses to apply it, and `explain` says so (#2143).** The
+reader and `explain` accept the evidence, so offline review works. `apply` of a
+SQL Server resolved plan refuses by name before it connects, and `explain`
+reports it as not applyable with no `approve_with`. The existing `applyable`
+field carries this, so the published schema contract gains no field. #2144 lifts
+the barrier when apply enforces the evidence.
+
+<a id="dec-2143-4"></a>
+
+**DEC-2143.4. Every scratch session re-reads the compared reported facts and
+must read what the run's first session read (#2143).** The marker and the
+database identity cannot tell a reconnect that reached another backend from one
+that did not. A different product version, collation, database option or session
+setting makes the run unusable and names the fact. Visibility is left out of the
+comparison, because it follows the principal and the plan's own grants. The
+check needs no new state in the evidence: the run is invalidated, and no
+evidence is sealed from it.
+
+<a id="dec-2143-5"></a>
+
+**DEC-2143.5. The closing scope follows from the plan's transitions, not from
+the two captures reading one scope (#2143).** PostgreSQL's opening and compiled
+captures share one scope, so the projection required the scopes to be equal. A
+SQL Server run reads two databases: the scratch retains a root the plan creates,
+and the target a root the plan drops. Requiring equality made every plan that
+creates or drops a managed object unsealable, and only a plan that touched no
+root could be sealed.
+
+The projection now requires equal candidates and accounts for every difference
+between the retained roots: a root only the opening capture retains must be a
+record the plan removes, and a root only the compiled capture retains must be a
+record it installs. The closing scope is the opening roots, less the removed
+ones, plus the created ones, and the reader derives the same scope from the
+sealed transitions. Any other difference is refused as an invalid projection,
+so a scope that no transition explains cannot be sealed. Equal scopes behave as
+before, which PostgreSQL's runs always satisfy; a PostgreSQL plan that drops a
+managed view was measured to seal unchanged.
+
+A created table with typed columns still does not seal: its columns bind
+built-in types that neither the opening capture reached nor the plan installs.
+That boundary is open in #2143 and not decided here.

@@ -4515,6 +4515,7 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
             .validate_dependencies(&plan.dialect, plan.dependencies.keys())?;
         match plan.dialect.as_str() {
             "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
+            "mssql" => pbps_mssql::resolver::validate_evidence(evidence)?,
             engine => anyhow::bail!(
                 "this build cannot enforce resolver evidence for {}",
                 pbps_model::escape::Escaped(engine)

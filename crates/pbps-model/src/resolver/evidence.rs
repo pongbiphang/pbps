@@ -156,7 +156,7 @@ impl SameInstance {
     }
 }
 
-/// The identity used to compile supported PostgreSQL resolver evidence.
+/// The identity used to compile supported resolver evidence.
 /// Target-side authorization fingerprints still describe their own checks;
 /// they cannot prove that a supplied scratch login reproduced the deployer.
 #[derive(
@@ -173,6 +173,18 @@ impl AuthorizationReproduction {
         match layout {
             ScratchLayout::RunOwned => Self::Reproduced,
             ScratchLayout::Supplied => Self::LoginStandin,
+        }
+    }
+
+    /// What a qualification under `rule` must claim for its layout. A supplied
+    /// PostgreSQL database compiles as its own login; SQL Server enters a
+    /// sandbox user that reproduces the deployer under either layout, so its
+    /// evidence claims `Reproduced` or is not its evidence (DEC-2143.2).
+    pub fn expected(rule: &str, layout: ScratchLayout) -> Self {
+        if rule.starts_with("mssql-") {
+            Self::Reproduced
+        } else {
+            Self::for_postgres_layout(layout)
         }
     }
 
@@ -402,7 +414,7 @@ impl ResolverEvidence {
             layout,
             ..
         } = &q.runtime;
-        if q.authorization != AuthorizationReproduction::for_postgres_layout(*layout) {
+        if q.authorization != AuthorizationReproduction::expected(&q.rule, *layout) {
             return Err(EvidenceError::Incomplete);
         }
         let qualified = !entry.is_empty()
@@ -454,7 +466,7 @@ impl ResolverEvidence {
                     // Owner transitions cover catalog records, not resolution
                     // membership: every inline binding needs its own observation.
                     let mut surfaces = Vec::new();
-                    for column in table.expression_columns() {
+                    for column in table.binding_columns() {
                         surfaces.push(super::Surface::Default(name.column(column)));
                     }
                     for check in table.checks.keys() {

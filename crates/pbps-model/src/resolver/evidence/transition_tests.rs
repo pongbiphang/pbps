@@ -1781,8 +1781,8 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
     ] {
         let (changes, evidence, compiled) = owner_coverage(
             change,
-            Surface::Column(table.column("n")),
-            Surface::Column(table.column("n")),
+            Surface::Default(table.column("n")),
+            Surface::Default(table.column("n")),
             creating,
         );
         evidence
@@ -2572,6 +2572,160 @@ mod column_vector_parent {
                 &evidence,
                 &compiled,
                 "parent authority for a nonvector edit",
+            );
+        }
+    }
+}
+
+/// The two captures of a SQL Server run read different databases: a root the
+/// plan creates is retained only by the compiled one, and a root it drops only
+/// by the opening one. The closing scope follows from the plan's own
+/// transitions, and nothing else may differ (DEC-2143.5).
+mod scope_roots {
+    use super::*;
+
+    fn rescoped(manifest: &InputManifest, retained: &BTreeSet<ObjectIdentity>) -> InputManifest {
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["scope"]["retained"] = serde_json::to_value(retained).unwrap();
+        serde_json::from_value(json).unwrap()
+    }
+
+    struct Case {
+        changes: ChangeSet,
+        evidence: ResolverEvidence,
+        compiled: InputManifest,
+        /// What the plan creates or drops.
+        planned: BTreeSet<ObjectIdentity>,
+        /// A record both captures hold and the plan does not touch.
+        untouched: ObjectIdentity,
+    }
+
+    fn case(creating: bool) -> Case {
+        let table: TableName = "app.v".parse().unwrap();
+        let computed = crate::schema::ComputedColumn {
+            expression: "a * 2".into(),
+            persisted: false,
+            not_null: false,
+        };
+        let change = if creating {
+            Change::AddComputedColumn {
+                table: table.clone(),
+                name: "n".into(),
+                computed,
+            }
+        } else {
+            Change::DropComputedColumn {
+                table: table.clone(),
+                name: "n".into(),
+                computed,
+            }
+        };
+        let (changes, evidence, compiled) = owner_coverage(
+            change,
+            Surface::Default(table.column("n")),
+            Surface::Default(table.column("n")),
+            creating,
+        );
+        let transition = &evidence.transitions[0];
+        let planned = if creating {
+            transition.after.clone()
+        } else {
+            transition.before.clone()
+        };
+        let untouched = evidence
+            .before
+            .prerequisites()
+            .iter()
+            .map(|p| p.object.clone())
+            .find(|o| !planned.contains(o))
+            .expect("a record the plan leaves alone");
+        Case {
+            changes,
+            evidence,
+            compiled,
+            planned,
+            untouched,
+        }
+    }
+
+    impl Case {
+        fn project(
+            &self,
+            opening: &BTreeSet<ObjectIdentity>,
+            compiled: &BTreeSet<ObjectIdentity>,
+        ) -> Result<InputManifest, ManifestError> {
+            rescoped(&self.evidence.before, opening).project(
+                &self.changes,
+                &rescoped(&self.compiled, compiled),
+                &self.evidence.transitions,
+            )
+        }
+    }
+
+    #[test]
+    fn a_created_root_is_retained_by_the_closing_scope_and_read_back() {
+        let case = case(true);
+        let kept = BTreeSet::from([case.untouched.clone()]);
+        let both: BTreeSet<_> = kept.union(&case.planned).cloned().collect();
+        let after = case.project(&kept, &both).expect("a created root projects");
+        // The closing manifest retains every record it lists as well.
+        assert!(after.scope().retained.is_superset(&both));
+        let mut evidence = case.evidence.clone();
+        evidence.before = rescoped(&evidence.before, &kept);
+        evidence.after = after;
+        evidence
+            .validate(&case.changes)
+            .expect("and the reader accepts it");
+    }
+
+    #[test]
+    fn a_dropped_root_leaves_the_closing_scope_and_is_read_back() {
+        let case = case(false);
+        let kept = BTreeSet::from([case.untouched.clone()]);
+        let both: BTreeSet<_> = kept.union(&case.planned).cloned().collect();
+        let after = case.project(&both, &kept).expect("a dropped root projects");
+        assert!(after.scope().retained.is_superset(&kept));
+        assert!(
+            case.planned.is_disjoint(&after.scope().retained),
+            "a dropped root must leave the scope"
+        );
+        let mut evidence = case.evidence.clone();
+        evidence.before = rescoped(&evidence.before, &both);
+        evidence.after = after;
+        evidence
+            .validate(&case.changes)
+            .expect("and the reader accepts it");
+    }
+
+    /// PostgreSQL's two captures read one scope: nothing about it changes.
+    #[test]
+    fn equal_scopes_project_to_the_same_scope() {
+        for creating in [true, false] {
+            let case = case(creating);
+            let kept = BTreeSet::from([case.untouched.clone()]);
+            let after = case.project(&kept, &kept).expect("equal scopes project");
+            assert!(
+                after.scope().retained.is_superset(&kept),
+                "creating={creating}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_difference_no_transition_explains_is_refused() {
+        for creating in [true, false] {
+            let case = case(creating);
+            let kept = BTreeSet::from([case.untouched.clone()]);
+            // A root only one capture retains that the plan does not touch.
+            assert_eq!(
+                case.project(&kept, &BTreeSet::new()).err(),
+                Some(ManifestError::Invalid),
+                "opening-only untouched root, creating={creating}"
+            );
+            assert_eq!(
+                case.project(&BTreeSet::new(), &kept).err(),
+                Some(ManifestError::Invalid),
+                "compiled-only untouched root, creating={creating}"
             );
         }
     }

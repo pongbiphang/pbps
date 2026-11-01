@@ -4,10 +4,10 @@
 use super::Error;
 use super::engine::BindingRecord;
 use pbps_db::resolver::capture::{Assessment, Verdict};
+use pbps_model::Schema;
 use pbps_model::resolver::{
     BoundSurface, InputManifest, ObjectOwnership, Surface, SurfaceResolution,
 };
-use pbps_model::{ModuleId, Schema};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn required(schema: &Schema) -> BTreeSet<Surface> {
@@ -16,7 +16,7 @@ fn required(schema: &Schema) -> BTreeSet<Surface> {
         // Both declarations bind through pg_attrdef; their expressions
         // remain distinct model fields (DEC-1168.1). So does a partition's
         // own default (DEC-1578.1).
-        for column in definition.expression_columns() {
+        for column in definition.binding_columns() {
             surfaces.insert(Surface::Default(table.column(column)));
         }
         for name in definition.checks.keys() {
@@ -38,20 +38,6 @@ fn required(schema: &Schema) -> BTreeSet<Surface> {
     surfaces
 }
 
-fn binding_class(surface: &Surface) -> &'static str {
-    match surface {
-        Surface::Default(_) => "pg_attrdef",
-        Surface::Check { .. } => "pg_constraint",
-        Surface::Index { .. } => "pg_index",
-        Surface::Module(ModuleId::Named(_)) => "pg_rewrite",
-        Surface::Module(ModuleId::Routine(_)) => "pg_proc",
-        Surface::Module(ModuleId::Trigger { .. }) => "pg_trigger",
-        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Type(_) => {
-            unreachable!("not a creation-time binding surface")
-        }
-    }
-}
-
 pub(super) fn records(manifest: &InputManifest) -> Vec<BindingRecord> {
     manifest
         .prerequisites()
@@ -64,14 +50,22 @@ pub(super) fn records(manifest: &InputManifest) -> Vec<BindingRecord> {
         .collect()
 }
 
-fn bound(records: &[BindingRecord], surface: &Surface) -> Result<BoundSurface, Error> {
+fn bound<D: super::PlanningDialect>(
+    records: &[BindingRecord],
+    surface: &Surface,
+) -> Result<BoundSurface, Error> {
+    let classes = D::binding_classes(surface).ok_or_else(|| {
+        Error::Binding(format!(
+            "the engine has no creation-time catalog mapping for {surface:?}"
+        ))
+    })?;
     let owners: BTreeMap<_, _> = records
         .iter()
         .map(|entry| (&entry.object, &entry.ownership))
         .collect();
     let mut records = records.iter().filter(|entry| {
         entry.ownership == ObjectOwnership::Surface(surface.clone())
-            && entry.object.class == binding_class(surface)
+            && classes.contains(&entry.object.class.as_str())
     });
     let record = records.next().ok_or_else(|| {
         Error::Binding(format!(
@@ -101,7 +95,7 @@ fn bound(records: &[BindingRecord], surface: &Surface) -> Result<BoundSurface, E
 /// [`from_records`] for the planning sides, naming each removed surface by
 /// the spelling the plan's removal of it uses, by the rule the planner's
 /// coverage check applies (`pbps_diff::resolver::removal_spelling`).
-pub(super) fn from_sides(
+pub(super) fn from_sides<D: super::PlanningDialect>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     opening: &[BindingRecord],
@@ -109,7 +103,7 @@ pub(super) fn from_sides(
     assessment: &Assessment,
 ) -> Result<Vec<SurfaceResolution>, Error> {
     let base_names = base.ids.index();
-    resolve(
+    resolve::<D>(
         base.schema,
         desired.schema,
         &|surface, before, after| {
@@ -129,7 +123,7 @@ pub(super) fn from_records(
     compiled: &[BindingRecord],
     assessment: &Assessment,
 ) -> Result<Vec<SurfaceResolution>, Error> {
-    resolve(
+    resolve::<pbps_pg::Postgres>(
         base,
         desired,
         &|surface, _, _| surface.clone(),
@@ -142,7 +136,7 @@ pub(super) fn from_records(
 /// Names a base surface given the base and desired surface sets.
 type Relocate<'a> = dyn Fn(&Surface, &BTreeSet<Surface>, &BTreeSet<Surface>) -> Surface + 'a;
 
-fn resolve(
+fn resolve<D: super::PlanningDialect>(
     base: &Schema,
     desired: &Schema,
     relocate: &Relocate<'_>,
@@ -159,7 +153,7 @@ fn resolve(
         if before.contains(surface) && !after.contains(surface) {
             let named = relocate(surface, &before, &after);
             if &named != surface {
-                let current = Some(bound(opening, surface)?);
+                let current = Some(bound::<D>(opening, surface)?);
                 resolved.push(SurfaceResolution {
                     surface: named,
                     current,
@@ -170,11 +164,11 @@ fn resolve(
         }
         let current = before
             .contains(surface)
-            .then(|| bound(opening, surface))
+            .then(|| bound::<D>(opening, surface))
             .transpose()?;
         let desired = after
             .contains(surface)
-            .then(|| bound(compiled, surface))
+            .then(|| bound::<D>(compiled, surface))
             .transpose()?;
         // Every desired surface needs its verdict: one the target holds
         // under the same identity is compared, and one it does not hold yet
