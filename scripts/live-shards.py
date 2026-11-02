@@ -711,6 +711,10 @@ def cargo_proxy(args):
              "--color=never", *assigned], assigned,
             on_failure=lambda results: save_receipt(results, 0.0, False, False))
     save_receipt(reported, seconds, valid, interrupted)
+    # Stop the shell runner on interruption even without a valid test stream.
+    # The loss receipt still goes through the ordinary audit/resume proof.
+    if code < 0 or code >= 128:
+        return 128 - code if code < 0 else code
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
 

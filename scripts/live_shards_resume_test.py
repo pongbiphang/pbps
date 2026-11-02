@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ for name in ran:
                     time.sleep(0.001)
                 assert "test a05 ... FAILED" in log.read_text()
             os.kill(os.getppid(), signal.SIGKILL)
+        if os.environ.get("FAKE_SIGNAL_CHILD"):
+            os.kill(os.getpid(), int(os.environ["FAKE_SIGNAL_CHILD"]))
         os._exit(137)
 bad = sum(n in fail for n in ran)
 print(f"\\ntest result: {{'FAILED' if bad else 'ok'}}. {{len(ran) - bad}} passed; {{bad}} failed; "
@@ -227,6 +230,32 @@ class ContinuedTestFailures(Harness):
             text = path.read_text().replace("fi\n", "fi\nsource scripts/live-test-status.sh\n", 1)
             path.write_text(text + '\nexit "$live_test_status"\n')
         git(cls.repo, "commit", "-q", "-am", "continue ordinary cargo failures")
+
+    def test_killed_cargo_stops_the_shard_before_its_later_invocation(self):
+        for suite in ("pg", "mssql"):
+            for signum in (signal.SIGINT, signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(suite=suite, signum=signum):
+                    result, output = self.drive(
+                        suite=suite, shards=1, die="a05", check=0,
+                        env={"FAKE_SIGNAL_CHILD": str(signum),
+                             "FAKE_LOSS_STATE": str(self.runs / f"signal-{suite}-{signum}")})
+                    original = self.summary(output / "original")
+                    events = [json.loads(line) for line in self.trace.read_text().splitlines()]
+                    starts = [e["names"] for e in events if e["event"] == "start"
+                              and e["run"] == original["run"]["run_id"]]
+                    self.assertEqual(starts, [A_NAMES])
+                    self.assertEqual(original[suite]["exits"], [128 + signum])
+                    # The invalid receipt remains loss evidence, not a pass.
+                    receipts = list((output / "original" / suite).glob("*/*.json"))
+                    self.assertEqual(len(receipts), 1)
+                    receipt = json.loads(receipts[0].read_text())
+                    self.assertFalse(receipt["valid"])
+                    self.assertTrue(receipt["interrupted"])
+                    # The existing bounded continuation runs only after drain.
+                    final = self.summary(output)
+                    self.assertEqual((final[suite]["passed"], final[suite]["failed"],
+                                      final[suite]["union"]), (18, 0, "exact"))
+                    self.assertIn("automatic_rerun", final["run"])
 
     def test_a_failed_invocation_still_produces_every_assigned_receipt(self):
         for suite in ("pg", "mssql"):
