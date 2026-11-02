@@ -4743,8 +4743,17 @@ The differ (`extensions::drops`) carries an object only where this plan removes
 it: an outside object or a blocker that is a managed module this plan drops
 (a routine by signature, a view or materialized view by name, a view's `_RETURN`
 rule as the view, a trigger by table and name; `ProviderMember::module`) becomes
-an ordering edge, and a package that requires this one and is dropped by the
-plan is a `requirers` edge (a package that stays is refused). Everything else is
+an ordering edge, and so does everything that hangs off it: each reach row names
+the object it was reached through (its parent, one row per path, read in the same
+statement), and an outside object is carried when **every** path into the reach
+passes through a carried object, which follows a marked materialized view's row
+type, the array type of that and its indexes (measured on 16.15 and 18.6) without
+a list of kinds. An object with one path through something kept, or through the
+package itself, is not carried, and of the refused only the roots are named, so a
+kept view is refused as the view and not by its row type. A package that requires
+this one and is dropped by the plan is a `requirers` edge (a package that stays is
+refused). This model holds no materialized view, so a marked one is always refused
+as the view; the chain is exercised by what the engine reports for one. Everything else is
 refused by name with the remedy, because an `x` edge is a user's mark and never
 permission to delete. Indexes, tables and defaults are not carried: they are
 refused with a two-plan remedy. **Limit, stated:** carrying them needs a mapping

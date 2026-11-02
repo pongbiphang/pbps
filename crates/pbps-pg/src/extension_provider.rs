@@ -83,17 +83,21 @@ SELECT 'member', e.extname::text, a.type, pg_catalog.array_to_json(a.object_name
 /// that requires another is a blocker of it by its `n` edge, and an object that
 /// belongs to *another* package's reach (a member of a package that requires
 /// this one, which uses a member of this one) is reported as that package, so
-/// that dropping both clears it and dropping one does not.
+/// that dropping both clears it and dropping one does not. Each row also names
+/// the object it was reached through (its parent: the extension for a direct
+/// member or mark, the owner of an internal or automatic subsidiary), one row
+/// per path, so that a plan can follow a subsidiary back to what carries it.
 macro_rules! reach {
     () => {
-        "WITH RECURSIVE reach(ext, classid, objid, objsubid) AS (
-    SELECT e.oid, 'pg_catalog.pg_extension'::regclass::oid, e.oid, 0 FROM pg_catalog.pg_extension e
+        "WITH RECURSIVE reach(ext, classid, objid, objsubid, pclass, pobj, psub) AS (
+    SELECT e.oid, 'pg_catalog.pg_extension'::regclass::oid, e.oid, 0, NULL::oid, NULL::oid, NULL::int4
+      FROM pg_catalog.pg_extension e
     UNION
-    SELECT d.refobjid, d.classid, d.objid, d.objsubid
+    SELECT d.refobjid, d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid, 0
       FROM pg_catalog.pg_depend d
      WHERE d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.deptype IN ('e', 'x')
     UNION
-    SELECT r.ext, d.classid, d.objid, d.objsubid
+    SELECT r.ext, d.classid, d.objid, d.objsubid, r.classid, r.objid, r.objsubid
       FROM reach r JOIN pg_catalog.pg_depend d
         ON d.refclassid = r.classid AND d.refobjid = r.objid
        AND d.deptype IN ('a', 'i', 'x', 'P', 'S')
@@ -116,17 +120,20 @@ const DROP_READ: &str = concat!(
     reach!(),
     "
 SELECT 'reach' AS kind, e.extname::text AS name, a.type, pg_catalog.array_to_json(a.object_names)::text AS names,
-       pg_catalog.array_to_json(a.object_args)::text AS args
+       pg_catalog.array_to_json(a.object_args)::text AS args,
+       p.type AS ptype, pg_catalog.array_to_json(p.object_names)::text AS pnames,
+       pg_catalog.array_to_json(p.object_args)::text AS pargs
   FROM reach r
   JOIN pg_catalog.pg_extension e ON e.oid = r.ext
   LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(r.classid, r.objid, r.objsubid) a ON true
+  LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(r.pclass, r.pobj, r.psub) p ON true
  WHERE NOT (r.classid = 'pg_catalog.pg_extension'::regclass AND r.objid = r.ext)
    AND ",
     "{NOT_STORAGE}",
     "
 UNION ALL
 SELECT 'blocker', e.extname::text, a.type, pg_catalog.array_to_json(a.object_names)::text,
-       pg_catalog.array_to_json(a.object_args)::text
+       pg_catalog.array_to_json(a.object_args)::text, NULL, NULL, NULL
   FROM reach r
   JOIN pg_catalog.pg_extension e ON e.oid = r.ext
   JOIN pg_catalog.pg_depend d
@@ -134,7 +141,8 @@ SELECT 'blocker', e.extname::text, a.type, pg_catalog.array_to_json(a.object_nam
   LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(d.classid, d.objid, d.objsubid) a ON true
  WHERE NOT EXISTS (SELECT 1 FROM reach o WHERE o.classid = d.classid AND o.objid = d.objid)
 UNION ALL
-SELECT 'blocker', e.extname::text, 'extension', pg_catalog.array_to_json(ARRAY[o.name])::text, '[]'
+SELECT 'blocker', e.extname::text, 'extension', pg_catalog.array_to_json(ARRAY[o.name])::text, '[]',
+       NULL, NULL, NULL
   FROM reach r
   JOIN pg_catalog.pg_extension e ON e.oid = r.ext
   JOIN pg_catalog.pg_depend d
@@ -185,6 +193,19 @@ pub async fn drop_facts(
             Some("reach") => {
                 // A member the manifest holds is not outside it.
                 if !providers[&name].members.contains(&member) {
+                    // Each path in: the object it was reached through, which is
+                    // the package itself for an object marked directly.
+                    if let Some(class) = row.try_get::<&str>("ptype")? {
+                        facts
+                            .parents
+                            .entry(member.clone())
+                            .or_default()
+                            .insert(ProviderMember {
+                                class: class.to_owned(),
+                                names: names(row.try_get::<&str>("pnames")?, "a parent's names")?,
+                                args: names(row.try_get::<&str>("pargs")?, "a parent's arguments")?,
+                            });
+                    }
                     facts.outside.insert(member);
                 }
             }
@@ -294,7 +315,7 @@ pub async fn vet_before_drop(
     .await?;
     conn.execute(&format!(
         "{} INSERT INTO pg_temp.pbps_drop_reach \
-         SELECT e.extname, r.classid, r.objid, r.objsubid FROM reach r \
+         SELECT DISTINCT e.extname, r.classid, r.objid, r.objsubid FROM reach r \
            JOIN pg_catalog.pg_extension e ON e.oid = r.ext WHERE e.extname = {}",
         reach!(),
         crate::emit::literal(name),
@@ -928,6 +949,7 @@ mod tests {
                         args: Vec::new(),
                     }]
                     .into(),
+                    ..Default::default()
                 },
             ),
             ("zzz".into(), Default::default()),
@@ -1474,6 +1496,7 @@ mod tests {
         ALTER TRIGGER x_trg ON app.t DEPENDS ON EXTENSION zzz_base; \
         CREATE MATERIALIZED VIEW app.x_mv AS SELECT 1 AS one; \
         ALTER MATERIALIZED VIEW app.x_mv DEPENDS ON EXTENSION zzz_base; \
+        CREATE INDEX x_mv_idx ON app.x_mv (one); \
         CREATE INDEX x_idx ON app.t (id); ALTER INDEX app.x_idx DEPENDS ON EXTENSION zzz_base; \
         CREATE INDEX plain_idx ON app.t (b); \
         CREATE INDEX on_member ON ext.tabled2447_t (body); \
@@ -1538,6 +1561,69 @@ mod tests {
                 has(&base.blockers, "extension", &["aaa_dep"]),
                 "{:?}",
                 base.blockers
+            );
+            // What hangs off the marked view (its rule, row type, the array type
+            // of that, and a user index on it) was reached through it, one path
+            // each, and the array type through the row type: the chain the plan
+            // follows to carry them with the view.
+            let mv = ProviderMember {
+                class: "materialized view".into(),
+                names: vec!["app".into(), "x_mv".into()],
+                args: Vec::new(),
+            };
+            let through = |class: &str, names: &[&str]| {
+                let child = base
+                    .outside
+                    .iter()
+                    .find(|m| {
+                        m.class == class
+                            && m.names.iter().map(String::as_str).eq(names.iter().copied())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{variable}: {class} {names:?} in {:?}", base.outside)
+                    });
+                base.parents[child].clone()
+            };
+            assert_eq!(through("materialized view", &["app", "x_mv"]).len(), 1);
+            for (class, names) in [
+                ("rule", &["app", "x_mv", "_RETURN"][..]),
+                ("index", &["app", "x_mv_idx"][..]),
+                ("type", &["app.x_mv"][..]),
+            ] {
+                assert_eq!(
+                    through(class, names),
+                    [mv.clone()].into(),
+                    "{variable} {class}"
+                );
+            }
+            let row = base
+                .parents
+                .iter()
+                .find(|(c, _)| c.class == "type" && c.names == ["app.x_mv"])
+                .unwrap()
+                .0
+                .clone();
+            assert_eq!(through("type", &["app.x_mv[]"]), [row].into(), "{variable}");
+            // Carried with the view: remove the marked modules and what is left
+            // is the one marked index, which is not a module. Keep the view and
+            // its row type, array type, rule and index are no root cause: only
+            // the view is named.
+            let routine: pbps_model::ModuleId = "app.x_fn(integer,text)".parse().unwrap();
+            let procedure: pbps_model::ModuleId = "app.x_proc()".parse().unwrap();
+            let trigger: pbps_model::ModuleId = "app.t.x_trg".parse().unwrap();
+            let view: pbps_model::ModuleId = "app.x_mv".parse().unwrap();
+            let name_of = |roots: Vec<&ProviderMember>| {
+                let mut v: Vec<String> = roots.iter().map(|m| m.to_string()).collect();
+                v.sort();
+                v
+            };
+            let (_, roots) = base.carried_by(&[&routine, &procedure, &trigger, &view]);
+            assert_eq!(name_of(roots), ["index app.x_idx"], "{variable}");
+            let (_, roots) = base.carried_by(&[&routine, &procedure, &trigger]);
+            assert_eq!(
+                name_of(roots),
+                ["index app.x_idx", "materialized view app.x_mv"],
+                "{variable}"
             );
             // The package that nothing depends on has neither.
             assert_eq!(

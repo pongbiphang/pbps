@@ -119,10 +119,87 @@ pub struct ExtensionDropFacts {
     /// those. An `x` edge is a user's mark, not membership, and is never
     /// deleted without the plan saying so.
     pub outside: std::collections::BTreeSet<ProviderMember>,
+    /// For each outside object, the objects the engine reached it through, one
+    /// per path: the package itself (an object marked directly), or the owner
+    /// of an internal or automatic subsidiary (a view's row type, its array
+    /// type, its indexes). The plan follows these back to a module it removes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub parents:
+        std::collections::BTreeMap<ProviderMember, std::collections::BTreeSet<ProviderMember>>,
     /// Objects that depend normally on the package or on a member, which make
     /// the engine refuse: a view over a member function, a column default that
     /// calls one, another package that requires this one.
     pub blockers: std::collections::BTreeSet<ProviderMember>,
+}
+
+impl ExtensionDropFacts {
+    /// The modules of `removed` that carry outside objects, and the objects
+    /// nothing carries.
+    ///
+    /// An outside object is carried when it is a module the plan removes, or
+    /// when **every** path that brought it into the reach passes through a
+    /// carried object: a removed materialized view takes its row type, the
+    /// array type of that, and its indexes with it, and nobody lists them as
+    /// modules. The rule follows the chain the engine walked (`parents`), so it
+    /// has no list of kinds. An object with one path through something kept, or
+    /// through the package itself, is not carried: an unrelated type stays
+    /// refused. Of the refused, only the roots are named: an object reached
+    /// only through a refused one is that refusal's consequence.
+    #[must_use]
+    pub fn carried_by<'a>(
+        &'a self,
+        removed: &[&'a crate::ModuleId],
+    ) -> (
+        std::collections::BTreeSet<crate::ModuleId>,
+        Vec<&'a ProviderMember>,
+    ) {
+        let mut releases = std::collections::BTreeSet::new();
+        let mut carried: std::collections::BTreeSet<&ProviderMember> = Default::default();
+        for member in &self.outside {
+            if let Some(id) = member.module(removed.iter().copied()) {
+                releases.insert(id.clone());
+                carried.insert(member);
+            }
+        }
+        loop {
+            let more: Vec<&ProviderMember> = self
+                .outside
+                .iter()
+                .filter(|m| !carried.contains(m))
+                .filter(|m| {
+                    self.parents
+                        .get(*m)
+                        .is_some_and(|ps| !ps.is_empty() && ps.iter().all(|p| carried.contains(&p)))
+                })
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            carried.extend(more);
+        }
+        let refused: std::collections::BTreeSet<&ProviderMember> = self
+            .outside
+            .iter()
+            .filter(|m| !carried.contains(m))
+            .collect();
+        let roots: Vec<&ProviderMember> = refused
+            .iter()
+            .copied()
+            .filter(|m| {
+                !self
+                    .parents
+                    .get(*m)
+                    .is_some_and(|ps| ps.iter().any(|p| refused.contains(&p)))
+            })
+            .collect();
+        // A cycle of refused objects has no root; name them all rather than none.
+        let named = if roots.is_empty() {
+            refused.into_iter().collect()
+        } else {
+            roots
+        };
+        (releases, named)
+    }
 }
 
 /// An installed package and everything it owns or requires.

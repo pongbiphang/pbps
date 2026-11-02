@@ -662,3 +662,43 @@ fn a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists() {
         on_server(admin, &format!("DROP ROLE {role}"));
     });
 }
+
+/// A materialized view marked as depending on the package reaches its row type,
+/// the array type of that and an index of a user's. This model does not hold
+/// materialized views, so the plan cannot drop one, and the refusal names the
+/// view and not the objects that only hang off it (DEC-2447.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_marked_materialized_view_is_refused_as_the_view_and_not_by_what_hangs_off_it() {
+    servers(|admin, slug| {
+        let own = OwnDatabase::new(admin, &format!("drop2447-matview-{slug}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA ext; CREATE EXTENSION zzz_base SCHEMA ext",
+        );
+        let d = adopted(
+            connection,
+            &format!("drop2447-matview-{slug}"),
+            &["zzz_base"],
+        );
+        on_server(
+            connection,
+            "CREATE SCHEMA app; CREATE MATERIALIZED VIEW app.mv AS SELECT 1 AS one; \
+             CREATE INDEX mv_idx ON app.mv (one); \
+             ALTER MATERIALIZED VIEW app.mv DEPENDS ON EXTENSION zzz_base",
+        );
+        retire(&d, "zzz_base", "retire it, with a marked matview");
+        d.commit();
+        let path = d.dir.join("plan.json");
+        let out = plan_to(&d, connection, &path);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        let message = said(&out);
+        assert!(message.contains("materialized view app.mv"), "{message}");
+        for consequence in ["type app.mv", "app.mv[]", "app.mv_idx", "_RETURN"] {
+            assert!(!message.contains(consequence), "{consequence}: {message}");
+        }
+        assert!(!path.exists());
+        assert_eq!(present(connection, "'zzz_base'"), "zzz_base");
+    });
+}

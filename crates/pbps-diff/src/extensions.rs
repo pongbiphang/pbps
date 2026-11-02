@@ -141,15 +141,14 @@ pub fn drops(
         };
         let (mut requirers, mut releases, mut found) =
             (BTreeSet::new(), BTreeSet::new(), Vec::new());
-        for member in &facts.outside {
-            match member.module(removed.iter().copied()) {
-                Some(id) => {
-                    releases.insert(id.clone());
-                }
-                None => found.push(format!(
-                    "`{member}` depends on the package, so the engine would delete it too, and this plan does not drop it"
-                )),
-            }
+        // What the engine would delete with the package: carried where this
+        // plan removes the module it hangs from, whatever it is made of.
+        let (carried, refused) = facts.carried_by(&removed);
+        releases.extend(carried);
+        for member in refused {
+            found.push(format!(
+                "`{member}` depends on the package, so the engine would delete it too, and this plan does not drop it"
+            ));
         }
         for member in &facts.blockers {
             if member.class == "extension"
@@ -744,6 +743,7 @@ mod tests {
             pbps_model::ExtensionDropFacts {
                 outside: outside.iter().cloned().collect(),
                 blockers: blockers.iter().cloned().collect(),
+                ..Default::default()
             },
         )]
         .into()
@@ -1068,5 +1068,104 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, crate::identity::Blocker::UnusedIntent { .. }))
         );
+    }
+
+    fn typed(class: &str, names: &[&str]) -> pbps_model::ProviderMember {
+        member(class, names)
+    }
+
+    /// A marked materialized view reaches its rule, its row type, the array type
+    /// of that, and a user index on it. Each hangs off the view, directly or
+    /// through another that does; so dropping the view in the same plan carries
+    /// all of them, without a rule for any kind (DEC-2447.8).
+    #[test]
+    fn what_hangs_off_a_carried_module_is_carried_with_it_through_the_chain() {
+        let package = typed("extension", &["citext"]);
+        let view = typed("materialized view", &["app", "mv"]);
+        let row = typed("type", &["app.mv"]);
+        let array = typed("type", &["app.mv[]"]);
+        let index = typed("index", &["app", "mv_idx"]);
+        let rule = typed("rule", &["app", "mv", "_RETURN"]);
+        let mut reach = pbps_model::ExtensionDropFacts {
+            outside: [&view, &row, &array, &index, &rule]
+                .into_iter()
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        for (child, parent) in [
+            (&view, &package),
+            (&row, &view),
+            (&array, &row),
+            (&index, &view),
+            (&rule, &view),
+        ] {
+            reach
+                .parents
+                .entry(child.clone())
+                .or_default()
+                .insert(parent.clone());
+        }
+        let mut dropped = world(&["citext"], &["citext"], &[]);
+        dropped.base.modules.insert(
+            "app.mv".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "SELECT 1".into(),
+                options: Default::default(),
+            },
+        );
+        let all: std::collections::BTreeMap<_, _> = [("citext".into(), reach.clone())].into();
+        let (changes, errors) = dropped.drops(&all);
+        assert!(errors.is_empty(), "{errors:?}");
+        let [pbps_model::Change::DropExtension { releases, .. }] = changes.as_slice() else {
+            panic!("{changes:?}")
+        };
+        // One module carries all five objects; nothing else is a module.
+        assert_eq!(
+            releases
+                .iter()
+                .map(|m| m.raw().to_string())
+                .collect::<Vec<_>>(),
+            ["app.mv"]
+        );
+
+        // Negative: the same view kept refuses by the view, and not by the
+        // row type, array type, index or rule that merely hang off it.
+        let kept = world(&["citext"], &["citext"], &[]);
+        let (changes, errors) = kept.drops(&all);
+        assert!(changes.is_empty());
+        let text = errors[0].to_string();
+        assert!(text.contains("materialized view app.mv"), "{text}");
+        for consequence in ["type app.mv", "mv_idx", "_RETURN"] {
+            assert!(!text.contains(consequence), "{consequence}: {text}");
+        }
+
+        // Negative: an unrelated type, reached through the package itself, is
+        // refused although a carried view stands beside it; and an object with
+        // one path through the view and one through the package is not carried.
+        let stray = typed("type", &["app.unrelated"]);
+        let both = typed("index", &["app", "both"]);
+        reach.outside.extend([stray.clone(), both.clone()]);
+        reach
+            .parents
+            .entry(stray.clone())
+            .or_default()
+            .insert(package.clone());
+        reach
+            .parents
+            .entry(both.clone())
+            .or_default()
+            .extend([view.clone(), package.clone()]);
+        let mixed: std::collections::BTreeMap<_, _> = [("citext".into(), reach)].into();
+        let (changes, errors) = dropped.drops(&mixed);
+        assert!(changes.is_empty());
+        let text = errors[0].to_string();
+        assert!(
+            text.contains("type app.unrelated") && text.contains("index app.both"),
+            "{text}"
+        );
+        assert!(!text.contains("app.mv"), "{text}");
     }
 }
