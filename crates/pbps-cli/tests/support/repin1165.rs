@@ -424,9 +424,17 @@ fn exhausted_allocator_is_unanswerable(old: bool) {
 }
 
 fn a_changed_input_cannot_move_the_pin(old: bool) {
-    for target in ["tests/pbps-tests.yml", "tests/orders.sql"] {
+    // `HEAD` is the baseline the original side was read from; a committed
+    // candidate does not capture it, so the re-pin must.
+    for target in ["tests/pbps-tests.yml", "tests/orders.sql", "HEAD"] {
         let w = world(IDENTITY);
         w.commit_fixtures(old, &[("orders", &w.old, KEPT_AND_DISCARDED)]);
+        if target == "HEAD" {
+            let candidate = w.p.head();
+            let text = format!("{}candidate: {candidate}\n", w.manifest_text());
+            w.p.write("tests/pbps-tests.yml", text);
+            w.p.0.git(&["commit", "-qam", "committed candidate"]);
+        }
         // Equal data; the sleep holds the proposed side open while the file moves.
         w.p.write(
             "tests/orders.sql",
@@ -438,17 +446,29 @@ fn a_changed_input_cannot_move_the_pin(old: bool) {
         let manifest = w.manifest_text();
         let (running, _) = waiting_on(&w.p, w.repin_command("orders", &w.base, "json"));
         let path = w.p.0.dir.join(target);
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("\n-- edited during the run\n");
-        std::fs::write(&path, &text).unwrap();
+        if target == "HEAD" {
+            w.p.0
+                .git(&["commit", "-q", "--allow-empty", "-m", "HEAD moves"]);
+        } else {
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str("\n-- edited during the run\n");
+            std::fs::write(&path, &text).unwrap();
+        }
         let out = running.finish();
         assert_eq!(code(&out), 1, "{target}: {}{}", stdout(&out), stderr(&out));
         let v = w.envelope(&out);
-        assert!(messages(&v).contains("changed"), "{target}: {v}");
+        let expected = if target == "HEAD" {
+            "HEAD was"
+        } else {
+            "changed"
+        };
+        assert!(messages(&v).contains(expected), "{target}: {v}");
         assert_eq!(v["data"]["repin"]["manifest"]["status"], "not_attempted");
         let now = w.manifest_text();
         if target.ends_with(".yml") {
             assert_eq!(now, format!("{manifest}\n-- edited during the run\n"));
+        } else if target == "HEAD" {
+            assert_eq!(now, manifest);
         } else {
             assert_eq!(now, manifest, "the pin must not move");
         }

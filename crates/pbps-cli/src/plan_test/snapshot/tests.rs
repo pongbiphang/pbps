@@ -19,6 +19,7 @@ fn snapshot(table: Rows, allocators: &[(&str, &str)]) -> Snapshot {
                 (
                     (*name).to_owned(),
                     Allocator {
+                        name: (*name).to_owned(),
                         used_by: Some("app.t.id".into()),
                         next: (*next).to_owned(),
                     },
@@ -79,6 +80,7 @@ fn a_table_or_sequence_only_one_side_has_is_a_difference() {
     b.allocators.insert(
         "app.s".into(),
         Allocator {
+            name: "app.s".into(),
             used_by: None,
             next: "1".into(),
         },
@@ -102,4 +104,39 @@ fn shown_differences_are_bounded_but_the_equality_test_is_not() {
     assert_eq!(tables[0].differences.len(), SHOWN);
     assert!(tables[0].truncated);
     assert_eq!(tables[0].original_rows, (SHOWN + 5) as u64);
+}
+
+fn owned(name: &str, owner: Option<&str>, next: &str) -> (String, Allocator) {
+    let key = owner.unwrap_or(name).to_owned();
+    let allocator = Allocator {
+        name: name.to_owned(),
+        used_by: owner.map(str::to_owned),
+        next: next.to_owned(),
+    };
+    (key, allocator)
+}
+
+#[test]
+fn a_renamed_owner_keeps_its_allocator_but_an_unowned_name_does_not_move() {
+    let mut a = snapshot(rows(&["id"], &[]), &[]);
+    let mut b = snapshot(rows(&["id"], &[]), &[]);
+    a.allocators
+        .extend([owned("app.t_id_seq", Some("app.u.id"), "3")]);
+    b.allocators
+        .extend([owned("app.u_id_seq", Some("app.u.id"), "3")]);
+    assert!(
+        equal(&a, &b),
+        "the same owning column, a different generated name"
+    );
+    let (_, allocators) = compare(&a, &b);
+    assert_eq!(allocators[0].sequence, "app.t_id_seq -> app.u_id_seq");
+    // The next value still decides, and an unowned sequence is matched by name.
+    b.allocators
+        .extend([owned("app.u_id_seq", Some("app.u.id"), "4")]);
+    assert!(!equal(&a, &b));
+    let mut c = snapshot(rows(&["id"], &[]), &[]);
+    let mut d = snapshot(rows(&["id"], &[]), &[]);
+    c.allocators.extend([owned("app.free", None, "1")]);
+    d.allocators.extend([owned("app.other", None, "1")]);
+    assert!(!equal(&c, &d));
 }

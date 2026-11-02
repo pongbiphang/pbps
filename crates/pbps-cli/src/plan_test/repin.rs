@@ -225,6 +225,9 @@ fn validate(
         })?;
     let from = manifest.fixtures[index].at.clone();
     let head = git::resolve_commit(&root, "HEAD").map_err(|p| vec![git_refusal("HEAD", p)])?;
+    // The baseline is read at `HEAD` whatever the candidate is, so the final
+    // recheck must watch it even when a committed candidate did not capture it.
+    inputs.head.get_or_insert_with(|| head.clone());
     let manifest_file = inputs.frozen.manifest_file.clone();
     let working = std::fs::read(inputs.frozen.manifest_target())
         .map_err(|e| refuse(format!("the manifest cannot be read again: {e}")))?;

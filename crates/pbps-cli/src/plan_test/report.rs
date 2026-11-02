@@ -380,6 +380,8 @@ impl TestData {
     }
     pub(crate) fn startup_failure(&mut self, phase: usize, error: &crate::test_scratch::Error) {
         if let crate::test_scratch::Error::StartCleanup { cleanup, .. } = error {
+            // An earlier scratch's confirmation says nothing about this one.
+            self.cleanup_confirmed = false;
             self.run_id = Some(cleanup.run_id.clone());
             let mut p = Phase::new("cleanup", &cleanup.run_id);
             p.outcome = Status::Unanswerable;

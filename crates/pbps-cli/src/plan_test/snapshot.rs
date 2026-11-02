@@ -23,7 +23,11 @@ pub(super) struct Rows {
     rows: BTreeMap<Vec<Option<String>>, u64>,
 }
 
+/// An allocator is compared under the column that owns it, else under its name:
+/// a renamed table keeps its sequence's old generated name, while a bootstrap
+/// of the new revision generates a new one, and neither is a difference.
 pub(super) struct Allocator {
+    name: String,
     used_by: Option<String>,
     next: String,
 }
@@ -128,7 +132,19 @@ pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Resu
             .transpose()?
             .with_context(|| format!("sequence {shown} gave no next value"))?
             .to_owned();
-        allocators.insert(shown, Allocator { used_by, next });
+        // Two sequences owned by one column are told apart by name.
+        let key = used_by
+            .clone()
+            .filter(|owner| !allocators.contains_key(owner))
+            .unwrap_or_else(|| shown.clone());
+        allocators.insert(
+            key,
+            Allocator {
+                name: shown,
+                used_by,
+                next,
+            },
+        );
     }
     Ok(Snapshot { tables, allocators })
 }
@@ -211,8 +227,12 @@ pub(super) fn compare(
         .into_iter()
         .map(|name| {
             let (a, b) = (original.allocators.get(name), proposed.allocators.get(name));
+            let named = |x: &Allocator| x.name.clone();
             AllocatorComparison {
-                sequence: name.clone(),
+                sequence: match (a, b) {
+                    (Some(a), Some(b)) if a.name != b.name => format!("{} -> {}", a.name, b.name),
+                    (a, b) => a.or(b).map(named).unwrap_or_default(),
+                },
                 used_by: a.or(b).and_then(|x| x.used_by.clone()),
                 original_next: a.map(|x| x.next.clone()),
                 proposed_next: b.map(|x| x.next.clone()),
