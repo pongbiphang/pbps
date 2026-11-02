@@ -760,7 +760,9 @@ impl Operation {
             Change::CreateRole { uid, .. }
             | Change::DropRole { uid, .. }
             | Change::RenameRole { uid, .. } => ObjectKey::Role(recorded(uid)),
-            Change::CreateExtension { uid, .. } => ObjectKey::Extension(recorded(uid)),
+            Change::CreateExtension { uid, .. } | Change::DropExtension { uid, .. } => {
+                ObjectKey::Extension(recorded(uid))
+            }
             Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } => {
                 ObjectKey::Grant {
                     grantee: Grantee::Role(role.clone()),
@@ -890,6 +892,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DropIndex { .. }
             | Change::DeleteRow { .. }
             | Change::DropModule { .. }
+            | Change::DropExtension { .. }
             | Change::DropRole { .. } => exists(true, false)?,
             Change::CreateType { .. }
             | Change::AddComputedColumn { .. }

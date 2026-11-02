@@ -584,6 +584,12 @@ pub fn names(
             nx.release(role_address(from), holder.clone());
             nx.claim(role_address(to), holder);
         }
+        Change::DropExtension { uid, name, .. } => {
+            nx.release(
+                extension_address(name),
+                ObjectKey::Extension(Recorded(uid.clone())),
+            );
+        }
         Change::CreateExtension { uid, name, .. } => {
             nx.claim(
                 extension_address(name),

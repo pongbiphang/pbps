@@ -4,11 +4,22 @@ use anyhow::{Context as _, ensure};
 use clap::{ArgAction, Args};
 use pbps_model::{ColumnRef, Intent, Reason};
 
-pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, move-rows or rebuild-table accept --reason - too.";
+pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, drop-extension, move-rows or rebuild-table accept --reason - too.";
 
 /// The reason options. Only their second value is audit text, so only there
 /// can `-` stand for stdin.
-const REASON_FLAGS: [&str; 4] = ["--drop-type", "--drop", "--drop-table", "--drop-role"];
+const REASON_FLAGS: [&str; 5] = [
+    "--drop-type",
+    "--drop",
+    "--drop-table",
+    "--drop-role",
+    DROP_EXTENSION_FLAG,
+];
+
+/// The batch spelling of `pbps drop-extension`. The clap field below, the
+/// reports and the command are tied to [`crate::report::DROP_EXTENSION`] by a
+/// test, so the name is changed in one place and the test names the rest.
+const DROP_EXTENSION_FLAG: &str = "--drop-extension";
 
 #[derive(Args)]
 #[group(required = true, multiple = true)]
@@ -37,6 +48,9 @@ pub struct BatchArgs {
     /// Drop a role with its own nonblank audit reason
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["ROLE", "REASON"])]
     drop_role: Vec<String>,
+    /// Drop an installed extension with its own nonblank audit reason
+    #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["EXTENSION", "REASON"])]
+    drop_extension: Vec<String>,
 }
 
 /// The command boundary cannot ask resolution to record an empty answer.
@@ -77,6 +91,7 @@ impl BatchArgs {
             ("--drop", &self.drop),
             ("--drop-table", &self.drop_table),
             ("--drop-role", &self.drop_role),
+            (DROP_EXTENSION_FLAG, &self.drop_extension),
         ];
         let mut piped = 0;
         for (flag, values) in options {
@@ -153,7 +168,11 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             role: first.to_owned().into(),
             reason: second.parse()?,
         },
-        _ => unreachable!("only the six declared pair options reach this parser"),
+        DROP_EXTENSION_FLAG => Intent::DropExtension {
+            name: first.to_owned().into(),
+            reason: second.parse()?,
+        },
+        _ => unreachable!("only the declared pair options reach this parser"),
     })
 }
 
@@ -306,5 +325,85 @@ mod tests {
                 assert!(parse_pair(flag, name, reason).is_err());
             }
         }
+    }
+
+    /// A package drop travels in a batch like any other, takes its reason from
+    /// stdin when it is `-`, and refuses a blank one (DEC-2447.8).
+    #[test]
+    fn a_package_drop_travels_in_a_batch_with_its_own_reason() {
+        let parsed = batch(&[
+            "--drop-extension",
+            "citext",
+            "-",
+            "--drop",
+            "app.t.a",
+            "kept",
+        ])
+        .parse_with(|| Ok("retired".parse().unwrap()))
+        .unwrap()
+        .into_vec();
+        assert!(parsed.contains(&Intent::DropExtension {
+            name: "citext".into(),
+            reason: "retired".parse().unwrap(),
+        }));
+        assert!(parse_pair(DROP_EXTENSION_FLAG, "citext", "why").is_ok());
+        for reason in ["", " ", "\t\n"] {
+            assert!(parse_pair(DROP_EXTENSION_FLAG, "citext", reason).is_err());
+        }
+        // Negative: a second `-` is refused with this flag too, and a name
+        // that starts with `-` is not read as a value.
+        let error = batch(&[
+            "--drop-extension",
+            "citext",
+            "-",
+            "--drop-role",
+            "reader",
+            "-",
+        ])
+        .parse_with(unread)
+        .unwrap_err();
+        assert!(error.to_string().contains("only one reason"), "{error:#}");
+        let error = batch(&["--drop-extension", "-", "why"])
+            .parse_with(unread)
+            .unwrap_err();
+        assert!(error.to_string().contains("hyphen-leading"), "{error:#}");
+    }
+
+    /// The command's name lives in one constant. The batch flag, the single
+    /// command clap derives from the variant, and the sentences the reports
+    /// print are tied to it, so that renaming it fails here and names every
+    /// place that still spells the old one (DEC-2447.9).
+    #[test]
+    fn the_drop_extension_command_has_one_name_everywhere() {
+        use clap::CommandFactory as _;
+        assert_eq!(
+            DROP_EXTENSION_FLAG,
+            format!("--{}", crate::report::DROP_EXTENSION)
+        );
+        let command = crate::Cli::command();
+        assert!(
+            command
+                .find_subcommand(crate::report::DROP_EXTENSION)
+                .is_some(),
+            "the single command is `{}`",
+            crate::report::DROP_EXTENSION
+        );
+        let batch_flag = command
+            .find_subcommand("intent")
+            .unwrap()
+            .get_arguments()
+            .any(|a| a.get_long() == Some(DROP_EXTENSION_FLAG.trim_start_matches("--")));
+        assert!(batch_flag, "`pbps intent` takes {DROP_EXTENSION_FLAG}");
+        // The remedy a blocker prints runs as written.
+        let said = crate::report::blockers(&[pbps_diff::Blocker::DropExtensionNeedsReason {
+            name: "citext".into(),
+        }]);
+        assert!(
+            said.contains(&format!(
+                "pbps {} citext --reason",
+                crate::report::DROP_EXTENSION
+            )),
+            "{said}"
+        );
     }
 }

@@ -717,6 +717,18 @@
     }
   },
   {
+    "name": "DropExtension",
+    "change": {
+      "op": "drop_extension",
+      "uid": "e_aaaaaa",
+      "name": "part",
+      "definition": {
+        "schema": "ext",
+        "version": "1.0"
+      }
+    }
+  },
+  {
     "name": "CreateRole",
     "change": {
       "op": "create_role",

@@ -74,6 +74,13 @@ pub enum Intent {
         role: crate::RoleName,
         reason: Reason,
     },
+    /// Drop an installed package (`DROP EXTENSION`). "Why was this package,
+    /// and everything it brought, removed" is the question an auditor asks of
+    /// the one change that deletes member tables with their rows (DEC-2447.8).
+    DropExtension {
+        name: crate::ObjectLocalName,
+        reason: Reason,
+    },
     /// Allow the DEFAULT partition's rows inside a new range partition's
     /// range to move into it, at most `max_rows` of them (#1788).
     MoveRows {
@@ -95,7 +102,8 @@ impl Intent {
             Intent::RenameType { .. }
             | Intent::DropType { .. }
             | Intent::RenameRole { .. }
-            | Intent::DropRole { .. } => false,
+            | Intent::DropRole { .. }
+            | Intent::DropExtension { .. } => false,
         }
     }
 }

@@ -1135,7 +1135,7 @@ adds no Schema member or apply query. The resolver still refuses undeclared
 managed three-part references, and DEC-619.3's sandbox boundary is unchanged.
 Apply continues to bind the real objects in its transaction.
 
-### 4.10 PostgreSQL extensions (adoption and pinned creation)
+### 4.10 PostgreSQL extensions (adoption, pinned creation and explicit drop)
 
 One package per `schema/extensions/<name>.yml` file (DEC-2447.1):
 
@@ -1206,10 +1206,28 @@ refused by name and is planned in two steps, the package first (DEC-2447.6). A
 package whose members the declarations also manage as their own is
 refused after the rehearsal, and a collision with an unmanaged object of the
 target is the engine's own refusal inside the rolled-back transaction
-(DEC-2447.7). DROP EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET
-SCHEMA differences are named refusals and named drift, with no partial
-executable plan. Provider-type admission and the use of a package's members by
-declarations remain later slices.
+(DEC-2447.7). ALTER EXTENSION UPDATE and ALTER EXTENSION SET SCHEMA differences
+are named refusals and named drift, with no partial executable plan.
+Provider-type admission and the use of a package's members by declarations
+remain later slices.
+
+**Dropping a package (DEC-2447.8, DEC-2447.9).** Removing a declaration is not a
+drop: `plan` names the package and the command, and a human runs `pbps
+drop-extension NAME --reason WHY` (batch: `pbps intent --drop-extension NAME
+WHY`), which records a tombstone like every other drop. `plan --db` then reads
+what `DROP EXTENSION NAME RESTRICT` would reach and seals it: the package's
+members (a table of its own, a table someone added to it, with their rows, are
+all deleted and are listed), and the objects outside it that the engine would
+delete (`DEPENDS ON EXTENSION` marks). An outside object or a dependent that
+blocks the drop is carried only where the same plan drops that module, which the
+drop then waits for; a package another package requires is dropped only together
+with it and after it. Everything else is refused by name with the remedy. The
+class is `destructive` and gated; the role must own the package (superuser,
+owner, or a member inheriting its privileges). `apply` vets the manifest and the
+reach before the statement, proves afterwards that the package and everything
+reachable are gone, and rolls back on any difference. The plan is sealed in plan
+format 61. A drop is planned only against a database, and a rehearsal is not
+required for it.
 
 ## 5. The identity file (`schema.ids.json`)
 
@@ -1944,10 +1962,11 @@ two halves:
    Untouched policies keep their exact catalog predicates. Both RLS flags
    match the values the plan leaves, independently of whether any policy exists.
    Managed extensions retain their exact name, schema and version. A plan admits
-   only creates (DEC-2447.6), so every package keeps these fields unchanged,
-   except that each one the plan installs stands in exactly its pinned
-   definition at the close and in none other before it; installed packages
-   outside the declarations are not compared.
+   only creates and drops (DEC-2447.6, DEC-2447.8), so every package keeps these
+   fields unchanged, except that each one the plan installs stands in exactly
+   its pinned definition at the close and in none other before it, and each one
+   the plan drops stands as pinned until its statement and is absent from the
+   close on; installed packages outside the declarations are not compared.
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 

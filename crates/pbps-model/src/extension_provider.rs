@@ -63,6 +63,68 @@ impl fmt::Display for ProviderMember {
     }
 }
 
+impl ProviderMember {
+    /// The module of `ids` this object is, where it is one a plan manages: a
+    /// routine by its full signature, a view or materialized view by name, a
+    /// trigger by its table and name, and a view's rule as the view it makes
+    /// (the engine reports a view that uses an object as its `_RETURN` rule).
+    /// The engine spells a built-in argument type with its schema
+    /// (`pg_catalog.text`), which a declaration does not, so that prefix is
+    /// dropped before comparing. `None` is any object this cannot place, which
+    /// a caller must treat as not one the plan removes (DEC-2447.8).
+    pub fn module<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a crate::ModuleId>,
+    ) -> Option<&'a crate::ModuleId> {
+        use crate::ModuleId;
+        let args = self
+            .args
+            .iter()
+            .map(|a| a.replace("pg_catalog.", ""))
+            .collect::<Vec<_>>()
+            .join(",");
+        ids.into_iter().find(
+            |id| match (self.class.as_str(), self.names.as_slice(), id) {
+                (
+                    "function" | "procedure" | "aggregate" | "routine",
+                    [schema, name],
+                    ModuleId::Routine(_),
+                ) => {
+                    id.raw().to_string().replace("pg_catalog.", "")
+                        == format!("{schema}.{name}({args})")
+                }
+                ("view" | "materialized view", [schema, name], ModuleId::Named(n)) => {
+                    n.schema == *schema && n.name == *name
+                }
+                ("rule", [schema, view, rule], ModuleId::Named(n)) => {
+                    rule == "_RETURN" && n.schema == *schema && n.name == *view
+                }
+                ("trigger", [schema, table, name], ModuleId::Trigger { on, name: n }) => {
+                    on.schema == *schema && on.name == *table && n == name
+                }
+                _ => false,
+            },
+        )
+    }
+}
+
+/// What `DROP EXTENSION name RESTRICT` would reach beyond the package's own
+/// members, read from the target's dependency catalog (DEC-2447.8). Both sets
+/// are logical (class, names, arguments), as a manifest is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionDropFacts {
+    /// Objects the engine deletes with the package that it does not own:
+    /// objects marked `DEPENDS ON EXTENSION`, and what hangs automatically off
+    /// those. An `x` edge is a user's mark, not membership, and is never
+    /// deleted without the plan saying so.
+    pub outside: std::collections::BTreeSet<ProviderMember>,
+    /// Objects that depend normally on the package or on a member, which make
+    /// the engine refuse: a view over a member function, a column default that
+    /// calls one, another package that requires this one.
+    pub blockers: std::collections::BTreeSet<ProviderMember>,
+}
+
 /// An installed package and everything it owns or requires.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
@@ -356,5 +418,70 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         value["owner"] = "postgres".into();
         assert!(serde_json::from_value::<ExtensionProvider>(value).is_err());
+    }
+
+    fn routine(text: &str) -> crate::ModuleId {
+        text.parse().unwrap()
+    }
+
+    /// An object the engine reports is the module a plan manages when its class
+    /// and name say so: a routine by its signature (whichever way the engine
+    /// spells a built-in type), a view or materialized view by name, a view's
+    /// rule as the view, a trigger by table and name (DEC-2447.8).
+    #[test]
+    fn a_reported_object_is_recognised_as_the_module_it_is() {
+        let ids = [
+            routine("app.f(integer,text)"),
+            routine("app.g()"),
+            "app.v".parse().unwrap(),
+            routine("app.t.trg"),
+        ];
+        let at = |m: &ProviderMember| m.module(ids.iter()).map(|id| id.raw().to_string());
+        let named = |class: &str, names: &[&str], args: &[&str]| ProviderMember {
+            class: class.into(),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        };
+        assert_eq!(
+            at(&named(
+                "function",
+                &["app", "f"],
+                &["integer", "pg_catalog.text"]
+            ))
+            .as_deref(),
+            Some("app.f(integer,text)")
+        );
+        assert_eq!(
+            at(&named("procedure", &["app", "g"], &[])).as_deref(),
+            Some("app.g()")
+        );
+        assert_eq!(
+            at(&named("view", &["app", "v"], &[])).as_deref(),
+            Some("app.v")
+        );
+        assert_eq!(
+            at(&named("materialized view", &["app", "v"], &[])).as_deref(),
+            Some("app.v")
+        );
+        assert_eq!(
+            at(&named("rule", &["app", "v", "_RETURN"], &[])).as_deref(),
+            Some("app.v")
+        );
+        assert_eq!(
+            at(&named("trigger", &["app", "t", "trg"], &[])).as_deref(),
+            Some("app.t.trg")
+        );
+        // Negative: another signature, another schema, a rule that is not a
+        // view's, an index and a default are not any of them.
+        for other in [
+            named("function", &["app", "f"], &["integer"]),
+            named("function", &["other", "g"], &[]),
+            named("rule", &["app", "v", "other_rule"], &[]),
+            named("index", &["app", "v"], &[]),
+            named("default value", &["app", "t", "n"], &[]),
+            named("trigger", &["app", "t", "other"], &[]),
+        ] {
+            assert_eq!(at(&other), None, "{other:?}");
+        }
     }
 }

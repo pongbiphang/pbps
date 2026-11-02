@@ -54,6 +54,7 @@ pub enum ChoiceKind {
     DropColumn(ColumnRef),
     DropTable(TableName),
     DropRole(pbps_model::RoleName),
+    DropExtension(pbps_model::ObjectLocalName),
     DropType(pbps_model::TypeRef),
 }
 
@@ -231,6 +232,13 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             ),
             kind: ChoiceKind::DropRole(role.clone()),
         }),
+        Blocker::DropExtensionNeedsReason { name } => out.push(Choice {
+            label: format!(
+                "extension {} was dropped (you will be asked why)",
+                name.shown()
+            ),
+            kind: ChoiceKind::DropExtension(name.clone()),
+        }),
         // A stale or misspelled annotation. There is nothing to choose: the
         // remedy is to edit the file, and offering an option here would invite
         // the user to confirm a typo into the identity file.
@@ -348,6 +356,10 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
             ChoiceKind::DropRole(role) => Intent::DropRole {
                 role: role.clone(),
                 reason: reason(&mut lines, &format!("role {role}", role = role.shown(),))?,
+            },
+            ChoiceKind::DropExtension(name) => Intent::DropExtension {
+                name: name.clone(),
+                reason: reason(&mut lines, &format!("extension {}", name.shown()))?,
             },
         });
     }
@@ -476,6 +488,12 @@ fn question(b: &Blocker) -> String {
             format!(
                 "role {role} disappeared from the declarations",
                 role = role.shown(),
+            )
+        }
+        Blocker::DropExtensionNeedsReason { name } => {
+            format!(
+                "extension {} disappeared from the declarations",
+                name.shown()
             )
         }
         Blocker::UnusedIntent { intent } => format!("{intent:?}"),
@@ -949,6 +967,30 @@ mod tests {
                 }]
             );
         }
+    }
+
+    /// A package that vanished from the declarations offers one choice, a drop,
+    /// asks why, never defaults the answer, and records nothing on a blank one
+    /// (DEC-2447.8).
+    #[test]
+    fn a_vanished_package_offers_a_drop_and_asks_why() {
+        let b = Blocker::DropExtensionNeedsReason {
+            name: "citext".into(),
+        };
+        let offered = choices(&b);
+        assert_eq!(offered.len(), 1);
+        assert!(matches!(&offered[0].kind, ChoiceKind::DropExtension(n) if n.raw() == "citext"));
+        let got = ask_from(std::slice::from_ref(&b), answers("1\nretired for good\n")).unwrap();
+        assert_eq!(
+            got,
+            vec![Intent::DropExtension {
+                name: "citext".into(),
+                reason: "retired for good".parse().unwrap(),
+            }]
+        );
+        // Negative: a blank reason, or no answer, records nothing.
+        assert_eq!(ask_from(std::slice::from_ref(&b), answers("1\n\n")), None);
+        assert_eq!(ask_from(std::slice::from_ref(&b), answers("")), None);
     }
 
     /// The negative cases, and the important ones: every way of not answering

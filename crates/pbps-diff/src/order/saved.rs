@@ -545,6 +545,7 @@ pub fn validate_saved_plan(
         refuse!("enum label steps disagree with their pinned intermediate definitions");
     }
     package_pins_match_their_creates(plan)?;
+    package_pins_match_their_drops(plan)?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 
@@ -624,6 +625,72 @@ pub(super) fn package_pins_match_their_creates(plan: &SavedPlan) -> Result<(), A
             || requires
                 .iter()
                 .any(|r| r == *uid || !creates.contains_key(r))
+        {
+            return Err(disagree(name));
+        }
+    }
+    Ok(())
+}
+
+/// The same for `DROP EXTENSION` (DEC-2447.8): every drop is sealed with
+/// exactly one manifest and every manifest belongs to one drop; the plan's
+/// identities hold a tombstone with a reason for the package and no live entry;
+/// and a package that requires another is dropped by the same plan, never one
+/// the plan does not drop. A drop whose own parts disagree never reaches a
+/// statement.
+pub(super) fn package_pins_match_their_drops(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::{Change, UidKind};
+    let drops: std::collections::BTreeMap<_, _> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::DropExtension {
+                uid,
+                name,
+                definition,
+                requirers,
+                ..
+            } = &p.change
+            {
+                Some((uid, (name, definition, requirers)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let disagree = |name: &pbps_model::ObjectLocalName| {
+        AdmissionError::message(format!(
+            "extension evidence disagrees with the plan's drop of `{}`",
+            name.shown()
+        ))
+    };
+    let mut pinned = std::collections::BTreeSet::new();
+    for pin in &plan.extension_drops {
+        let Some((name, definition, _)) = drops.get(&pin.uid) else {
+            return Err(disagree(&pin.name));
+        };
+        if **name != pin.name
+            || **definition != pin.definition
+            || pin.manifest.definition != pin.definition
+            || !pinned.insert(&pin.uid)
+        {
+            return Err(disagree(&pin.name));
+        }
+    }
+    for (uid, (name, _, requirers)) in &drops {
+        let recorded = plan
+            .ids
+            .tombstones
+            .get(*uid)
+            .is_some_and(|t| t.was == name.raw() && !t.reason.trim().is_empty());
+        if !pinned.contains(uid)
+            || uid.kind() != UidKind::Extension
+            || !recorded
+            || plan.ids.extensions.contains_key(*uid)
+            || requirers
+                .iter()
+                .any(|r| r == *uid || !drops.contains_key(r))
         {
             return Err(disagree(name));
         }

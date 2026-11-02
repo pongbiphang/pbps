@@ -279,7 +279,9 @@ use crate::zone::SessionZone;
 // 58 carries typed retained-expression writebacks (DEC-2354.1).
 // 59 extends retained-expression targets to column defaults (DEC-2354.4).
 // 60 adds the pinned `CREATE EXTENSION` and its sealed provider manifests (DEC-2447.6).
-pub const CURRENT_VERSION: u32 = 60;
+// 61 adds the explicit `DROP EXTENSION` and the target's manifest and accepted outside
+// objects it is sealed with (DEC-2447.8): an older build would refuse the change as unknown.
+pub const CURRENT_VERSION: u32 = 61;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -473,6 +475,12 @@ pub struct SavedPlan {
     /// Omitted when empty, so a plan with no create keeps its bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_pins: Vec<ExtensionPin>,
+    /// The packages this plan drops, each with the manifest the target held
+    /// when it was planned and the objects outside the package that the drop
+    /// was accepted to delete (DEC-2447.8). The apply re-reads both before the
+    /// statement and refuses on any difference. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_drops: Vec<ExtensionDropPin>,
 
     /// Review and pin user-written roots on referenced types' potential input paths.
     /// Omit false to preserve historical bytes; true remains checksum-pinned.
@@ -534,6 +542,22 @@ pub struct ExtensionPin {
     pub name: crate::ObjectLocalName,
     pub definition: crate::Extension,
     pub manifest: crate::ExtensionProvider,
+}
+
+/// One `DROP EXTENSION` of the plan and what it was approved to delete: the
+/// provider as the target held it, and the objects outside the package that
+/// the engine would delete with it (`x` dependents) which the plan also removes.
+/// Covered by the checksum, so neither can be swapped (DEC-2447.8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionDropPin {
+    pub uid: crate::Uid,
+    pub name: crate::ObjectLocalName,
+    pub definition: crate::Extension,
+    pub manifest: crate::ExtensionProvider,
+    /// What the drop reaches beyond the manifest and the plan removes first.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub outside: std::collections::BTreeSet<crate::ProviderMember>,
 }
 
 /// A referenced type's identity and unkeyed canonical-definition digest.
@@ -607,6 +631,7 @@ impl SavedPlan {
             type_pins: Vec::new(),
             declared_type_pins: Vec::new(),
             extension_pins: Vec::new(),
+            extension_drops: Vec::new(),
             pin_type_routines: false,
             type_routines: Vec::new(),
             type_routine_pins: None,
@@ -1255,6 +1280,70 @@ mod tests {
                 &json.replace("\"oid\":40000", "\"oid\":40000,\"invented\":true")
             )
             .is_err()
+        );
+    }
+
+    /// The drop evidence is new, so a plan without a drop writes none of it and
+    /// keeps its bytes; one with a drop carries its pin, and an older reader
+    /// refuses the field (the version moved with it, DEC-2447.8).
+    #[test]
+    fn a_plan_without_a_drop_writes_no_drop_evidence_and_one_with_a_drop_writes_it() {
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            "minimal",
+            "2026-11-02T00:00:00Z",
+            PlanBaseline {
+                description: "d".into(),
+                checksum: "c".into(),
+                database_collation: None,
+                time_zone: None,
+            },
+            Default::default(),
+            Default::default(),
+        );
+        assert_eq!(plan.version, 61);
+        let bare = serde_json::to_value(&plan).unwrap();
+        assert!(bare.get("extension_drops").is_none(), "{bare}");
+        assert!(bare.get("extension_pins").is_none());
+        let mut dropping = plan.clone();
+        let definition = crate::Extension {
+            schema: "ext".into(),
+            version: "1.0".into(),
+        };
+        dropping.extension_drops.push(ExtensionDropPin {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition: definition.clone(),
+            manifest: crate::ExtensionProvider {
+                definition,
+                requires: Default::default(),
+                members: Default::default(),
+            },
+            outside: Default::default(),
+        });
+        let written = serde_json::to_value(&dropping).unwrap();
+        assert_eq!(written["extension_drops"][0]["name"], "citext");
+        assert!(written["extension_drops"][0].get("outside").is_none());
+        let back: SavedPlan = serde_json::from_value(written).unwrap();
+        assert_eq!(back, dropping);
+        // The evidence is part of what the plan is: it changes the checksum.
+        assert_ne!(plan.wire_fingerprint(), dropping.wire_fingerprint());
+        // Negative: a drop change with nothing to wait for writes neither list.
+        let change = serde_json::to_value(crate::Change::DropExtension {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition: crate::Extension {
+                schema: "ext".into(),
+                version: "1.0".into(),
+            },
+            requirers: Default::default(),
+            releases: Default::default(),
+        })
+        .unwrap();
+        let payload = change.get("drop_extension").unwrap_or(&change);
+        assert!(
+            payload.get("requirers").is_none() && payload.get("releases").is_none(),
+            "{change}"
         );
     }
 }

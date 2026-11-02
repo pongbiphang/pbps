@@ -106,7 +106,7 @@ pub use data::{
 pub use data_work::{DataWorkError, DataWorkIdentity, DataWorkOutcome, DataWorkRecord};
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
-pub use extension_provider::{ExtensionProvider, ProviderMember};
+pub use extension_provider::{ExtensionDropFacts, ExtensionProvider, ProviderMember};
 pub use finding::{Finding, Severity};
 pub use ids::{
     Conversion, DropGuard, DropRequirement, IdsFile, IdsIndex, Move, Tombstone, ValidIds,
@@ -122,8 +122,9 @@ pub use name::{
 };
 pub use partitions::Partitions;
 pub use plan::{
-    DeclaredTypeBefore, DeclaredTypePin, ExtensionPin, PlanBaseline, PlanMode, PlanOrigin,
-    RoutinePin, RoutinePins, SavedPlan, TypePin, TypeRoutine, state_checksum, wire_fingerprint,
+    DeclaredTypeBefore, DeclaredTypePin, ExtensionDropPin, ExtensionPin, PlanBaseline, PlanMode,
+    PlanOrigin, RoutinePin, RoutinePins, SavedPlan, TypePin, TypeRoutine, state_checksum,
+    wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{ColumnShape, Rebuild, RebuildIdentities};

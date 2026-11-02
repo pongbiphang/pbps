@@ -44,6 +44,13 @@ pub enum DiffError {
         name: pbps_model::ObjectLocalName,
         action: String,
     },
+    #[error("extension `{}`: DROP EXTENSION deletes the package's members and what depends on it, so it is planned only against a database (`plan --db`), where the plan reads and pins what the drop reaches (DEC-2447.8)", .name.shown())]
+    ExtensionDropNeedsDatabase { name: pbps_model::ObjectLocalName },
+    #[error("extension `{}`: DROP EXTENSION would reach what this plan does not remove: {}; drop or release each in an earlier plan (`ALTER ... NO DEPENDS ON EXTENSION` for an object that is not declared), then drop the package (DEC-2447.8)", .name.shown(), .found.join("; "))]
+    ExtensionDropRefused {
+        name: pbps_model::ObjectLocalName,
+        found: Vec<String>,
+    },
     #[error("extension `{}`: CREATE EXTENSION runs the package's install script, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what the script installs (DEC-2447.6)", .name.shown())]
     ExtensionCreateNeedsDatabase { name: pbps_model::ObjectLocalName },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
@@ -865,6 +872,10 @@ pub(crate) fn diff_partial_rebuilding(
         dialect.name(),
         &hints.extension_requires,
     ));
+    let (extension_drops, extension_drop_errors) =
+        crate::extensions::drops(base, declared, dialect.name(), &hints.extension_drops);
+    changes.extend(extension_drops);
+    errs.extend(extension_drop_errors);
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2658,8 +2669,11 @@ pub(crate) fn diff_partial_rebuilding(
                 && let Some(rank) = late_attach.get(table)
             {
                 *rank
-            } else if let Change::CreateExtension { uid, .. } = &p.change {
-                // Behind the packages of this plan it requires (DEC-2447.6).
+            } else if let Change::CreateExtension { uid, .. } | Change::DropExtension { uid, .. } =
+                &p.change
+            {
+                // Behind the packages of this plan it requires, or that require
+                // it for a drop (DEC-2447.6, DEC-2447.8).
                 extension_rank.get(uid).copied().unwrap_or(0)
             } else {
                 dependency_rank(
@@ -7076,6 +7090,7 @@ fn dependency_rank(
         Change::DropType { name, .. } => -drop_type_rank.get(name).copied().unwrap_or(0),
         Change::CreateTable { .. }
         | Change::CreateExtension { .. }
+        | Change::DropExtension { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -8045,7 +8060,9 @@ fn order_key(c: &Change) -> u8 {
             ..
         } => 13,
         Change::EnumRebuild { .. } => COLUMN_ALTERATIONS,
-        Change::DropType { .. } => 18,
+        // After every module this plan drops and the packages it requires
+        // are gone: late, like the type drops (DEC-2447.8).
+        Change::DropType { .. } | Change::DropExtension { .. } => 18,
         Change::RenameType { .. } => 1,
         // A policy releases its bindings before module and column teardown.
         Change::DropPolicy { .. } => 0,

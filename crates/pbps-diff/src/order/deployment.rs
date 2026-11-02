@@ -3183,6 +3183,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
+            | Change::DropExtension { .. }
     ) {
         return false;
     }

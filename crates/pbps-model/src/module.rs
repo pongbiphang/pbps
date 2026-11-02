@@ -1114,6 +1114,11 @@ pub struct Hints {
     pub extension_requires:
         BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ObjectLocalName>>,
 
+    /// What dropping each installed package that is recorded and no longer
+    /// declared would reach, read from the target at plan time (DEC-2447.8).
+    /// Absent offline: a drop is planned only against a database.
+    pub extension_drops: BTreeMap<crate::ObjectLocalName, crate::ExtensionDropFacts>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).

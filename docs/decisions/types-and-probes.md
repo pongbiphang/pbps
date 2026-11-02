@@ -4717,3 +4717,102 @@ refusal inside the apply's transaction, rolled back, and the message names the
 statement. Handing a name over between a package and another object belongs to
 the DROP and UPDATE slices, and the use of a member by a declaration to the
 slices after them.
+
+
+<a id="dec-2447-8"></a>
+
+**DEC-2447.8. A package is dropped by `DROP EXTENSION RESTRICT` that is sealed, vetted before and confirmed after.**
+
+`Change::DropExtension` (`destructive`, class 18 with `DropType`) drops a package
+that a recorded human intent retired (DEC-2447.9). `RESTRICT` alone is not the
+contract. Measured on 16.15 and 18.6, it also deletes every object marked
+`DEPENDS ON EXTENSION` (an `x` edge: function, procedure, trigger, materialized
+view, index) and every member, including a table a user added with
+`ALTER EXTENSION ADD TABLE`, rows and all; and a user index on a member table is
+an `a` subsidiary of it. So the drop is judged against what the engine would
+reach, read from `pg_depend` (`extension_provider::drop_facts`, one static
+statement; an object the engine can no longer name is unreadable evidence, never
+a smaller set): **members** (the manifest, TOAST excluded as in DEC-2447.4),
+**outside** (the reach minus the members: the `x` objects and what hangs off
+them) and **blockers** (normal dependents, which make the engine answer 2BP01: a
+view or default using a member function, a package that requires this one, and
+a member of such a package, reported as that package so that dropping both
+clears it).
+
+The differ (`extensions::drops`) carries an object only where this plan removes
+it: an outside object or a blocker that is a managed module this plan drops
+(a routine by signature, a view or materialized view by name, a view's `_RETURN`
+rule as the view, a trigger by table and name; `ProviderMember::module`) becomes
+an ordering edge, and a package that requires this one and is dropped by the
+plan is a `requirers` edge (a package that stays is refused). Everything else is
+refused by name with the remedy, because an `x` edge is a user's mark and never
+permission to delete. Indexes, tables and defaults are not carried: they are
+refused with a two-plan remedy. **Limit, stated:** carrying them needs a mapping
+from a catalog address to a plan change for each kind, and no case measured needs
+one yet.
+
+The plan is **sealed** (`Plan::extension_drops`, plan format **61**): the
+target's manifest at plan time and the outside set the plan accepted, covered by
+the checksum; admission demands one pin per drop, a tombstone with a reason and
+no live entry for the uid, and that a requirer is dropped by the same plan. State
+and ids are unchanged: the tombstone is the generic one. The apply asks again in
+the statement's own transaction (also for a staged run): **before** the statement
+the manifest must equal the sealed one (a member added since the plan, a
+removed one, refuse), nothing may block, and no outside object may be present
+that the plan did not accept; the reach is remembered in a temporary table that
+ends with the transaction; **after** it the package is gone and every
+remembered object is (`pg_describe_object` of a vanished object is NULL, measured
+on both). A difference rolls the drop back and records nothing. The opening
+check also asks the role: measured, `DROP EXTENSION` needs ownership only (a
+superuser, the owner, or a member that inherits the owner's privileges,
+`pg_has_role(current_user, extowner, 'USAGE')`); `CREATE` on the database is not
+asked, and a role that is not allowed is refused at planning and at apply with
+the owner named. The closing guard expects the package standing as pinned until
+its statement and gone from the close on.
+
+Order is by facts, not a new class: the payload names the packages and modules to
+wait for (`Absent` effects), the differ's draft ranks a package after its
+requirers (`extensions::depths`, which counts drops the other way round), and the
+name is released. A same-name drop and create in one plan is refused (the
+identity-replacement refusal now names the two-plan remedy). The adoption of a
+package is a drop's mirror and not a rename: names are immutable.
+
+**`moves_bindings` stays `false` for a drop.** Answering `true` was tried and
+measured: it sends every kept surface to a resolver whose scratch holds the
+package through its externals file, and the closing evidence then omits a
+prerequisite the plan removes ("resolver evidence omits a required prerequisite",
+an internal error, on 16 and 18). What a drop does to a kept surface is bounded by
+the engine: a stored view, default, check or SQL-bodied routine that uses a member
+is a dependent (a blocker, refused first by name); only a body bound at call time,
+plpgsql's, finds nothing once the member is gone, which is the resolver's
+documented observation limit and is not refused lexically.
+
+All forty `catalog_change!()` arms were read again for a drop. All join: the drop
+reads no table, column, row, constraint or existing binding, `drop_impact`'s
+`drop_blockers` is the reader for table-like drops and a package has its own
+(`drop_facts`), and SQL Server never receives the change (the differ refuses
+extensions there, and its emitter says so by name). Two arms are pinned by tests
+and not left to the macro: the closing guard, and `touches` (a package touches
+no table, as a create does). A rehearsal is not required for a drop: when the
+project rehearses, the drop replays on the scratch and converges, and its
+evidence is the target's, not the scratch's.
+
+<a id="dec-2447-9"></a>
+
+**DEC-2447.9. A drop is a recorded human decision, through the mechanism every other drop uses.**
+
+`pbps drop-extension NAME --reason R` (and `pbps intent --drop-extension NAME
+REASON`) records `Intent::DropExtension`; identity resolution turns the uid into a
+tombstone (`was`, `dropped_at`, `reason`, `operator`), and a removal with no intent
+is `Blocker::DropExtensionNeedsReason` (from the baseline inventory, because a uid
+the target never installed is simply forgotten), shown with the command to run
+and asked as its own question by the prompt. The command's name is one constant
+(`report::DROP_EXTENSION`) and a test ties the batch flag, the command and the
+printed remedies to it. No `plan` or `apply` flag, environment variable or YAML
+field supplies the intent, and `--allow destructive` never does: risk approval and
+identity intent stay two gates. The design wrote `pbps drop extension`; `drop` is
+already the column command, so the existing hyphenated grammar wins. A lexical
+refusal of a module that names a member in an opaque body could be added later
+without reshaping anything here: it would be one more finding in
+`extensions::drops` over the sealed manifest.
+

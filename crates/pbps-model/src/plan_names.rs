@@ -349,6 +349,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::DropType { .. }
         | Change::RenameType { .. }
         | Change::CreateExtension { .. }
+        | Change::DropExtension { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { .. }

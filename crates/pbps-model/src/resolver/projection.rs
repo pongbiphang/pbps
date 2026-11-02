@@ -763,6 +763,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::SetColumnDeprecated { .. }
         | Change::CreateRole { .. }
         | Change::CreateExtension { .. }
+        | Change::DropExtension { .. }
         | Change::RenameRole { .. }
         | Change::DropRole { .. }
         | Change::Grant { .. }
