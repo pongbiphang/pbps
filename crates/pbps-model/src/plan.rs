@@ -527,7 +527,7 @@ pub struct DeclaredTypeBefore {
 /// One `CREATE EXTENSION` of the plan and what it was approved to bring:
 /// the provider the rehearsal read from the scratch after replaying the plan.
 /// The plan checksum covers it, so the manifest cannot be swapped.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionPin {
     pub uid: crate::Uid,

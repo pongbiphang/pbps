@@ -22,7 +22,17 @@ use std::fmt;
 /// types that tell overloads and operators apart. The parts are the engine's, so
 /// a schema-qualified function is two parts while a type is one rendered string
 /// (`ext.citext`); no consumer splits them.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderMember {
     pub class: String,
@@ -54,7 +64,9 @@ impl fmt::Display for ProviderMember {
 }
 
 /// An installed package and everything it owns or requires.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionProvider {
     pub definition: Extension,
