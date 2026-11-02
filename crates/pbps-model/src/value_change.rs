@@ -1,9 +1,10 @@
 //! Stored-value semantics shared by column retypes and type rebuilds (#2461).
 
 use crate::{Change, ColumnType, EnumRebuildStep};
+use schemars::JsonSchema;
 
 /// What stored values undergo, independently of the statements that move them.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValueChange {
     Cast {

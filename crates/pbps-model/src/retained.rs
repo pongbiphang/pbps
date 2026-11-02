@@ -1,9 +1,10 @@
 //! Approved expression spelling changes whose bound objects are retained.
 use crate::{Change, ChangeSet, ColumnRef, ObjectLocalName, Schema, TableName, Uid, ValueSource};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A logical lifecycle step, independent of its scheduled position.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RenameAnchor {
     pub uid: Uid,
@@ -11,7 +12,7 @@ pub struct RenameAnchor {
 }
 
 /// The target is tagged so another expression surface needs no payload redesign.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExpressionTarget {
     ColumnDefault {
@@ -72,7 +73,7 @@ impl ExpressionTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetainedExpression {
     pub target: ExpressionTarget,

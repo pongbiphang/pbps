@@ -6,9 +6,10 @@ use super::{
     InputManifest, ManifestError, ObjectTransition, OrderError, OrderingProof, SurfaceResolution,
 };
 use crate::{Change, ChangeSet};
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(
     tag = "kind",
     content = "evidence",
@@ -22,13 +23,13 @@ pub enum PlanAnalysis {
 
 /// The keyed-fingerprint design declassifies fingerprints, not external
 /// plaintext (DEC-952.1). There is no caller-selected public/private boolean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum EvidenceHandling {
     KeyedFingerprints,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ResolverRuntime {
     /// A scratch engine the operator vouches for: nothing about it was
@@ -56,14 +57,14 @@ pub enum ResolverRuntime {
 }
 
 /// How this run supplied one declared cross-database dependency (DEC-2376.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DependencyPlacement {
     Bound {},
     Companion { shape: DependencyShape },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyShape {
     Compared,
@@ -109,7 +110,7 @@ impl ResolverRuntime {
 }
 
 /// How the run held its scratch database (#1517).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ScratchLayout {
     /// A login and database the run created, and dropped after it.
@@ -119,7 +120,7 @@ pub enum ScratchLayout {
 }
 
 /// Where the resolver's scratch came from.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ScratchSource {
     /// A server the operator supplied. A struct variant, not a unit one:
@@ -133,7 +134,7 @@ pub enum ScratchSource {
 }
 
 /// What a baseline was allowed to change outside the scratch database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutsideWrites {
     Refused,
@@ -141,7 +142,9 @@ pub enum OutsideWrites {
 }
 
 /// Applicability is separate from consent, preserving legacy PostgreSQL bytes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum SameInstance {
     #[default]
@@ -159,9 +162,7 @@ impl SameInstance {
 /// The identity used to compile supported PostgreSQL resolver evidence.
 /// Target-side authorization fingerprints still describe their own checks;
 /// they cannot prove that a supplied scratch login reproduced the deployer.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorizationReproduction {
     Reproduced,
@@ -186,7 +187,7 @@ impl AuthorizationReproduction {
 
 /// Environment-keyed fingerprints of the complete qualified observations.
 /// Paths, source-bearing settings and executable metadata are not exported.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     pub rule: String,
@@ -221,14 +222,14 @@ pub struct Qualification {
 /// Apply asks the same question; another one would fingerprint other facts
 /// and refuse an unchanged target (#616). Schema names only, which the
 /// plan's changes name anyway.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetScope {
     pub schemas: Vec<String>,
     pub write_path_extras: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationCondition {
     pub rule: String,
@@ -246,7 +247,7 @@ pub struct AuthorizationCondition {
 
 /// This version covers creation-time bindings only; a runtime-bound body is
 /// an explicit limitation, retained in each manifest, never a verified body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum BindingCoverage {
     CreationTimeV1,
@@ -260,7 +261,7 @@ pub enum BindingCoverage {
 /// PostgreSQL compiled as the deployer or a supplied login stand-in (#2570).
 pub const EVIDENCE_VERSION: u32 = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverEvidence {
     version: u32,

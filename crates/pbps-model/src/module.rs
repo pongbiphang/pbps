@@ -31,6 +31,7 @@
 //! because a parameter is part of the object's contract, and modelling T-SQL
 //! parameter syntax would be parsing SQL — which this tool does not do (§8.2).
 
+use schemars::JsonSchema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -896,6 +897,8 @@ impl FromStr for RoutineId {
     }
 }
 
+string_json_schema!(ModuleId, RoutineId);
+
 // A routine names itself the same way inside a plan as it does as a map key:
 // one string, `app.f(integer,text)`, read back through the shape rule above.
 impl serde::Serialize for RoutineId {
@@ -912,7 +915,17 @@ impl<'de> serde::Deserialize<'de> for RoutineId {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleKind {
@@ -957,7 +970,7 @@ impl std::fmt::Display for ModuleKind {
 /// argument types live. Both were fields once; both are part of what the
 /// object *is* (ADR-0009 §1), and a field beside a key that has to agree with
 /// it is the bug that cannot detect itself.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Module {
     pub kind: ModuleKind,
@@ -989,7 +1002,9 @@ pub struct Module {
 /// Each part is part of what the module *is*, so it is compared, saved and
 /// read back like the definition. Kept in one struct so that a new part does
 /// not touch every place a [`Module`] is written down.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleOptions {
     /// `WITH SCHEMABINDING`: the engine records it
