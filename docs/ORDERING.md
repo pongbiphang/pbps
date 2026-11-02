@@ -890,7 +890,8 @@ decision or the issue named in its row.
   the enum and refuses one this file does not name, and
   `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
   column the code disagrees with.
-- A new database-global named object (today roles and types, `CatalogObject`)
+- A new database-global named object (today roles, types and extensions,
+  `CatalogObject`)
   is added to `catalog_change!` and to `Change::catalog_object` in
   `pbps_model::change`, which names every other variant. Every exhaustive match
   that lists the kinds alike uses `catalog_change!()`, so the new kind joins
@@ -898,6 +899,15 @@ decision or the issue named in its row.
   take the new kind out of the ones where it differs (DEC-2447.5). A
   `matches!` or `if let` does not use the macro, so a new kind never joins it
   unseen.
+- A kind that waits for another kind of its own class (a package for the
+  packages it requires, DEC-2447.6) needs two things: the effect edge, and a
+  rank in the differ's draft so that the draft does not contradict the effects.
+  Without the rank the order shadow in debug builds refuses the plan, naming the
+  edge.
+- The wildcard-allowed functions are where a new kind defaults silently, and
+  neither the compiler nor the macro finds them. Search for every function
+  marked `#[allow(clippy::wildcard_enum_match_arm)]` whose body names a role or
+  type variant, and decide each (the list for extensions is in DEC-2447.6).
 - A new ordering rule states an effect on existing resources, or supplies a
   factual constraint to an existing order-owned route. Only a new obligation
   needs a typed expansion. Check scoped compatibility/search predicates and

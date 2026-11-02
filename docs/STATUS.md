@@ -6,17 +6,19 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
-PostgreSQL extension read-only adoption is available (#2447 PR A,
-DEC-2447.1): exact quoted versions, explicit schemas, `e_` identities, pull,
+PostgreSQL extension adoption is available (#2447 PR A, DEC-2447.1), and
+`plan --db` plans a pinned `CREATE EXTENSION` (#2447 PR B, DEC-2447.6): rehearsed
+on the resolver scratch, gated as `extension-code`, sealed with the package's
+member manifest and vetted in the transaction that installs it. exact quoted versions, explicit schemas, `e_` identities, pull,
 baseline, verify and no-op plans. Pull selects new packages only through
 repeatable `--extension NAME`; existing declarations/identities stay selected.
 Unselected installed packages remain inventory with an opt-in hint (DEC-2447.3).
 Connected bootstrap adopts exact preinstalled
 package prerequisites without lifecycle DDL (DEC-2447.2); SQL replay checks
-exact package metadata before DDL. Lifecycle changes refuse by action name.
-Installed extension members remain excluded; unheld packages remain census
-advisories. Extension code execution, lifecycle approvals/rehearsal and
-extension-provided type/operator-class support remain later #2447 slices.
+exact package metadata before DDL. UPDATE, SET SCHEMA and DROP refuse by action
+name. Installed extension members remain excluded; unheld packages remain census
+advisories. Declarations that use a package's members and extension-provided
+type/operator-class support remain later #2447 slices.
 
 
 Preview `plan --dev` shares the resolver's SQL Server server/Docker acquisition
