@@ -66,21 +66,16 @@ fn mentions(object: &ObjectIdentity, set: &BTreeSet<ObjectIdentity>) -> bool {
 /// record already reached (a foreign key on another table that points at
 /// the seed), then, to a fixed point, every record whose identity names one
 /// (that key's RI triggers on either table and their dependency rows).
-fn reach(records: &[BindingRecord], seed: &BTreeSet<ObjectIdentity>) -> BTreeSet<ObjectIdentity> {
+fn reach<D: super::PlanningDialect>(
+    records: &[BindingRecord],
+    seed: &BTreeSet<ObjectIdentity>,
+) -> BTreeSet<ObjectIdentity> {
     let mut found = seed.clone();
     loop {
         let size = found.len();
         let dependents: Vec<_> = records
             .iter()
-            .filter(|entry| entry.object.class == "pg_depend")
-            .filter(|entry| {
-                entry
-                    .object
-                    .signature
-                    .get(1)
-                    .is_some_and(|referenced| found.contains(referenced))
-            })
-            .filter_map(|entry| entry.object.signature.first().cloned())
+            .filter_map(|entry| D::dependent_object(entry, &found))
             .collect();
         found.extend(dependents);
         let named: Vec<_> = records
@@ -111,12 +106,12 @@ fn table_of(surface: &Surface) -> Option<&pbps_model::TableName> {
 /// surface owns ride; a view or routine tied to the table keeps its own
 /// transition or its full fingerprint, and an unqualified record never
 /// rides (DEC-1274.1, #1466).
-fn sweep(
+fn sweep<D: super::PlanningDialect>(
     records: &[BindingRecord],
     tree: &BTreeSet<ObjectIdentity>,
     taken: &BTreeSet<ObjectIdentity>,
 ) -> BTreeSet<ObjectIdentity> {
-    let reached = reach(records, tree);
+    let reached = reach::<D>(records, tree);
     records
         .iter()
         .filter(|entry| {
@@ -212,7 +207,7 @@ fn declared(schema: &Schema, surface: &Surface) -> bool {
         Surface::Default(column) => schema
             .tables
             .get(&column.table)
-            .is_some_and(|table| table.expression_columns().any(|c| c == &column.name)),
+            .is_some_and(|table| table.binding_columns().any(|c| c == &column.name)),
         Surface::Check { table, name } => schema
             .tables
             .get(table)
@@ -244,7 +239,7 @@ fn specializes(child: &Surface, parent: &Surface) -> bool {
 /// name the final object; RENAME's `to` is final and its recorded UID locates
 /// the opening spelling. DROP records an explicit opening endpoint so a
 /// subsequent CREATE reusing the spelling cannot steal its inventory.
-pub(super) fn derive(
+pub(super) fn derive_for<D: super::PlanningDialect>(
     changes: &ChangeSet,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -368,13 +363,21 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 let final_column = final_column(uid, &table.column(name), desired);
                 (Surface::Column(final_column), true, false, true, None)
             }
-            // A computed column is SQL Server's (#1174), and PostgreSQL
-            // evidence has no transition for it; refuse rather than seal a
-            // plan whose column no inventory covers.
-            Change::AddComputedColumn { .. } | Change::DropComputedColumn { .. } => {
-                return Err(Error::Binding(
-                    "a computed column has no PostgreSQL resolver transition".into(),
-                ));
+            // A SQL Server computed column (#1174) is the Default-compatible
+            // surface of its column, as a PostgreSQL generated one is: its
+            // record is the column's own. It has no recorded identity, so
+            // a drop names the spelling it opened under (DEC-2143.2).
+            Change::AddComputedColumn { table, name, .. } => {
+                (Surface::Default(table.column(name)), false, false, true, None)
+            }
+            Change::DropComputedColumn { table, name, .. } => {
+                // The surface is named as the closing schema spells it; the
+                // drop's "before" is the table's opening spelling, which a
+                // rename in the same plan has already moved (the check and
+                // index drops resolve it the same way).
+                let surface = Surface::Default(table.column(name));
+                let before = Surface::Default(opening_table(&tables, base, table).column(name));
+                (surface, false, true, false, Some(before))
             }
             Change::DropColumn { uid, column, .. } => (
                 Surface::Column(column.clone()),
@@ -766,8 +769,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         } else {
             BTreeSet::new()
         };
-        let before = sweep(opening, &opening_tree, &taken_before);
-        let after = sweep(compiled, &compiled_tree, &taken_after);
+        let before = sweep::<D>(opening, &opening_tree, &taken_before);
+        let after = sweep::<D>(compiled, &compiled_tree, &taken_after);
         taken_before.extend(before.iter().cloned());
         taken_after.extend(after.iter().cloned());
         let transition = &mut transitions[anchor];
@@ -777,4 +780,15 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         transition.after.extend(after);
     }
     Ok(transitions)
+}
+
+#[cfg(test)]
+pub(super) fn derive(
+    changes: &ChangeSet,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    opening: &[BindingRecord],
+    compiled: &[BindingRecord],
+) -> Result<Vec<ObjectTransition>, Error> {
+    derive_for::<pbps_pg::Postgres>(changes, base, desired, opening, compiled)
 }

@@ -6,13 +6,13 @@ use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
 
-pub(crate) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
+pub(crate) fn surfaces(schema: &Schema, filter_binds: bool) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         // Generated expressions use the same binding surface as defaults;
         // omitting them rejects qualified evidence (DEC-1168.1). A
         // partition's own default is one too (DEC-1578.1).
-        for column in definition.expression_columns() {
+        for column in definition.binding_columns() {
             result.insert(Surface::Default(table.column(column)));
         }
         for name in definition.checks.keys() {
@@ -22,7 +22,7 @@ pub(crate) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
             });
         }
         for (name, index) in &definition.indexes {
-            if index.holds_expression() {
+            if index.holds_expression_when(filter_binds) {
                 result.insert(Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
@@ -38,9 +38,10 @@ pub(crate) fn coverage(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     observations: &[SurfaceResolution],
+    filter_binds: bool,
 ) -> Result<(), Error> {
-    let after = surfaces(desired.schema);
-    let opening = surfaces(base.schema);
+    let after = surfaces(desired.schema, filter_binds);
+    let opening = surfaces(base.schema, filter_binds);
     let base_names = base.ids.index();
     let before: BTreeSet<_> = opening
         .iter()

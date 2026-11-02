@@ -172,18 +172,14 @@ fn without(inventory: &(Vec<String>, Vec<String>), names: &[String]) -> (Vec<Str
     (keep(&inventory.0), keep(&inventory.1))
 }
 
-/// A run's acquisition against `scratch`: it reaches the reconstruction
-/// boundary, which is the run's own end, and releases what it made. Boxed,
-/// as `refusal` is: several acquisitions in one debug test otherwise exhaust
+/// A run's acquisition against `scratch`: it completes with a plan and
+/// releases what it made. Boxed, as `outcome` is: several acquisitions in one debug test otherwise exhaust
 /// the test thread's stack.
 fn run(scratch: &str) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
         let target = server("PBPS_TEST_DB");
-        let outcome = refusal(&target, scratch).await;
-        assert!(
-            matches!(&outcome, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2143")),
-            "{outcome}"
-        );
+        let outcome = outcome(&target, scratch).await;
+        assert!(outcome.is_ok(), "{}", why(&outcome));
     })
 }
 
@@ -1329,28 +1325,23 @@ async fn two_runs_that_start_together_on_one_supplied_database_exactly_one_proce
         }
         recovery::take();
         let (a, b) = tokio::join!(
-            refusal(&target, &supplied.connection),
-            refusal(&target, &supplied.connection)
+            outcome(&target, &supplied.connection),
+            outcome(&target, &supplied.connection)
         );
         let collected = recovery::take();
         let left = supplied.names().await;
         Box::pin(supplied.drop()).await;
         let outcomes = [a, b];
-        let proceeded = outcomes
-            .iter()
-            .filter(|o| matches!(o, ProduceError::Run(Error::Binding(r)) if r.contains("#2143")))
-            .count();
+        let proceeded = outcomes.iter().filter(|o| o.is_ok()).count();
         let refused = outcomes
             .iter()
-            .filter(|o| {
-                o.to_string()
-                    .contains("in use by a run that is still running")
-            })
+            .filter(|o| why(o).contains("in use by a run that is still running"))
             .count();
         assert_eq!(
             (proceeded, refused),
             (1, 1),
-            "{dead_sandbox}: exactly one proceeds and the other is refused: {outcomes:?}"
+            "{dead_sandbox}: exactly one proceeds and the other is refused: {:?}",
+            outcomes.iter().map(why).collect::<Vec<_>>()
         );
         assert_eq!(
             left,

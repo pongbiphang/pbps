@@ -20,6 +20,8 @@
     {"target": ["pbps-db", "test", "live_mssql"], "prefix": "", "owner": "mssql"},
     {"target": ["pbps-db", "test", "live_pg"], "prefix": "", "owner": "pg"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "annotations2469::", "owner": "mssql"},
+    {"target": ["pbps-mssql", "test", "live"], "prefix": "authorization2143::", "owner": "mssql"},
+    {"target": ["pbps-mssql", "test", "live"], "prefix": "builtins2143::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "binding_releases::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "capture2141::", "owner": "mssql"},
     {"target": ["pbps-mssql", "test", "live"], "prefix": "commutation::", "owner": "mssql"},

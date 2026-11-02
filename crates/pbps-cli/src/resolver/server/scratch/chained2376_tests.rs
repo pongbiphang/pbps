@@ -217,13 +217,9 @@ async fn mssql_native_chain_is_compared_and_merged_for_renderer_and_deferred_fil
                 assert!(roots.contains(&capture::object("dbo", "a")));
                 assert!(!roots.contains(&capture::object("dbo", "managed")));
                 let outcome =
-                    declared_refusal(target, scratch, &schema, file.as_deref(), &provenance())
-                        .await
-                        .to_string();
-                assert!(
-                    outcome.contains("planning from evidence") && outcome.contains("#2143"),
-                    "{outcome}"
-                );
+                    declared_outcome(target, scratch, &schema, file.as_deref(), &provenance())
+                        .await;
+                assert!(outcome.is_ok(), "{}", why(&outcome));
             }
             connection(target)
                 .await

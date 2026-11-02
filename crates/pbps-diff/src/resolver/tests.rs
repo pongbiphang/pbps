@@ -2049,10 +2049,10 @@ mod generated_surface_coverage {
             schema: &desired,
             ids: &after_ids,
         };
-        super::super::prepare::coverage(base_side, desired_side, &[removed(&a), removed(&b)])
+        super::super::prepare::coverage(base_side, desired_side, &[removed(&a), removed(&b)], true)
             .unwrap();
         assert!(matches!(
-            super::super::prepare::coverage(base_side, desired_side, &[removed(&a)]),
+            super::super::prepare::coverage(base_side, desired_side, &[removed(&a)], true),
             Err(super::super::Error::Coverage(_))
         ));
 
@@ -4793,7 +4793,7 @@ mod operations {
 
     /// Every surface of a schema the plan creates whole, observed.
     fn observed(desired: &Schema) -> Vec<SurfaceResolution> {
-        super::super::prepare::surfaces(desired)
+        super::super::prepare::surfaces(desired, true)
             .into_iter()
             .map(|surface| observation(surface, BTreeSet::new()))
             .collect()
@@ -5476,6 +5476,7 @@ fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
                     schema: &desired,
                     ids: &ids,
                 },
+                true,
             );
             assert!(edges.iter().any(|e| e.before == 1 && e.after == 2));
             assert_eq!(
@@ -5484,4 +5485,53 @@ fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
             );
         }
     }
+}
+
+/// A filter alone binds something only on an engine whose predicate may call a
+/// module; an expression key binds on every engine (DEC-2143.2).
+#[test]
+fn a_filtered_index_is_a_surface_only_where_its_filter_can_bind() {
+    use pbps_model::{Index, IndexColumn, IndexKey, Table, TableName};
+    let index = |key: IndexKey, filter: Option<&str>| Index {
+        columns: vec![IndexColumn {
+            key,
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: false,
+        filter: filter.map(str::to_owned),
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let mut table = Table::default();
+    table.indexes.insert(
+        "filtered".into(),
+        index(IndexKey::Column("id".into()), Some("id > 0")),
+    );
+    table.indexes.insert(
+        "expression".into(),
+        index(IndexKey::Expression("lower(name)".into()), None),
+    );
+    table
+        .indexes
+        .insert("plain".into(), index(IndexKey::Column("id".into()), None));
+    let schema = pbps_model::Schema {
+        tables: [(TableName::new("app", "t"), table)].into(),
+        ..Default::default()
+    };
+    let names = |filter_binds| -> Vec<String> {
+        super::prepare::surfaces(&schema, filter_binds)
+            .into_iter()
+            .filter_map(|s| {
+                if let Surface::Index { name, .. } = s {
+                    Some(name.raw().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    assert_eq!(names(true), ["expression", "filtered"]);
+    assert_eq!(names(false), ["expression"]);
 }

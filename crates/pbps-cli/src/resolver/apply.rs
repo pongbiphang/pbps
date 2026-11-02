@@ -39,6 +39,20 @@ pub struct Guard<'a> {
 /// describes another, and only a new plan describes this one.
 const PLAN_AGAIN: &str = "Plan again against the target as it is now.";
 
+pub const MSSQL_APPLY_PENDING: &str =
+    "this build cannot yet enforce SQL Server resolver evidence during apply (#2144)";
+
+/// Reader admission does not authorize applying evidence whose checks this
+/// build cannot execute. Ordinary SQL Server and resolved PostgreSQL keep
+/// their existing admission path (DEC-2143.3).
+pub fn enforceable(plan: &SavedPlan) -> bool {
+    !(plan.dialect == "mssql"
+        && matches!(
+            plan.analysis,
+            pbps_model::resolver::PlanAnalysis::Resolved(_)
+        ))
+}
+
 impl<'a> Keyed<'a> {
     /// Before apply connects (#616 step 1): the environment's key is the one
     /// the plan was sealed under (DEC-952.1). `None` for a plan without
@@ -52,6 +66,9 @@ impl<'a> Keyed<'a> {
         let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis else {
             return Ok(None);
         };
+        if !enforceable(plan) {
+            anyhow::bail!(MSSQL_APPLY_PENDING);
+        }
         let sealed = evidence.before().key_id();
         let key = key.map_err(|why| {
             anyhow::anyhow!(

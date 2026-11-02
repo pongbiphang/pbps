@@ -3414,6 +3414,14 @@ pub trait Dialect {
         false
     }
 
+    /// Whether a filter on an index can bind something when the index is
+    /// created (a PostgreSQL partial-index predicate may call a function). A
+    /// SQL Server filtered index predicate binds only its own table's
+    /// columns, so its index is no binding surface (DEC-2143.2).
+    fn filter_binds_expression(&self) -> bool {
+        true
+    }
+
     /// Whether this engine compares two names it holds by their exact
     /// spelling, so that two different spellings are never one name (#1964,
     /// DEC-1964.1). PostgreSQL's identifiers are compared byte for byte once

@@ -313,8 +313,7 @@ pub(crate) fn planned_schema_grants(
             Change::CreateRole { .. } | Change::RenameRole { .. } | Change::DropRole { .. }
         ) {
             return Err(
-                "persistent PostgreSQL authorization cannot project cluster role identity changes"
-                    .into(),
+                "persistent resolver authorization cannot project role identity changes".into(),
             );
         }
         let statement = match &p.change {
@@ -430,8 +429,8 @@ impl Authorization {
     pub(crate) fn same_context(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Postgres(left), Self::Postgres(right)) => left.canonical() == right.canonical(),
-            (Self::Postgres(_), Self::Mssql(_))
-            | (Self::Mssql(_), Self::Postgres(_) | Self::Mssql(_)) => false,
+            (Self::Mssql(left), Self::Mssql(right)) => left.canonical() == right.canonical(),
+            (Self::Postgres(_), Self::Mssql(_)) | (Self::Mssql(_), Self::Postgres(_)) => false,
         }
     }
 
@@ -456,7 +455,7 @@ impl Authorization {
             Self::Postgres(context) => {
                 Some(authorization_digest(key, &context.canonical(), grants))
             }
-            Self::Mssql(_) => None,
+            Self::Mssql(context) => Some(authorization_digest(key, &context.canonical(), grants)),
         }
     }
 
@@ -465,6 +464,16 @@ impl Authorization {
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
         changes: &pbps_model::ChangeSet,
         object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
+    ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
+        self.persisted_after(key, changes, object_grants, None)
+    }
+
+    pub(crate) fn persisted_after(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        changes: &pbps_model::ChangeSet,
+        object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
+        measured: Option<&mssql_auth::Condition>,
     ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
         use pbps_model::Change;
         let planned = planned_schema_grants(changes)?;
@@ -477,9 +486,8 @@ impl Authorization {
                 pg_auth::with_planned(context.clone(), &pg_planned(&planned)).canonical(),
             ),
             Self::Mssql(_) => {
-                return Err(
-                    "persistent SQL Server resolver authorization is not implemented".into(),
-                );
+                let measured = measured.ok_or("the SQL Server authorization after-state was not read from the verified reproduction")?;
+                (measured.before().canonical(), measured.after().canonical())
             }
         };
         let before_grants: Vec<_> = object_grants

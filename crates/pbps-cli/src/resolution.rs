@@ -18,36 +18,20 @@ use pbps_cli::resolver::server::ProduceError;
 use pbps_config::resolver::ResolverSelection;
 use pbps_diff::resolver::{Answer, Assessment};
 
-// Resolution returns a PostgreSQL-only opaque result. The concrete CLI
-// dispatch must retain that brand when ordinary and resolved plans meet;
-// ScopeInput cannot erase it back to an engine-free differ result.
-pub(crate) trait Continuation: crate::emission::Engine {
+// The dialect brand survives the ordinary continuation and the publication recheck.
+pub(crate) trait Continuation:
+    crate::emission::Engine + pbps_cli::resolver::server::PlanningDialect
+{
     fn with_scope(
         &self,
         scope: &pbps_diff::order::writebacks::ScopeInput,
-        resolved: &pbps_cli::resolver::server::Unsealed,
-    ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>>;
-}
-impl Continuation for pbps_pg::Postgres {
-    fn with_scope(
-        &self,
-        scope: &pbps_diff::order::writebacks::ScopeInput,
-        resolved: &pbps_cli::resolver::server::Unsealed,
+        resolved: &pbps_cli::resolver::server::Unsealed<Self>,
     ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>> {
         scope.append_to(resolved.changes().clone(), self)
     }
 }
-impl Continuation for pbps_mssql::Mssql {
-    fn with_scope(
-        &self,
-        _scope: &pbps_diff::order::writebacks::ScopeInput,
-        _resolved: &pbps_cli::resolver::server::Unsealed,
-    ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>> {
-        // resolve refuses this engine before it can return Unsealed. Keep
-        // that refusal at its existing point, without a cross-engine cast.
-        unreachable!("SQL Server resolution was refused before returning a plan")
-    }
-}
+impl Continuation for pbps_pg::Postgres {}
+impl Continuation for pbps_mssql::Mssql {}
 
 /// Which case a connected plan is in.
 pub enum Case<'a> {
@@ -93,7 +77,7 @@ pub struct ResolverAssessment {
     pub unaffected: usize,
     /// Kept surfaces the plan recreates from their declarations anyway.
     pub rebuilt: usize,
-    /// The identity actually used by the successful PostgreSQL resolver run.
+    /// The identity actually used by the successful resolver run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization: Option<pbps_model::resolver::AuthorizationReproduction>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,10 +295,10 @@ pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::
 ///
 /// The answer comes back unsealed: the caller runs its ordinary passes on
 /// it, rechecks the target, then seals it (#1516).
-pub(crate) async fn resolve(
+pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
     request: &Request<'_>,
     entry: &mut Entry<'_>,
-) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
+) -> Result<pbps_cli::resolver::server::Unsealed<D>, Refused> {
     let driver = request.target.driver();
     if let Err(missing) =
         pbps_cli::resolver::sealing::environment_key(request.project, request.target.environment())
@@ -341,7 +325,7 @@ pub(crate) async fn resolve(
                 .context("the declarations' bootstrap cannot be formed"),
         )
     })?;
-    producer::produce(request, driver, &bootstrap, entry).await
+    producer::produce::<D>(request, driver, &bootstrap, entry).await
 }
 
 /// A resolver's externals file, read only from under the project root.
@@ -526,12 +510,12 @@ mod producer {
     use super::{Entry, Refused, Request, unresolved};
     use pbps_cli::resolver::server::{Error, ProduceError};
 
-    pub(super) async fn produce(
+    pub(super) async fn produce<D: pbps_cli::resolver::server::PlanningDialect>(
         request: &Request<'_>,
         driver: pbps_db::Driver,
         bootstrap: &pbps_diff::order::DiffPlan,
         entry: &mut Entry<'_>,
-    ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
+    ) -> Result<pbps_cli::resolver::server::Unsealed<D>, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
             dependencies: request.dependencies,
             bootstrap,
@@ -547,7 +531,7 @@ mod producer {
             )));
         };
         let open = entry.open(driver, identity).await?;
-        scratch::produce_unsealed(
+        scratch::produce_unsealed::<D>(
             driver,
             &open.connection,
             request.target.connection(),
@@ -1047,7 +1031,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime");
-        let refusal = |target_identity| match rt.block_on(producer::produce(
+        let refusal = |target_identity| match rt.block_on(producer::produce::<pbps_pg::Postgres>(
             &request(target_identity),
             pbps_db::Driver::Postgres,
             &pbps_diff::diff(
@@ -1124,7 +1108,7 @@ mod tests {
                 hints: &hints,
                 target_identity: None,
             };
-            match rt.block_on(resolve(
+            match rt.block_on(resolve::<pbps_pg::Postgres>(
                 &request,
                 &mut Entry::new(&selection, &project, &target),
             )) {

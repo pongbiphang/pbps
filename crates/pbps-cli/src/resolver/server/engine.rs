@@ -39,14 +39,56 @@ pub(super) use pbps_pg::resolver::capture::BindingRecord;
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 
-/// Where a SQL Server run stops: reconstruction, the compiled capture and
-/// the target's opening capture exist, and planning from their evidence is
-/// #2143. Assessment exists; ordering from that evidence is the next boundary.
-const PLANNING_FROM_EVIDENCE: &str =
-    "SQL Server planning from evidence is not implemented yet (#2143)";
-
 fn unsupported() -> Error {
     Error::Binding("the resolver is implemented for PostgreSQL only".into())
+}
+
+/// Concrete planning type retained from the engine adapter through publication.
+/// Configuration comes from the qualified capture, never a cross-engine cast.
+pub trait PlanningDialect: pbps_dialect::Dialect + Clone + Send + Sync + 'static {
+    const DRIVER: Driver;
+    /// Whether an index filter binds at creation; see
+    /// `Dialect::filter_binds_expression`.
+    const FILTER_BINDS: bool;
+    fn configured(extras: &[String], version: Option<i64>) -> Self;
+    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]>;
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
+    ) -> Option<pbps_model::resolver::ObjectIdentity>;
+}
+impl PlanningDialect for pbps_pg::Postgres {
+    const DRIVER: Driver = Driver::Postgres;
+    const FILTER_BINDS: bool = true;
+    fn configured(extras: &[String], version: Option<i64>) -> Self {
+        let dialect = Self::with_write_path_extras(extras.to_vec());
+        version.map_or(dialect.clone(), |v| dialect.with_server_version(v))
+    }
+    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]> {
+        pbps_pg::resolver::binding_classes(surface)
+    }
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
+    ) -> Option<pbps_model::resolver::ObjectIdentity> {
+        pbps_pg::resolver::dependent_object(&record.object, &record.bindings, reached)
+    }
+}
+impl PlanningDialect for pbps_mssql::Mssql {
+    const DRIVER: Driver = Driver::Mssql;
+    const FILTER_BINDS: bool = false;
+    fn configured(_: &[String], _: Option<i64>) -> Self {
+        Self
+    }
+    fn binding_classes(surface: &pbps_model::resolver::Surface) -> Option<&'static [&'static str]> {
+        pbps_mssql::resolver::binding_classes(surface)
+    }
+    fn dependent_object(
+        record: &BindingRecord,
+        reached: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
+    ) -> Option<pbps_model::resolver::ObjectIdentity> {
+        pbps_mssql::resolver::dependent_object(&record.object, &record.bindings, reached)
+    }
 }
 
 /// The standard is engine-owned; the PostgreSQL conversion keeps callers of
@@ -348,6 +390,15 @@ impl Scratch<'_> {
 }
 
 impl Prepared {
+    pub(super) async fn authorization_condition(
+        &mut self,
+        target: &mut Conn,
+    ) -> Result<Option<Box<pbps_mssql::resolver::authorization::Condition>>, Error> {
+        match self {
+            Self::Postgres(_) => Ok(None),
+            Self::Mssql(prepared) => prepared.authorization_condition(target).await.map(Some),
+        }
+    }
     pub(super) fn completed_staged(&self) -> Option<Staged> {
         match self {
             Self::Mssql(prepared) => Some(Staged::Mssql(prepared.staged.clone())),
@@ -630,23 +681,32 @@ pub(super) fn ordinary(
 }
 
 impl Binding {
-    pub(super) fn plan(
+    pub(super) fn plan<D: PlanningDialect>(
         &self,
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
         hints: &Hints,
         extras: &[String],
         surfaces: &[SurfaceResolution],
-    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>, Error>
-    {
-        match self {
-            Self::Postgres(binding) => binding.plan(base, desired, hints, extras, surfaces),
-            Self::Mssql(_) => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
-        }
+    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>, Error> {
+        let version = match self {
+            Self::Postgres(binding) if D::DRIVER == Driver::Postgres => {
+                Some(binding.generation_version())
+            }
+            Self::Mssql(_) if D::DRIVER == Driver::Mssql => None,
+            Self::Postgres(_) | Self::Mssql(_) => {
+                return Err(Error::Binding(
+                    "the planning dialect and qualified capture belong to different engines".into(),
+                ));
+            }
+        };
+        let dialect = D::configured(extras, version);
+        pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
+            .map_err(|error| Error::Binding(error.to_string()))
     }
 }
 
-pub(super) fn surfaces(
+pub(super) fn surfaces<D: PlanningDialect>(
     driver: Driver,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -654,12 +714,10 @@ pub(super) fn surfaces(
     compiled: &[BindingRecord],
     assessment: &Assessment,
 ) -> Result<Vec<SurfaceResolution>, Error> {
-    match driver {
-        Driver::Postgres => {
-            super::resolution::from_sides(base, desired, opening, compiled, assessment)
-        }
-        Driver::Mssql => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
+    if driver != D::DRIVER {
+        return Err(unsupported());
     }
+    super::resolution::from_sides::<D>(base, desired, opening, compiled, assessment)
 }
 
 pub(super) fn reported_build(

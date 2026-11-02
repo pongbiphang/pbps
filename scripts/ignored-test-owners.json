@@ -2906,7 +2906,14 @@
         "predicate2400::case_regeneration_matches_native_three_valued_logic",
         "predicate2400::grouping_quoting_and_plain_strings_preserve_native_results",
         "predicate2400::current_engine_and_compatibility_facts_gate_new_function_shapes",
-        "predicate2400::datefirst_and_dateformat_remain_session_dependent"
+        "predicate2400::datefirst_and_dateformat_remain_session_dependent",
+        "authorization2143::schema_control_records_the_schema_owner_as_grantor",
+        "authorization2143::grant_option_records_the_deployer_as_grantor",
+        "authorization2143::a_plain_grant_preserves_an_existing_grant_option",
+        "authorization2143::revoking_grant_option_without_cascade_refuses_before_a_condition_exists",
+        "authorization2143::revoking_a_role_deny_restores_engine_reported_schema_and_column_permissions",
+        "authorization2143::an_unmapped_scratch_principal_is_named_and_never_sealed",
+        "builtins2143::engine_builtins_are_the_shipped_types_and_never_a_user_defined_one"
       ]
     },
     {

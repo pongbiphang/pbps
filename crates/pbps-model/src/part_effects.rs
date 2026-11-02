@@ -139,6 +139,10 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                         });
                     }
                 }
+                for column in table.computed.keys() {
+                    contained(Part::Column(name.column(column)));
+                    contained(Part::Generated(name.column(column)));
+                }
                 parts
             }
             Change::DropTable { name, .. } => vec![direct(Part::Table(name), Effect::Removed)],
@@ -168,6 +172,14 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 }
                 parts
             }
+            Change::AddComputedColumn { table, name, .. } => vec![
+                direct(Part::Column(table.column(name)), Effect::Created),
+                PartEffect { part: Part::Generated(table.column(name)), effect: Effect::Created, origin: Origin::Contained },
+            ],
+            Change::DropComputedColumn { table, name, .. } => vec![
+                direct(Part::Column(table.column(name)), Effect::Removed),
+                PartEffect { part: Part::Generated(table.column(name)), effect: Effect::Removed, origin: Origin::Contained },
+            ],
             Change::DropColumn { column, .. } => {
                 vec![direct(Part::Column(column.clone()), Effect::Removed)]
             }
@@ -278,8 +290,6 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             // the column (#1889).
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }

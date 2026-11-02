@@ -73,6 +73,7 @@ pub fn assess(
         &Engine {
             indexes_are_relations: dialect.indexes_share_namespace_with_tables(),
             normalize: &|definition| dialect.normalize_definition(definition),
+            filter_binds: dialect.filter_binds_expression(),
         },
     )
 }
@@ -84,6 +85,8 @@ struct Engine<'a> {
     /// The comparison form of a module definition, as the differ compares
     /// one (SPEC §8.2).
     normalize: &'a dyn Fn(&str) -> String,
+    /// Whether an index filter binds at creation (SQL Server's does not).
+    filter_binds: bool,
 }
 
 /// [`assess`], with the engine facts it reads.
@@ -93,7 +96,7 @@ fn assessed_with(
     ordinary: &ChangeSet,
     engine: &Engine<'_>,
 ) -> Assessment {
-    let after = surfaces(desired.schema);
+    let after = surfaces(desired.schema, engine.filter_binds);
     let parts: Vec<_> = ordinary
         .changes
         .iter()
@@ -107,7 +110,7 @@ fn assessed_with(
     // Asked once per base surface: indexed once (#1870).
     let base_names = base.ids.index();
     let desired_names = desired.ids.index();
-    for surface in surfaces(base.schema) {
+    for surface in surfaces(base.schema, engine.filter_binds) {
         let kept = forward(&surface, &base_names, desired.ids);
         if !after.contains(&kept) {
             continue;
@@ -360,6 +363,7 @@ mod tests {
         Engine {
             indexes_are_relations,
             normalize: &minimal,
+            filter_binds: true,
         }
     }
 

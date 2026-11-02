@@ -88,7 +88,7 @@ Reconstruction creates only target-present schemas. Verification re-asks the
 captured questions even if scratch's default or recipe changed, and names a
 required schema's presence, owner, permissions or grant mismatch. SQL-login
 qualification does not establish Windows-group default-schema behavior (#725)
-or enable persisted SQL Server planning/apply (#2143/#2144).
+or enable SQL Server apply of resolver evidence (#2144); planning and sealing are #2143.
 
 **Effective replay default (DEC-725.1).** For an existing default schema,
 the replay name comes from the deployer session's `SCHEMA_NAME()`, including
@@ -787,9 +787,10 @@ post-file inventory root and accepts the corresponding target shapes. Its
 capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
 the canonical `mssql-capture-v4` shape and its sealed prerequisites, so later
 rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals, compiles the declarations as the
-reproduced deployer (§5) and reads the compiled scratch and the target, then
-stops at the named boundary: planning from evidence (#2143). No planning or
-binding certificate is fabricated.
+reproduced deployer (§5), reads the compiled scratch and the target, plans from
+that evidence through `settle` and seals it (#2143, DEC-2143.1-.4). A build
+that reads the sealed evidence refuses to apply it until #2144 enforces it
+(DEC-2143.3).
 
 System-named keys, CHECKs, DEFAULTs, foreign keys and key-backed indexes use
 canonical declaration identities (DEC-2375.1). Private CHECK definitions stay
@@ -861,7 +862,7 @@ The managed declarations supply `dbo.managed`; the deferred file creates only
 its externals. Deferred statements do not interleave with managed steps.
 A failure names the numbered deferred statement, and partially created objects
 remain in the cleanup inventory. Same-instance file policy remains #2270's;
-preparation still does not publish evidence before #2143.
+the sealed evidence is read back through the SQL Server reader (DEC-2143.2).
 
 The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
 

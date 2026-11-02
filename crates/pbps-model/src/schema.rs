@@ -185,6 +185,16 @@ impl Table {
             )
     }
 
+    /// [`Self::expression_columns`] and the SQL Server computed columns: every
+    /// column whose creation binds an expression, which is what an inventory
+    /// of resolver surfaces counts (DEC-2143.2). A computed column binds the
+    /// functions and columns it reads when it is created, as a default does.
+    /// It is a separate list because the ordering reads `expression_columns`
+    /// as the columns that hold a default row, which a computed column does not.
+    pub fn binding_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        self.expression_columns().chain(self.computed.keys())
+    }
+
     /// Reused declared names across this table's constraint kinds.
     ///
     /// Separate maps cannot enforce this shared rule. Indexes are excluded:
@@ -1489,7 +1499,16 @@ impl Index {
     /// it is built after the modules it may call, and observed wherever a
     /// filtered index is (DEC-1169.2).
     pub fn holds_expression(&self) -> bool {
-        self.filter.is_some() || self.columns.iter().any(|c| c.key.expression().is_some())
+        self.holds_expression_when(true)
+    }
+
+    /// [`Self::holds_expression`] for an engine whose filter may not call a
+    /// module: SQL Server's filtered-index predicate binds only its own
+    /// table's columns, so a filter alone binds nothing at creation and the
+    /// index is no resolver surface there (DEC-2143.2).
+    pub fn holds_expression_when(&self, filter_binds: bool) -> bool {
+        (filter_binds && self.filter.is_some())
+            || self.columns.iter().any(|c| c.key.expression().is_some())
     }
 
     pub fn column_keys(&self) -> Option<Vec<ColumnName>> {
@@ -2310,6 +2329,38 @@ mod tests {
         assert_eq!(
             partition.expression_columns().cloned().collect::<Vec<_>>(),
             [crate::ColumnName::from("d")]
+        );
+    }
+
+    /// Computed columns count for an inventory of resolver surfaces, apart
+    /// from the columns that hold a default row (DEC-2143.2).
+    #[test]
+    fn binding_columns_add_computed_columns_to_the_expression_columns() {
+        let mut table = Table::default();
+        let mut d = Column::new("int".parse().unwrap());
+        d.value_source = crate::ValueSource::Default("0".into());
+        table.columns.insert("d".into(), d);
+        table.computed.insert(
+            "c".into(),
+            ComputedColumn {
+                expression: "d * 2".into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        assert_eq!(
+            table.expression_columns().cloned().collect::<Vec<_>>(),
+            [crate::ColumnName::from("d")],
+            "a computed column holds no default row"
+        );
+        assert_eq!(
+            table.binding_columns().cloned().collect::<Vec<_>>(),
+            [crate::ColumnName::from("d"), crate::ColumnName::from("c")]
+        );
+        assert_eq!(
+            Table::default().binding_columns().count(),
+            0,
+            "a table with neither binds no expression"
         );
     }
 }

@@ -240,6 +240,7 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
             &observations,
             old,
             wanted,
+            true,
         )
     });
     assert_eq!(projections, prepared.changes.changes.len());

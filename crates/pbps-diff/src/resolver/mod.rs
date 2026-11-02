@@ -251,7 +251,15 @@ fn scheduled(
         &mut schedule,
         &crate::order::slots::edges(&slots, None, &[]),
     );
-    for c in graph::constraints(changes, origins, owners, resolution, base, desired) {
+    for c in graph::constraints(
+        changes,
+        origins,
+        owners,
+        resolution,
+        base,
+        desired,
+        dialect.filter_binds_expression(),
+    ) {
         schedule.edge(c.before, c.after, c.source, c.reason);
     }
     for c in crate::order::generated::constraints(changes, desired.schema, declared, dialect) {
@@ -331,7 +339,7 @@ fn prepare(
     resolution: &[SurfaceResolution],
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<(crate::order::DiffPlan, prepare::Prepared), Error> {
-    prepare::coverage(base, desired, resolution)?;
+    prepare::coverage(base, desired, resolution, dialect.filter_binds_expression())?;
     let ordinary = ordinary(base, desired, dialect, hints)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
     let rebuilds = prepare::rebuilds(
