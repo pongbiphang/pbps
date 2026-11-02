@@ -3,6 +3,20 @@ use super::*;
 use pbps_diff::order::rebuild::*;
 use pbps_model::*;
 
+mod snapshot {
+    include!("catalog_snapshot.rs");
+}
+
+async fn owned_snapshot(db: &mut TestDb, suffix: &str) -> Schema {
+    snapshot::owned_roles(
+        pbps_pg::catalog::introspect(&mut db.conn)
+            .await
+            .unwrap()
+            .schema,
+        |name| name.ends_with(suffix),
+    )
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
@@ -11,10 +25,8 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
     db.conn.execute("CREATE INDEX parent_plain ON app.parent(id); CREATE INDEX child_memo ON app.child(memo)").await.unwrap();
     let role = super::super::least_privilege_role(&mut db, "factory2298").await;
     db.conn.execute(&format!("GRANT SELECT ON app.parent,app.left_view TO {role}; GRANT EXECUTE ON FUNCTION app.composite(app.parent) TO {role}")).await.unwrap();
-    let base = pbps_pg::catalog::introspect(&mut db.conn)
-        .await
-        .unwrap()
-        .schema;
+    let role_suffix = format!("_factory2298_{}", std::process::id());
+    let base = owned_snapshot(&mut db, &role_suffix).await;
     let ctx = pbps_diff::Context {
         operator: "maintainer".into(),
         today: "2026-10-24".into(),
@@ -245,16 +257,71 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
         );
     }
     db.conn.execute("ROLLBACK").await.unwrap();
-    assert_eq!(
-        pbps_pg::catalog::introspect(&mut db.conn)
-            .await
-            .unwrap()
-            .schema,
-        base
-    );
+    assert_eq!(owned_snapshot(&mut db, &role_suffix).await, base);
     db.conn
         .execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
         .await
         .unwrap();
     db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn an_unrelated_cluster_role_does_not_change_a_replay_snapshot() {
+    let mut db = TestDb::create("snapshot_foreign2608").await;
+    db.conn
+        .execute("CREATE TABLE public.kept(id integer)")
+        .await
+        .unwrap();
+    let suffix = format!("_snapshot_foreign2608_{}", std::process::id());
+    let before = owned_snapshot(&mut db, &suffix).await;
+    let unrelated = format!("pbps_noise_snapshot2608_{}", std::process::id());
+    let mut outside = db.second().await;
+    db.conn.execute("BEGIN").await.unwrap();
+    outside
+        .execute(&format!("CREATE ROLE {unrelated}"))
+        .await
+        .unwrap();
+    db.conn.execute("ROLLBACK").await.unwrap();
+    let after = owned_snapshot(&mut db, &suffix).await;
+    // Clean up before asserting, so the intentional revert witness leaves no role.
+    outside
+        .execute(&format!("DROP ROLE {unrelated}"))
+        .await
+        .unwrap();
+    drop(outside);
+    db.drop().await;
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_leaked_own_role_still_changes_a_replay_snapshot() {
+    let mut db = TestDb::create("snapshot_own2608").await;
+    let suffix = format!("_snapshot_own2608_{}", std::process::id());
+    let before = owned_snapshot(&mut db, &suffix).await;
+    let leaked = format!("pbps_leaked{suffix}");
+    let mut outside = db.second().await;
+    db.conn.execute("BEGIN").await.unwrap();
+    // Model an escaped caller-side write: a second connection commits a role
+    // in our namespace, so rolling back the main transaction cannot remove it.
+    outside
+        .execute(&format!("CREATE ROLE {leaked}"))
+        .await
+        .unwrap();
+    db.conn.execute("ROLLBACK").await.unwrap();
+    let after = owned_snapshot(&mut db, &suffix).await;
+    outside
+        .execute(&format!("DROP ROLE {leaked}"))
+        .await
+        .unwrap();
+    drop(outside);
+    db.drop().await;
+    assert!(!before.roles.contains_key(leaked.as_str()));
+    assert!(after.roles.contains_key(leaked.as_str()));
+    let assertion = std::panic::catch_unwind(|| assert_eq!(after, before));
+    assert!(
+        assertion.is_err(),
+        "an own-role leak must fail snapshot equality"
+    );
 }
