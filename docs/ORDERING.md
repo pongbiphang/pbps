@@ -889,6 +889,14 @@ decision or the issue named in its row.
   the enum and refuses one this file does not name, and
   `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
   column the code disagrees with.
+- A new database-global named object (today roles and types, `CatalogObject`)
+  is added to `catalog_change!` and to `Change::catalog_object` in
+  `pbps_model::change`, which names every other variant. Every exhaustive match
+  that lists the kinds alike uses `catalog_change!()`, so the new kind joins
+  those arms without a compile error: read each `catalog_change!()` site and
+  take the new kind out of the ones where it differs (DEC-2447.5). A
+  `matches!` or `if let` does not use the macro, so a new kind never joins it
+  unseen.
 - A new ordering rule states an effect on existing resources, or supplies a
   factual constraint to an existing order-owned route. Only a new obligation
   needs a typed expansion. Check scoped compatibility/search predicates and

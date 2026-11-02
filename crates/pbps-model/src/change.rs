@@ -1409,6 +1409,118 @@ pub enum PermissionChange<'a> {
     Revoked(&'a BTreeSet<Permission>),
 }
 
+/// The database-global named objects a plan creates, drops and renames by
+/// identity: roles and types. Enum value and domain edits, grants and the rest
+/// act *on* one of them and are not themselves a kind of catalog object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CatalogObject {
+    Role,
+    Type,
+}
+
+/// The `Change` patterns of the catalog objects, for a match arm that treats
+/// all of them alike: `catalog_change!()` is every one, `catalog_change!(roles)`
+/// and `catalog_change!(types)` one kind.
+///
+/// A macro and not a method, because a match guard does not count towards
+/// exhaustiveness: `c if c.catalog_object().is_some() => ..` would force a
+/// `_ =>` arm, and a wildcard on `Change` is what lets a new variant slip past
+/// every consumer (ORDERING, "Keeping this current"). Expanding to the variant
+/// patterns keeps every such match exhaustive. It is also what
+/// [`Change::catalog_object`] is built from, so the two cannot disagree.
+///
+/// The cost is that a kind added here joins every arm that uses the macro
+/// without a compile error. Use it only for an arm that is true of any
+/// database-global object, and when adding a kind, read every
+/// `catalog_change!()` site and take out of it those where the kind differs.
+/// Do not use it in `matches!` or `if let`, which are not exhaustive: a new
+/// kind would join them with nothing to say it did.
+#[macro_export]
+macro_rules! catalog_change {
+    () => {
+        $crate::catalog_change!(roles) | $crate::catalog_change!(types)
+    };
+    (roles) => {
+        $crate::Change::CreateRole { .. }
+            | $crate::Change::DropRole { .. }
+            | $crate::Change::RenameRole { .. }
+    };
+    (types) => {
+        $crate::Change::CreateType { .. }
+            | $crate::Change::DropType { .. }
+            | $crate::Change::RenameType { .. }
+    };
+}
+
+impl Change {
+    /// The kind of catalog object this change creates, drops or renames, or
+    /// `None` for every other change.
+    ///
+    /// Total on purpose: each variant is named, so a new one does not compile
+    /// until someone decides which side it is on. Read this before listing a
+    /// variant in a consumer's own `Role`/`Type` arms.
+    #[must_use]
+    pub fn catalog_object(&self) -> Option<CatalogObject> {
+        match self {
+            crate::catalog_change!(roles) => Some(CatalogObject::Role),
+            crate::catalog_change!(types) => Some(CatalogObject::Type),
+            Change::RebuildPartitionedTable(..)
+            | Change::CopyTableRows(..)
+            | Change::AnalyzeTableTree(..)
+            | Change::BuildPartitionedIndex(..)
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::AlterDomain { .. }
+            | Change::EnumRebuild { .. }
+            | Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::DetachPartition { .. }
+            | Change::AttachPartition { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetReplicaIdentity { .. }
+            | Change::SetStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
+            | Change::SetPartitionDefault { .. }
+            | Change::SetPartitionNotNull { .. }
+            | Change::SetIndexStorageParameters { .. }
+            | Change::CreatePolicy { .. }
+            | Change::DropPolicy { .. }
+            | Change::SetRowSecurity { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::SetEnsureKeys { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => None,
+        }
+    }
+}
+
 impl Change {
     /// What this change acts on, for grouping in output and for ordering:
     /// `dbo.customer`, or `role app_reader`.
@@ -1536,12 +1648,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => return None,
@@ -1642,12 +1749,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -1769,12 +1871,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -1879,12 +1976,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -2015,12 +2107,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -2094,12 +2181,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -2193,12 +2275,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. } => None,
+            | crate::catalog_change!() => None,
         }
     }
 
@@ -2341,12 +2418,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -2464,12 +2536,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -2550,12 +2617,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => Vec::new(),
@@ -2704,12 +2766,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
@@ -2858,12 +2915,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -2923,12 +2975,7 @@ impl Change {
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,

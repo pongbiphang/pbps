@@ -121,13 +121,8 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
-        | Change::CreateType { .. }
+        | pbps_model::catalog_change!()
         | Change::AlterDomain { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
         | Change::AddEnumValue { .. }
