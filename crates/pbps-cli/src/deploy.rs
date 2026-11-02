@@ -7640,11 +7640,13 @@ fn plan_db(
 }
 
 /// A plan with no target assertions: the scratch test runner plans this way
-/// and runs its own assertions on its own database.
+/// and runs its own assertions on its own database. Not an `async fn`: an
+/// extra async layer would hold the whole planning future twice, which
+/// overflows a test thread's stack in a debug build.
 #[allow(clippy::too_many_arguments)]
-async fn plan_db_async(
-    project: &Project,
-    target: &Target,
+fn plan_db_async<'a>(
+    project: &'a Project,
+    target: &'a Target,
     declarations: services::Declarations,
     dialect: crate::emission::SelectedDialect,
     script: bool,
@@ -7652,9 +7654,9 @@ async fn plan_db_async(
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
-    carried: &mut Vec<crate::output::Finding>,
+    carried: &'a mut Vec<crate::output::Finding>,
     quiet: bool,
-) -> anyhow::Result<services::PlanResult> {
+) -> impl std::future::Future<Output = anyhow::Result<services::PlanResult>> + 'a {
     plan_db_selected(
         project,
         target,
@@ -7669,7 +7671,6 @@ async fn plan_db_async(
         carried,
         quiet,
     )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7856,9 +7857,11 @@ async fn plan_db_selected(
         // First, before the resolver and rehearsal: a violation stops cheaply,
         // and a refused login never reaches the expensive steps (DEC-2401.4).
         // Run on fresh assertion connections; the planning session only names
-        // the target they must match.
+        // the target they must match. Boxed: the engines' runner futures are
+        // large and would otherwise grow every frame that holds this block,
+        // overflowing a test thread's stack in the rehearsal tests.
         if let Some(selection) = assertions {
-            match selection.run(&mut conn).await {
+            match Box::pin(selection.run(&mut conn)).await {
                 Ok(passed) => target_assertions = passed,
                 Err(crate::plan_assert::Stop::Refused(finding)) => {
                     return Ok(Connected::Refused { finding, findings: checkout_findings.clone() });
