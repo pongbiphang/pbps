@@ -646,7 +646,11 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::SetColumnDeprecated { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }
-            | Change::DropRole { .. } => continue,
+            | Change::DropRole { .. }
+            // A package's members are new to the target and no standing
+            // object's fingerprint reads them until a declaration does
+            // (member consumers, DEC-2447.7).
+            | Change::CreateExtension { .. } => continue,
         };
         let entry = affected.entry(surface).or_default();
         entry.children |= children;

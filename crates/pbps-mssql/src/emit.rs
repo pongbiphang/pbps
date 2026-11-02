@@ -310,6 +310,10 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             feature: format!("declared type {}", name.shown()),
         }),
+        Change::CreateExtension { name, .. } => Err(DialectError::Unsupported {
+            dialect: crate::types::DIALECT,
+            feature: format!("extension {}", name.shown()),
+        }),
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable { name, table, .. } => {

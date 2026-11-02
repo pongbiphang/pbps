@@ -4830,6 +4830,27 @@ pub(crate) fn emit_in(
         // arrived some other way names the statement a human has to run,
         // rather than becoming SQL that widens or narrows the whole cluster's
         // idea of who a principal is.
+        // Exactly what the declaration pins: no `IF NOT EXISTS`, which would
+        // adopt a package that is already there, and no `CASCADE`, which would
+        // install a prerequisite at a version nobody approved (DEC-2447.6).
+        Change::CreateExtension {
+            uid,
+            name,
+            definition,
+            ..
+        } => {
+            let mut statement = Statement::new(format!(
+                "CREATE EXTENSION {} SCHEMA {} VERSION {};",
+                quote(name.raw())?,
+                quote(&definition.schema)?,
+                literal(&definition.version)
+            ));
+            statement.extension = Some(pbps_dialect::ExtensionStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+            });
+            Ok(vec![statement])
+        }
         Change::CreateRole { name, .. } => {
             let statement = format!("CREATE ROLE {};", quote(name.raw())?);
             Err(by_hand(

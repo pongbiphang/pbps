@@ -1353,6 +1353,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             Change::RenameTable { from, .. } => Surface::Table(from.clone()),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
+            | Change::CreateExtension { .. }
             | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }

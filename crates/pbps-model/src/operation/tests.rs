@@ -270,6 +270,7 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
             | ObjectKey::Column(_)
             | ObjectKey::Type(_)
             | ObjectKey::Role(_)
+            | ObjectKey::Extension(_)
             | ObjectKey::NotNull(_)
             | ObjectKey::Rows { .. }
             | ObjectKey::ColumnOrder(_)

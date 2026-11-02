@@ -117,8 +117,8 @@ ALLOWED = {
         "builds encoded role filenames from original bytes; the key remains raw",
     ),
     "crates/pbps-model/src/change.rs": (
-        2,
-        "role subjects are raw grouping and policy keys, which remain raw",
+        3,
+        "role and extension subjects are raw grouping and policy keys, which remain raw",
     ),
     "crates/pbps-cli/src/resolver/scope.rs": (
         1,

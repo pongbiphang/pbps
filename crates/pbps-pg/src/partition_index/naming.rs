@@ -224,7 +224,8 @@ impl<'a> Allocation<'a> {
                     Namespace::Types(_)
                     | Namespace::Table(_, _)
                     | Namespace::Routines(_)
-                    | Namespace::Roles => None,
+                    | Namespace::Roles
+                    | Namespace::Extensions => None,
                 };
                 if schema == Some(&leaf.schema) {
                     unavailable.insert(slot.name.clone());

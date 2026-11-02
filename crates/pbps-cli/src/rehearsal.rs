@@ -285,6 +285,11 @@ pub struct Findings {
     pub structural: Vec<String>,
     pub spelling: Vec<String>,
     pub externals_staged: bool,
+    /// What each package the plan installed owns on the scratch after the
+    /// replay, read from the scratch itself: the manifest the plan pins
+    /// (DEC-2447.6). Empty for a plan that installs none.
+    pub extensions:
+        std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionProvider>,
 }
 
 impl Findings {
@@ -303,8 +308,35 @@ pub async fn rehearse_in(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Findings> {
-    // A scratch bootstrap assumes package state, never permission to install it.
-    crate::engine::require_scratch_extensions(conn, &declared.extensions).await?;
+    // A scratch bootstrap assumes package state, never permission to install
+    // it: every declared package is already there, except the ones this plan
+    // installs, which the scratch must be able to install the same way the
+    // target is checked (DEC-2447.6).
+    let created: std::collections::BTreeMap<_, _> = plan
+        .iter()
+        .filter_map(|s| s.extension.as_ref())
+        .filter_map(|e| Some((e.name.clone(), declared.extensions.get(&e.name)?.clone())))
+        .collect();
+    let standing: std::collections::BTreeMap<_, _> = declared
+        .extensions
+        .iter()
+        .filter(|(name, _)| !created.contains_key(*name))
+        .map(|(name, definition)| (name.clone(), definition.clone()))
+        .collect();
+    crate::engine::require_scratch_extensions(conn, &standing).await?;
+    if !created.is_empty() {
+        let problems = pbps_pg::resolver::scratch::extension_requirements(conn, &created).await?;
+        anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
+        // The target was checked for the schema, so the scratch that stands for
+        // it has it: a package is installed into a schema that is there.
+        let schemas: Vec<String> = created
+            .values()
+            .map(|definition| definition.schema.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        pbps_pg::resolver::scratch::create_schemas(conn, &schemas).await?;
+    }
     // The rehearsal reads the rows back and compares; a spelling the engine
     // reads differently would fail that comparison without saying which
     // spelling to write. Asked first, as every connected command asks
@@ -367,6 +399,15 @@ pub async fn rehearse_in(
     )
     .await?;
 
+    // Read before anything else touches the scratch: it is what the engine
+    // holds for the package after the plan's own statements, not a guess.
+    let extensions = if created.is_empty() {
+        Default::default()
+    } else {
+        pbps_pg::resolver::scratch::extension_manifests(conn, &created.keys().collect::<Vec<_>>())
+            .await
+            .context(words.read)?
+    };
     let built = crate::engine::introspect(conn, crate::engine::Read::Snapshot)
         .await
         .context(words.read)?;
@@ -470,6 +511,7 @@ pub async fn rehearse_in(
         structural,
         spelling,
         externals_staged: false,
+        extensions,
     })
 }
 
@@ -905,21 +947,26 @@ mod tests {
         };
         let (lowered, _) = lower_from_empty(&pg, &schema, &ids, &Default::default()).unwrap();
         assert!(lowered.statements().is_empty());
-        assert!(
-            pbps_diff::diff(
-                pbps_diff::Side {
-                    schema: &Schema::default(),
-                    ids: &IdsFile::default()
-                },
-                pbps_diff::Side {
-                    schema: &schema,
-                    ids: &ids
-                },
-                &pg,
-                &Default::default()
-            )
-            .is_err()
-        );
+        // The same declarations compared with a target that lacks the package
+        // are one create, which a bootstrap never emits because it starts from
+        // the packages it was handed (`bootstrap_base`).
+        let planned = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &Schema::default(),
+                ids: &IdsFile::default(),
+            },
+            pbps_diff::Side {
+                schema: &schema,
+                ids: &ids,
+            },
+            &pg,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            planned.changes().changes.as_slice(),
+            [p] if matches!(p.change, pbps_model::Change::CreateExtension { .. })
+        ));
     }
 
     #[test]

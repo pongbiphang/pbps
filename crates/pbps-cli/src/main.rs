@@ -5415,6 +5415,24 @@ fn cmd_plan(
             }
         }
 
+        // A package this plan would install has no scratch to read its members
+        // from here, so no manifest to pin. The preview above shows the create
+        // (and `--out` marks it unapplyable), so that a first plan can still
+        // mint the identity; a script or a dev rehearsal of it would run the
+        // package's install script unvetted, so each refuses by name, and
+        // `plan --db` plans it (DEC-2447.6).
+        let unsealed = || -> anyhow::Result<()> {
+            match deploy::created_extensions(cs.changes()).next() {
+                Some(name) => bail!(
+                    "{}",
+                    pbps_diff::DiffError::ExtensionCreateNeedsDatabase { name: name.clone() }
+                ),
+                None => Ok(()),
+            }
+        };
+        if sql.is_some() {
+            output::or_unanswerable("plan", json, "plan.unrenderable", unsealed())?;
+        }
         if let Some(path) = sql {
             // Rendering can fail for the same reason `explain` can — a typed change
             // the emitter refuses — and writing for the same reason `--out` can.
@@ -5460,6 +5478,7 @@ fn cmd_plan(
             )?
         };
         if let Some(spec) = dev_spec {
+            output::or_unanswerable("plan", json, "plan.unrenderable", unsealed())?;
             // Rendered first, and wrapped in its own right. As an argument it was
             // evaluated *before* the wrapper was entered, so an emitter refusal
             // here escaped exactly the envelope the call around it was added to

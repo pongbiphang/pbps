@@ -51,10 +51,15 @@ pub fn switched_off(project: &pbps_config::Project, environment: Option<&str>, f
         .is_some_and(|environment| environment.rehearse == Some(false))
 }
 
+/// What each package a plan installs owned on the scratch after the replay.
+pub type Manifests =
+    std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionProvider>;
+
 /// What a rehearsal decided about a plan.
 pub enum Verdict {
-    /// The plan converged; the record to seal into it.
-    Sealed(pbps_model::Rehearsal),
+    /// The plan converged; the record to seal into it, and the manifest of
+    /// each package it installs as the scratch held it afterwards.
+    Sealed(pbps_model::Rehearsal, Manifests),
     /// The plan was refused, and nothing is written.
     Refused(crate::output::Finding),
 }
@@ -314,17 +319,20 @@ fn verdict(
             )
             .remedy("fix the declarations or the plan; nothing was written"),
         )),
-        Ok((findings, authorization)) => Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged {
-            entry: Text::from(entry),
-            scratch: scratch.clone(),
-            layout,
-            spelling: findings
-                .spelling
-                .iter()
-                .map(|line| Text::from(line.as_str()))
-                .collect(),
-            authorization,
-        })),
+        Ok((findings, authorization)) => Ok(Verdict::Sealed(
+            pbps_model::Rehearsal::Converged {
+                entry: Text::from(entry),
+                scratch: scratch.clone(),
+                layout,
+                spelling: findings
+                    .spelling
+                    .iter()
+                    .map(|line| Text::from(line.as_str()))
+                    .collect(),
+                authorization,
+            },
+            findings.extensions,
+        )),
     }
 }
 
@@ -374,6 +382,7 @@ mod tests {
             structural: structural.iter().map(|line| (*line).to_owned()).collect(),
             spelling: spelling.iter().map(|line| (*line).to_owned()).collect(),
             externals_staged: false,
+            extensions: Default::default(),
         }
     }
 
@@ -403,12 +412,15 @@ mod tests {
             "{}",
             finding.message
         );
-        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged {
-            entry,
-            layout,
-            spelling,
-            ..
-        })) = judged(Ok(findings(&[], &["check c on t", "index i on t"])))
+        let Ok(Verdict::Sealed(
+            pbps_model::Rehearsal::Converged {
+                entry,
+                layout,
+                spelling,
+                ..
+            },
+            _,
+        )) = judged(Ok(findings(&[], &["check c on t", "index i on t"])))
         else {
             panic!("a respelling is sealed");
         };
@@ -416,7 +428,7 @@ mod tests {
         assert_eq!(layout, pbps_model::resolver::ScratchLayout::Supplied);
         assert_eq!(spelling.len(), 2);
         // Negative: nothing differing at all is sealed with no spelling.
-        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { spelling, .. })) =
+        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { spelling, .. }, _)) =
             judged(Ok(findings(&[], &[])))
         else {
             panic!("an exact match is sealed");
@@ -476,16 +488,18 @@ mod tests {
         let skipped = AuthorizationRehearsal::NotRehearsed {
             reason: "no CREATEROLE".into(),
         };
-        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. })) = verdict(
-            "ci",
-            &pbps_model::resolver::ScratchSource::Server {},
-            pbps_model::resolver::ScratchLayout::Supplied,
-            Ok((findings(&[], &[]), skipped.clone())),
-        ) else {
+        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. }, _)) =
+            verdict(
+                "ci",
+                &pbps_model::resolver::ScratchSource::Server {},
+                pbps_model::resolver::ScratchLayout::Supplied,
+                Ok((findings(&[], &[]), skipped.clone())),
+            )
+        else {
             panic!("a downgraded rehearsal that converged is sealed");
         };
         assert_eq!(authorization, skipped);
-        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. })) =
+        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. }, _)) =
             judged(Ok(findings(&[], &[])))
         else {
             panic!("a full rehearsal is sealed");

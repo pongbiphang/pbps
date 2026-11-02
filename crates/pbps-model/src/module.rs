@@ -1107,6 +1107,13 @@ pub struct Hints {
     /// the swap, as a trigger whose table changes hands does (DEC-1635.7).
     pub enum_dependents: std::collections::BTreeSet<crate::ModuleId>,
 
+    /// The packages each declared-but-absent extension's control file requires,
+    /// read from the target's package catalog at plan time. A fact about the
+    /// target, absent offline: it is what lets a create wait for the prerequisite
+    /// this plan also creates (DEC-2447.6).
+    pub extension_requires:
+        BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ObjectLocalName>>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).

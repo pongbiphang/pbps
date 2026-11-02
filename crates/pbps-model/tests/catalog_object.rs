@@ -43,6 +43,18 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
             CatalogObject::Role,
         ),
         (
+            Change::CreateExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.6".into(),
+                },
+                requires: Default::default(),
+            },
+            CatalogObject::Extension,
+        ),
+        (
             Change::CreateType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 name: type_name(),
@@ -141,11 +153,17 @@ fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
             kind == CatalogObject::Type,
             "{change:?}"
         );
+        assert_eq!(
+            matches!(change, catalog_change!(extensions)),
+            kind == CatalogObject::Extension,
+            "{change:?}"
+        );
     }
     for change in others() {
         assert!(!matches!(change, catalog_change!()), "{change:?}");
         assert!(!matches!(change, catalog_change!(roles)), "{change:?}");
         assert!(!matches!(change, catalog_change!(types)), "{change:?}");
+        assert!(!matches!(change, catalog_change!(extensions)), "{change:?}");
     }
 }
 
@@ -181,6 +199,7 @@ fn the_classifier_names_every_variant_not_a_catalog_object() {
         "CreateType",
         "DropType",
         "RenameType",
+        "CreateExtension",
     ];
     for variant in &variants {
         let named = body.contains(&format!("Change::{variant} "))

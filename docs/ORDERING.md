@@ -301,7 +301,7 @@ The differ sorts every planned change by, in order:
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
    | 6 | `DropTable`; an `AlterColumnNumbering` giving up, renaming, or (on a column neither tightened nor retyped) turning into an identity an owned sequence, at (6, 1 + its depth in the chain of names they free) |
-   | 7 | `CreateType`, `AddEnumValue`, `RenameEnumValue` before `CreateTable`; a domain's `Loosen` that sets a default, after every label change (7, last) |
+   | 7 | `CreateExtension`, `CreateType`, `AddEnumValue`, `RenameEnumValue` before `CreateTable`; one package after the packages it requires, by an edge; a domain's `Loosen` that sets a default, after every label change (7, last) |
    | 8 | `AddColumn` |
    | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
@@ -481,6 +481,7 @@ requirement is common to all of them, so it is listed once,
 | Change | Class | Requires before it | Creates, removes or rewrites | Effects (checked) |
 |---|---|---|---|---|
 | `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views and catalog-bound ordinary DEFAULT holders | Removes the module, frees its name | removes |
+| `CreateExtension` | 7, with `CreateType`; after each package of the plan its control file requires | The name free. P: each of those packages' final incarnation | A package, brought in by one `CREATE EXTENSION`; the objects it owns are read back and pinned, not ordered (DEC-2447.6, DEC-2447.7) | Is, creates |
 | `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
 | `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |

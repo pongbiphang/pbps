@@ -570,7 +570,10 @@ impl Contract {
             })
         };
         let reference = match key {
-            ObjectKey::Table(uid) | ObjectKey::Type(uid) | ObjectKey::Role(uid) => ObjectRef {
+            ObjectKey::Table(uid)
+            | ObjectKey::Type(uid)
+            | ObjectKey::Role(uid)
+            | ObjectKey::Extension(uid) => ObjectRef {
                 root: BoundRoot::Recorded(uid.uid().clone()),
                 part: Selector::Whole,
             },

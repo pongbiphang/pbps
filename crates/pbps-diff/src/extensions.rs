@@ -31,8 +31,98 @@ pub fn bootstrap_base(desired: Side<'_>) -> (pbps_model::Schema, pbps_model::Ids
     )
 }
 
+/// The packages the declaration holds under a recorded uid that the base does
+/// not have: each becomes a pinned `CREATE EXTENSION` (DEC-2447.6). Inventory
+/// with no uid never creates (DEC-2447.2). `requires` is the target's package
+/// catalog (control `requires` per declared package, absent offline); only the
+/// prerequisites this plan also creates become edges, because one already
+/// installed needs none and one neither installed nor created is refused with
+/// the target facts before a plan exists.
+pub fn creates(
+    base: Side<'_>,
+    desired: Side<'_>,
+    dialect: &str,
+    requires: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        BTreeSet<pbps_model::ObjectLocalName>,
+    >,
+) -> Vec<pbps_model::Change> {
+    if dialect != "postgres" {
+        return Vec::new();
+    }
+    let created: std::collections::BTreeMap<_, _> = desired
+        .schema
+        .extensions
+        .iter()
+        .filter(|(name, _)| !base.schema.extensions.contains_key(*name))
+        .filter_map(|(name, definition)| {
+            Some((name, (desired.ids.extension_uid(name)?, definition)))
+        })
+        .collect();
+    created
+        .iter()
+        .map(
+            |(name, (uid, definition))| pbps_model::Change::CreateExtension {
+                uid: (*uid).clone(),
+                name: (*name).clone(),
+                definition: (*definition).clone(),
+                requires: requires
+                    .get(*name)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|required| created.get(required))
+                    .map(|(uid, _)| (*uid).clone())
+                    .collect(),
+            },
+        )
+        .collect()
+}
+
+/// How many packages of the plan each create waits behind, so that the differ's
+/// own order has a prerequisite ahead of what requires it. It is the effects
+/// graph that decides the order the plan keeps; this rank only keeps the
+/// differ's draft from contradicting it, as a domain's rank does for the enum
+/// under it (a cycle is the effects graph's refusal, and ranks the cycle as 0).
+pub(crate) fn depths<'a>(
+    changes: impl Iterator<Item = &'a pbps_model::Change>,
+) -> std::collections::BTreeMap<pbps_model::Uid, isize> {
+    let requires: std::collections::BTreeMap<_, _> = changes
+        .filter_map(|c| {
+            if let pbps_model::Change::CreateExtension { uid, requires, .. } = c {
+                Some((uid, requires))
+            } else {
+                None
+            }
+        })
+        .collect();
+    fn depth<'a>(
+        uid: &'a pbps_model::Uid,
+        requires: &std::collections::BTreeMap<&'a pbps_model::Uid, &'a BTreeSet<pbps_model::Uid>>,
+        walking: &mut BTreeSet<&'a pbps_model::Uid>,
+    ) -> isize {
+        let Some(needs) = requires.get(uid) else {
+            return 0;
+        };
+        if !walking.insert(uid) {
+            return 0;
+        }
+        let deepest = needs
+            .iter()
+            .map(|need| 1 + depth(need, requires, walking))
+            .max()
+            .unwrap_or(0);
+        walking.remove(uid);
+        deepest
+    }
+    requires
+        .keys()
+        .map(|uid| ((*uid).clone(), depth(uid, &requires, &mut BTreeSet::new())))
+        .collect()
+}
+
 /// Refusals share the drift channel, so no executable plan can lose an
-/// extension difference merely because no Change can yet express it.
+/// extension difference merely because no Change can yet express it. A create
+/// is not one: [`creates`] expresses it.
 pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<DiffError> {
     let mut errors = Vec::new();
     let mut refuse = |name: &pbps_model::ObjectLocalName, action: String| {
@@ -61,7 +151,7 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
             base.schema.extensions.get(name),
             desired.schema.extensions.get(name),
         ) {
-            (None, Some(_)) => refuse(name, "CREATE EXTENSION".into()),
+            (None, Some(_)) => {}
             (Some(_), None) => refuse(name, "DROP EXTENSION".into()),
             (Some(old), Some(new)) => {
                 if old.version != new.version {
@@ -99,6 +189,29 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
                 name,
                 format!("rename to `{}`; extension names are immutable", to.shown()),
             );
+        }
+    }
+    errors
+}
+
+/// [`differences`], plus a refusal for each package the declarations hold that
+/// the base lacks: for the callers that install nothing, which check that the
+/// packages they were handed stand exactly as declared (a bootstrap's
+/// prerequisites, a replay target). A create is for [`creates`] alone, behind a
+/// rehearsal and a sealed manifest (DEC-2447.6); here it would be a package
+/// nobody is going to install.
+pub fn prerequisite_differences(
+    base: Side<'_>,
+    desired: Side<'_>,
+    dialect: &str,
+) -> Vec<DiffError> {
+    let mut errors = differences(base, desired, dialect);
+    for change in creates(base, desired, dialect, &Default::default()) {
+        if let pbps_model::Change::CreateExtension { name, .. } = change {
+            errors.push(DiffError::ExtensionLifecycleUnsupported {
+                name,
+                action: "CREATE EXTENSION".into(),
+            });
         }
     }
     errors
@@ -145,8 +258,20 @@ mod tests {
                     schema: &schema,
                     ids: &ids,
                 };
+                // A recorded identity for an absent package is a create, which
+                // `differences` leaves to `creates`; it is not a refusal.
+                assert!(differences(absent, owned, "postgres").is_empty());
+                let planned = creates(absent, owned, "postgres", &Default::default());
+                assert!(
+                    matches!(
+                        planned.as_slice(),
+                        [pbps_model::Change::CreateExtension { name: n, .. }] if n.raw() == name
+                    ),
+                    "{planned:?}"
+                );
+                assert!(creates(owned, absent, "postgres", &Default::default()).is_empty());
+                assert!(creates(unowned, absent, "postgres", &Default::default()).is_empty());
                 for (before, after, action) in [
-                    (absent, owned, "CREATE EXTENSION"),
                     (owned, absent, "DROP EXTENSION"),
                     (unowned, owned, "identity"),
                 ] {
@@ -200,18 +325,17 @@ mod tests {
             .is_empty()
         );
         let empty = Schema::default();
-        assert!(
-            differences(
-                Side {
-                    schema: &empty,
-                    ids: &IdsFile::default()
-                },
-                desired,
-                "postgres"
-            )[0]
-            .to_string()
-            .contains("CREATE EXTENSION")
+        let nothing = Side {
+            schema: &empty,
+            ids: &IdsFile::default(),
+        };
+        assert!(differences(nothing, desired, "postgres").is_empty());
+        assert_eq!(
+            creates(nothing, desired, "postgres", &Default::default()).len(),
+            1
         );
+        // The same declarations plan nothing on another engine, which refuses.
+        assert!(creates(nothing, desired, "mssql", &Default::default()).is_empty());
         assert!(
             differences(
                 Side {
@@ -296,18 +420,11 @@ mod tests {
             );
         }
         let empty = Schema::default();
-        assert!(
-            differences(
-                Side {
-                    schema: &empty,
-                    ids: &IdsFile::default()
-                },
-                side,
-                "postgres"
-            )[0]
-            .to_string()
-            .contains("CREATE EXTENSION")
-        );
+        let nothing = Side {
+            schema: &empty,
+            ids: &IdsFile::default(),
+        };
+        assert!(differences(nothing, side, "postgres").is_empty());
         let new_ids = IdsFile {
             extensions: [("e_000001".parse().unwrap(), "other".into())].into(),
             ..Default::default()

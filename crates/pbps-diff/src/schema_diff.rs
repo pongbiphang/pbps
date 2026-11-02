@@ -44,6 +44,8 @@ pub enum DiffError {
         name: pbps_model::ObjectLocalName,
         action: String,
     },
+    #[error("extension `{}`: CREATE EXTENSION runs the package's install script, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what the script installs (DEC-2447.6)", .name.shown())]
+    ExtensionCreateNeedsDatabase { name: pbps_model::ObjectLocalName },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
     EnumValueUse {
         name: pbps_model::TypeRef,
@@ -857,6 +859,12 @@ pub(crate) fn diff_partial_rebuilding(
     errs.extend(rebuilt_domains.errors);
     changes.extend(label_changes);
     changes.extend(rebuilt_domains.changes);
+    changes.extend(crate::extensions::creates(
+        base,
+        declared,
+        dialect.name(),
+        &hints.extension_requires,
+    ));
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2640,6 +2648,7 @@ pub(crate) fn diff_partial_rebuilding(
     // sides of every comparison, a third of a 4,000-table plan's CPU
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
+    let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
     crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
@@ -2649,6 +2658,9 @@ pub(crate) fn diff_partial_rebuilding(
                 && let Some(rank) = late_attach.get(table)
             {
                 *rank
+            } else if let Change::CreateExtension { uid, .. } = &p.change {
+                // Behind the packages of this plan it requires (DEC-2447.6).
+                extension_rank.get(uid).copied().unwrap_or(0)
             } else {
                 dependency_rank(
                     &p.change,
@@ -7063,6 +7075,7 @@ fn dependency_rank(
         }
         Change::DropType { name, .. } => -drop_type_rank.get(name).copied().unwrap_or(0),
         Change::CreateTable { .. }
+        | Change::CreateExtension { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -8005,7 +8018,11 @@ fn order_key(c: &Change) -> u8 {
             step: pbps_model::EnumRebuildStep::Create { .. },
             ..
         }
-        | Change::CreateType { .. } => 7,
+        // A package's own objects are what a later type, module or table of
+        // the plan may use, so it goes with the type creates; the order among
+        // packages is the `requires` edge, not this number (DEC-2447.6).
+        | Change::CreateType { .. }
+        | Change::CreateExtension { .. } => 7,
         // A domain's checks and NOT NULL are dropped with a table's, before
         // the plan's rows, and added with them after the rows (DEC-1635.8).
         // A default the half sets can name a label the plan renames or adds,
