@@ -199,13 +199,15 @@ fn missing_domain_facets_and_external_aliases_are_not_available() {
         definition: Box::new(f.schema.types[&"c2469.d".parse().unwrap()].clone()),
     };
     let engine = pbps_mssql::Mssql;
+    let refs: std::collections::BTreeSet<pbps_model::object_ref::ObjectRef> =
+        ["check::type::c2469.d.positive".parse().unwrap()].into();
     let parts = engine
         .creation_parts(
             &create,
             &f.ids,
             &[],
             false,
-            &["check::type::c2469.d.positive".parse().unwrap()].into(),
+            (&refs).into(),
             &Default::default(),
         )
         .unwrap();
