@@ -1524,7 +1524,9 @@ elif command[0] != 'sleep':
     def test_ci_history_fixture_copy_reaches_each_pinned_service(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         step = workflow.split("      - name: Install catalog-history extension fixtures\n", 1)[1].split("      - run:", 1)[0]
-        self.assertIn("if: matrix.suite == 'dialect'", step)
+        # Not filtered by suite: `capture` and the `flow-*` shares install
+        # these packages too, as the local script does for every run.
+        self.assertNotIn("if:", step)
         for service in ("job.services.postgres.id", "job.services['postgres-old'].id",
                         "job.services['postgres-scratch'].id"):
             self.assertIn(service, step)
