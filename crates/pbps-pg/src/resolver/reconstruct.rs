@@ -464,6 +464,7 @@ impl Reconstruction {
                 // skipped and the parts that use the package would fail
                 // later with a message about something else.
                 | Change::CreateExtension { .. }
+                | Change::DropExtension { .. }
                 | Change::Revoke { .. } => {
                     return Err(ReconstructError::Unsupported(
                         serde_json::to_value(change)

@@ -201,7 +201,8 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
                 // with no scratch has no rehearsal to pin its members with.
                 "is created by this plan",
             ),
-            ("hstore", None, "DROP EXTENSION"),
+            // Removing a declaration is no drop: a human records why first.
+            ("hstore", None, "pbps drop-extension hstore"),
             (
                 "citext",
                 Some("extension: citext\nschema: ext\nversion: '1.5'\n"),
@@ -669,7 +670,12 @@ fn connected_bootstrap_adopts_exact_preinstalled_packages_without_lifecycle_ddl(
         // Recorded ownership must still make an explicit removal a refused DROP.
         std::fs::remove_file(extension_file(&d, "hstore")).unwrap();
         d.commit();
-        assert_refused(&d, target.connection(), "DROP EXTENSION", "hstore");
+        assert_refused(
+            &d,
+            target.connection(),
+            "pbps drop-extension hstore",
+            "hstore",
+        );
     });
 }
 

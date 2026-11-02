@@ -299,6 +299,7 @@ pub(super) fn classify(
         | Change::AddEnumValue { .. }
         | Change::CreateType { .. }
         | Change::CreateExtension { .. }
+        | Change::DropExtension { .. }
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetReplicaIdentity { .. }

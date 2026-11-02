@@ -12,6 +12,10 @@ use pbps_model::escape::Escaped;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 
+/// The command that records a package's drop, and its batch spelling: the one
+/// place the name lives, so a rename is a one-line change (DEC-2447.9).
+pub(crate) const DROP_EXTENSION: &str = "drop-extension";
+
 /// One intent in the user's own vocabulary.
 ///
 /// An intent retains its meaning, not where it was supplied (SPEC §6). Describe
@@ -52,6 +56,9 @@ pub fn intent(i: &Intent) -> String {
         ),
         Intent::DropRole { role, reason } => {
             format!("drop role {role} (reason: {reason})", role = role.shown(),)
+        }
+        Intent::DropExtension { name, reason } => {
+            format!("drop extension {} (reason: {reason})", name.shown())
         }
         Intent::MoveRows {
             table,
@@ -111,6 +118,7 @@ fn decision_count(blocker: &Blocker) -> Option<usize> {
         Blocker::AmbiguousTables { disappeared, .. } => Some(disappeared.len()),
         Blocker::DropColumnNeedsReason { .. }
         | Blocker::DropTableNeedsReason { .. }
+        | Blocker::DropExtensionNeedsReason { .. }
         | Blocker::DropRoleNeedsReason { .. } => Some(1),
         Blocker::ProvisionalTableIdentity { blocker, .. } => decision_count(blocker),
         Blocker::UnusedIntent { .. }
@@ -183,6 +191,12 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
         Intent::DropRole { role, reason } => {
             pair_flag("--drop-role", role.raw(), reason.as_ref(), "why")
         }
+        Intent::DropExtension { name, reason } => pair_flag(
+            &format!("--{DROP_EXTENSION}"),
+            name.raw(),
+            reason.as_ref(),
+            "why",
+        ),
         // MoveRows remains a separate command (SPEC §6.5); do not advertise an
         // option the identity batch does not accept.
         Intent::MoveRows { .. } => return None,
@@ -312,6 +326,12 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         Blocker::DropRoleNeedsReason { role } => {
             fixed.push(pair_flag("--drop-role", role.raw(), "", "why"))
         }
+        Blocker::DropExtensionNeedsReason { name } => fixed.push(pair_flag(
+            &format!("--{DROP_EXTENSION}"),
+            name.raw(),
+            "",
+            "why",
+        )),
         Blocker::ProvisionalTableIdentity { from, to, blocker } => {
             // A derived column choice is conditional on its table identity.
             // Putting its flag on the fixed command would silently decide it.
@@ -533,6 +553,52 @@ mod batch_tests {
         assert_eq!(blocker_findings(&blockers[..1]).len(), 1);
     }
 
+    /// A package drop is described, advertised and remedied in the same words
+    /// as every other recorded drop: the batch carries it with a reason left to
+    /// the person, a command a person can run, and the intent shows as written
+    /// (DEC-2447.8).
+    #[test]
+    fn a_package_drop_reads_as_a_decision_in_every_report() {
+        let missing = Blocker::DropExtensionNeedsReason {
+            name: "citext".into(),
+        };
+        let human = super::blockers(std::slice::from_ref(&missing));
+        assert!(
+            human.contains("pbps drop-extension citext --reason \"\""),
+            "{human}"
+        );
+        assert!(human.contains("a drop must record why"), "{human}");
+        let finding = blocker_finding(&missing);
+        assert_eq!(finding.id, "identity.drop-extension-needs-reason");
+        let batch = blocker_findings(&[
+            missing.clone(),
+            Blocker::DropColumnNeedsReason {
+                column: "app.t.old".parse().unwrap(),
+            },
+        ]);
+        let remedy = batch.last().unwrap().remedy.as_ref().unwrap();
+        assert!(remedy.contains("--drop-extension citext \"\""), "{remedy}");
+        let supplied = Intent::DropExtension {
+            name: "citext".into(),
+            reason: "retired".parse().unwrap(),
+        };
+        assert_eq!(
+            supplied_flag(&supplied).unwrap(),
+            "--drop-extension citext retired"
+        );
+        assert_eq!(intent(&supplied), "drop extension citext (reason: retired)");
+        // Negative: a name a shell cannot carry safely becomes a placeholder
+        // and never a command that runs another one.
+        let hostile = Intent::DropExtension {
+            name: "a\u{1b}[31mb".into(),
+            reason: "r".parse().unwrap(),
+        };
+        assert_eq!(
+            supplied_flag(&hostile).unwrap(),
+            "--drop-extension \"<object name>\" r"
+        );
+    }
+
     #[test]
     fn every_missing_identity_reason_is_an_empty_double_quoted_argument() {
         for blocker in [
@@ -655,6 +721,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::DropTableNeedsReason { .. } => "identity.drop-table-needs-reason",
             Blocker::AmbiguousRoles { .. } => "identity.ambiguous-roles",
             Blocker::DropRoleNeedsReason { .. } => "identity.drop-role-needs-reason",
+            Blocker::DropExtensionNeedsReason { .. } => "identity.drop-extension-needs-reason",
             Blocker::UnusedIntent { .. } => "identity.unused-intent",
             Blocker::ConflictingRenameIntents { .. } => "identity.conflicting-rename-intents",
             Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
@@ -842,6 +909,13 @@ fn one_blocker(b: &Blocker) -> String {
             argument = shell_arg(role.raw()).unwrap_or_else(|| placeholder("role")),
             role = role.shown(),
         ),
+        Blocker::DropExtensionNeedsReason { name } => format!(
+            "  extension {name} disappeared from the declarations, but a drop must record why — \
+             it deletes the package's members, including any table of theirs and its rows, and \
+             what depends on it\n\n    pbps {DROP_EXTENSION} {argument} --reason {why}\n",
+            argument = shell_arg(name.raw()).unwrap_or_else(|| placeholder("extension")),
+            name = name.shown(),
+        ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
                 "  this intent matches nothing in either the declarations or the identity file, likely a typo:\n    {}\n\n    correct the names where this intent was supplied: edit its declaration annotation, fix and rerun the command, or retry with a corrected prompt answer\n",
@@ -988,7 +1062,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1951,6 +2025,10 @@ pub fn describe(c: &Change) -> String {
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
         Change::CreateRole { name, .. } => format!("+ create role {name}", name = name.shown(),),
+        Change::DropExtension { name, .. } => format!(
+            "- drop extension {} (deletes its members and anything that depends on it)",
+            name.shown()
+        ),
         Change::CreateExtension {
             name, definition, ..
         } => format!(

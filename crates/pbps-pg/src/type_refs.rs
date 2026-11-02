@@ -64,7 +64,8 @@ fn reference_uses<'a>(
             })),
             Change::BuildPartitionedIndex(_)
             | Change::AnalyzeTableTree(_)
-            | Change::CreateExtension { .. } => {}
+            | Change::CreateExtension { .. }
+            | Change::DropExtension { .. } => {}
             Change::CreateTable { table, .. }
             | Change::AttachPartition { shape: table, .. }
             | Change::DetachPartition { shape: table, .. } => {

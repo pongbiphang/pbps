@@ -387,6 +387,16 @@ enum Command {
         reason: pbps_model::Reason,
     },
 
+    /// Record an extension drop: the package, every member of it (a table of its
+    /// own included, with its rows) and anything marked as depending on it
+    /// (DEC-2447.8)
+    DropExtension {
+        extension: String,
+        /// Why it is being dropped; required for audit
+        #[arg(long)]
+        reason: pbps_model::Reason,
+    },
+
     /// Allow a new range partition to take its rows from the DEFAULT partition
     /// beside it (#1788)
     MoveRows {
@@ -622,6 +632,7 @@ impl Command {
             | Command::DropTable { .. }
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
+            | Command::DropExtension { .. }
             | Command::MoveRows { .. }
             | Command::Convert { .. }
             | Command::RebuildTable { .. }
@@ -944,6 +955,7 @@ fn run() -> anyhow::Result<()> {
     if let Command::Drop { reason, .. }
     | Command::DropTable { reason, .. }
     | Command::DropRole { reason, .. }
+    | Command::DropExtension { reason, .. }
     | Command::MoveRows { reason, .. }
     | Command::RebuildTable {
         reason: Some(reason),
@@ -974,6 +986,7 @@ fn run() -> anyhow::Result<()> {
         | Command::Drop { .. }
         | Command::DropTable { .. }
         | Command::DropRole { .. }
+        | Command::DropExtension { .. }
         | Command::MoveRows { .. }
         | Command::Convert { .. }
         | Command::RebuildTable { .. }
@@ -1505,6 +1518,14 @@ fn run() -> anyhow::Result<()> {
             &project,
             Intent::DropRole {
                 role: role.into(),
+                reason,
+            }
+            .into(),
+        ),
+        Command::DropExtension { extension, reason } => cmd_intent(
+            &project,
+            Intent::DropExtension {
+                name: extension.into(),
                 reason,
             }
             .into(),

@@ -49,6 +49,11 @@ pub enum Blocker {
     DropTypeNeedsReason {
         name: pbps_model::TypeRef,
     },
+    /// A package vanished from the declarations with no reason for dropping it
+    /// (DEC-2447.8).
+    DropExtensionNeedsReason {
+        name: pbps_model::ObjectLocalName,
+    },
     /// A later diagnosis depends on this contested table rename having won.
     /// Keep the diagnosis visible without presenting declaration order as intent.
     ProvisionalTableIdentity {
@@ -204,6 +209,7 @@ pub struct Resolution {
     pub renamed_types: Vec<(Uid, pbps_model::TypeRef, pbps_model::TypeRef)>,
     pub created_roles: Vec<(Uid, pbps_model::RoleName)>,
     pub dropped_roles: Vec<(Uid, pbps_model::RoleName)>,
+    pub dropped_extensions: Vec<(Uid, pbps_model::ObjectLocalName)>,
     /// `(uid, old name, new name)`
     pub renamed_roles: Vec<(Uid, pbps_model::RoleName, pbps_model::RoleName)>,
 }
@@ -298,6 +304,9 @@ pub fn resolve_with_baseline(
                 }
                 Removal::Role { uid, name } => (uid, Blocker::DropRoleNeedsReason { role: name }),
                 Removal::Type { uid, name } => (uid, Blocker::DropTypeNeedsReason { name }),
+                Removal::Extension { uid, name } => {
+                    (uid, Blocker::DropExtensionNeedsReason { name })
+                }
                 // Computed columns keep their non-UID boundary (DEC-1174.1).
                 Removal::ComputedColumn { .. } => return None,
             };
@@ -329,9 +338,45 @@ fn resolve_with_provenance(
     let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
     // Immutable global names never enter rename inference (DEC-2447.1).
-    r.ids
+    // A package the declarations no longer hold is retired by a recorded
+    // intent: its uid becomes a tombstone, which is what lets a plan drop it.
+    // With no intent the uid is forgotten as it always was, and what a
+    // baseline says was removed is the caller's blocker (`resolve_with_baseline`).
+    let gone: Vec<(Uid, pbps_model::ObjectLocalName)> = r
+        .ids
         .extensions
-        .retain(|_, name| declared.extensions.contains_key(name));
+        .iter()
+        .filter(|(_, name)| !declared.extensions.contains_key(*name))
+        .map(|(uid, name)| (uid.clone(), name.clone()))
+        .collect();
+    for (uid, name) in gone {
+        r.ids.extensions.remove(&uid);
+        if let Some((i, reason)) = intents.iter().enumerate().find_map(|(i, intent)| {
+            if let Intent::DropExtension {
+                name: named,
+                reason,
+            } = intent
+                && *named == name
+            {
+                Some((i, reason))
+            } else {
+                None
+            }
+        }) {
+            r.ids.tombstones.insert(
+                uid.clone(),
+                Tombstone {
+                    require: None,
+                    was: name.raw().to_owned(),
+                    dropped_at: ctx.today.clone(),
+                    reason: reason.to_string(),
+                    operator: ctx.operator.clone(),
+                },
+            );
+            r.dropped_extensions.push((uid, name));
+            used.insert(i);
+        }
+    }
     for name in declared.extensions.keys() {
         if r.ids.extension_uid(name).is_none() {
             let uid = fresh_uid(&r.ids, UidKind::Extension);
@@ -481,6 +526,7 @@ fn resolve_with_provenance(
             | Intent::DropTable { .. }
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
+            | Intent::DropExtension { .. }
             | Intent::MoveRows { .. } => None,
         };
         // The identities are read in the namespace this annotation was written
@@ -524,6 +570,7 @@ fn resolve_with_provenance(
             | Intent::DropColumn { .. }
             | Intent::DropType { .. }
             | Intent::DropRole { .. }
+            | Intent::DropExtension { .. }
             | Intent::MoveRows { .. } => {
                 intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
             }
@@ -564,6 +611,7 @@ fn resolve_with_provenance(
                     | Intent::RenameRole { .. }
                     | Intent::DropType { .. }
                     | Intent::DropRole { .. }
+                    | Intent::DropExtension { .. }
                     | Intent::MoveRows { .. } => None,
                 },
                 Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
@@ -579,6 +627,7 @@ fn resolve_with_provenance(
                 | Blocker::AmbiguousTypes { .. }
                 | Blocker::DropTypeNeedsReason { .. }
                 | Blocker::DropRoleNeedsReason { .. }
+                | Blocker::DropExtensionNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
                 | Blocker::MissingType { .. }
@@ -762,6 +811,9 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         }
         Intent::RenameRole { from, to } => has_role(to) && vacated(has_role(from)),
         Intent::DropRole { role, .. } => !has_role(role) && retired(UidKind::Role, role.raw()),
+        Intent::DropExtension { name, .. } => {
+            ids.extension_uid(name).is_none() && retired(UidKind::Extension, name.raw())
+        }
         // Recorded already, with this bound.
         Intent::MoveRows {
             table, max_rows, ..
@@ -821,6 +873,7 @@ impl RenameSource {
                 .is_some_and(|table| table.columns.contains_key(&column.name)),
             Intent::DropType { name, .. } => declared.types.contains_key(name),
             Intent::DropRole { role, .. } => declared.roles.contains_key(role),
+            Intent::DropExtension { name, .. } => declared.extensions.contains_key(name),
             Intent::MoveRows { .. } => false,
         };
         if redeclared {
@@ -1709,6 +1762,7 @@ fn sort_resolution(r: &mut Resolution) {
     r.renamed_columns.sort();
     r.created_roles.sort();
     r.dropped_roles.sort();
+    r.dropped_extensions.sort();
     r.renamed_roles.sort();
 }
 

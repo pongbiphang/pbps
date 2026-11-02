@@ -482,6 +482,7 @@ requirement is common to all of them, so it is listed once,
 |---|---|---|---|---|
 | `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views and catalog-bound ordinary DEFAULT holders | Removes the module, frees its name | removes |
 | `CreateExtension` | 7, with `CreateType`; after each package of the plan its control file requires | The name free. P: each of those packages' final incarnation | A package, brought in by one `CREATE EXTENSION`; the objects it owns are read back and pinned, not ordered (DEC-2447.6, DEC-2447.7) | Is, creates |
+| `DropExtension` | 18, with `DropType`; after each package of the plan that requires it, by an edge | P: each of those packages' final absence; each module the plan drops that the drop would delete (`DEPENDS ON EXTENSION`) or be blocked by | Removes the package and every object it owns, and releases its name; the objects it reaches were read and sealed, not ordered (DEC-2447.8) | Exists, Absent, removes |
 | `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
 | `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |
@@ -948,6 +949,8 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 | Type creation/rename → defaults, checks, modules and grants naming it | final name first | classes 1/7 before defaults/checks/modules/grants (9/13/14/16) |
 | DropTable/DropColumn/retype away → DropType | last column released first | classes 6/5/9 before 18; `Absent` table/column or final-column `Is` effects |
 | DropModule/drop default/drop check → DropType | dependent gone first | classes 0/9/2 before 18 |
+| DropModule → DropExtension | a module that depends on the package, or hangs off it by `DEPENDS ON EXTENSION`, gone first | class 0 before 18; `Absent(Module)` effect from the payload's `releases` |
+| DropExtension of a package that another dropped package requires → DropExtension of it | the requirer gone first | reverse prerequisite depth rank within class 18, plus `Absent(Extension)` from the payload's `requirers` |
 | DropType of a domain → DropType of its base | dependent domain gone first | reverse baseline domain-base depth rank within class 18, plus `Absent(Type)` effect |
 | Drop/rename a type, table or view → claim its Types name | old holder releases first | existing slot handover edges, including cross-kind class inversions |
 | RenameType chains | free destination first | existing slot edges; cycles/swaps refuse by name in the differ |

@@ -4852,6 +4852,21 @@ pub(crate) fn emit_in(
             statement.extension = Some(pbps_dialect::ExtensionStatement {
                 uid: uid.clone(),
                 name: name.clone(),
+                drops: false,
+            });
+            Ok(vec![statement])
+        }
+        // `RESTRICT` is the engine's default and is written anyway, and there
+        // is no `IF EXISTS` or `CASCADE`: a package the target lost is an
+        // error, and what the drop reaches was sealed into the plan and is
+        // checked by the executor (DEC-2447.8).
+        Change::DropExtension { uid, name, .. } => {
+            let mut statement =
+                Statement::new(format!("DROP EXTENSION {} RESTRICT;", quote(name.raw())?));
+            statement.extension = Some(pbps_dialect::ExtensionStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                drops: true,
             });
             Ok(vec![statement])
         }

@@ -11,7 +11,7 @@
 use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
-use pbps_model::{Extension, ExtensionProvider, ProviderMember};
+use pbps_model::{Extension, ExtensionDropFacts, ExtensionProvider, ProviderMember};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Every installed package, with its schema and exact version. The namespace is
@@ -73,6 +73,267 @@ SELECT 'member', e.extname::text, a.type, pg_catalog.array_to_json(a.object_name
                  SELECT 1 FROM pg_catalog.pg_index x
                    JOIN pg_catalog.pg_class t ON t.oid = x.indrelid
                   WHERE x.indexrelid = c.oid AND t.relkind = 't'))))";
+
+/// Everything `DROP EXTENSION` would delete or be blocked by, per package
+/// (DEC-2447.8): the objects reachable from the package through the dependency
+/// edges the engine follows when it removes something (`e` members, `x`
+/// `DEPENDS ON EXTENSION` marks, and the automatic and internal subsidiaries of
+/// each), and the objects outside that set which depend on it normally, which
+/// make the engine refuse. The extension's own row is in the set, so a package
+/// that requires another is a blocker of it by its `n` edge, and an object that
+/// belongs to *another* package's reach (a member of a package that requires
+/// this one, which uses a member of this one) is reported as that package, so
+/// that dropping both clears it and dropping one does not.
+macro_rules! reach {
+    () => {
+        "WITH RECURSIVE reach(ext, classid, objid, objsubid) AS (
+    SELECT e.oid, 'pg_catalog.pg_extension'::regclass::oid, e.oid, 0 FROM pg_catalog.pg_extension e
+    UNION
+    SELECT d.refobjid, d.classid, d.objid, d.objsubid
+      FROM pg_catalog.pg_depend d
+     WHERE d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.deptype IN ('e', 'x')
+    UNION
+    SELECT r.ext, d.classid, d.objid, d.objsubid
+      FROM reach r JOIN pg_catalog.pg_depend d
+        ON d.refclassid = r.classid AND d.refobjid = r.objid
+       AND d.deptype IN ('a', 'i', 'x', 'P', 'S')
+)"
+    };
+}
+
+/// The same storage exclusion as [`PROVIDERS`]: a TOAST table and its index are
+/// physical storage named by a number, reached from their owner, and not an
+/// object a person would name.
+const NOT_STORAGE: &str = "NOT (r.classid = 'pg_catalog.pg_class'::regclass AND EXISTS (
+         SELECT 1 FROM pg_catalog.pg_class c
+          WHERE c.oid = r.objid
+            AND (c.relkind = 't' OR EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_index x
+                   JOIN pg_catalog.pg_class t ON t.oid = x.indrelid
+                  WHERE x.indexrelid = c.oid AND t.relkind = 't'))))";
+
+const DROP_READ: &str = concat!(
+    reach!(),
+    "
+SELECT 'reach' AS kind, e.extname::text AS name, a.type, pg_catalog.array_to_json(a.object_names)::text AS names,
+       pg_catalog.array_to_json(a.object_args)::text AS args
+  FROM reach r
+  JOIN pg_catalog.pg_extension e ON e.oid = r.ext
+  LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(r.classid, r.objid, r.objsubid) a ON true
+ WHERE NOT (r.classid = 'pg_catalog.pg_extension'::regclass AND r.objid = r.ext)
+   AND ",
+    "{NOT_STORAGE}",
+    "
+UNION ALL
+SELECT 'blocker', e.extname::text, a.type, pg_catalog.array_to_json(a.object_names)::text,
+       pg_catalog.array_to_json(a.object_args)::text
+  FROM reach r
+  JOIN pg_catalog.pg_extension e ON e.oid = r.ext
+  JOIN pg_catalog.pg_depend d
+    ON d.refclassid = r.classid AND d.refobjid = r.objid AND d.deptype = 'n'
+  LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(d.classid, d.objid, d.objsubid) a ON true
+ WHERE NOT EXISTS (SELECT 1 FROM reach o WHERE o.classid = d.classid AND o.objid = d.objid)
+UNION ALL
+SELECT 'blocker', e.extname::text, 'extension', pg_catalog.array_to_json(ARRAY[o.name])::text, '[]'
+  FROM reach r
+  JOIN pg_catalog.pg_extension e ON e.oid = r.ext
+  JOIN pg_catalog.pg_depend d
+    ON d.refclassid = r.classid AND d.refobjid = r.objid AND d.deptype = 'n'
+  JOIN (SELECT o.ext, o.classid, o.objid, x.extname::text AS name
+          FROM reach o JOIN pg_catalog.pg_extension x ON x.oid = o.ext) o
+    ON o.classid = d.classid AND o.objid = d.objid AND o.ext <> r.ext
+ WHERE NOT EXISTS (SELECT 1 FROM reach m
+                    WHERE m.ext = r.ext AND m.classid = d.classid AND m.objid = d.objid)"
+);
+
+/// What dropping each installed package reaches, for the packages in
+/// `providers` (read just before, so members and the rest are one story). A
+/// member is what the manifest already holds; the rest of the reach is
+/// `outside`. An object the engine can no longer name is unreadable evidence,
+/// never a smaller set.
+pub async fn drop_facts(
+    conn: &mut impl QueryConnection,
+    providers: &BTreeMap<String, ExtensionProvider>,
+) -> Result<BTreeMap<String, ExtensionDropFacts>, DbError> {
+    let mut out: BTreeMap<String, ExtensionDropFacts> = providers
+        .keys()
+        .map(|name| (name.clone(), ExtensionDropFacts::default()))
+        .collect();
+    let sql = DROP_READ.replace("{NOT_STORAGE}", NOT_STORAGE);
+    for row in conn.query(&sql).await? {
+        let name = text(&row, "name")?;
+        let class = row.try_get::<&str>("type")?.ok_or_else(|| {
+            DbError::Refused(format!(
+                "the catalog changed while what dropping extension `{}` reaches was read: an \
+                 object was there when the dependencies were walked and gone when it was named. \
+                 Run the command again when the other change has finished.",
+                Escaped(&name)
+            ))
+        })?;
+        let member = ProviderMember {
+            class: class.to_owned(),
+            names: names(row.try_get::<&str>("names")?, "an object's names")?,
+            args: names(row.try_get::<&str>("args")?, "an object's arguments")?,
+        };
+        let facts = out.get_mut(&name).ok_or_else(|| {
+            DbError::BadRow(format!(
+                "a row names extension `{}`, which the same read does not list",
+                Escaped(&name)
+            ))
+        })?;
+        match row.try_get::<&str>("kind")? {
+            Some("reach") => {
+                // A member the manifest holds is not outside it.
+                if !providers[&name].members.contains(&member) {
+                    facts.outside.insert(member);
+                }
+            }
+            Some("blocker") => {
+                facts.blockers.insert(member);
+            }
+            _ => {
+                return Err(DbError::BadRow(
+                    "an extension drop read returned an unknown row kind".into(),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Why the connected role could not drop each of `names`, one sentence each:
+/// measured on 16.15 and 18.6, `DROP EXTENSION` needs ownership of the package
+/// (a superuser, its owner, or a member of the owner that inherits its
+/// privileges) and nothing else; `CREATE` on the database is not asked.
+pub async fn drop_problems(
+    conn: &mut impl QueryConnection,
+    names: &BTreeSet<String>,
+) -> Result<Vec<String>, DbError> {
+    const WHO: &str = "SELECT e.extname::text AS name, pg_catalog.pg_get_userbyid(e.extowner)::text AS owner, (r.rolsuper OR pg_catalog.pg_has_role(current_user, e.extowner, 'USAGE'))::text AS allowed, current_user::text AS me FROM pg_catalog.pg_extension e CROSS JOIN pg_catalog.pg_roles r WHERE r.rolname = current_user";
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for row in conn.query(WHO).await? {
+        let name = text(&row, "name")?;
+        if !names.contains(&name) {
+            continue;
+        }
+        if !flag(&row, "allowed")? {
+            out.push(format!(
+                "extension `{}` is owned by `{}`, and the connected role `{}` is neither a superuser, that owner, nor a member of it that inherits its privileges, so the engine would refuse the drop (42501)",
+                Escaped(&name),
+                Escaped(&text(&row, "owner")?),
+                Escaped(&text(&row, "me")?)
+            ));
+        }
+        seen.insert(name);
+    }
+    for missing in names.difference(&seen) {
+        out.push(format!(
+            "extension `{}` is not installed on the target, so there is nothing to drop",
+            Escaped(missing)
+        ));
+    }
+    Ok(out)
+}
+
+/// The check that runs in the statement's own transaction, *before* a
+/// `DROP EXTENSION`: the closure the engine holds now is the one the plan was
+/// approved over, nothing outside it depends on the package that the plan did
+/// not accept, and what is about to go is remembered (in a temporary table that
+/// ends with the transaction) so that [`confirm_dropped`] can prove it went.
+pub async fn vet_before_drop(
+    conn: &mut pbps_db::Conn,
+    name: &str,
+    pin: &pbps_model::ExtensionDropPin,
+) -> Result<(), DbError> {
+    let all = providers(conn).await?;
+    let Some(actual) = all.get(name) else {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is no longer installed",
+            Escaped(name)
+        )));
+    };
+    let differences = pin.manifest.differences(actual);
+    if !differences.is_empty() {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is not what the plan was approved to drop (its members changed since \
+             it was planned): {}",
+            Escaped(name),
+            differences.join("; ")
+        )));
+    }
+    let facts = drop_facts(conn, &all)
+        .await?
+        .remove(name)
+        .unwrap_or_default();
+    let list = |set: &BTreeSet<ProviderMember>| {
+        set.iter()
+            .map(|m| format!("`{m}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !facts.blockers.is_empty() {
+        return Err(DbError::Refused(format!(
+            "extension `{}` still has dependents the engine would refuse to drop: {}",
+            Escaped(name),
+            list(&facts.blockers)
+        )));
+    }
+    let unaccepted: BTreeSet<_> = facts.outside.difference(&pin.outside).cloned().collect();
+    if !unaccepted.is_empty() {
+        return Err(DbError::Refused(format!(
+            "extension `{}` has objects the engine would delete with it that the plan did not accept: {}",
+            Escaped(name),
+            list(&unaccepted)
+        )));
+    }
+    conn.execute(
+        "CREATE TEMPORARY TABLE IF NOT EXISTS pg_temp.pbps_drop_reach \
+         (ext text, classid oid, objid oid, objsubid int4) ON COMMIT DROP",
+    )
+    .await?;
+    conn.execute(&format!(
+        "{} INSERT INTO pg_temp.pbps_drop_reach \
+         SELECT e.extname, r.classid, r.objid, r.objsubid FROM reach r \
+           JOIN pg_catalog.pg_extension e ON e.oid = r.ext WHERE e.extname = {}",
+        reach!(),
+        crate::emit::literal(name),
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The check that runs in the same transaction right *after* the drop: the
+/// package is gone, and so is every object that was reachable from it when
+/// [`vet_before_drop`] looked. An object the engine can still name means the
+/// drop did not do what it was approved to do, and the transaction rolls back.
+pub async fn confirm_dropped(conn: &mut impl QueryConnection, name: &str) -> Result<(), DbError> {
+    if installed(conn).await?.contains_key(name) {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is still installed after its drop statement",
+            Escaped(name)
+        )));
+    }
+    let left = conn
+        .query(&format!(
+            "SELECT count(*)::text AS n FROM pg_temp.pbps_drop_reach t WHERE t.ext = {} \
+             AND pg_catalog.pg_describe_object(t.classid, t.objid, t.objsubid) IS NOT NULL",
+            crate::emit::literal(name)
+        ))
+        .await?;
+    let n = left
+        .first()
+        .map(|r| text(r, "n"))
+        .transpose()?
+        .ok_or_else(|| DbError::BadRow("the drop check read no count".into()))?;
+    if n != "0" {
+        return Err(DbError::Refused(format!(
+            "{n} object(s) reachable from extension `{}` are still there after its drop",
+            Escaped(name)
+        )));
+    }
+    Ok(())
+}
 
 /// One installable version of one package, as its control file declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +846,135 @@ mod tests {
         );
     }
 
+    /// A drop is exactly `DROP EXTENSION name RESTRICT` with the boundary the
+    /// executor vets before and confirms after, and through the real differ and
+    /// orderer it waits for what it must: the requirer of its package, and the
+    /// module the plan drops that the package's removal would delete. The
+    /// requirer sorts after it by name, so only the edge and the rank can put it first.
+    #[test]
+    fn a_drop_is_exactly_the_restrict_statement_and_waits_for_its_requirer_and_its_modules() {
+        use pbps_model::{Change, IdsFile, Schema};
+        let pg = crate::Postgres::new();
+        let drop = Change::DropExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "odd \"name".into(),
+            definition: wanted("ext\"s", "1.0"),
+            requirers: Default::default(),
+            releases: Default::default(),
+        };
+        let statements = crate::emit::emit(&pg, &drop, Default::default()).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "DROP EXTENSION \"odd \"\"name\" RESTRICT;"
+        );
+        for forbidden in ["IF EXISTS", "CASCADE"] {
+            assert!(!statements[0].sql.contains(forbidden));
+        }
+        let boundary = statements[0].extension.as_ref().unwrap();
+        assert!(boundary.drops && boundary.name.raw() == "odd \"name");
+
+        // `aaa` is required by `zzz` (dropped by the plan, sorts last), and a
+        // function marked as depending on `aaa` goes with the plan.
+        let held = Schema {
+            extensions: [("aaa", "1.0"), ("zzz", "1.0")]
+                .map(|(n, v)| (n.into(), wanted("ext", v)))
+                .into(),
+            modules: [(
+                "app.marked()".parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS int LANGUAGE sql RETURN 1".into(),
+                    options: Default::default(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let held_ids = IdsFile {
+            extensions: [("e_000001", "aaa"), ("e_000002", "zzz")]
+                .map(|(u, n)| (u.parse().unwrap(), n.into()))
+                .into(),
+            ..Default::default()
+        };
+        let mut gone_ids = IdsFile::default();
+        for (uid, name) in [("e_000001", "aaa"), ("e_000002", "zzz")] {
+            gone_ids.tombstones.insert(
+                uid.parse().unwrap(),
+                pbps_model::Tombstone {
+                    require: None,
+                    was: name.into(),
+                    dropped_at: "2026-11-02".into(),
+                    reason: "retired".into(),
+                    operator: "test".into(),
+                },
+            );
+        }
+        let gone = Schema::default();
+        let facts = [
+            (
+                "aaa".into(),
+                pbps_model::ExtensionDropFacts {
+                    outside: [ProviderMember {
+                        class: "function".into(),
+                        names: vec!["app".into(), "marked".into()],
+                        args: Vec::new(),
+                    }]
+                    .into(),
+                    blockers: [ProviderMember {
+                        class: "extension".into(),
+                        names: vec!["zzz".into()],
+                        args: Vec::new(),
+                    }]
+                    .into(),
+                },
+            ),
+            ("zzz".into(), Default::default()),
+        ]
+        .into();
+        let hints = pbps_model::Hints {
+            extension_drops: facts,
+            ..Default::default()
+        };
+        let planned = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &held,
+                ids: &held_ids,
+            },
+            pbps_diff::Side {
+                schema: &gone,
+                ids: &gone_ids,
+            },
+            &pg,
+            &hints,
+        )
+        .unwrap();
+        // The differ's own order, which its order shadow holds to the effects
+        // graph in debug builds, so a draft that disagreed with an edge would
+        // have refused the plan here.
+        let order: Vec<String> = planned
+            .changes()
+            .changes
+            .iter()
+            .map(|p| {
+                if let Change::DropModule { id, .. } = &p.change {
+                    format!("module {}", id.shown())
+                } else if let Change::DropExtension { name, .. } = &p.change {
+                    format!("package {}", name.shown())
+                } else {
+                    panic!("{:?}", p.change)
+                }
+            })
+            .collect();
+        // `zzz` sorts last and is dropped first: only the edge says so.
+        assert_eq!(
+            order,
+            ["module app.marked()", "package zzz", "package aaa"],
+            "{order:?}"
+        );
+    }
+
     #[test]
     fn a_create_is_exactly_the_pinned_statement_and_waits_for_its_prerequisite() {
         use pbps_model::{Change, IdsFile, Schema};
@@ -1064,6 +1454,333 @@ mod tests {
             assert!(error.to_string().contains("absent after its statement"));
             discard(admin, db, target).await;
             discard(admin2, db2, scratch).await;
+        }
+    }
+
+    /// Three packages and the objects that hang off them in each of the ways
+    /// the engine follows when it drops one: `x` marks of every kind, a user
+    /// index on a member table, a table added to a package, and normal
+    /// dependents that make the drop refuse.
+    const DROP_WORLD: &str = "CREATE SCHEMA ext; CREATE SCHEMA app; \
+        CREATE EXTENSION zzz_base SCHEMA ext; CREATE EXTENSION aaa_dep SCHEMA ext; \
+        CREATE EXTENSION tabled2447 SCHEMA ext; \
+        CREATE TABLE app.t (id int, b text); \
+        CREATE FUNCTION app.x_fn(a int, b text) RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+        ALTER FUNCTION app.x_fn(int, text) DEPENDS ON EXTENSION zzz_base; \
+        CREATE PROCEDURE app.x_proc() LANGUAGE sql AS 'SELECT 1'; \
+        ALTER PROCEDURE app.x_proc() DEPENDS ON EXTENSION zzz_base; \
+        CREATE FUNCTION app.trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+        CREATE TRIGGER x_trg BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trg(); \
+        ALTER TRIGGER x_trg ON app.t DEPENDS ON EXTENSION zzz_base; \
+        CREATE MATERIALIZED VIEW app.x_mv AS SELECT 1 AS one; \
+        ALTER MATERIALIZED VIEW app.x_mv DEPENDS ON EXTENSION zzz_base; \
+        CREATE INDEX x_idx ON app.t (id); ALTER INDEX app.x_idx DEPENDS ON EXTENSION zzz_base; \
+        CREATE INDEX plain_idx ON app.t (b); \
+        CREATE INDEX on_member ON ext.tabled2447_t (body); \
+        CREATE TABLE app.born (id int PRIMARY KEY); ALTER EXTENSION tabled2447 ADD TABLE app.born; \
+        CREATE TABLE app.uses (n int DEFAULT ext.zzz_base_one()); \
+        CREATE VIEW app.v_uses AS SELECT ext.zzz_base_one() AS one";
+
+    /// Whether `set` holds an object of this class and name. The arguments are
+    /// not compared: how a built-in type is spelled in them differs by engine.
+    fn has(set: &BTreeSet<ProviderMember>, class: &str, names: &[&str]) -> bool {
+        set.iter().any(|m| {
+            m.class == class && m.names.iter().map(String::as_str).eq(names.iter().copied())
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_drop_reaches_marked_dependents_and_is_blocked_by_normal_ones() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut conn) = fresh(variable, "dropreach").await;
+            conn.execute(DROP_WORLD).await.unwrap();
+            let all = providers(&mut conn).await.unwrap();
+            let facts = drop_facts(&mut conn, &all).await.unwrap();
+            let base = &facts["zzz_base"];
+            // Everything marked `DEPENDS ON EXTENSION`, of every class, is
+            // outside the package and would be deleted with it.
+            for (class, names) in [
+                ("function", &["app", "x_fn"][..]),
+                ("procedure", &["app", "x_proc"][..]),
+                ("trigger", &["app", "t", "x_trg"][..]),
+                ("materialized view", &["app", "x_mv"][..]),
+                ("index", &["app", "x_idx"][..]),
+            ] {
+                assert!(
+                    has(&base.outside, class, names),
+                    "{variable} {class}: {:?}",
+                    base.outside
+                );
+            }
+            // Negative: an unmarked index, the member function and the
+            // objects that merely depend on it are not outside deletions.
+            assert!(!has(&base.outside, "index", &["app", "plain_idx"]));
+            assert!(!has(&base.outside, "function", &["ext", "zzz_base_one"]));
+            assert!(
+                base.outside
+                    .iter()
+                    .all(|m| m.names.first().map(String::as_str) != Some("uses"))
+            );
+            // A default and a view that use a member function, and the package
+            // that requires this one, make the engine refuse.
+            assert!(
+                has(&base.blockers, "default value", &["app", "uses", "n"]),
+                "{:?}",
+                base.blockers
+            );
+            assert!(
+                has(&base.blockers, "rule", &["app", "v_uses", "_RETURN"]),
+                "{:?}",
+                base.blockers
+            );
+            assert!(
+                has(&base.blockers, "extension", &["aaa_dep"]),
+                "{:?}",
+                base.blockers
+            );
+            // The package that nothing depends on has neither.
+            assert_eq!(
+                facts["aaa_dep"],
+                ExtensionDropFacts::default(),
+                "{variable}"
+            );
+            // A package with a member table, its TOAST storage, an index a user
+            // put on it and a table a user added to it: all members of the
+            // manifest, so none is outside, and nothing blocks the drop.
+            let tabled = &facts["tabled2447"];
+            assert_eq!(
+                *tabled,
+                ExtensionDropFacts::default(),
+                "{variable}: {tabled:?}"
+            );
+            for (class, names) in [
+                ("table", &["app", "born"][..]),
+                ("index", &["ext", "on_member"][..]),
+            ] {
+                assert!(
+                    has(
+                        &all["tabled2447"].members.iter().cloned().collect(),
+                        class,
+                        names
+                    ),
+                    "{variable} {class}"
+                );
+            }
+            discard(admin, db, conn).await;
+        }
+    }
+
+    /// The drop is vetted before it runs and confirmed after, each against what
+    /// the plan was approved over (DEC-2447.8).
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_drop_is_vetted_before_it_runs_and_confirmed_after_it_ran() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut conn) = fresh(variable, "dropvet").await;
+            conn.execute(DROP_WORLD).await.unwrap();
+            // Settle the world so `tabled2447` has nothing outside it, and
+            // seal what the plan would.
+            let pin_of = |all: &BTreeMap<String, ExtensionProvider>,
+                          facts: &mut BTreeMap<String, ExtensionDropFacts>,
+                          name: &str| pbps_model::ExtensionDropPin {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: name.into(),
+                definition: all[name].definition.clone(),
+                manifest: all[name].clone(),
+                outside: facts.remove(name).unwrap().outside,
+            };
+            let all = providers(&mut conn).await.unwrap();
+            let mut facts = drop_facts(&mut conn, &all).await.unwrap();
+            let pin = pin_of(&all, &mut facts, "tabled2447");
+
+            // Confirmed before the drop ran: the package is still there.
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_drop(&mut conn, "tabled2447", &pin)
+                .await
+                .unwrap();
+            let error = confirm_dropped(&mut conn, "tabled2447").await.unwrap_err();
+            assert!(error.to_string().contains("still installed"), "{error}");
+            conn.execute("DROP EXTENSION tabled2447 RESTRICT")
+                .await
+                .unwrap();
+            confirm_dropped(&mut conn, "tabled2447").await.unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // An object that survives the statement is named: the package is
+            // gone but a table sealed into its reach is not (here it was taken
+            // out of the package first, so the drop leaves it standing).
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_drop(&mut conn, "tabled2447", &pin)
+                .await
+                .unwrap();
+            conn.execute("ALTER EXTENSION tabled2447 DROP TABLE ext.tabled2447_t")
+                .await
+                .unwrap();
+            conn.execute("DROP EXTENSION tabled2447 RESTRICT")
+                .await
+                .unwrap();
+            let error = confirm_dropped(&mut conn, "tabled2447").await.unwrap_err();
+            assert!(
+                error.to_string().contains("still there after its drop"),
+                "{variable}: {error}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // A member added since the plan stops it before the statement.
+            conn.execute(
+                "CREATE TABLE app.later (id int); ALTER EXTENSION tabled2447 ADD TABLE app.later",
+            )
+            .await
+            .unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            let error = vet_before_drop(&mut conn, "tabled2447", &pin)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("members changed")
+                    && error.to_string().contains("app.later"),
+                "{variable}: {error}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+            conn.execute("ALTER EXTENSION tabled2447 DROP TABLE app.later")
+                .await
+                .unwrap();
+
+            // An object marked as depending on it since the plan is not one it
+            // accepted.
+            conn.execute(
+                "CREATE FUNCTION app.newcomer() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+                 ALTER FUNCTION app.newcomer() DEPENDS ON EXTENSION tabled2447",
+            )
+            .await
+            .unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            let error = vet_before_drop(&mut conn, "tabled2447", &pin)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("did not accept")
+                    && error.to_string().contains("newcomer"),
+                "{variable}: {error}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+            // ... but one the plan accepted (and removed first) is fine, and a
+            // newcomer already gone is no problem.
+            let mut accepting = pin.clone();
+            accepting.outside.insert(ProviderMember {
+                class: "function".into(),
+                names: vec!["app".into(), "newcomer".into()],
+                args: Vec::new(),
+            });
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_drop(&mut conn, "tabled2447", &accepting)
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+            conn.execute("DROP FUNCTION app.newcomer()").await.unwrap();
+
+            // A dependent that would make the engine refuse is named first.
+            let blocked = pin_of(&all, &mut facts, "zzz_base");
+            conn.execute("BEGIN").await.unwrap();
+            let error = vet_before_drop(&mut conn, "zzz_base", &blocked)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("would refuse to drop"),
+                "{variable}: {error}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // A package already gone is named, and the transaction is not left
+            // holding a half-built check.
+            conn.execute("BEGIN").await.unwrap();
+            let error = vet_before_drop(&mut conn, "nosuch", &pin)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("no longer installed"), "{error}");
+            conn.execute("ROLLBACK").await.unwrap();
+            discard(admin, db, conn).await;
+        }
+    }
+
+    /// `DROP EXTENSION` needs ownership of the package and nothing else: the
+    /// rule `drop_problems` states is what the engine does for a superuser, the
+    /// owner, a member that inherits the owner's privileges, one that does not,
+    /// and a stranger (measured on 16.15 and 18.6).
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_connected_role_may_drop_what_it_owns_and_nothing_else() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (mut admin, db, mut conn) = fresh(variable, "dropown").await;
+            let tag = db.rsplit('_').next().unwrap().to_owned();
+            let [own, member, loose, stranger] =
+                ["own", "member", "loose", "stranger"].map(|r| format!("pbps_drop_{r}_{tag}"));
+            admin
+                .execute(&format!(
+                    "CREATE ROLE {own} NOLOGIN; CREATE ROLE {member} NOLOGIN; \
+                     CREATE ROLE {loose} NOLOGIN; CREATE ROLE {stranger} NOLOGIN; \
+                     GRANT {own} TO {member}; GRANT {own} TO {loose} WITH INHERIT FALSE"
+                ))
+                .await
+                .unwrap();
+            conn.execute(&format!(
+                "CREATE SCHEMA ext; GRANT ALL ON SCHEMA ext TO {own}; GRANT CREATE ON DATABASE {db} TO {own}; \
+                 SET ROLE {own}; CREATE EXTENSION nonsu2447 SCHEMA ext; RESET ROLE"
+            ))
+            .await
+            .unwrap();
+            let names: BTreeSet<String> = ["nonsu2447".to_owned()].into();
+            // The superuser connection first.
+            assert!(drop_problems(&mut conn, &names).await.unwrap().is_empty());
+            for (role, allowed) in [
+                (&own, true),
+                (&member, true),
+                (&loose, false),
+                (&stranger, false),
+            ] {
+                conn.execute(&format!("SET ROLE {role}")).await.unwrap();
+                let problems = drop_problems(&mut conn, &names).await.unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                let tried = conn.execute("DROP EXTENSION nonsu2447 RESTRICT").await;
+                conn.execute("ROLLBACK").await.unwrap();
+                conn.execute("RESET ROLE").await.unwrap();
+                assert_eq!(
+                    problems.is_empty(),
+                    allowed,
+                    "{variable} {role}: {problems:?}"
+                );
+                assert_eq!(
+                    tried.is_ok(),
+                    allowed,
+                    "{variable} {role}: the engine said {tried:?}"
+                );
+                if !allowed {
+                    assert!(
+                        problems[0].contains("42501") && problems[0].contains(&own),
+                        "{problems:?}"
+                    );
+                }
+            }
+            // Negative: a package that is not installed is named.
+            let missing: BTreeSet<String> = ["absent2447".to_owned()].into();
+            let problems = drop_problems(&mut conn, &missing).await.unwrap();
+            assert!(problems[0].contains("not installed"), "{problems:?}");
+            drop(conn);
+            admin
+                .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+                .await
+                .unwrap();
+            admin
+                .execute(&format!(
+                    "DROP OWNED BY {own}, {member}, {loose}, {stranger}"
+                ))
+                .await
+                .ok();
+            admin
+                .execute(&format!("DROP ROLE {own}, {member}, {loose}, {stranger}"))
+                .await
+                .unwrap();
         }
     }
 }

@@ -1,17 +1,38 @@
 //! One removal inventory for checkout ancestry and recorded drop intent.
 //! Projection reads existing identities and explicit renames; it creates no UID
 //! and does not infer that a disappeared name became an appeared one.
-use pbps_model::{ColumnRef, IdsFile, Intent, RoleName, Schema, TableName, TypeRef, Uid};
+use pbps_model::{
+    ColumnRef, IdsFile, Intent, ObjectLocalName, RoleName, Schema, TableName, TypeRef, Uid,
+};
 
 /// A baseline object removed from management. SQL Server computed columns
 /// have no UID (DEC-1174.1): ancestry covers them, but tombstones do not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Removal {
-    Table { uid: Uid, name: TableName },
-    Column { uid: Uid, name: ColumnRef },
-    ComputedColumn { name: ColumnRef },
-    Role { uid: Uid, name: RoleName },
-    Type { uid: Uid, name: TypeRef },
+    Table {
+        uid: Uid,
+        name: TableName,
+    },
+    Column {
+        uid: Uid,
+        name: ColumnRef,
+    },
+    ComputedColumn {
+        name: ColumnRef,
+    },
+    Role {
+        uid: Uid,
+        name: RoleName,
+    },
+    Type {
+        uid: Uid,
+        name: TypeRef,
+    },
+    /// An installed package the declarations no longer hold (DEC-2447.8).
+    Extension {
+        uid: Uid,
+        name: ObjectLocalName,
+    },
 }
 
 impl std::fmt::Display for Removal {
@@ -23,6 +44,7 @@ impl std::fmt::Display for Removal {
             }
             Self::Role { name, .. } => write!(f, "role {}", name.shown()),
             Self::Type { name, .. } => write!(f, "type {}", name.shown()),
+            Self::Extension { name, .. } => write!(f, "extension {}", name.shown()),
         }
     }
 }
@@ -197,6 +219,16 @@ pub fn inventory(
             removed.push(Removal::Role {
                 uid: uid.clone(),
                 name: role.clone(),
+            });
+        }
+    }
+    // A package is immutable by name (DEC-2447.1), so there is no rename to
+    // project: it is held by the declarations or it is removed from them.
+    for (uid, name) in &recorded.extensions {
+        if recorded_schema.extensions.contains_key(name) && !names.extensions.contains_key(uid) {
+            removed.push(Removal::Extension {
+                uid: uid.clone(),
+                name: name.clone(),
             });
         }
     }

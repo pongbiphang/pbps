@@ -147,6 +147,7 @@ impl RoleMapping {
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
+            | Change::DropExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }

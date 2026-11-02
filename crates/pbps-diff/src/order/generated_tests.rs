@@ -716,6 +716,21 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
     pin(
+        Change::DropExtension {
+            uid: "e_015032".parse().unwrap(),
+            name: "citext".into(),
+            definition: pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+            requirers: Default::default(),
+            releases: Default::default(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
         Change::Grant {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),

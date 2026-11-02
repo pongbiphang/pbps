@@ -1397,6 +1397,26 @@ impl Cx<'_> {
                     ));
                 }
             }
+            // A package is dropped after the packages of this plan that
+            // require it, and after the modules of this plan that its removal
+            // would delete or be blocked by: factual edges named by the
+            // payload, so a saved plan orders the same way (DEC-2447.8).
+            Change::DropExtension {
+                uid,
+                requirers,
+                releases,
+                ..
+            } => {
+                self.exists(ObjectKey::Extension(Recorded(uid.clone())));
+                for requirer in requirers {
+                    self.requires(Requirement::Absent(ObjectKey::Extension(Recorded(
+                        requirer.clone(),
+                    ))));
+                }
+                for id in releases {
+                    self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
+                }
+            }
             Change::RenameRole { uid, .. } => {
                 let key = ObjectKey::Role(Recorded(uid.clone()));
                 self.exists(key.clone());
