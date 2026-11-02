@@ -10,7 +10,7 @@
 use super::http::Http;
 use super::*;
 use std::io::{BufRead, BufReader};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 
 const CHILD: &str = "publication::process_death::publication_stop_child";
 
@@ -83,8 +83,8 @@ pub(super) fn assert_no_core_dumps() {
 /// disabled; SIGKILL writes none, and a child that aborts instead must not
 /// leave one behind either. Returns the operation the child reported.
 fn killed_at(f: &Fixture, mode: &str, operation: &str) -> String {
-    let socket = f.repo.root.join(format!("stop-{mode}.sock"));
-    let listener = UnixListener::bind(&socket).unwrap();
+    let socket = crate::unix_socket::Socket::bind();
+    let listener = socket.listener();
     listener.set_nonblocking(true).unwrap();
     let log_path = f.repo.root.join(format!("child-{mode}.log"));
     let log = fs::File::create(&log_path).unwrap();
@@ -93,7 +93,7 @@ fn killed_at(f: &Fixture, mode: &str, operation: &str) -> String {
         .arg(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", CHILD, "--nocapture"])
         .env("PBPS_PUBLICATION_TEST_REPOSITORY", &f.repo.root)
-        .env("PBPS_PUBLICATION_TEST_SOCKET", &socket)
+        .env("PBPS_PUBLICATION_TEST_SOCKET", socket.path())
         .env("PBPS_PUBLICATION_TEST_MODE", mode)
         .env("PBPS_PUBLICATION_TEST_OPERATION", operation)
         .stdout(Stdio::from(log.try_clone().unwrap()))

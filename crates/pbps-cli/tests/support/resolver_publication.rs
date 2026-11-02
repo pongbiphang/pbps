@@ -1430,15 +1430,16 @@ pub fn applied(server: &str) {
     // and are never reached.
     let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     unreachable.set_nonblocking(true).unwrap();
-    let socket = sealed.d.dir.join("docker.sock");
     // A Unix socket, as Docker's is: this fixture runs on Linux, and
     // `--all-targets` compiles it elsewhere too.
     #[cfg(unix)]
-    let docker = {
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        listener
-    };
+    let docker = crate::unix_socket::Socket::bind();
+    #[cfg(unix)]
+    docker.listener().set_nonblocking(true).unwrap();
+    #[cfg(unix)]
+    let socket = docker.path();
+    #[cfg(not(unix))]
+    let socket = sealed.d.dir.join("docker.sock");
     let output = successful(
         sealed
             .apply_command(&sealed.artifact)
@@ -1461,7 +1462,7 @@ pub fn applied(server: &str) {
     );
     #[cfg(unix)]
     assert_eq!(
-        docker.accept().unwrap_err().kind(),
+        docker.listener().accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "apply reached the Docker socket: {}",
         stdout(&output)

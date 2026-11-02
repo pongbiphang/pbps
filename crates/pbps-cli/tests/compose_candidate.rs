@@ -13,6 +13,10 @@ use std::time::{Duration, SystemTime};
 
 use pbps_ui::compose::{Candidates, CaptureBoundary, Config, Intent, Request};
 
+#[cfg(unix)]
+#[path = "support/unix_socket.rs"]
+mod unix_socket;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 const ORIGINAL: &str = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n";
 const RENAMED: &str = "table: dbo.t\ncolumns:\n  ident: {type: int, nullable: false}\n";

@@ -19,6 +19,10 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+#[path = "support/unix_socket.rs"]
+mod unix_socket;
+
 #[path = "support/stand_in.rs"]
 mod stand_in;
 
