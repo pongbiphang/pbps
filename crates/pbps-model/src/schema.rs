@@ -70,7 +70,7 @@ pub struct Schema {
 }
 
 /// Installed package state; the database-global name is the map key.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Extension {
     pub schema: String,
