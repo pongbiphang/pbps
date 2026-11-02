@@ -51,6 +51,7 @@ limitations and deferred findings. Two groups of commands:
 | `apply --plan --checksum --allow` | Run the checksum-pinned approved plan, in one transaction |
 | `apply --staged --checksum` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
 | `verify` (`--format json`) | The drift check; exits 2 on drift |
+| `test`, `test --cleanup` | PostgreSQL fixtures and assertions in owned disposable scratch; reports evidence, writes no applyable plan |
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `state list`, `state show <id>`, `state diff <id> [<id>]` (`--format json`) | Inspect and compare recorded history |
 | `state export <id>` (`--force` / `--format json`) | Write historical declarations for review, commit and a new forward plan; preserve current identity intent |

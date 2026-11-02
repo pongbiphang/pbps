@@ -75,3 +75,4 @@ DECISIONS 465).
 - `83/` adds retained CHECK writebacks to plan explanations (#2354 PR 1).
 - `84/` adds retained column DEFAULT writebacks to plan explanations (#2354 PR 2).
 - `85/` adds exact read-only PostgreSQL extension declarations and state identities (#2447 PR A).
+- `86/` adds owned PostgreSQL `test` results: frozen input provenance, replay/candidate phases, assertion evidence and confirmed cleanup (#1165).

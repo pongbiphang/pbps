@@ -908,3 +908,22 @@ values, ordinary refusals, cancellation and cleanup; input/evidence tests pin
 partial refusals and unavailable identities. Replay and public publication are
 D2b2; the prerequisite-design class remains #2552 and the combined bootstrap/
 unlock evidence follow-up remains #2547.
+
+
+<a id="dec-1165-11"></a>
+
+**DEC-1165.11. The public PostgreSQL test command replays frozen endpoints through the owned services.**
+D2b2 exposes run and cleanup through the existing findings envelope, with no
+connection selector or applyable plan output. Fixture groups follow git ancestry;
+files sharing a pin keep manifest order and one fixture session. Ordinary sealed
+plans replay endpoint jumps and then the candidate, preserving admission and
+submission observations separately. Namespace prerequisites cover all frozen
+revisions; roles still wait for their hop so future identities cannot poison an
+earlier unmanaged check. D2b1 owns cancellation, budgets, partial evidence and
+confirmed cleanup, and publication also rechecks the frozen inputs. The new
+command is outside older closed envelope branches, so DEC-1734.1 raises the
+archive compatibility floor to this schema set while wire version 1 stays. Public CLI
+PG16/18 regressions cover retained rows, replay order, candidate checksums,
+assertion/fixture refusals, cancellation and input changes. SQL Server and verified
+fixture re-pinning remain later #1165 slices; #2552 and the deferred reporting
+findings retain their existing scope (ADR-0019).
