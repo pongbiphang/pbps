@@ -79,6 +79,25 @@ fn baseline(
             same,
         )
     }));
+    // The manifest's own spelling of each fixture path. The frozen path is the
+    // resolved one, so a fixture replaced by a link would otherwise be read from
+    // HEAD at the link's target and compared against the wrong original.
+    let dir = manifest.path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    for (f, declared) in inputs
+        .frozen
+        .fixtures
+        .iter()
+        .zip(&inputs.frozen.manifest.fixtures)
+    {
+        let declared = declared_path(dir, &declared.file);
+        if declared != f.file.path {
+            refusals.extend(refuse(format!(
+                "fixture `{}` is declared at `{declared}` but resolves to `{}`; a re-pin needs \
+                 a plain file there, not a link",
+                f.name, f.file.path
+            )));
+        }
+    }
     for (what, path, role, same) in wanted {
         let committed =
             revision::committed_file(&inputs.root, head, path, role).map_err(|problem| {
@@ -114,6 +133,22 @@ fn baseline(
     } else {
         Err(refusals)
     }
+}
+
+/// `file` relative to the manifest's project directory, with `.` and `..`
+/// folded the way a resolved path is.
+fn declared_path(dir: &str, file: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in file.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
 }
 
 /// A re-pin only advances: `to` is a commit this repository has, other than
@@ -256,7 +291,15 @@ fn validate(
             .collect()
     };
     let fixture = &inputs.frozen.fixtures[index];
-    let mut proposed_inputs = vec![manifest_file.clone(), fixture.file.clone()];
+    // The proposed side replays every fixture in its chain, not only the edited one.
+    let mut proposed_inputs = vec![manifest_file.clone()];
+    proposed_inputs.extend(
+        proposed
+            .groups
+            .iter()
+            .flat_map(|g| &g.fixtures)
+            .map(|&i| inputs.frozen.fixtures[i].file.clone()),
+    );
     proposed_inputs.extend(files(&proposed));
     original_inputs.extend(files(&original));
     for list in [&mut original_inputs, &mut proposed_inputs] {
@@ -451,6 +494,13 @@ async fn side(
     found
 }
 
+/// Whether the side runs: the first always does, the second only after the
+/// first completed and its scratch is confirmed gone, so a later cleanup can
+/// never stand in for an earlier one that failed.
+fn runs(second: bool, completed: usize, cleanup_confirmed: bool) -> bool {
+    completed == usize::from(second) && (!second || cleanup_confirmed)
+}
+
 async fn execute(plan: &Plan, data: &mut TestData) {
     let timeouts = plan.inputs.frozen.manifest.timeouts;
     let Some(dir) = reconcile(data, ms(timeouts.cleanup_ms)).await else {
@@ -460,7 +510,7 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     let mut snapshots = Vec::new();
     // Stop at the first side that does not complete; the other is listed as skipped.
     for label in ["original", "proposed"] {
-        let run = snapshots.len() == usize::from(label == "proposed");
+        let run = runs(label == "proposed", snapshots.len(), data.cleanup_confirmed);
         if let Some(found) = side(plan, label, &dir, &mut control, data, run).await {
             snapshots.push(found);
         }
@@ -540,3 +590,6 @@ fn compare(
         repin.allocators = allocators;
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -254,6 +254,9 @@ fn later_fixture_exposes_the_difference(old: bool) {
         .unwrap();
     assert_eq!(t["equal"], false);
     assert!(!t["differences"].as_array().unwrap().is_empty());
+    // The proposed side replayed `later` too, so it is named among its inputs.
+    let inputs = v["data"]["repin"]["proposed_inputs"].as_array().unwrap();
+    assert!(inputs.iter().any(|f| f["path"] == "tests/later.sql"), "{v}");
     assert_eq!(w.manifest_text(), manifest);
 }
 
@@ -543,6 +546,17 @@ fn repin_refusals_happen_before_any_scratch_and_change_nothing() {
         message.contains("`other`") && message.contains("uncommitted changes"),
         "{message}"
     );
+    // A fixture replaced by a link to another file is not the committed original.
+    let sql = w.p.0.dir.join("tests/orders.sql");
+    let kept = std::fs::read(&sql).unwrap();
+    std::fs::remove_file(&sql).unwrap();
+    w.p.write("tests/linked.sql", "SELECT 3;");
+    std::os::unix::fs::symlink("linked.sql", &sql).unwrap();
+    let (exit, message) = run("orders", &w.base);
+    assert_eq!(exit, 2);
+    assert!(message.contains("not a link"), "{message}");
+    std::fs::remove_file(&sql).unwrap();
+    std::fs::write(&sql, kept).unwrap();
     // A fixture file git does not have is not a baseline.
     w.p.write("tests/other.sql", "SELECT 1;");
     w.p.0.git(&["rm", "-q", "--cached", "tests/other.sql"]);
