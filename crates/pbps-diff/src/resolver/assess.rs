@@ -269,7 +269,21 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         | Change::AddEnumValue { .. }
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
-         | pbps_model::catalog_change!() | Change::PublicExecution { .. } => false,
+        // Roles, types and extensions (`catalog_change!`). A role or type moves
+        // no existing lookup. A package create **can**: it may add an operator
+        // or function that matches an argument type better than what the path
+        // found before (measured on 16 and 18: intarray's `@>` on `int[]`; a
+        // stored view, default, check and `BEGIN ATOMIC` body keep their binding,
+        // while later statements and string-bodied or plpgsql routines bind the
+        // package's operator at call time; citext adds nothing that rebinds).
+        // DEC-1515.1's rule would make that `true`, and it stays `false` on
+        // purpose: `true` sends every kept surface to a resolver that cannot
+        // describe a package the target lacks, and `resolution::resolve`
+        // refuses that by name. So the assessment's "unaffected" count does not
+        // cover a create; answering it soundly needs the resolver to hold the
+        // package (DEC-2447.6, a later slice). Do not "fix" this to `true`.
+        | pbps_model::catalog_change!()
+        | Change::PublicExecution { .. } => false,
     }
 }
 
@@ -415,6 +429,37 @@ mod tests {
         );
         assert!(!found.requires_resolution(), "{found:?}");
         assert_eq!(found.count(Answer::Unaffected), 3, "{found:?}");
+    }
+
+    /// A package create alone stays "not needed": the resolver cannot describe a
+    /// package the target lacks, so answering `Resolve` for it would make every
+    /// package create in a project with a kept surface unplannable. The create
+    /// beside a change that does move names is the case `resolution::resolve`
+    /// refuses by name (DEC-2447.6); the same table change without the create
+    /// still goes to the engine, so this negative does not hide it.
+    #[test]
+    fn a_package_create_alone_needs_no_resolver_and_a_table_change_still_does() {
+        let base = bound();
+        let package = || Change::CreateExtension {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition: pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+            requires: BTreeSet::new(),
+        };
+        let alone = with(&base, vec![package()]);
+        assert!(!alone.requires_resolution(), "{alone:?}");
+        assert_eq!(alone.count(Answer::Unaffected), 3, "{alone:?}");
+        let table = || Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            name: "extra".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        };
+        assert!(with(&base, vec![table()]).requires_resolution());
+        assert!(with(&base, vec![package(), table()]).requires_resolution());
     }
 
     /// Ordinary table changes are not exempt (ADR-0016 §1): a column that

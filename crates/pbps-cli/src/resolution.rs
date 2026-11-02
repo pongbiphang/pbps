@@ -300,6 +300,41 @@ pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::
     )
 }
 
+/// A plan that creates a package and also needs the resolver (DEC-2447.6).
+/// The resolver reconstructs the desired namespace on a scratch that does not
+/// hold a package the target lacks, so it cannot seal evidence over the create;
+/// measured, it failed late with an internal error. The two plans taken in
+/// order work: the package alone needs no resolver answer, and once it is
+/// installed and managed the scratch holds it through its externals file
+/// (DEC-2447.2).
+fn package_created(request: &Request<'_>) -> Option<crate::output::Finding> {
+    let created: Vec<String> = request
+        .desired
+        .schema
+        .extensions
+        .keys()
+        .filter(|name| {
+            request.desired.ids.extension_uid(name).is_some()
+                && !request.base.schema.extensions.contains_key(*name)
+        })
+        .map(|name| format!("`{}`", name.shown()))
+        .collect();
+    if created.is_empty() {
+        return None;
+    }
+    Some(gated(
+        request.selection,
+        request.assessment,
+        &format!(
+            "this plan also creates extension {}, and the resolver cannot describe a package the \
+             target does not hold yet",
+            created.join(", ")
+        ),
+        "Plan the package alone first and apply it. Then provision it on the scratch through \
+         the entry's externals file (DEC-2447.2) and plan the rest.",
+    ))
+}
+
 /// Case 3: ask the selected resolver for the plan it seals. Only this path
 /// reads the key or opens a resolver resource, and it reads the key first,
 /// so a missing key costs no image and no scratch server.
@@ -315,6 +350,11 @@ pub(crate) async fn resolve(
     request: &Request<'_>,
     entry: &mut Entry<'_>,
 ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
+    // The only way into a resolver run, so this is the one place a package
+    // create is turned away: before the key is read or a scratch is touched.
+    if let Some(finding) = package_created(request) {
+        return Err(Refused::Finding(finding));
+    }
     let driver = request.target.driver();
     if let Err(missing) =
         pbps_cli::resolver::sealing::environment_key(request.project, request.target.environment())

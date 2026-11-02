@@ -611,3 +611,87 @@ fn an_offline_saved_plan_holding_a_create_is_refused_by_apply_and_writes_nothing
         untouched(&f);
     });
 }
+
+/// A plan that creates a package and also changes names a kept surface could
+/// bind (here a new table, beside a kept view) needs the resolver's answer, and
+/// the resolver cannot describe a package the target lacks. It used to fail
+/// late with "a bug in pbps"; it is refused by name before the resolver runs
+/// (DEC-2447.6). The two plans taken in order work.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn create_and_a_binding_change_in_one_plan_is_refused_by_name() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-both-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        std::fs::write(
+            f.d.dir.join("schema/app.t2.yml"),
+            "table: app.t2\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_t2, columns: [id]}\n",
+        )
+        .unwrap();
+        minted(&f);
+        let before = ledger_entries(&f);
+        let out = f.plan(&[]);
+        assert_eq!(code(&out), 2, "{}", said(&out));
+        let message = said(&out);
+        assert!(
+            message.contains("`zzz_base`")
+                && message.contains("Plan the package alone first")
+                && message.contains("externals file"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("bug in pbps"),
+            "the refusal came from the internal error: {message}"
+        );
+        assert!(!f.artifact().exists(), "a refused plan wrote a file");
+        assert_eq!(ledger_entries(&f), before);
+        assert_eq!(held(&f, BOTH), "");
+
+        // The remedy, in order: the package alone, applied; then the scratch
+        // holds it through its externals file and the rest plans.
+        let g = fixture(
+            server,
+            &format!("create2447-order-{slug}"),
+            &Options::default(),
+        );
+        declare(&g, "zzz_base", "1.0");
+        minted(&g);
+        let out = g.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let out = g.apply("extension-code");
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        assert_eq!(held(&g, "'zzz_base'"), "zzz_base@ext@1.0");
+        std::fs::write(
+            g.d.dir.join("externals.sql"),
+            "CREATE SCHEMA ext; CREATE EXTENSION zzz_base SCHEMA ext VERSION '1.0';\n",
+        )
+        .unwrap();
+        let config = std::fs::read_to_string(g.d.dir.join("pbps.yml")).unwrap();
+        std::fs::write(
+            g.d.dir.join("pbps.yml"),
+            config.replace(
+                "    url_env: PBPS_REH_SCRATCH\n",
+                "    url_env: PBPS_REH_SCRATCH\n    externals: externals.sql\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            g.d.dir.join("schema/app.t2.yml"),
+            "table: app.t2\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_t2, columns: [id]}\n",
+        )
+        .unwrap();
+        minted(&g);
+        let out = g.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let plan = saved(&g);
+        assert!(plan.extension_pins.is_empty());
+        assert!(matches!(
+            plan.analysis,
+            pbps_model::resolver::PlanAnalysis::Resolved(_)
+        ));
+    });
+}

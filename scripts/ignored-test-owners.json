@@ -710,6 +710,7 @@
         "extensions2447_create::an_apply_asks_the_target_again_and_installs_nothing_when_it_changed",
         "extensions2447_create::a_staged_apply_vets_the_install_in_its_own_transaction",
         "extensions2447_create::an_offline_saved_plan_holding_a_create_is_refused_by_apply_and_writes_nothing",
+        "extensions2447_create::create_and_a_binding_change_in_one_plan_is_refused_by_name",
         "census2444::census_names_extensions_pgcrypto",
         "census2444::census_names_extensions_uuid",
         "census2444::census_names_unsupported_comment",
