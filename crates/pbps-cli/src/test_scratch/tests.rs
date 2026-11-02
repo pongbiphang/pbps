@@ -1097,8 +1097,6 @@ mod live {
                     .is_err()
             );
         }
-        // The drop fallback is a spawned `docker rm`: give it the time it needs.
-        tokio::time::sleep(Duration::from_secs(8)).await;
         let listed = |token: &String| {
             let name = format!("pbps-scratch-{token}");
             async move {
@@ -1112,13 +1110,21 @@ mod live {
                     .is_empty()
             }
         };
+        // The spawned `docker rm` can be delayed under load: poll for absence
+        // instead of assuming a fixed sleep is enough, but bound a broken fallback.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while listed(&anonymous).await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "the resolver's own start still removes its container"
+        );
         assert!(
             listed(&recorded).await,
             "a recoverable start's container waits for recovery"
-        );
-        assert!(
-            !listed(&anonymous).await,
-            "the resolver's own start still removes its container"
         );
     }
 
