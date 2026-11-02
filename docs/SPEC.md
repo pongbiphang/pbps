@@ -4013,7 +4013,8 @@ the third system copies and edits it (14.3).
 candidate declaration change using SQL fixtures and assertions in a scratch
 **it created**. The accepted contract is
 [ADR-0019](ADR-0019-plan-tests.md); implementation is #1165 (PostgreSQL first,
-then SQL Server, both required). The PostgreSQL run and `test --cleanup` commands are implemented, and `test fixtures repin` verifies a re-pin there without yet writing the manifest; SQL Server execution remains pending. It accepts no `--db`, `--env`, supplied server
+then SQL Server, both required). The PostgreSQL run, `test --cleanup`
+and `test fixtures repin` are implemented for PostgreSQL; SQL Server execution remains pending. It accepts no `--db`, `--env`, supplied server
 or production plan, and writes **no applyable plan file**. The result reports
 the exact executed test-plan checksum, not a promise that a future production
 plan will have identical bytes. §9.3's preview/rehearsal remains separate.

@@ -150,7 +150,7 @@ fn verified_match(old: bool) {
     engine(&v, old);
     assert_eq!(v["result"], "ok");
     assert_eq!(v["data"]["cleanup_confirmed"], true);
-    assert_eq!(v["data"]["repin"]["manifest"]["status"], "not_attempted");
+    assert_eq!(v["data"]["repin"]["manifest"]["status"], "written");
     let sides = v["data"]["repin"]["sides"].as_array().unwrap();
     assert_eq!(sides.len(), 2);
     assert_ne!(
@@ -180,16 +180,27 @@ fn verified_match(old: bool) {
             .iter()
             .all(|a| a["sequence"].as_str().unwrap().starts_with("app."))
     );
-    for name in ["compare_rows", "compare_allocators"] {
+    for name in ["compare_rows", "compare_allocators", "manifest_write"] {
         assert_eq!(phase(&v, name)["outcome"], "passed");
     }
-    // Verification only: neither the manifest nor the SQL was touched.
-    assert_eq!(w.manifest_text(), before);
+    // Exactly the selected pin moved; the file layout and the SQL are untouched.
+    assert_eq!(
+        w.manifest_text(),
+        before.replacen(&format!("at: {}", w.old), &format!("at: {}", w.base), 1)
+    );
     assert_eq!(
         std::fs::read_to_string(w.p.0.dir.join("tests/orders.sql")).unwrap(),
         edited
     );
     w.p.settled();
+    assert!(
+        std::fs::read_dir(w.p.0.dir.join("tests"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
+    );
+    // Pinned where it now is, the pin cannot advance again.
+    let again = w.repin("orders", &w.base, 2);
+    assert!(messages(&again).contains("already pinned"), "{again}");
 }
 
 fn allocator_state_differs(old: bool) {
@@ -355,7 +366,7 @@ fn another_groups_operations_do_not_commute(old: bool) {
         "{v}"
     );
     assert_eq!(w.manifest_text(), manifest);
-    // Listed first, `early` keeps its place before `late`, and the comparison passes.
+    // Listed first, `early` keeps its place before `late`, and the pin moves.
     w.commit_fixtures(
         old,
         &[
@@ -373,8 +384,15 @@ fn another_groups_operations_do_not_commute(old: bool) {
     );
     let manifest = w.manifest_text();
     let v = w.repin("early", &w.base, 0);
-    assert_eq!(v["data"]["repin"]["manifest"]["status"], "not_attempted");
-    assert_eq!(w.manifest_text(), manifest);
+    assert_eq!(v["data"]["repin"]["manifest"]["status"], "written");
+    assert_eq!(
+        w.manifest_text(),
+        manifest.replacen(
+            &format!("name: early, file: early.sql, at: {}", w.old),
+            &format!("name: early, file: early.sql, at: {}", w.base),
+            1
+        )
+    );
 }
 
 fn fixture_errors(old: bool) {
@@ -474,6 +492,43 @@ fn a_changed_input_cannot_move_the_pin(old: bool) {
         }
         w.p.settled();
     }
+}
+
+fn a_failed_replacement_moves_nothing(old: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let w = world(IDENTITY);
+    w.commit_fixtures(old, &[("orders", &w.old, KEPT_AND_DISCARDED)]);
+    w.p.write(
+        "tests/orders.sql",
+        concat!(
+            "INSERT INTO app.t(v, note) VALUES ('kept', NULL), ('discarded', NULL); ",
+            "DELETE FROM app.t WHERE v = 'discarded';"
+        ),
+    );
+    let manifest = w.manifest_text();
+    let dir = w.p.0.dir.join("tests");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(dir.clone());
+    if std::fs::File::create(dir.join("probe")).is_ok() {
+        return; // a superuser is not stopped by the mode
+    }
+    let v = w.repin("orders", &w.base, 1);
+    assert_eq!(v["result"], "unanswerable");
+    assert!(
+        finding_ids(&v).contains(&"test.repin.manifest".to_owned()),
+        "{v}"
+    );
+    assert_eq!(v["data"]["repin"]["manifest"]["status"], "failed");
+    assert_eq!(w.manifest_text(), manifest);
+    // Rows and allocators matched and cleanup was confirmed: only the write failed.
+    assert_eq!(phase(&v, "compare_rows")["outcome"], "passed");
+    assert_eq!(v["data"]["cleanup_confirmed"], true);
 }
 
 #[test]
@@ -626,7 +681,7 @@ macro_rules! on_both {
 }
 
 on_both! {
-    repin_equal_rows_and_allocators_verify_without_writing => verified_match,
+    repin_equal_rows_and_allocators_moves_only_the_pin => verified_match,
     repin_equal_rows_different_allocator_state => allocator_state_differs,
     repin_later_fixture_exposes_allocator_difference => later_fixture_exposes_the_difference,
     repin_row_differences_in_null_case_and_space_are_refused => rows_differ,
@@ -636,4 +691,5 @@ on_both! {
     repin_unestablishable_allocator_is_unanswerable => exhausted_allocator_is_unanswerable,
     repin_committed_candidate_with_another_working_tree_verifies => committed_candidate_with_another_working_tree,
     repin_changed_input_cannot_move_the_pin => a_changed_input_cannot_move_the_pin,
+    repin_failed_replacement_moves_nothing => a_failed_replacement_moves_nothing,
 }

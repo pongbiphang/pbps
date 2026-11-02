@@ -7,6 +7,7 @@
 //! manifest changes only on a match with both cleanups confirmed; everything
 //! else leaves it byte-for-byte as it was.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::time::Instant;
 
@@ -31,6 +32,8 @@ struct Plan {
     head: CommitId,
     /// The fixture as committed at `HEAD`: what the original side loads.
     old_sql: String,
+    /// The manifest with only the selected pin changed.
+    new_manifest: String,
     original: ReplayChain,
     proposed: ReplayChain,
 }
@@ -308,6 +311,10 @@ fn validate(
         list.sort();
         list.dedup();
     }
+    let text = String::from_utf8(working).expect("the manifest was read as UTF-8");
+    let new_manifest = manifest
+        .with_pin(&text, index, &to)
+        .map_err(|reason| refuse(format!("the manifest cannot be edited safely: {reason}")))?;
     data.repin = Some(Repin {
         fixture: name.to_owned(),
         path: fixture.file.path.clone(),
@@ -322,9 +329,7 @@ fn validate(
             status: "not_attempted".to_owned(),
             old_sha256: manifest_file.sha256,
             new_sha256: None,
-            reason: Some(
-                "this build verifies the re-pin but does not yet write the manifest".to_owned(),
-            ),
+            reason: None,
         },
     });
     Ok(Plan {
@@ -333,6 +338,7 @@ fn validate(
         to,
         head,
         old_sql,
+        new_manifest,
         original,
         proposed,
     })
@@ -501,15 +507,14 @@ async fn side(
 /// A `HEAD` that moved since the baseline was read. `Inputs::reverify` watches
 /// it only for a working-tree candidate, and capturing it there for another
 /// candidate would also compare the working files with the candidate's.
-fn head_moved(plan: &Plan) -> String {
+fn head_moved(plan: &Plan) -> Option<Refusal> {
     match git::resolve_commit(&plan.inputs.root, "HEAD") {
-        Ok(now) if now == plan.head => String::new(),
-        Ok(now) => Refusal::HeadMoved {
+        Ok(now) if now == plan.head => None,
+        Ok(now) => Some(Refusal::HeadMoved {
             captured: plan.head.clone(),
             now,
-        }
-        .to_string(),
-        Err(problem) => git_refusal("HEAD", problem).to_string(),
+        }),
+        Err(problem) => Some(git_refusal("HEAD", problem)),
     }
 }
 
@@ -551,14 +556,47 @@ async fn execute(plan: &Plan, data: &mut TestData) {
         "manifest_write",
         plan.inputs.frozen.manifest_file.path.clone(),
     ));
+    let write = rows + 2;
     if let [original, proposed] = &snapshots[..] {
         compare(data, rows, original, proposed);
     }
     data.reverify(&plan.inputs);
-    let moved = head_moved(plan);
-    if !moved.is_empty() {
+    if let Some(moved) = head_moved(plan) {
         data.inputs_reverified = false;
-        data.failure(0, "test.input", moved, true);
+        data.failure(0, "test.input", moved.to_string(), true);
+    }
+    if may_publish(data) {
+        let started = Instant::now();
+        let result = publish_pin(plan);
+        data.phases[write].elapsed_ms = elapsed(started);
+        let manifest = &mut data
+            .repin
+            .as_mut()
+            .expect("a re-pin has its record")
+            .manifest;
+        match result {
+            Ok(()) => {
+                manifest.status = "written".to_owned();
+                manifest.new_sha256 = Some(sha256(plan.new_manifest.as_bytes()));
+                data.phases[write].outcome = Status::Passed;
+            }
+            Err(blocked) => {
+                let (id, message) = match blocked {
+                    Blocked::Input(refusals) => (
+                        "test.input",
+                        refusals
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                    Blocked::Write(error) => ("test.repin.manifest", format!("{error:#}")),
+                };
+                manifest.status = "failed".to_owned();
+                manifest.reason = Some(message.clone());
+                data.failure(write, id, format!("the pin was not moved: {message}"), true);
+            }
+        }
     }
 }
 
@@ -621,6 +659,99 @@ fn compare(
         repin.tables = tables;
         repin.allocators = allocators;
     }
+}
+
+/// The pin moves only when every other phase passed, including the comparisons,
+/// the final input check and both cleanups (ADR-0019 §5). A phase that was
+/// skipped, failed or could not be answered withholds it.
+fn may_publish(data: &TestData) -> bool {
+    data.cleanup_confirmed
+        && data.inputs_reverified
+        && data
+            .phases
+            .iter()
+            .all(|p| p.phase == "manifest_write" || matches!(p.outcome, Status::Passed))
+}
+
+enum Blocked {
+    /// An input moved after it was read, so what was compared is not what is on disk.
+    Input(Vec<Refusal>),
+    Write(anyhow::Error),
+}
+
+fn publish_pin(plan: &Plan) -> Result<(), Blocked> {
+    replace(
+        plan.inputs.frozen.manifest_target(),
+        plan.new_manifest.as_bytes(),
+        || {
+            let mut moved = plan.inputs.reverify().err().unwrap_or_default();
+            moved.extend(head_moved(plan));
+            if moved.is_empty() { Ok(()) } else { Err(moved) }
+        },
+    )
+}
+
+/// Replaces `target` with `bytes` whole or not at all: a temporary file in the
+/// same directory, written and synced, checked against the inputs one last
+/// time, then renamed over the target. A crash leaves the old manifest and at
+/// most one orphan `.…repin-….tmp`; no reader ever sees half a manifest. Two
+/// writers can still interleave between the check and the rename (DEC-1165.12).
+fn replace(
+    target: &Path,
+    bytes: &[u8],
+    check: impl FnOnce() -> Result<(), Vec<Refusal>>,
+) -> Result<(), Blocked> {
+    use anyhow::Context as _;
+    let dir = target
+        .parent()
+        .context("the manifest has no directory")
+        .map_err(Blocked::Write)?;
+    let name = target
+        .file_name()
+        .context("the manifest has no name")
+        .map_err(Blocked::Write)?;
+    let temporary = dir.join(format!(
+        ".{}.repin-{:x}.tmp",
+        name.to_string_lossy(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<(), Blocked> {
+        let io = |what: &'static str| {
+            move |e: std::io::Error| Blocked::Write(anyhow::Error::new(e).context(what))
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(io("cannot create a temporary file beside the manifest"))?;
+        let mode = std::fs::metadata(target)
+            .map_err(io("cannot read the manifest's mode"))?
+            .permissions();
+        file.set_permissions(mode)
+            .map_err(io("cannot copy the manifest's mode"))?;
+        file.write_all(bytes)
+            .map_err(io("cannot write the new manifest"))?;
+        file.sync_all()
+            .map_err(io("cannot sync the new manifest"))?;
+        drop(file);
+        check().map_err(Blocked::Input)?;
+        std::fs::rename(&temporary, target).map_err(io("cannot replace the manifest"))?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io("cannot sync the manifest's directory"))?;
+        match std::fs::read(target) {
+            Ok(now) if now == bytes => Ok(()),
+            Ok(_) => Err(Blocked::Write(anyhow::anyhow!(
+                "the manifest was changed again right after the replacement"
+            ))),
+            Err(e) => Err(io("cannot read the manifest back")(e)),
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
