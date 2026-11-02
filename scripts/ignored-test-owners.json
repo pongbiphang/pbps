@@ -2438,7 +2438,11 @@
         "assertions1165::target2401::a_different_cluster_with_the_same_database_name_is_not_the_target",
         "assertions1165::target2401::read_server_files_is_refused_through_the_actor_closure",
         "assertions1165::target2401::write_server_files_is_refused_through_the_actor_closure",
-        "assertions1165::target2401::execute_server_program_is_refused_through_the_actor_closure"
+        "assertions1165::target2401::execute_server_program_is_refused_through_the_actor_closure",
+        "domain2469::domain_check_uses_the_bare_type_before_its_function_and_enforces_values",
+        "domain2469::domain_facets_keep_vetted_intermediates_authored_text_and_execution_modes",
+        "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks",
+        "domain2469::split_derived_defaults_override_temporary_inheritance"
       ]
     },
     {
