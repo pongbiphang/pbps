@@ -1,38 +1,69 @@
 //! Orchestration over frozen inputs and the owned-only adapters (DEC-1165.9).
 use super::{
-    Inputs, Outcome,
+    Assembled, Inputs, Outcome, ReplayChain,
     execution::{Control, elapsed, ms},
     report::{Assertion, Phase, Status, TestData},
     session::Session,
 };
 use crate::{deploy::test_run, test_scratch};
+use pbps_config::test_manifest::{CommitId, Timeouts};
 use std::{
-    path::Path,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-fn prepare(data: &mut TestData, inputs: &Inputs) {
-    data.phases
-        .push(Phase::new("provision", "owned PostgreSQL scratch"));
-    for (index, group) in inputs.chain.groups.iter().enumerate() {
+/// One pinned replay: bootstrap the oldest pin, hop between pins, grant and
+/// load each group's fixtures. `pbps test` replays to the base; a re-pin replays
+/// the same way, twice, to the new revision (ADR-0019 §4, §5).
+pub(super) struct Replay<'a> {
+    pub chain: &'a ReplayChain,
+    pub revisions: &'a BTreeMap<CommitId, Assembled>,
+    /// Name and SQL by manifest index; an entry the chain does not name is unused.
+    pub fixtures: Vec<(&'a str, &'a str)>,
+    pub timeouts: Timeouts,
+}
+
+impl Inputs {
+    fn replay(&self) -> Replay<'_> {
+        Replay {
+            chain: &self.chain,
+            revisions: &self.revisions,
+            fixtures: self
+                .frozen
+                .fixtures
+                .iter()
+                .map(|f| (f.name.as_str(), f.text.as_str()))
+                .collect(),
+            timeouts: self.frozen.manifest.timeouts,
+        }
+    }
+}
+
+pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
+    for (index, group) in r.chain.groups.iter().enumerate() {
         if index == 0 {
-            data.phases
-                .push(Phase::new("bootstrap", group.commit.to_string()));
+            phases.push(Phase::new("bootstrap", group.commit.to_string()));
         } else {
-            let hop = &inputs.chain.hops[index - 1];
+            let hop = &r.chain.hops[index - 1];
             for phase in ["replay_plan", "replay_apply"] {
                 let mut p = Phase::new(phase, group.commit.to_string());
                 p.from = Some(hop.from.to_string());
                 p.to = Some(hop.to.to_string());
                 p.distance = Some(hop.distance);
-                data.phases.push(p);
+                phases.push(p);
             }
         }
         for f in &group.fixtures {
-            data.phases
-                .push(Phase::new("fixture", &inputs.frozen.fixtures[*f].name));
+            phases.push(Phase::new("fixture", r.fixtures[*f].0));
         }
     }
+}
+
+fn prepare(data: &mut TestData, inputs: &Inputs) {
+    data.phases
+        .push(Phase::new("provision", "owned PostgreSQL scratch"));
+    replay_phases(&inputs.replay(), &mut data.phases);
     data.phases.push(Phase::new(
         "candidate_plan",
         inputs.candidate.revision.to_string(),
@@ -54,17 +85,24 @@ fn prepare(data: &mut TestData, inputs: &Inputs) {
         });
     }
 }
-async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, control: &mut Control) {
-    let timeouts = inputs.frozen.manifest.timeouts;
-    let mut phase = 2;
-    for (index, group) in inputs.chain.groups.iter().enumerate() {
-        let input = &inputs.revisions[&group.commit];
+/// Runs the phases [`replay_phases`] listed, from `phase`; `None` when one
+/// failed (its finding is recorded), else the index after the last.
+pub(super) async fn run_replay(
+    r: &Replay<'_>,
+    session: &Session<'_>,
+    data: &mut TestData,
+    control: &mut Control,
+    mut phase: usize,
+) -> Option<usize> {
+    let timeouts = r.timeouts;
+    for (index, group) in r.chain.groups.iter().enumerate() {
+        let input = &r.revisions[&group.commit];
         if index == 0 {
             let Ok(entry) = control
                 .bootstrap(session, input, &mut data.phases[phase])
                 .await
             else {
-                return;
+                return None;
             };
             data.phases[phase].entry = Some(entry);
             phase += 1;
@@ -74,7 +112,7 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
             data.replay_hops += 1;
             data.replay_ms += elapsed(start);
             if !passed {
-                return;
+                return None;
             }
             phase += 2;
         }
@@ -83,7 +121,7 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
             .await
             .is_err()
         {
-            return;
+            return None;
         }
         if !group.fixtures.is_empty() {
             let mut conn = match control
@@ -93,7 +131,7 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
                 Ok(c) => c,
                 Err(error) => {
                     data.failure(phase, "test.infrastructure", format!("{error:#}"), true);
-                    return;
+                    return None;
                 }
             };
             for f in &group.fixtures {
@@ -109,13 +147,13 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
                     .bounded(ms(timeouts.fixture_ms), async {
                         conn.execute(&format!("SET statement_timeout = '{timeout_ms}ms'"))
                             .await?;
-                        conn.execute(&inputs.frozen.fixtures[*f].text).await?;
+                        conn.execute(r.fixtures[*f].1).await?;
                         Ok(())
                     })
                     .await;
                 data.phases[phase].record(start, "test.fixture", &result);
                 if result.is_err() {
-                    return;
+                    return None;
                 }
                 phase += 1;
             }
@@ -123,6 +161,16 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
             drop(conn);
         }
     }
+    Some(phase)
+}
+async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, control: &mut Control) {
+    let timeouts = inputs.frozen.manifest.timeouts;
+    let replay = inputs.replay();
+    let Some(mut phase) =
+        test_run::boxed_future(|| run_replay(&replay, session, data, control, 2)).await
+    else {
+        return;
+    };
     if !hop(session, &inputs.candidate, data, phase, control, true).await {
         return;
     }
@@ -233,6 +281,50 @@ async fn hop(
     result.is_ok()
 }
 
+/// The project root, found without parsing configuration twice or losing its
+/// hash on a refusal, and the manifest path (default `tests/pbps-tests.yml`).
+pub(super) fn locate(start: &Path, manifest: Option<&Path>) -> (PathBuf, PathBuf) {
+    let root = start
+        .ancestors()
+        .find(|p| {
+            let found = std::fs::symlink_metadata(p.join(pbps_config::CONFIG_FILE));
+            !matches!(found, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .unwrap_or(start);
+    let manifest = root
+        .join(manifest.unwrap_or_else(|| Path::new(pbps_config::test_manifest::DEFAULT_MANIFEST)));
+    (root.to_owned(), manifest)
+}
+
+/// Reconciles this user's recorded leftovers before any new work. `None` means
+/// the findings are recorded and nothing may start.
+pub(super) async fn reconcile(
+    data: &mut TestData,
+    allowance: Duration,
+) -> Option<test_scratch::StateDir> {
+    let dir = match test_scratch::state_dir(|name| std::env::var_os(name)) {
+        Ok(dir) => dir,
+        Err(error) => {
+            data.failure(0, "test.cleanup", error.to_string(), true);
+            return None;
+        }
+    };
+    match test_scratch::recover(&dir, Instant::now() + allowance).await {
+        Ok(recovered) => {
+            data.recovery_live = recovered.live;
+            data.recovery_removed = recovered.removed;
+            for error in recovered.failures {
+                data.failure(0, "test.cleanup", error.to_string(), true);
+            }
+            data.phases[0].findings.is_empty().then_some(dir)
+        }
+        Err(error) => {
+            data.failure(0, "test.cleanup", error.to_string(), true);
+            None
+        }
+    }
+}
+
 pub(crate) fn command(
     start: &Path,
     manifest: Option<&Path>,
@@ -255,17 +347,8 @@ pub(crate) fn command(
                 return publish(data.finish(), json);
             }
         };
-        // Locate, but do not parse configuration twice or lose its hash on a refusal.
-        let root = start
-            .ancestors()
-            .find(|p| {
-                let found = std::fs::symlink_metadata(p.join(pbps_config::CONFIG_FILE));
-                !matches!(found, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-            })
-            .unwrap_or(&start);
-        let manifest = root.join(
-            manifest.unwrap_or_else(|| Path::new(pbps_config::test_manifest::DEFAULT_MANIFEST)),
-        );
+        let (root, manifest) = locate(&start, manifest);
+        let root = root.as_path();
         let checked = super::validate_recorded(root, &manifest, &mut data.observed_input);
         data.phases[0].elapsed_ms = elapsed(started);
         match checked {
@@ -313,29 +396,9 @@ async fn execute(inputs: Option<&Inputs>, data: &mut TestData) {
     let allowance = inputs.map_or(Duration::from_secs(30), |i| {
         ms(i.frozen.manifest.timeouts.cleanup_ms)
     });
-    let dir = match test_scratch::state_dir(|name| std::env::var_os(name)) {
-        Ok(dir) => dir,
-        Err(error) => {
-            data.failure(0, "test.cleanup", error.to_string(), true);
-            return;
-        }
+    let Some(dir) = reconcile(data, allowance).await else {
+        return;
     };
-    match test_scratch::recover(&dir, Instant::now() + allowance).await {
-        Ok(recovered) => {
-            data.recovery_live = recovered.live;
-            data.recovery_removed = recovered.removed;
-            for error in recovered.failures {
-                data.failure(0, "test.cleanup", error.to_string(), true);
-            }
-            if !data.phases[0].findings.is_empty() {
-                return;
-            }
-        }
-        Err(error) => {
-            data.failure(0, "test.cleanup", error.to_string(), true);
-            return;
-        }
-    }
     let Some(inputs) = inputs else {
         data.cleanup_confirmed = true;
         return;
