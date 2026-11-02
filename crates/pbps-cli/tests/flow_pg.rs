@@ -72,6 +72,8 @@ mod census2444;
 
 #[path = "support/extensions2447.rs"]
 mod extensions2447;
+#[path = "support/extensions2447_create.rs"]
+mod extensions2447_create;
 
 #[path = "support/grant_advisories2446.rs"]
 mod grant_advisories2446;
@@ -2471,6 +2473,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | pbps_model::Change::CreateType { .. }
             | pbps_model::Change::DropType { .. }
             | pbps_model::Change::RenameType { .. }
+            | pbps_model::Change::CreateExtension { .. }
             | pbps_model::Change::CreateTable { .. } => {
                 assert_eq!(c["status"], "unavailable");
                 assert!(c["reason"].as_str().unwrap().contains("no measurement"));

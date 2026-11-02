@@ -1,0 +1,4 @@
+comment = 'owns a table with TOAST storage (#2447)'
+default_version = '1.0'
+relocatable = false
+superuser = false

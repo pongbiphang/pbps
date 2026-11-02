@@ -1,0 +1,415 @@
+//! A declared package is created by a pinned `CREATE EXTENSION`: planned with
+//! a rehearsal, sealed with the members the install script made, gated, and
+//! vetted by `apply` in the transaction that installs it (#2447, DEC-2447.6).
+//! Every case runs on both pinned engines, on a confined account's database on
+//! the target's own cluster, which is the scratch of the same major version.
+//!
+//! The packages are the SQL-only ones in `scripts/fixtures/pg-history695`:
+//! `aaa_dep` requires `zzz_base`, which sorts after it by name, so only the
+//! prerequisite edge can put the two in order.
+
+use super::rehearsal2379::{Fixture, Kind, Options};
+use super::{code, json_output, on_server, plan_checksum, stderr, stdout, succeeds, text_of};
+use std::process::Output;
+
+fn servers(mut check: impl FnMut(&str, &str)) {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        check(&std::env::var(variable).unwrap(), variable);
+    }
+}
+
+fn said(output: &Output) -> String {
+    format!("{}{}", stdout(output), stderr(output))
+}
+
+fn fixture(server: &str, slug: &str, options: &Options<'_>) -> Fixture {
+    let f = Fixture::new(server, slug, Kind::Supplied, options);
+    on_server(f.target(), "CREATE SCHEMA ext");
+    f
+}
+
+/// Declares `name` at `version` in schema `ext` and lets an offline plan mint
+/// its identity, which is how a first declaration gets one.
+fn declare(f: &Fixture, name: &str, version: &str) {
+    let dir = f.d.dir.join("schema/extensions");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.yml")),
+        format!("extension: {name}\nschema: ext\nversion: \"{version}\"\n"),
+    )
+    .unwrap();
+}
+
+fn minted(f: &Fixture) {
+    succeeds(f.d.run(&["plan"]));
+    f.d.commit();
+}
+
+fn saved(f: &Fixture) -> pbps_model::SavedPlan {
+    serde_json::from_slice(&std::fs::read(f.artifact()).unwrap()).unwrap()
+}
+
+fn held(f: &Fixture, names: &str) -> String {
+    text_of(
+        f.target(),
+        &format!(
+            "SELECT coalesce(string_agg(extname || '@' || n.nspname || '@' || extversion, ',' ORDER BY extname), '') \
+             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE extname IN ({names})"
+        ),
+    )
+}
+
+const BOTH: &str = "'aaa_dep', 'zzz_base'";
+
+fn ledger_entries(f: &Fixture) -> String {
+    text_of(f.target(), "SELECT count(*)::text FROM public.__pbps_state")
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_declared_package_is_created_after_its_prerequisite_pinned_gated_and_recorded() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-ok-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "aaa_dep", "1.0");
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        assert!(
+            stdout(&out).contains("Rehearsal: converged"),
+            "{}",
+            stdout(&out)
+        );
+        let plan = saved(&f);
+        assert_eq!(plan.version, pbps_model::plan::CURRENT_VERSION);
+        // The prerequisite first, by an edge: `aaa_dep` sorts ahead by name.
+        let order: Vec<_> = plan
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::CreateExtension { name, requires, .. } = &p.change {
+                    Some((name.raw().to_owned(), requires.len(), p.risks.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            order.iter().map(|o| o.0.as_str()).collect::<Vec<_>>(),
+            ["zzz_base", "aaa_dep"],
+            "{order:?}"
+        );
+        assert_eq!((order[0].1, order[1].1), (0, 1));
+        assert!(
+            order
+                .iter()
+                .all(|o| o.2.contains(&pbps_model::RiskClass::ExtensionCode))
+        );
+        // Both are sealed with the members the scratch held after the replay.
+        assert_eq!(plan.extension_pins.len(), 2);
+        let manifest = |name: &str| {
+            plan.extension_pins
+                .iter()
+                .find(|p| p.name.raw() == name)
+                .unwrap()
+        };
+        assert!(
+            manifest("zzz_base")
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.class == "function" && m.names.last().unwrap() == "zzz_base_one"),
+            "{:?}",
+            manifest("zzz_base").manifest
+        );
+        assert_eq!(
+            manifest("aaa_dep").manifest.requires,
+            ["zzz_base".to_owned()].into()
+        );
+        // The class is gated: the risk is named, and nothing was installed.
+        let refused = f.apply("destructive");
+        assert_ne!(code(&refused), 0);
+        assert!(
+            said(&refused).contains("extension-code"),
+            "{}",
+            said(&refused)
+        );
+        assert_eq!(held(&f, BOTH), "");
+        let before = ledger_entries(&f);
+        let applied = f.apply("extension-code");
+        assert_eq!(code(&applied), 0, "{}", said(&applied));
+        assert_eq!(held(&f, BOTH), "aaa_dep@ext@1.0,zzz_base@ext@1.0");
+        assert_eq!(
+            text_of(f.target(), "SELECT ext.aaa_dep_two()::text"),
+            "2",
+            "the package's own code ran"
+        );
+        assert_ne!(ledger_entries(&f), before, "the apply was recorded");
+        // The next plan has nothing to do: the packages are held, recorded and
+        // identified.
+        // (Not rehearsed: a scratch that stands for a target holding managed
+        // packages has them from its externals file, as before this change.)
+        let next = json_output(f.plan(&["--no-rehearse", "--format", "json"]));
+        assert_eq!(next["data"]["changes"], 0, "{next}");
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_nothing() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-no-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        let before = ledger_entries(&f);
+        // Turned off, and with no scratch entry selected.
+        for (label, extra, options) in [
+            ("off", vec!["--no-rehearse"], None),
+            (
+                "unselected",
+                vec![],
+                Some(Options {
+                    unselected: true,
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let other;
+            let used = match &options {
+                Some(options) => {
+                    other = fixture(server, &format!("create2447-no-{slug}-{label}"), options);
+                    declare(&other, "zzz_base", "1.0");
+                    minted(&other);
+                    &other
+                }
+                None => &f,
+            };
+            let out = used.plan(&extra);
+            assert_ne!(code(&out), 0, "{label}: {}", said(&out));
+            let message = said(&out);
+            assert!(
+                message.contains("`zzz_base`") && message.contains("rehearsal"),
+                "{label}: {message}"
+            );
+            assert!(
+                !used.artifact().exists(),
+                "{label}: a refused plan wrote a file"
+            );
+        }
+        // A preview with no database has no scratch to read the members from:
+        // it shows the create but cannot be applied, and a script or a dev
+        // rehearsal of it refuses by name.
+        let script = f.d.dir.join("plan.sql");
+        let root = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.d.dir)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        let root = String::from_utf8(root.stdout).unwrap();
+        let since = ["--since", root.trim()];
+        let out = f.d.run(&[
+            "plan",
+            "--sql",
+            script.to_str().unwrap(),
+            since[0],
+            since[1],
+        ]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(said(&out).contains("`zzz_base`"), "{}", said(&out));
+        assert!(!script.exists());
+        let preview = succeeds(f.d.run(&["plan", since[0], since[1]]));
+        assert!(
+            stdout(&preview).contains("create extension zzz_base"),
+            "{}",
+            stdout(&preview)
+        );
+        assert_eq!(ledger_entries(&f), before);
+        assert_eq!(held(&f, BOTH), "");
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn what_the_target_cannot_install_is_named_before_a_plan_exists() {
+    servers(|server, slug| {
+        // A version the server does not list names the ones it does.
+        let f = fixture(
+            server,
+            &format!("create2447-version-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "9.9");
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        let message = said(&out);
+        assert!(
+            message.contains("`zzz_base`")
+                && message.contains("`9.9`")
+                && message.contains("available versions: `1.0`"),
+            "{message}"
+        );
+        assert!(!f.artifact().exists());
+        // A prerequisite the declarations neither pin nor the target holds.
+        let f = fixture(
+            server,
+            &format!("create2447-needs-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "aaa_dep", "1.0");
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("requires extension `zzz_base`"),
+            "{}",
+            said(&out)
+        );
+        // A schema the target does not have.
+        let f = fixture(
+            server,
+            &format!("create2447-schema-{slug}"),
+            &Options::default(),
+        );
+        std::fs::create_dir_all(f.d.dir.join("schema/extensions")).unwrap();
+        std::fs::write(
+            f.d.dir.join("schema/extensions/zzz_base.yml"),
+            "extension: zzz_base\nschema: nowhere\nversion: \"1.0\"\n",
+        )
+        .unwrap();
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("schema `nowhere`") && said(&out).contains("does not have"),
+            "{}",
+            said(&out)
+        );
+        // A package that is already installed is never adopted by a create.
+        let f = fixture(
+            server,
+            &format!("create2447-held-{slug}"),
+            &Options::default(),
+        );
+        on_server(f.target(), "CREATE EXTENSION zzz_base SCHEMA ext");
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(said(&out).contains("already installed"), "{}", said(&out));
+        // Negative: the same declaration, with the schema and a free name, plans.
+        let f = fixture(
+            server,
+            &format!("create2447-fine-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        succeeds(f.plan(&[]));
+    });
+}
+
+/// The members are sealed and the engine is held to them in the transaction
+/// that installs the package. A plan whose manifest differs from what the
+/// script makes (here one a hand edit gave a member the script does not make,
+/// with the checksum approved over the edited file) is rolled back whole.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_install_that_differs_from_its_sealed_manifest_is_rolled_back_and_not_recorded() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-vet-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        succeeds(f.plan(&[]));
+        let original = std::fs::read_to_string(f.artifact()).unwrap();
+        let mut edited: serde_json::Value = serde_json::from_str(&original).unwrap();
+        let members = edited["extension_pins"][0]["manifest"]["members"]
+            .as_array_mut()
+            .unwrap();
+        members.push(serde_json::json!({
+            "class": "function",
+            "names": ["ext", "zzz_base_two"],
+            "args": []
+        }));
+        std::fs::write(f.artifact(), serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+        let before = ledger_entries(&f);
+        let out = f.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        let message = said(&out);
+        assert!(
+            message.contains("`zzz_base`")
+                && message.contains("does not match what was approved")
+                && message.contains("zzz_base_two"),
+            "{message}"
+        );
+        assert!(message.contains("rolled back"), "{message}");
+        assert_eq!(held(&f, BOTH), "", "the install was taken back");
+        // The failed attempt is recorded as a failure and not as the package.
+        assert_eq!(
+            text_of(
+                f.target(),
+                "SELECT count(*)::text FROM pg_proc WHERE proname = 'zzz_base_one'"
+            ),
+            "0"
+        );
+        let _ = before;
+        // Negative: the plan as written installs.
+        std::fs::write(f.artifact(), &original).unwrap();
+        assert_eq!(plan_checksum(&f.artifact()), {
+            let raw: pbps_model::SavedPlan = serde_json::from_str(&original).unwrap();
+            raw.wire_fingerprint()
+        });
+        succeeds(f.apply("extension-code"));
+        assert_eq!(held(&f, "'zzz_base'"), "zzz_base@ext@1.0");
+    });
+}
+
+/// A name the target holds and pbps does not manage is a collision the scratch
+/// cannot see: the engine refuses it inside the apply's transaction, and the
+/// message says which statement.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_member_name_an_unmanaged_object_holds_fails_the_install_and_rolls_back() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-clash-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        succeeds(f.plan(&[]));
+        // Made after the plan, so the plan is the one the target allowed.
+        on_server(
+            f.target(),
+            "CREATE FUNCTION ext.zzz_base_one() RETURNS integer LANGUAGE sql AS 'SELECT 7'",
+        );
+        let out = f.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        let message = said(&out);
+        assert!(
+            message.contains("CREATE EXTENSION \"zzz_base\"") && message.contains("already exists"),
+            "{message}"
+        );
+        assert_eq!(held(&f, "'zzz_base'"), "");
+        assert_eq!(
+            text_of(f.target(), "SELECT ext.zzz_base_one()::text"),
+            "7",
+            "the other object stands, untouched"
+        );
+    });
+}

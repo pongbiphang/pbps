@@ -1,0 +1,5 @@
+comment = 'depends on zzz_base, which sorts after it by name (#2447)'
+default_version = '1.0'
+requires = 'zzz_base'
+relocatable = true
+superuser = false
