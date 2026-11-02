@@ -655,6 +655,13 @@ def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False
     return code
 
 
+def stop_interrupted_cargo(code):
+    # Listing and execution must both stop the runner, rather than become an
+    # ordinary status 1 in the proxy's validation-error handler.
+    if code < 0 or code >= 128:
+        raise SystemExit(128 - code if code < 0 else code)
+
+
 def cargo_proxy(args):
     env = os.environ
     index, count = selector(env["PBPS_LIVE_SHARD"])
@@ -670,6 +677,7 @@ def cargo_proxy(args):
     key = f"{invocation}-{occurrence}"
     enumeration = subprocess.run([real, *cargo, *listing, "--list", "--format=pretty", "--color=never"],
                                  text=True, stdout=subprocess.PIPE)
+    stop_interrupted_cargo(enumeration.returncode)
     require(enumeration.returncode == 0, "cargo --list failed")
     names = listed_tests(enumeration.stdout)
     pinned = env.get("PBPS_LIVE_PINNED") == "1"
@@ -711,10 +719,8 @@ def cargo_proxy(args):
              "--color=never", *assigned], assigned,
             on_failure=lambda results: save_receipt(results, 0.0, False, False))
     save_receipt(reported, seconds, valid, interrupted)
-    # Stop the shell runner on interruption even without a valid test stream.
-    # The loss receipt still goes through the ordinary audit/resume proof.
-    if code < 0 or code >= 128:
-        return 128 - code if code < 0 else code
+    # Preserve loss evidence before an interruption stops the shell runner.
+    stop_interrupted_cargo(code)
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
 

@@ -1791,9 +1791,10 @@ receipt. The runner exits with the recorded status; a later success cannot hide
 an earlier failure. A status of 128 or higher exits immediately: interrupted or
 killed cargo work must not launch another invocation. All wrapped call sites
 are direct commands, outside pipelines, substitutions and conditions. Setup
-and the TLS helper retain `set -euo pipefail` handling. The sharded proxy saves
-its receipt before preserving an interrupted cargo status (negative signal
-wait statuses become 128 plus the signal). Incomplete reports stay invalid;
-the ordinary audit and continuation proof still decide their disposition.
+and the TLS helper retain `set -euo pipefail` handling. The sharded proxy uses
+one interruption check for both cargo listing and execution (negative signal
+wait statuses become 128 plus the signal). Execution saves its loss receipt
+first; an interrupted listing produces no test proof. Incomplete reports stay
+invalid; the ordinary audit and continuation proof still decide their disposition.
 Test arguments, output, CI step semantics and DEC-2584.1's first-pass FAILED
 policy are unchanged.

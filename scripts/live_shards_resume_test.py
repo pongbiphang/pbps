@@ -38,6 +38,8 @@ names = json.loads(os.environ["FAKE_A"]) if "--lib" in args else json.loads(os.e
 if "--test" in args and args[args.index("--test") + 1] == "tls":
     names = [args[args.index("--exact") + 1]]
 if "--list" in args:
+    if "--lib" in args and os.environ.get("FAKE_SIGNAL_LIST"):
+        os.kill(os.getpid(), int(os.environ["FAKE_SIGNAL_LIST"]))
     if args[args.index("-p") + 1] != "demo":
         names = json.loads(os.environ.get("FAKE_EXPRESS", "{{}}"))[args[args.index("-p") + 1]]
     print("\\n".join(n + ": test" for n in names))
@@ -230,6 +232,21 @@ class ContinuedTestFailures(Harness):
             text = path.read_text().replace("fi\n", "fi\nsource scripts/live-test-status.sh\n", 1)
             path.write_text(text + '\nexit "$live_test_status"\n')
         git(cls.repo, "commit", "-q", "-am", "continue ordinary cargo failures")
+
+    def test_killed_listing_stops_the_shard_before_its_later_invocation(self):
+        for suite in ("pg", "mssql"):
+            for signum in (signal.SIGINT, signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(suite=suite, signum=signum):
+                    _, output = self.drive(suite=suite, shards=1, check=1,
+                                           env={"FAKE_SIGNAL_LIST": str(signum)})
+                    events = self.trace.read_text().splitlines() if self.trace.exists() else []
+                    self.assertEqual(events, [], "no later cargo may start after a killed listing")
+                    summary = self.summary(output)
+                    # No listing means no receipts; the existing empty-shard
+                    # proof fails even though the shell stopped on the signal.
+                    self.assertEqual(list((output / suite).glob("*/*.json")), [])
+                    self.assertEqual(summary[suite]["union"], "failed")
+                    self.assertNotIn("automatic_rerun", summary["run"])
 
     def test_killed_cargo_stops_the_shard_before_its_later_invocation(self):
         for suite in ("pg", "mssql"):
