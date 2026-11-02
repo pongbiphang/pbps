@@ -1133,6 +1133,76 @@ elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
 
 
 class LiveExecution(unittest.TestCase):
+    @staticmethod
+    def cargo_count(runner):
+        filename = "live-tests-pg.sh" if runner == "pg" else "live-tests.sh"
+        return len(re.findall(r"^(?:exec )?cargo test ",
+                              (ROOT / "scripts" / filename).read_text(), re.MULTILINE))
+
+    def test_passing_live_runs_keep_their_output_and_arguments(self):
+        for runner in ("mssql", "pg"):
+            with self.subTest(runner=runner):
+                result, calls, _ = self.named_fixture_script(runner, cargo_statuses={})
+                count = self.cargo_count(runner)
+                prefix = ("waiting for PostgreSQL...\n" if runner == "pg" else
+                          "waiting for SQL Server...\nwaiting for the Express SQL Server...\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, prefix + "".join(
+                    f"cargo {i} stdout\n" for i in range(1, count + 1)))
+                self.assertEqual(result.stderr, "".join(
+                    f"cargo {i} stderr\n" for i in range(1, count + 1)))
+                cargo = [c for c in calls if c[0] == "cargo"]
+                self.assertEqual(len(cargo), count)
+                self.assertTrue(all(c[-2:] == ["--exact", "fixture case"] for c in cargo))
+
+    def test_each_cargo_failure_runs_later_commands_and_preserves_the_first_status(self):
+        for runner in ("mssql", "pg"):
+            baseline, expected, _ = self.named_fixture_script(runner, cargo_statuses={})
+            count = self.cargo_count(runner)
+            for failures in [{i: 37} for i in range(1, count + 1)] + [{1: 23, 2: 29}]:
+                with self.subTest(runner=runner, failures=failures):
+                    result, calls, _ = self.named_fixture_script(runner, cargo_statuses=failures)
+                    self.assertEqual(result.returncode, next(iter(failures.values())), result.stderr)
+                    # Only cargo outcomes differ: commands, argument boundaries,
+                    # output, and the interleaved setup/transport steps stay intact.
+                    clients = lambda rows: [c for c in rows if c[0] == "cargo"
+                                            or c[:2] == ["python3", "scripts/live-transport.py"]]
+                    self.assertEqual(clients(calls), clients(expected))
+                    self.assertCountEqual(calls, expected)
+                    self.assertEqual((result.stdout, result.stderr),
+                                     (baseline.stdout, baseline.stderr))
+
+    def test_signal_status_stops_the_runner_even_after_an_ordinary_failure(self):
+        for runner in ("mssql", "pg"):
+            for status in (128, 130, 137, 143, 255):
+                with self.subTest(runner=runner, status=status):
+                    result, calls, _ = self.named_fixture_script(
+                        runner, cargo_statuses={1: 37, 2: status})
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual(sum(c[0] == "cargo" for c in calls), 2)
+            for signum in (signal.SIGINT, signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(runner=runner, signum=signum):
+                    result, calls, _ = self.named_fixture_script(
+                        runner, cargo_statuses={1: 37}, cargo_signal=(2, signum))
+                    self.assertEqual(result.returncode, 128 + signum, result.stderr)
+                    self.assertEqual(sum(c[0] == "cargo" for c in calls), 2)
+
+    def test_setup_failure_stops_immediately_before_or_between_cargo_calls(self):
+        for runner in ("mssql", "pg"):
+            for failing in ("listing", "transport"):
+                with self.subTest(runner=runner, failing=failing):
+                    result, calls, _ = self.named_fixture_script(
+                        runner, failing=failing, cargo_statuses={1: 37})
+                    self.assertEqual(result.returncode, 19, result.stderr)
+                    cargo = [c for c in calls if c[0] == "cargo"]
+                    if failing == "listing":
+                        self.assertFalse(cargo)
+                        self.assertEqual(calls, [["docker", "ps", "-a", "--format", "{{.Names}}"]])
+                    else:
+                        self.assertGreater(len(cargo), 0)
+                        self.assertLess(len(cargo), self.cargo_count(runner))
+                        self.assertEqual(calls[-1], ["python3", "scripts/live-transport.py", runner])
+
     def test_fixture_names_default_when_unset_or_empty(self):
         for runner in ("mssql", "pg", "resolver"):
             for empty in (False, True):
@@ -1286,14 +1356,14 @@ class LiveExecution(unittest.TestCase):
         return [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
 
     def named_fixture_script(self, runner, overrides=None, existing=(), failing="", *,
-                             client_delay=0):
+                             client_delay=0, cargo_statuses=None, cargo_signal=None):
         # Exercise the real scripts, including the sourced helper. Every Docker,
         # checker, transport and cargo invocation is intercepted before execution.
         with tempfile.TemporaryDirectory(prefix="pbps-fixture-names-") as directory:
             root = Path(directory)
             fake = root / "client"
             fake.write_text(f"#!{sys.executable}\n" + r'''
-import json, os, sys, time
+import json, os, signal, sys, time
 from pathlib import Path
 root = Path(os.environ["PBPS_NAMES_CONTROL"])
 command = [Path(sys.argv[0]).name, *sys.argv[1:]]
@@ -1304,7 +1374,18 @@ if command[0] == "cargo":
     with (root / "environments").open("a") as log:
         log.write(json.dumps({key: os.environ.get(key) for key in
                              ("PBPS_TEST_PG_CONTAINER", "PBPS_TEST_PG_OLD_CONTAINER")}) + "\n")
+    number = len((root / "environments").read_text().splitlines())
+    if os.environ["PBPS_NAMES_CARGO_OUTPUT"] == "1":
+        print(f"cargo {number} stdout")
+        print(f"cargo {number} stderr", file=sys.stderr)
+    interrupt = json.loads(os.environ["PBPS_NAMES_CARGO_SIGNAL"])
+    if interrupt and number == interrupt[0]:
+        os.kill(os.getpid(), interrupt[1])
+    sys.exit(json.loads(os.environ["PBPS_NAMES_CARGO_STATUSES"]).get(str(number), 0))
 if command[:2] == ["docker", "ps"]:
+    if os.environ["PBPS_NAMES_FAILING"] == "listing":
+        print("controlled fixture listing failure", file=sys.stderr)
+        sys.exit(19)
     print(os.environ["PBPS_NAMES_EXISTING"])
     if (root / "started").exists():
         print((root / "started").read_text())
@@ -1322,6 +1403,10 @@ elif command[:2] == ["docker", "cp"]:
         sys.exit(1)
 elif command[:2] == ["docker", "logs"]:
     print("controlled fixture not ready", file=sys.stderr)
+elif command[:2] == ["python3", "scripts/live-transport.py"]:
+    if os.environ["PBPS_NAMES_FAILING"] == "transport":
+        print("controlled transport setup failure", file=sys.stderr)
+        sys.exit(19)
 elif command[0] not in ("cargo", "python3", "sleep"):
     raise RuntimeError("Unexpected external command: " + repr(command))
 ''')
@@ -1353,7 +1438,10 @@ sleep() {
                 PATH=str(root) + os.pathsep + os.environ["PATH"],
                 BASH_ENV=str(builtins), PBPS_NAMES_CLIENT_DELAY=str(client_delay),
                 PBPS_NAMES_CONTROL=str(root), PBPS_NAMES_EXISTING="\n".join(existing),
-                PBPS_NAMES_FAILING=failing)
+                PBPS_NAMES_FAILING=failing,
+                PBPS_NAMES_CARGO_STATUSES=json.dumps(cargo_statuses or {}),
+                PBPS_NAMES_CARGO_SIGNAL=json.dumps(cargo_signal),
+                PBPS_NAMES_CARGO_OUTPUT="1" if cargo_statuses is not None else "0")
             env.update(overrides or {})
             command = (["bash", "-c", "source scripts/resolver-mssql-fixtures.sh"]
                        if runner == "resolver" else

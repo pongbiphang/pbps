@@ -23,7 +23,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ("live-shards.py", "live-transport.py", "known_flakes.py", "ignored_test_inventory.py",
-           "ci_release_scope.py")
+           "ci_release_scope.py", "live-test-status.sh")
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 CARGO = ["test", "-p", "demo", "--lib", "--"]
 A_NAMES = [f"a{i:02}" for i in range(12)]
@@ -214,6 +214,41 @@ class Harness(unittest.TestCase):
         subprocess.run([*GIT, "commit", "-q", "-am", "reset"], cwd=self.repo, capture_output=True)
         subprocess.run([*GIT, "clean", "-fdq", "-e", "target"], cwd=self.repo, capture_output=True)
         subprocess.run([*GIT, "checkout", "-q", "--", "."], cwd=self.repo, capture_output=True)
+
+
+class ContinuedTestFailures(Harness):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Keep the existing loss/resume fixtures unchanged. These two-command
+        # runners use the same sourced wrapper as both canonical live runners.
+        for filename in ("live-tests.sh", "live-tests-pg.sh"):
+            path = cls.repo / "scripts" / filename
+            text = path.read_text().replace("fi\n", "fi\nsource scripts/live-test-status.sh\n", 1)
+            path.write_text(text + '\nexit "$live_test_status"\n')
+        git(cls.repo, "commit", "-q", "-am", "continue ordinary cargo failures")
+
+    def test_a_failed_invocation_still_produces_every_assigned_receipt(self):
+        for suite in ("pg", "mssql"):
+            for fail in ((), ("a05",)):
+                with self.subTest(suite=suite, fail=fail):
+                    result, output = self.drive(suite=suite, fail=fail, check=int(bool(fail)))
+                    row = self.summary(output)[suite]
+                    self.assertEqual((row["union"], row["passed"], row["failed"]),
+                                     ("exact", 18 - len(fail), len(fail)))
+                    self.assertEqual(sorted(row["exits"]), [0, 101] if fail else [0, 0])
+                    receipts = [json.loads(p.read_text()) for p in output.glob(f"{suite}/*/*.json")]
+                    self.assertEqual(len(receipts), 4)
+                    self.assertTrue(all(r["valid"] and set(r["assigned"]) == set(r["reported"])
+                                        for r in receipts))
+                    self.assertCountEqual([name for r in receipts for name in r["reported"]],
+                                          A_NAMES + B_NAMES)
+                    missing = {}
+                    self.shards.audit(output / suite, 2, expected_invocations=2, missing=missing)
+                    self.assertEqual(missing, {})
+                    self.assertNotIn("automatic_rerun", self.summary(output)["run"])
+                    if fail:
+                        self.assertIn("FAILED in the first pass forbids automatic rerun", result.stdout)
 
 
 class PlainRun(Harness):

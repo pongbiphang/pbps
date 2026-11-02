@@ -1776,3 +1776,20 @@ removed, and a variant added, removed or renamed each move it, and doc comments,
 field order, helper code and type names do not. The same edits applied to every site
 of a fixture schema, and to a sample of the sites of the real plan and snapshot
 schemas, move the hash.
+
+
+<a id="dec-2620-1"></a>
+
+**DEC-2620.1. Both canonical live runners finish their cargo invocations after
+ordinary test failures and exit with the first failing status.** Under shell
+`errexit`, one failed test command prevented every later command from producing
+receipts, making DEC-2357.1's union incomplete (#2620). A shared sourced,
+shell-local `cargo` wrapper runs `command cargo`, records the first nonzero
+status, and lets the runner reach its remaining direct cargo commands. This
+preserves the sharded driver's PATH proxy and each invocation's real failure
+receipt. The runner exits with the recorded status; a later success cannot hide
+an earlier failure. A status of 128 or higher exits immediately: interrupted or
+killed cargo work must not launch another invocation. All wrapped call sites
+are direct commands, outside pipelines, substitutions and conditions. Setup
+and the TLS helper retain `set -euo pipefail` handling. Test arguments, output,
+CI step semantics and DEC-2584.1's first-pass FAILED policy are unchanged.

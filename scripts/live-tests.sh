@@ -11,6 +11,8 @@ if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
     exec python3 scripts/live-shards.py shard mssql "$@"
 fi
 
+source scripts/live-test-status.sh
+
 NAME=${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}
 # Overridable: a developer machine often already has a SQL Server container
 # holding the default port, and "the tests will not start" is a bad way to find
@@ -139,4 +141,6 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 # `${SKIP[@]+"${SKIP[@]}"}`, not `"${SKIP[@]}"`: under `set -u` an empty array
 # is an unbound variable in bash before 4.4, and macOS ships 3.2.
-exec cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 ${SKIP[@]+"${SKIP[@]}"} "$@"
+cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 ${SKIP[@]+"${SKIP[@]}"} "$@"
+
+exit "$live_test_status"
