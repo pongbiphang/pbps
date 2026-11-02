@@ -272,6 +272,94 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
     assert!(!parent.before.contains(&check) && !parent.before.contains(&index));
 }
 
+/// A SQL Server computed column dropped after its table's rename is named by
+/// the closing spelling, while its record opened under the old one. The drop
+/// keeps that opening record as its inventory (the full gate's reviewer found
+/// it resolved against the closing spelling and refused the plan); a drop in
+/// a table that keeps its name is unchanged.
+#[test]
+fn a_computed_column_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Column, ComputedColumn, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+
+    let old: pbps_model::TableName = "app.t".parse().unwrap();
+    let new: pbps_model::TableName = "app.u".parse().unwrap();
+    let mut bare = Table::default();
+    bare.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let computed = ComputedColumn {
+        expression: "id + 1".into(),
+        persisted: false,
+        not_null: false,
+    };
+    let mut keyed = bare.clone();
+    keyed.computed.insert("n".into(), computed.clone());
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), keyed);
+    let base_ids = ids(&base, &IdsFile::default());
+    let uid = base_ids.table_uid(&old).unwrap().clone();
+    let mut desired = Schema::default();
+    desired.tables.insert(new.clone(), bare);
+    let mut desired_ids = base_ids.clone();
+    desired_ids.rename_table(&old, &new);
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let column = ObjectIdentity {
+        class: "sys.columns".into(),
+        name: vec!["n".into()],
+        signature: vec![relation(&old)],
+    };
+    let owned = |object: ObjectIdentity, surface: Surface| BindingRecord {
+        object,
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let opening = vec![
+        owned(relation(&old), Surface::Table(old.clone())),
+        owned(column.clone(), Surface::Default(old.column("n"))),
+    ];
+    let compiled = vec![owned(relation(&new), Surface::Table(new.clone()))];
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid,
+                from: old.clone(),
+                to: new.clone(),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::DropComputedColumn {
+                table: new.clone(),
+                name: "n".into(),
+                computed,
+            }),
+        ],
+    };
+    let transitions = super::transitions::derive(
+        &changes,
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &opening,
+        &compiled,
+    )
+    .unwrap();
+    let dropped = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Default(new.column("n")))
+        .expect("the drop has its own transition");
+    assert_eq!(exact(dropped).0, BTreeSet::from([column]));
+    assert!(dropped.after.is_empty());
+}
+
 /// One DDL statement reaches past its own surface: a retype rebuilds the
 /// index over the column, and a default change flips the column's own flag.
 /// The table is the unit of the closing inventory (#1466): its whole tree

@@ -371,8 +371,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 (Surface::Default(table.column(name)), false, false, true, None)
             }
             Change::DropComputedColumn { table, name, .. } => {
+                // The surface is named as the closing schema spells it; the
+                // drop's "before" is the table's opening spelling, which a
+                // rename in the same plan has already moved (the check and
+                // index drops resolve it the same way).
                 let surface = Surface::Default(table.column(name));
-                (surface.clone(), false, true, false, Some(surface))
+                let before = Surface::Default(opening_table(&tables, base, table).column(name));
+                (surface, false, true, false, Some(before))
             }
             Change::DropColumn { uid, column, .. } => (
                 Surface::Column(column.clone()),
