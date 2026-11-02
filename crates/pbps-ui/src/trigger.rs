@@ -550,10 +550,12 @@ mod tests {
     fn stand_in(directory: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let script = directory.join("pbps-stand-in");
+        // The script entry vanishes with the fixture, so deleting the directory
+        // cannot turn a release-file wait into an orphan.
         std::fs::write(
             &script,
             "#!/bin/sh\nprintf '%s\\n' \"$@\"\necho diagnostics >&2\n\
-             while [ ! -e release ]; do sleep 0.05; done\nexit 3\n",
+             while [ -f \"$0\" ] && [ ! -e release ]; do sleep 0.05; done\nexit 3\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -582,6 +584,24 @@ mod tests {
         serde_json::from_slice(&trigger.answer("runs", b"{}").unwrap()).unwrap()
     }
 
+    /// Keep the fixture's release file available until every child and its
+    /// captured output have ended, including the final run a test starts.
+    #[cfg(unix)]
+    fn ended_runs(trigger: &mut Trigger) -> Vec<serde_json::Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let all = runs(trigger);
+            if all.iter().all(|run| run["ended"] == true) {
+                return all;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_run_outlives_its_request_and_blocks_a_second_run_on_that_environment_only() {
@@ -608,18 +628,7 @@ mod tests {
         start(&mut trigger, "apply", &body("test"));
 
         std::fs::write(directory.join("release"), "").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let ended = loop {
-            let all = runs(&mut trigger);
-            if all.iter().all(|run| run["ended"] == true) {
-                break all;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the stand-in never ended"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
+        let ended = ended_runs(&mut trigger);
         let prod = ended
             .iter()
             .find(|run| run["environment"] == "prod")
@@ -634,6 +643,7 @@ mod tests {
         assert_eq!(prod["stderr"], "diagnostics\n");
         // Once the run has ended, the environment takes another.
         start(&mut trigger, "apply", &body("prod"));
+        assert!(ended_runs(&mut trigger).iter().all(|run| run["code"] == 3));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -737,6 +747,7 @@ mod tests {
             "plan",
             br#"{"environment":"prod","out":"new.json"}"#,
         );
+        assert_eq!(ended_runs(&mut trigger)[0]["code"], 3);
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
