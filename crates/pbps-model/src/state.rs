@@ -146,7 +146,8 @@ use schemars::JsonSchema;
 /// reporting checkout as deployed schema evidence.
 /// Version 35 keeps per-link rebuild conversion history (DEC-2298.13).
 /// Version 36 records exact installed PostgreSQL extensions (DEC-2447.1).
-pub const CURRENT_VERSION: u32 = 36;
+/// Version 37 keeps the target assertions the applied plan recorded (DEC-2401.4).
+pub const CURRENT_VERSION: u32 = 37;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -323,6 +324,11 @@ pub struct StateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_work: Option<crate::DataWorkRecord>,
 
+    /// The target assertions the applied plan recorded at plan time. Copied,
+    /// never re-run: nothing user-supplied runs at apply (DEC-2401.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_assertions: Vec<crate::TargetAssertion>,
+
     /// The schema that environment actually has.
     pub schema: Schema,
 
@@ -412,6 +418,7 @@ impl StateSnapshot {
             baseline_evidence: None,
             kind,
             data_work: None,
+            target_assertions: Vec::new(),
             schema,
             ids,
             module_deps: ModuleDeps::default(),
@@ -1131,5 +1138,32 @@ mod tests {
         );
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("staged"), "{json}");
+    }
+
+    /// DEC-2401.4: the assertions an applied plan recorded ride in the ledger
+    /// entry and are absent when none were asked for, so earlier entries read
+    /// as having none.
+    #[test]
+    fn target_assertions_round_trip_and_are_absent_when_empty() {
+        let mut snap = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert!(
+            !serde_json::to_string(&snap)
+                .unwrap()
+                .contains("target_assertions")
+        );
+        snap.target_assertions = vec![crate::TargetAssertion {
+            path: "checks/a.sql".into(),
+            sha256: "c".repeat(64),
+            outcome: crate::AssertionOutcome::Pass,
+        }];
+        let json = serde_json::to_string(&snap).unwrap();
+        assert_eq!(StateSnapshot::from_json(&json).unwrap(), snap);
+        // An older build refuses the unknown field rather than dropping it.
+        assert!(json.contains("target_assertions"));
     }
 }

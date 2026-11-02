@@ -15,7 +15,7 @@ mod runner;
 pub(crate) use repin::command as repin;
 pub(crate) use runner::command;
 pub(crate) mod execution;
-mod files;
+pub(crate) mod files;
 mod git;
 pub(crate) mod repin;
 pub(crate) mod report;

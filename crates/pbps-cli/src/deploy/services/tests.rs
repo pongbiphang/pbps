@@ -107,6 +107,7 @@ fn planned() -> Planned {
             resolver_selection: None,
             resolver_assessment: None,
             rehearsal: None,
+            target_assertions: Vec::new(),
         },
         findings: Vec::new(),
     }
@@ -236,6 +237,7 @@ fn connected_planning_and_apply_use_in_memory_inputs_without_a_plan_file() {
                 true,
                 None,
                 false,
+                None,
                 &mut Vec::new(),
             )
             .unwrap();

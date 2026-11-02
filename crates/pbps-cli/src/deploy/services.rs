@@ -102,6 +102,7 @@ pub(crate) fn cmd_plan_db(
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
+    assertions: Option<&crate::plan_assert::Selection>,
     carried: &mut Vec<Finding>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
@@ -116,6 +117,7 @@ pub(crate) fn cmd_plan_db(
         json,
         resolver_selection,
         no_rehearse,
+        assertions,
         carried,
     )? {
         PlanResult::Planned(planned) => planned.publish(out, sql_out, json),

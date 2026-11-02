@@ -77,6 +77,7 @@ pub async fn collect(conn: &mut Conn, root: &Root, source: Side<'_>) -> Result<C
             | DbError::ConnectTimeout { .. }
             | DbError::Context { .. }
             | DbError::Refused(_)
+            | DbError::DeadlineExceeded(_)
             | DbError::WrongSession { .. }
             | DbError::UnsupportedServer { .. } => error,
             DbError::BadRow(_) => error.context(format!(

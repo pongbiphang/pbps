@@ -29,6 +29,7 @@ mod output;
 mod partitions;
 mod paths;
 mod pins;
+mod plan_assert;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "#1165 PR D wires the `test` command")
@@ -281,6 +282,14 @@ enum Command {
         /// `rehearse: false` under an environment
         #[arg(long)]
         no_rehearse: bool,
+
+        /// Run this reviewed read-only SQL assertion against the target while
+        /// planning (repeatable; needs --db/--env). Zero rows is a pass; a plan
+        /// is written only if every one passes. The login comes from
+        /// PBPS_ASSERTION_CONN, never from --db. Recorded in the plan; never
+        /// run again at apply
+        #[arg(long = "assert", value_name = "FILE")]
+        assertions: Vec<PathBuf>,
 
         /// human (default) or json. With --db/--env, JSON reports change counts,
         /// connected checks and findings. --out writes the separate saved plan
@@ -1286,6 +1295,7 @@ fn run() -> anyhow::Result<()> {
             no_dev,
             resolve_with,
             no_rehearse,
+            assertions,
             format,
         } => {
             // Every refusal below goes through the envelope, not `bail!`. These
@@ -1361,6 +1371,23 @@ fn run() -> anyhow::Result<()> {
                     "environment.unconfigured",
                     target.resolve(&project),
                 )?;
+                // Read and hashed before any connection: a missing variable or
+                // file stops here, naming what to fix (DEC-2401.4).
+                let selected = match plan_assert::Selection::prepare(
+                    project.root(),
+                    &assertions,
+                    std::env::var(plan_assert::CONNECTION_VARIABLE),
+                ) {
+                    Ok(selected) => selected,
+                    Err(findings) => {
+                        let report = output::Report::plain("plan", findings);
+                        if json {
+                            return report.emit_json();
+                        }
+                        eprint!("{}", output::human(&report.findings));
+                        return report.outcome();
+                    }
+                };
                 let mut carried = Vec::new();
                 let planned = deploy::cmd_plan_db(
                     &project,
@@ -1371,6 +1398,7 @@ fn run() -> anyhow::Result<()> {
                     json,
                     resolver_selection,
                     no_rehearse,
+                    selected.as_ref(),
                     &mut carried,
                 );
                 // A typed refusal already emitted its findings envelope. Only
@@ -1392,6 +1420,11 @@ fn run() -> anyhow::Result<()> {
                     planned,
                     carried,
                 );
+            }
+            if !assertions.is_empty() {
+                refuse(
+                    "--assert runs SQL against the target while planning, so it needs the target: pass --db or --env",
+                )?;
             }
             if resolve_with.is_some() {
                 refuse(
@@ -4848,6 +4881,10 @@ pub struct PlanData {
     /// was turned off (#2379). Absent when no scratch entry was configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     rehearsal: Option<explain::RehearsalDetail>,
+    /// The reviewed assertions that passed against the target while planning
+    /// (#2401): an observation, not re-run at apply. Absent when none was asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_assertions: Vec<pbps_model::TargetAssertion>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -5659,6 +5696,7 @@ fn cmd_plan(
                     resolver_selection: None,
                     resolver_assessment: None,
                     rehearsal: None,
+                    target_assertions: Vec::new(),
                 }),
             );
             // A non-converging rehearsal is an error finding, so `outcome` exits 2

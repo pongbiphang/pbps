@@ -63,7 +63,7 @@ pub async fn run_target(
     })
     .await
     .map_err(|_| {
-        DbError::Refused("assertion deadline exceeded during target checks or execution".into())
+        DbError::DeadlineExceeded("assertion deadline exceeded during target checks or execution")
     })?
 }
 

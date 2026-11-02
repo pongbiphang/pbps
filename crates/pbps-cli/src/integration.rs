@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 89;
+pub const SCHEMA_VERSION: u32 = 90;
+// 90: a plan's and `explain`'s `target_assertions`, recorded reviewed assertions (#2401).
 // 89: verified fixture re-pin results of `pbps test fixtures repin` (issue #1165).
 // 87: resolver authorization reproduction and assessment descriptions name both engines;
 // an empty explain `approve_with` for evidence this build cannot enforce (#2143 c1).
@@ -954,6 +955,8 @@ mod tests {
                 "ResolverProfile/oneOf/0",
                 "ResolverProfile/oneOf/1",
                 "ScratchStandard",
+                // A recorded assertion is exactly its path, hash and outcome.
+                "TargetAssertion",
                 // Missing run identities always have a textual reason.
                 "TestData/properties/unavailable",
                 "TypeRoutine",

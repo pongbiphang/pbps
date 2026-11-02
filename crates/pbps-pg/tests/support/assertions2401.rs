@@ -361,3 +361,33 @@ async fn write_server_files_is_refused_through_the_actor_closure() {
 async fn execute_server_program_is_refused_through_the_actor_closure() {
     host_capability_is_refused("pg_execute_server_program", "hostexec2401").await;
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+async fn a_target_deadline_is_a_typed_error_never_a_refusal() {
+    for server in servers() {
+        let mut f = Fixture::new(server, "targetlate2401").await;
+        let target = Target::read(&mut f.admin).await.unwrap();
+        // Already expired when the connection is first polled: the answer is
+        // unknown, which the caller must not read as "refused" (DEC-2401.4).
+        let error = run_target(
+            &f.assertion,
+            &target,
+            "SELECT 1 WHERE false",
+            Duration::from_nanos(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, pbps_db::DbError::DeadlineExceeded(_)),
+            "{error:?}"
+        );
+        // An admission refusal stays a refusal: the two are distinguishable.
+        let admin = settings(&f.base, &[("dbname", &f.database)]);
+        let error = run_target(&admin, &target, "SELECT 1", DEADLINE)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, pbps_db::DbError::Refused(_)), "{error:?}");
+        f.finish().await;
+    }
+}

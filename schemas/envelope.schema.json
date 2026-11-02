@@ -1083,6 +1083,13 @@
               "type": "null"
             }
           ]
+        },
+        "target_assertions": {
+          "description": "The reviewed assertions that passed against the target while planning\n(#2401): an observation, not re-run at apply. Absent when none was asked.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetAssertion"
+          }
         }
       },
       "required": [
@@ -1899,6 +1906,39 @@
         "outcome"
       ]
     },
+    "TargetAssertion": {
+      "description": "One assertion file, as it was when the plan was computed.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "The project-relative path with `/` separators.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the file's bytes. A file edited after the plan\nhas another hash, so a replan differs from this record.",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/AssertionOutcome"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "outcome"
+      ]
+    },
+    "AssertionOutcome": {
+      "description": "How one assertion ended. Only a pass reaches a written plan.",
+      "oneOf": [
+        {
+          "description": "A complete, readable result with a tabular shape and zero rows.",
+          "type": "string",
+          "const": "pass"
+        }
+      ]
+    },
     "envelope.plan": {
       "required": [
         "schema_version",
@@ -2263,6 +2303,13 @@
               "type": "null"
             }
           ]
+        },
+        "target_assertions": {
+          "description": "The reviewed assertions that passed against the target while the plan\nwas computed (#2401), in the order given. Present only if some were\nasked for: absence is not \"all passed\". An observation; apply runs none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetAssertion"
+          }
         }
       },
       "required": [
@@ -3838,6 +3885,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 89,
+  "x-pbps-schema-version": 90,
   "x-pbps-tool-version": "0.0.0"
 }

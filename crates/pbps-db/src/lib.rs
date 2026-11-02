@@ -153,6 +153,13 @@ pub enum DbError {
     #[error("{0}")]
     Refused(String),
 
+    /// A deadline this workspace set ran out. Its own variant, not a
+    /// [`DbError::Refused`] sentence, so a caller tells "took too long" (the
+    /// answer is unknown) from "refused" (the answer is no) without reading
+    /// text (DEC-2401.4). The text is the caller's own, never a server's.
+    #[error("{0}")]
+    DeadlineExceeded(&'static str),
+
     /// The server was reached and is not the session the connection string
     /// requires (`target_session_attrs`).
     ///
@@ -199,6 +206,7 @@ impl DbError {
             | Self::Connect { .. }
             | Self::ConnectTimeout { .. }
             | Self::Refused(_)
+            | Self::DeadlineExceeded(_)
             | Self::WrongSession { .. }
             | Self::UnsupportedServer { .. }
             | Self::BadRow(_) => None,
@@ -244,7 +252,8 @@ impl DbError {
             // A tool-composed refusal never carries a server code — a real
             // one belongs on the `Driver` it was read from, never invented
             // here (see `Refused`'s own doc comment).
-            | DbError::Refused(_) => None,
+            | DbError::Refused(_)
+            | DbError::DeadlineExceeded(_) => None,
         }
     }
 }
@@ -351,6 +360,7 @@ pub(crate) async fn open_socket(
             | DbError::Driver { .. }
             | DbError::Context { .. }
             | DbError::Refused(_)
+            | DbError::DeadlineExceeded(_)
             | DbError::WrongSession { .. }
             | DbError::UnsupportedServer { .. }
             | DbError::BadRow(_)) => error,

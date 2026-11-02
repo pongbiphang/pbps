@@ -375,6 +375,7 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
         | DbError::Driver { .. }
         | DbError::Context { .. }
         | DbError::Refused(_)
+        | DbError::DeadlineExceeded(_)
         | DbError::WrongSession { .. }
         | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a refused socket is not {error:?}"),
@@ -469,6 +470,7 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         | DbError::Driver { .. }
         | DbError::Context { .. }
         | DbError::Refused(_)
+        | DbError::DeadlineExceeded(_)
         | DbError::WrongSession { .. }
         | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
@@ -511,6 +513,7 @@ async fn a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling() {
         | DbError::Driver { .. }
         | DbError::Context { .. }
         | DbError::Refused(_)
+        | DbError::DeadlineExceeded(_)
         | DbError::WrongSession { .. }
         | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
@@ -770,6 +773,7 @@ async fn a_session_the_connection_string_excludes_is_refused() {
             | DbError::Driver { .. }
             | DbError::Context { .. }
             | DbError::Refused(_)
+            | DbError::DeadlineExceeded(_)
             | DbError::UnsupportedServer { .. }
             | DbError::BadRow(_) => panic!("a session mismatch is not {error:?}"),
         }
@@ -2918,6 +2922,7 @@ fn sqlstate(e: &DbError) -> &str {
         | DbError::Connect { .. }
         | DbError::ConnectTimeout { .. }
         | DbError::Refused(_)
+        | DbError::DeadlineExceeded(_)
         | DbError::WrongSession { .. }
         | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_)) => panic!("not a refusal from the server: {other:?}"),
@@ -12146,6 +12151,7 @@ async fn a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_sta
         | DbError::ConnectTimeout { .. }
         | DbError::Context { .. }
         | DbError::Refused(_)
+        | DbError::DeadlineExceeded(_)
         | DbError::WrongSession { .. }
         | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_)) => {
