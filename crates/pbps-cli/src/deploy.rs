@@ -9557,6 +9557,9 @@ fn failed_apply_snapshot(
     let is_staged_checkpoint = current.staged.is_some();
     current.kind = StateKind::Failed;
     current.data_work = None;
+    // The newest row's assertions passed for the plan that wrote it; this row
+    // records a failed attempt and must not attribute them to another plan.
+    current.target_assertions.clear();
     current.operator = operator.to_owned();
     if !is_staged_checkpoint {
         current.git_sha = attempted_git_sha;
@@ -25743,6 +25746,12 @@ mod data_work_failure_tests {
                 None,
             )
             .unwrap();
+        let mut current = current;
+        current.target_assertions = vec![pbps_model::TargetAssertion {
+            path: "checks/a.sql".into(),
+            sha256: "c".repeat(64),
+            outcome: pbps_model::AssertionOutcome::Pass,
+        }];
         let failed = super::failed_apply_snapshot(
             pbps_db::Driver::Mssql,
             current,
@@ -25753,6 +25762,7 @@ mod data_work_failure_tests {
         );
         assert_eq!(failed.kind, pbps_model::StateKind::Failed);
         assert!(failed.data_work.is_none());
+        assert!(failed.target_assertions.is_empty());
         assert_eq!(failed.schema, before.schema);
         assert!(
             pbps_model::StateSnapshot::from_json(&serde_json::to_string(&failed).unwrap()).is_ok()

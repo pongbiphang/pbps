@@ -450,6 +450,9 @@ impl StateSnapshot {
         next.version = CURRENT_VERSION;
         next.kind = StateKind::DataWork;
         next.data_work = Some(work);
+        // The copied row's assertions belong to the apply that wrote it, not
+        // to this report (DEC-2401.4).
+        next.target_assertions.clear();
         next.operator = operator;
         next.reason = Some(reason.to_string().into());
         next.git_sha = git_sha;
@@ -1165,5 +1168,40 @@ mod tests {
         assert_eq!(StateSnapshot::from_json(&json).unwrap(), snap);
         // An older build refuses the unknown field rather than dropping it.
         assert!(json.contains("target_assertions"));
+    }
+
+    /// A data-work row is copied from the newest state; the assertions that
+    /// state recorded passed for another plan and are not this report's.
+    #[test]
+    fn data_work_does_not_inherit_the_copied_rows_target_assertions() {
+        let mut before = StateSnapshot::new(
+            StateKind::Apply,
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        before.target_assertions = vec![crate::TargetAssertion {
+            path: "checks/a.sql".into(),
+            sha256: "c".repeat(64),
+            outcome: crate::AssertionOutcome::Pass,
+        }];
+        let work = crate::DataWorkRecord {
+            identity: crate::DataWorkIdentity::ExternalVersion {
+                version: "v7".into(),
+            },
+            expand_checksum: "a".repeat(64),
+            outcome: crate::DataWorkOutcome::Failed,
+            notes: None,
+        };
+        let next = before
+            .recording_data_work(
+                work,
+                "reporter".into(),
+                crate::Reason::new("backfill").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(next.target_assertions.is_empty());
+        assert_eq!(before.target_assertions.len(), 1);
     }
 }
