@@ -235,6 +235,16 @@ fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_noth
         assert_ne!(code(&out), 0, "{}", said(&out));
         assert!(said(&out).contains("`zzz_base`"), "{}", said(&out));
         assert!(!script.exists());
+        // A dev rehearsal of it refuses by name before any engine is asked.
+        let dev =
+            f.d.run(&["plan", since[0], since[1], "--dev", "docker://unused"]);
+        assert_ne!(code(&dev), 0, "{}", said(&dev));
+        assert!(
+            said(&dev).contains("`zzz_base`")
+                && said(&dev).contains("planned only against a database"),
+            "{}",
+            said(&dev)
+        );
         let preview = succeeds(f.d.run(&["plan", since[0], since[1]]));
         assert!(
             stdout(&preview).contains("create extension zzz_base"),
@@ -535,5 +545,69 @@ fn a_staged_apply_vets_the_install_in_its_own_transaction() {
         assert_eq!(held(&f, "'zzz_base'"), "zzz_base@ext@1.0");
         let next = json_output(f.plan(&["--no-rehearse", "--format", "json"]));
         assert_eq!(next["data"]["changes"], 0, "{next}");
+    });
+}
+
+/// A preview is never applyable. The saved plan of an offline `plan` holds the
+/// create with no pin; `apply --plan` refuses it as a preview, and one edited to
+/// claim a database origin (with the checksum approved over the edit) is
+/// refused at admission for the create with no pin. Neither writes anything.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_offline_saved_plan_holding_a_create_is_refused_by_apply_and_writes_nothing() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-offline-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        let root = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.d.dir)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        let root = String::from_utf8(root.stdout).unwrap();
+        let out = f.d.run(&[
+            "plan",
+            "--since",
+            root.trim(),
+            "--out",
+            f.artifact().to_str().unwrap(),
+        ]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let plan = saved(&f);
+        assert_eq!(plan.origin, pbps_model::PlanOrigin::Preview);
+        assert!(plan.extension_pins.is_empty());
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::CreateExtension { .. }))
+        );
+        let before = ledger_entries(&f);
+        let untouched = |f: &Fixture| {
+            assert_eq!(held(f, BOTH), "");
+            assert_eq!(ledger_entries(f), before);
+        };
+        let out = f.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(said(&out).contains("offline preview"), "{}", said(&out));
+        untouched(&f);
+        // The same file made to claim a database origin: the create has no pin.
+        let mut edited: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.artifact()).unwrap()).unwrap();
+        edited["origin"] = "database".into();
+        std::fs::write(f.artifact(), serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+        let out = f.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("extension evidence disagrees"),
+            "{}",
+            said(&out)
+        );
+        untouched(&f);
     });
 }
