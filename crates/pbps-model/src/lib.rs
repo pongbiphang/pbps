@@ -33,6 +33,7 @@ pub mod dependency;
 pub mod diagnostic;
 pub mod drift;
 pub mod escape;
+pub mod extension_provider;
 pub mod finding;
 pub mod ids;
 pub mod intent;
@@ -78,6 +79,7 @@ pub use data::{
 pub use data_work::{DataWorkError, DataWorkIdentity, DataWorkOutcome, DataWorkRecord};
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
+pub use extension_provider::{ExtensionProvider, ProviderMember};
 pub use finding::{Finding, Severity};
 pub use ids::{
     Conversion, DropGuard, DropRequirement, IdsFile, IdsIndex, Move, Tombstone, ValidIds,

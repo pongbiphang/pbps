@@ -1332,7 +1332,7 @@ fn batch_query(identity: &str) -> String {
         ("modules", modules_query(), "schema_name, name, oid"),
         ("module_args", module_args_query(), "oid, pos"),
         ("roles", ROLES.to_owned(), "name"),
-        ("extensions", "SELECT e.extname::text AS name, n.nspname::text AS schema, e.extversion::text AS version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace".to_owned(), "name"),
+        ("extensions", crate::extension_provider::INSTALLED.to_owned(), "name"),
         ("types", crate::user_types::managed_query(), "schema, name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
         ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
