@@ -394,9 +394,10 @@ on arbitrary sequences. Neither engine's fixtures may reset allocators by DDL.
 
 ## 7. Assertion contract, shared with target planning
 
-An assertion entry names one UTF-8 SQL file containing **one query** in the
-selected dialect. It must return exactly one tabular result set with **at least
-one output column**. A zero-column result is an invalid
+An assertion entry names one UTF-8 SQL file in the selected dialect. PostgreSQL
+accepts one query through the extended protocol below; SQL Server accepts a
+batch, including non-result statements. Either must return exactly one tabular
+result set with **at least one output column**. A zero-column result is an invalid
 assertion, whether it contains zero rows or any rows; it is neither pass nor
 violation. Refuse it with the remedy `SELECT 1 ...` (DEC-1165.1). With a valid
 result shape, zero rows is pass. Any returned row is a violation, including a
@@ -466,10 +467,13 @@ including apply, fixture and capture clients. From the provisioning connection
 to master, set that database READ_ONLY with a bounded wait and verify the mode.
 Do **not** use ROLLBACK IMMEDIATE: there should be no connection to evict.
 A remaining connection/timeout is a setup failure, not permission to kill it.
-Only then open assertion-login connections and execute one query/file. Use
-dialect-aware framing to refuse multiple top-level statements; do not treat
-framing or a SELECT prefix as enforcement of read-only behavior. Require the
-one-result-set shape and consume driver errors as above.
+Only then open assertion-login connections and execute the file as one native
+batch. Do not recognize SQL statements lexically: require exactly one result
+set and consume driver errors as above, within the deadline. Non-result
+statements are allowed; READ_ONLY is the scratch write boundary. An author can
+already write a vacuous zero-row query, so framing cannot protect assertion
+meaning. GO and sqlcmd metacommands are not interpreted and remain engine/driver
+errors. An error after a result is an error, never pass (DEC-2401.2).
 
 READ_ONLY blocks persistent writes even through an owner-executing procedure
 or administrator, while temporary objects in tempdb remain writable. Snapshots
@@ -486,13 +490,64 @@ variable, never fall back to the apply/planning login. Verify it identifies the
 same target database through ordinary endpoint/database identity reads.
 PostgreSQL retains the owned READ ONLY transaction protocol above. A SQL Server
 target cannot be switched read-only: **its boundary is the least-privilege login
-only**, and privileged callable routines can exceed direct SELECT rights.
-Verify and report effective assertion privileges and that weaker boundary;
-never claim scratch-strength read-only enforcement on a target. No user SQL
+only**. Refuse effective EXECUTE on procedure-like objects (`P`, `PC`, `X`,
+`RF`), including grants inherited from roles, schemas or the database: ordinary
+ownership chaining can persist writes without EXECUTE AS or caller table DML.
+Name the procedure in the refusal. Refuse any user-defined assembly in the
+target database (`sys.assemblies.is_user_defined = 1`), naming it; an unreadable
+answer refuses. Do not trust permission_set: CAS is not a boundary under CLR
+strict security. Over-refusing databases with CLR is accepted because
+ownership-chained T-SQL function/view wrappers can execute CLR without direct
+CLR grants. Without CLR, T-SQL functions (`FN`, `IF`, `TF`) retain their allowed
+execution rights; T-SQL functions cannot change persistent database state.
+
+Audit the same effective privilege inventory in every accessible system
+database (`master`, `msdb`, `model`, `tempdb`) before returning to the target.
+Guest access itself is allowed; write-capable rights on permanent objects and
+CREATE TABLE refuse by database and object/permission name. Ordinary temporary
+objects stay allowed. Complete metadata is required in every audited database;
+map a read-only user there, grant VIEW DEFINITION, and deny inherited procedure
+EXECUTE. Include system procedures from `sys.system_objects` in the same
+inventory. Their object permissions are managed in master (native 4629); an
+object DENY there applies when the procedure is invoked from another database,
+whereas database-wide DENY in master alone does not. Default guest ownership can include permanent CREATE SEQUENCE and is refused as a real capability.
+Legacy DEFAULT/RULE object permission rows are nominal: native DROP and GRANT
+are denied without schema rights, which the same inventory still checks. Table
+types are checked in the TYPE namespace rather than as OBJECT securables.
+
+The assertion login must have no access to any other user database on the
+instance. Check HAS_DBACCESS for every other user database, by database id;
+unreadable answers refuse. Server VIEW ANY DATABASE is required so a hidden
+accessible database cannot appear absent. Refuse a linked server with a mapping
+for the login or all logins, naming the server. A default mapping is hidden
+without server VIEW ANY DEFINITION; require that read permission before treating
+a visible server's mapping inventory as complete. A mapped remote identity can
+write through OPENQUERY or EXEC AT, even when the outer query returns zero rows.
+
+Reject grant options as write-capable authority too: inspect state W grants
+held through the login/user tokens, including object/column, schema, database
+and server permissions. A data DENY does not neutralize GRANT AS a member role;
+measure delegation independently of ordinary access (DEC-2401.3). PostgreSQL's
+existing SET/INHERIT actor closure also excludes the three host-file/program
+roles above before SQL; READ ONLY cannot contain a program's other connection.
+
+Verify and report these effective privileges before any assertion SQL. As in
+scratch, SQL Server accepts a batch with exactly one result set, including
+non-result statements, with a deadline and complete-stream error handling; no
+lexical statement recognition runs. Effective privileges are the target write
+boundary, and the target is never switched to scratch READ_ONLY mode. No user SQL
 runs during apply. Target assertion hashes/outcomes enter the plan checksum,
 `explain` and ledger (#2401); failures/errors write no plan. The accepted
 plan-to-apply window is closed only for the specific predicates covered by
 constraints or recorded drop preconditions, not arbitrary target assertions.
+
+#2401 PR A supplies the target engine entry points; the CLI selection and saved
+observation fields follow in PR B. SQL Server's assertion credential also needs
+`VIEW DEFINITION` on the target database so hidden securables cannot appear to
+have no write permissions. The server metadata requirements above likewise
+prevent hidden databases or default linked-server mappings from reading empty.
+Unknown identity or permission reads refuse before assertion SQL; no grants are added by the runner. The existing PostgreSQL
+scratch entry point and its transaction protocol remain unchanged.
 
 ## 8. Measurements supporting the boundaries
 
@@ -850,8 +905,8 @@ successful test run.
   Removing the identity/postcheck/first-read protections makes their tests fail.
 - SQL Server closes owned clients before READ_ONLY, verifies the mode, refuses
   persistent owner-procedure writes and retains temporary-object behavior.
-  #2401 separately qualifies the weaker privilege-only target boundary; it
-  never switches the target read-only.
+  #2401 separately refuses write-capable target credentials, including
+  procedure EXECUTE through ownership chaining; it never switches target mode.
 - Zero rows, NULL row, multiple/no result sets, bounded violations, SQL errors,
   transport loss, driver timeouts and unreadable results retain distinct facts
   and correct exit codes. Cleanup failure always prevents overall success.

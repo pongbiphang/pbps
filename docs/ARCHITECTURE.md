@@ -48,7 +48,7 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 ```
 
 - Only `pbps-db` and the engine modules that take a `Conn` (`catalog`, `state`,
-  `impact`, `doctor`, `edition`, `estimate`, `dependencies`, `resolver` on SQL Server; `catalog`, `state`, `impact`,
+  `impact`, `doctor`, `edition`, `estimate`, `dependencies`, `resolver`, `assertions` on SQL Server; `catalog`, `state`, `impact`,
   `doctor`, `roles`, `modules`, `data_triggers`, `staged`, `statement`, `estimate`, `resolver`, `assertions` on PostgreSQL) are async; the CLI `block_on`s
   them per command, through `engine`.
 - Two places in `pbps-cli` name an engine to *choose* it: `dialect_for` (the

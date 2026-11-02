@@ -752,6 +752,23 @@ impl Conn {
         }
     }
 
+    /// Completes one bounded result stream, consuming its connection so an
+    /// unfinished query can never be followed by a new assertion on that session.
+    /// PostgreSQL runners use prepare_query first to vet binary result capability.
+    pub async fn query_bounded(
+        self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<query::QueryEvidence, DbError> {
+        match self {
+            Conn::Mssql(conn) => conn.query_bounded(sql, timeout).await,
+            Conn::Postgres(mut conn) => {
+                let prepared = conn.prepare_query(sql).await?;
+                conn.query_prepared_bounded(prepared, timeout).await
+            }
+        }
+    }
+
     /// Runs one batch of statements and discards any results.
     pub async fn execute(&mut self, sql: &str) -> Result<(), DbError> {
         match self {

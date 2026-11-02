@@ -2,22 +2,12 @@
 //! The caller provisions SELECT-only grants; this runner additionally refuses
 //! elevated logins. Target assertions can use it without a scratch dependency.
 
-use pbps_db::{
-    Conn, DbError, Driver,
-    query::{PreparedQuery, QueryEvidence},
-};
+use pbps_db::{Conn, DbError, Driver, query::PreparedQuery};
 use std::time::Duration;
 
-/// Internal execution facts for the future CLI report, not a wire format.
-#[derive(Debug)]
-pub enum AssertionResult {
-    Pass(QueryEvidence),
-    Violation(QueryEvidence),
-    InvalidResult { message: String },
-    SqlError(DbError),
-    BoundaryViolation,
-    Unanswerable(DbError),
-}
+pub use pbps_db::query::AssertionResult;
+mod target;
+pub use target::{Target, run_target};
 
 #[derive(Debug, PartialEq, Eq)]
 struct TransactionIdentity {
@@ -78,10 +68,14 @@ async fn run_inner(
     sql: &str,
     deadline: tokio::time::Instant,
 ) -> AssertionResult {
-    let mut conn = match Conn::connect(Driver::Postgres, connection_string).await {
+    let conn = match Conn::connect(Driver::Postgres, connection_string).await {
         Ok(conn) => conn,
         Err(error) => return AssertionResult::Unanswerable(error),
     };
+    run_on(conn, sql, deadline).await
+}
+
+async fn run_on(mut conn: Conn, sql: &str, deadline: tokio::time::Instant) -> AssertionResult {
     match prepare(&mut conn, deadline).await {
         Ok(()) => {}
         Err(error) => return AssertionResult::Unanswerable(error),
@@ -123,16 +117,7 @@ async fn run_inner(
             return AssertionResult::Unanswerable(error);
         }
     }
-    // DEC-1165.1: zero columns cannot establish a tabular assertion result.
-    if evidence.columns.is_empty() {
-        AssertionResult::InvalidResult {
-            message: "an assertion must return at least one output column; use SELECT 1 ...".into(),
-        }
-    } else if evidence.rows.is_empty() && !evidence.truncated {
-        AssertionResult::Pass(evidence)
-    } else {
-        AssertionResult::Violation(evidence)
-    }
+    AssertionResult::from_evidence(evidence)
 }
 
 // DEC-1165.3: the native driver requests binary results. Check the server's

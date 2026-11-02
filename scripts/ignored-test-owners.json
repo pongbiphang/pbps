@@ -1788,7 +1788,25 @@
         "default_holders2455::default_holder_capture_is_complete_deduplicated_and_never_hides_unreadable_evidence",
         "commutation::pairs_the_effects_call_independent_commute_on_the_engine",
         "annotations2469::module_to_object_annotations_drive_installs_and_removals",
-        "annotations2469::in_place_provider_keeps_availability_and_releases_old_dependencies"
+        "annotations2469::in_place_provider_keeps_availability_and_releases_old_dependencies",
+        "assertions2401::guest_enabled_databases_do_not_overlap_target_assertion_cases",
+        "assertions2401::an_assertion_login_is_checked_by_effective_object_column_and_ddl_permissions",
+        "assertions2401::multi_statement_writes_are_refused_by_permissions_before_execution",
+        "assertions2401::target_batches_distinguish_rows_result_shapes_and_complete_stream_errors",
+        "assertions2401::wrong_targets_and_incomplete_metadata_are_refused_before_assertion_sql",
+        "assertions2401::bounded_results_and_driver_timeouts_do_not_collect_or_pass_partial_streams",
+        "assertions2401::procedure_execute_is_write_capable_even_through_ownership_chaining",
+        "assertions2401::access_to_another_user_database_refuses_before_assertion_sql",
+        "assertions2401::user_clr_assemblies_refuse_even_through_function_and_view_wrappers",
+        "assertions2401::usable_linked_server_mappings_refuse_before_assertion_sql",
+        "assertions2401::native_identifier_positions_are_decided_by_the_engine",
+        "assertions2401::system_database_writes_are_refused_before_sql_and_session_temps_stay_allowed",
+        "assertions2401::system_procedure_execute_is_inventoried_without_refusing_read_only_queries",
+        "assertions2401::object_grant_options_refuse_before_assertion_sql",
+        "assertions2401::column_grant_options_refuse_before_assertion_sql",
+        "assertions2401::schema_grant_options_refuse_before_assertion_sql",
+        "assertions2401::database_grant_options_refuse_before_assertion_sql",
+        "assertions2401::server_grant_options_refuse_before_assertion_sql"
       ]
     },
     {
@@ -2393,7 +2411,14 @@
         "creation2469::prefix_facets_precede_the_function_and_later_column_in_native_order",
         "creation2469::scratch_facets_keep_zero_sql_paths_and_require_actual_role_setup",
         "creation2469::generated_complete_shape_is_version_gated_before_any_sql",
-        "creation2469::required_inline_groups_preserve_create_options_and_late_columns"
+        "creation2469::required_inline_groups_preserve_create_options_and_late_columns",
+        "assertions1165::target2401::a_target_assertion_checks_effective_write_and_ddl_rights_before_user_sql",
+        "assertions1165::target2401::target_identity_and_permission_reads_cannot_be_replaced_by_empty_answers",
+        "assertions1165::target2401::target_queries_keep_the_original_read_only_transaction_and_result_contract",
+        "assertions1165::target2401::a_different_cluster_with_the_same_database_name_is_not_the_target",
+        "assertions1165::target2401::read_server_files_is_refused_through_the_actor_closure",
+        "assertions1165::target2401::write_server_files_is_refused_through_the_actor_closure",
+        "assertions1165::target2401::execute_server_program_is_refused_through_the_actor_closure"
       ]
     },
     {

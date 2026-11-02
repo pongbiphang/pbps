@@ -754,3 +754,60 @@ checksum comparison under the deployment lock refuses before DDL; the failed
 attempt remains an audit record, not new deployed provenance. Rechecking the
 applying host's Git history would reject an approved plan for evidence unrelated
 to its construction and would not strengthen that checksum boundary.
+
+<a id="dec-2401-1"></a>
+
+**DEC-2401.1. Target assertions share the assertion result contract, but each
+engine establishes its own boundary (#2401 PR A).** Target-only entry points
+verify database identity and effective write/DDL permissions on the fresh
+assertion session before user SQL. PostgreSQL reuses the owned READ ONLY
+transaction runner unchanged; SQL Server consumes a bounded native result stream
+and relies on the separate credential, never a target mode change. Result shape
+is not read-only enforcement (DEC-2401.2). Effective EXECUTE on a procedure-like object
+(`P`, `PC`, `X`, `RF`) is write-capable even through ordinary ownership chaining;
+refuse it by object name, including inherited schema/database grants. Any
+user-defined CLR assembly refuses by name, regardless of permission_set or direct permissions:
+ownership-chained wrappers can execute it; CAS is not a boundary under CLR
+strict security. Without CLR, T-SQL functions retain allowed execution rights.
+Refuse access to another user database or a linked-server mapping for this login/all logins, naming the database or
+server. Require VIEW ANY DATABASE for complete database access reads and VIEW
+ANY DEFINITION before a visible server's missing mapping is conclusive. Unknown
+answers refuse; neither hidden metadata nor a zero-row query proves no writes.
+Reuse this oracle in accessible system databases too, including permanent tempdb
+objects and CREATE TABLE. Access alone is allowed; complete metadata and the
+same effective permission checks are required. Session temporary objects and
+nominal legacy DEFAULT/RULE object rights are excluded; real schema/parent DDL
+rights remain checked; table types use the TYPE oracle. Restore the target
+before assertion SQL. Include `sys.system_objects` procedure securables in the
+same inventory; their object DENY is managed in master and applies across
+databases, unlike a database-wide DENY in master alone (native 4629/229).
+Intrinsic session-setting rights and control of the login's own principal do
+not confer target data/DDL rights; native controls retain those ordinary logins.
+The existing PostgreSQL API stays available to #1165. CLI selection and saved
+plan/ledger observations follow in PR B; no assertion runs during apply.
+
+<a id="dec-2401-2"></a>
+
+**DEC-2401.2. SQL Server assertions use native result shape, not lexical
+statement recognition (#2401).** Three review findings exposed false refusals:
+R1's parenthesized query operands and Unicode identifiers, R3's unquoted keyword
+identifiers (THROW), and R6's CTE with parenthesized query operands. Delete the
+parallel SQL recognizer instead of extending it. Target and scratch accept a
+native batch with exactly one tabular result set; zero or multiple sets are
+InvalidResult, and errors after a result never pass. Keep the deadline and the
+write boundary: effective privileges on a target, READ_ONLY on scratch.
+Non-result statements are allowed: an author can already write a vacuous
+zero-row assertion, so framing did not protect its meaning. GO/sqlcmd commands
+remain engine/driver errors. This supersedes #2598's statement-count proposal.
+
+<a id="dec-2401-3"></a>
+
+**DEC-2401.3. Assertion admission includes host and delegation authority
+(#2605, fixed in #2401 PR A).** PostgreSQL excludes the three host-file/program
+roles from ADR-0019 §6 through the existing SET/INHERIT actor closure: READ ONLY
+cannot contain their external effects or connections. SQL Server checks state W
+permissions held by grant-capable user/login tokens in each audited context,
+including columns, schemas, databases and the server. Native GRANT AS role still
+succeeds when the login's data permission is denied; do not filter delegation
+through a data-right verdict. A DENY replacing the sole W grant removes that
+option; unreadable metadata still refuses. Keep ordinary non-delegable reads.

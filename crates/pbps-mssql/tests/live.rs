@@ -65,6 +65,9 @@ mod reconstruct2374;
 #[path = "support/creation2469.rs"]
 mod creation2469;
 
+#[path = "support/assertions2401.rs"]
+mod assertions2401;
+
 #[path = "support/annotations2469.rs"]
 mod annotations2469;
 

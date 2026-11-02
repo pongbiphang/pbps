@@ -603,7 +603,7 @@ impl Conn {
         &mut self,
         prepared: PreparedQuery,
     ) -> Result<crate::query::QueryEvidence, DbError> {
-        use crate::query::{MAX_BYTES, MAX_ROWS, QueryEvidence};
+        use crate::query::{MAX_BYTES, QueryEvidence};
         use futures_util::TryStreamExt;
         let mut evidence = QueryEvidence {
             columns: prepared.columns,
@@ -621,20 +621,7 @@ impl Conn {
                 .map(|i| render_cell(&row, i, &mut remaining))
                 .collect();
             evidence.rows.push(cells);
-            if evidence.rows.len() == MAX_ROWS
-                || remaining == 0
-                || evidence.rows.last().is_some_and(|row| {
-                    row.iter().any(|cell| {
-                        matches!(
-                            cell,
-                            crate::query::EvidenceCell::Text {
-                                truncated: true,
-                                ..
-                            }
-                        )
-                    })
-                })
-            {
+            if evidence.at_limit(remaining) {
                 evidence.truncated = true;
                 // Closing avoids draining an unbounded stream, and prevents
                 // queued postchecks from running behind an unfinished query.
@@ -1914,15 +1901,7 @@ fn render_cell(
         };
         text
     };
-    let mut end = text.len().min(*remaining);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    *remaining -= end;
-    EvidenceCell::Text {
-        value: text[..end].to_owned(),
-        truncated: end != text.len(),
-    }
+    crate::query::text_cell(text, remaining)
 }
 
 #[cfg(test)]
