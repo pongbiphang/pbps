@@ -1805,6 +1805,9 @@
         "darwin"
       ],
       "cases": [
+        "extension_provider::tests::the_engine_reports_what_is_installable_and_what_a_package_owns",
+        "extension_provider::tests::a_closure_vets_across_databases_and_prerequisites_are_read_not_guessed",
+        "extension_provider::tests::a_member_table_with_toast_storage_compares_equal_across_databases",
         "input_path::tests::conversion_vetters_refuse_unbalanced_using_before_binding_on_both_majors",
         "emit::rebuild::native::replacement_preserves_declared_rows_ownership_and_external_bindings",
         "emit::rebuild::native::failed_physical_prefix_restores_the_exact_opening_manifest",
