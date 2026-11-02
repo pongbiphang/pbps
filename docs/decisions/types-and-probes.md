@@ -4635,8 +4635,13 @@ externals file, as DEC-2447.2 requires. The plan seals
 one manifest per create in `extension_pins`, in the checksum like every other
 pin, and admission refuses a create with no pin, a pin with no create, and a pin
 whose uid, name, definition or `requires` disagrees with its change. Without a
-scratch, with the rehearsal turned off, offline, with `--sql` or with `--dev`
-there is nothing to pin, so each of those refuses by package name.
+scratch, with the rehearsal turned off, with `--sql` or with `--dev` there is
+nothing to pin, so each of those refuses by package name. An offline `plan`
+shows the create as an unsealed preview instead, because the first plan is where
+the `e_` identity is minted and a refusal there would leave `plan --db` refusing
+`identity.stale` with no way to get one. The preview is never applyable: its
+saved plan has the preview origin and is refused at apply, and even one edited
+to claim a database origin holds a create with no pin, which admission refuses.
 
 Planning asks the target before it writes: the exact version is listed, a fixed
 control schema equals the declared one, each prerequisite is declared with a pin

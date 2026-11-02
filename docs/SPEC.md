@@ -1182,8 +1182,10 @@ for a package the target lacks plans one `CREATE EXTENSION name SCHEMA schema
 VERSION 'v'`, never `IF NOT EXISTS` and never `CASCADE`. It runs the package's
 install script, so it carries the gated risk class `extension-code` and needs
 `--allow extension-code`. It is planned only by `plan --db`, with a rehearsal
-on the resolver scratch: a plan with the rehearsal off, no scratch, an offline
-preview, `--sql` or `--dev` refuses by name. The planner refuses, naming the
+on the resolver scratch: a plan with the rehearsal off, no scratch, `--sql` or
+`--dev` refuses by name. An offline `plan` shows the create as an unsealed
+preview, so that the first plan can mint the `e_` identity; its saved plan is
+never applyable (apply refuses a preview, and a create with no pin). The planner refuses, naming the
 package and the fact, a version the target does not list, a fixed control
 schema other than the declared one, a prerequisite neither declared with a pin
 nor installed, a missing schema, a package that is already installed, and a role
