@@ -31,6 +31,15 @@ const AVAILABLE: &str = "SELECT name::text AS name, version::text AS version, in
 /// membership: it is a user object that `DROP EXTENSION` happens to remove.
 /// Identities come from the engine's own address renderer, which holds no
 /// object number.
+///
+/// A TOAST table and its index are left out, though the closure reaches them
+/// (an `i` edge from the owning table, measured on PG 16 and 18). They are
+/// physical storage the engine creates for any table with a toastable column,
+/// named `pg_toast_<oid of the owner>`, so the same package in two databases
+/// would differ by a number that means nothing and `vet` would refuse a valid
+/// install. The logical owner stays a member, and it is the owner that decides
+/// whether storage exists. They are found by what they are (`relkind = 't'`, or
+/// an index on such a relation), not by the shape of their names.
 const PROVIDERS: &str = "\
 WITH RECURSIVE members(ext, classid, objid, objsubid) AS (
     SELECT d.refobjid, d.classid, d.objid, d.objsubid
@@ -56,7 +65,14 @@ SELECT 'member', e.extname::text, a.type, pg_catalog.array_to_json(a.object_name
        pg_catalog.array_to_json(a.object_args)::text
   FROM members m
   JOIN pg_catalog.pg_extension e ON e.oid = m.ext
-  LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(m.classid, m.objid, m.objsubid) a ON true";
+  LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(m.classid, m.objid, m.objsubid) a ON true
+ WHERE NOT (m.classid = 'pg_catalog.pg_class'::regclass AND EXISTS (
+         SELECT 1 FROM pg_catalog.pg_class c
+          WHERE c.oid = m.objid
+            AND (c.relkind = 't' OR EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_index x
+                   JOIN pg_catalog.pg_class t ON t.oid = x.indrelid
+                  WHERE x.indexrelid = c.oid AND t.relkind = 't'))))";
 
 /// One installable version of one package, as its control file declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +506,97 @@ mod tests {
             // Negative: a version the server does not ship is not listed.
             assert!(!versions.contains_key(&("citext".into(), "definitely-not-shipped".into())));
             discard(admin, db, conn).await;
+        }
+    }
+
+    /// The name of the TOAST table of `ext.owned`.
+    async fn toast_name(conn: &mut pbps_db::Conn) -> String {
+        let rows = conn
+            .query(
+                "SELECT t.relname::text AS name FROM pg_catalog.pg_class t \
+                 JOIN pg_catalog.pg_class o ON o.reltoastrelid = t.oid \
+                 WHERE o.oid = 'ext.owned'::regclass",
+            )
+            .await
+            .unwrap();
+        rows[0].try_get::<&str>("name").unwrap().unwrap().to_owned()
+    }
+
+    /// The physical storage an owned table brings (its TOAST table and index)
+    /// is named after an object number of the database it is in, so it must not
+    /// be part of what two databases are compared on.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_member_table_with_toast_storage_compares_equal_across_databases() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut target) = fresh(variable, "toast").await;
+            let (admin2, db2, mut other) = fresh(variable, "toastother").await;
+            // Objects the first database holds and the second does not, so the
+            // two number their tables differently.
+            for n in 0..3 {
+                target
+                    .execute(&format!("CREATE TABLE public.shift{n} (id integer)"))
+                    .await
+                    .unwrap();
+            }
+            for conn in [&mut target, &mut other] {
+                conn.execute("CREATE SCHEMA ext").await.unwrap();
+                conn.execute("CREATE EXTENSION citext SCHEMA ext VERSION '1.4'")
+                    .await
+                    .unwrap();
+                // A package-owned table with a toastable column: the same
+                // `e` edge on the table and `i` edge to its TOAST table that a
+                // package shipping one has.
+                conn.execute("CREATE TABLE ext.owned (id integer PRIMARY KEY, body text)")
+                    .await
+                    .unwrap();
+                conn.execute("ALTER EXTENSION citext ADD TABLE ext.owned")
+                    .await
+                    .unwrap();
+            }
+            // The premise: the storage names really do differ, so equal
+            // manifests mean the names are not read.
+            assert_ne!(toast_name(&mut target).await, toast_name(&mut other).await);
+            let first = providers(&mut target).await.unwrap()["citext"].clone();
+            let second = providers(&mut other).await.unwrap()["citext"].clone();
+            let owned = |p: &ExtensionProvider| {
+                p.members
+                    .iter()
+                    .any(|m| m.class == "table" && m.names == ["ext", "owned"])
+            };
+            assert!(owned(&first) && owned(&second), "{:?}", first.members);
+            assert!(
+                first
+                    .members
+                    .iter()
+                    .all(|m| !m.names.iter().any(|n| n.contains("pg_toast"))),
+                "{:?}",
+                first.members
+            );
+            assert_eq!(first, second);
+            vet(&mut target, "citext", &second).await.unwrap();
+
+            // Negative: dropping the storage filter must not hide a real
+            // difference. One more owned table in one database is named.
+            other
+                .execute("CREATE TABLE ext.extra (id integer, body text)")
+                .await
+                .unwrap();
+            other
+                .execute("ALTER EXTENSION citext ADD TABLE ext.extra")
+                .await
+                .unwrap();
+            let grown = providers(&mut other).await.unwrap()["citext"].clone();
+            assert_ne!(first, grown);
+            let error = vet(&mut target, "citext", &grown).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing members: `table ext.extra`"),
+                "{error}"
+            );
+            discard(admin, db, target).await;
+            discard(admin2, db2, other).await;
         }
     }
 

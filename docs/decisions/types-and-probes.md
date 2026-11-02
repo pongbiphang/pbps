@@ -4552,7 +4552,12 @@ rendering of an object address (class, name parts, argument types) for the
 direct `e` members and their internal and automatic subsidiaries, the closure
 the census already projects out of independent declarations. A user routine
 that only `DEPENDS ON EXTENSION` (an `x` edge) and an ordinary object in the
-package's schema are not members.
+package's schema are not members. Physical TOAST storage is not a member
+either: a package-owned table with a toastable column reaches a TOAST table and
+its index through an internal edge, and both are named after the owner's object
+number (measured on PostgreSQL 16 and 18). They are excluded by what they are
+(`relkind = 't'`, or an index on such a relation), not by name shape, and the
+logical owner stays a member.
 
 It holds no object number, no owner and no library path. A number means
 nothing on the other server, an owner depends on who installed the package
