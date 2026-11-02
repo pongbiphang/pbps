@@ -233,6 +233,17 @@
         },
         "cleanup_confirmed": {
           "type": "boolean"
+        },
+        "repin": {
+          "description": "Present only for `operation: \"repin\"`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Repin"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -477,6 +488,13 @@
         "identity": {
           "type": "string"
         },
+        "side": {
+          "description": "Which comparison database a re-pin phase worked in (`original` or\n`proposed`); absent for an ordinary run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "outcome": {
           "$ref": "#/$defs/Status"
         },
@@ -670,6 +688,240 @@
             "unrenderable"
           ]
         }
+      ]
+    },
+    "Repin": {
+      "description": "What a verified re-pin compared and decided (ADR-0019 §5, §9).",
+      "type": "object",
+      "properties": {
+        "fixture": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "from": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "to": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "original_inputs": {
+          "description": "Everything the original side consumed: the committed manifest and fixture\nat `HEAD`, and each replayed revision's files.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsumedFile"
+          }
+        },
+        "proposed_inputs": {
+          "description": "Everything the proposed side consumed: the working files and revisions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsumedFile"
+          }
+        },
+        "sides": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Side"
+          }
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TableComparison"
+          }
+        },
+        "allocators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AllocatorComparison"
+          }
+        },
+        "manifest": {
+          "$ref": "#/$defs/ManifestWrite"
+        }
+      },
+      "required": [
+        "fixture",
+        "path",
+        "from",
+        "to",
+        "original_inputs",
+        "proposed_inputs",
+        "sides",
+        "tables",
+        "allocators",
+        "manifest"
+      ]
+    },
+    "Side": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acquired_image": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_build": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label"
+      ]
+    },
+    "TableComparison": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "equal": {
+          "type": "boolean"
+        },
+        "original_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "proposed_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "original_rows": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "proposed_rows": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "differences": {
+          "description": "Bounded: the equality test sees every row, the report only some.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RowDifference"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "table",
+        "equal",
+        "original_columns",
+        "proposed_columns",
+        "original_rows",
+        "proposed_rows",
+        "differences",
+        "truncated"
+      ]
+    },
+    "RowDifference": {
+      "type": "object",
+      "properties": {
+        "original_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "proposed_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "row": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Cell"
+          }
+        }
+      },
+      "required": [
+        "original_count",
+        "proposed_count",
+        "row"
+      ]
+    },
+    "AllocatorComparison": {
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "type": "string"
+        },
+        "used_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "original_next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proposed_next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "equal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sequence",
+        "equal"
+      ]
+    },
+    "ManifestWrite": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "`not_attempted`, `written` or `failed`.",
+          "type": "string"
+        },
+        "old_sha256": {
+          "type": "string"
+        },
+        "new_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "old_sha256"
       ]
     },
     "envelope.test": {
@@ -3586,6 +3838,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 87,
+  "x-pbps-schema-version": 88,
   "x-pbps-tool-version": "0.0.0"
 }

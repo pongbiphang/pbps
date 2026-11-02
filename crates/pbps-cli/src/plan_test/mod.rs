@@ -12,13 +12,16 @@
 
 mod chain;
 mod runner;
+pub(crate) use repin::command as repin;
 pub(crate) use runner::command;
 pub(crate) mod execution;
 mod files;
 mod git;
+pub(crate) mod repin;
 pub(crate) mod report;
 pub(crate) mod revision;
 pub(crate) mod session;
+mod snapshot;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -173,6 +176,9 @@ pub(crate) enum Refusal {
     Git { what: String, problem: GitProblem },
     #[error("{0}")]
     Chain(ChainProblem),
+    /// A re-pin precondition the user can fix (`pbps test fixtures repin`).
+    #[error("{0}")]
+    Repin(String),
     #[error("{revision}: {problem}")]
     At {
         revision: Revision,
@@ -225,6 +231,7 @@ impl Refusal {
             | Refusal::DuplicateFile { .. }
             | Refusal::Git { .. }
             | Refusal::Chain(_)
+            | Refusal::Repin(_)
             | Refusal::At { .. } => Outcome::Finding,
         }
     }

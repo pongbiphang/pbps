@@ -4,7 +4,7 @@ use super::{BIN, Demo, code, stderr, stdout, succeeds};
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     time::{Duration, Instant},
 };
 
@@ -630,14 +630,27 @@ fn empty_candidate(old: bool) {
 struct Running {
     child: Option<Child>,
     state: std::path::PathBuf,
+    /// Files, not pipes: nothing reads the child's output while the test waits,
+    /// and a pipe of a few KiB (the kernel shrinks them under pipe pressure)
+    /// would block the child before it reached the wait.
+    output: [std::path::PathBuf; 2],
 }
 impl Running {
     fn finish(mut self) -> std::process::Output {
-        self.child.take().unwrap().wait_with_output().unwrap()
+        let status = self.child.take().unwrap().wait().unwrap();
+        let [out, err] = &self.output;
+        std::process::Output {
+            status,
+            stdout: std::fs::read(out).unwrap(),
+            stderr: std::fs::read(err).unwrap(),
+        }
     }
 }
 impl Drop for Running {
     fn drop(&mut self) {
+        for file in &self.output {
+            let _ = std::fs::remove_file(file);
+        }
         if let Some(c) = &mut self.child {
             let _ = c.kill();
             let _ = c.wait();
@@ -657,15 +670,18 @@ impl Drop for Running {
     }
 }
 fn waiting(p: &Project) -> (Running, String) {
-    let child = p
-        .command("json")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    waiting_on(p, p.command("json"))
+}
+fn waiting_on(p: &Project, mut command: Command) -> (Running, String) {
+    let output = ["out", "err"].map(|kind| p.0.dir.with_extension(kind));
+    let [out, err] = output
+        .clone()
+        .map(|path| std::fs::File::create(path).unwrap());
+    let child = command.stdout(out).stderr(err).spawn().unwrap();
     let mut running = Running {
         child: Some(child),
         state: p.state(),
+        output,
     };
     let end = Instant::now() + Duration::from_secs(120);
     loop {
@@ -840,3 +856,6 @@ fn d2b2_1165_pg16_fixture_timeouts_use_the_server_limit_and_remaining_run_budget
 fn d2b2_1165_pg18_fixture_timeouts_use_the_server_limit_and_remaining_run_budget() {
     fixture_timeout_limits(false);
 }
+
+#[path = "repin1165.rs"]
+mod repin1165;

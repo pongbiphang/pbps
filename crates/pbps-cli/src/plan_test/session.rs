@@ -14,10 +14,10 @@ pub(crate) struct Session<'a> {
     roles: [String; 3],
     key: std::path::PathBuf,
 }
-fn quoted(name: &str) -> anyhow::Result<String> {
+pub(super) fn quoted(name: &str) -> anyhow::Result<String> {
     Ok(pbps_pg::Postgres::new().quote_ident(name)?)
 }
-fn table(name: &TableName) -> anyhow::Result<String> {
+pub(super) fn table(name: &TableName) -> anyhow::Result<String> {
     Ok(format!("{}.{}", quoted(&name.schema)?, quoted(&name.name)?))
 }
 impl<'a> Session<'a> {
@@ -91,7 +91,7 @@ impl<'a> Session<'a> {
             key,
         })
     }
-    async fn admin(&self) -> anyhow::Result<Conn> {
+    pub(super) async fn admin(&self) -> anyhow::Result<Conn> {
         let db = format!("{} dbname=pbps_test", self.scratch.connection());
         Ok(Conn::connect(Driver::Postgres, &db).await?)
     }

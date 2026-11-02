@@ -21,6 +21,7 @@ pub(super) struct Replay<'a> {
     pub revisions: &'a BTreeMap<CommitId, Assembled>,
     /// Name and SQL by manifest index; an entry the chain does not name is unused.
     pub fixtures: Vec<(&'a str, &'a str)>,
+    pub side: Option<&'a str>,
     pub timeouts: Timeouts,
 }
 
@@ -35,12 +36,14 @@ impl Inputs {
                 .iter()
                 .map(|f| (f.name.as_str(), f.text.as_str()))
                 .collect(),
+            side: None,
             timeouts: self.frozen.manifest.timeouts,
         }
     }
 }
 
 pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
+    let first = phases.len();
     for (index, group) in r.chain.groups.iter().enumerate() {
         if index == 0 {
             phases.push(Phase::new("bootstrap", group.commit.to_string()));
@@ -57,6 +60,9 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
         for f in &group.fixtures {
             phases.push(Phase::new("fixture", r.fixtures[*f].0));
         }
+    }
+    for p in &mut phases[first..] {
+        p.side = r.side.map(str::to_owned);
     }
 }
 
@@ -429,7 +435,7 @@ async fn execute(inputs: Option<&Inputs>, data: &mut TestData) {
     control.finish(scratch, data).await;
 }
 
-fn publish(report: crate::output::Report<TestData>, json: bool) -> anyhow::Result<()> {
+pub(super) fn publish(report: crate::output::Report<TestData>, json: bool) -> anyhow::Result<()> {
     let mut report = report;
     report.findings.extend(
         report

@@ -223,6 +223,27 @@ fn tree_file(
     }
 }
 
+/// The bytes git has for the project file `project_path` at `commit` with the
+/// hash that names them, or `None` when that commit has no such file.
+pub(super) fn committed_file(
+    root: &Path,
+    commit: &CommitId,
+    project_path: &str,
+    role: Role,
+) -> Result<Option<(Vec<u8>, ConsumedFile)>, Problem> {
+    let prefix = relative_to(root).map_err(|e| Problem::Unreadable {
+        path: root.display().to_string(),
+        reason: format!("{e:#}"),
+    })?;
+    let repo_path =
+        under(&prefix, Path::new(project_path)).map_err(|e| Problem::Paths(format!("{e:#}")))?;
+    let found = tree_file(root, commit, &repo_path, &prefix, &mut Vec::new(), role)?;
+    Ok(found.map(|(path, bytes)| {
+        let file = consumed(role, &Revision::Commit(commit.clone()), &path, &bytes);
+        (bytes, file)
+    }))
+}
+
 /// Reads the inputs of `commit` from git, without checking it out.
 ///
 /// An entry git has no record of is absent; one it cannot read is a refusal,

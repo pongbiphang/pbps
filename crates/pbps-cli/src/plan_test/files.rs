@@ -226,6 +226,12 @@ pub(super) fn freeze_recorded(
 }
 
 impl Frozen {
+    /// The file the manifest resolved to when it was read: a re-pin replaces
+    /// that file, not a symlink that names it.
+    pub(crate) fn manifest_target(&self) -> &Path {
+        &self.manifest_resolved
+    }
+
     /// Every consumed file, sorted so the same inputs always list the same
     /// way.
     pub(crate) fn consumed(&self) -> Vec<ConsumedFile> {
