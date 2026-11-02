@@ -40,6 +40,19 @@
       ],
       "issue": 2616,
       "expires": "2026-12-01"
+    },
+    {
+      "test": "a_docker_run_killed_after_its_keeper_connected_is_removed_by_the_next_run",
+      "cargo": [
+        "test",
+        "-p",
+        "pbps-cli",
+        "--test",
+        "flow_pg",
+        "--"
+      ],
+      "issue": 2638,
+      "expires": "2026-12-02"
     }
   ]
 }
