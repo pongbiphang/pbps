@@ -4785,7 +4785,7 @@ an internal error, on 16 and 18). What a drop does to a kept surface is bounded 
 the engine: a stored view, default, check or SQL-bodied routine that uses a member
 is a dependent (a blocker, refused first by name); only a body bound at call time,
 plpgsql's, finds nothing once the member is gone, which is the resolver's
-documented observation limit and is not refused lexically.
+documented observation limit and is not refused lexically. A drop beside another change that does need the resolver is refused by name before it runs, as a create is (`resolution::package_changed`, measured: it failed late with an internal error), with the two-plan remedy: the drop alone first, then the rest.
 
 All forty `catalog_change!()` arms were read again for a drop. All join: the drop
 reads no table, column, row, constraint or existing binding, `drop_impact`'s

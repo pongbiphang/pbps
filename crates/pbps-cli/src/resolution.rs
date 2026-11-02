@@ -300,7 +300,7 @@ pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::
     )
 }
 
-/// A plan that creates a package and also needs the resolver (DEC-2447.6).
+/// A plan that creates or drops a package and also needs the resolver (DEC-2447.6, .8).
 /// The resolver reconstructs the desired namespace on a scratch that does not
 /// hold a package the target lacks, so it cannot seal evidence over the create;
 /// measured, it failed late with an internal error. The two plans taken in
@@ -320,7 +320,24 @@ fn package_created(request: &Request<'_>) -> Option<crate::output::Finding> {
         .map(|name| format!("`{}`", name.shown()))
         .collect();
     if created.is_empty() {
-        return None;
+        let (base, want) = (&request.base, &request.desired.schema.extensions);
+        let dropped: Vec<_> = (base.schema.extensions.keys())
+            .filter(|n| base.ids.extension_uid(n).is_some() && !want.contains_key(*n))
+            .map(|n| format!("`{}`", n.shown()))
+            .collect();
+        if dropped.is_empty() {
+            return None;
+        }
+        return Some(gated(
+            request.selection,
+            request.assessment,
+            &format!(
+                "this plan also drops extension {}, and the resolver cannot describe a package \
+                 that leaves while its scratch holds it",
+                dropped.join(", ")
+            ),
+            "Plan the drop alone first and apply it. Then plan the rest.",
+        ));
     }
     Some(gated(
         request.selection,
@@ -351,7 +368,7 @@ pub(crate) async fn resolve(
     entry: &mut Entry<'_>,
 ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
     // The only way into a resolver run, so this is the one place a package
-    // create is turned away: before the key is read or a scratch is touched.
+    // create or drop is turned away: before the key is read or a scratch is touched.
     if let Some(finding) = package_created(request) {
         return Err(Refused::Finding(finding));
     }

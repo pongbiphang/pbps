@@ -720,6 +720,7 @@
         "extensions2447_drop::a_staged_apply_vets_and_confirms_the_drop_in_its_own_transaction",
         "extensions2447_drop::a_drop_is_rehearsed_when_the_project_rehearses_and_pins_the_targets_manifest",
         "extensions2447_drop::a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists",
+        "extensions2447_drop::a_package_drop_beside_a_resolver_bound_change_is_refused_by_name_and_writes_nothing",
         "census2444::census_names_extensions_pgcrypto",
         "census2444::census_names_extensions_uuid",
         "census2444::census_names_unsupported_comment",

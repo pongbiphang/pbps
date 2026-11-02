@@ -662,3 +662,81 @@ fn a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists() {
         on_server(admin, &format!("DROP ROLE {role}"));
     });
 }
+
+/// A package drop beside a change that needs the resolver is refused by name
+/// before the resolver runs, with the two-plan remedy, and writes nothing; the
+/// same drop alone, with the same resolver selected, plans. Measured before the
+/// guard: the combination failed late with "resolver evidence omits a required
+/// prerequisite", an internal error, on 16 and 18 (DEC-2447.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_package_drop_beside_a_resolver_bound_change_is_refused_by_name_and_writes_nothing() {
+    use super::rehearsal2379::{Fixture, Kind, Options};
+    let fixture = |admin: &str, slug: &str| {
+        let f = Fixture::new(
+            admin,
+            &format!("drop2447-{slug}"),
+            Kind::Supplied,
+            &Options {
+                externals: Some("CREATE SCHEMA ext; CREATE EXTENSION zzz_base SCHEMA ext"),
+                ..Default::default()
+            },
+        );
+        succeeds(f.d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            f.target(),
+            "--extension",
+            "zzz_base",
+        ]));
+        f.d.commit();
+        succeeds(f.d.run(&[
+            "baseline",
+            "--db",
+            f.target(),
+            "--reason",
+            "adopt the package",
+        ]));
+        f
+    };
+    servers(|admin, slug| {
+        let f = fixture(admin, &format!("both-{slug}"));
+        // A new column on a table that a kept view reads: the resolver's
+        // question. It gets its identity from an offline plan first.
+        let table = std::fs::read_to_string(f.d.dir.join("schema/app.t.yml")).unwrap();
+        std::fs::write(
+            f.d.dir.join("schema/app.t.yml"),
+            table.replace(
+                "  note:\n    type: text\n",
+                "  note:\n    type: text\n  extra:\n    type: text\n",
+            ),
+        )
+        .unwrap();
+        succeeds(f.d.run(&["plan"]));
+        f.d.commit();
+        retire(&f.d, "zzz_base", "retire it beside a column");
+        f.d.commit();
+        let entries = ledger(f.target());
+        let planned = f.plan(&[]);
+        assert_ne!(code(&planned), 0, "{}", said(&planned));
+        let message = said(&planned);
+        assert!(
+            message.contains("this plan also drops extension `zzz_base`")
+                && message.contains("Plan the drop alone first")
+                && !message.contains("this is a bug in pbps"),
+            "{message}"
+        );
+        assert!(!f.artifact().exists(), "a refused plan wrote a file");
+        assert_eq!(ledger(f.target()), entries);
+        assert_eq!(present(f.target(), "'zzz_base'"), "zzz_base");
+
+        // Negative: the drop alone, with the resolver selected, plans.
+        let alone = fixture(admin, &format!("alone-{slug}"));
+        retire(&alone.d, "zzz_base", "retire it alone");
+        alone.d.commit();
+        let ok = alone.plan(&[]);
+        assert_eq!(code(&ok), 0, "{}", said(&ok));
+        assert_eq!(saved(&alone.artifact()).extension_drops.len(), 1);
+    });
+}
