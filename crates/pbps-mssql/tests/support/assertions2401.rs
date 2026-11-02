@@ -6,8 +6,17 @@ use std::time::Duration;
 // Admission now audits every accessible system database as well as the target.
 // Give the native fixture room on shared hosts; the 200 ms timeout case is separate.
 const DEADLINE: Duration = Duration::from_secs(30);
-// Default linked-server mappings and guest-enabled databases affect every
-// login on the instance. Guest-admission controls share this case guard.
+// The census reads the whole instance, so these cases must not run beside any
+// other test. `scripts/live-tests.sh` and the CI `live (dialect)` job give the
+// `assertions2401::` cases an invocation of their own with one test thread (#2631):
+// beside the parallel run a sibling's database, its msdb grants or its master DDL
+// changed the verdict or deadlocked a case. A lock here could only exclude the
+// siblings that take it, and a new sibling cannot know to.
+//
+// Within that invocation this guard is a backstop. Default linked-server mappings
+// and guest-enabled databases affect every login on the instance, and the
+// guest-admission controls in other modules still share it when someone runs the
+// whole binary by hand.
 static TARGET_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // Hold the guard until the caller removes the guest-enabled database: otherwise
 // unrelated positive assertion cases correctly refuse its instance-wide access.

@@ -99,7 +99,14 @@ export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
 
 # The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
 # which needs the same server and is `#[ignore]`d for the same reason.
-cargo test -p pbps-mssql --test live -- --ignored --skip scratch2236 --skip deployer2267 --skip staged2268 --skip externals2269 "$@"
+# The assertion census reads the whole instance: every user database, the
+# permissions of its login in every system database, and server state. Beside
+# the parallel run below, a sibling's database, its grants in msdb or its DDL
+# in master changed the census's verdict or deadlocked it (#2631, #2618). One
+# process of its own, one test at a time, and first, so nothing runs beside it.
+# The ordinary profile: the same binary as the parallel run, so no second build.
+cargo test -p pbps-mssql --test live -- --ignored --test-threads=1 assertions2401:: "$@"
+cargo test -p pbps-mssql --test live -- --ignored --skip assertions2401:: --skip scratch2236 --skip deployer2267 --skip staged2268 --skip externals2269 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268 "$@"

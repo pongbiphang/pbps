@@ -279,6 +279,37 @@ else:
         self.assertIn("merge-multiple: true", gate)
         self.assertIn("audit .resolver-mssql 3 --expected-invocations 7", gate)
 
+    def test_assertion_census_runs_alone_one_test_at_a_time_and_before_the_parallel_run(self):
+        # The census reads the whole instance, so a sibling's database, msdb grant
+        # or master DDL changes its verdict or deadlocks it (#2631, #2618). The
+        # inventory accepts a run that executes it beside siblings, so pin the
+        # shape here: its own invocation, one thread, first, and skipped by the
+        # parallel invocation that follows.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        script = (ROOT / "scripts/live-tests.sh").read_text()
+        for owner, commands in (
+            ("the CI live job", job_commands(workflow, "live")),
+            ("scripts/live-tests.sh", list(inventory.shell_commands(script))),
+        ):
+            dialect = [c for c in commands
+                       if c[:2] == ["cargo", "test"] and "pbps-mssql" in c and "live" in c
+                       and "--" in c and "--ignored" in c[c.index("--"):]]
+            census = [c for c in dialect if "assertions2401::" in c[c.index("--"):]
+                      and "--skip" not in c[c.index("--"):]]
+            self.assertEqual(len(census), 1, owner)
+            self.assertIn("--test-threads=1", census[0], owner)
+            parallel = [c for c in dialect if not any(t.startswith("--test-threads") for t in c)
+                        and "scratch2236" in c]
+            self.assertEqual(len(parallel), 1, owner)
+            skipped = [parallel[0][i + 1] for i, a in enumerate(parallel[0][:-1]) if a == "--skip"]
+            self.assertIn("assertions2401::", skipped, owner)
+            self.assertLess(dialect.index(census[0]), dialect.index(parallel[0]), owner)
+            # Negatives: no other invocation runs the census beside siblings.
+            others = [c for c in dialect if c is not census[0]
+                      and "assertions2401::" in c[c.index("--"):]
+                      and "--skip" not in c[c.index("--"):]]
+            self.assertEqual(others, [], owner)
+
 
 class ShardedExecution(unittest.TestCase):
     def test_descendant_cleanup_finishes_after_its_runner_leader_exits(self):
