@@ -679,6 +679,7 @@
         "darwin"
       ],
       "cases": [
+        "rehearsal2379::docker_events::creation_evidence_survives_unrelated_history_eviction",
         "trace::pg18_server_keeps_definition_sources_out_of_every_sink",
         "trace::pg16_server_keeps_definition_sources_out_of_every_sink",
         "trace::pg18_docker_keeps_definition_sources_out_of_every_sink",
