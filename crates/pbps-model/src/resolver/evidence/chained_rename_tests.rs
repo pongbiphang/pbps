@@ -30,6 +30,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         Change::RenameTable { from, .. } => Surface::Table(from.clone()),
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
+        | Change::CreateExtension { .. }
         | Change::AttachPartition { .. }
         | Change::DropTable { .. }
         | Change::AddColumn { .. }

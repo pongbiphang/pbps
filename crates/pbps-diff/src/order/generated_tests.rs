@@ -700,6 +700,21 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         vec![],
         None,
     );
+    // A package names no table and no row: nothing here reads or writes either.
+    pin(
+        Change::CreateExtension {
+            uid: "e_015032".parse().unwrap(),
+            name: "citext".into(),
+            definition: pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+            requires: Default::default(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
     pin(
         Change::Grant {
             role: "reader".into(),

@@ -300,6 +300,8 @@ pub enum ObjectKey {
     Table(Recorded),
     Column(ColumnKey),
     Role(Recorded),
+    /// A package installed by `CREATE EXTENSION` (DEC-2447.6).
+    Extension(Recorded),
     /// A column's default or generation expression: the expression object
     /// the engine keeps beside the column, which a plan can take off and put
     /// back while the column stands (DEC-1168.1).
@@ -758,6 +760,7 @@ impl Operation {
             Change::CreateRole { uid, .. }
             | Change::DropRole { uid, .. }
             | Change::RenameRole { uid, .. } => ObjectKey::Role(recorded(uid)),
+            Change::CreateExtension { uid, .. } => ObjectKey::Extension(recorded(uid)),
             Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } => {
                 ObjectKey::Grant {
                     grantee: Grantee::Role(role.clone()),
@@ -897,7 +900,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::AddIndex { .. }
             | Change::InsertRow { .. }
             | Change::CreateModule { .. }
-            | Change::CreateRole { .. } => exists(false, true)?,
+            | Change::CreateRole { .. }
+            | Change::CreateExtension { .. } => exists(false, true)?,
             Change::AlterColumnDefault { from, to, .. } => exists(from.is_some(), to.is_some())?,
             // `SET EXPRESSION` replaces the expression the engine keeps for
             // the column, as a changed default does (DEC-1168.1).

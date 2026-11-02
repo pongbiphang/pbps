@@ -394,7 +394,10 @@ impl Declared {
                 Change::RebuildPartitionedTable(_)
                 | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
-                | Change::AnalyzeTableTree(_) => {}
+                | Change::AnalyzeTableTree(_)
+                // A package declares no expression text; its members are not
+                // read as declared types or defaults (DEC-2447.6).
+                | Change::CreateExtension { .. } => {}
                 Change::AlterDomain { name, to, .. } => {
                     self.types.insert(name.clone(), (**to).clone());
                 }

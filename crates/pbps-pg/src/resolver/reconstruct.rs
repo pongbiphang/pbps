@@ -456,6 +456,11 @@ impl Reconstruction {
                 | Change::DropModule { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
+                // A bootstrap is handed the packages it needs already
+                // installed (`bootstrap_base`); a create reaching it would be
+                // skipped and the parts that use the package would fail
+                // later with a message about something else.
+                | Change::CreateExtension { .. }
                 | Change::Revoke { .. } => {
                     return Err(ReconstructError::Unsupported(
                         serde_json::to_value(change)

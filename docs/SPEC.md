@@ -1135,7 +1135,7 @@ adds no Schema member or apply query. The resolver still refuses undeclared
 managed three-part references, and DEC-619.3's sandbox boundary is unchanged.
 Apply continues to bind the real objects in its transaction.
 
-### 4.10 PostgreSQL extensions (read-only adoption)
+### 4.10 PostgreSQL extensions (adoption and pinned creation)
 
 One package per `schema/extensions/<name>.yml` file (DEC-2447.1):
 
@@ -1175,11 +1175,41 @@ recorded read-back; ordinary managed objects must still be absent. Bootstrap
 SQL export checks those exact prerequisites on its replay target before DDL.
 An initial offline authoring preview labels package prerequisites unverified.
 Raw installed inventory without a UID is not a lifecycle request in
-either comparison direction. A no-op plan is supported. CREATE EXTENSION, DROP
-EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET SCHEMA differences
-are named refusals and named drift, with no partial executable plan. No
-extension installation, code execution, provider-type admission or lifecycle
-approval is implemented in this phase.
+either comparison direction. A no-op plan is supported.
+
+**Creating a package (DEC-2447.6).** A declaration that holds an `e_` identity
+for a package the target lacks plans one `CREATE EXTENSION name SCHEMA schema
+VERSION 'v'`, never `IF NOT EXISTS` and never `CASCADE`. It runs the package's
+install script, so it carries the gated risk class `extension-code` and needs
+`--allow extension-code`. It is planned only by `plan --db`, with a rehearsal
+on the resolver scratch: a plan with the rehearsal off, no scratch, `--sql` or
+`--dev` refuses by name. An offline `plan` shows the create as an unsealed
+preview, so that the first plan can mint the `e_` identity; its saved plan is
+never applyable (apply refuses a preview, and a create with no pin). The planner refuses, naming the
+package and the fact, a version the target does not list, a fixed control
+schema other than the declared one, a prerequisite neither declared with a pin
+nor installed, a missing schema, a package that is already installed, and a role
+that cannot install it (a superuser always can; any other role needs `CREATE`
+on the database for a `trusted` package and cannot install an untrusted one that
+asks for a superuser; measured on PostgreSQL 16 and 18). The rehearsal's scratch
+reads the members the install script left (the manifest of DEC-2447.4), and the
+plan seals one manifest per create in `extension_pins`, covered by the
+checksum. `apply` re-asks the same questions under the lock, runs the statement
+in its own transaction, and holds what the engine now has to the sealed
+manifest before that transaction commits: any difference, unreadable read or
+absent package rolls the install back and records nothing. A prerequisite the
+plan also creates is created first, by an ordering edge and not by a class
+number. A package create is not described by the resolver's binding assessment
+(a package can add an overload that a fresh binding would pick, which stored
+views, defaults and checks do not follow); a plan that also needs the resolver is
+refused by name and is planned in two steps, the package first (DEC-2447.6). A
+package whose members the declarations also manage as their own is
+refused after the rehearsal, and a collision with an unmanaged object of the
+target is the engine's own refusal inside the rolled-back transaction
+(DEC-2447.7). DROP EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET
+SCHEMA differences are named refusals and named drift, with no partial
+executable plan. Provider-type admission and the use of a package's members by
+declarations remain later slices.
 
 ## 5. The identity file (`schema.ids.json`)
 
@@ -1913,9 +1943,11 @@ two halves:
    WITH CHECK presence checked independently. A dropped policy is absent.
    Untouched policies keep their exact catalog predicates. Both RLS flags
    match the values the plan leaves, independently of whether any policy exists.
-   Managed extensions retain their exact name, schema and version. PR A admits
-   no extension lifecycle changes, so every admitted plan leaves these fields
-   unchanged; installed packages outside the declarations are not compared.
+   Managed extensions retain their exact name, schema and version. A plan admits
+   only creates (DEC-2447.6), so every package keeps these fields unchanged,
+   except that each one the plan installs stands in exactly its pinned
+   definition at the close and in none other before it; installed packages
+   outside the declarations are not compared.
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 

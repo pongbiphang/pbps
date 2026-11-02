@@ -299,6 +299,106 @@ pub fn requirement_problems(
     out
 }
 
+/// What decides whether the connected role can install a package on the target
+/// now: measured on PostgreSQL 16.15 and 18.6, a superuser always can; any
+/// other role can install a package whose control file does not ask for a
+/// superuser (`superuser = false`) with no further privilege, and one marked
+/// `trusted` only with `CREATE` on the database; an untrusted package that asks
+/// for a superuser is refused. `CREATE` on the schema is not asked for by any
+/// of the three, which the engine does not check either.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub installed: BTreeMap<String, Extension>,
+    pub available: BTreeMap<(String, String), Control>,
+    pub schemas: BTreeSet<String>,
+    pub superuser: bool,
+    pub database_create: bool,
+}
+
+const WHO: &str = "SELECT r.rolsuper::text AS superuser, pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CREATE')::text AS database_create FROM pg_catalog.pg_roles r WHERE r.rolname = current_user";
+const SCHEMAS: &str = "SELECT nspname::text AS name FROM pg_catalog.pg_namespace";
+
+/// The facts [`create_problems`] judges, read on the connection that will run
+/// the statement.
+pub async fn target(conn: &mut impl QueryConnection) -> Result<Target, DbError> {
+    let who = conn.query(WHO).await?;
+    let [who] = who.as_slice() else {
+        return Err(DbError::BadRow(
+            "the connected role has no pg_roles row".into(),
+        ));
+    };
+    let mut schemas = BTreeSet::new();
+    for row in conn.query(SCHEMAS).await? {
+        schemas.insert(text(&row, "name")?);
+    }
+    Ok(Target {
+        installed: installed(conn).await?,
+        available: available(conn).await?,
+        schemas,
+        superuser: flag(who, "superuser")?,
+        database_create: flag(who, "database_create")?,
+    })
+}
+
+/// Why `CREATE EXTENSION` of `wanted` would fail or surprise on `target`, one
+/// sentence each. `pinned` are the packages the declaration pins that this plan
+/// installs: with the installed ones they are what a prerequisite may be.
+pub fn create_problems(
+    target: &Target,
+    name: &str,
+    wanted: &Extension,
+    pinned: &BTreeMap<String, Extension>,
+) -> Vec<String> {
+    let at = |detail: String| {
+        format!(
+            "extension `{}` version `{}` {detail}",
+            Escaped(name),
+            Escaped(&wanted.version)
+        )
+    };
+    let mut out = Vec::new();
+    if let Some(held) = target.installed.get(name) {
+        out.push(at(format!(
+            "is already installed on the target (version `{}` in schema `{}`); a create never adopts a package that stands: select it with `pbps pull --extension {}` and adopt it with `pbps baseline`",
+            Escaped(&held.version),
+            Escaped(&held.schema),
+            Escaped(name)
+        )));
+    }
+    let mut known = target.installed.clone();
+    known.extend(pinned.iter().map(|(n, d)| (n.clone(), d.clone())));
+    out.extend(requirement_problems(
+        "target",
+        name,
+        wanted,
+        &target.available,
+        &known,
+    ));
+    if !target.schemas.contains(&wanted.schema) {
+        out.push(at(format!(
+            "installs into schema `{}`, which the target does not have; create the schema first",
+            Escaped(&wanted.schema)
+        )));
+    }
+    if let Some(control) = target
+        .available
+        .get(&(name.to_owned(), wanted.version.clone()))
+        && !target.superuser
+        && control.superuser
+    {
+        if !control.trusted {
+            out.push(at(
+                "is not trusted and its install script needs a superuser; the connected role is not one".into(),
+            ));
+        } else if !target.database_create {
+            out.push(at(
+                "is installed by a role with CREATE on the database, which the connected role lacks".into(),
+            ));
+        }
+    }
+    out
+}
+
 /// The vet that runs inside the transaction that installed a package: the
 /// closure the engine now holds must be the one the plan was approved over.
 pub async fn vet(
@@ -416,6 +516,175 @@ mod tests {
         );
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|f| !f.contains("target")));
+    }
+
+    fn facts(superuser: bool, database_create: bool) -> Target {
+        let mut available = catalog();
+        // `superuser` and `trusted` as a control file spells them: the three
+        // kinds the engine tells apart (measured on PostgreSQL 16.15 and 18.6).
+        for (key, superuser, trusted) in [
+            (("citext", "1.6"), true, true),
+            (("fixed", "1.0"), true, false),
+            (("earthdistance", "1.1"), false, false),
+        ] {
+            let c = available.get_mut(&(key.0.into(), key.1.into())).unwrap();
+            c.superuser = superuser;
+            c.trusted = trusted;
+        }
+        Target {
+            installed: [("held".to_owned(), wanted("ext", "1.0"))].into(),
+            available,
+            schemas: ["ext".to_owned(), "fixed".to_owned()].into(),
+            superuser,
+            database_create,
+        }
+    }
+
+    fn create(target: &Target, name: &str, w: &Extension) -> Vec<String> {
+        create_problems(target, name, w, &BTreeMap::new())
+    }
+
+    #[test]
+    fn what_the_connected_role_may_install_follows_the_control_file() {
+        let (plain, creator) = (facts(false, false), facts(false, true));
+        let (citext, fixed) = (wanted("ext", "1.6"), wanted("fixed", "1.0"));
+        // A trusted package needs CREATE on the database, and only that.
+        assert!(create(&creator, "citext", &citext).is_empty());
+        let refused = create(&plain, "citext", &citext);
+        assert!(refused[0].contains("CREATE on the database"), "{refused:?}");
+        // An untrusted one that asks for a superuser is refused whatever else
+        // the role holds; a superuser installs it.
+        let refused = create(&creator, "fixed", &fixed);
+        assert!(refused[0].contains("needs a superuser"), "{refused:?}");
+        assert!(create(&facts(true, false), "fixed", &fixed).is_empty());
+        // A package that does not ask for a superuser needs no privilege.
+        assert!(create(&plain, "earthdistance", &wanted("ext", "1.1")).len() == 1);
+        let mut easy = plain.clone();
+        easy.installed.insert("cube".into(), wanted("ext", "1.0"));
+        assert!(create(&easy, "earthdistance", &wanted("ext", "1.1")).is_empty());
+    }
+
+    #[test]
+    fn an_installed_name_or_a_missing_schema_is_refused_before_a_statement() {
+        let target = facts(true, true);
+        let held = create(&target, "held", &wanted("ext", "1.0"));
+        assert!(
+            held.iter().any(|p| p.contains("already installed")),
+            "{held:?}"
+        );
+        let absent = create(&target, "citext", &wanted("nowhere", "1.6"));
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        assert!(absent[0].contains("does not have"), "{absent:?}");
+        // The same facts with the schema and a free name have no problem.
+        assert!(create(&target, "citext", &wanted("ext", "1.6")).is_empty());
+        // A pinned prerequisite of the same plan is a known package, as an
+        // installed one is.
+        let pinned = [("cube".to_owned(), wanted("ext", "1.5"))].into();
+        assert!(
+            create_problems(&target, "earthdistance", &wanted("ext", "1.1"), &pinned).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_create_is_exactly_the_pinned_statement_and_waits_for_its_prerequisite() {
+        use pbps_model::{Change, IdsFile, Schema};
+        let pg = crate::Postgres::new();
+        // `aaa` sorts first by name and requires `zzz`: only the edge can put
+        // `zzz` ahead, so the order is not an accident of the alphabet.
+        let declared = Schema {
+            extensions: [("aaa", "1.0"), ("zzz", "1.0"), ("quiet", "2.0")]
+                .map(|(n, v)| (n.into(), wanted("ext", v)))
+                .into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [
+                ("e_000001", "aaa"),
+                ("e_000002", "zzz"),
+                ("e_000003", "quiet"),
+            ]
+            .map(|(u, n)| (u.parse().unwrap(), n.into()))
+            .into(),
+            ..Default::default()
+        };
+        let empty = Schema::default();
+        let none = IdsFile::default();
+        let hints = pbps_model::Hints {
+            extension_requires: [
+                ("aaa".into(), ["zzz".into(), "installed".into()].into()),
+                ("quiet".into(), Default::default()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let planned = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &none,
+            },
+            pbps_diff::Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &pg,
+            &hints,
+        )
+        .unwrap();
+        let order: Vec<_> = planned
+            .changes()
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::CreateExtension { name, requires, .. } = &p.change {
+                    Some((name.raw().to_owned(), requires.len()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let at = |n: &str| order.iter().position(|(name, _)| name == n).unwrap();
+        // One edge, to the prerequisite the plan creates; `installed` adds none.
+        assert_eq!(order[at("aaa")].1, 1, "{order:?}");
+        assert!(at("zzz") < at("aaa"), "{order:?}");
+        // Negative: with no fact about a prerequisite the plan has no edge, and
+        // the packages are in the differ's own order.
+        let blind = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &none,
+            },
+            pbps_diff::Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &pg,
+            &pbps_model::Hints::default(),
+        )
+        .unwrap();
+        assert!(blind.changes().changes.iter().all(|p| !matches!(
+            &p.change,
+            Change::CreateExtension { requires, .. } if !requires.is_empty()
+        )));
+        // The statement is the pin and nothing else, with the install boundary
+        // the executor vets, and no option that would choose for the author.
+        let create = Change::CreateExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "odd \"name".into(),
+            definition: wanted("ext\"s", "1.0'x"),
+            requires: Default::default(),
+        };
+        let statements = crate::emit::emit(&pg, &create, Default::default()).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "CREATE EXTENSION \"odd \"\"name\" SCHEMA \"ext\"\"s\" VERSION '1.0''x';"
+        );
+        for forbidden in ["IF NOT EXISTS", "CASCADE"] {
+            assert!(!statements[0].sql.contains(forbidden));
+        }
+        let boundary = statements[0].extension.as_ref().unwrap();
+        assert_eq!(boundary.name.raw(), "odd \"name");
+        assert!(statements[0].declared_type.is_none());
     }
 
     #[test]
@@ -597,6 +866,115 @@ mod tests {
             );
             discard(admin, db, target).await;
             discard(admin2, db2, other).await;
+        }
+    }
+
+    /// The rule `create_problems` applies to the connected role is what the
+    /// engine does, for each kind of control file, with and without `CREATE` on
+    /// the database. A rule that said yes where the engine says no would plan an
+    /// install that fails at apply; one that said no would refuse a valid plan.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_privilege_rule_is_what_the_engine_does_for_each_kind_of_control_file() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let (mut admin, db, mut owner) = fresh(variable, "priv").await;
+            let role = format!("pbps_priv_{}", db.rsplit('_').next().unwrap());
+            admin
+                .execute(&format!(
+                    "CREATE ROLE {role} LOGIN PASSWORD 'priv' NOSUPERUSER NOCREATEDB; \
+                     GRANT CONNECT ON DATABASE {db} TO {role}"
+                ))
+                .await
+                .unwrap();
+            owner
+                .execute(&format!("CREATE SCHEMA ext AUTHORIZATION {role}"))
+                .await
+                .unwrap();
+            // The three kinds: asks for no superuser, trusted, and untrusted
+            // with a superuser (a contrib package that is neither).
+            let packages = ["nonsu2447", "citext", "file_fdw"];
+            let mut agreed = 0;
+            for create_on_database in [false, true] {
+                admin
+                    .execute(&format!(
+                        "{} CREATE ON DATABASE {db} {} {role}",
+                        if create_on_database {
+                            "GRANT"
+                        } else {
+                            "REVOKE"
+                        },
+                        if create_on_database { "TO" } else { "FROM" }
+                    ))
+                    .await
+                    .unwrap();
+                let words: Vec<_> = base
+                    .split_whitespace()
+                    .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+                    .collect();
+                let as_role = format!("{} user={role} password=priv dbname={db}", words.join(" "));
+                let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &as_role)
+                    .await
+                    .unwrap();
+                let facts = target(&mut conn).await.unwrap();
+                assert!(!facts.superuser);
+                assert_eq!(facts.database_create, create_on_database);
+                for name in packages {
+                    let version = facts
+                        .available
+                        .keys()
+                        .filter(|(n, _)| n == name)
+                        .map(|(_, v)| v.clone())
+                        .next_back()
+                        .unwrap();
+                    let wanted = Extension {
+                        schema: "ext".into(),
+                        version,
+                    };
+                    let predicted = create_problems(&facts, name, &wanted, &BTreeMap::new());
+                    let tried = conn
+                        .execute(&format!(
+                            "CREATE EXTENSION {name} SCHEMA ext VERSION '{}'",
+                            wanted.version
+                        ))
+                        .await;
+                    assert_eq!(
+                        predicted.is_empty(),
+                        tried.is_ok(),
+                        "{variable} {name} database CREATE {create_on_database}: \
+                         rule {predicted:?}, engine {tried:?}"
+                    );
+                    if tried.is_ok() {
+                        conn.execute(&format!("DROP EXTENSION {name}"))
+                            .await
+                            .unwrap();
+                    }
+                    agreed += 1;
+                }
+            }
+            assert_eq!(agreed, 6);
+            // Negative: a superuser is never refused for privilege, whatever
+            // the control file says.
+            let facts = target(&mut owner).await.unwrap();
+            assert!(facts.superuser);
+            let untrusted = facts
+                .available
+                .keys()
+                .filter(|(n, _)| n == "file_fdw")
+                .map(|(_, v)| v.clone())
+                .next_back()
+                .unwrap();
+            let wanted = Extension {
+                schema: "ext".into(),
+                version: untrusted,
+            };
+            assert!(create_problems(&facts, "file_fdw", &wanted, &BTreeMap::new()).is_empty());
+            admin
+                .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+                .await
+                .unwrap();
+            admin.execute(&format!("DROP OWNED BY {role}")).await.ok();
+            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
         }
     }
 

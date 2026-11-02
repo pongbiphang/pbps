@@ -988,7 +988,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1951,6 +1951,14 @@ pub fn describe(c: &Change) -> String {
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
         Change::CreateRole { name, .. } => format!("+ create role {name}", name = name.shown(),),
+        Change::CreateExtension {
+            name, definition, ..
+        } => format!(
+            "+ create extension {} version {} in schema {} (runs the package's install script)",
+            name.shown(),
+            Escaped(&definition.version),
+            Escaped(&definition.schema)
+        ),
         Change::DropRole { name, members, .. } if members.is_empty() => {
             format!("- drop role {name}", name = name.shown(),)
         }

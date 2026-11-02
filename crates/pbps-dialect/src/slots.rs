@@ -39,6 +39,8 @@ pub enum Namespace {
     Table(ObjectKey, TableSpace),
     /// Roles, which belong to no schema.
     Roles,
+    /// Extensions, which are named once per database and belong to no schema.
+    Extensions,
 }
 
 /// Which of a table's own namespaces a name is in.
@@ -66,6 +68,7 @@ impl std::fmt::Display for SlotKey {
             Namespace::Routines(schema) => write!(f, "{schema}.{} (routine)", self.name),
             Namespace::Table(table, space) => write!(f, "{} ({space:?}) on {table:?}", self.name),
             Namespace::Roles => write!(f, "role {}", self.name),
+            Namespace::Extensions => write!(f, "extension {}", self.name),
         }
     }
 }
@@ -429,6 +432,7 @@ pub fn slots(dialect: &(impl Dialect + ?Sized), address: &Address) -> Vec<SlotKe
         NameKind::Policy => vec![table(TableSpace::Policies)],
         NameKind::Column => vec![table(TableSpace::Columns)],
         NameKind::Role => vec![Namespace::Roles],
+        NameKind::Extension => vec![Namespace::Extensions],
     };
     namespaces.dedup();
     namespaces

@@ -37,6 +37,10 @@ pub enum NameKind {
     Policy,
     Column,
     Role,
+    /// A package name: database-global, in its own namespace (DEC-2447.6).
+    /// Only the package's own name is claimed; the objects it brings are read
+    /// back and checked after the rehearsal, not ordered (DEC-2447.7).
+    Extension,
 }
 
 /// A name as a step spells it, with what scopes it.
@@ -580,6 +584,12 @@ pub fn names(
             nx.release(role_address(from), holder.clone());
             nx.claim(role_address(to), holder);
         }
+        Change::CreateExtension { uid, name, .. } => {
+            nx.claim(
+                extension_address(name),
+                ObjectKey::Extension(Recorded(uid.clone())),
+            );
+        }
         // A module rebuilt in place keeps its name; the rest take none.
         Change::AddEnumValue { .. }
         | Change::AlterDomain { .. }
@@ -625,6 +635,16 @@ fn type_address(name: &crate::TypeRef) -> Address {
 fn role_address(name: &crate::RoleName) -> Address {
     Address {
         kind: NameKind::Role,
+        schema: String::new(),
+        table: None,
+        name: name.raw().to_owned(),
+        signature: None,
+    }
+}
+
+fn extension_address(name: &crate::ObjectLocalName) -> Address {
+    Address {
+        kind: NameKind::Extension,
         schema: String::new(),
         table: None,
         name: name.raw().to_owned(),
@@ -678,6 +698,14 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
             out.push(Named {
                 address: role_address(role),
                 holder: ObjectKey::Role(Recorded(uid)),
+            });
+        }
+    }
+    for name in before.schema.extensions.keys() {
+        if let Some(uid) = before.ids.extension_uid(name) {
+            out.push(Named {
+                address: extension_address(name),
+                holder: ObjectKey::Extension(Recorded(uid.clone())),
             });
         }
     }

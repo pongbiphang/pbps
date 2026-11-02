@@ -1,0 +1,4 @@
+comment = 'asks for no superuser (#2447)'
+default_version = '1.0'
+superuser = false
+relocatable = true

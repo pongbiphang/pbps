@@ -668,8 +668,12 @@ jobs:
       # and the runner's own Docker for a Docker scratch (#1674). The filter
       # must not end in `:`, which YAML reads as a mapping and rejects the
       # whole file.
+      # Every suite gets the fixtures: their packages are installed by tests in
+      # `capture` (pbps-pg lib) and in the `flow-*` shares of `flow_pg`, not
+      # only by `dialect`, and `scripts/live-tests-pg.sh` copies them for
+      # every run. A suite filter here let the local gate pass while the
+      # merge group's other suites found the packages "not available".
       - name: Install catalog-history extension fixtures
-        if: matrix.suite == 'dialect'
         env:
           PG_FIXTURE_18: ${{ job.services.postgres.id }}
           PG_FIXTURE_16: ${{ job.services['postgres-old'].id }}

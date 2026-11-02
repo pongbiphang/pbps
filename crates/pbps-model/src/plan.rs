@@ -278,7 +278,8 @@ use crate::zone::SessionZone;
 // 57 pins per-link rebuild conversions and ordered copy stages (DEC-2298.13).
 // 58 carries typed retained-expression writebacks (DEC-2354.1).
 // 59 extends retained-expression targets to column defaults (DEC-2354.4).
-pub const CURRENT_VERSION: u32 = 59;
+// 60 adds the pinned `CREATE EXTENSION` and its sealed provider manifests (DEC-2447.6).
+pub const CURRENT_VERSION: u32 = 60;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -466,6 +467,12 @@ pub struct SavedPlan {
     /// Declared type evidence follows identity through renames (DEC-1635.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_type_pins: Vec<DeclaredTypePin>,
+    /// The packages this plan installs, each with the member closure the
+    /// rehearsal read. The apply vets what the engine holds after the
+    /// statement against it and rolls back on any difference (DEC-2447.6).
+    /// Omitted when empty, so a plan with no create keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_pins: Vec<ExtensionPin>,
 
     /// Review and pin user-written roots on referenced types' potential input paths.
     /// Omit false to preserve historical bytes; true remains checksum-pinned.
@@ -515,6 +522,18 @@ pub struct DeclaredTypePin {
 pub struct DeclaredTypeBefore {
     pub name: crate::TypeRef,
     pub definition: crate::ManagedType,
+}
+
+/// One `CREATE EXTENSION` of the plan and what it was approved to bring:
+/// the provider the rehearsal read from the scratch after replaying the plan.
+/// The plan checksum covers it, so the manifest cannot be swapped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionPin {
+    pub uid: crate::Uid,
+    pub name: crate::ObjectLocalName,
+    pub definition: crate::Extension,
+    pub manifest: crate::ExtensionProvider,
 }
 
 /// A referenced type's identity and unkeyed canonical-definition digest.
@@ -587,6 +606,7 @@ impl SavedPlan {
             routine_pins: None,
             type_pins: Vec::new(),
             declared_type_pins: Vec::new(),
+            extension_pins: Vec::new(),
             pin_type_routines: false,
             type_routines: Vec::new(),
             type_routine_pins: None,

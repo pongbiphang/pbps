@@ -22,7 +22,17 @@ use std::fmt;
 /// types that tell overloads and operators apart. The parts are the engine's, so
 /// a schema-qualified function is two parts while a type is one rendered string
 /// (`ext.citext`); no consumer splits them.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderMember {
     pub class: String,
@@ -54,7 +64,9 @@ impl fmt::Display for ProviderMember {
 }
 
 /// An installed package and everything it owns or requires.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionProvider {
     pub definition: Extension,
@@ -64,6 +76,48 @@ pub struct ExtensionProvider {
     /// Direct members and their internal and automatic subsidiaries. Empty is
     /// legal only for a package whose script made no object.
     pub members: BTreeSet<ProviderMember>,
+}
+
+impl ExtensionProvider {
+    /// The members a declaration also holds as an object of its own, so that
+    /// one object would have two owners (DEC-2447.7). Only names the model can
+    /// compare exactly count: tables, views and the like by schema and name, a
+    /// type by its rendered name, a routine by its full signature. A name this
+    /// cannot decide is left to the engine, whose own refusal rolls the
+    /// install back (`42710`).
+    pub fn collisions(&self, declared: &crate::Schema) -> Vec<&ProviderMember> {
+        use crate::ModuleId;
+        self.members
+            .iter()
+            .filter(|m| match (m.class.as_str(), m.names.as_slice()) {
+                (
+                    "table" | "view" | "materialized view" | "sequence" | "foreign table",
+                    [schema, name],
+                ) => {
+                    declared
+                        .tables
+                        .keys()
+                        .any(|t| t.schema == *schema && t.name == *name)
+                        || declared.modules.keys().any(|id| {
+                            matches!(id, ModuleId::Named(_))
+                                && id.schema() == schema
+                                && id.name() == name
+                        })
+                }
+                ("type", [rendered]) => declared
+                    .types
+                    .keys()
+                    .any(|t| format!("{}.{}", t.schema(), t.name()) == *rendered),
+                ("function" | "procedure" | "aggregate", [schema, name]) => {
+                    let signature = format!("{schema}.{name}({})", m.args.join(","));
+                    declared.modules.keys().any(|id| {
+                        matches!(id, ModuleId::Routine(_)) && id.raw().to_string() == signature
+                    })
+                }
+                _ => false,
+            })
+            .collect()
+    }
 }
 
 /// How many differing items a refusal spells out before it counts the rest.
@@ -155,6 +209,70 @@ mod tests {
             ]
             .into(),
         }
+    }
+
+    /// A member the declarations also manage is one object with two owners,
+    /// and only an exact match counts: a table of the same name in another
+    /// schema, a routine of the same name with other argument types, or a type
+    /// the declarations do not hold are not collisions.
+    #[test]
+    fn a_member_the_declarations_also_manage_is_found_and_a_near_miss_is_not() {
+        use crate::{ModuleKind, TableName};
+        let table = |schema: &str, name: &str| ProviderMember {
+            class: "table".into(),
+            names: vec![schema.into(), name.into()],
+            args: Vec::new(),
+        };
+        let mut declared = crate::Schema::default();
+        declared
+            .tables
+            .insert(TableName::new("ext", "owned"), Default::default());
+        declared.types.insert(
+            "ext.citext".parse().unwrap(),
+            crate::ManagedType::Enum {
+                values: vec!["a".into()],
+            },
+        );
+        declared.modules.insert(
+            "ext.citextin(cstring)".parse().unwrap(),
+            crate::Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: String::new(),
+                options: Default::default(),
+            },
+        );
+        // The engine renders a type as one string, the schema in it.
+        let mut whole = provider();
+        whole.members = [
+            ProviderMember {
+                class: "type".into(),
+                names: vec!["ext.citext".into()],
+                args: Vec::new(),
+            },
+            member("function", "citextin", &["cstring"]),
+        ]
+        .into();
+        let found = whole.collisions(&declared);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let mut one = provider();
+        one.members = [table("ext", "owned"), table("other", "owned")].into();
+        let owned = table("ext", "owned");
+        assert_eq!(one.collisions(&declared), [&owned]);
+        // Negative: another overload, another class of the same name, and a
+        // package with nothing the declarations hold.
+        let mut near = provider();
+        near.members = [
+            member("function", "citextin", &["text"]),
+            ProviderMember {
+                class: "operator".into(),
+                names: vec!["ext".into(), "owned".into()],
+                args: Vec::new(),
+            },
+        ]
+        .into();
+        assert!(near.collisions(&declared).is_empty());
+        assert!(provider().collisions(&crate::Schema::default()).is_empty());
     }
 
     #[test]

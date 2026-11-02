@@ -265,6 +265,15 @@ pub struct DeclaredTypeStatement {
     pub after_vet: Option<String>,
 }
 
+/// A package install boundary supplied by the emitter, never inferred from
+/// SQL: the executor vets the members the statement leaves against the plan's
+/// pinned manifest in its own transaction (DEC-2447.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStatement {
+    pub uid: pbps_model::Uid,
+    pub name: pbps_model::ObjectLocalName,
+}
+
 /// One executable statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
@@ -276,6 +285,9 @@ pub struct Statement {
     pub execution: Option<StatementExecution>,
     /// The declared type this statement leaves, vetted before its transaction commits.
     pub declared_type: Option<DeclaredTypeStatement>,
+
+    /// The package this statement installs, vetted before its transaction commits.
+    pub extension: Option<ExtensionStatement>,
 
     /// Reference-data writes that need an engine-specific execution guard.
     /// Derived by the emitter, never inferred by parsing the SQL.
@@ -440,6 +452,7 @@ impl Statement {
             drop_guard: None,
             execution: None,
             declared_type: None,
+            extension: None,
             row_write: None,
             index_build: None,
             own_batch: false,

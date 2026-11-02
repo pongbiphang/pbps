@@ -544,6 +544,7 @@ pub fn validate_saved_plan(
     if !crate::enum_labels::valid_steps(&plan.changes, &plan.declared_type_pins) {
         refuse!("enum label steps disagree with their pinned intermediate definitions");
     }
+    package_pins_match_their_creates(plan)?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 
@@ -566,6 +567,65 @@ pub fn validate_saved_plan(
                 names(&planned.risks),
                 names(expected)
             );
+        }
+    }
+    Ok(())
+}
+
+/// Every `CREATE EXTENSION` of a plan is sealed with exactly one manifest, and
+/// every manifest belongs to one create (DEC-2447.6). The plan checksum covers
+/// the pins, so a swapped manifest is a different plan; this refuses a plan
+/// whose own parts disagree before it can reach a statement.
+pub(super) fn package_pins_match_their_creates(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::{Change, UidKind};
+    let creates: std::collections::BTreeMap<_, _> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateExtension {
+                uid,
+                name,
+                definition,
+                requires,
+            } = &p.change
+            {
+                Some((uid, (name, definition, requires)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let disagree = |name: &pbps_model::ObjectLocalName| {
+        AdmissionError::message(format!(
+            "extension evidence disagrees with the plan's create of `{}`",
+            name.shown()
+        ))
+    };
+    let mut pinned = std::collections::BTreeSet::new();
+    for pin in &plan.extension_pins {
+        let Some((name, definition, _)) = creates.get(&pin.uid) else {
+            return Err(disagree(&pin.name));
+        };
+        if pin.uid.kind() != UidKind::Extension
+            || plan.ids.extensions.get(&pin.uid) != Some(&pin.name)
+            || **name != pin.name
+            || **definition != pin.definition
+            || pin.manifest.definition != pin.definition
+            || !pinned.insert(&pin.uid)
+        {
+            return Err(disagree(&pin.name));
+        }
+    }
+    for (uid, (name, _, requires)) in &creates {
+        if !pinned.contains(uid)
+            || uid.kind() != UidKind::Extension
+            || plan.ids.extensions.get(*uid) != Some(*name)
+            || requires
+                .iter()
+                .any(|r| r == *uid || !creates.contains_key(r))
+        {
+            return Err(disagree(name));
         }
     }
     Ok(())

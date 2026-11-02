@@ -245,3 +245,114 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
     let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("t_aaaaaa"));
     assert!(!super::saved::rebuild_is_well_formed(&ids, &change));
 }
+
+fn package_plan() -> SavedPlan {
+    use pbps_model::{Extension, ExtensionPin, ExtensionProvider};
+    let definition = Extension {
+        schema: "ext".into(),
+        version: "1.5".into(),
+    };
+    let mut plan = wire();
+    plan.changes.changes = vec![
+        PlannedChange::new(Change::CreateExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "cube".into(),
+            definition: definition.clone(),
+            requires: Default::default(),
+        }),
+        PlannedChange::new(Change::CreateExtension {
+            uid: "e_000002".parse().unwrap(),
+            name: "earthdistance".into(),
+            definition: definition.clone(),
+            requires: ["e_000001".parse().unwrap()].into(),
+        }),
+    ];
+    plan.ids.extensions = [
+        ("e_000001".parse().unwrap(), "cube".into()),
+        ("e_000002".parse().unwrap(), "earthdistance".into()),
+    ]
+    .into();
+    plan.extension_pins = ["e_000001", "e_000002"]
+        .iter()
+        .zip(["cube", "earthdistance"])
+        .map(|(uid, name)| ExtensionPin {
+            uid: uid.parse().unwrap(),
+            name: name.into(),
+            definition: definition.clone(),
+            manifest: ExtensionProvider {
+                definition: definition.clone(),
+                requires: Default::default(),
+                members: Default::default(),
+            },
+        })
+        .collect();
+    plan
+}
+
+/// Each create is sealed with exactly one manifest that says the same thing
+/// the change does, so no edited part of a plan can send a statement to the
+/// vet with another package's evidence (DEC-2447.6).
+#[test]
+fn every_create_has_exactly_its_own_pin_and_every_pin_its_create() {
+    let check = |plan: &SavedPlan| super::saved::package_pins_match_their_creates(plan);
+    assert!(check(&package_plan()).is_ok());
+    type Edit = (&'static str, fn(&mut SavedPlan));
+    let edits: [Edit; 9] = [
+        ("a create with no pin", |p| {
+            p.extension_pins.pop();
+        }),
+        ("a pin with no create", |p| {
+            p.changes.changes.pop();
+        }),
+        ("a pin twice", |p| {
+            let again = p.extension_pins[0].clone();
+            p.extension_pins.push(again);
+        }),
+        ("another version in the pin", |p| {
+            p.extension_pins[0].definition.version = "1.6".into();
+        }),
+        ("another schema in the manifest", |p| {
+            p.extension_pins[1].manifest.definition.schema = "other".into();
+        }),
+        ("another name in the pin", |p| {
+            p.extension_pins[0].name = "hstore".into();
+        }),
+        ("a uid the ids do not hold", |p| {
+            p.ids.extensions.remove(&"e_000001".parse().unwrap());
+        }),
+        ("an edge to a package the plan does not create", |p| {
+            if let Change::CreateExtension { requires, .. } = &mut p.changes.changes[1].change {
+                requires.insert("e_000009".parse().unwrap());
+            }
+        }),
+        ("an edge to itself", |p| {
+            if let Change::CreateExtension { requires, .. } = &mut p.changes.changes[0].change {
+                requires.insert("e_000001".parse().unwrap());
+            }
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut plan = package_plan();
+        edit(&mut plan);
+        let error = check(&plan).expect_err(what).to_string();
+        assert!(
+            error.contains("extension evidence disagrees"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// The check is part of admission, not only a function that exists: an edited
+/// plan whose create lost its pin is refused by `admit`, before a statement,
+/// and the plan as written gets past it.
+#[test]
+fn admission_refuses_a_create_whose_pin_was_removed() {
+    let mut plan = package_plan();
+    plan.extension_pins.pop();
+    let checksum = plan.wire_fingerprint();
+    let error = refusal(plan, &checksum);
+    assert!(error.contains("extension evidence disagrees"), "{error}");
+    let whole = package_plan();
+    let checksum = whole.wire_fingerprint();
+    assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
+}

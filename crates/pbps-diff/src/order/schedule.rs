@@ -807,6 +807,7 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
                 | ObjectKey::Table(_)
                 | ObjectKey::Column(_)
                 | ObjectKey::Role(_)
+                | ObjectKey::Extension(_)
                 | ObjectKey::Default(_)
                 | ObjectKey::Module(_)
                 | ObjectKey::NotNull(_)
@@ -831,6 +832,7 @@ fn of_key(key: &ObjectKey) -> OrderReason {
         ObjectKey::Row { .. } | ObjectKey::Rows { .. } => OrderReason::Data,
         ObjectKey::Grant { .. } | ObjectKey::Role(_) => OrderReason::Authorization,
         ObjectKey::Type(_)
+        | ObjectKey::Extension(_)
         | ObjectKey::Table(_)
         | ObjectKey::Column(_)
         | ObjectKey::Default(_)

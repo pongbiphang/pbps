@@ -43,6 +43,18 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
             CatalogObject::Role,
         ),
         (
+            Change::CreateExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.6".into(),
+                },
+                requires: Default::default(),
+            },
+            CatalogObject::Extension,
+        ),
+        (
             Change::CreateType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 name: type_name(),
@@ -117,6 +129,19 @@ fn each_catalog_variant_maps_to_its_own_kind() {
     }
 }
 
+/// A package is named by its own subject, which plan groupings, policies and
+/// refusals key on: not blank, and not a role's or a table's.
+#[test]
+fn a_create_names_its_package_as_the_subject() {
+    for (change, kind) in catalog() {
+        if kind == CatalogObject::Extension {
+            assert_eq!(change.subject(), "extension citext");
+        } else {
+            assert!(!change.subject().starts_with("extension "), "{change:?}");
+        }
+    }
+}
+
 #[test]
 fn a_change_that_is_not_a_catalog_object_maps_to_none() {
     for change in others() {
@@ -141,11 +166,17 @@ fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
             kind == CatalogObject::Type,
             "{change:?}"
         );
+        assert_eq!(
+            matches!(change, catalog_change!(extensions)),
+            kind == CatalogObject::Extension,
+            "{change:?}"
+        );
     }
     for change in others() {
         assert!(!matches!(change, catalog_change!()), "{change:?}");
         assert!(!matches!(change, catalog_change!(roles)), "{change:?}");
         assert!(!matches!(change, catalog_change!(types)), "{change:?}");
+        assert!(!matches!(change, catalog_change!(extensions)), "{change:?}");
     }
 }
 
@@ -181,6 +212,7 @@ fn the_classifier_names_every_variant_not_a_catalog_object() {
         "CreateType",
         "DropType",
         "RenameType",
+        "CreateExtension",
     ];
     for variant in &variants {
         let named = body.contains(&format!("Change::{variant} "))

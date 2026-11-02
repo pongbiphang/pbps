@@ -1,0 +1,4 @@
+comment = 'base package for the create-ordering tests (#2447)'
+default_version = '1.0'
+relocatable = true
+superuser = false

@@ -1105,6 +1105,7 @@ fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
         ObjectKey::Type(_)
         | ObjectKey::Table(_)
         | ObjectKey::Role(_)
+        | ObjectKey::Extension(_)
         | ObjectKey::Module(_)
         | ObjectKey::NotNull(_)
         | ObjectKey::Part { .. }

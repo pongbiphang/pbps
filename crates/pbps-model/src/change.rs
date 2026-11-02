@@ -96,6 +96,11 @@ pub enum RiskClass {
     /// column of it is rewritten under ACCESS EXCLUSIVE, even for a pure
     /// reorder.
     TypeRebuild,
+    /// A package's install script runs inside the database (DEC-2447.6):
+    /// code pbps did not write and the plan cannot show, with the privileges
+    /// of the role that applies it. The plan pins the exact members the
+    /// rehearsal read and the apply rolls back on any other.
+    ExtensionCode,
 }
 
 impl RiskClass {
@@ -114,6 +119,7 @@ impl RiskClass {
             RiskClass::Numbering => "numbering",
             RiskClass::RowSecurity => "row-security",
             RiskClass::TypeRebuild => "type-rebuild",
+            RiskClass::ExtensionCode => "extension-code",
         }
     }
 
@@ -167,13 +173,16 @@ impl RiskClass {
             RiskClass::TypeRebuild => {
                 "every table with a column of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure reorder, and the dependents on it are dropped and restored"
             }
+            RiskClass::ExtensionCode => {
+                "the package's install script runs in the database with the applying role's privileges; the plan pins the members the rehearsal saw, and the apply rolls back on any other"
+            }
             RiskClass::Numbering => {
                 "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails, or one fails sooner because the numbers now end earlier"
             }
         }
     }
 
-    pub const ALL: [RiskClass; 12] = [
+    pub const ALL: [RiskClass; 13] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -186,6 +195,7 @@ impl RiskClass {
         RiskClass::Numbering,
         RiskClass::RowSecurity,
         RiskClass::TypeRebuild,
+        RiskClass::ExtensionCode,
     ];
 }
 
@@ -314,6 +324,21 @@ pub enum Change {
         from: crate::TypeRef,
         to: crate::TypeRef,
         definition: Box<crate::ManagedType>,
+    },
+    /// `CREATE EXTENSION name SCHEMA schema VERSION version` of a package the
+    /// declaration holds under an `e_` uid and the target lacks (DEC-2447.6).
+    /// It runs package code, so it is `extension-code` risk and is sealed with
+    /// the provider manifest the rehearsal read (`Plan::extension_pins`).
+    CreateExtension {
+        uid: Uid,
+        name: ObjectLocalName,
+        definition: crate::Extension,
+        /// The packages this plan also creates that this one's control file
+        /// requires, by uid: the create waits for each. A prerequisite that
+        /// is already installed adds no edge, and one that is neither is a
+        /// plan-time refusal, so the list is the whole of what ordering needs.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        requires: BTreeSet<Uid>,
     },
     CreateTable {
         uid: Uid,
@@ -1432,17 +1457,18 @@ pub enum PermissionChange<'a> {
 }
 
 /// The database-global named objects a plan creates, drops and renames by
-/// identity: roles and types. Enum value and domain edits, grants and the rest
+/// identity: roles, types and extensions. Enum value and domain edits, grants and the rest
 /// act *on* one of them and are not themselves a kind of catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CatalogObject {
     Role,
     Type,
+    Extension,
 }
 
 /// The `Change` patterns of the catalog objects, for a match arm that treats
-/// all of them alike: `catalog_change!()` is every one, `catalog_change!(roles)`
-/// and `catalog_change!(types)` one kind.
+/// all of them alike: `catalog_change!()` is every one, `catalog_change!(roles)`,
+/// `catalog_change!(types)` and `catalog_change!(extensions)` one kind.
 ///
 /// A macro and not a method, because a match guard does not count towards
 /// exhaustiveness: `c if c.catalog_object().is_some() => ..` would force a
@@ -1460,7 +1486,9 @@ pub enum CatalogObject {
 #[macro_export]
 macro_rules! catalog_change {
     () => {
-        $crate::catalog_change!(roles) | $crate::catalog_change!(types)
+        $crate::catalog_change!(roles)
+            | $crate::catalog_change!(types)
+            | $crate::catalog_change!(extensions)
     };
     (roles) => {
         $crate::Change::CreateRole { .. }
@@ -1471,6 +1499,9 @@ macro_rules! catalog_change {
         $crate::Change::CreateType { .. }
             | $crate::Change::DropType { .. }
             | $crate::Change::RenameType { .. }
+    };
+    (extensions) => {
+        $crate::Change::CreateExtension { .. }
     };
 }
 
@@ -1486,6 +1517,7 @@ impl Change {
         match self {
             crate::catalog_change!(roles) => Some(CatalogObject::Role),
             crate::catalog_change!(types) => Some(CatalogObject::Type),
+            crate::catalog_change!(extensions) => Some(CatalogObject::Extension),
             Change::RebuildPartitionedTable(..)
             | Change::CopyTableRows(..)
             | Change::AnalyzeTableTree(..)
@@ -1570,6 +1602,7 @@ impl Change {
             Change::RenameRole { from, .. } => {
                 format!("role {}", from.raw())
             }
+            Change::CreateExtension { name, .. } => format!("extension {}", name.raw()),
             // The routine, not the grantee. `PUBLIC` is every principal at
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
@@ -2328,6 +2361,7 @@ impl Change {
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
+            | Change::CreateExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2824,6 +2858,7 @@ impl Change {
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
+            | Change::CreateExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -3092,6 +3127,9 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             }
             Change::EnumRebuild { .. } => {
                 r.insert(RiskClass::TypeRebuild);
+            }
+            Change::CreateExtension { .. } => {
+                r.insert(RiskClass::ExtensionCode);
             }
             // The loosening statements carry no class, as `DropCheck` does
             // (DECISIONS 486). A check added or changed validates every row

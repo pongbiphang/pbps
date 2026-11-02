@@ -4612,3 +4612,108 @@ or list one kind or one action were left as they were, so a new kind is
 reported by the compiler wherever it has to be decided. Enum value and domain
 edits, grants and revokes act on a catalog object and are not one.
 `resolver/scope.rs` was left unconverted while #2614 changes it.
+
+<a id="dec-2447-6"></a>
+
+**DEC-2447.6. A package is created by a pinned `CREATE EXTENSION` that is rehearsed, sealed and vetted.**
+
+A declaration that holds an `e_` identity for a package the target lacks is one
+`Change::CreateExtension { uid, name, definition, requires }`, emitted as
+`CREATE EXTENSION name SCHEMA schema VERSION 'v'` and nothing else. `IF NOT
+EXISTS` would adopt a package that is already there, and `CASCADE` would
+install a prerequisite at a version nobody approved. The install script is code
+pbps did not write and the plan cannot show, so the change carries a new gated
+risk class, `extension-code`, and the plan format is 60.
+
+The statement runs only from a plan whose rehearsal read what the script
+installs. The rehearsal replays the plan on the resolver scratch, which has no
+copy of the package beforehand and is given the package's schema first (the
+target was checked for it), and reads the package's manifest (DEC-2447.4)
+from the scratch after the plan's own statements ran there. Packages the
+project already manages are still provisioned on the scratch through its
+externals file, as DEC-2447.2 requires. The plan seals
+one manifest per create in `extension_pins`, in the checksum like every other
+pin, and admission refuses a create with no pin, a pin with no create, and a pin
+whose uid, name, definition or `requires` disagrees with its change. Without a
+scratch, with the rehearsal turned off, with `--sql` or with `--dev` there is
+nothing to pin, so each of those refuses by package name. An offline `plan`
+shows the create as an unsealed preview instead, because the first plan is where
+the `e_` identity is minted and a refusal there would leave `plan --db` refusing
+`identity.stale` with no way to get one. The preview is never applyable: its
+saved plan has the preview origin and is refused at apply, and even one edited
+to claim a database origin holds a create with no pin, which admission refuses.
+
+Planning asks the target before it writes: the exact version is listed, a fixed
+control schema equals the declared one, each prerequisite is declared with a pin
+or installed, the schema exists, the name is free, and the connected role can
+install it. Measured on PostgreSQL 16.15 and 18.6: a superuser always can; any
+other role can install a package whose control file does not ask for a
+superuser with no further privilege, and one marked `trusted` only with `CREATE`
+on the database; an untrusted package that asks for a superuser is refused;
+`CREATE` on the schema is asked of none of them. The apply asks the same
+questions again under the lock, before its first statement, and runs the
+statement in its own transaction, where the vet holds what the engine now has
+to the sealed manifest. A difference, an unreadable read or an absent package
+rolls the install back and records nothing. The closing guard knows exactly the
+plan's creates: a package may appear only in its pinned definition, and a
+create that did not take effect fails it.
+
+The published JSON schemas do not change: no risk class or change kind is an
+enumeration in them, so the schema set stays where it was.
+
+A create is answered `false` by the resolver assessment (`moves_bindings`), and
+that is a stated limit, not a proof. Measured on PostgreSQL 16 and 18: a package
+may add an operator or function that matches an argument type better than what
+the path found before (intarray's `@>` on `int[]` beats the built-in `anyarray`
+one). A stored view, a column default, a check and a `BEGIN ATOMIC` routine keep
+the binding they were made with; a statement run later in the plan, a
+string-bodied SQL routine and a plpgsql routine bind the package's operator at
+call time; the same package in a schema off the search path changes nothing.
+citext adds nothing that rebinds (its casts into citext are assignment-only, and
+an unknown literal prefers `text`). DEC-1515.1 would make the answer `true`, but
+`true` sends every kept surface to a resolver that cannot describe a package the
+target lacks, so no package could be created in a project with a view. The
+rehearsal and the read-back are faithful to what the engine did (the scratch has
+the same package), so nothing is refused or recorded wrongly; only the
+assessment's "unaffected" count does not cover a create, and answering it soundly
+needs the resolver to hold the package, a later slice. A plan that creates a
+package and also needs the resolver (a new table beside a kept view, say) is
+refused by name before the resolver runs, with the two-plan remedy: plan the
+package alone and apply it; once it is installed and managed, provision it on the
+scratch through its externals file (DEC-2447.2) and plan the rest. It used to
+fail late with an internal error. A plan with a create never carries resolver
+evidence, so no saved plan, staged or transactional, reaches that sealing.
+
+Order is a factual edge, not a class number. A create sorts in class 7 with the
+type creates and waits for each package of the same plan its control file
+requires (`Is(Extension, Final)`); a prerequisite already installed adds no
+edge, and one neither installed nor created is refused with the target facts
+before a plan exists. The `requires` list is in the change, so a saved plan
+orders the same way. The resolver's bootstrap is still handed the declared
+packages already installed, and refuses a create that reaches it.
+
+Adding the kind to `catalog_change!()` made it join forty exhaustive arms
+(DEC-2447.5), and each was read. All forty join: none asks about tables,
+columns, rows, constraints, modules or an existing binding, or reaches a dialect
+that cannot receive the change. Both pg preflight sites (`build`, `probes`) were
+expected to carry the target facts and do not, because the planner and the
+apply opening read them before any probe is built. The arms outside the macro
+were decided one by one: the `subject` of the change names the package, and the
+walks that rebuild the identity maps in `identity/type_refs.rs` rebuild the type
+map only, so a package changes none of them.
+
+<a id="dec-2447-7"></a>
+
+**DEC-2447.7. Only the package's own name is claimed; its members are read back, not ordered.**
+
+The members of a package are known only after the rehearsal, which is after the
+order is decided, so they cannot be an input to ordering. The create claims the
+package's own database-global name and no member name. A member that the
+declarations also manage as their own object (a table, view, type or routine
+matched exactly by schema, name and signature) would have two owners, and the
+plan is refused by name after the rehearsal, before it is sealed. A collision
+with an object the target holds and pbps does not manage is the engine's own
+refusal inside the apply's transaction, rolled back, and the message names the
+statement. Handing a name over between a package and another object belongs to
+the DROP and UPDATE slices, and the use of a member by a declaration to the
+slices after them.

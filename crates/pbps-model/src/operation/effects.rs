@@ -1386,6 +1386,17 @@ impl Cx<'_> {
                 }
             }
             Change::CreateRole { .. } | Change::DropRole { .. } => {}
+            // A package waits for the packages of this plan its control file
+            // requires, by a factual edge and not by a class number: the
+            // payload names them, so a saved plan orders the same way.
+            Change::CreateExtension { requires, .. } => {
+                for uid in requires {
+                    self.requires(Requirement::Is(
+                        ObjectKey::Extension(Recorded(uid.clone())),
+                        Incarnation::Final,
+                    ));
+                }
+            }
             Change::RenameRole { uid, .. } => {
                 let key = ObjectKey::Role(Recorded(uid.clone()));
                 self.exists(key.clone());
@@ -2572,6 +2583,14 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
             .keys()
             .map(|uid| ObjectKey::Role(Recorded(uid.clone()))),
     );
+    held.extend(
+        before
+            .ids
+            .extensions
+            .iter()
+            .filter(|(_, name)| before.schema.extensions.contains_key(*name))
+            .map(|(uid, _)| ObjectKey::Extension(Recorded(uid.clone()))),
+    );
     held
 }
 
@@ -2587,6 +2606,7 @@ pub fn holds_unknown(key: &ObjectKey) -> bool {
         | ObjectKey::Column(ColumnKey::Recorded(_))
         | ObjectKey::Type(_)
         | ObjectKey::Role(_)
+        | ObjectKey::Extension(_)
         | ObjectKey::Default(_)
         | ObjectKey::Module(_)
         | ObjectKey::NotNull(ColumnKey::Recorded(_))

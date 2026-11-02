@@ -298,6 +298,7 @@ pub(super) fn classify(
         | Change::AnalyzeTableTree(_)
         | Change::AddEnumValue { .. }
         | Change::CreateType { .. }
+        | Change::CreateExtension { .. }
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetReplicaIdentity { .. }

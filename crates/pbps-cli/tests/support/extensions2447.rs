@@ -197,7 +197,9 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
             (
                 "pgcrypto",
                 Some("extension: pgcrypto\nschema: ext\nversion: '1.3'\n"),
-                "CREATE EXTENSION",
+                // A package the target lacks is a create now, and a project
+                // with no scratch has no rehearsal to pin its members with.
+                "is created by this plan",
             ),
             ("hstore", None, "DROP EXTENSION"),
             (
@@ -222,8 +224,25 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
             if action == "UPDATE" {
                 std::fs::write(&ordinary, "table: ext.ordinary\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n").unwrap();
             }
+            // A new declaration gets its identity from an offline plan first,
+            // as any new object does.
+            let creates = action == "is created by this plan";
+            if creates {
+                succeeds(d.run(&["plan", "--no-dev"]));
+            }
             d.commit();
             assert_refused(&d, connection, action, name);
+            if creates {
+                // The declaration and its minted identity go together.
+                let reset = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&d.dir)
+                    .args(["reset", "--hard", "--quiet", "HEAD~1"])
+                    .status()
+                    .unwrap();
+                assert!(reset.success());
+                continue;
+            }
             std::fs::write(ordinary, table).unwrap();
             match original {
                 Some(text) => std::fs::write(&path, text).unwrap(),
@@ -292,8 +311,9 @@ fn legacy_scope_keeps_unheld_packages_out_until_explicit_adoption() {
             "extension: citext\nschema: public\nversion: '1.4'\n",
         )
         .unwrap();
+        succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
-        assert_refused(&d, connection, "CREATE EXTENSION", "citext");
+        assert_refused(&d, connection, "already installed", "citext");
         succeeds(d.run(&[
             "pull",
             "--force",
@@ -504,11 +524,6 @@ fn scratch_bootstrap_does_not_authorize_real_extension_lifecycle_changes() {
         );
         for (name, text, action) in [
             (
-                "pgcrypto",
-                "extension: pgcrypto\nschema: ext\nversion: '1.3'\n",
-                "CREATE EXTENSION",
-            ),
-            (
                 "citext",
                 "extension: citext\nschema: ext\nversion: '1.6'\n",
                 "UPDATE",
@@ -530,6 +545,21 @@ fn scratch_bootstrap_does_not_authorize_real_extension_lifecycle_changes() {
             }
             case.demo.commit();
         }
+        // What a scratch does authorize is a create: a package the target lacks
+        // is rehearsed beside the standing ones, and its members are pinned.
+        let path = extension_file(&case.demo, "pgcrypto");
+        std::fs::write(&path, "extension: pgcrypto\nschema: ext\nversion: '1.3'\n").unwrap();
+        succeeds(case.demo.run(&["plan", "--no-dev"]));
+        case.demo.commit();
+        let out = case.plan(false);
+        assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        let plan: pbps_model::SavedPlan = serde_json::from_slice(
+            &std::fs::read(case.demo.dir.join("scratch.plan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.extension_pins.len(), 1);
+        assert_eq!(plan.extension_pins[0].name.raw(), "pgcrypto");
+        assert!(!plan.extension_pins[0].manifest.members.is_empty());
     });
 }
 
@@ -881,7 +911,7 @@ fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
         assert_eq!(selected.values().next().unwrap().raw(), "citext");
         // Local selection is not permission to take ownership in an ordinary plan.
         d.commit();
-        assert_refused(&d, connection, "CREATE EXTENSION", "citext");
+        assert_refused(&d, connection, "already installed", "citext");
         let package_path = extension_file(&d, "citext");
         let package = std::fs::read(&package_path).unwrap();
         let entries = text_of(connection, "SELECT count(*)::text FROM public.__pbps_state");
