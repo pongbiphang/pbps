@@ -13,7 +13,7 @@ async fn engine(db: &mut TestDb) -> Postgres {
         .unwrap();
     Postgres::new().with_server_version(rows[0].try_get::<i32>("version").unwrap().unwrap() as i64)
 }
-async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode, user_code: bool) {
+async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode) {
     let plan = f.compile(pg).unwrap();
     let mut record = Declared::default();
     record.advance(plan.changes());
@@ -73,23 +73,12 @@ async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode, user
         for statement in group.statements() {
             db.conn.execute(&statement.sql).await.unwrap();
             if let Some(metadata) = &statement.declared_type {
-                if user_code
-                    && matches!(&metadata.definition,Some(pbps_model::ManagedType::Domain{checks,..}) if !checks.is_empty())
-                {
-                    let error = pbps_pg::type_refs::declared::vet(&mut db.conn, metadata, &trusted)
-                        .await
-                        .unwrap_err();
-                    assert!(error.to_string().contains("c2469"), "{error}");
-                    // Native acceptance measures the design's SQL order. The
-                    // product's built-in-only code gate remains a refusal.
-                    if let Some(tail) = &metadata.after_vet {
-                        db.conn.execute(tail).await.unwrap();
-                    }
-                } else {
-                    pbps_pg::type_refs::declared::vet(&mut db.conn, metadata, &trusted)
-                        .await
-                        .unwrap();
-                }
+                // Every fixture routine is a SQL-standard body over built-ins,
+                // which tier 1 admits (DEC-2563.1): the gate passes and itself
+                // runs the `NOT VALID` tail before any dependent statement.
+                pbps_pg::type_refs::declared::vet(&mut db.conn, metadata, &trusted)
+                    .await
+                    .unwrap();
             }
         }
         if mode == PlanMode::Staged {
@@ -126,7 +115,7 @@ async fn domain_check_uses_the_bare_type_before_its_function_and_enforces_values
         db.conn.execute("CREATE SCHEMA c2469").await.unwrap();
         let pg = engine(&mut db).await;
         db.conn.execute("BEGIN").await.unwrap();
-        apply(&mut db, &f, &pg, PlanMode::Transactional, true).await;
+        apply(&mut db, &f, &pg, PlanMode::Transactional).await;
         let rows = db.conn.query("SELECT 7::c2469.d AS value").await.unwrap();
         assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(7));
         bad(&mut db, "SELECT (-1)::c2469.d", "23514").await;
@@ -167,7 +156,7 @@ async fn domain_facets_keep_vetted_intermediates_authored_text_and_execution_mod
             if mode == PlanMode::Transactional {
                 db.conn.execute("BEGIN").await.unwrap();
             }
-            apply(&mut db, &f, &pg, mode, false).await;
+            apply(&mut db, &f, &pg, mode).await;
             if mode == PlanMode::Staged {
                 db.conn.execute("BEGIN").await.unwrap();
             }
@@ -222,7 +211,7 @@ async fn scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks
             db.conn.execute("CREATE SCHEMA c2469").await.unwrap();
             let pg = engine(&mut db).await;
             db.conn.execute("BEGIN").await.unwrap();
-            apply(&mut db, &f, &pg, PlanMode::Transactional, false).await;
+            apply(&mut db, &f, &pg, PlanMode::Transactional).await;
             if facet == "default" {
                 db.conn
                     .execute("INSERT INTO c2469.t(anchor) VALUES(1)")
@@ -304,7 +293,7 @@ async fn split_derived_defaults_override_temporary_inheritance() {
         "{why}"
     );
     db.conn.execute("BEGIN").await.unwrap();
-    apply(&mut db, &f, &pg, PlanMode::Transactional, false).await;
+    apply(&mut db, &f, &pg, PlanMode::Transactional).await;
     db.conn.execute("CREATE TABLE c2469.default_values(a c2469.d, b c2469.child); INSERT INTO c2469.default_values DEFAULT VALUES").await.unwrap();
     let rows = db
         .conn
