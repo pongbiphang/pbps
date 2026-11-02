@@ -587,6 +587,30 @@ fn repin_refusals_happen_before_any_scratch_and_change_nothing() {
     assert!(!w.p.state().exists());
 }
 
+fn committed_candidate_with_another_working_tree(old: bool) {
+    let w = world(IDENTITY);
+    w.commit_fixtures(old, &[("orders", &w.old, KEPT_AND_DISCARDED)]);
+    let candidate = w.p.head();
+    let text = format!("{}candidate: {candidate}\n", w.manifest_text());
+    w.p.write("tests/pbps-tests.yml", text);
+    w.p.0.git(&["commit", "-qam", "committed candidate"]);
+    // Equal data and the same next id, spelled with the explicit column.
+    w.p.write(
+        "tests/orders.sql",
+        concat!(
+            "INSERT INTO app.t(v, note) VALUES ('kept', NULL), ('discarded', NULL); ",
+            "DELETE FROM app.t WHERE v = 'discarded';"
+        ),
+    );
+    // A declaration that differs from the candidate's is not a change during the run.
+    let declaration = w.p.0.dir.join("schema/app.plain.yml");
+    let text = std::fs::read_to_string(&declaration).unwrap();
+    std::fs::write(&declaration, format!("{text}\n# working tree only\n")).unwrap();
+    let out = w.repin_command("orders", &w.base, "json").output().unwrap();
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    w.p.settled();
+}
+
 macro_rules! on_both {
     ($($name:ident => $body:ident),* $(,)?) => {$(
         mod $name {
@@ -610,5 +634,6 @@ on_both! {
     repin_other_groups_noncommuting_order_is_refused => another_groups_operations_do_not_commute,
     repin_fixture_errors_name_the_proposed_side => fixture_errors,
     repin_unestablishable_allocator_is_unanswerable => exhausted_allocator_is_unanswerable,
+    repin_committed_candidate_with_another_working_tree_verifies => committed_candidate_with_another_working_tree,
     repin_changed_input_cannot_move_the_pin => a_changed_input_cannot_move_the_pin,
 }

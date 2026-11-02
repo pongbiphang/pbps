@@ -27,6 +27,8 @@ struct Plan {
     inputs: Inputs,
     index: usize,
     to: CommitId,
+    /// The `HEAD` the original side was read at, whatever the candidate is.
+    head: CommitId,
     /// The fixture as committed at `HEAD`: what the original side loads.
     old_sql: String,
     original: ReplayChain,
@@ -225,9 +227,6 @@ fn validate(
         })?;
     let from = manifest.fixtures[index].at.clone();
     let head = git::resolve_commit(&root, "HEAD").map_err(|p| vec![git_refusal("HEAD", p)])?;
-    // The baseline is read at `HEAD` whatever the candidate is, so the final
-    // recheck must watch it even when a committed candidate did not capture it.
-    inputs.head.get_or_insert_with(|| head.clone());
     let manifest_file = inputs.frozen.manifest_file.clone();
     let working = std::fs::read(inputs.frozen.manifest_target())
         .map_err(|e| refuse(format!("the manifest cannot be read again: {e}")))?;
@@ -332,6 +331,7 @@ fn validate(
         inputs,
         index,
         to,
+        head,
         old_sql,
         original,
         proposed,
@@ -439,6 +439,7 @@ async fn side(
     if !run {
         return None;
     }
+    forget_observations(data);
     let scratch =
         test_run::boxed_future(|| control.start(dir, &plan.inputs.identity.image, data, provision))
             .await?;
@@ -497,6 +498,29 @@ async fn side(
     found
 }
 
+/// A `HEAD` that moved since the baseline was read. `Inputs::reverify` watches
+/// it only for a working-tree candidate, and capturing it there for another
+/// candidate would also compare the working files with the candidate's.
+fn head_moved(plan: &Plan) -> String {
+    match git::resolve_commit(&plan.inputs.root, "HEAD") {
+        Ok(now) if now == plan.head => String::new(),
+        Ok(now) => Refusal::HeadMoved {
+            captured: plan.head.clone(),
+            now,
+        }
+        .to_string(),
+        Err(problem) => git_refusal("HEAD", problem).to_string(),
+    }
+}
+
+/// Observations belong to one scratch: the second must not inherit the first's
+/// image, engine build or run when its own provisioning fails early.
+fn forget_observations(data: &mut TestData) {
+    data.run_id = None;
+    data.acquired_image = None;
+    data.engine_build = None;
+}
+
 /// Whether the side runs: the first always does, the second only after the
 /// first completed and its scratch is confirmed gone, so a later cleanup can
 /// never stand in for an earlier one that failed.
@@ -531,6 +555,11 @@ async fn execute(plan: &Plan, data: &mut TestData) {
         compare(data, rows, original, proposed);
     }
     data.reverify(&plan.inputs);
+    let moved = head_moved(plan);
+    if !moved.is_empty() {
+        data.inputs_reverified = false;
+        data.failure(0, "test.input", moved, true);
+    }
 }
 
 fn compare(
