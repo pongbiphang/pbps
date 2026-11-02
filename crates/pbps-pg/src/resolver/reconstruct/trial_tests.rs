@@ -669,7 +669,7 @@ async fn retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects() {
                     columns: vec![pbps_model::IndexColumn {
                         key: pbps_model::IndexKey::Column("a".into()),
                         descending: false,
-                        opclass: Some("app.absent_ops".into()),
+                        opclass: Some("app.absent_ops".parse().unwrap()),
                     }],
                     include: vec![],
                     unique: false,

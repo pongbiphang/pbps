@@ -91,6 +91,9 @@ mod literal_inputs2378;
 #[path = "support/drop_requirements2400.rs"]
 mod drop_requirements2400;
 
+#[path = "support/index_policy2448.rs"]
+mod index_policy2448;
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
@@ -2953,8 +2956,8 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
     assert_eq!(indexes["ix_body"].columns[0].opclass, None);
     assert_eq!(indexes["ix_tags"].method, IndexMethod::Gin);
     assert_eq!(
-        indexes["ix_tags"].columns[0].opclass.as_deref(),
-        Some("jsonb_path_ops")
+        indexes["ix_tags"].columns[0].opclass,
+        Some(pbps_model::OpClassRef::bare("jsonb_path_ops"))
     );
     assert!(indexes["ix_tags"].filter.is_some());
     assert_eq!(indexes["ix_id"].method, IndexMethod::Btree);
@@ -2979,7 +2982,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
     {
         let t = changed.tables.get_mut(&doc).unwrap();
         t.indexes.get_mut("ix_body").unwrap().columns[0].opclass =
-            Some("jsonb_path_ops".to_owned());
+            Some(pbps_model::OpClassRef::bare("jsonb_path_ops"));
         t.indexes.remove("ix_tags");
     }
     let step = plan(&rebuilt, &ids, &changed, &ids);
@@ -5590,8 +5593,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             ["doc_1_d", "doc_1_p"]
         );
         assert_eq!(
-            doc_1.indexes["doc_1_p"].columns[0].opclass.as_deref(),
-            Some("jsonb_path_ops")
+            doc_1.indexes["doc_1_p"].columns[0].opclass,
+            Some(pbps_model::OpClassRef::bare("jsonb_path_ops"))
         );
         let with_own = |partition: pbps_model::Table, from: &pbps_model::Table| pbps_model::Table {
             checks: from.checks.clone(),

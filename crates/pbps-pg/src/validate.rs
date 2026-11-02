@@ -21,8 +21,7 @@ use std::collections::BTreeSet;
 
 use pbps_dialect::{DialectError, Expression};
 use pbps_model::{
-    GrantTarget, Index, IndexMethod, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema,
-    Table,
+    GrantTarget, Index, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table,
 };
 
 use crate::quote;
@@ -204,81 +203,97 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
 /// B-tree under each type's default class, and GIN over `jsonb` under
 /// `jsonb_ops`, its default, or `jsonb_path_ops`. Anything else would be
 /// created as declared but read back as a limitation, so it is refused here
-/// rather than applied and then refused.
+/// rather than applied and then refused. What each method may do is its row in
+/// the model's policy table, and which classes are the engine's own is
+/// [`crate::index_policy`]'s, shared with the pull (DEC-2448.1).
+///
+/// Measured on 18.6: `gin` refuses `UNIQUE` ("access method \"gin\" does not
+/// support unique indexes"), `INCLUDE` and `ASC`/`DESC`, and an `int` column
+/// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
+    use crate::index_policy::{ClassProblem, class_problem, holds_key_type, key_scope, offered};
+    let policy = index.method.policy();
+    let method = index.method.as_str().to_ascii_uppercase();
     let mut found = Vec::new();
-    match index.method {
-        IndexMethod::Btree => {
-            for key in &index.columns {
-                if let Some(class) = &key.opclass {
-                    found.push(invalid(format!(
-                        "{what} indexes `{}` with operator class `{class}`; a B-tree index here \
-                         takes only its type's default class, so leave the class out \
-                         (or, if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                        pbps_model::escape::Escaped(key.key.text()),
-                        class = pbps_model::escape::Escaped(class),
-                    )));
-                }
-            }
+    if index.unique && !policy.unique {
+        found.push(invalid(format!(
+            "{what} is a {method} index, which cannot be unique"
+        )));
+    }
+    if !index.include.is_empty() && !policy.include {
+        found.push(invalid(format!(
+            "{what} is a {method} index, which cannot include payload columns"
+        )));
+    }
+    for key in &index.columns {
+        let shown = pbps_model::escape::Escaped(key.key.text());
+        if key.descending && !policy.ordered {
+            found.push(invalid(format!(
+                "{what} orders `{shown}` descending, and a {method} index has no order"
+            )));
         }
-        // Measured on 18.6: `gin` refuses `UNIQUE` ("access method \"gin\"
-        // does not support unique indexes"), `INCLUDE` and `ASC`/`DESC`, and an
-        // `int` column has no default GIN class at all.
-        IndexMethod::Gin => {
-            if index.unique {
+        let column = match key.key.column() {
+            Some(column) => Some(column),
+            None if !policy.expression_keys => {
                 found.push(invalid(format!(
-                    "{what} is a GIN index, which cannot be unique"
+                    "{what} is a {method} index over the expression `{shown}`, and this model \
+                     holds {method} only over {}",
+                    key_scope(policy)
+                )));
+                continue;
+            }
+            None => None,
+        };
+        if let Some(column) = column {
+            // A missing column is already named by `key_columns`.
+            if table
+                .columns
+                .get(column)
+                .is_some_and(|c| !holds_key_type(policy, c))
+            {
+                found.push(invalid(format!(
+                    "{what} is a {method} index over `{column}`, and this model holds {method} \
+                     only over {}",
+                    key_scope(policy),
+                    column = column.shown(),
                 )));
             }
-            if !index.include.is_empty() {
-                found.push(invalid(format!(
-                    "{what} is a GIN index, which cannot include payload columns"
-                )));
-            }
-            for key in &index.columns {
-                if key.descending {
-                    found.push(invalid(format!(
-                        "{what} orders `{}` descending, and a GIN index has no order",
-                        pbps_model::escape::Escaped(key.key.text())
-                    )));
-                }
-                let Some(column) = key.key.column() else {
-                    found.push(invalid(format!(
-                        "{what} is a GIN index over the expression `{}`, and this model holds \
-                         GIN only over `jsonb` columns",
-                        pbps_model::escape::Escaped(key.key.text())
-                    )));
-                    continue;
-                };
-                let jsonb = table.columns.get(column).is_some_and(|c| {
-                    // Not `jsonb[]`, whose base is the element's (#1525 review).
-                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb" && !t.is_array())
-                });
-                // A missing column is already named by `key_columns`.
-                if table.columns.contains_key(column) && !jsonb {
-                    found.push(invalid(format!(
-                        "{what} is a GIN index over `{column}`, and this model holds GIN only over \
-                         `jsonb` columns",
-                        column = column.shown(),
-                    )));
-                }
-                match key.opclass.as_deref() {
-                    None | Some("jsonb_path_ops") => {}
-                    Some("jsonb_ops") => found.push(invalid(format!(
-                        "{what} names `jsonb_ops` for `{column}`, which is GIN's default for \
-                         `jsonb`; leave the class out",
-                        column = column.shown(),
-                    ))),
-                    Some(class) => found.push(invalid(format!(
-                        "{what} indexes `{column}` with operator class `{class}`; a GIN index \
-                         over `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the \
-                         default `jsonb_ops`",
-                        column = column.shown(),
-                        class = pbps_model::escape::Escaped(class),
-                    ))),
-                }
-            }
         }
+        let Some(class) = &key.opclass else { continue };
+        let at = format!("`{shown}`");
+        let named = class.shown();
+        found.push(invalid(match class_problem(policy, class) {
+            None => continue,
+            // The B-tree's own wording: its direction words are the likelier slip.
+            Some(ClassProblem::DefaultOnly) => format!(
+                "{what} indexes {at} with operator class `{named}`; a B-tree index here \
+                 takes only its type's default class, so leave the class out \
+                 (or, if `{named}` was meant as a direction, it is `asc` or `desc`)"
+            ),
+            Some(ClassProblem::DefaultSpelledOut) => format!(
+                "{what} names `{named}` for {at}, which is {method}'s default for \
+                 `{}`; leave the class out",
+                policy.key_type.unwrap_or("its key type")
+            ),
+            Some(ClassProblem::NotHeld) => format!(
+                "{what} indexes {at} with operator class `{named}`; a {method} index \
+                 over `{}` here takes `{}` or, by leaving it out, the \
+                 default `{}`",
+                policy.key_type.unwrap_or("its key type"),
+                policy.classes.join("` or `"),
+                policy.default_class.unwrap_or("its default"),
+            ),
+            Some(ClassProblem::Outside) => format!(
+                "{what} indexes {at} with operator class `{named}`, which a schema owns; this \
+                 model holds only the engine's own classes ({}) until a pinned provider vouches \
+                 for one (#2447 PR F)",
+                if policy.classes.is_empty() && policy.default_class.is_none() {
+                    "none, for a B-tree".to_owned()
+                } else {
+                    offered(policy)
+                }
+            ),
+        }));
     }
     found
 }
@@ -777,7 +792,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{Module, ModuleKind, RoutineArg, RoutineId, Table};
+    use pbps_model::{IndexMethod, Module, ModuleKind, RoutineArg, RoutineId, Table};
 
     /// A schema with one table, one view, one procedure and two overloads of
     /// one function — the shapes a grant can name, and the one that is not an
@@ -931,7 +946,7 @@ mod tests {
                     .map(|(name, class, descending)| pbps_model::IndexColumn {
                         key: pbps_model::IndexKey::Column((*name).into()),
                         descending: *descending,
-                        opclass: class.map(str::to_owned),
+                        opclass: class.map(|c| c.parse().unwrap()),
                     })
                     .collect(),
                 include: Vec::new(),
@@ -999,7 +1014,7 @@ mod tests {
             table.indexes.get_mut("ix").unwrap().columns = vec![pbps_model::IndexColumn {
                 key: pbps_model::IndexKey::Expression(text.into()),
                 descending: false,
-                opclass: class.map(str::to_owned),
+                opclass: class.map(|c| c.parse().unwrap()),
             }];
             structure(&table)
         };
@@ -1046,6 +1061,48 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("operator class `dsc`") && m.contains("`asc` or `desc`")),
             "{found:?}"
+        );
+    }
+
+    /// A class a schema owns is parsed by the loader and refused here, by
+    /// name, on every method and key shape, until a pinned provider vouches
+    /// for it (#2447 PR F); the engine's own spelling `pg_catalog.x` is the
+    /// bare class and gets the bare class's verdict (DEC-2448.1).
+    #[test]
+    fn a_class_a_schema_owns_is_refused_by_name_and_pg_catalog_is_not_one() {
+        let refused = |table: Table, expected: &[&str]| {
+            let found = structure(&table);
+            assert!(
+                found.iter().any(|m| expected.iter().all(|e| m.contains(e))),
+                "expected {expected:?} in {found:?}"
+            );
+        };
+        refused(
+            indexed(IndexMethod::Btree, &[("n", Some("ext.int4_ops"), false)]),
+            &["`ext.int4_ops`", "a schema owns", "#2447 PR F"],
+        );
+        refused(
+            indexed(
+                IndexMethod::Gin,
+                &[("body", Some("ext.jsonb_path_ops"), false)],
+            ),
+            &["`ext.jsonb_path_ops`", "#2447 PR F", "`jsonb_ops`"],
+        );
+        // The same name in `pg_catalog` is the bare class, and held.
+        assert!(
+            structure(&indexed(
+                IndexMethod::Gin,
+                &[("body", Some("pg_catalog.jsonb_path_ops"), false)]
+            ))
+            .is_empty()
+        );
+        // Negative: the bare btree class stays refused, with its own wording.
+        refused(
+            indexed(
+                IndexMethod::Btree,
+                &[("n", Some("pg_catalog.int4_ops"), false)],
+            ),
+            &["takes only its type's default class"],
         );
     }
 

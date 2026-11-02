@@ -1543,6 +1543,9 @@ pub enum IndexMethod {
 }
 
 impl IndexMethod {
+    /// Every method this model holds, in the order a message lists them.
+    pub const ALL: [IndexMethod; 2] = [IndexMethod::Btree, IndexMethod::Gin];
+
     pub fn is_btree(&self) -> bool {
         *self == IndexMethod::Btree
     }
@@ -1553,6 +1556,19 @@ impl IndexMethod {
             IndexMethod::Btree => "btree",
             IndexMethod::Gin => "gin",
         }
+    }
+
+    /// The method a catalog's `pg_am.amname` names, if this model holds it.
+    pub fn from_am_name(name: &str) -> Option<IndexMethod> {
+        Self::ALL.into_iter().find(|m| m.as_str() == name)
+    }
+
+    /// What the engine lets this method do, and what changing one of its
+    /// parameters costs: one record, read by the loader, the differ and every
+    /// dialect, so a method is one row here and not an arm in each of them
+    /// (DEC-2448.1).
+    pub fn policy(self) -> &'static crate::storage::MethodPolicy {
+        crate::storage::policy_of(self)
     }
 }
 
@@ -1608,8 +1624,9 @@ pub struct IndexColumn {
     pub descending: bool,
     /// The operator class this key is indexed with, where it is not the
     /// method's default for the key's type; absent is that default. Which
-    /// names are accepted is the dialect's question (DEC-1169.1).
-    pub opclass: Option<String>,
+    /// names are accepted is the dialect's question (DEC-1169.1). Bare for
+    /// the engine's own, qualified for a schema's (DEC-2448.1).
+    pub opclass: Option<crate::OpClassRef>,
 }
 
 /// What an index key orders by: a column of the table, or an expression over
@@ -1677,7 +1694,7 @@ struct RawIndexColumn {
     #[serde(default)]
     descending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    opclass: Option<String>,
+    opclass: Option<crate::OpClassRef>,
 }
 
 impl TryFrom<RawIndexColumn> for IndexColumn {
@@ -1720,6 +1737,34 @@ impl From<IndexColumn> for RawIndexColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An index key's bytes are what they were before the class became a
+    /// reference: a bare class and an absent one write exactly the old text,
+    /// and the old text reads back (DEC-2448.1). A saved plan or state from
+    /// before this change is the evidence that nothing moved.
+    #[test]
+    fn an_index_key_keeps_its_old_bytes_with_and_without_a_class() {
+        let with = r#"{"name":"body","descending":false,"opclass":"jsonb_path_ops"}"#;
+        let without = r#"{"name":"id","descending":true}"#;
+        for legacy in [with, without] {
+            let key: IndexColumn = serde_json::from_str(legacy).unwrap();
+            assert_eq!(serde_json::to_string(&key).unwrap(), legacy);
+        }
+        let key: IndexColumn = serde_json::from_str(with).unwrap();
+        assert_eq!(key.opclass, Some(crate::OpClassRef::bare("jsonb_path_ops")));
+        // The engine's own class by its catalog spelling is the same key.
+        let spelled = r#"{"name":"body","descending":false,"opclass":"pg_catalog.jsonb_path_ops"}"#;
+        assert_eq!(serde_json::from_str::<IndexColumn>(spelled).unwrap(), key);
+        // A schema's class is held, and written qualified.
+        let own: IndexColumn =
+            serde_json::from_str(r#"{"name":"c","descending":false,"opclass":"ext.gist_ops"}"#)
+                .unwrap();
+        assert_eq!(own.opclass.as_ref().and_then(|c| c.schema()), Some("ext"));
+        assert_eq!(
+            serde_json::to_string(&own).unwrap(),
+            r#"{"name":"c","descending":false,"opclass":"ext.gist_ops"}"#
+        );
+    }
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()

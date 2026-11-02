@@ -1018,7 +1018,10 @@ indexes:
         let gin = &t.table.indexes["ix_body"];
         assert_eq!(gin.method, pbps_model::IndexMethod::Gin);
         assert_eq!(gin.columns[0].opclass, None);
-        assert_eq!(gin.columns[1].opclass.as_deref(), Some("jsonb_path_ops"));
+        assert_eq!(
+            gin.columns[1].opclass,
+            Some(pbps_model::OpClassRef::bare("jsonb_path_ops"))
+        );
         assert!(!gin.columns[1].descending);
         // Negative: no method is the B-tree, and no class is the default one.
         let plain = &t.table.indexes["ix_n"];
@@ -1040,8 +1043,98 @@ indexes:
             "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    columns: [a text_pattern_ops desc]\n",
         );
         let key = &both.table.indexes["ix"].columns[0];
-        assert_eq!(key.opclass.as_deref(), Some("text_pattern_ops"));
+        assert_eq!(
+            key.opclass,
+            Some(pbps_model::OpClassRef::bare("text_pattern_ops"))
+        );
         assert!(key.descending);
+    }
+
+    /// A qualified class parses and is held for the dialect to refuse;
+    /// `pg_catalog.x` is the bare `x`, and the writer puts each back as it is
+    /// spelled canonically (DEC-2448.1).
+    #[test]
+    fn a_qualified_operator_class_loads_and_pg_catalog_is_the_bare_class() {
+        let text = "table: app.doc\ncolumns:\n  a: {type: text}\n  b: {type: jsonb}\nindexes:\n\
+                    \x20 ix_a:\n    keys:\n      - {column: a, opclass: ext.my_ops}\n\
+                    \x20 ix_b:\n    method: gin\n    columns: [b pg_catalog.jsonb_path_ops]\n";
+        let t = load(text);
+        let own = t.table.indexes["ix_a"].columns[0].opclass.as_ref().unwrap();
+        assert_eq!((own.schema(), own.name()), (Some("ext"), "my_ops"));
+        let engine = t.table.indexes["ix_b"].columns[0].opclass.as_ref().unwrap();
+        assert_eq!(engine.as_bare(), Some("jsonb_path_ops"));
+        let written = crate::render(&t.name, &t.table, &[], None);
+        assert!(written.contains("columns: [a ext.my_ops]"), "{written}");
+        assert!(written.contains("columns: [b jsonb_path_ops]"), "{written}");
+        assert_eq!(load(&written).table, t.table);
+        // A quoted name with a space cannot be a word of `columns:`, so the
+        // writer takes `keys:` for it and it still round-trips.
+        let spaced = load(
+            "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    keys:\n\
+             \x20     - {column: a, opclass: 'ext.\"My Ops\"'}\n",
+        );
+        let written = crate::render(&spaced.name, &spaced.table, &[], None);
+        assert!(written.contains("keys:"), "{written}");
+        assert_eq!(load(&written).table, spaced.table);
+    }
+
+    /// Negative: a bare name that is not an identifier, and a malformed
+    /// qualified one, are refused as before (DEC-1169.1, DEC-2448.1).
+    #[test]
+    fn a_malformed_operator_class_is_still_refused() {
+        for (keys, expected) in [
+            ("    columns: [a bad-class]\n", "not an operator class name"),
+            (
+                "    keys:\n      - {column: a, opclass: 'a.b.c'}\n",
+                "not an operator class name",
+            ),
+            (
+                "    keys:\n      - {column: a, opclass: 'ext.'}\n",
+                "not an operator class name",
+            ),
+        ] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n{keys}"
+            ));
+            assert!(render(&e).contains(expected), "{keys}: {}", render(&e));
+        }
+    }
+
+    /// A key `collation:` is read so that it can be refused by name, and the
+    /// refusal says it arrives with a later part of #2448 and where a
+    /// collation can be written today (DEC-2448.1). Without it the same
+    /// index loads: the refusal is the field's, not the index's.
+    #[test]
+    fn a_key_collation_is_refused_by_name_until_it_is_held() {
+        let with = errors(
+            "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    keys:\n\
+             \x20     - {column: a, collation: \"C\"}\n",
+        );
+        let text = render(&with);
+        assert!(
+            text.contains("`collation: C` is not supported yet") && text.contains("#2448"),
+            "{text}"
+        );
+        let without = load(
+            "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    keys:\n\
+             \x20     - {column: a}\n",
+        );
+        assert_eq!(without.table.indexes["ix"].columns.len(), 1);
+    }
+
+    /// The access methods and constraints that come with later parts of #2448
+    /// are refused at load today, naming what was written.
+    #[test]
+    fn gist_brin_and_exclude_are_refused_by_name_until_their_parts_land() {
+        for method in ["gist", "brin", "spgist", "hash"] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n    method: {method}\n    columns: [a]\n"
+            ));
+            assert!(render(&e).contains(method), "{method}: {}", render(&e));
+        }
+        let e =
+            errors("table: app.t\ncolumns:\n  a: {type: text}\nexclude:\n  ex: {using: gist}\n");
+        assert!(render(&e).contains("exclude"), "{}", render(&e));
     }
 
     /// Report every problem at once, rather than fix-one-run-again.

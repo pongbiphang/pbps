@@ -9367,3 +9367,56 @@ identity capabilities, nested/reparented/bound changes and external adoption
 remain guarded where no active replacement proves them. Missing capabilities
 and incompatible cuts still name the separate-plans remedy. No new pass,
 rank, tie-break, settlement, persisted field or wire version is introduced.
+
+
+<a id="dec-2448-1"></a>
+
+**DEC-2448.1. One policy table per index method, and a qualified operator class (#2448 PR A).**
+What an index access method may do, and what changing one of its storage
+parameters costs, was four copies of the same rule: `validate` (which keys and
+classes), `introspect` (the same, for a pull), `emit` (`ASC`/`DESC` and
+`USING`) and `estimate` (the lock). A method is now one record in
+`pbps_model::storage` (`IndexMethod::policy()`): the capabilities the engine
+reports (`unique`, `include`, `ordered`, expression keys), the one key type it
+is held over and its non-default classes, the lock an in-place change takes,
+and each parameter with a verdict, `Alter`, `Rebuild` or `Refuse`. Every reader
+asks the record. btree and GIN are exactly what they were: every parameter is
+`Alter`, and the recorded outputs are byte for byte the old ones. A later
+method (GiST in #2448 PR B, BRIN in #2449) is one more row and no new arm.
+
+The differ reads the verdict (`schema_diff::parameter_edit`): `Alter` is the
+`ALTER INDEX` it always was, `Rebuild` replaces the part with its final
+parameters in the `CREATE`, `Refuse` is `DiffError::IndexParameterRefused`.
+The worst verdict among the changed parameters decides. No method holds a
+parameter that is not `Alter` yet; the two arms are exercised by a synthetic
+policy, and measuring a real one is the first thing a method that needs it does.
+
+Measured on 16.15 and 18.6 (live, both servers, each case in a database of its
+own): the policy's `unique`, `include` and `ordered` equal
+`pg_indexam_has_property` and an actual `CREATE INDEX` (`0A000` where it is
+`false`); every held parameter changes with `ALTER INDEX … SET`/`RESET` and
+keeps the relation file; the lock is on the index relation and is
+`ShareUpdateExclusiveLock` for btree and `AccessExclusiveLock` for GIN.
+
+A key's operator class is `OpClassRef`: bare for the engine's own, qualified by
+schema for any other. A bare class is held and written verbatim, so every saved
+plan, state and declaration keeps its bytes; `pg_catalog.x` normalises to the
+bare `x` (the emitter already qualified a bare class with `pg_catalog`, so they
+were one class); another schema is parsed with the model's qualified-name
+reader (a quoted dot survives) and held. PostgreSQL's validation and pull
+refuse a class outside `pg_catalog` by name, pointing at #2447 PR F, which
+supplies the provider proof; F then reuses this type. SQL Server has no
+classes and refuses any, qualified or not, as before.
+
+Refused by name until the later parts: a key `collation:` (read by the loader
+and refused with the part that will hold it named; the DTO field is not in the
+published schema until it is declarable), `method: gist`/`brin` and `exclude:`
+(unknown to the loader and, in a pull, left out with a note listing the methods
+the table holds), a class outside `pg_catalog`, a non-default btree class
+(btree stays default-class-only, DEC-1169.1), and collation or class on a key
+the method does not hold. **No format changes**: no plan, state, ids or
+published-schema version moves, because nothing new is stored: the field
+`collation` does not exist on the model, and a class serialises to the string
+it always was. The key collation's model field, its read from
+`pg_index.indcollation` and its three format numbers arrive with the part that
+admits it.

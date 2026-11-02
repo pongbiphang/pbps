@@ -534,9 +534,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 table,
                 Rewrite::No,
                 Reads::Nothing,
-                match method {
-                    pbps_model::IndexMethod::Btree => Lock::ShareUpdateExclusive,
-                    pbps_model::IndexMethod::Gin => Lock::AccessExclusive,
+                match method.policy().lock {
+                    pbps_model::storage::IndexLock::ShareUpdateExclusive => {
+                        Lock::ShareUpdateExclusive
+                    }
+                    pbps_model::storage::IndexLock::AccessExclusive => Lock::AccessExclusive,
                 },
             )
         }

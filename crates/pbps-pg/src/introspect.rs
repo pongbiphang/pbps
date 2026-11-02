@@ -62,8 +62,8 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
-    IndexMethod, Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction,
-    ReplicaIdentity, RoutineArg, RoutineId, Table, TableName, UniqueConstraint,
+    IndexMethod, Module, ModuleId, ModuleKind, ObjectName, OpClassRef, PrimaryKey,
+    ReferentialAction, ReplicaIdentity, RoutineArg, RoutineId, Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
@@ -3567,34 +3567,37 @@ fn unknown_match(
 /// Returns whether the index reached the pull, which is what tells a foreign
 /// key whether the uniqueness it is enforced against is there.
 fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) -> bool {
-    let method = match raw.method.as_str() {
-        "btree" => IndexMethod::Btree,
-        "gin" => IndexMethod::Gin,
-        other => {
-            note(
-                pulled,
-                &parts.name,
-                format!(
-                    "index `{}` on `{}` uses the `{other}` method, and this model holds only \
-                     `btree` and `gin`. It is left out of the pull, so a plan cannot see it.",
-                    raw.name.shown(),
-                    parts.name.shown()
-                ),
-            );
-            return false;
-        }
-    };
-    // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
-    // `jsonb` columns (DEC-1169.1).
-    if method == IndexMethod::Gin && (raw.has_expressions || raw.columns.contains(&0)) {
+    let Some(method) = IndexMethod::from_am_name(&raw.method) else {
+        let held = IndexMethod::ALL
+            .iter()
+            .map(|m| format!("`{}`", m.as_str()))
+            .collect::<Vec<_>>()
+            .join(" and ");
         note(
             pulled,
             &parts.name,
             format!(
-                "index `{}` on `{}` is a GIN index over an expression, which this model does not \
+                "index `{}` on `{}` uses the `{}` method, and this model holds only {held}. \
+                 It is left out of the pull, so a plan cannot see it.",
+                raw.name.shown(),
+                parts.name.shown(),
+                raw.method,
+            ),
+        );
+        return false;
+    };
+    // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
+    // `jsonb` columns (DEC-1169.1). Each method's policy says which.
+    if !method.policy().expression_keys && (raw.has_expressions || raw.columns.contains(&0)) {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` is a {} index over an expression, which this model does not \
                  hold. It is left out of the pull, so a plan cannot see it.",
                 raw.name.shown(),
-                parts.name.shown()
+                parts.name.shown(),
+                method.as_str().to_ascii_uppercase(),
             ),
         );
         return false;
@@ -3624,9 +3627,9 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             &parts.name,
             format!(
                 "index `{}` on `{}` orders a column by a collation that is not the column's own \
-                 -- `COLLATE \"C\"` is the one that comes up -- and `IndexColumn` has no field \
-                 for it. Read back it is an ordinary index, which compares different values \
-                 equal, so it is left out.",
+                 -- `COLLATE \"C\"` is the one that comes up -- and this model holds no key \
+                 collation yet (a later part of #2448 adds it). Read back it is an ordinary \
+                 index, which compares different values equal, so it is left out.",
                 raw.name.shown(),
                 parts.name.shown()
             ),
@@ -3764,7 +3767,9 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
 /// different queries, and read back as an ordinary index it would compare
 /// clean against one it is not. GIN holds `jsonb` keys under `jsonb_ops`, the
 /// default and so no class at all, or `jsonb_path_ops`, and only the engine's
-/// own: a class of that name in another schema is another class.
+/// own: a class of that name in another schema is another class. Which of
+/// these a method holds is its row in the policy table, read through
+/// [`crate::index_policy`] as a declaration is (DEC-2448.1).
 fn key_class(
     raw: &RawIndex,
     parts: &Parts,
@@ -3773,7 +3778,8 @@ fn key_class(
     position: usize,
     column: &str,
     pulled: &mut Pulled,
-) -> Option<Option<String>> {
+) -> Option<Option<OpClassRef>> {
+    use crate::index_policy::{ClassProblem, class_problem, holds_key_type, offered};
     // An empty entry is the default class; a missing one is a key the query
     // did not describe, which is not the same thing.
     let Some(class) = raw.key_classes.get(position) else {
@@ -3801,9 +3807,42 @@ fn key_class(
             ),
         );
     };
-    match method {
-        IndexMethod::Btree if class.is_empty() => Some(None),
-        IndexMethod::Btree => {
+    let policy = method.policy();
+    let in_table = table.columns.get(column);
+    // A key type the method does not hold is named before its class: the class
+    // of a key the model cannot read back is no part of the answer.
+    if policy.key_type.is_some() && !in_table.is_some_and(|c| holds_key_type(policy, c)) {
+        left_out(
+            pulled,
+            format!(
+                "is a {0} index over `{column}`, and this model holds {0} only over `{1}`",
+                method.as_str().to_ascii_uppercase(),
+                policy.key_type.unwrap_or_default(),
+            ),
+        );
+        return None;
+    }
+    if class.is_empty() {
+        return Some(None);
+    }
+    // The catalog's `schema.name` is not split: a name may hold a dot. Only
+    // `pg_catalog.` is the engine's own, and any other schema is refused
+    // whole, as a class a provider has not vouched for (#2447 PR F).
+    let Some(name) = class.strip_prefix("pg_catalog.") else {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class `{class}`, which a schema owns; this \
+                 model holds only the engine's own classes until a pinned provider vouches for \
+                 one (#2447 PR F)"
+            ),
+        );
+        return None;
+    };
+    let held = OpClassRef::bare(name);
+    match class_problem(policy, &held) {
+        None => Some(Some(held)),
+        Some(ClassProblem::DefaultOnly) => {
             left_out(
                 pulled,
                 format!(
@@ -3813,37 +3852,18 @@ fn key_class(
             );
             None
         }
-        IndexMethod::Gin => {
-            let jsonb = table
-                .columns
-                .get(column)
-                // Not `jsonb[]`, whose base is the element's (#1525 review).
-                .is_some_and(|c| {
-                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb" && !t.is_array())
-                });
-            if !jsonb {
-                left_out(
-                    pulled,
-                    format!(
-                        "is a GIN index over `{column}`, and this model holds GIN only over `jsonb`"
-                    ),
-                );
-                return None;
-            }
-            match class.as_str() {
-                "" => Some(None),
-                "pg_catalog.jsonb_path_ops" => Some(Some("jsonb_path_ops".to_owned())),
-                other => {
-                    left_out(
-                        pulled,
-                        format!(
-                            "indexes `{column}` with operator class `{other}`, and this model holds \
-                             GIN over `jsonb` only with `jsonb_ops` or `pg_catalog.jsonb_path_ops`"
-                        ),
-                    );
-                    None
-                }
-            }
+        Some(_) => {
+            left_out(
+                pulled,
+                format!(
+                    "indexes `{column}` with operator class `{class}`, and this model holds {} \
+                     over `{}` only with {}",
+                    method.as_str().to_ascii_uppercase(),
+                    policy.key_type.unwrap_or("its key type"),
+                    offered(policy)
+                ),
+            );
+            None
         }
     }
 }
@@ -6745,7 +6765,11 @@ mod tests {
         );
         assert_eq!(doc_1.indexes["doc_1_d"].columns[0].opclass, None);
         assert_eq!(
-            doc_1.indexes["doc_1_p"].columns[0].opclass.as_deref(),
+            doc_1.indexes["doc_1_p"].columns[0]
+                .opclass
+                .as_ref()
+                .map(|c| c.raw().to_string())
+                .as_deref(),
             Some("jsonb_path_ops")
         );
         assert!(doc_1.columns.is_empty(), "its columns stay its parent's");
@@ -7736,7 +7760,10 @@ mod tests {
         let ix = &only(&pulled).indexes["t_ix"];
         assert_eq!(ix.method, IndexMethod::Gin);
         assert_eq!(ix.columns[0].opclass, None);
-        assert_eq!(ix.columns[1].opclass.as_deref(), Some("jsonb_path_ops"));
+        assert_eq!(
+            ix.columns[1].opclass,
+            Some(OpClassRef::bare("jsonb_path_ops"))
+        );
 
         for (classes, expected) in [
             (&["pg_catalog.jsonb_hash_ops"][..], "jsonb_hash_ops"),
@@ -7765,6 +7792,118 @@ mod tests {
                 pulled.warnings
             );
         }
+    }
+
+    /// The collation note says the model will hold it in a later part of
+    /// #2448, so a reader knows the omission is a stage and not a decision.
+    #[test]
+    fn the_left_out_collation_names_the_part_that_will_hold_it() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.nondefault_collation = true;
+        let pulled = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "text")],
+            indexes: vec![ix],
+            ..RawCatalog::default()
+        });
+        assert!(
+            pulled.warnings[0].contains("a later part of #2448"),
+            "{:?}",
+            pulled.warnings
+        );
+    }
+
+    /// A key the method is not held over is named for what it is, from the
+    /// policy: a GIN index over an expression says so, and a B-tree over one is
+    /// held (DEC-1169.2, DEC-2448.1).
+    #[test]
+    fn a_gin_index_over_an_expression_is_named_for_the_expression() {
+        let build = |method: &str| {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = method.to_owned();
+            ix.has_expressions = true;
+            ix.columns = vec![0];
+            ix.key_texts = vec!["(a)::jsonb".to_owned()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "text")],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        let gin = build("gin");
+        assert!(only(&gin).indexes.is_empty());
+        assert!(
+            gin.warnings[0].contains("is a GIN index over an expression"),
+            "{:?}",
+            gin.warnings
+        );
+        let btree = build("btree");
+        assert_eq!(only(&btree).indexes.len(), 1, "{:?}", btree.warnings);
+    }
+
+    /// Every access method the model does not hold is named, with the list of
+    /// the ones it does read from the policy table (DEC-2448.1).
+    #[test]
+    fn an_access_method_outside_the_policy_table_is_named_and_left_out() {
+        for method in ["gist", "brin", "spgist", "hash", "bloom"] {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = method.to_owned();
+            let pulled = assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "text")],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            });
+            assert!(only(&pulled).indexes.is_empty(), "{method}");
+            let note = &pulled.warnings[0];
+            assert!(
+                note.contains(&format!("`{method}` method"))
+                    && note.contains("only `btree` and `gin`"),
+                "{method}: {note}"
+            );
+        }
+    }
+
+    /// A class a schema owns is refused whole, on a B-tree and on GIN, and the
+    /// note names where it will be admitted (#2447 PR F); the engine's own
+    /// non-default class keeps its own wording.
+    #[test]
+    fn a_class_a_schema_owns_is_left_out_and_names_its_part() {
+        for (method, ty, class) in [
+            ("btree", "text", "ext.my_ops"),
+            ("gin", "jsonb", "ext.my_ops"),
+        ] {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = method.to_owned();
+            ix.key_classes = vec![class.to_owned()];
+            let pulled = assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", ty)],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            });
+            assert!(only(&pulled).indexes.is_empty(), "{method}");
+            let note = &pulled.warnings[0];
+            assert!(
+                note.contains("ext.my_ops") && note.contains("#2447 PR F"),
+                "{method}: {note}"
+            );
+        }
+        // Negative: the engine's own class is not "a schema's".
+        let mut ix = index(50, 1, "t_ix");
+        ix.key_classes = vec!["pg_catalog.text_pattern_ops".to_owned()];
+        let pulled = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "text")],
+            indexes: vec![ix],
+            ..RawCatalog::default()
+        });
+        assert!(
+            !pulled.warnings[0].contains("#2447"),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     /// A key constraint's `INCLUDE` payload lives on its backing index and
