@@ -4539,3 +4539,32 @@ adoptions. Missing managed packages on scratch/reconstruction refuse by name:
 provision the exact version/schema externally. Logical scope cuts must project
 both definitions and identities together. PR A installs no package and infers
 no default version; lifecycle and provider-code support remain later slices.
+
+<a id="dec-2447-5"></a>
+
+**DEC-2447.5. Catalog objects are one pattern macro, and the classifier is built from it.**
+
+Roles and types are listed together in about forty exhaustive matches that treat
+them alike ("no effect here"). A third database-global kind (a PostgreSQL
+extension, #2447 PR B2) would have meant a new line in each. They now use
+`catalog_change!()`, which expands to exactly the six Create/Drop/Rename
+patterns they used to list, and `Change::catalog_object() -> Option<CatalogObject>`
+is the total classifier built from the same macro and naming every other
+variant. The refactor changes no output: the macro expands to the same
+patterns, and every converted match is still exhaustive, so a pattern the
+macro missed would not compile.
+
+A method alone cannot do this. A guard such as
+`c if c.catalog_object().is_some() => ..` does not count towards
+exhaustiveness, so the match would need a `_ =>` arm, and a wildcard on `Change`
+is what lets a new variant pass every consumer unseen (ORDERING, "Keeping this
+current"). The macro keeps the matches exhaustive with no wildcard.
+
+The cost is stated at the macro: a kind added to it joins every arm that uses
+it, with no compile error, so adding a kind means reading each
+`catalog_change!()` site and taking the kind out where it differs. Sites that
+are not exhaustive matches (`matches!`, `if let`) and arms that differ per kind
+or list one kind or one action were left as they were, so a new kind is
+reported by the compiler wherever it has to be decided. Enum value and domain
+edits, grants and revokes act on a catalog object and are not one.
+`resolver/scope.rs` was left unconverted while #2614 changes it.
