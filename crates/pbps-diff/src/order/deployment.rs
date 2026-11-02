@@ -3166,7 +3166,9 @@ fn names_column(
 #[allow(clippy::wildcard_enum_match_arm)]
 fn touches(change: &Change, table: &TableName) -> bool {
     // A shared type has its own identity. Treating its table-less change as
-    // touching every table reverses a type-to-table slot handover.
+    // touching every table reverses a type-to-table slot handover. A package
+    // is the same: its install script names no table of the plan, and its
+    // place is the class and edge of its own (DEC-2447.6).
     if matches!(
         change,
         Change::AddEnumValue { .. }
@@ -3180,6 +3182,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
+            | Change::CreateExtension { .. }
     ) {
         return false;
     }
@@ -3629,5 +3632,33 @@ mod policy_message_tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::*;
+
+    /// A table-less change is held to every table, which would put a package's
+    /// create behind or among table changes it has nothing to do with (as a
+    /// type's would reverse a slot handover). A package touches none.
+    #[test]
+    fn a_package_touches_no_table_though_another_table_less_change_touches_every_one() {
+        let table = TableName::new("app", "t");
+        let create = Change::CreateExtension {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition: pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+            requires: Default::default(),
+        };
+        assert!(!touches(&create, &table));
+        let role = Change::CreateRole {
+            uid: "r_aaaaaa".parse().unwrap(),
+            name: "reader".into(),
+        };
+        assert!(touches(&role, &table));
     }
 }

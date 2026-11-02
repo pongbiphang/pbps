@@ -707,6 +707,8 @@
         "extensions2447_create::what_the_target_cannot_install_is_named_before_a_plan_exists",
         "extensions2447_create::an_install_that_differs_from_its_sealed_manifest_is_rolled_back_and_not_recorded",
         "extensions2447_create::a_member_name_an_unmanaged_object_holds_fails_the_install_and_rolls_back",
+        "extensions2447_create::an_apply_asks_the_target_again_and_installs_nothing_when_it_changed",
+        "extensions2447_create::a_staged_apply_vets_the_install_in_its_own_transaction",
         "census2444::census_names_extensions_pgcrypto",
         "census2444::census_names_extensions_uuid",
         "census2444::census_names_unsupported_comment",

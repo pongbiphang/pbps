@@ -341,3 +341,18 @@ fn every_create_has_exactly_its_own_pin_and_every_pin_its_create() {
         );
     }
 }
+
+/// The check is part of admission, not only a function that exists: an edited
+/// plan whose create lost its pin is refused by `admit`, before a statement,
+/// and the plan as written gets past it.
+#[test]
+fn admission_refuses_a_create_whose_pin_was_removed() {
+    let mut plan = package_plan();
+    plan.extension_pins.pop();
+    let checksum = plan.wire_fingerprint();
+    let error = refusal(plan, &checksum);
+    assert!(error.contains("extension evidence disagrees"), "{error}");
+    let whole = package_plan();
+    let checksum = whole.wire_fingerprint();
+    assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
+}

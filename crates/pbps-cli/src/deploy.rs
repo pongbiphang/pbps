@@ -25433,6 +25433,75 @@ mod data_work_failure_tests {
 mod extension_guard_tests {
     use super::*;
 
+    /// What is sealed is what the rehearsal read, and a package whose members
+    /// the declarations also manage as their own is refused before it is
+    /// sealed, never sealed with a manifest the engine will not honour
+    /// (DEC-2447.6, DEC-2447.7). A create the rehearsal read nothing for is
+    /// refused too, not sealed empty.
+    #[test]
+    fn a_manifest_is_sealed_only_for_a_create_the_rehearsal_read_and_nobody_else_owns() {
+        let definition = pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.5".into(),
+        };
+        let uid: pbps_model::Uid = "e_aaaaaa".parse().unwrap();
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::CreateExtension {
+                    uid: uid.clone(),
+                    name: "cube".into(),
+                    definition: definition.clone(),
+                    requires: Default::default(),
+                },
+            )],
+        };
+        let ids = IdsFile {
+            extensions: [(uid, "cube".into())].into(),
+            ..Default::default()
+        };
+        let read = |member: &str| -> crate::rehearsal::connected::Manifests {
+            [(
+                "cube".into(),
+                pbps_model::ExtensionProvider {
+                    definition: definition.clone(),
+                    requires: Default::default(),
+                    members: [pbps_model::ProviderMember {
+                        class: "table".into(),
+                        names: vec!["ext".into(), member.into()],
+                        args: Vec::new(),
+                    }]
+                    .into(),
+                },
+            )]
+            .into()
+        };
+        let mut declared = Schema::default();
+        declared
+            .tables
+            .insert(TableName::new("app", "ordinary"), Default::default());
+        let pins = extension_pins(&changes, read("cube_t"), &declared, &ids).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].manifest.members.len(), 1);
+        // The declarations manage a table the package would also own.
+        declared
+            .tables
+            .insert(TableName::new("ext", "cube_t"), Default::default());
+        let error = extension_pins(&changes, read("cube_t"), &declared, &ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`cube`")
+                && error.contains("table ext.cube_t")
+                && error.contains("two owners"),
+            "{error}"
+        );
+        // Nothing read for a create is a refusal and not an empty manifest.
+        let error = extension_pins(&changes, Default::default(), &Schema::default(), &ids)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read no members"), "{error}");
+    }
+
     /// A plan that installs a package lets exactly that package appear, in
     /// exactly the pinned definition, and fails the close if it did not
     /// (DEC-2447.6). Without this a create that never took effect, or took

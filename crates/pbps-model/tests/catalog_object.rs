@@ -129,6 +129,19 @@ fn each_catalog_variant_maps_to_its_own_kind() {
     }
 }
 
+/// A package is named by its own subject, which plan groupings, policies and
+/// refusals key on: not blank, and not a role's or a table's.
+#[test]
+fn a_create_names_its_package_as_the_subject() {
+    for (change, kind) in catalog() {
+        if kind == CatalogObject::Extension {
+            assert_eq!(change.subject(), "extension citext");
+        } else {
+            assert!(!change.subject().starts_with("extension "), "{change:?}");
+        }
+    }
+}
+
 #[test]
 fn a_change_that_is_not_a_catalog_object_maps_to_none() {
     for change in others() {

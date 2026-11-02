@@ -172,8 +172,13 @@ fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_noth
         minted(&f);
         let before = ledger_entries(&f);
         // Turned off, and with no scratch entry selected.
-        for (label, extra, options) in [
-            ("off", vec!["--no-rehearse"], None),
+        for (label, extra, options, reason) in [
+            (
+                "off",
+                vec!["--no-rehearse"],
+                None,
+                "the rehearsal is turned off",
+            ),
             (
                 "unselected",
                 vec![],
@@ -181,6 +186,7 @@ fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_noth
                     unselected: true,
                     ..Default::default()
                 }),
+                "no scratch is available",
             ),
         ] {
             let other;
@@ -196,8 +202,10 @@ fn a_create_without_a_rehearsal_or_a_database_is_refused_by_name_and_writes_noth
             let out = used.plan(&extra);
             assert_ne!(code(&out), 0, "{label}: {}", said(&out));
             let message = said(&out);
+            // The refusal before the plan is built, not the later one that finds
+            // no manifest to pin.
             assert!(
-                message.contains("`zzz_base`") && message.contains("rehearsal"),
+                message.contains("`zzz_base`") && message.contains(reason),
                 "{label}: {message}"
             );
             assert!(
@@ -411,5 +419,121 @@ fn a_member_name_an_unmanaged_object_holds_fails_the_install_and_rolls_back() {
             "7",
             "the other object stands, untouched"
         );
+    });
+}
+
+/// The plan is not the permission: what the target allowed when it was made is
+/// asked again under the lock, before the first statement, with the planner's
+/// own sentences. A package that appeared since is refused and nothing is
+/// written.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_apply_asks_the_target_again_and_installs_nothing_when_it_changed() {
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-again-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        succeeds(f.plan(&[]));
+        let before = ledger_entries(&f);
+        // Another session installs the package between plan and apply.
+        on_server(f.target(), "CREATE EXTENSION zzz_base SCHEMA ext");
+        let out = f.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        let message = said(&out);
+        assert!(
+            message.contains("nothing was applied")
+                && message.contains("`zzz_base`")
+                && message.contains("already installed"),
+            "{message}"
+        );
+        assert_eq!(held(&f, "'zzz_base'"), "zzz_base@ext@1.0");
+        // The refused attempt is a failure entry that records no package.
+        let latest = super::latest_snapshot(f.target());
+        assert_eq!(latest.kind, pbps_model::StateKind::Failed);
+        assert!(latest.schema.extensions.is_empty() && latest.ids.extensions.is_empty());
+        let _ = before;
+        // The schema going away is refused the same way.
+        let g = fixture(
+            server,
+            &format!("create2447-gone-{slug}"),
+            &Options::default(),
+        );
+        declare(&g, "zzz_base", "1.0");
+        minted(&g);
+        succeeds(g.plan(&[]));
+        on_server(g.target(), "DROP SCHEMA ext");
+        let out = g.apply("extension-code");
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("schema `ext`") && said(&out).contains("does not have"),
+            "{}",
+            said(&out)
+        );
+    });
+}
+
+/// A staged apply runs the statement in a transaction of its own and vets it
+/// there, so a package that differs from its manifest is taken back by that
+/// statement's own rollback, and the plan as written installs and is
+/// checkpointed with the package in its identities.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_apply_vets_the_install_in_its_own_transaction() {
+    let staged = |f: &Fixture| {
+        let checksum = plan_checksum(&f.artifact());
+        std::process::Command::new(super::BIN)
+            .arg("--project")
+            .arg(&f.d.dir)
+            .args(["apply", "--env", "prod", "--plan"])
+            .arg(f.artifact())
+            .args([
+                "--checksum",
+                &checksum,
+                "--allow",
+                "extension-code",
+                "--staged",
+            ])
+            .env("PBPS_REH_TARGET", f.target())
+            .output()
+            .unwrap()
+    };
+    servers(|server, slug| {
+        let f = fixture(
+            server,
+            &format!("create2447-staged-{slug}"),
+            &Options::default(),
+        );
+        declare(&f, "zzz_base", "1.0");
+        minted(&f);
+        let planned = f.plan(&["--staged"]);
+        assert_eq!(code(&planned), 0, "{}", said(&planned));
+        let original = std::fs::read_to_string(f.artifact()).unwrap();
+        // Another member than the script makes: the statement's own
+        // transaction takes the install back, and nothing is recorded.
+        let mut edited: serde_json::Value = serde_json::from_str(&original).unwrap();
+        edited["extension_pins"][0]["manifest"]["members"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"class": "function", "names": ["ext", "zzz_base_two"], "args": []}));
+        std::fs::write(f.artifact(), serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+        let out = staged(&f);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("does not match what was approved"),
+            "{}",
+            said(&out)
+        );
+        assert_eq!(held(&f, "'zzz_base'"), "");
+        // The plan as written installs, and the next plan has nothing to do.
+        std::fs::write(f.artifact(), &original).unwrap();
+        let out = staged(&f);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        assert_eq!(held(&f, "'zzz_base'"), "zzz_base@ext@1.0");
+        let next = json_output(f.plan(&["--no-rehearse", "--format", "json"]));
+        assert_eq!(next["data"]["changes"], 0, "{next}");
     });
 }
