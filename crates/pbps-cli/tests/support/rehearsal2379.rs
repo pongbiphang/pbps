@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(90);
 
+#[path = "docker_events2616.rs"]
+mod docker_events;
+use docker_events::DockerEvents;
+
 /// The environment variables the fixture's `pbps.yml` reads.
 const TARGET: &str = "PBPS_REH_TARGET";
 const SCRATCH: &str = "PBPS_REH_SCRATCH";
@@ -580,34 +584,6 @@ impl Fixture {
     }
 }
 
-/// Scratch containers the process `pid` created at or after `since`.
-fn created_by(pid: u32, since: u64) -> Vec<String> {
-    let now = unix_now() + 1;
-    let out = Command::new("docker")
-        .args([
-            "events",
-            "--since",
-            &since.to_string(),
-            "--until",
-            &now.to_string(),
-            "--filter",
-            "type=container",
-            "--filter",
-            "event=create",
-            "--format",
-            "{{.Actor.Attributes.name}} {{index .Actor.Attributes \"pbps.resolver.process\"}}",
-        ])
-        .output()
-        .expect("docker");
-    let label = format!("{pid}-");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(name, process)| name.starts_with("pbps-scratch-") && process.starts_with(&label))
-        .map(|(name, _)| name.to_owned())
-        .collect()
-}
-
 fn remaining_containers() -> Vec<String> {
     let out = Command::new("docker")
         .args([
@@ -620,17 +596,17 @@ fn remaining_containers() -> Vec<String> {
         ])
         .output()
         .expect("docker");
-    String::from_utf8_lossy(&out.stdout)
+    assert!(
+        out.status.success(),
+        "docker ps: {}: {}",
+        out.status,
+        stderr(&out)
+    );
+    String::from_utf8(out.stdout)
+        .expect("docker ps stdout must be readable")
         .lines()
         .map(str::to_owned)
         .collect()
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 fn said(output: &Output) -> String {
@@ -660,7 +636,7 @@ pub fn converges(server: &str, kind: Kind) {
         &Options::default(),
     );
     f.revise_row();
-    let since = unix_now();
+    let evidence = (kind == Kind::Docker).then(|| DockerEvents::start(&image()).unwrap());
     let (out, pid) = f.plan_as_process(&[]);
     assert_eq!(code(&out), 0, "{kind:?}: {}", said(&out));
     let text = stdout(&out);
@@ -734,7 +710,7 @@ pub fn converges(server: &str, kind: Kind) {
         said(&applied)
     );
     if kind == Kind::Docker {
-        let made = created_by(pid, since);
+        let made = evidence.unwrap().created_by(pid).unwrap();
         assert_eq!(made.len(), 1, "{made:?}");
         assert!(
             remaining_containers()
@@ -755,7 +731,7 @@ pub fn shares_one_scratch(server: &str, kind: Kind) {
         &Options::default(),
     );
     f.add_column("true");
-    let since = unix_now();
+    let evidence = (kind == Kind::Docker).then(|| DockerEvents::start(&image()).unwrap());
     let (out, pid) = f.plan_as_process(&[]);
     assert_eq!(code(&out), 0, "{kind:?}: {}", said(&out));
     let text = stdout(&out);
@@ -772,7 +748,7 @@ pub fn shares_one_scratch(server: &str, kind: Kind) {
     assert_eq!(plan["origin"], "resolved_database", "{plan}");
     assert!(plan.get("rehearsal").is_some(), "{plan}");
     if kind == Kind::Docker {
-        let made = created_by(pid, since);
+        let made = evidence.unwrap().created_by(pid).unwrap();
         assert_eq!(made.len(), 1, "one container for both uses: {made:?}");
         assert!(
             remaining_containers()
@@ -781,8 +757,17 @@ pub fn shares_one_scratch(server: &str, kind: Kind) {
         );
         // Negative: the process is the right one to ask about; with the
         // rehearsal off it makes the one container the resolver needs.
-        let (_, alone) = f.plan_as_process(&["--no-rehearse"]);
-        assert_eq!(created_by(alone, since).len(), 1);
+        let evidence = DockerEvents::start(&image()).unwrap();
+        let (out, alone) = f.plan_as_process(&["--no-rehearse"]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        assert_eq!(f.record(), serde_json::json!("off"));
+        let made = evidence.created_by(alone).unwrap();
+        assert_eq!(made.len(), 1, "resolver without rehearsal: {made:?}");
+        assert!(
+            remaining_containers()
+                .iter()
+                .all(|name| !made.contains(name))
+        );
     }
 }
 
