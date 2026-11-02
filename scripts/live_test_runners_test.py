@@ -313,6 +313,12 @@ else:
 
 class ShardedExecution(unittest.TestCase):
     def test_an_exited_leaders_survivor_is_drained_before_ownership_is_retired(self):
+        self.assert_survivor_is_drained(0)
+
+    def test_delayed_pid_publication_still_drains_the_exited_leaders_survivor(self):
+        self.assert_survivor_is_drained(0.25)
+
+    def assert_survivor_is_drained(self, write_delay):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             child = root / "child"
@@ -326,13 +332,21 @@ if os.fork() == 0:
         (root / "cleaned").touch()
         os._exit(0)
     signal.signal(signal.SIGTERM, cleanup)
-    (root / "child").write_text(str(os.getpid()))
+    # Existence releases the leader, so publish only the closed, complete PID.
+    pending = root / "child.pending"
+    with pending.open("w") as output:
+        time.sleep(float(sys.argv[2]))
+        output.write(str(os.getpid()))
+    pending.replace(root / "child")
     while True:
         time.sleep(0.01)
+deadline = time.monotonic() + 5
 while not (root / "child").exists():
+    if time.monotonic() >= deadline:
+        sys.exit("child did not publish its PID")
     time.sleep(0.001)
 os._exit(0)
-""", str(root)]
+""", str(root), str(write_delay)]
             fixture = SHARDS.FixtureRun([])
             try:
                 with mock.patch.object(SHARDS, "container_names", return_value=set()), \
@@ -341,8 +355,10 @@ os._exit(0)
                         self.assertEqual(fixture.run(command), 0)
                         self.assertTrue(cleaned.exists(), "the first-pass writer must finish before reuse")
                         self.assertEqual(fixture.processes, [])
+                    pid = child.read_text()
+                    self.assertRegex(pid, r"^[1-9][0-9]*\Z", "the published PID must be complete")
                     with self.assertRaises(ProcessLookupError):
-                        os.kill(int(child.read_text()), 0)
+                        os.kill(int(pid), 0)
             finally:
                 # Test failure must not leave the regression's own sleeper.
                 if child.exists():
