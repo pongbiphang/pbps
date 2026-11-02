@@ -1199,7 +1199,11 @@ in its own transaction, and holds what the engine now has to the sealed
 manifest before that transaction commits: any difference, unreadable read or
 absent package rolls the install back and records nothing. A prerequisite the
 plan also creates is created first, by an ordering edge and not by a class
-number. A package whose members the declarations also manage as their own is
+number. A package create is not described by the resolver's binding assessment
+(a package can add an overload that a fresh binding would pick, which stored
+views, defaults and checks do not follow); a plan that also needs the resolver is
+refused by name and is planned in two steps, the package first (DEC-2447.6). A
+package whose members the declarations also manage as their own is
 refused after the rehearsal, and a collision with an unmanaged object of the
 target is the engine's own refusal inside the rolled-back transaction
 (DEC-2447.7). DROP EXTENSION, ALTER EXTENSION UPDATE and ALTER EXTENSION SET

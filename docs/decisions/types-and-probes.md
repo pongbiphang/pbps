@@ -4661,6 +4661,29 @@ create that did not take effect fails it.
 The published JSON schemas do not change: no risk class or change kind is an
 enumeration in them, so the schema set stays where it was.
 
+A create is answered `false` by the resolver assessment (`moves_bindings`), and
+that is a stated limit, not a proof. Measured on PostgreSQL 16 and 18: a package
+may add an operator or function that matches an argument type better than what
+the path found before (intarray's `@>` on `int[]` beats the built-in `anyarray`
+one). A stored view, a column default, a check and a `BEGIN ATOMIC` routine keep
+the binding they were made with; a statement run later in the plan, a
+string-bodied SQL routine and a plpgsql routine bind the package's operator at
+call time; the same package in a schema off the search path changes nothing.
+citext adds nothing that rebinds (its casts into citext are assignment-only, and
+an unknown literal prefers `text`). DEC-1515.1 would make the answer `true`, but
+`true` sends every kept surface to a resolver that cannot describe a package the
+target lacks, so no package could be created in a project with a view. The
+rehearsal and the read-back are faithful to what the engine did (the scratch has
+the same package), so nothing is refused or recorded wrongly; only the
+assessment's "unaffected" count does not cover a create, and answering it soundly
+needs the resolver to hold the package, a later slice. A plan that creates a
+package and also needs the resolver (a new table beside a kept view, say) is
+refused by name before the resolver runs, with the two-plan remedy: plan the
+package alone and apply it; once it is installed and managed, provision it on the
+scratch through its externals file (DEC-2447.2) and plan the rest. It used to
+fail late with an internal error. A plan with a create never carries resolver
+evidence, so no saved plan, staged or transactional, reaches that sealing.
+
 Order is a factual edge, not a class number. A create sorts in class 7 with the
 type creates and waits for each package of the same plan its control file
 requires (`Is(Extension, Final)`); a prerequisite already installed adds no
