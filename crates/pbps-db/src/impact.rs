@@ -170,19 +170,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::PublicExecution { .. } => None,
+             | pbps_model::catalog_change!() | Change::Grant { .. } | Change::Revoke { .. } | Change::DetachPartition { .. } | Change::AttachPartition { .. } | Change::SetPartitionDefault { .. } | Change::SetPartitionNotNull { .. } | Change::PublicExecution { .. } => None,
         })
         .collect()
 }

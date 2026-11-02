@@ -3972,26 +3972,7 @@ name = name.shown(),
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
-        | Change::CreateType { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
-        | Change::SetPartitionDefault { .. }
-        | Change::SetPartitionNotNull { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-        | Change::DetachPartition { .. }
-        | Change::AttachPartition { .. }
-        | Change::PublicExecution { .. } => Ok(Vec::new()),
+         | pbps_model::catalog_change!() | Change::Grant { .. } | Change::Revoke { .. } | Change::SetIndexStorageParameters { .. } | Change::SetTablePersistence { .. } | Change::SetPartitionDefault { .. } | Change::SetPartitionNotNull { .. } | Change::SetStorageParameters { .. } | Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } | Change::SetReplicaIdentity { .. } | Change::DetachPartition { .. } | Change::AttachPartition { .. } | Change::PublicExecution { .. } => Ok(Vec::new()),
     }
 }
 
@@ -4446,12 +4427,7 @@ pub(crate) fn probes(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::DetachPartition { .. }
