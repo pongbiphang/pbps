@@ -1,4 +1,45 @@
 {
   "version": 1,
-  "flakes": []
+  "flakes": [
+    {
+      "test": "dependencies_tests::execution::expansion_replays_own_parts_external_bindings_and_member_lifetimes",
+      "cargo": [
+        "test",
+        "-p",
+        "pbps-pg",
+        "--test",
+        "live",
+        "--"
+      ],
+      "issue": 2608,
+      "expires": "2026-12-01"
+    },
+    {
+      "test": "resolver::server::scratch::live_tests::docker2410_tests::recovery_confirms_another_remover_started_between_listing_and_liveness",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2612,
+      "expires": "2026-12-01"
+    },
+    {
+      "test": "a_connected_plan_is_rehearsed_and_sealed_on_every_kind_of_scratch",
+      "cargo": [
+        "test",
+        "-p",
+        "pbps-cli",
+        "--test",
+        "flow_pg",
+        "--"
+      ],
+      "issue": 2616,
+      "expires": "2026-12-01"
+    }
+  ]
 }
