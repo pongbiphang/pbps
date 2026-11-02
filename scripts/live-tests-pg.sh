@@ -15,6 +15,8 @@ if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
     exec python3 scripts/live-shards.py shard pg "$@"
 fi
 
+source scripts/live-test-status.sh
+
 NAME=${PBPS_TEST_PG_NAME:-pbps-test-pg}
 # Overridable for the same reason as the SQL Server one: a developer machine
 # often already has PostgreSQL on 5432, and "the tests will not start" is a bad
@@ -153,3 +155,5 @@ cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 r
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
 cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 "$@"
+
+exit "$live_test_status"

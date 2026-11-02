@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ("live-shards.py", "live-transport.py", "known_flakes.py", "ignored_test_inventory.py",
-           "ci_release_scope.py")
+           "ci_release_scope.py", "live-test-status.sh")
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 CARGO = ["test", "-p", "demo", "--lib", "--"]
 A_NAMES = [f"a{i:02}" for i in range(12)]
@@ -37,6 +38,8 @@ names = json.loads(os.environ["FAKE_A"]) if "--lib" in args else json.loads(os.e
 if "--test" in args and args[args.index("--test") + 1] == "tls":
     names = [args[args.index("--exact") + 1]]
 if "--list" in args:
+    if "--lib" in args and os.environ.get("FAKE_SIGNAL_LIST"):
+        os.kill(os.getpid(), int(os.environ["FAKE_SIGNAL_LIST"]))
     if args[args.index("-p") + 1] != "demo":
         names = json.loads(os.environ.get("FAKE_EXPRESS", "{{}}"))[args[args.index("-p") + 1]]
     print("\\n".join(n + ": test" for n in names))
@@ -75,6 +78,8 @@ for name in ran:
                     time.sleep(0.001)
                 assert "test a05 ... FAILED" in log.read_text()
             os.kill(os.getppid(), signal.SIGKILL)
+        if os.environ.get("FAKE_SIGNAL_CHILD"):
+            os.kill(os.getpid(), int(os.environ["FAKE_SIGNAL_CHILD"]))
         os._exit(137)
 bad = sum(n in fail for n in ran)
 print(f"\\ntest result: {{'FAILED' if bad else 'ok'}}. {{len(ran) - bad}} passed; {{bad}} failed; "
@@ -214,6 +219,82 @@ class Harness(unittest.TestCase):
         subprocess.run([*GIT, "commit", "-q", "-am", "reset"], cwd=self.repo, capture_output=True)
         subprocess.run([*GIT, "clean", "-fdq", "-e", "target"], cwd=self.repo, capture_output=True)
         subprocess.run([*GIT, "checkout", "-q", "--", "."], cwd=self.repo, capture_output=True)
+
+
+class ContinuedTestFailures(Harness):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Keep the existing loss/resume fixtures unchanged. These two-command
+        # runners use the same sourced wrapper as both canonical live runners.
+        for filename in ("live-tests.sh", "live-tests-pg.sh"):
+            path = cls.repo / "scripts" / filename
+            text = path.read_text().replace("fi\n", "fi\nsource scripts/live-test-status.sh\n", 1)
+            path.write_text(text + '\nexit "$live_test_status"\n')
+        git(cls.repo, "commit", "-q", "-am", "continue ordinary cargo failures")
+
+    def test_killed_listing_stops_the_shard_before_its_later_invocation(self):
+        for suite in ("pg", "mssql"):
+            for signum in (signal.SIGINT, signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(suite=suite, signum=signum):
+                    _, output = self.drive(suite=suite, shards=1, check=1,
+                                           env={"FAKE_SIGNAL_LIST": str(signum)})
+                    events = self.trace.read_text().splitlines() if self.trace.exists() else []
+                    self.assertEqual(events, [], "no later cargo may start after a killed listing")
+                    summary = self.summary(output)
+                    # No listing means no receipts; the existing empty-shard
+                    # proof fails even though the shell stopped on the signal.
+                    self.assertEqual(list((output / suite).glob("*/*.json")), [])
+                    self.assertEqual(summary[suite]["union"], "failed")
+                    self.assertNotIn("automatic_rerun", summary["run"])
+
+    def test_killed_cargo_stops_the_shard_before_its_later_invocation(self):
+        for suite in ("pg", "mssql"):
+            for signum in (signal.SIGINT, signal.SIGKILL, signal.SIGTERM):
+                with self.subTest(suite=suite, signum=signum):
+                    result, output = self.drive(
+                        suite=suite, shards=1, die="a05", check=0,
+                        env={"FAKE_SIGNAL_CHILD": str(signum),
+                             "FAKE_LOSS_STATE": str(self.runs / f"signal-{suite}-{signum}")})
+                    original = self.summary(output / "original")
+                    events = [json.loads(line) for line in self.trace.read_text().splitlines()]
+                    starts = [e["names"] for e in events if e["event"] == "start"
+                              and e["run"] == original["run"]["run_id"]]
+                    self.assertEqual(starts, [A_NAMES])
+                    self.assertEqual(original[suite]["exits"], [128 + signum])
+                    # The invalid receipt remains loss evidence, not a pass.
+                    receipts = list((output / "original" / suite).glob("*/*.json"))
+                    self.assertEqual(len(receipts), 1)
+                    receipt = json.loads(receipts[0].read_text())
+                    self.assertFalse(receipt["valid"])
+                    self.assertTrue(receipt["interrupted"])
+                    # The existing bounded continuation runs only after drain.
+                    final = self.summary(output)
+                    self.assertEqual((final[suite]["passed"], final[suite]["failed"],
+                                      final[suite]["union"]), (18, 0, "exact"))
+                    self.assertIn("automatic_rerun", final["run"])
+
+    def test_a_failed_invocation_still_produces_every_assigned_receipt(self):
+        for suite in ("pg", "mssql"):
+            for fail in ((), ("a05",)):
+                with self.subTest(suite=suite, fail=fail):
+                    result, output = self.drive(suite=suite, fail=fail, check=int(bool(fail)))
+                    row = self.summary(output)[suite]
+                    self.assertEqual((row["union"], row["passed"], row["failed"]),
+                                     ("exact", 18 - len(fail), len(fail)))
+                    self.assertEqual(sorted(row["exits"]), [0, 101] if fail else [0, 0])
+                    receipts = [json.loads(p.read_text()) for p in output.glob(f"{suite}/*/*.json")]
+                    self.assertEqual(len(receipts), 4)
+                    self.assertTrue(all(r["valid"] and set(r["assigned"]) == set(r["reported"])
+                                        for r in receipts))
+                    self.assertCountEqual([name for r in receipts for name in r["reported"]],
+                                          A_NAMES + B_NAMES)
+                    missing = {}
+                    self.shards.audit(output / suite, 2, expected_invocations=2, missing=missing)
+                    self.assertEqual(missing, {})
+                    self.assertNotIn("automatic_rerun", self.summary(output)["run"])
+                    if fail:
+                        self.assertIn("FAILED in the first pass forbids automatic rerun", result.stdout)
 
 
 class PlainRun(Harness):
