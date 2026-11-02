@@ -269,13 +269,7 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         | Change::AddEnumValue { .. }
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
-        | Change::CreateType { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::PublicExecution { .. } => false,
+         | pbps_model::catalog_change!() | Change::PublicExecution { .. } => false,
     }
 }
 

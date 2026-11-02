@@ -295,12 +295,7 @@ impl<'a> TableChanges<'a> {
                 | Change::AlterDomain { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
-                | Change::CreateType { .. }
-                | Change::DropType { .. }
-                | Change::RenameType { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
+                | pbps_model::catalog_change!()
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::PublicExecution { .. } => {}

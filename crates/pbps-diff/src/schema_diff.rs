@@ -1643,12 +1643,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -1707,12 +1702,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -1968,12 +1958,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => None,
@@ -2036,12 +2021,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. } => false,
@@ -3255,12 +3235,7 @@ fn recreate_referenced_foreign_keys(
             | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
+            | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
@@ -3888,12 +3863,7 @@ fn recreate_retyped_dependents(
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
-        | Change::CreateType { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
+        | pbps_model::catalog_change!()
         | Change::Grant { .. }
         | Change::Revoke { .. }
         | Change::PublicExecution { .. } => None,
@@ -6025,12 +5995,7 @@ fn refuse_computed_dependencies(
                     | Change::AlterDomain { .. }
                     | Change::RenameEnumValue { .. }
                     | Change::EnumRebuild { .. }
-                    | Change::CreateType { .. }
-                    | Change::DropType { .. }
-                    | Change::RenameType { .. }
-                    | Change::CreateRole { .. }
-                    | Change::DropRole { .. }
-                    | Change::RenameRole { .. }
+                    | pbps_model::catalog_change!()
                     | Change::Grant { .. }
                     | Change::Revoke { .. }
                     | Change::PublicExecution { .. } => None,
