@@ -886,12 +886,7 @@ name = name.shown(),
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
-        | Change::CreateType { .. }
-        | Change::DropType { .. }
-        | Change::RenameType { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
+        | pbps_model::catalog_change!()
         // This dialect never produces one and `emit` refuses it; a probe
         // would be a second opinion about a statement that will not be
         // written.
