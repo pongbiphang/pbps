@@ -327,14 +327,14 @@ jobs:
       # first, in a process of its own and one test at a time. Beside the parallel
       # run below, a sibling's database, its grants in msdb or its DDL in master
       # changed the census's verdict or deadlocked it (#2631, #2618).
-      - run: cargo test -p pbps-mssql --test live -- --ignored --test-threads=1 assertions2401::
+      - run: cargo test -p pbps-mssql --test live -- --ignored --test-threads=1 'assertions2401::'
         if: matrix.suite == 'dialect'
       # Two tests need a second, Express server beside this one, and they live
       # in `live-editions`: a second SQL Server starting beside this one is
       # the pressure the startup crashes in docs/PITFALLS.md warn about, and
       # it crashed this job the first time it was tried (#611). Skipped by
       # name here; unset, their variable makes them fail rather than pass.
-      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it --skip assertions2401:: --skip scratch2236 --skip deployer2267 --skip staged2268 --skip externals2269
+      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it --skip 'assertions2401::' --skip scratch2236 --skip deployer2267 --skip staged2268 --skip externals2269
         if: matrix.suite == 'dialect'
       # Driver error conversion is a separate test target, ignored by quick.
       - run: cargo test -p pbps-db --test live_mssql -- --ignored
