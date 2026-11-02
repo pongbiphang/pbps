@@ -127,6 +127,7 @@ class FixtureRun:
         self.names = set(names)
         self.processes = []
         self.lock = Lock()
+        self.draining = Lock()
         self.stopped = False
         self.handlers = {}
 
@@ -145,15 +146,34 @@ class FixtureRun:
             process = subprocess.Popen(command, start_new_session=True, **kwargs)
             self.processes.append(process)
         try:
-            return process.wait()
+            # Leave the leader waitable until draining starts: its PID still
+            # anchors ownership of the group even when only descendants run.
+            try:
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            except ChildProcessError:
+                pass  # stop() already drained and reaped this owned group.
         finally:
-            with self.lock:
-                self.processes.remove(process)
+            self.drain([process])
+        return process.wait()
 
     def stop(self):
         with self.lock:
             self.stopped = True
             processes = list(self.processes)
+        self.drain(processes)
+
+    def drain(self, processes):
+        # Workers and signal cleanup can observe the same exited leader. Only
+        # one drainer may signal it; retirement requires confirmed group exit.
+        with self.draining:
+            with self.lock:
+                processes = [p for p in processes if p in self.processes]
+            self.drain_groups(processes)
+            with self.lock:
+                for process in processes:
+                    self.processes.remove(process)
+
+    def drain_groups(self, processes):
         if not processes:
             return
         deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
@@ -170,6 +190,25 @@ class FixtureRun:
         # A runner can exit before its TLS helper finishes removing its own
         # container. Keep the whole group alive for cleanup (DEC-2366.1).
         groups = [process.pid for process in processes]
+        groups = self.wait_groups(groups, deadline)
+        for pid in groups:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        killed_deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
+        for process in processes:
+            if process.pid in groups:
+                try:
+                    process.wait(timeout=max(0, killed_deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+        remaining = self.wait_groups(groups, killed_deadline)
+        require(not remaining, "owned runner process groups did not exit: "
+                + ", ".join(map(str, remaining)))
+
+    @staticmethod
+    def wait_groups(groups, deadline):
         while groups:
             remaining = []
             for pid in groups:
@@ -183,11 +222,7 @@ class FixtureRun:
             if not groups or delay <= 0:
                 break
             time.sleep(min(0.05, delay))
-        for pid in groups:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        return groups
 
     def interrupt(self, sig, frame):
         for handled in self.handlers:
@@ -388,6 +423,28 @@ def check_row(row, path):
             f"malformed result in receipt {path}")
 
 
+def shard_rows(directory):
+    """Receipts plus durable pre-execution obligations (DEC-2584.1)."""
+    rows = {p.stem: read_json(p, "receipt") for p in directory.glob("*.json")}
+    for path in (directory / "expected").glob("*.json"):
+        expected = read_json(path, "invocation assignment")
+        fields = {"args", "identity", "listed", "groups", "assigned", "pinned", "tree", "inputs", "carried"}
+        require(isinstance(expected, dict) and set(expected) == fields,
+                f"malformed invocation assignment {path}")
+        pending = dict(expected, reported={}, seconds=0.0, valid=False, interrupted=True)
+        check_row(pending, path)
+        row = rows.get(path.stem)
+        if row is not None:
+            check_row(row, path.parent.parent / path.name)
+            require(row["tree"] == expected["tree"] and row["inputs"] == expected["inputs"],
+                    f"receipt {path.stem} was written for another head or inputs")
+        require(row is None or all(row.get(k) == v for k, v in expected.items()),
+                f"receipt disagrees with invocation assignment {path}")
+        if row is None:
+            rows[path.stem] = dict(pending, pending=True)
+    return rows
+
+
 def load_inherited(previous, manifest, tree, inputs, suites):
     """The evidence a resumed run was itself given, so a chain keeps every link.
 
@@ -453,13 +510,23 @@ def load_resume(previous, tree, inputs, suites, flakes):
     for suite in suites:
         directory = previous / suite
         require(directory.is_dir(), f"the previous output has no {suite} receipts")
+        for shard in sorted(directory.iterdir()):
+            if shard.is_dir():
+                pending = shard / "tls-cleanup.pending"
+                try:
+                    pending.lstat()
+                except FileNotFoundError:
+                    continue
+                raise ValueError(f"unconfirmed TLS fixture removal: {pending}")
         rows = {}
-        for path in sorted(directory.glob("*/*.json")):
-            row = read_json(path, "receipt")
-            check_row(row, path)
-            require(row["tree"] == tree and row["inputs"] == inputs,
-                    f"receipt {path} was written for another head or inputs")
-            rows.setdefault(path.stem, []).append(row)
+        for shard in sorted(directory.iterdir()):
+            if not shard.is_dir():
+                continue
+            for key, row in shard_rows(shard).items():
+                check_row(row, shard / key)
+                require(row["tree"] == tree and row["inputs"] == inputs,
+                        f"receipt {shard / key} was written for another head or inputs")
+                rows.setdefault(key, []).append(row)
         before = inherited.get(suite, {})
         for key, group in rows.items():
             first = group[0]
@@ -503,7 +570,7 @@ def load_resume(previous, tree, inputs, suites, flakes):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned):
+def run_tests(command, assigned, *, on_failure=None):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
@@ -512,7 +579,6 @@ def run_tests(command, assigned):
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None,
                           text=True, bufsize=1) as process:
         for line in process.stdout:
-            print(line, end="", flush=True)
             header = re.fullmatch(r"running ([0-9]+) tests?\n?", line)
             if header:
                 headers.append(int(header[1]))
@@ -527,8 +593,13 @@ def run_tests(command, assigned):
                 now = time.monotonic()
                 reported[name] = {"status": status, "seconds": max(now - last, 0.000001)}
                 last = now
+                if status == "FAILED" and on_failure is not None:
+                    on_failure(reported)
             if line.startswith("test result:"):
                 summaries.append(line.strip())
+            # Observed failures must reach the existing receipt protocol before
+            # the line is forwarded: the proxy can die before its final receipt.
+            print(line, end="", flush=True)
         code = process.wait()
     passed = sum(r["status"] == "ok" for r in reported.values())
     failed = len(reported) - passed
@@ -537,7 +608,11 @@ def run_tests(command, assigned):
         rf"test result: {'FAILED' if failed else 'ok'}\. {passed} passed; {failed} failed; "
         r"0 ignored; 0 measured; [0-9]+ filtered out; finished in .+", summaries[0])
         and (code == 0) == (failed == 0))
-    return reported, code, time.monotonic() - started, bool(valid)
+    # A clean prefix ending without libtest's summary is a lost invocation,
+    # not proof that its printed ok names passed (DEC-2584.1).
+    interrupted = (headers == [len(assigned)] and not duplicates and not summaries
+                   and bool(assigned) and set(reported) <= set(assigned) and code != 0)
+    return reported, code, time.monotonic() - started, bool(valid), interrupted
 
 
 def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False):
@@ -561,9 +636,9 @@ def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False
     assigned = groups[index]
     print(f"ci shard {index}/{count}: {len(assigned)}/{len(names)} tests", flush=True)
     require(assigned or allow_empty, "CI shard has no assigned tests")
-    reported, code, seconds, valid = {}, 0, 0.0, True
+    reported, code, seconds, valid, interrupted = {}, 0, 0.0, True, False
     if assigned:
-        reported, code, seconds, valid = run_tests(
+        reported, code, seconds, valid, interrupted = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
              "--color=never", *assigned], assigned)
     if output is not None:
@@ -590,7 +665,8 @@ def cargo_proxy(args):
     invocation = invocation_id(args)
     # TLS repeats one exact command with three different trust inputs. Preserve
     # each occurrence as its own obligation instead of overwriting its receipt.
-    occurrence = len(list(root.glob(invocation + "-*.json")))
+    occurrence = len(set(p.stem for directory in (root, root / "expected")
+                         for p in directory.glob(invocation + "-*.json")))
     key = f"{invocation}-{occurrence}"
     enumeration = subprocess.run([real, *cargo, *listing, "--list", "--format=pretty", "--color=never"],
                                  text=True, stdout=subprocess.PIPE)
@@ -603,23 +679,38 @@ def cargo_proxy(args):
     groups = partition(remaining, count, identity, read_weights(env.get("PBPS_LIVE_WEIGHTS")), pinned)
     verify_express(groups)
     assigned = groups[index]
+    # Publish the obligation before a test (or its proxy) can be killed. A
+    # missing final receipt must remain visible even on a single-shard run.
+    tree = tree_identity(ROOT)
+    expected = {"args": args, "identity": identity, "listed": names, "groups": groups,
+                "assigned": assigned, "pinned": pinned,
+                "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
+                "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried}
+    directory = root / "expected"
+    directory.mkdir(exist_ok=True)
+    write_atomic(directory / (key + ".json"), json.dumps(expected, indent=2) + "\n")
     print(f"shard {index}/{count} {key}: {len(assigned)}/{len(names)} tests", flush=True)
     if carried and not assigned:
         # A caller that checks per-test output sees nothing for a name proven
         # earlier; this line is its cue to ask `carried_attestation`.
         print(CARRIED_LINE + key, flush=True)
-    reported, code, seconds, valid = {}, 0, 0.0, True
+    def save_receipt(reported, seconds, valid, interrupted):
+        # A provisional FAILED receipt is invalid proof of ok-ness, but resume
+        # already treats its FAILED result as authoritative failure evidence.
+        tree = tree_identity(ROOT)
+        receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
+                   "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
+                   "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
+                   "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried, "interrupted": interrupted}
+        write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
+
+    reported, code, seconds, valid, interrupted = {}, 0, 0.0, True, False
     if assigned:
-        reported, code, seconds, valid = run_tests(
+        reported, code, seconds, valid, interrupted = run_tests(
             [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-             "--color=never", *assigned], assigned)
-    # The head the tests ran on must still be the head the driver started on.
-    tree = tree_identity(ROOT)
-    receipt = {"args": args, "identity": identity, "listed": names, "groups": groups,
-               "assigned": assigned, "reported": reported, "pinned": pinned, "seconds": seconds,
-               "valid": valid, "tree": tree if tree == env.get("PBPS_LIVE_TREE") else None,
-               "inputs": env.get("PBPS_LIVE_INPUTS"), "carried": carried}
-    write_atomic(root / (key + ".json"), json.dumps(receipt, indent=2) + "\n")
+             "--color=never", *assigned], assigned,
+            on_failure=lambda results: save_receipt(results, 0.0, False, False))
+    save_receipt(reported, seconds, valid, interrupted)
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
 
@@ -696,22 +787,22 @@ def shard(suite, extra):
     return result.returncode
 
 
-def audit(suite_root, count, *, expected_invocations=None):
-    receipts = [{p.stem: json.loads(p.read_text()) for p in (suite_root / str(i)).glob("*.json")}
-                for i in range(count)]
+def audit(suite_root, count, *, expected_invocations=None, missing=None):
+    receipts = [shard_rows(suite_root / str(i)) for i in range(count)]
     if expected_invocations is not None:
         require(all(len(shard) == expected_invocations for shard in receipts),
                 "unexpected invocation receipt count")
     # A resumed run may leave a shard nothing to run; it must still have receipts.
     resumed = any(row.get("carried") for shard in receipts for row in shard.values())
-    require(all(shard if resumed else any(r["assigned"] for r in shard.values()) for shard in receipts),
+    require(missing is not None and any(receipts) or
+            all(shard if resumed else any(r["assigned"] for r in shard.values()) for shard in receipts),
             "a shard is empty for the whole suite")
     passed = failed = carried_total = 0
     measured = {}
     for key in sorted(set().union(*(set(shard) for shard in receipts))):
         rows = [shard.get(key) for shard in receipts]
         reference = next(row for row in rows if row is not None)
-        require(all(row is not None for row in rows) or
+        require(missing is not None or all(row is not None for row in rows) or
                 reference["pinned"] and rows[0] is not None
                 and all(row is None for row in rows[1:]), "missing invocation receipt")
         carried = reference.get("carried", {})
@@ -719,19 +810,35 @@ def audit(suite_root, count, *, expected_invocations=None):
                                                     for r in carried.values()),
                 "a carried name is not ok")
         groups = []
+        require(len(reference["groups"]) == count, "partition has the wrong shard count")
+        absent = []
         for index, row in enumerate(rows):
             if row is None:
-                groups.append([])
+                assigned = reference["groups"][index]
+                require(not reference["pinned"] or index == 0 or not assigned,
+                        "pinned invocation assigned outside shard zero")
+                groups.append(assigned)
+                absent.extend(assigned)
                 continue
             require(all(row[k] == reference[k] for k in ("args", "identity", "listed", "groups", "pinned")),
                     "shards disagree about the invocation or partition")
             require(row.get("carried", {}) == carried, "shards disagree about the carried names")
             require(row["assigned"] == row["groups"][index], "assignment differs from partition")
-            require(row["valid"], "libtest reports or summary are incomplete")
-            require(set(row["assigned"]) == set(row["reported"]), "assigned test has no result")
+            lost = (not row["valid"] and row.get("interrupted") is True
+                    and bool(row["assigned"]) and set(row["reported"]) <= set(row["assigned"]))
+            require(missing is not None or not row.get("pending"),
+                    f"missing invocation receipt {key}: " + ", ".join(row["assigned"]))
+            require(row["valid"] or missing is not None and lost,
+                    "libtest reports or summary are incomplete")
+            require(set(row["reported"]) <= set(row["assigned"]), "unassigned test reported a result")
+            require(missing is not None and lost or set(row["assigned"]) == set(row["reported"]),
+                    "assigned test has no result")
             require(all(r["status"] in ("ok", "FAILED") for r in row["reported"].values()),
                     "test did not report ok/FAILED")
             groups.append(row["assigned"])
+            if missing is not None and lost:
+                # Match load_resume: an invalid receipt proves none of its names.
+                absent.extend(row["assigned"])
             for name, result in row["reported"].items():
                 passed += result["status"] == "ok"
                 failed += result["status"] == "FAILED"
@@ -740,6 +847,8 @@ def audit(suite_root, count, *, expected_invocations=None):
                 "a carried name ran again")
         verify_union(reference["listed"], [*groups, sorted(carried)])
         verify_express(groups)
+        if absent:
+            missing[key] = sorted(absent)
         passed += len(carried)
         carried_total += len(carried)
     result = {"passed": passed, "failed": failed, "union": "exact"}
@@ -796,7 +905,7 @@ def sample_memory(stop, samples, errors):
             return
 
 
-def drive(args):
+def drive(args, *, automatic=True):
     suites = list(RUNNERS) if args.suite == "all" else [args.suite]
     memory = available_gb()
     counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
@@ -894,7 +1003,7 @@ def drive(args):
     with FixtureRun(used_names) as fixtures:
         try:
             sampler.start()
-            with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            with ThreadPoolExecutor(max_workers=len(tasks) if automatic else 1) as pool:
                 finished = list(pool.map(launch, tasks))
         finally:
             stop.set()
@@ -942,7 +1051,72 @@ def drive(args):
         weights = weights or {}
         weights.update(measured)
         Path(args.measure).write_text(json.dumps(weights, indent=2, sort_keys=True) + "\n")
+    if failed and automatic:
+        try:
+            missing = lost_tests(output, summary, tree, inputs)
+        except (ValueError, OSError, LookupError, TypeError, AttributeError) as error:
+            print(f"no automatic rerun: {error}", flush=True)
+        else:
+            return rerun_missing(args, output, summary, missing, started)
     return int(failed)
+
+
+def lost_tests(output, summary, tree, inputs):
+    """Diagnose loss with the audit, then apply the ordinary resume proof checks."""
+    require(not summary["run"]["memory_errors"], "memory sampling failed")
+    missing = {}
+    for suite, count in summary["run"]["shards"].items():
+        gaps = {}
+        checked, _ = audit(output / suite, count, missing=gaps)
+        require(not checked["failed"], "FAILED in the first pass forbids automatic rerun")
+        require(gaps or not any(summary[suite]["exits"]), "runner failed without lost results")
+        missing[suite] = gaps
+    require(any(missing.values()), "no lost names to rerun")
+    # An empty waiver map deliberately rejects even registered flakes.
+    # This also checks every receipt's identity and inherited evidence.
+    load_resume(output, tree, inputs, list(missing), {})
+    return missing
+
+
+def rerun_missing(args, output, original_summary, missing, started):
+    """One serial use of --resume, with both immutable evidence sets (DEC-2584.1)."""
+    original = output / "original"
+    require(not original.exists(), "original evidence directory already exists")
+    original.mkdir()
+    for name in (MANIFEST, SNAPSHOT, "weights-input.json", "summary.json", *missing):
+        path = output / name
+        if path.exists():
+            path.rename(original / name)
+    options = argparse.Namespace(**vars(args))
+    options.resume = str(original)
+    options.output = str(output)
+    options.mssql_shards = options.pg_shards = 1
+    # Freeze the same weights; they select neighbours, not proof identity.
+    frozen_weights = read_json(original / "weights-input.json", "weights snapshot")
+    options.weights = str(original / "weights-input.json") if frozen_weights is not None else None
+    print("rerunning lost names once, serially; missed means no valid receipt; "
+          f"original summary {original / 'summary.json'}", flush=True)
+    code = drive(options, automatic=False)
+    final = read_json(output / "summary.json", "rerun summary")
+    before, after = original_summary["run"], final["run"]
+    # A killed shard may never have reached a later pinned invocation. Its
+    # authoritative --list appears for the first time during the continuation.
+    for suite, gaps in missing.items():
+        for path in (output / suite).glob("*/*.json"):
+            row = read_json(path, "rerun receipt")
+            if row["assigned"]:
+                gaps[path.stem] = sorted(set(gaps.get(path.stem, [])) | set(row["assigned"]))
+    after["automatic_rerun"] = {
+        "original_run_id": before["run_id"], "rerun_run_id": after["run_id"],
+        "original_summary": str((original / "summary.json").resolve()),
+        "missed_definition": "no valid receipt", "names": missing}
+    after["seconds"] = time.monotonic() - started
+    after["minimum_available_gib"] = min(before["minimum_available_gib"], after["minimum_available_gib"])
+    after["memory_samples"] += before["memory_samples"]
+    write_atomic(output / "summary.json", json.dumps(final, indent=2) + "\n")
+    print(f"combined gate: {after['seconds']:.2f}s; minimum available memory: "
+          f"{after['minimum_available_gib']:.2f} GiB; summary {output / 'summary.json'}", flush=True)
+    return code
 
 
 def main():

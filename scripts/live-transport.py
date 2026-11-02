@@ -132,6 +132,13 @@ def main():
             )
         # The unguessable name is owned by this invocation, including a create
         # interrupted after Docker accepted it but before returning its ID.
+        pending = None
+        if os.environ.get("PBPS_LIVE_SHARD_DIR"):
+            pending = Path(os.environ["PBPS_LIVE_SHARD_DIR"]) / "tls-cleanup.pending"
+            # Retain the obligation across a killed helper or failed removal.
+            # Exclusive creation cannot overwrite an earlier unproven cleanup.
+            with pending.open("x") as marker:
+                marker.write(name + "\n")
         try:
             run("docker", "create", "--name", name, "--user", "0", "--memory", "3g",
                 "-p", f"127.0.0.1::{internal_port}", *environment,
@@ -166,6 +173,8 @@ def main():
             # Do not silently ignore failed cleanup: no shared container is
             # named, and a failed removal leaves this fixture's resources live.
             run("docker", "rm", "-fv", name, stdout=subprocess.DEVNULL)
+            if pending is not None:
+                pending.unlink()
 
 
 if __name__ == "__main__":

@@ -86,6 +86,32 @@ class CaseEvidence(unittest.TestCase):
 
 
 class FixtureOwnership(unittest.TestCase):
+    def test_cleanup_marker_precedes_creation_and_only_confirmed_removal_clears_it(self):
+        for fails in (False, True):
+            with self.subTest(removal_fails=fails), tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory) / "tls-cleanup.pending"
+
+                def run(*args, **kwargs):
+                    if args[:2] in (("docker", "create"), ("docker", "rm")):
+                        name = args[args.index("--name") + 1] if args[1] == "create" else args[-1]
+                        self.assertEqual(marker.read_text(), name + "\n")
+                        if args[1] == "rm" and fails:
+                            raise subprocess.CalledProcessError(1, args)
+                    return subprocess.CompletedProcess(args, 0, json.dumps({"5432/tcp": [{"HostPort": "54321"}]}))
+
+                with (patch.dict(os.environ, PBPS_LIVE_SHARD_DIR=directory),
+                      patch.object(transport, "run", side_effect=run),
+                      patch.object(transport.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+                      patch.object(transport, "run_case"), patch.object(transport.signal, "signal"),
+                      patch("sys.argv", ["live-transport.py", "pg"]),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    if fails:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            transport.main()
+                    else:
+                        transport.main()
+                self.assertEqual(marker.exists(), fails)
+
     def test_initialization_and_readiness_deadline_cannot_admit_tls_cases(self):
         for deadline in (False, True):
             with self.subTest(deadline=deadline):
