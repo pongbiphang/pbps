@@ -571,6 +571,43 @@ fn assertions(old: bool) {
         p.settled();
     }
 }
+fn fixture_timeout_limits(old: bool) {
+    for (fixture_ms, run_ms, comparison) in [
+        (i32::MAX as u32 + 1, 600000, ">= 600000"),
+        (u32::MAX, u32::MAX, "<> 2147483647"),
+    ] {
+        let p = Project::new();
+        let base = p.commit();
+        p.write(
+            "tests/f.sql",
+            "INSERT INTO app.t(id,amount) SELECT 1,setting::integer \
+             FROM pg_catalog.pg_settings WHERE name='statement_timeout'",
+        );
+        p.manifest(
+            &image(old),
+            &base,
+            &[("f", &base)],
+            &format!(
+                "SELECT 1 FROM app.t HAVING count(*) <> 1 OR min(amount) < 1 \
+                 OR max(amount) {comparison}"
+            ),
+        );
+        let path = p.0.dir.join("tests/pbps-tests.yml");
+        let manifest = std::fs::read_to_string(path)
+            .unwrap()
+            .replace("fixture_ms: 30000", &format!("fixture_ms: {fixture_ms}"))
+            .replace("run_ms: 600000", &format!("run_ms: {run_ms}"));
+        p.write("tests/pbps-tests.yml", manifest);
+        let v = p.run(0);
+        engine(&v, old);
+        assert_eq!(phase(&v, "fixture")["outcome"], "passed");
+        assert_eq!(v["data"]["assertions"][0]["outcome"], "pass");
+        assert_eq!(v["data"]["cleanup_confirmed"], true);
+        identities(&v);
+        p.settled();
+    }
+}
+
 fn empty_candidate(old: bool) {
     let p = Project::new();
     let base = p.commit();
@@ -791,4 +828,15 @@ fn d2b2_1165_pg16_an_empty_candidate_still_checks_assertion_result_shapes() {
 #[ignore = "needs docker and the pinned PostgreSQL 18 scratch image"]
 fn d2b2_1165_pg18_an_empty_candidate_still_checks_assertion_result_shapes() {
     empty_candidate(false);
+}
+
+#[test]
+#[ignore = "needs docker and the pinned PostgreSQL 16 scratch image"]
+fn d2b2_1165_pg16_fixture_timeouts_use_the_server_limit_and_remaining_run_budget() {
+    fixture_timeout_limits(true);
+}
+#[test]
+#[ignore = "needs docker and the pinned PostgreSQL 18 scratch image"]
+fn d2b2_1165_pg18_fixture_timeouts_use_the_server_limit_and_remaining_run_budget() {
+    fixture_timeout_limits(false);
 }

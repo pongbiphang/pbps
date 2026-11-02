@@ -48,7 +48,7 @@ impl Control {
             })),
         }
     }
-    fn deadline(&self, allowance: Duration) -> Deadline {
+    pub(super) fn deadline(&self, allowance: Duration) -> Deadline {
         self.end.min(Deadline::now() + allowance)
     }
     pub(crate) async fn bounded<T>(
