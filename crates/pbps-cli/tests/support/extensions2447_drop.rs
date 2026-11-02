@@ -630,7 +630,7 @@ fn a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists() {
         on_server(
             admin,
             &format!(
-                "DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'stranger' NOSUPERUSER"
+                "DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'trigger-test' NOSUPERUSER"
             ),
         );
         on_server(
@@ -639,9 +639,10 @@ fn a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists() {
                 "GRANT USAGE ON SCHEMA public, ext TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"
             ),
         );
-        let stranger = connection
-            .replace("user=postgres", &format!("user={role}"))
-            .replace("password=Pbps!Test12345", "password=stranger");
+        // The suite's own helper drops whatever `user` and `password` the
+        // suite was configured with (the gate's and CI's passwords differ), and
+        // logs in with its fixed password, which the role above is given.
+        let stranger = super::as_role(connection, &role);
         assert_ne!(stranger, connection);
         let path = d.dir.join("plan.json");
         let out = plan_to(&d, &stranger, &path);
