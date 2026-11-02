@@ -1158,7 +1158,6 @@ fn resource_stop_child() {
 #[test]
 fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidence() {
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
     for mode in [
         "snapshot-created",
         "commit-root-created",
@@ -1196,8 +1195,8 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
         } else {
             String::new()
         };
-        let socket = f.repo.root.join("stop.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let socket = crate::unix_socket::Socket::bind();
+        let listener = socket.listener();
         listener.set_nonblocking(true).unwrap();
         let log_path = f.repo.root.join("child.log");
         let log = fs::File::create(&log_path).unwrap();
@@ -1212,7 +1211,7 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
                 "--nocapture",
             ])
             .env("PBPS_RESOURCE_TEST_REPOSITORY", &f.repo.root)
-            .env("PBPS_RESOURCE_TEST_SOCKET", &socket)
+            .env("PBPS_RESOURCE_TEST_SOCKET", socket.path())
             .env("PBPS_RESOURCE_TEST_MODE", mode)
             .env("PBPS_RESOURCE_TEST_OPERATION", pending)
             .stdout(Stdio::from(log.try_clone().unwrap()))
