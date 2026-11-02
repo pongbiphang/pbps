@@ -146,7 +146,7 @@ pub use schema::{
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use text::Text;
-pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
+pub use types::{CollationName, ColumnType, OpClassRef, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
 pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};

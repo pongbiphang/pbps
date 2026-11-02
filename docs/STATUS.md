@@ -708,7 +708,9 @@ cannot spell, a virtual generated column (a stored one is held, DEC-1168.1),
 than `btree` and `gin`, a GIN index off `jsonb` or under a class other than
 `jsonb_ops` and `jsonb_path_ops` (GIN over `jsonb` itself is held, DEC-1169.1),
 a GIN index over an expression or an expression key under a non-default class
-or collation (a B-tree expression index is held, DEC-1169.2), a null ordering that is not its direction's default, and a `NOT VALID`
+or collation (a B-tree expression index is held, DEC-1169.2), a key collation,
+a class a schema owns (both refused by name until the later parts of #2448 and
+the provider work of #2447, DEC-2448.1), a null ordering that is not its direction's default, and a `NOT VALID`
 check. A foreign key whose action is `RESTRICT` is held as `restrict`, never as
 `NO ACTION` (DEC-1633.1). Such a key used to be left out of the pull and named.
 A project that declared it as `no_action` now gets a plan that drops the key and

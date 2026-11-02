@@ -2459,7 +2459,7 @@ mod tests {
             ("unique", |i| i.unique = !i.unique),
             ("filter", |i| i.filter = Some("a > 0".into())),
             ("opclass", |i| {
-                i.columns[0].opclass = Some("int4_ops".into());
+                i.columns[0].opclass = Some(pbps_model::OpClassRef::bare("int4_ops"));
             }),
             ("expression key", |i| {
                 i.columns[0].key = pbps_model::IndexKey::Expression("a + 1".into());

@@ -833,14 +833,22 @@ fn render_indexes(
             // `columns:` while every key is a column, as every index was
             // written before expressions; `keys:`, one mapping each, once any
             // is an expression (DEC-1169.2).
-            if ix.columns.iter().all(|c| c.key.column().is_some()) {
+            // A class whose name holds a space cannot be one word of the
+            // `columns:` text, so it takes `keys:` too (DEC-2448.1).
+            let inline = |c: &pbps_model::IndexColumn| {
+                c.key.column().is_some()
+                    && c.opclass
+                        .as_ref()
+                        .is_none_or(|o| !o.raw().to_string().contains(char::is_whitespace))
+            };
+            if ix.columns.iter().all(inline) {
                 let cols: Vec<String> = ix
                     .columns
                     .iter()
                     .map(|c| {
                         let mut spelled = c.key.text().to_owned();
                         if let Some(class) = &c.opclass {
-                            spelled = format!("{spelled} {class}");
+                            spelled = format!("{spelled} {}", class.raw());
                         }
                         if c.descending {
                             spelled.push_str(" desc");
@@ -858,7 +866,11 @@ fn render_indexes(
                     };
                     let _ = write!(s, "{pad}      - {field}: {}", scalar(text));
                     if let Some(class) = &c.opclass {
-                        let _ = write!(s, "\n{pad}        opclass: {}", scalar(class));
+                        let _ = write!(
+                            s,
+                            "\n{pad}        opclass: {}",
+                            scalar(&class.raw().to_string())
+                        );
                     }
                     if c.descending {
                         let _ = write!(s, "\n{pad}        order: desc");

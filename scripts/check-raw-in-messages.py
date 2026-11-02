@@ -100,8 +100,8 @@ ALLOWED = {
         "builds companion reconstruction SQL; diagnostic sinks remain checked",
     ),
     "crates/pbps-model/src/types.rs": (
-        4,
-        "Three shown adapters escape canonical raw spellings; the canonical formatter preserves "
+        6,
+        "Four shown adapters escape canonical raw spellings; the canonical formatters preserve "
         "its argument bytes.",
     ),
     "crates/pbps-pg/src/type_refs.rs": (

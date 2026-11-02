@@ -402,7 +402,7 @@ fn operator_classes(what: &str, index: &pbps_model::Index) -> Vec<DialectError> 
                 "{what} indexes `{}` with `{class}`, and SQL Server has no operator classes \
                  (if `{class}` was meant as a direction, it is `asc` or `desc`)",
                 pbps_model::escape::Escaped(key.key.text()),
-                class = pbps_model::escape::Escaped(class),
+                class = class.shown(),
             )))
         })
         .collect()
@@ -2220,7 +2220,7 @@ mod tests {
             columns: vec![IndexColumn {
                 key: pbps_model::IndexKey::Column("a".into()),
                 descending: false,
-                opclass: opclass.map(str::to_owned),
+                opclass: opclass.map(|c| c.parse().unwrap()),
             }],
             include: Vec::new(),
             unique: false,
@@ -2247,6 +2247,14 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("indexes only columns")),
             "{expression:?}"
+        );
+        // A qualified class is PostgreSQL's too, refused the same way.
+        let qualified = messages(index(IndexMethod::Btree, Some("ext.int4_ops")));
+        assert!(
+            qualified
+                .iter()
+                .any(|m| m.contains("`ext.int4_ops`") && m.contains("no operator classes")),
+            "{qualified:?}"
         );
         let class = messages(index(IndexMethod::Btree, Some("dsc")));
         assert!(

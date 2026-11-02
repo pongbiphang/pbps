@@ -9,7 +9,7 @@
 //! engine's rules, into one spelling: `true`/`false`, a decimal integer, the
 //! shortest decimal of a real, and `auto`/`on`/`off`.
 //!
-//! Indexes take their own per-method list ([`index_parameters`], #1442),
+//! Indexes take their own per-method list ([`MethodPolicy::parameters`], #1442),
 //! parsed by the same rules.
 //!
 //! `toast.*` parameters are not here: a table without a TOAST relation
@@ -81,16 +81,136 @@ pub fn canonical(name: &str, value: &str) -> Result<String, String> {
     spelled(kind, name, value)
 }
 
-/// Every index parameter an index of `method` may declare, with how the
-/// engine parses it (#1442). Measured on 16 and 18: each changes in place
-/// (`ALTER INDEX … SET`), and the other method's are refused.
-pub fn index_parameters(method: IndexMethod) -> &'static [(&'static str, Kind)] {
+/// What changing an index storage parameter in place does, by the engine
+/// (DEC-2448.1). Measured per parameter and per method, never assumed from
+/// another method's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParameterChange {
+    /// `ALTER INDEX … SET`/`RESET`: nothing is rebuilt.
+    Alter,
+    /// The engine takes no in-place change, or it is not measured to keep the
+    /// index sound: the part is dropped and created again with the final
+    /// parameters in its `CREATE`.
+    Rebuild,
+    /// Neither is safe, so the change is refused by name.
+    Refuse,
+}
+
+/// The table lock an in-place parameter change takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLock {
+    ShareUpdateExclusive,
+    AccessExclusive,
+}
+
+/// One storage parameter of an index method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexParameter {
+    pub name: &'static str,
+    pub kind: Kind,
+    pub change: ParameterChange,
+}
+
+/// What this model holds of one index access method: the capabilities the
+/// engine reports for it, the key types and operator classes it is held over,
+/// and its storage parameters with their change verdicts (DEC-2448.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodPolicy {
+    pub method: IndexMethod,
+    /// `pg_indexam_has_property(…, 'can_unique')`.
+    pub unique: bool,
+    /// `can_include`.
+    pub include: bool,
+    /// `can_order`: a key may be `ASC` or `DESC`.
+    pub ordered: bool,
+    /// Whether a key may be an expression rather than a column.
+    pub expression_keys: bool,
+    /// The one key type the method is held over, as a normalised base type;
+    /// `None` for any type its default class covers.
+    pub key_type: Option<&'static str>,
+    /// The engine's own non-default classes the model holds, bare.
+    pub classes: &'static [&'static str],
+    /// The method's default class for `key_type`, which a declaration leaves
+    /// out and never spells; `None` where it depends on the key's type.
+    pub default_class: Option<&'static str>,
+    /// The lock an in-place change of one of its parameters takes.
+    pub lock: IndexLock,
+    pub parameters: &'static [IndexParameter],
+}
+
+impl MethodPolicy {
+    /// The parameter `name`, if this method declares it.
+    pub fn parameter(&self, name: &str) -> Option<&'static IndexParameter> {
+        self.parameters.iter().find(|p| p.name == name)
+    }
+
+    /// The most severe verdict among `names` and the first name that has it.
+    /// A name this method does not declare is `Alter`: the loader already
+    /// refused it, so the differ never has to guess.
+    pub fn change_of<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> (ParameterChange, Option<&'a str>) {
+        let mut worst = (ParameterChange::Alter, None);
+        for name in names {
+            let verdict = self
+                .parameter(name)
+                .map_or(ParameterChange::Alter, |p| p.change);
+            if verdict > worst.0 {
+                worst = (verdict, Some(name));
+            }
+        }
+        worst
+    }
+}
+
+const fn param(name: &'static str, kind: Kind) -> IndexParameter {
+    // Every parameter this model holds was measured on 16 and 18 to change in
+    // place and keep the relfilenode (#1442, DEC-1442.1; re-measured for
+    // DEC-2448.1).
+    IndexParameter {
+        name,
+        kind,
+        change: ParameterChange::Alter,
+    }
+}
+
+static BTREE: MethodPolicy = MethodPolicy {
+    method: IndexMethod::Btree,
+    unique: true,
+    include: true,
+    ordered: true,
+    expression_keys: true,
+    key_type: None,
+    classes: &[],
+    default_class: None,
+    lock: IndexLock::ShareUpdateExclusive,
+    parameters: &[
+        param("deduplicate_items", Kind::Bool),
+        param("fillfactor", Kind::Int),
+    ],
+};
+
+static GIN: MethodPolicy = MethodPolicy {
+    method: IndexMethod::Gin,
+    unique: false,
+    include: false,
+    ordered: false,
+    expression_keys: false,
+    key_type: Some("jsonb"),
+    classes: &["jsonb_path_ops"],
+    default_class: Some("jsonb_ops"),
+    lock: IndexLock::AccessExclusive,
+    parameters: &[
+        param("fastupdate", Kind::Bool),
+        param("gin_pending_list_limit", Kind::Int),
+    ],
+};
+
+pub(crate) fn policy_of(method: IndexMethod) -> &'static MethodPolicy {
     match method {
-        IndexMethod::Btree => &[("deduplicate_items", Kind::Bool), ("fillfactor", Kind::Int)],
-        IndexMethod::Gin => &[
-            ("fastupdate", Kind::Bool),
-            ("gin_pending_list_limit", Kind::Int),
-        ],
+        IndexMethod::Btree => &BTREE,
+        IndexMethod::Gin => &GIN,
     }
 }
 
@@ -98,10 +218,10 @@ pub fn index_parameters(method: IndexMethod) -> &'static [(&'static str, Kind)] 
 /// canonical spelling, or why it is not one. A key's and a unique
 /// constraint's index is a B-tree.
 pub fn canonical_index(method: IndexMethod, name: &str, value: &str) -> Result<String, String> {
-    let kind = index_parameters(method)
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, k)| *k)
+    let kind = method
+        .policy()
+        .parameter(name)
+        .map(|p| p.kind)
         .ok_or_else(|| {
             format!(
                 "`{name}` is not a storage parameter of a {} index this model declares",
@@ -241,6 +361,99 @@ fn parse_real(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What btree and GIN hold, as data: the capabilities the engine reports
+    /// (measured live against `pg_indexam_has_property` too), the key type
+    /// and classes, the lock, and a verdict for every parameter (DEC-2448.1).
+    #[test]
+    fn the_policy_table_holds_what_btree_and_gin_always_did() {
+        let b = IndexMethod::Btree.policy();
+        assert_eq!(b.method, IndexMethod::Btree);
+        assert!(b.unique && b.include && b.ordered && b.expression_keys);
+        assert_eq!(
+            (b.key_type, b.classes, b.default_class),
+            (None, &[][..], None)
+        );
+        assert_eq!(b.lock, IndexLock::ShareUpdateExclusive);
+        let g = IndexMethod::Gin.policy();
+        assert_eq!(g.method, IndexMethod::Gin);
+        assert!(!g.unique && !g.include && !g.ordered && !g.expression_keys);
+        assert_eq!(g.key_type, Some("jsonb"));
+        assert_eq!(
+            (g.classes, g.default_class),
+            (&["jsonb_path_ops"][..], Some("jsonb_ops"))
+        );
+        assert_eq!(g.lock, IndexLock::AccessExclusive);
+        let names = |p: &MethodPolicy| p.parameters.iter().map(|x| x.name).collect::<Vec<_>>();
+        assert_eq!(names(b), ["deduplicate_items", "fillfactor"]);
+        assert_eq!(names(g), ["fastupdate", "gin_pending_list_limit"]);
+        for method in IndexMethod::ALL {
+            let policy = method.policy();
+            assert!(
+                policy
+                    .parameters
+                    .iter()
+                    .all(|p| p.change == ParameterChange::Alter),
+                "nothing is rebuilt or refused yet: {}",
+                method.as_str()
+            );
+            assert_eq!(IndexMethod::from_am_name(method.as_str()), Some(method));
+        }
+    }
+
+    /// Negative: another method's parameter, and a method the model does not
+    /// hold, are not this method's.
+    #[test]
+    fn a_parameter_belongs_to_its_method_only() {
+        let b = IndexMethod::Btree.policy();
+        assert!(b.parameter("fillfactor").is_some());
+        assert!(b.parameter("fastupdate").is_none());
+        assert!(IndexMethod::Gin.policy().parameter("fillfactor").is_none());
+        assert!(canonical_index(IndexMethod::Gin, "fillfactor", "70").is_err());
+        assert_eq!(IndexMethod::from_am_name("gist"), None);
+        assert_eq!(IndexMethod::from_am_name("brin"), None);
+        assert_eq!(IndexMethod::from_am_name("BTREE"), None);
+    }
+
+    /// The worst verdict among the names decides, and names the first that
+    /// has it; a name the method does not declare is `Alter`.
+    #[test]
+    fn the_worst_parameter_verdict_decides_and_is_named() {
+        static P: [IndexParameter; 3] = [
+            IndexParameter {
+                name: "a",
+                kind: Kind::Int,
+                change: ParameterChange::Alter,
+            },
+            IndexParameter {
+                name: "r",
+                kind: Kind::Int,
+                change: ParameterChange::Rebuild,
+            },
+            IndexParameter {
+                name: "x",
+                kind: Kind::Int,
+                change: ParameterChange::Refuse,
+            },
+        ];
+        let policy = MethodPolicy {
+            parameters: &P,
+            ..*IndexMethod::Btree.policy()
+        };
+        assert_eq!(policy.change_of([]), (ParameterChange::Alter, None));
+        assert_eq!(
+            policy.change_of(["a", "unknown"]),
+            (ParameterChange::Alter, None)
+        );
+        assert_eq!(
+            policy.change_of(["a", "r"]),
+            (ParameterChange::Rebuild, Some("r"))
+        );
+        assert_eq!(
+            policy.change_of(["r", "x", "a"]),
+            (ParameterChange::Refuse, Some("x"))
+        );
+    }
 
     /// Each spelling the engine reads as one value is one value here, by the
     /// engine's own rules (measured on 16 and 18).

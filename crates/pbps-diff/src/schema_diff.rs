@@ -39,6 +39,13 @@ use pbps_model::{
 pub enum DiffError {
     #[error("{reason}")]
     DropRequirement { reason: String },
+    #[error("{target} on `{}`: storage parameter `{}` of a {method} index cannot be changed in place, and this model does not rebuild the index for it (DEC-2448.1)", .table.shown(), pbps_model::escape::Escaped(.parameter))]
+    IndexParameterRefused {
+        table: TableName,
+        target: String,
+        method: &'static str,
+        parameter: String,
+    },
     #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
     ExtensionLifecycleUnsupported {
         name: pbps_model::ObjectLocalName,
@@ -1426,6 +1433,7 @@ pub(crate) fn diff_partial_rebuilding(
                         &renames.apply(&table, base_name),
                         declared_table,
                         &mut changes,
+                        &mut errs,
                     );
                     diff_storage_parameters(
                         uid,
@@ -1511,6 +1519,7 @@ pub(crate) fn diff_partial_rebuilding(
             &renames.apply(base_table, base_name),
             declared_table,
             &mut changes,
+            &mut errs,
         );
         diff_computed(declared_name, base_table, declared_table, &mut changes);
         diff_storage_parameters(uid, declared_name, base_table, declared_table, &mut changes);
@@ -6393,11 +6402,80 @@ fn by_name<T>(
     changes.extend(base.keys().filter(|n| !declared.contains_key(*n)).map(drop));
 }
 
-fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
+/// What a difference in an index's storage parameters asks of the plan, by
+/// the verdicts of the method's policy (DEC-2448.1).
+#[derive(Debug, PartialEq, Eq)]
+enum ParameterEdit {
+    Unchanged,
+    /// One changed parameter cannot be altered in place: the part is replaced.
+    Rebuild,
+    /// One changed parameter is refused outright.
+    Refuse {
+        parameter: String,
+    },
+    Alter {
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+}
+
+fn parameter_edit(
+    policy: &pbps_model::storage::MethodPolicy,
+    was: &BTreeMap<String, String>,
+    now: &BTreeMap<String, String>,
+) -> ParameterEdit {
+    use pbps_model::storage::ParameterChange;
+    let set: BTreeMap<String, String> = now
+        .iter()
+        .filter(|(k, v)| was.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let reset: BTreeSet<String> = was
+        .keys()
+        .filter(|k| !now.contains_key(*k))
+        .cloned()
+        .collect();
+    if set.is_empty() && reset.is_empty() {
+        return ParameterEdit::Unchanged;
+    }
+    let named = set.keys().chain(reset.iter()).map(String::as_str);
+    match policy.change_of(named) {
+        (ParameterChange::Alter, _) => ParameterEdit::Alter { set, reset },
+        (ParameterChange::Rebuild, _) => ParameterEdit::Rebuild,
+        (ParameterChange::Refuse, parameter) => ParameterEdit::Refuse {
+            parameter: parameter.unwrap_or_default().to_owned(),
+        },
+    }
+}
+
+fn diff_constraints(
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+) {
+    diff_constraints_by(name, base, declared, changes, errs, &IndexMethod::policy);
+}
+
+/// [`diff_constraints`] under a given policy table, so that a verdict no
+/// method holds yet can be exercised end to end.
+fn diff_constraints_by(
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+    policy_of: &dyn Fn(IndexMethod) -> &'static pbps_model::storage::MethodPolicy,
+) {
     // Storage parameters change in place, every supported one of both
     // methods (measured on 16 and 18), so a part is rebuilt only where it
     // differs otherwise; a difference in them alone is one `ALTER INDEX`
     // (DEC-1442.1). A rebuilt part carries its declared ones in its `CREATE`.
+    // That is each parameter's verdict in the method's policy (DEC-2448.1):
+    // every one this model holds is `Alter`, and a method that gains a
+    // parameter the engine cannot change in place says `Rebuild` or `Refuse`
+    // in its own row and nothing here changes.
     fn bare<T: Clone>(part: &T, strip: impl Fn(&mut T)) -> T {
         let mut part = part.clone();
         strip(&mut part);
@@ -6406,27 +6484,38 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     let pk_bare = |pk: &PrimaryKey| bare(pk, |p| p.storage_parameters.clear());
     let unique_bare = |u: &UniqueConstraint| bare(u, |u| u.storage_parameters.clear());
     let index_bare = |ix: &Index| bare(ix, |ix| ix.storage_parameters.clear());
+    let refused = std::cell::RefCell::new(Vec::new());
+    // `None` replaces the part, `Some(None)` leaves it, `Some(Some(_))` alters it.
     let parameters = |target: IndexPart,
                       method: IndexMethod,
                       was: &BTreeMap<String, String>,
-                      now: &BTreeMap<String, String>| {
-        let set: BTreeMap<String, String> = now
-            .iter()
-            .filter(|(k, v)| was.get(*k) != Some(*v))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let reset: BTreeSet<String> = was
-            .keys()
-            .filter(|k| !now.contains_key(*k))
-            .cloned()
-            .collect();
-        (!set.is_empty() || !reset.is_empty()).then(|| Change::SetIndexStorageParameters {
-            table: name.clone(),
-            target,
-            method,
-            set,
-            reset,
-        })
+                      now: &BTreeMap<String, String>|
+     -> Option<Option<Change>> {
+        match parameter_edit(policy_of(method), was, now) {
+            ParameterEdit::Unchanged => Some(None),
+            ParameterEdit::Rebuild => None,
+            ParameterEdit::Refuse { parameter } => {
+                refused.borrow_mut().push(DiffError::IndexParameterRefused {
+                    table: name.clone(),
+                    target: match &target {
+                        IndexPart::PrimaryKey => "the primary key's index".to_owned(),
+                        IndexPart::Unique(n) | IndexPart::Index(n) => {
+                            format!("index {}", n.shown())
+                        }
+                    },
+                    method: method.as_str(),
+                    parameter,
+                });
+                Some(None)
+            }
+            ParameterEdit::Alter { set, reset } => Some(Some(Change::SetIndexStorageParameters {
+                table: name.clone(),
+                target,
+                method,
+                set,
+                reset,
+            })),
+        }
     };
 
     // A declaration that leaves the key unnamed (`primary_key: [id]`) leaves
@@ -6444,7 +6533,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     // clustered index nonclustered (1925, measured), and the other direction
     // is refused while a foreign key references the key (1930). So it is
     // replaced like any other changed key (#1178).
-    let pk_differs = match (&base.primary_key, &declared.primary_key) {
+    let mut pk_differs = match (&base.primary_key, &declared.primary_key) {
         (Some(b), Some(d)) if d.name.is_none() => b.columns != d.columns,
         (Some(b), Some(d)) => pk_bare(b) != pk_bare(d),
         (b, d) => b != d,
@@ -6452,12 +6541,15 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         && declared.primary_key.is_some()
         && base.primary_key_is_clustered() != declared.primary_key_is_clustered());
     if !pk_differs && let (Some(b), Some(d)) = (&base.primary_key, &declared.primary_key) {
-        changes.extend(parameters(
+        match parameters(
             IndexPart::PrimaryKey,
             IndexMethod::Btree,
             &b.storage_parameters,
             &d.storage_parameters,
-        ));
+        ) {
+            Some(edit) => changes.extend(edit),
+            None => pk_differs = true,
+        }
     }
     if pk_differs {
         // A key that is *replaced* is emitted as two changes: the old one's
@@ -6549,6 +6641,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
                     &d.storage_parameters,
                 )
             })
+            .flatten()
         },
         |n| Change::DropUnique {
             table: name.clone(),
@@ -6576,6 +6669,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
                     &d.storage_parameters,
                 )
             })
+            .flatten()
         },
         |n| Change::DropIndex {
             table: name.clone(),
@@ -6589,6 +6683,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         },
         changes,
     );
+    errs.extend(refused.into_inner());
 }
 
 /// Declared reference data (ADR-0004).
@@ -7825,7 +7920,9 @@ pub fn restoration_comparison<'a>(
         };
         let mut edits = Vec::new();
         let renamed = renames.apply(before, old);
-        diff_constraints(new, &renamed, after, &mut edits);
+        // A refusal is the plan's to report; this comparison only asks which
+        // parts a plan would edit, so it has nowhere to put one.
+        diff_constraints(new, &renamed, after, &mut edits, &mut Vec::new());
         if let (Some(was), Some(now)) = (&before.partition_of, &after.partition_of) {
             let was_columns =
                 partition_columns_by_uid(&was.columns, &was.parent, &now.parent, &index);
@@ -10078,6 +10175,189 @@ mod tests {
                 }]
             ),
             "{cs:?}"
+        );
+    }
+
+    /// A policy that is not btree's or GIN's: one parameter of each verdict,
+    /// so the differ's `Rebuild` and `Refuse` arms are exercised before any
+    /// method needs them (DEC-2448.1).
+    static SYNTHETIC: pbps_model::storage::MethodPolicy = {
+        use pbps_model::storage::{IndexLock, IndexParameter, Kind, ParameterChange};
+        const fn p(name: &'static str, change: ParameterChange) -> IndexParameter {
+            IndexParameter {
+                name,
+                kind: Kind::Int,
+                change,
+            }
+        }
+        pbps_model::storage::MethodPolicy {
+            method: IndexMethod::Btree,
+            unique: true,
+            include: true,
+            ordered: true,
+            expression_keys: true,
+            key_type: None,
+            classes: &[],
+            default_class: None,
+            lock: IndexLock::AccessExclusive,
+            parameters: &[
+                p("altered", ParameterChange::Alter),
+                p("rebuilt", ParameterChange::Rebuild),
+                p("refused", ParameterChange::Refuse),
+            ],
+        }
+    };
+
+    fn parameters_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// A difference in parameters is read through each parameter's verdict:
+    /// the worst one decides, and a refused one is named (DEC-2448.1).
+    #[test]
+    fn a_parameter_difference_follows_the_verdict_of_its_policy_row() {
+        let edit = |was: &[(&str, &str)], now: &[(&str, &str)]| {
+            parameter_edit(&SYNTHETIC, &parameters_of(was), &parameters_of(now))
+        };
+        assert_eq!(edit(&[], &[]), ParameterEdit::Unchanged);
+        assert_eq!(
+            edit(&[("altered", "1")], &[("altered", "1")]),
+            ParameterEdit::Unchanged
+        );
+        assert_eq!(
+            edit(&[], &[("altered", "1")]),
+            ParameterEdit::Alter {
+                set: parameters_of(&[("altered", "1")]),
+                reset: BTreeSet::new()
+            }
+        );
+        // A reset is a change of its parameter too.
+        assert_eq!(edit(&[("rebuilt", "1")], &[]), ParameterEdit::Rebuild);
+        assert_eq!(edit(&[], &[("rebuilt", "2")]), ParameterEdit::Rebuild);
+        // The worst verdict wins, wherever it sits among the others.
+        assert_eq!(
+            edit(&[], &[("altered", "1"), ("rebuilt", "2")]),
+            ParameterEdit::Rebuild
+        );
+        assert_eq!(
+            edit(&[("altered", "1")], &[("rebuilt", "2"), ("refused", "3")]),
+            ParameterEdit::Refuse {
+                parameter: "refused".into()
+            }
+        );
+    }
+
+    /// Negative: btree and GIN hold only `Alter` parameters, so a change in
+    /// any of them is the `ALTER INDEX` it always was, never a rebuild or a
+    /// refusal. The old behaviour is the table's content, not a special case.
+    #[test]
+    fn every_parameter_btree_and_gin_hold_is_altered_in_place() {
+        for method in IndexMethod::ALL {
+            for parameter in method.policy().parameters {
+                let now = parameters_of(&[(parameter.name, "1")]);
+                assert!(
+                    matches!(
+                        parameter_edit(method.policy(), &BTreeMap::new(), &now),
+                        ParameterEdit::Alter { .. }
+                    ),
+                    "{} {}",
+                    method.as_str(),
+                    parameter.name
+                );
+            }
+        }
+    }
+
+    /// Through the differ itself, under a policy that holds one parameter of
+    /// each verdict: `Alter` is the `ALTER INDEX` change, `Rebuild` replaces
+    /// the index (its drop and its add, carrying the final parameters), and
+    /// `Refuse` is a named error with no change (DEC-2448.1).
+    #[test]
+    fn the_differ_alters_rebuilds_or_refuses_an_index_by_its_parameters_verdict() {
+        let table_with = |parameters: &[(&str, &str)]| {
+            let mut t = Table::default();
+            t.columns
+                .insert("a".into(), Column::new("int".parse().unwrap()));
+            t.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn::column("a")],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Btree,
+                    storage_parameters: parameters_of(parameters),
+                },
+            );
+            t
+        };
+        let run = |now: &[(&str, &str)]| {
+            let mut changes = Vec::new();
+            let mut errs = Vec::new();
+            diff_constraints_by(
+                &"dbo.t".parse().unwrap(),
+                &table_with(&[]),
+                &table_with(now),
+                &mut changes,
+                &mut errs,
+                &|_| &SYNTHETIC,
+            );
+            (changes, errs)
+        };
+        let (changes, errs) = run(&[("altered", "1")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [Change::SetIndexStorageParameters { .. }]
+            ),
+            "{changes:?}"
+        );
+        let (changes, errs) = run(&[("rebuilt", "1")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+                    if index.storage_parameters.get("rebuilt").map(String::as_str) == Some("1")
+            ),
+            "{changes:?}"
+        );
+        let (changes, errs) = run(&[("refused", "1")]);
+        assert!(changes.is_empty(), "{changes:?}");
+        let [
+            DiffError::IndexParameterRefused {
+                parameter, method, ..
+            },
+        ] = errs.as_slice()
+        else {
+            panic!("{errs:?}")
+        };
+        assert_eq!((parameter.as_str(), *method), ("refused", "btree"));
+        let message = errs[0].to_string();
+        assert!(
+            message.contains("`refused`") && message.contains("DEC-2448.1"),
+            "{message}"
+        );
+        // Negative: the real table refuses nothing and rebuilds nothing.
+        let mut changes = Vec::new();
+        let mut errs = Vec::new();
+        diff_constraints(
+            &"dbo.t".parse().unwrap(),
+            &table_with(&[]),
+            &table_with(&[("fillfactor", "70")]),
+            &mut changes,
+            &mut errs,
+        );
+        assert!(
+            errs.is_empty()
+                && matches!(
+                    changes.as_slice(),
+                    [Change::SetIndexStorageParameters { .. }]
+                )
         );
     }
 
@@ -26096,6 +26376,7 @@ mod tests {
             &base_t,
             &declared_t,
             &mut changes,
+            &mut Vec::new(),
         );
         assert!(changes.is_empty(), "{changes:?}");
 
@@ -26111,6 +26392,7 @@ mod tests {
             &base_t,
             &declared_t,
             &mut changes,
+            &mut Vec::new(),
         );
         assert!(
             matches!(
@@ -26133,6 +26415,7 @@ mod tests {
             &base_t,
             &declared_t,
             &mut changes,
+            &mut Vec::new(),
         );
         assert!(
             matches!(

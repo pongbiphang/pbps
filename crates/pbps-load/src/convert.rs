@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Clustered, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity,
-    Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey,
+    Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, OpClassRef, Permission, PrimaryKey,
     ReplicaIdentity, Role, Row, RowKey, Strategy, Table, TableData, TableName, UniqueConstraint,
     Value,
 };
@@ -1127,14 +1127,8 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
             None
         }
     };
-    let opclass = |o: &str| {
-        if is_opclass_name(o) {
-            Ok(o.to_owned())
-        } else {
-            Err(bad(&format!("`{o}` is not an operator class name")))
-        }
-    };
-    let column = |name: &str, opclass: Option<String>, descending: bool| IndexColumn {
+    let opclass = |o: &str| opclass_ref(o).map_err(|why: String| bad(&why));
+    let column = |name: &str, opclass: Option<OpClassRef>, descending: bool| IndexColumn {
         key: pbps_model::IndexKey::Column(name.into()),
         descending,
         opclass,
@@ -1154,7 +1148,19 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
     }
 }
 
-/// A plain identifier, which is every operator class name this tool accepts.
+/// An operator class as written: a plain identifier, the engine's own class,
+/// or a schema-qualified name, which parses and is held for the dialect to
+/// refuse until a provider vouches for it (DEC-2448.1). `pg_catalog.x` is the
+/// bare `x`.
+fn opclass_ref(o: &str) -> Result<OpClassRef, String> {
+    if !o.contains(['.', '"']) && !is_opclass_name(o) {
+        return Err(format!("`{o}` is not an operator class name"));
+    }
+    o.parse::<OpClassRef>()
+        .map_err(|e| format!("`{o}` is not an operator class name: {e}"))
+}
+
+/// A plain identifier, the one shape of bare operator class name this tool accepts.
 fn is_opclass_name(o: &str) -> bool {
     let mut chars = o.chars();
     chars
@@ -1242,15 +1248,25 @@ fn parse_index_key(
         (Some(_), Some(_)) => return Err(bad("a key names a column or an expression, not both")),
         (None, None) => return Err(bad("a key names a column or an expression")),
     };
-    if let Some(class) = &e.opclass
-        && !is_opclass_name(class)
-    {
-        return Err(bad(&format!("`{class}` is not an operator class name")));
+    let opclass = e
+        .opclass
+        .as_deref()
+        .map(opclass_ref)
+        .transpose()
+        .map_err(|why: String| bad(&why))?;
+    // The model holds no key collation yet (DEC-2448.1); say so rather than
+    // let a declaration read as if it were kept.
+    if let Some(collation) = &e.collation {
+        return Err(bad(&format!(
+            "`collation: {collation}` is not supported yet; a PostgreSQL index key collation \
+             arrives in a later part of #2448, and until then write `COLLATE` inside an \
+             `expression:` key"
+        )));
     }
     Ok(IndexColumn {
         key,
         descending: e.order == Some(crate::dto::IndexOrder::Desc),
-        opclass: e.opclass.clone(),
+        opclass,
     })
 }
 

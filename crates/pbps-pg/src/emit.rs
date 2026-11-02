@@ -1895,10 +1895,10 @@ fn key_index_parameters(parameters: &BTreeMap<String, String>) -> Result<String,
     if parameters.is_empty() {
         return Ok(String::new());
     }
-    let btree = pbps_model::storage::index_parameters(pbps_model::IndexMethod::Btree);
+    let btree = pbps_model::IndexMethod::Btree.policy();
     Ok(format!(
         " WITH ({})",
-        listed(parameters, &|name| btree.iter().any(|(n, _)| *n == name))?
+        listed(parameters, &|name| btree.parameter(name).is_some())?
     ))
 }
 
@@ -1977,7 +1977,8 @@ fn create_index_on(
 ) -> Result<String, DialectError> {
     // A GIN key has no order: measured on 18.6, `ASC`/`DESC` on one is
     // "access method \"gin\" does not support ASC/DESC options" (DEC-1169.1).
-    let ordered = index.method.is_btree();
+    // The method's policy says so (DEC-2448.1).
+    let ordered = index.method.policy().ordered;
     let keys = index
         .columns
         .iter()
@@ -1990,10 +1991,15 @@ fn create_index_on(
                 pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
             };
             // Qualified, so a class of the same name earlier on the
-            // `search_path` cannot stand in for the one declared: every class
-            // this model accepts is the engine's own.
+            // `search_path` cannot stand in for the one declared: a bare class
+            // is the engine's own, `pg_catalog`'s, and a schema's carries its
+            // own (DEC-2448.1).
             if let Some(class) = &c.opclass {
-                key = format!("{key} {}.{}", quote("pg_catalog")?, quote(class)?);
+                key = format!(
+                    "{key} {}.{}",
+                    quote(class.schema().unwrap_or("pg_catalog"))?,
+                    quote(class.name())?
+                );
             }
             if ordered {
                 key = format!("{key} {}", if c.descending { "DESC" } else { "ASC" });
@@ -2014,7 +2020,7 @@ fn create_index_on(
         quote(name)?,
         if only { "ONLY " } else { "" },
         qualified(table)?,
-        if ordered {
+        if index.method.is_btree() {
             String::new()
         } else {
             format!(" USING {}", index.method.as_str())
@@ -2029,9 +2035,7 @@ fn create_index_on(
         s.push_str(&format!(
             " WITH ({})",
             listed(&index.storage_parameters, &|name| {
-                pbps_model::storage::index_parameters(method)
-                    .iter()
-                    .any(|(n, _)| *n == name)
+                method.policy().parameter(name).is_some()
             })?
         ));
     }
@@ -4611,9 +4615,7 @@ pub(crate) fn emit_in(
             reset,
         } => {
             let actions = storage_actions(set, reset, &|name| {
-                pbps_model::storage::index_parameters(*method)
-                    .iter()
-                    .any(|(n, _)| *n == name)
+                method.policy().parameter(name).is_some()
             })?;
             let alter = |index: &str| -> Result<String, DialectError> {
                 Ok(format!(
@@ -10792,7 +10794,7 @@ mod tests {
         let key = |name: &str, opclass: Option<&str>| IndexColumn {
             key: pbps_model::IndexKey::Column(name.into()),
             descending: false,
-            opclass: opclass.map(str::to_owned),
+            opclass: opclass.map(|c| c.parse().unwrap()),
         };
         let change = Change::AddIndex {
             table: name("app", "doc"),
@@ -10816,6 +10818,45 @@ mod tests {
             "{sql}"
         );
         assert!(!sql.contains("ASC") && !sql.contains("DESC"), "{sql}");
+    }
+
+    /// A schema's own class is written with its schema, a quoted dot kept,
+    /// and the engine's own spelled `pg_catalog.x` is the bare class and
+    /// emits exactly what the bare one does (DEC-2448.1).
+    #[test]
+    fn a_class_is_qualified_by_its_own_schema_or_by_pg_catalog() {
+        let sql = |class: &str| {
+            let change = Change::AddIndex {
+                table: name("app", "doc"),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("tags".into()),
+                        descending: false,
+                        opclass: Some(class.parse().unwrap()),
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: pbps_model::IndexMethod::Gin,
+                    storage_parameters: Default::default(),
+                }),
+                clustered: false,
+            };
+            sql_of(&Postgres::new(), &change).remove(0)
+        };
+        assert!(
+            sql("ext.my_ops").contains("(\"tags\" \"ext\".\"my_ops\");"),
+            "{}",
+            sql("ext.my_ops")
+        );
+        assert!(
+            sql("\"My.Schema\".\"A Ops\"").contains("\"My.Schema\".\"A Ops\""),
+            "{}",
+            sql("\"My.Schema\".\"A Ops\"")
+        );
+        assert_eq!(sql("pg_catalog.jsonb_path_ops"), sql("jsonb_path_ops"));
+        assert!(sql("jsonb_path_ops").contains("\"pg_catalog\".\"jsonb_path_ops\""));
     }
 
     /// An index without a filter and without the hint is the ordinary case, and

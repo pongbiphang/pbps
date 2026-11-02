@@ -48,6 +48,7 @@ mod drop_impact;
 mod emit;
 pub mod engine_effects;
 pub mod extension_provider;
+mod index_policy;
 pub mod resolver;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
@@ -3751,7 +3752,7 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         key: pbps_model::IndexKey::Column("doc".into()),
                         descending: false,
-                        opclass: Some("jsonb_path_ops".into()),
+                        opclass: Some(pbps_model::OpClassRef::bare("jsonb_path_ops")),
                     }],
                     include: Vec::new(),
                     unique: false,

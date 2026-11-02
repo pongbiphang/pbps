@@ -508,7 +508,13 @@ indexes:
   An absent class is the method's default for the column's type. The first
   slice holds `method: gin` over `jsonb` columns, with the class left out or
   `jsonb_path_ops`. SQL Server has only the default method and no classes, so
-  it refuses `method: gin` and any class (DEC-1169.1).
+  it refuses `method: gin` and any class (DEC-1169.1). A class is written bare
+  (the engine's own, `pg_catalog`'s: `pg_catalog.x` is the bare `x`) or
+  qualified by its schema; a qualified class parses and is refused by name
+  until a pinned provider vouches for it. What each method may do and what
+  changing one of its parameters costs is one table per method, not a rule per
+  dialect, and a key `collation:`, `method: gist`/`brin` and `exclude:` are
+  refused by name until the later parts of #2448 (DEC-2448.1).
 - **A stored generated column is `generated: {expression: "a * 2", stored:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and

@@ -538,7 +538,154 @@ impl<'de> serde::Deserialize<'de> for CollationName {
     }
 }
 
-string_json_schema!(TypeRef, CollationName);
+/// An operator class of an index key (DEC-1169.1, DEC-2448.1): the engine's
+/// own, written bare (`jsonb_path_ops`), or one a schema owns (`ext.gist_ops`).
+///
+/// **One spelling per class, and the old bytes survive.** A bare class is held
+/// and written verbatim, exactly the string an index key carried before this
+/// type existed, so every saved plan, state and declaration reads and writes
+/// the same bytes. `pg_catalog.x` is the engine's own and normalises to the
+/// bare `x`: the emitter always qualifies a bare class with `pg_catalog`, so
+/// the two spellings are one class. Any other schema is parsed by the same
+/// qualified-name reader a [`TypeRef`] uses (a quoted dot survives) and held,
+/// but the model only holds it: whether a class outside `pg_catalog` is
+/// admitted is the dialect's question, and PostgreSQL refuses it until a
+/// provider vouches for it (#2447 PR F).
+///
+/// Rendering requires an explicit choice between canonical data and human text.
+///
+/// ```compile_fail,E0599
+/// let value: pbps_model::OpClassRef = "jsonb_path_ops".parse().unwrap();
+/// let _ = value.to_string();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpClassRef(OpClassRepr);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum OpClassRepr {
+    Bare(String),
+    Qualified(TypeRef),
+}
+
+impl OpClassRef {
+    /// The engine's own class `name`, in `pg_catalog`, as written.
+    #[must_use]
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self(OpClassRepr::Bare(name.into()))
+    }
+
+    /// A class by schema and name exactly as the catalog keeps them. The
+    /// engine's `pg_catalog` is the bare form.
+    #[must_use]
+    pub fn in_schema(schema: &str, name: &str) -> Self {
+        if schema == "pg_catalog" {
+            Self::bare(name)
+        } else {
+            Self(OpClassRepr::Qualified(TypeRef::unchecked(
+                schema.to_owned(),
+                name.to_owned(),
+            )))
+        }
+    }
+
+    /// The schema, or `None` for the engine's own (bare) class.
+    #[must_use]
+    pub fn schema(&self) -> Option<&str> {
+        match &self.0 {
+            OpClassRepr::Bare(_) => None,
+            OpClassRepr::Qualified(t) => Some(t.schema()),
+        }
+    }
+
+    /// The class's name, without its schema.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match &self.0 {
+            OpClassRepr::Bare(name) => name,
+            OpClassRepr::Qualified(t) => t.name(),
+        }
+    }
+
+    /// The name of an engine-owned class, or `None` for a schema's own.
+    #[must_use]
+    pub fn as_bare(&self) -> Option<&str> {
+        match &self.0 {
+            OpClassRepr::Bare(name) => Some(name),
+            OpClassRepr::Qualified(_) => None,
+        }
+    }
+
+    /// The canonical spelling for SQL, serialization and identity comparisons.
+    #[must_use]
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawOpClass(self)
+    }
+
+    /// The canonical spelling for a person, escaped exactly once.
+    #[must_use]
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownOpClass(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawOpClass<'a>(&'a OpClassRef);
+
+#[derive(Clone, Copy)]
+struct ShownOpClass<'a>(&'a OpClassRef);
+
+impl fmt::Display for RawOpClass<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0.0 {
+            OpClassRepr::Bare(name) => f.write_str(name),
+            OpClassRepr::Qualified(t) => write!(f, "{}", t.raw()),
+        }
+    }
+}
+
+impl fmt::Display for ShownOpClass<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", crate::escape::Escaped(&self.0.raw().to_string()))
+    }
+}
+
+impl FromStr for OpClassRef {
+    type Err = TypeParseError;
+
+    /// A text with no `.` and no quote is a bare class, verbatim: that is every
+    /// string a key held before, so nothing already stored stops reading. Any
+    /// other text is a qualified name, and has to be one.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        if !text.contains(['.', '"']) {
+            return Ok(Self::bare(text));
+        }
+        let (name, array) = qualified_parts(text)?;
+        if array || name.name.is_empty() || name.schema.contains('\0') || name.name.contains('\0') {
+            return Err(bad_reference(
+                text,
+                "expected a qualified operator class name",
+            ));
+        }
+        Ok(Self::in_schema(&name.schema, &name.name))
+    }
+}
+
+impl serde::Serialize for OpClassRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw().to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OpClassRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// All three cross JSON as one string with a hand-written codec (DEC-2412.1).
+string_json_schema!(TypeRef, CollationName, OpClassRef);
 
 impl TypeRef {
     /// A reference from two parts exactly as the engine keeps them, with no
@@ -786,6 +933,73 @@ impl From<ColumnType> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn class(text: &str) -> OpClassRef {
+        text.parse().unwrap()
+    }
+
+    /// A bare class is held and written exactly as it always was: the string
+    /// an index key carried before `OpClassRef` existed (DEC-2448.1).
+    #[test]
+    fn a_bare_operator_class_keeps_its_old_bytes() {
+        for text in ["jsonb_path_ops", "text_pattern_ops", "Odd_Case_Ops"] {
+            let c = class(text);
+            assert_eq!(c.as_bare(), Some(text));
+            assert_eq!(c.schema(), None);
+            assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"{text}\""));
+            let back: OpClassRef = serde_json::from_str(&format!("\"{text}\"")).unwrap();
+            assert_eq!(back, c);
+            assert_eq!(c.raw().to_string(), text);
+        }
+    }
+
+    /// `pg_catalog.x` is the engine's own class, whose spelling is the bare
+    /// `x`: one class has one value, so the two never compare unequal.
+    #[test]
+    fn pg_catalog_normalises_to_the_bare_class() {
+        assert_eq!(class("pg_catalog.jsonb_path_ops"), class("jsonb_path_ops"));
+        assert_eq!(
+            class("\"pg_catalog\".jsonb_path_ops"),
+            class("jsonb_path_ops")
+        );
+        assert_eq!(
+            OpClassRef::in_schema("pg_catalog", "x"),
+            OpClassRef::bare("x")
+        );
+    }
+
+    /// A schema's own class is held with its schema, a quoted dot survives,
+    /// and its canonical spelling parses back to it.
+    #[test]
+    fn a_qualified_operator_class_round_trips_with_a_quoted_dot() {
+        for (text, schema, name) in [
+            ("ext.gist_int4_ops", "ext", "gist_int4_ops"),
+            ("EXT.Ops", "ext", "ops"),
+            ("\"Ext\".\"My.Ops\"", "Ext", "My.Ops"),
+            ("\"a.b\".c", "a.b", "c"),
+        ] {
+            let c = class(text);
+            assert_eq!((c.schema(), c.name()), (Some(schema), name), "{text}");
+            assert_eq!(c.as_bare(), None);
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(
+                serde_json::from_str::<OpClassRef>(&json).unwrap(),
+                c,
+                "{text}"
+            );
+        }
+        assert_ne!(class("ext.x"), class("other.x"));
+        assert_ne!(class("ext.x"), class("x"));
+    }
+
+    /// Negative: what is not a class name is refused, not guessed at.
+    #[test]
+    fn a_malformed_qualified_operator_class_is_refused() {
+        for text in ["a.b.c", "a.", ".b", "ext.ops[]", "\"open.ops", "u&\"x\".y"] {
+            assert!(text.parse::<OpClassRef>().is_err(), "{text}");
+        }
+        assert!(serde_json::from_str::<OpClassRef>("\"a.b.c\"").is_err());
+    }
 
     fn p(s: &str) -> ColumnType {
         s.parse().unwrap()
