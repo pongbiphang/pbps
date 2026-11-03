@@ -282,6 +282,18 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         // refuses that by name. So the assessment's "unaffected" count does not
         // cover a create; answering it soundly needs the resolver to hold the
         // package (DEC-2447.6, a later slice). Do not "fix" this to `true`.
+        //
+        // A package **drop** is the same answer for the same reason, and one
+        // measured more: `true` sent every kept surface to a resolver whose
+        // scratch holds the package through its externals file, and the
+        // closing evidence then omitted a prerequisite the plan removes
+        // ("resolver evidence omits a required prerequisite", an internal
+        // error, on 16 and 18). What a drop does to a kept surface is bounded
+        // by the engine instead: a stored view, default, check or SQL-bodied
+        // routine that uses a member is a dependent that makes `RESTRICT` refuse
+        // (and the plan refuses it first, by name); only a body bound at call
+        // time, such as plpgsql's, finds nothing once the member is gone, which
+        // is the resolver's documented observation limit (DEC-2447.8).
         | pbps_model::catalog_change!()
         | Change::PublicExecution { .. } => false,
     }
@@ -460,6 +472,45 @@ mod tests {
         };
         assert!(with(&base, vec![table()]).requires_resolution());
         assert!(with(&base, vec![package(), table()]).requires_resolution());
+    }
+
+    /// A package drop, like a create, is not a question for the resolver: the
+    /// engine's `RESTRICT` bounds what it can do to a kept surface, and sending
+    /// the surfaces to a scratch that cannot describe the package leaving broke
+    /// the closing evidence (DEC-2447.8). Pinned so that a change to `true` is
+    /// made on purpose, with the evidence able to hold a package's removal.
+    #[test]
+    fn a_package_drop_and_a_create_alone_need_no_resolver() {
+        let base = bound();
+        let definition = pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.6".into(),
+        };
+        let drop = Change::DropExtension {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition: definition.clone(),
+            requirers: BTreeSet::new(),
+            releases: BTreeSet::new(),
+        };
+        let found = with(&base, vec![drop]);
+        assert!(!found.requires_resolution(), "{found:?}");
+        assert_eq!(found.count(Answer::Unaffected), 3, "{found:?}");
+        // Negative: a table change beside it still does.
+        let table = Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            name: "extra".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        };
+        let drop = Change::DropExtension {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            definition,
+            requirers: BTreeSet::new(),
+            releases: BTreeSet::new(),
+        };
+        assert!(with(&base, vec![drop, table]).requires_resolution());
     }
 
     /// Ordinary table changes are not exempt (ADR-0016 §1): a column that

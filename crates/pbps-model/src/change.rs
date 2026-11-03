@@ -340,6 +340,27 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         requires: BTreeSet<Uid>,
     },
+    /// `DROP EXTENSION name RESTRICT` of a package a recorded human intent
+    /// retires (DEC-2447.8). It deletes every member of the package and every
+    /// object that depends on it by `DEPENDS ON EXTENSION`, so it is
+    /// `destructive` and is sealed with the target's own manifest and the
+    /// outside objects it accepted (`Plan::extension_drops`).
+    DropExtension {
+        uid: Uid,
+        name: ObjectLocalName,
+        /// The package as the target held it, which the pin must repeat.
+        definition: crate::Extension,
+        /// The packages of this plan that require this one, by uid: each is
+        /// dropped first, as its own control file's `requires` forbids the
+        /// other order. A requirer that survives is a plan-time refusal.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        requirers: BTreeSet<Uid>,
+        /// The modules this plan also drops that the package's removal would
+        /// otherwise delete (`x` dependents) or be blocked by (a view over a
+        /// member function): the drop waits for each.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        releases: BTreeSet<crate::ModuleId>,
+    },
     CreateTable {
         uid: Uid,
         name: TableName,
@@ -1501,7 +1522,7 @@ macro_rules! catalog_change {
             | $crate::Change::RenameType { .. }
     };
     (extensions) => {
-        $crate::Change::CreateExtension { .. }
+        $crate::Change::CreateExtension { .. } | $crate::Change::DropExtension { .. }
     };
 }
 
@@ -1602,7 +1623,9 @@ impl Change {
             Change::RenameRole { from, .. } => {
                 format!("role {}", from.raw())
             }
-            Change::CreateExtension { name, .. } => format!("extension {}", name.raw()),
+            Change::CreateExtension { name, .. } | Change::DropExtension { name, .. } => {
+                format!("extension {}", name.raw())
+            }
             // The routine, not the grantee. `PUBLIC` is every principal at
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
@@ -2362,6 +2385,7 @@ impl Change {
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
+            | Change::DropExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2859,6 +2883,7 @@ impl Change {
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
+            | Change::DropExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -3115,7 +3140,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // depends on it, not data — so it faces the gate, but needs no
             // tombstone and no reason: the definition is in git history, which
             // is this object family's audit trail (ADR-0002).
-            Change::DropType { .. } | Change::DropModule { .. } => {
+            Change::DropType { .. } | Change::DropModule { .. } | Change::DropExtension { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             // A role rename keeps its membership — which is why it is a

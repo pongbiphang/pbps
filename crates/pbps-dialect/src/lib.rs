@@ -265,13 +265,18 @@ pub struct DeclaredTypeStatement {
     pub after_vet: Option<String>,
 }
 
-/// A package install boundary supplied by the emitter, never inferred from
+/// A package install or drop boundary supplied by the emitter, never inferred from
 /// SQL: the executor vets the members the statement leaves against the plan's
 /// pinned manifest in its own transaction (DEC-2447.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionStatement {
     pub uid: pbps_model::Uid,
     pub name: pbps_model::ObjectLocalName,
+    /// The statement drops the package. The executor then vets the target's
+    /// manifest and the objects outside it *before* the statement and confirms
+    /// everything sealed is gone after it, where an install is vetted after
+    /// only (DEC-2447.8).
+    pub drops: bool,
 }
 
 /// One executable statement.

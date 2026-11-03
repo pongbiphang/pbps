@@ -402,6 +402,98 @@ async fn extension_creates(
         .collect())
 }
 
+/// The packages a recorded intent retires, by name: held by the target, no
+/// longer declared, and tombstoned in the identity this plan will carry.
+fn retired_extensions(
+    base: &Schema,
+    declared: &Schema,
+    recorded: &IdsFile,
+    ids: &IdsFile,
+) -> BTreeSet<pbps_model::ObjectLocalName> {
+    base.extensions
+        .keys()
+        .filter(|name| !declared.extensions.contains_key(*name))
+        .filter(|name| {
+            recorded
+                .extension_uid(name)
+                .is_some_and(|uid| ids.tombstones.contains_key(uid))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What the target says dropping each retired package would reach, judged
+/// before any plan is written (DEC-2447.8): the connected role must be allowed
+/// to drop it, and the facts become the differ's input, which carries what the
+/// plan also removes and refuses the rest by name.
+async fn extension_drop_facts(
+    conn: &mut pbps_db::Conn,
+    retired: &BTreeSet<pbps_model::ObjectLocalName>,
+) -> anyhow::Result<BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionDropFacts>> {
+    if retired.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let names: BTreeSet<String> = retired.iter().map(|n| n.raw().to_owned()).collect();
+    let problems = pbps_pg::extension_provider::drop_problems(conn, &names).await?;
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("\n"));
+    let all = pbps_pg::extension_provider::providers(conn).await?;
+    let mut facts = pbps_pg::extension_provider::drop_facts(conn, &all).await?;
+    Ok(retired
+        .iter()
+        .filter_map(|name| Some((name.clone(), facts.remove(name.raw())?)))
+        .collect())
+}
+
+/// The sealed evidence of each drop: the manifest the target holds now, and
+/// what the drop reaches beyond it that the plan accepted. A package the
+/// target no longer holds as the plan assumed is refused, never sealed.
+async fn extension_drop_pins(
+    conn: &mut pbps_db::Conn,
+    cs: &pbps_model::ChangeSet,
+) -> anyhow::Result<Vec<pbps_model::ExtensionDropPin>> {
+    let drops: Vec<_> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::DropExtension {
+                uid,
+                name,
+                definition,
+                ..
+            } = &p.change
+            {
+                Some((uid, name, definition))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if drops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = pbps_pg::extension_provider::providers(conn).await?;
+    let mut facts = pbps_pg::extension_provider::drop_facts(conn, &all).await?;
+    drops
+        .into_iter()
+        .map(|(uid, name, definition)| {
+            let manifest = all.get(name.raw()).filter(|m| m.definition == *definition);
+            let manifest = manifest.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "extension `{}` is not installed as the plan assumed, so the plan cannot pin its drop",
+                    name.shown()
+                )
+            })?;
+            Ok(pbps_model::ExtensionDropPin {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: definition.clone(),
+                manifest: manifest.clone(),
+                outside: facts.remove(name.raw()).unwrap_or_default().outside,
+            })
+        })
+        .collect()
+}
+
 /// The sealed evidence of each create: the manifest the rehearsal read, after
 /// the check that no member is also an object the declaration manages. A
 /// create the rehearsal did not capture is refused, never sealed empty.
@@ -5000,14 +5092,39 @@ fn refuse_pinned_movement(
             _ => None,
         })
         .collect();
+    // The packages a drop removes: standing until its statement, absent from
+    // it on, and in exactly the pinned definition while they stand.
+    let removals: BTreeMap<&pbps_model::ObjectLocalName, &pbps_model::Extension> = changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            pbps_model::Change::DropExtension {
+                name, definition, ..
+            } => Some((name, definition)),
+            _ => None,
+        })
+        .collect();
     let extensions: BTreeSet<_> = before
         .extensions
         .keys()
         .chain(after.extensions.keys())
         .chain(installs.keys().copied())
+        .chain(removals.keys().copied())
         .collect();
     for name in extensions {
         let (was, now) = (before.extensions.get(name), after.extensions.get(name));
+        if let Some(pinned) = removals.get(name) {
+            if was.is_some_and(|was| was != *pinned)
+                || now.is_some_and(|now| now != *pinned)
+                || (now.is_some() && !matches!(settled, Settled::SoFar))
+            {
+                bail!(
+                    "extension `{}` does not match what its plan promised during {label}",
+                    name.shown()
+                )
+            }
+            continue;
+        }
         match installs.get(name) {
             None if was != now => bail!("extension `{}` changed during {label}", name.shown()),
             // A resumed run starts from a checkpoint that may already hold
@@ -6956,6 +7073,7 @@ async fn bootstrap_async(
                 enum_dependents: Default::default(),
                 // Nothing is created here: the packages are the prerequisites.
                 extension_requires: Default::default(),
+                extension_drops: Default::default(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
                 // Carried for the same reason, and one more: it is what decides
@@ -8023,6 +8141,11 @@ async fn plan_db_async(
             hints.domain_array_holders =
                 pbps_pg::domain_alter::array_holders(&mut conn, &domains).await?;
             hints.extension_requires = extension_creates(&mut conn, &base, &declared, &resolved.ids).await?;
+            hints.extension_drops = extension_drop_facts(
+                &mut conn,
+                &retired_extensions(&base, &declared, &recorded_ids, &resolved.ids),
+            )
+            .await?;
         }
         // SQL Server's computed columns that stand throughout are judged by
         // the catalog's edges below (`order_computed_by_edges`), under the
@@ -8911,6 +9034,7 @@ async fn plan_db_async(
             return Err(error);
         }
         let extension_pins = extension_pins(&cs, manifests, &declared, &resolved.ids)?;
+        let extension_drops = extension_drop_pins(&mut conn, &cs).await?;
         Ok(Connected::Ordinary(Box::new((
             cs,
             // The zone this session started in: what every offset-less
@@ -8946,7 +9070,7 @@ async fn plan_db_async(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins),
+            (rehearsal, extension_pins, extension_drops),
         ))))
     }).await?;
         let (
@@ -8962,7 +9086,7 @@ async fn plan_db_async(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins),
+            (rehearsal, extension_pins, extension_drops),
         ) = match connected {
             Connected::Ordinary(planned) => *planned,
             Connected::Refused {
@@ -9116,6 +9240,7 @@ async fn plan_db_async(
         plan.trusted_roles = project.config.trusted_roles.clone();
         plan.rehearsal = rehearsal;
         plan.extension_pins = extension_pins;
+        plan.extension_drops = extension_drops;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -10388,6 +10513,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     Some(&entry.snapshot.declared.overlay(&previous)),
                 )
                 .await?;
+                if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {
+                    vet_before_extension_drop(conn, dropped, &plan.extension_drops).await?;
+                }
                 conn.execute(&stmt.sql).await?;
                 retained_verified =
                     crate::engine::verify_retained(conn, retained.as_ref(), &previous).await?;
@@ -10399,8 +10527,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     )
                     .await?;
                 }
-                if let Some(installed) = &stmt.extension {
-                    vet_installed_extension(conn, installed, &plan.extension_pins).await?;
+                if let Some(extension) = &stmt.extension {
+                    if extension.drops {
+                        confirm_extension_dropped(conn, extension).await?;
+                    } else {
+                        vet_installed_extension(conn, extension, &plan.extension_pins).await?;
+                    }
                 }
                 crate::engine::refuse_unsafe_definers(
                     conn,
@@ -10487,9 +10619,13 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             }
         }
         if let Some(installed) = &stmt.extension {
-            live_ids
-                .extensions
-                .insert(installed.uid.clone(), installed.name.clone());
+            if installed.drops {
+                live_ids.extensions.remove(&installed.uid);
+            } else {
+                live_ids
+                    .extensions
+                    .insert(installed.uid.clone(), installed.name.clone());
+            }
         }
         adopt_created(&mut live_ids, &plan.ids, &stmt.creates);
 
@@ -11617,6 +11753,12 @@ async fn execute_statement(
     }
     crate::engine::check_data_write(conn, stmt, data_guard).await?;
     crate::engine::check_drop_requirement(conn, stmt).await?;
+    // A drop is vetted before it runs: what it would delete is judged while
+    // it can still be refused, not after (DEC-2447.8).
+    if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {
+        let pins = reviewed.map_or(&[][..], |a| a.plan.extension_drops.as_slice());
+        vet_before_extension_drop(conn, dropped, pins).await?;
+    }
     if let Some(progress) = progress {
         progress.started.set(true);
     }
@@ -11638,9 +11780,13 @@ async fn execute_statement(
     if let Some(type_statement) = &stmt.declared_type {
         pbps_pg::type_refs::declared::vet(conn, type_statement, trusted).await?;
     }
-    if let Some(installed) = &stmt.extension {
-        let pins = reviewed.map_or(&[][..], |a| a.plan.extension_pins.as_slice());
-        vet_installed_extension(conn, installed, pins).await?;
+    if let Some(extension) = &stmt.extension {
+        if extension.drops {
+            confirm_extension_dropped(conn, extension).await?;
+        } else {
+            let pins = reviewed.map_or(&[][..], |a| a.plan.extension_pins.as_slice());
+            vet_installed_extension(conn, extension, pins).await?;
+        }
     }
     Ok(())
 }
@@ -11671,6 +11817,44 @@ async fn vet_installed_extension(
         })
 }
 
+/// The check before a `DROP EXTENSION` runs, in the statement's own
+/// transaction: the manifest and the objects outside it must be what the plan
+/// was approved over, and a pin must exist (DEC-2447.8).
+async fn vet_before_extension_drop(
+    conn: &mut Conn,
+    dropped: &pbps_dialect::ExtensionStatement,
+    pins: &[pbps_model::ExtensionDropPin],
+) -> anyhow::Result<()> {
+    let pin = pins
+        .iter()
+        .find(|p| p.uid == dropped.uid && p.name == dropped.name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "extension `{}` has no pinned manifest in the plan, so what its drop reaches cannot be vetted",
+                dropped.name.shown()
+            )
+        })?;
+    pbps_pg::extension_provider::vet_before_drop(conn, dropped.name.raw(), pin)
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context("nothing was dropped and nothing was recorded")
+        })
+}
+
+/// The check right after a `DROP EXTENSION`, before its transaction commits:
+/// the package and everything reachable from it are gone, or the drop is taken
+/// back with the rest (DEC-2447.8).
+async fn confirm_extension_dropped(
+    conn: &mut Conn,
+    dropped: &pbps_dialect::ExtensionStatement,
+) -> anyhow::Result<()> {
+    pbps_pg::extension_provider::confirm_dropped(conn, dropped.name.raw())
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context("the drop was rolled back and nothing was recorded")
+        })
+}
+
 /// The opening check of an apply that installs packages, under the lock: the
 /// target must still be one the plan was made against, with the same sentences
 /// the planner gives. Nothing has run when it refuses.
@@ -11678,6 +11862,34 @@ async fn recheck_extension_creates(
     conn: &mut Conn,
     plan: &pbps_model::SavedPlan,
 ) -> anyhow::Result<()> {
+    if !plan.extension_drops.is_empty() {
+        // Each package this plan drops is still installed as it was pinned and
+        // the role may still drop it: the planner's sentences, before a
+        // statement runs.
+        let names: BTreeSet<String> = plan
+            .extension_drops
+            .iter()
+            .map(|p| p.name.raw().to_owned())
+            .collect();
+        let mut problems = pbps_pg::extension_provider::drop_problems(conn, &names).await?;
+        let held = pbps_pg::extension_provider::installed(conn).await?;
+        for pin in &plan.extension_drops {
+            if held
+                .get(pin.name.raw())
+                .is_some_and(|d| *d != pin.definition)
+            {
+                problems.push(format!(
+                    "extension `{}` is no longer installed as it was planned",
+                    pin.name.shown()
+                ));
+            }
+        }
+        anyhow::ensure!(
+            problems.is_empty(),
+            "nothing was applied: {}",
+            problems.join("; ")
+        );
+    }
     if plan.extension_pins.is_empty() {
         return Ok(());
     }
@@ -25506,6 +25718,103 @@ mod extension_guard_tests {
     /// exactly the pinned definition, and fails the close if it did not
     /// (DEC-2447.6). Without this a create that never took effect, or took
     /// effect as another version, would be recorded as applied.
+    /// The package a plan drops stands as pinned until its statement and is
+    /// gone from the close on; a drop that did not take effect fails the
+    /// closing read, and no other package may move (DEC-2447.8).
+    #[test]
+    fn a_dropped_package_stands_as_pinned_until_its_statement_and_is_gone_at_the_close() {
+        let pinned = pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.5".into(),
+        };
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropExtension {
+                    uid: "e_aaaaaa".parse().unwrap(),
+                    name: "cube".into(),
+                    definition: pinned.clone(),
+                    requirers: Default::default(),
+                    releases: Default::default(),
+                },
+            )],
+        };
+        let mut before = Schema::default();
+        for (name, version) in [("cube", "1.5"), ("standing", "1.0")] {
+            before.extensions.insert(
+                name.into(),
+                pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: version.into(),
+                },
+            );
+        }
+        let ids = guard::fixture_ids(&changes, &before);
+        let plan = guard::Plan {
+            changes: &changes,
+            ids: &ids,
+        };
+        let staged = guard::Staged::new(plan).unwrap();
+        let after_with = |extension: Option<pbps_model::Extension>| {
+            let mut after = before.clone();
+            after.extensions.remove("cube");
+            after
+                .extensions
+                .extend(extension.map(|e| ("cube".into(), e)));
+            after
+        };
+        let check = |read: guard::Read<'_>, after: &Schema| {
+            refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
+                .map_err(|e| e.to_string())
+        };
+        let closing = || guard::Read::transactional(plan);
+        let midway = || {
+            staged.read(StagedRead::Checkpoint {
+                completed: 0,
+                total: 1,
+            })
+        };
+        // Gone at the close and at a checkpoint after the statement; standing
+        // as pinned at a checkpoint before it.
+        check(closing(), &after_with(None)).unwrap();
+        check(midway(), &after_with(None)).unwrap();
+        check(midway(), &after_with(Some(pinned.clone()))).unwrap();
+        // Still there at the close: the drop did not take effect.
+        let error = check(closing(), &after_with(Some(pinned.clone()))).unwrap_err();
+        assert!(
+            error.contains("`cube`") && error.contains("promised"),
+            "{error}"
+        );
+        // Another version or schema standing is refused wherever it is read.
+        for other in [
+            pbps_model::Extension {
+                version: "1.6".into(),
+                ..pinned.clone()
+            },
+            pbps_model::Extension {
+                schema: "other".into(),
+                ..pinned.clone()
+            },
+        ] {
+            for read in [closing(), midway()] {
+                let error = check(read, &after_with(Some(other.clone()))).unwrap_err();
+                assert!(error.contains("promised"), "{error}");
+            }
+        }
+        // The drop of one package excuses no other moving.
+        let mut moved = after_with(None);
+        moved.extensions.get_mut("standing").unwrap().version = "2.0".into();
+        assert!(check(closing(), &moved).unwrap_err().contains("`standing`"));
+        let mut appeared = after_with(None);
+        appeared
+            .extensions
+            .insert("unplanned".into(), pinned.clone());
+        assert!(
+            check(closing(), &appeared)
+                .unwrap_err()
+                .contains("`unplanned`")
+        );
+    }
+
     #[test]
     fn only_the_pinned_package_may_appear_and_the_close_requires_it() {
         let pinned = pbps_model::Extension {

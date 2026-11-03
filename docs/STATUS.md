@@ -9,14 +9,15 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 PostgreSQL extension adoption is available (#2447 PR A, DEC-2447.1), and
 `plan --db` plans a pinned `CREATE EXTENSION` (#2447 PR B, DEC-2447.6): rehearsed
 on the resolver scratch, gated as `extension-code`, sealed with the package's
-member manifest and vetted in the transaction that installs it. exact quoted versions, explicit schemas, `e_` identities, pull,
+member manifest and vetted in the transaction that installs it. A recorded
+package is dropped by `pbps drop-extension` and a gated, sealed `DROP EXTENSION
+RESTRICT` (#2447 PR C, DEC-2447.8, DEC-2447.9; plan format 61). Exact quoted versions, explicit schemas, `e_` identities, pull,
 baseline, verify and no-op plans. Pull selects new packages only through
 repeatable `--extension NAME`; existing declarations/identities stay selected.
 Unselected installed packages remain inventory with an opt-in hint (DEC-2447.3).
 Connected bootstrap adopts exact preinstalled
 package prerequisites without lifecycle DDL (DEC-2447.2); SQL replay checks
-exact package metadata before DDL. UPDATE, SET SCHEMA and DROP refuse by action
-name. Installed extension members remain excluded; unheld packages remain census
+exact package metadata before DDL. UPDATE and SET SCHEMA refuse by action name. Installed extension members remain excluded; unheld packages remain census
 advisories. Declarations that use a package's members and extension-provided
 type/operator-class support remain later #2447 slices.
 

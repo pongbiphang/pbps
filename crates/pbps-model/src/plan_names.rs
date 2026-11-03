@@ -359,6 +359,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateExtension { .. }
+        | Change::DropExtension { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { .. }

@@ -310,10 +310,12 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             feature: format!("declared type {}", name.shown()),
         }),
-        Change::CreateExtension { name, .. } => Err(DialectError::Unsupported {
-            dialect: crate::types::DIALECT,
-            feature: format!("extension {}", name.shown()),
-        }),
+        Change::CreateExtension { name, .. } | Change::DropExtension { name, .. } => {
+            Err(DialectError::Unsupported {
+                dialect: crate::types::DIALECT,
+                feature: format!("extension {}", name.shown()),
+            })
+        }
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable { name, table, .. } => {
@@ -2404,6 +2406,36 @@ mod tests {
 
     use super::*;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid};
+
+    /// SQL Server has no packages: neither the install nor the drop of one is
+    /// ever emitted, whatever a plan carries (DEC-2447.6, DEC-2447.8).
+    #[test]
+    fn a_package_install_or_drop_is_unsupported_on_sql_server() {
+        let definition = pbps_model::Extension {
+            schema: "ext".into(),
+            version: "1.0".into(),
+        };
+        for change in [
+            Change::CreateExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: definition.clone(),
+                requires: Default::default(),
+            },
+            Change::DropExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                definition: definition.clone(),
+                requirers: Default::default(),
+                releases: Default::default(),
+            },
+        ] {
+            let error = super::emit(&change, Strategy::default())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("extension citext"), "{error}");
+        }
+    }
 
     fn indexed_view() -> (ModuleId, Module) {
         let index = |keys: &[&str], include: &[&str], unique: bool| pbps_model::Index {

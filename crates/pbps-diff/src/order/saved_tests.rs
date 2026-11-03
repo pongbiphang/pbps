@@ -356,3 +356,132 @@ fn admission_refuses_a_create_whose_pin_was_removed() {
     let checksum = whole.wire_fingerprint();
     assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
 }
+
+/// A plan that drops `cube` and `earthdistance` (which requires it): each drop
+/// is sealed with one manifest, the plan's identities tombstone both with a
+/// reason, and the requirer is dropped by the same plan.
+fn drop_plan() -> SavedPlan {
+    let definition = pbps_model::Extension {
+        schema: "ext".into(),
+        version: "1.0".into(),
+    };
+    let mut plan = wire();
+    plan.changes.changes = vec![
+        PlannedChange::new(Change::DropExtension {
+            uid: "e_000002".parse().unwrap(),
+            name: "earthdistance".into(),
+            definition: definition.clone(),
+            requirers: Default::default(),
+            releases: Default::default(),
+        }),
+        PlannedChange::new(Change::DropExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "cube".into(),
+            definition: definition.clone(),
+            requirers: ["e_000002".parse().unwrap()].into(),
+            releases: Default::default(),
+        }),
+    ];
+    plan.ids.tombstones = [("e_000001", "cube"), ("e_000002", "earthdistance")]
+        .into_iter()
+        .map(|(uid, name)| {
+            (
+                uid.parse().unwrap(),
+                pbps_model::Tombstone {
+                    require: None,
+                    was: name.into(),
+                    dropped_at: "2026-11-02".into(),
+                    reason: "retired".into(),
+                    operator: "test".into(),
+                },
+            )
+        })
+        .collect();
+    plan.extension_drops = ["e_000001", "e_000002"]
+        .iter()
+        .zip(["cube", "earthdistance"])
+        .map(|(uid, name)| pbps_model::ExtensionDropPin {
+            uid: uid.parse().unwrap(),
+            name: name.into(),
+            definition: definition.clone(),
+            manifest: pbps_model::ExtensionProvider {
+                definition: definition.clone(),
+                requires: Default::default(),
+                members: Default::default(),
+            },
+            outside: Default::default(),
+        })
+        .collect();
+    plan
+}
+
+/// Each drop is sealed with exactly one manifest that says the same thing the
+/// change does, recorded by a tombstone with a reason and no live entry, and a
+/// requirer it waits for is dropped by the plan too (DEC-2447.8).
+#[test]
+fn every_drop_has_exactly_its_own_pin_a_tombstone_and_the_requirers_it_waits_for() {
+    let check = |plan: &SavedPlan| super::saved::package_pins_match_their_drops(plan);
+    assert!(check(&drop_plan()).is_ok());
+    type Edit = (&'static str, fn(&mut SavedPlan));
+    let edits: [Edit; 9] = [
+        ("a drop with no pin", |p| {
+            p.extension_drops.pop();
+        }),
+        ("a pin with no drop", |p| {
+            p.changes.changes.pop();
+        }),
+        ("a pin twice", |p| {
+            let again = p.extension_drops[0].clone();
+            p.extension_drops.push(again);
+        }),
+        ("another version in the pin", |p| {
+            p.extension_drops[0].definition.version = "1.6".into();
+        }),
+        ("another schema in the manifest", |p| {
+            p.extension_drops[1].manifest.definition.schema = "other".into();
+        }),
+        ("no tombstone", |p| {
+            p.ids.tombstones.remove(&"e_000001".parse().unwrap());
+        }),
+        ("a tombstone with a blank reason", |p| {
+            p.ids
+                .tombstones
+                .get_mut(&"e_000001".parse().unwrap())
+                .unwrap()
+                .reason = "  ".into();
+        }),
+        ("the package still live in the ids", |p| {
+            p.ids
+                .extensions
+                .insert("e_000001".parse().unwrap(), "cube".into());
+        }),
+        ("a requirer the plan does not drop", |p| {
+            if let Change::DropExtension { requirers, .. } = &mut p.changes.changes[1].change {
+                requirers.insert("e_000009".parse().unwrap());
+            }
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut plan = drop_plan();
+        edit(&mut plan);
+        let error = check(&plan).expect_err(what).to_string();
+        assert!(
+            error.contains("extension evidence disagrees"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// The check is part of admission: an edited plan whose drop lost its pin is
+/// refused by `admit`, and the plan as written gets past it.
+#[test]
+fn admission_refuses_a_drop_whose_pin_was_removed() {
+    let mut plan = drop_plan();
+    plan.extension_drops.pop();
+    let checksum = plan.wire_fingerprint();
+    let error = refusal(plan, &checksum);
+    assert!(error.contains("extension evidence disagrees"), "{error}");
+    let whole = drop_plan();
+    let checksum = whole.wire_fingerprint();
+    assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
+}
