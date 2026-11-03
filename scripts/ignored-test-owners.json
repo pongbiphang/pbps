@@ -208,6 +208,16 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "domain_defaults2537::copied_defaults_bootstrap_and_keep_their_creation_values_after_base_edits",
+        "domain_defaults2537::explicit_defaults_equal_to_a_copy_are_written_and_can_be_removed"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
         "unmanaging_a_bridge_role_keeps_its_chain_and_needs_no_resolver_on_pg18"
       ]
     },

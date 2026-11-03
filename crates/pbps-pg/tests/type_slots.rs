@@ -549,9 +549,16 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
                 altered: false,
                 after_vet: None,
             };
-            declared::vet(&mut conn, &metadata, &Default::default())
-                .await
-                .unwrap();
+            declared::vet(
+                &mut conn,
+                &metadata,
+                &Default::default(),
+                &[],
+                &Default::default(),
+                &[],
+            )
+            .await
+            .unwrap();
             let mut statement = pbps_dialect::Statement::new(sql[i]);
             statement.declared_type = Some(metadata);
             executed.push(statement);
@@ -650,6 +657,9 @@ async fn a_domain_tightening_is_vetted_after_its_add_and_before_its_validation()
                 "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT probed",
             ),
             &Default::default(),
+            &[],
+            &Default::default(),
+            &[],
         )
         .await;
         assert!(refused.is_err());
@@ -678,6 +688,9 @@ async fn a_domain_tightening_is_vetted_after_its_add_and_before_its_validation()
                 "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT short",
             ),
             &Default::default(),
+            &[],
+            &Default::default(),
+            &[],
         )
         .await
         .unwrap();
@@ -698,6 +711,9 @@ async fn a_domain_tightening_is_vetted_after_its_add_and_before_its_validation()
                 "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT tiny",
             ),
             &Default::default(),
+            &[],
+            &Default::default(),
+            &[],
         )
         .await;
         assert!(failed.unwrap_err().to_string().contains("violate"));

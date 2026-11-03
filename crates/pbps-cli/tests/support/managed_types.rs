@@ -1380,6 +1380,9 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                                 &mut conn,
                                 statement.declared_type.as_ref().unwrap(),
                                 &trusted,
+                                &saved.declared_type_pins,
+                                &saved.changes,
+                                &statements[..=completed],
                             )
                             .await
                             .unwrap();

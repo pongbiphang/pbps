@@ -1411,8 +1411,14 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 else {
                     return false;
                 };
+                // The payload is authored; the before-pin is still raw.
+                // Admit the same scalar-derived omission as the declaration
+                // overlay, without weakening the applying catalog drift guard.
+                let copied = anchors
+                    .get(uid)
+                    .is_some_and(|catalog| from.projects_copied_default(catalog));
                 if not_null != from_not_null
-                    || default.is_some() != from_default.is_some()
+                    || (default.is_some() != from_default.is_some() && !copied)
                     || collation != from_collation
                     || !checks.keys().eq(from_checks.keys())
                 {
@@ -2342,6 +2348,60 @@ mod tests {
                 .map(|(name, text)| ((*name).into(), (*text).to_owned()))
                 .collect(),
             collation: None,
+        }
+    }
+
+    #[test]
+    fn a_saved_explicit_default_can_replace_an_authored_omission_over_a_physical_copy() {
+        for base in ["app.inner", "integer", "app.inner[]"] {
+            let domain = |default| {
+                let mut out = code(false, default, &[]);
+                let ManagedType::Domain { base: at, .. } = &mut out else {
+                    unreachable!()
+                };
+                *at = base.parse().unwrap();
+                out
+            };
+            let from = domain(None);
+            let to = domain(Some("7"));
+            let pin = DeclaredTypePin {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.outer".parse().unwrap(),
+                definition: to.clone(),
+                before: Some(DeclaredTypeBefore {
+                    name: "app.outer".parse().unwrap(),
+                    definition: to.clone(),
+                }),
+            };
+            let changes = ChangeSet {
+                changes: vec![PlannedChange::new(Change::AlterDomain {
+                    uid: pin.uid.clone(),
+                    name: pin.name.clone(),
+                    from: Box::new(from.clone()),
+                    to: Box::new(to),
+                    half: pbps_model::DomainHalf::Loosen,
+                })],
+            };
+            assert_eq!(
+                valid_steps(&changes, std::slice::from_ref(&pin)),
+                base == "app.inner"
+            );
+            let mut wrong = pin.clone();
+            let ManagedType::Domain { not_null, .. } =
+                &mut wrong.before.as_mut().unwrap().definition
+            else {
+                unreachable!()
+            };
+            *not_null = true;
+            assert!(
+                !valid_steps(&changes, &[wrong]),
+                "copied DEFAULT excuses no other field"
+            );
+            assert_eq!(
+                pin.before.as_ref().unwrap().definition,
+                domain(Some("7")),
+                "raw before-pin remains intact"
+            );
         }
     }
 

@@ -4993,6 +4993,7 @@ fn staged_movement(
         environment,
         read,
         None,
+        None,
     )
 }
 
@@ -5005,11 +5006,31 @@ fn refuse_pinned_movement(
     label: &str,
 ) -> anyhow::Result<()> {
     let verified = read.retained();
+    let defaults = read.domain_defaults();
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let mut named_before = sequences_named(dialect, before);
     use pbps_diff::identity::type_refs::{TypeResolver, TypeSide, after_changes, before_changes};
     let base_ids = before_changes(plan.ids, changes);
+    let physical_types = match defaults {
+        Some(defaults) => std::borrow::Cow::Borrowed(defaults),
+        None => std::borrow::Cow::Owned(pbps_pg::type_refs::declared::completed(
+            before, &base_ids, changes,
+        )),
+    };
+    let realized = |uid, definition: &pbps_model::ManagedType| {
+        let mut expected = definition.clone();
+        if let (
+            pbps_model::ManagedType::Domain { default, .. },
+            Some(pbps_model::ManagedType::Domain {
+                default: physical, ..
+            }),
+        ) = (&mut expected, physical_types.get(uid))
+        {
+            *default = physical.clone();
+        }
+        expected
+    };
     let desired_ids = after_changes(&base_ids, changes);
     let resolver = TypeResolver::new(&base_ids, &desired_ids);
     let renames = pbps_pg::type_refs::renames::TypeRenames::resolved(&base_ids, &desired_ids);
@@ -5044,7 +5065,7 @@ fn refuse_pinned_movement(
                 uid, definition, ..
             } => {
                 if let Some(name) = resolver.name(TypeSide::Desired, uid) {
-                    expected_types.insert(name.clone(), Some(definition.as_ref()));
+                    expected_types.insert(name.clone(), Some(realized(uid, definition)));
                 }
             }
             // The replacement may stand anywhere between its creation and the
@@ -5055,7 +5076,7 @@ fn refuse_pinned_movement(
                 if let pbps_model::EnumRebuildStep::Swap { definition, .. } = step
                     && let Some(name) = resolver.name(TypeSide::Desired, uid)
                 {
-                    expected_types.insert(name.clone(), Some(definition.as_ref()));
+                    expected_types.insert(name.clone(), Some(realized(uid, definition)));
                 }
             }
             _ => {}
@@ -9763,7 +9784,14 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         if let Some(resolved) = resolved {
             resolved.before_statements(conn).await?;
         }
-        execute_statements(conn, statements, &data_guard, Some(&approved), progress).await?;
+        let domain_defaults = pbps_pg::type_refs::declared::capture_defaults(
+            conn,
+            &plan.declared_type_pins,
+            &plan.changes,
+            pbps_pg::pins::Within::CallersTransaction,
+        )
+        .await?;
+        execute_statements(conn, statements, &data_guard, &approved, progress).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
             conn,
@@ -9855,7 +9883,8 @@ async fn apply_under_lock<D: crate::emission::Engine>(
                 changes: &plan.changes,
                 ids: &plan.ids,
             })
-            .with_retained(verified.as_ref()),
+            .with_retained(verified.as_ref())
+            .with_domain_defaults(Some(&domain_defaults)),
             &before,
             &after.schema,
             &target.label,
@@ -10432,6 +10461,13 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // Whether this run has a checkpoint to resume from: a resumed run starts
     // on one.
     let mut checkpointed = entry.snapshot.staged.is_some();
+    let domain_defaults = pbps_pg::type_refs::declared::capture_defaults(
+        conn,
+        &plan.declared_type_pins,
+        &plan.changes,
+        pbps_pg::pins::Within::OwnTransaction,
+    )
+    .await?;
     for (i, stmt) in statements.iter().enumerate().skip(start) {
         // Before each step, including the first after a resume, which skips
         // the check before the probes along with the probes.
@@ -10524,6 +10560,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                         conn,
                         type_statement,
                         &project.config.trusted_roles,
+                        &plan.declared_type_pins,
+                        &plan.changes,
+                        &statements[..=i],
                     )
                     .await?;
                 }
@@ -10753,6 +10792,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 total,
             },
             retained_verified.as_ref(),
+            Some(&domain_defaults),
         )?;
         previous = recorded;
     }
@@ -10813,6 +10853,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             target.environment(),
             StagedRead::Closing { total },
             verified.as_ref(),
+            Some(&domain_defaults),
         )?;
         // The same read, and the half of it no `Schema` holds. Refused here for
         // the reason the movement check above is: this is the last window, and
@@ -11045,10 +11086,13 @@ fn staged_pinned_movement<'a>(
     environment: Option<&str>,
     read: StagedRead,
     verified: Option<&'a pbps_pg::retained::Verified>,
+    defaults: Option<&'a pbps_pg::type_refs::declared::DomainDefaults>,
 ) -> anyhow::Result<()> {
     refuse_pinned_movement(
         dialect,
-        plan.read(read).with_retained(verified),
+        plan.read(read)
+            .with_retained(verified)
+            .with_domain_defaults(defaults),
         before,
         after,
         label,
@@ -11695,6 +11739,7 @@ async fn execute_transaction_body(
             position,
             &crate::engine::DataWriteGuard::default(),
             None,
+            changes,
             trusted,
             None,
         )
@@ -11707,7 +11752,7 @@ async fn execute_statements(
     conn: &mut Conn,
     statements: &crate::emission::LoweredPlan,
     data_guard: &crate::engine::DataWriteGuard,
-    reviewed: Option<&crate::pins::Approved<'_>>,
+    reviewed: &crate::pins::Approved<'_>,
     progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
     for position in 0..statements.len() {
@@ -11716,10 +11761,9 @@ async fn execute_statements(
             statements,
             position,
             data_guard,
-            reviewed,
-            reviewed
-                .map(|a| &a.project.config.trusted_roles)
-                .unwrap_or(&BTreeSet::new()),
+            Some(reviewed),
+            &reviewed.plan.changes,
+            &reviewed.project.config.trusted_roles,
             progress,
         )
         .await?;
@@ -11736,6 +11780,7 @@ async fn execute_statement(
     position: usize,
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
+    changes: &pbps_model::ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
     progress: Option<&services::Progress>,
 ) -> anyhow::Result<()> {
@@ -11778,7 +11823,15 @@ async fn execute_statement(
         )));
     }
     if let Some(type_statement) = &stmt.declared_type {
-        pbps_pg::type_refs::declared::vet(conn, type_statement, trusted).await?;
+        pbps_pg::type_refs::declared::vet(
+            conn,
+            type_statement,
+            trusted,
+            reviewed.map_or(&[][..], |a| a.plan.declared_type_pins.as_slice()),
+            changes,
+            &statements[..=position],
+        )
+        .await?;
     }
     if let Some(extension) = &stmt.extension {
         if extension.drops {

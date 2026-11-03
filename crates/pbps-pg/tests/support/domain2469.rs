@@ -66,19 +66,28 @@ async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode) {
         .unwrap()
     };
     let trusted = ["postgres".into()].into();
+    let mut executed = Vec::new();
     for group in lowered.groups() {
         if mode == PlanMode::Staged {
             db.conn.execute("BEGIN").await.unwrap();
         }
         for statement in group.statements() {
             db.conn.execute(&statement.sql).await.unwrap();
+            executed.push(statement.clone());
             if let Some(metadata) = &statement.declared_type {
                 // Every fixture routine is a SQL-standard body over built-ins,
                 // which tier 1 admits (DEC-2563.1): the gate passes and itself
                 // runs the `NOT VALID` tail before any dependent statement.
-                pbps_pg::type_refs::declared::vet(&mut db.conn, metadata, &trusted)
-                    .await
-                    .unwrap();
+                pbps_pg::type_refs::declared::vet(
+                    &mut db.conn,
+                    metadata,
+                    &trusted,
+                    &[],
+                    ordered.changes(),
+                    &executed,
+                )
+                .await
+                .unwrap();
             }
         }
         if mode == PlanMode::Staged {
@@ -330,16 +339,10 @@ async fn split_derived_defaults_override_temporary_inheritance() {
     inherited.deps.0[1].1 = ["type::c2469.d".parse().unwrap()].into();
     inherited.schema.modules = Fixture::new("default", false).schema.modules;
     for f in [inherited, Fixture::split_shadowing_default()] {
-        let plan = f
-            .compile(&pg)
-            .unwrap()
-            .ordered(PlanMode::Transactional, &pg);
-        let lowered = lower_all(&plan as &dyn pbps_diff::order::PlanView<Postgres>, &pg).unwrap();
-        // Existing implicit-default catalog policy is unchanged. This control
-        // executes certified SQL to measure the actual inherited snapshot.
-        for statement in lowered.iter() {
-            db.conn.execute(&statement.sql).await.unwrap();
-        }
+        db.conn.execute("BEGIN").await.unwrap();
+        // #2537 now holds inherited copies through the ordinary vet and the
+        // declaration projection too, rather than executing SQL without them.
+        apply(&mut db, &f, &pg, PlanMode::Transactional).await;
         let (ty, wanted) = if f.schema.types.len() == 3 {
             ("c2469.leaf", 11)
         } else {
@@ -353,7 +356,7 @@ async fn split_derived_defaults_override_temporary_inheritance() {
             .unwrap();
         assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(wanted));
         db.conn
-            .execute("DROP SCHEMA c2469 CASCADE; CREATE SCHEMA c2469")
+            .execute("COMMIT; DROP SCHEMA c2469 CASCADE; CREATE SCHEMA c2469")
             .await
             .unwrap();
     }

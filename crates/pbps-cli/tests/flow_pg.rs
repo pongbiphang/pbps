@@ -37,6 +37,9 @@ mod domain_vet2309;
 #[path = "support/retained2354.rs"]
 mod retained2354;
 
+#[path = "support/domain_defaults2537.rs"]
+mod domain_defaults2537;
+
 #[path = "support/managed_types.rs"]
 mod managed_types;
 
