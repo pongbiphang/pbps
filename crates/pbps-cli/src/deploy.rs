@@ -9759,7 +9759,6 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.changes,
         )
         .await?;
-        approved.require_reviewed(&admission)?;
         let retained = crate::engine::hold_retained(
             conn,
             &plan.changes,
@@ -11464,8 +11463,7 @@ async fn preflight<D: crate::emission::Engine>(
         Some(approved),
         progress,
     )
-    .await?;
-    approved.require_reviewed(&admission)
+    .await
 }
 
 /// The partitions the probes read the plan against: the relation as the
@@ -11848,9 +11846,6 @@ async fn execute_statement(
         crate::pins::Approved::admission,
     );
     crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
-    if let Some(approved) = reviewed {
-        approved.require_reviewed(&admission)?;
-    }
     // A drop is vetted before it runs: what it would delete is judged while
     // it can still be refused, not after (DEC-2447.8).
     if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {

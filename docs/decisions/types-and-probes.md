@@ -4912,8 +4912,10 @@ routine that exists and is untrusted waits for plan-time binding, the next slice
 of #2563). Widens DEC-2181.2: `pin_type_routines` admits a routine at every
 judged site, not only a referenced type's. The conversions, row requirements and
 copy conversions the plan holds are vetted at plan time and their reviewed
-routines join `type_routines`; apply refuses a reviewed routine the plan does
-not hold. Supersedes two sentences of DEC-2181.3 for routines: "pinning never
+routines join `type_routines`. Apply's admission holds that set, and a site
+refuses a reviewed routine outside it where it vets the expression, before
+anything evaluates it (a name that binds to a new overload after planning never
+runs). Supersedes two sentences of DEC-2181.3 for routines: "pinning never
 replaces owner trust" and "do not require a function-level `search_path`".
 DEC-2563.1's sentence that a refused user function "keeps `Why::NotBuiltin`" no
 longer applies: a function that is not tier 1 is judged by this predicate, and

@@ -580,3 +580,94 @@ async fn requirements_and_conversions_judge_a_routine_a_role_wrote_by_one_predic
         db.drop().await;
     }
 }
+
+async fn ran(db: &mut Scratch) -> bool {
+    db.conn
+        .query("SELECT is_called AS ran FROM app.ran")
+        .await
+        .unwrap()[0]
+        .try_get::<bool>("ran")
+        .unwrap()
+        .unwrap()
+}
+
+/// Apply's admission holds the set the plan showed and pinned (DEC-2563.2). A
+/// name that binds to another routine of an untrusted owner after planning (a
+/// new overload) is refused where it is vetted, before the count query or any
+/// probe evaluates it: the routine never runs. The held routine is the control
+/// and does run.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_routine_the_plan_did_not_hold_is_refused_before_anything_is_evaluated() {
+    use pbps_model::ColumnType;
+    for server in servers() {
+        let mut db = Scratch::create(&server, "requirements_approved_2563").await;
+        let label = server.label;
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        db.sql(&format!(
+            "CREATE SCHEMA app; CREATE SEQUENCE app.ran; CREATE TABLE app.t (amount integer NOT NULL);
+             INSERT INTO app.t VALUES (1); GRANT USAGE ON SCHEMA app TO {stranger};
+             CREATE FUNCTION app.held(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.ran'); RETURN true; END $$;
+             CREATE FUNCTION app.new_overload(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.ran'); RETURN true; END $$;
+             ALTER FUNCTION app.held(integer) OWNER TO {stranger};
+             ALTER FUNCTION app.new_overload(integer) OWNER TO {stranger};"
+        ))
+        .await;
+        let held: i64 = db
+            .conn
+            .query("SELECT 'app.held(integer)'::regprocedure::oid::int8 AS oid")
+            .await
+            .unwrap()[0]
+            .try_get("oid")
+            .unwrap()
+            .unwrap();
+        let approving = || Admission::new([], true).approving([held]);
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        let column = table.column("amount");
+        let integer = ColumnType::simple("integer");
+        let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+
+        // The requirement's count query, as apply runs it before the drop.
+        db.conn.begin(&framing).await.unwrap();
+        let refused = check(
+            &mut db.conn,
+            &approving(),
+            &guard("app.new_overload(amount)"),
+        )
+        .await
+        .unwrap_err();
+        db.conn.rollback(&framing).await.unwrap();
+        assert!(
+            refused.contains("did not show and pin"),
+            "on {label}: {refused}"
+        );
+        assert!(
+            !ran(&mut db).await,
+            "on {label}: the routine ran before it was refused"
+        );
+        db.conn.begin(&framing).await.unwrap();
+        check(&mut db.conn, &approving(), &guard("app.held(amount)"))
+            .await
+            .unwrap_or_else(|why| panic!("the held routine on {label}: {why}"));
+        db.conn.rollback(&framing).await.unwrap();
+        assert!(ran(&mut db).await, "on {label}: the control never ran");
+
+        // A conversion, which the pre-flight evaluates over the rows after this.
+        for (function, expect) in [("new_overload", false), ("held", true)] {
+            let using = format!("CASE WHEN app.{function}(amount) THEN 1 ELSE 0 END");
+            let outcome =
+                vet_conversion(&mut db.conn, &approving(), &column, &integer, &using).await;
+            assert_eq!(
+                outcome.is_ok(),
+                expect,
+                "{function} on {label}: {outcome:?}"
+            );
+            if let Err(why) = outcome {
+                assert!(why.contains("did not show and pin"), "on {label}: {why}");
+            }
+        }
+        db.drop().await;
+    }
+}

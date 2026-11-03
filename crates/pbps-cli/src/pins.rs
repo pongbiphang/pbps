@@ -182,27 +182,16 @@ impl Approved<'_> {
         check(conn, self.project, self.target, self.plan, self.managed, at).await
     }
 
-    /// The admission rule of the plan's own project and saved opt-in.
+    /// The admission rule of the plan's own project and saved opt-in. Review
+    /// admits only the routines the plan showed and pinned (DEC-2563.2), and
+    /// each site refuses any other where it vets, before it evaluates.
     #[must_use]
     pub fn admission(&self) -> Admission {
         Admission::new(
             self.project.config.trusted_roles.iter().cloned(),
             self.plan.pin_type_routines,
         )
-    }
-
-    /// Review admits only what the plan showed and pinned (DEC-2563.2). A site
-    /// that reached a reviewed routine the plan does not hold is refused: the
-    /// catalog changed since planning, and the pin never covered that routine.
-    pub fn require_reviewed(&self, admission: &Admission) -> anyhow::Result<()> {
-        let shown: BTreeSet<i64> = self.plan.type_routines.iter().map(|r| r.oid).collect();
-        match admission.reviewed().difference(&shown).next() {
-            None => Ok(()),
-            Some(oid) => bail!(
-                "the routine with OID {oid} is admitted by `pin_type_routines` but the plan did \
-                 not show and pin it; plan again against the database (DEC-2563.2)"
-            ),
-        }
+        .approving(self.plan.type_routines.iter().map(|r| r.oid))
     }
 }
 
@@ -423,7 +412,7 @@ async fn check_selected(
     )
     .await?;
     // The plan also holds what its expressions reached; the sites that run them
-    // check that set themselves (`Approved::require_reviewed`).
+    // check that set themselves (`Admission::approving`).
     let expected: BTreeSet<_> = plan.type_routines.iter().map(|r| r.oid).collect();
     if !roots.is_subset(&expected) || expected.len() != plan.type_routines.len() {
         bail!("the reviewed routine set changed; plan again (DEC-2181.2, DEC-2563.2)");

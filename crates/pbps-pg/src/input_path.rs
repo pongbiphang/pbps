@@ -1390,6 +1390,17 @@ async fn vet_in_transaction(
             }
         }
         let reviewed = judge_routines(found.user, &actors, admission.pin(), &mut reasons);
+        // At apply, review admits only what the plan showed and pinned; the
+        // refusal is here, before the caller evaluates the expression.
+        if reasons.is_empty()
+            && let Some(oid) = admission.unapproved(&reviewed)
+        {
+            return Err(refuse(&format!(
+                "reaches the routine with OID {oid}, which `pin_type_routines` admits but \
+                 the plan did not show and pin (the catalog changed since planning); \
+                 plan again against the database; nothing has been changed"
+            )));
+        }
         if reasons.is_empty() {
             admission.review(reviewed);
         }
@@ -2397,6 +2408,66 @@ mod tests {
                 .unwrap();
             }
             conn.execute("ROLLBACK").await.unwrap();
+        }
+    }
+
+    /// The rebuild window evaluates a copy conversion right after vetting it:
+    /// a routine the plan did not show and pin is refused in the vet, and never
+    /// runs (DEC-2563.2).
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs() {
+        for key in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+            let url = std::env::var(key).expect("the PostgreSQL fixture");
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &url)
+                .await
+                .unwrap();
+            let s = format!("copy2563_{}_{}", key.len(), std::process::id());
+            conn.execute(&format!(
+                "CREATE ROLE {s}_owner; CREATE SCHEMA {s}; CREATE SEQUENCE {s}.ran;
+                 GRANT USAGE ON SCHEMA {s} TO {s}_owner;
+                 CREATE FUNCTION {s}.f(text) RETURNS text LANGUAGE plpgsql IMMUTABLE
+                     SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('{s}.ran'); RETURN $1; END $$;
+                 ALTER FUNCTION {s}.f(text) OWNER TO {s}_owner"
+            ))
+            .await
+            .unwrap();
+            let oid = conn
+                .query(&format!(
+                    "SELECT '{s}.f(text)'::regprocedure::oid::int8 AS oid"
+                ))
+                .await
+                .unwrap()[0]
+                .try_get::<i64>("oid")
+                .unwrap()
+                .unwrap();
+            let column: pbps_model::ColumnName = "amount".into();
+            let from = "text".parse().unwrap();
+            let using = format!("{s}.f(amount)");
+            for (shown, expect) in [(vec![], false), (vec![oid], true)] {
+                let admission = Admission::new([], true).approving(shown);
+                conn.execute("BEGIN; SET LOCAL search_path = ''")
+                    .await
+                    .unwrap();
+                let outcome =
+                    super::vet_copy_conversion(&mut conn, &admission, &column, &from, &using).await;
+                conn.execute("ROLLBACK").await.unwrap();
+                assert_eq!(outcome.is_ok(), expect, "{key}: {outcome:?}");
+                if let Err(why) = outcome {
+                    assert!(why.contains("did not show and pin"), "{key}: {why}");
+                }
+            }
+            let ran = conn
+                .query(&format!("SELECT is_called AS ran FROM {s}.ran"))
+                .await
+                .unwrap()[0]
+                .try_get::<bool>("ran")
+                .unwrap()
+                .unwrap();
+            assert!(!ran, "{key}: vetting must evaluate nothing");
+            conn.execute(&format!("DROP SCHEMA {s} CASCADE; DROP ROLE {s}_owner"))
+                .await
+                .unwrap();
         }
     }
 

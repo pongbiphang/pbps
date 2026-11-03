@@ -44,6 +44,9 @@ pub struct Admission {
     /// Whether this site can show a routine's source in the plan. A type the
     /// plan itself creates cannot be read at plan time, so it cannot.
     can_review: bool,
+    /// The routines a saved plan showed and pinned. When set, a site refuses a
+    /// reviewed routine outside it, before it evaluates anything.
+    approved: Option<BTreeSet<Oid>>,
     reviewed: Mutex<BTreeSet<Oid>>,
 }
 
@@ -54,8 +57,25 @@ impl Admission {
             trusted: trusted.into_iter().collect(),
             pin,
             can_review: true,
+            approved: None,
             reviewed: Mutex::default(),
         }
+    }
+
+    /// Apply's admission: review admits only the routines the plan holds. A
+    /// name that binds to another routine now (a new overload, say) is refused
+    /// where it is vetted, which is before any expression is evaluated.
+    #[must_use]
+    pub fn approving(mut self, shown: impl IntoIterator<Item = Oid>) -> Self {
+        self.approved = Some(shown.into_iter().collect());
+        self
+    }
+
+    /// The first of `reviewed` that the plan did not show, if it holds a set.
+    #[must_use]
+    pub(crate) fn unapproved(&self, reviewed: &BTreeSet<Oid>) -> Option<Oid> {
+        let approved = self.approved.as_ref()?;
+        reviewed.difference(approved).next().copied()
     }
 
     /// A site where rule 4 does not apply, whatever `pin_type_routines` says.
@@ -295,6 +315,16 @@ mod tests {
             search_path_fix("app.f(integer)"),
             "ALTER FUNCTION app.f(integer) SET search_path = pg_catalog, pg_temp"
         );
+    }
+
+    #[test]
+    fn a_plan_holding_a_set_refuses_a_reviewed_routine_outside_it() {
+        let open = Admission::new([], true);
+        assert_eq!(open.unapproved(&BTreeSet::from([9])), None);
+        let approving = Admission::new([], true).approving([1, 2]);
+        assert_eq!(approving.unapproved(&BTreeSet::from([2])), None);
+        assert_eq!(approving.unapproved(&BTreeSet::from([2, 9])), Some(9));
+        assert_eq!(approving.unapproved(&BTreeSet::new()), None);
     }
 
     #[test]
