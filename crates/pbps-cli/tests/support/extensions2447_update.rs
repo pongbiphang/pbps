@@ -713,3 +713,72 @@ fn a_real_packages_update_retires_and_adds_members_and_leaves_what_depends_on_it
         );
     });
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_update_waits_for_a_package_only_a_version_on_its_path_requires() {
+    servers(|server, slug| {
+        // 1.0 to 1.2 goes through 1.1, whose control file requires `zzz_base`;
+        // the final version needs nothing (measured: the engine reads each).
+        let f = adopted(
+            server,
+            &format!("update2447-mid-{slug}"),
+            "updmid2447",
+            "1.0",
+            &Options::default(),
+        );
+        declare(&f, "updmid2447", "ext", "1.2");
+        // Neither declared nor installed: refused by name, nothing planned.
+        let missing = f.plan(&[]);
+        assert_ne!(code(&missing), 0, "{}", said(&missing));
+        assert!(
+            said(&missing).contains("`updmid2447`")
+                && said(&missing).contains("requires extension `zzz_base`"),
+            "{}",
+            said(&missing)
+        );
+        assert!(!f.artifact().exists());
+        // Declared, it is created first and the update waits for it.
+        std::fs::write(
+            f.d.dir.join("schema/extensions/zzz_base.yml"),
+            "extension: zzz_base\nschema: ext\nversion: \"1.0\"\n",
+        )
+        .unwrap();
+        succeeds(f.d.run(&["plan", "--no-dev"]));
+        f.d.commit();
+        let out = f.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let plan = saved(&f);
+        let order: Vec<_> = plan
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+                    Some(format!("create {}", name.shown()))
+                } else if let pbps_model::Change::UpdateExtension { name, requires, .. } = &p.change
+                {
+                    Some(format!(
+                        "update {} ({} required)",
+                        name.shown(),
+                        requires.len()
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["create zzz_base", "update updmid2447 (1 required)"],
+            "{order:?}"
+        );
+        assert_eq!(plan.extension_changes[0].path, ["1.0", "1.1", "1.2"]);
+        let applied = f.apply(ALLOW);
+        assert_eq!(code(&applied), 0, "{}", said(&applied));
+        assert_eq!(
+            held(&f, "'updmid2447', 'zzz_base'"),
+            "updmid2447@ext@1.2,zzz_base@ext@1.0"
+        );
+    });
+}

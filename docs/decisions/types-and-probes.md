@@ -5028,8 +5028,11 @@ is rolled back and nothing is recorded. The closing guard allows the package
 only at `from` or `to` while the plan runs and at `to` at the close.
 
 Order is by facts. An update shares class 7 with the creates, waits for each
-package of the plan its target version requires (`Is(Extension, Final)`, ranked
-as a create's prerequisite) and for **every** module the plan drops that depends
+package of the plan that **any version on its path** requires (measured on 16.15
+and 18.6: the engine reads each version's control file, so a middle version's
+prerequisite is needed although the last one's is not; `path_requires` is the one
+function that feeds both the check and the edge), ranked as a create's
+prerequisite (`Is(Extension, Final)`), and for **every** module the plan drops that depends
 on a member of the package (`Absent`, mapped with the members' module addresses of
 DEC-2447.8): a superset of what the script retires, which is known only after the
 rehearsal, and dropping a consumer first is never wrong. It claims no member

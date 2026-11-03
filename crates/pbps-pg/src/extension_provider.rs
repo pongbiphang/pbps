@@ -521,6 +521,38 @@ pub fn requirement_problems(
     available: &BTreeMap<(String, String), Control>,
     known: &BTreeMap<String, Extension>,
 ) -> Vec<String> {
+    requirement_problems_through(place, name, wanted, available, known, &BTreeSet::new())
+}
+
+/// The prerequisites of every version an update walks, the target's own included
+/// (measured on 16.15 and 18.6: the engine reads the control file of each version
+/// it applies, so a version in the middle of the path that requires a package
+/// the final one no longer does still fails without it, and passes once it is
+/// created earlier in the transaction). A version no control file or script
+/// lists adds nothing here, and takes its `requires` from the package's main
+/// control file, which any listed version that does not override it shows.
+pub fn path_requires(
+    available: &BTreeMap<(String, String), Control>,
+    name: &str,
+    path: &[String],
+) -> BTreeSet<String> {
+    path.iter()
+        .filter_map(|version| available.get(&(name.to_owned(), version.clone())))
+        .flat_map(|control| control.requires.iter().cloned())
+        .collect()
+}
+
+/// [`requirement_problems`] for a version that is reached through others: `also`
+/// are the prerequisites of the versions on the way (see [`path_requires`]),
+/// which are held to the same rule as the target's own.
+pub fn requirement_problems_through(
+    place: &str,
+    name: &str,
+    wanted: &Extension,
+    available: &BTreeMap<(String, String), Control>,
+    known: &BTreeMap<String, Extension>,
+    also: &BTreeSet<String>,
+) -> Vec<String> {
     let at = |detail: String| {
         format!(
             "extension `{}` version `{}` {detail}",
@@ -561,7 +593,8 @@ pub fn requirement_problems(
             Escaped(&wanted.schema)
         )));
     }
-    for required in control.requires.iter().filter(|r| !known.contains_key(*r)) {
+    let needed: BTreeSet<&String> = control.requires.iter().chain(also).collect();
+    for required in needed.into_iter().filter(|r| !known.contains_key(*r)) {
         out.push(at(format!(
             "requires extension `{}`, which is neither declared with a pinned version nor \
              installed; declare it first (pbps never installs a prerequisite by default)",
@@ -774,10 +807,8 @@ pub async fn update_problems(
                 Escaped(&from.schema)
             ));
         }
-        if update_path(conn, name, &from.version, &to.version)
-            .await?
-            .is_none()
-        {
+        let path = update_path(conn, name, &from.version, &to.version).await?;
+        if path.is_none() {
             out.push(format!(
                 "extension `{}` has no update path from version `{}` to `{}`; the engine applies only the versions the package ships scripts between, and pbps never guesses a downgrade or drops and recreates the package",
                 Escaped(name),
@@ -785,12 +816,17 @@ pub async fn update_problems(
                 Escaped(&to.version)
             ));
         }
-        out.extend(requirement_problems(
+        let through = path
+            .as_deref()
+            .map(|path| path_requires(&target.available, name, path))
+            .unwrap_or_default();
+        out.extend(requirement_problems_through(
             "target",
             name,
             to,
             &target.available,
             &known,
+            &through,
         ));
         out.extend(script_privilege(&target, name, to, "update", "updated"));
     }
@@ -1490,6 +1526,52 @@ mod tests {
 
     /// What may update a package follows the control file of the version it
     /// goes to, the same rule as an install (measured on 16.15 and 18.6).
+    /// An update is held to the prerequisites of every version it walks, not
+    /// only the one it ends at: a version in the middle that requires a package
+    /// the final one does not still fails without it (measured on 16.15 and 18.6).
+    #[test]
+    fn an_update_is_held_to_the_prerequisites_of_every_version_on_its_path() {
+        let mut available = catalog();
+        for (version, requires) in [("1.0", &[][..]), ("1.1", &["cube"][..]), ("1.2", &[][..])] {
+            available.insert(
+                ("mid".to_owned(), version.to_owned()),
+                control(None, requires),
+            );
+        }
+        let path = |versions: &[&str]| -> Vec<String> {
+            versions.iter().map(|v| (*v).to_owned()).collect()
+        };
+        // The union, from the first version to the last.
+        assert_eq!(
+            path_requires(&available, "mid", &path(&["1.0", "1.1", "1.2"])),
+            ["cube".to_owned()].into()
+        );
+        // Negatives: a path that skips the middle, a version nothing lists, and
+        // another package's versions add nothing.
+        assert!(path_requires(&available, "mid", &path(&["1.0", "1.2"])).is_empty());
+        assert!(path_requires(&available, "mid", &path(&["1.0", "1.5", "1.2"])).is_empty());
+        assert!(path_requires(&available, "other", &path(&["1.0", "1.1"])).is_empty());
+        // Judged: the final version needs nothing, yet the middle one's
+        // prerequisite is refused by name unless the target holds or creates it.
+        let wanted = wanted("ext", "1.2");
+        let through = path_requires(&available, "mid", &path(&["1.0", "1.1", "1.2"]));
+        let bare = BTreeMap::new();
+        let found =
+            requirement_problems_through("target", "mid", &wanted, &available, &bare, &through);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`mid`") && found[0].contains("requires extension `cube`"),
+            "{found:?}"
+        );
+        assert!(requirement_problems("target", "mid", &wanted, &available, &bare).is_empty());
+        let known: BTreeMap<String, Extension> =
+            [("cube".to_owned(), self::wanted("ext", "1.5"))].into();
+        assert!(
+            requirement_problems_through("target", "mid", &wanted, &available, &known, &through)
+                .is_empty()
+        );
+    }
+
     #[test]
     fn what_the_connected_role_may_update_follows_the_target_versions_control_file() {
         let (plain, creator) = (facts(false, false), facts(false, true));

@@ -461,18 +461,22 @@ async fn extension_update_facts(
     let available = pbps_pg::extension_provider::available(conn).await?;
     let all = pbps_pg::extension_provider::providers(conn).await?;
     let mut reach = pbps_pg::extension_provider::drop_facts(conn, &all).await?;
-    Ok(updates
-        .into_iter()
-        .map(|(name, (_, to))| {
-            let requires = available
-                .get(&(name.raw().to_owned(), to.version))
-                .into_iter()
-                .flat_map(|control| control.requires.iter().map(|r| r.as_str().into()))
-                .collect();
-            let reach = reach.remove(name.raw()).unwrap_or_default();
-            (name, pbps_model::ExtensionUpdateFacts { requires, reach })
-        })
-        .collect())
+    let mut facts = BTreeMap::new();
+    for (name, (from, to)) in updates {
+        // The prerequisites of every version on the path, which the same
+        // function that judged them above names (DEC-2447.10).
+        let path =
+            pbps_pg::extension_provider::update_path(conn, name.raw(), &from.version, &to.version)
+                .await?
+                .unwrap_or_default();
+        let requires = pbps_pg::extension_provider::path_requires(&available, name.raw(), &path)
+            .iter()
+            .map(|r| r.as_str().into())
+            .collect();
+        let reach = reach.remove(name.raw()).unwrap_or_default();
+        facts.insert(name, pbps_model::ExtensionUpdateFacts { requires, reach });
+    }
+    Ok(facts)
 }
 
 /// An update that would leave a member the declarations also manage as their

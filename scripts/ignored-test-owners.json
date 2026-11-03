@@ -744,6 +744,7 @@
         "extensions2447_update::an_update_beside_a_resolver_bound_change_is_refused_by_name_and_writes_nothing",
         "extensions2447_update::a_version_and_a_schema_change_in_one_plan_is_refused_with_the_two_plan_remedy",
         "extensions2447_update::an_update_waits_for_the_package_its_target_version_requires",
+        "extensions2447_update::an_update_waits_for_a_package_only_a_version_on_its_path_requires",
         "extensions2447_update::a_staged_apply_vets_and_confirms_the_update_in_its_own_transaction",
         "extensions2447_update::a_real_packages_update_retires_and_adds_members_and_leaves_what_depends_on_it_standing",
         "extensions2447_update::an_update_is_refused_at_the_opening_when_the_engine_lost_its_path_since_the_plan",
