@@ -160,3 +160,150 @@ async fn mssql_an_unmanaged_reference_is_matched_by_the_engines_own_lookup_path(
     }
     both(case).await;
 }
+
+/// A managed table the target and the plan both hold, with the id column the
+/// fixtures use, so that the plan keeps it.
+fn kept(declared: &mut Declared, name: &str) {
+    let (name, mut table) = table(name);
+    table.columns.get_mut("id").unwrap().nullable = false;
+    declared.desired.tables.insert(name.clone(), table.clone());
+    declared.base.tables.insert(name, table);
+}
+
+/// A resolved reference that a created object shadows: the module reads
+/// `fb2143` from `dbo` by id, and a table of the same name in the module's own
+/// schema becomes the first match on its path (DEC-619.2).
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_created_object_that_shadows_a_resolved_fallback_refuses_by_name() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE TABLE dbo.fb2143(id int NOT NULL);",
+                    "CREATE PROCEDURE dbo.indbo2143 AS SELECT 1 AS id FROM fb2143;",
+                ],
+            )
+            .await;
+            let mut declared = declared(&[]);
+            kept(&mut declared, "dbo.fb2143");
+            creates(&mut declared, "app2143.fb2143");
+            // A module in `dbo` already reads `dbo`: nothing shadows it.
+            declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("a module in dbo is not shadowed: {error}"));
+            // One in `app2143` reads the `dbo` fallback, which the new table
+            // now precedes.
+            exec(
+                target,
+                &["CREATE PROCEDURE app2143.shadow2143 AS SELECT 1 AS id FROM fb2143;"],
+            )
+            .await;
+            let Err(error) = declared_plan(target, scratch, &declared, None).await else {
+                panic!("a plan sealed over a module whose resolution it shadows");
+            };
+            let text = error.to_string();
+            assert!(
+                text.contains("shadow2143") && !text.contains("indbo2143"),
+                "{text}"
+            );
+        })
+    }
+    both(case).await;
+}
+
+/// A plan that creates nothing takes no name: the roots the scratch
+/// bootstrap creates again (the bootstrap plan creates every declared object)
+/// are the ones the target already holds. An unmanaged module calling a kept
+/// procedure by its one-part name must not refuse it.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_plan_that_creates_nothing_is_not_refused_for_the_roots_it_keeps() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(
+                target,
+                &[
+                    "CREATE PROCEDURE dbo.kept2143 AS SELECT 1 AS id;",
+                    "CREATE PROCEDURE dbo.unmanaged2143 AS EXEC kept2143;",
+                ],
+            )
+            .await;
+            let mut declared = declared(&[module(
+                ModuleKind::Procedure,
+                "dbo.kept2143",
+                "AS SELECT 1 AS id",
+            )]);
+            declared.base = declared.desired.clone();
+            declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("a plan that creates nothing should seal: {error}"));
+        })
+    }
+    both(case).await;
+}
+
+/// A call reaches the executing principal's default schema, then `dbo`: a
+/// procedure created in `dbo` or in a principal's default schema is the first
+/// match, one created in a schema no principal defaults to is not.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_path() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let kept = procedure_over_nothing(
+                target,
+                &[
+                    "CREATE SCHEMA off2143;",
+                    "CREATE SCHEMA app2143;",
+                    "CREATE PROCEDURE dbo.caller2143 AS EXEC ghostp2143;",
+                ],
+            )
+            .await;
+            let creating = |name: &str| {
+                let (id, procedure) = module(ModuleKind::Procedure, name, "AS SELECT 1 AS id");
+                let mut declared = Declared {
+                    base: kept.base.clone(),
+                    desired: kept.desired.clone(),
+                };
+                declared.desired.modules.insert(id, procedure);
+                declared
+            };
+            // No principal defaults to `off2143`, and the call is in `dbo`.
+            declared_plan(target, scratch, &creating("off2143.ghostp2143"), None)
+                .await
+                .unwrap_or_else(|error| panic!("a schema off every lookup path: {error}"));
+            // `dbo` is always on the path.
+            let Err(error) =
+                declared_plan(target, scratch, &creating("dbo.ghostp2143"), None).await
+            else {
+                panic!("a plan sealed over a call it takes");
+            };
+            assert!(error.to_string().contains("caller2143"), "{error}");
+            // So is the default schema of a principal that can run the call.
+            exec(
+                target,
+                &["CREATE USER user2143 WITHOUT LOGIN WITH DEFAULT_SCHEMA = app2143;"],
+            )
+            .await;
+            let Err(error) =
+                declared_plan(target, scratch, &creating("app2143.ghostp2143"), None).await
+            else {
+                panic!("a plan sealed over a call in a principal's default schema");
+            };
+            assert!(error.to_string().contains("caller2143"), "{error}");
+        })
+    }
+    both(case).await;
+}

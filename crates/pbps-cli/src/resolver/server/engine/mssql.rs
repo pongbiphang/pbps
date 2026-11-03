@@ -1305,12 +1305,17 @@ impl Binding {
             // record the opening never saw (DEC-2143.6).
             next.retained.extend(on_scratch.engine_builtins());
             if next == scope {
-                settled = Some((held(&scope, &on_scratch), held(&scope, &on_target)));
+                let on_target_now: BTreeSet<_> = on_target.objects().cloned().collect();
+                settled = Some((
+                    held(&scope, &on_scratch),
+                    held(&scope, &on_target),
+                    on_target_now,
+                ));
                 break;
             }
             scope = next;
         }
-        let Some((scratch_scope, target_scope)) = settled else {
+        let Some((scratch_scope, target_scope, on_target_now)) = settled else {
             return Err(Error::Read(
                 "the candidates of the runtime-bound names did not settle".into(),
             ));
@@ -1319,7 +1324,14 @@ impl Binding {
         // still has an unresolved reference to a name the plan creates will
         // bind it once applied: refuse by name rather than report nothing
         // (DEC-2143.7).
-        let created: BTreeSet<_> = self.reconstruction.created().into_keys().collect();
+        // Only an arrival can take a name: the scratch bootstrap also creates
+        // the roots the target already holds, and those move nothing.
+        let created: BTreeSet<_> = self
+            .reconstruction
+            .created()
+            .into_keys()
+            .filter(|object| !on_target_now.contains(object))
+            .collect();
         let rebound = capture::unmanaged_rebinds(target, &created, &scope.retained)
             .await
             .map_err(super::catalog_read_failed)?;

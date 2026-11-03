@@ -3,9 +3,8 @@
 //!
 //! A managed module's candidates are in the capture, so an arrival shows as a
 //! difference between them. An unmanaged module is not captured, so the only
-//! way to name it is a reverse read: the dependency rows whose referenced name
-//! is still unresolved (`referenced_id` is `NULL` while no object holds the
-//! name) and mention the name the plan creates.
+//! way to name it is a reverse read of the dependency rows, matched against the
+//! names the plan creates by the engine itself (see [`rebind_sql`]).
 
 use super::{CaptureError, ObjectIdentity, Uncovered, class};
 use pbps_db::transport::QueryConnection;
@@ -70,6 +69,61 @@ impl PartialOrd for Rebound {
     }
 }
 
+/// The read, with the matching done by the engine so that it follows the
+/// database's own collation (accents, width and case sensitivity). A created
+/// (schema, name) pair rebinds an unmanaged module's reference when it becomes
+/// the first match on the module's lookup path (DEC-619.2):
+///
+/// - a name spelled with a schema reaches exactly that schema, and only an
+///   unresolved one can still be taken;
+/// - a one-part name reaches the module's own schema, then `dbo`: an
+///   unresolved one is taken by either, a resolved one by the module's own
+///   schema when it now resolves to the `dbo` fallback (a stale resolution
+///   stays by id until the module is altered);
+/// - a one-part call (`is_caller_dependent`) reaches the executing principal's
+///   default schema, then `dbo`: the module's fixed principal, or every
+///   principal's when it runs as its caller, as `select::runtime_candidates`
+///   models it. Its row never says what it resolves to, so the pair is taken
+///   whenever its schema is on the path.
+///
+/// A schema-bound reference is bound by id and cannot move.
+fn rebind_sql(pairs: &str) -> String {
+    format!(
+        "SELECT DISTINCT CONVERT(nvarchar(128), SCHEMA_NAME(o.schema_id)) AS module_schema, \
+                o.name AS module_name, c.made_schema AS made_schema, c.made_name AS made_name \
+           FROM sys.sql_expression_dependencies d \
+           JOIN sys.objects o ON o.object_id = d.referencing_id \
+           JOIN sys.sql_modules m ON m.object_id = o.object_id \
+           JOIN (VALUES {pairs}) c(made_schema, made_name) \
+             ON d.referenced_entity_name = c.made_name \
+           LEFT JOIN sys.objects r ON r.object_id = d.referenced_id \
+          WHERE d.referenced_server_name IS NULL AND d.referenced_database_name IS NULL \
+            AND d.referenced_class_desc = N'OBJECT_OR_COLUMN' \
+            AND d.is_schema_bound_reference = 0 \
+            AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR') \
+            AND ( \
+                 (d.referenced_schema_name IS NOT NULL AND d.referenced_id IS NULL \
+                  AND d.referenced_schema_name = c.made_schema) \
+              OR (d.referenced_schema_name IS NULL AND d.is_caller_dependent = 0 \
+                  AND ((d.referenced_id IS NULL \
+                        AND (SCHEMA_NAME(o.schema_id) = c.made_schema OR c.made_schema = N'dbo')) \
+                    OR (d.referenced_id IS NOT NULL \
+                        AND SCHEMA_NAME(r.schema_id) = N'dbo' \
+                        AND SCHEMA_NAME(o.schema_id) <> N'dbo' \
+                        AND SCHEMA_NAME(o.schema_id) = c.made_schema))) \
+              OR (d.referenced_schema_name IS NULL AND d.is_caller_dependent = 1 \
+                  AND (c.made_schema = N'dbo' \
+                    OR c.made_schema IN (SELECT p.default_schema_name \
+                         FROM sys.database_principals p \
+                        WHERE m.execute_as_principal_id IS NULL \
+                           OR p.principal_id = CASE WHEN m.execute_as_principal_id = -2 \
+                                THEN COALESCE(o.principal_id, \
+                                     (SELECT sc.principal_id FROM sys.schemas sc \
+                                       WHERE sc.schema_id = o.schema_id)) \
+                                ELSE m.execute_as_principal_id END))));"
+    )
+}
+
 /// Reads the target's unresolved references to the names the plan creates.
 /// Without database `VIEW DEFINITION` the view returns nothing for a module
 /// the account cannot see, and nothing must never read as "no dependents": the
@@ -97,35 +151,17 @@ pub async fn unmanaged_rebinds(
     if !allowed {
         return Err(Uncovered::class(
             "sys.sql_expression_dependencies",
-            "the unresolved references to a created name are hidden without database VIEW \
+            "the references to a created name are hidden without database VIEW \
              DEFINITION, so which unmanaged modules it rebinds cannot be named",
         )
         .into());
     }
-    // The engine does the name matching, so it follows the database's own
-    // collation (accents, width and case sensitivity), which a comparison here
-    // could only approximate: a one-part reference reaches the module's own
-    // schema first and `dbo` second, a two-part one exactly its schema.
     let pairs: Vec<String> = created
         .iter()
         .filter_map(lookup)
         .map(|(schema, name)| format!("({}, {})", literal(schema), literal(name)))
         .collect();
-    let sql = format!(
-        "SELECT DISTINCT CONVERT(nvarchar(128), SCHEMA_NAME(o.schema_id)) AS module_schema, \
-                o.name AS module_name, c.made_schema AS made_schema, c.made_name AS made_name \
-           FROM sys.sql_expression_dependencies d \
-           JOIN sys.objects o ON o.object_id = d.referencing_id \
-           JOIN (VALUES {}) c(made_schema, made_name) \
-             ON d.referenced_entity_name = c.made_name \
-            AND ((d.referenced_schema_name IS NULL \
-                  AND (SCHEMA_NAME(o.schema_id) = c.made_schema OR c.made_schema = N'dbo')) \
-                 OR d.referenced_schema_name = c.made_schema) \
-          WHERE d.referenced_id IS NULL \
-            AND d.referenced_server_name IS NULL AND d.referenced_database_name IS NULL \
-            AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR');",
-        pairs.join(", ")
-    );
+    let sql = rebind_sql(&pairs.join(", "));
     let mut matches = Vec::new();
     for row in conn.query(&sql).await.map_err(|_| CaptureError::Read)? {
         let text = |field| -> Result<String, CaptureError> {
