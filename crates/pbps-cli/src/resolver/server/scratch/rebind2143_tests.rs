@@ -121,3 +121,42 @@ async fn mssql_an_unmanaged_module_that_would_bind_a_created_name_refuses_by_nam
     }
     both(case).await;
 }
+
+/// The engine's own lookup decides which unmanaged module a created name
+/// reaches: a one-part reference from another schema falls back to `dbo`, and
+/// a two-part reference reaches exactly the schema it spells.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_unmanaged_reference_is_matched_by_the_engines_own_lookup_path() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // Two-part, spelled `app`: creating `dbo.ghost` does not reach it.
+            let mut declared = procedure_over_nothing(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE PROCEDURE dbo.spelled2143 AS SELECT 1 AS id FROM app2143.ghost;",
+                ],
+            )
+            .await;
+            creates(&mut declared, "dbo.ghost");
+            declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("a spelled schema is exact: {error}"));
+            // One-part from `app`: it falls back to `dbo`, so it is reached.
+            exec(
+                target,
+                &["CREATE PROCEDURE app2143.fallback2143 AS SELECT 1 AS id FROM ghost;"],
+            )
+            .await;
+            let Err(error) = declared_plan(target, scratch, &declared, None).await else {
+                panic!("a plan sealed over a module whose fallback it takes");
+            };
+            assert!(error.to_string().contains("fallback2143"), "{error}");
+        })
+    }
+    both(case).await;
+}

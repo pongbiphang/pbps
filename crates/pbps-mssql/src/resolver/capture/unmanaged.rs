@@ -18,15 +18,10 @@ pub struct Rebound {
     pub created: Vec<String>,
 }
 
-/// One unresolved reference as the catalog lists it: the referencing module's
-/// schema and name, then the schema the reference spelled (empty when it
-/// spelled none) and the name.
-pub(crate) type Reference = (String, String, String, String);
+/// One unresolved reference the engine matched to a created name: the
+/// referencing module's schema and name, then the created object's.
+pub(crate) type Match = (String, String, String, String);
 
-/// The created objects an unresolved reference can bind. A type is not one:
-/// the catalog lists the unresolved references of `OBJECT_OR_COLUMN` class
-/// only, and a module naming a type that does not exist cannot be created at
-/// all (measured on 17.0), so creating a type can never satisfy one.
 fn lookup(created: &ObjectIdentity) -> Option<(&str, &str)> {
     match (created.class.as_str(), created.name.as_slice()) {
         (class::OBJECT, [schema, name]) => Some((schema, name)),
@@ -38,17 +33,15 @@ fn literal(text: &str) -> String {
     format!("N'{}'", text.replace('\'', "''"))
 }
 
-/// The modules among `references` that a created object takes a name from:
-/// a one-part reference reaches the module's own schema first and `dbo`
-/// second; a two-part reference reaches exactly its schema. Names compare
-/// as the default collation does, without case.
-pub(crate) fn rebound(
-    references: &[Reference],
+/// The matches that name an unmanaged module: not one the plan manages and
+/// not one it creates.
+pub(crate) fn unmanaged(
+    matches: &[Match],
     created: &BTreeSet<ObjectIdentity>,
     own: &BTreeSet<ObjectIdentity>,
 ) -> Vec<Rebound> {
     let mut found = BTreeSet::new();
-    for (module_schema, module, spelled, name) in references {
+    for (module_schema, module, made_schema, made) in matches {
         let id = ObjectIdentity {
             class: class::OBJECT.into(),
             name: vec![module_schema.clone(), module.clone()],
@@ -57,22 +50,10 @@ pub(crate) fn rebound(
         if own.contains(&id) || created.contains(&id) {
             continue;
         }
-        for object in created {
-            let Some((schema, made)) = lookup(object) else {
-                continue;
-            };
-            let reaches = if spelled.is_empty() {
-                module_schema.eq_ignore_ascii_case(schema) || schema.eq_ignore_ascii_case("dbo")
-            } else {
-                spelled.eq_ignore_ascii_case(schema)
-            };
-            if reaches && name.eq_ignore_ascii_case(made) {
-                found.insert(Rebound {
-                    module: id.name.clone(),
-                    created: object.name.clone(),
-                });
-            }
-        }
+        found.insert(Rebound {
+            module: id.name,
+            created: vec![made_schema.clone(), made.clone()],
+        });
     }
     found.into_iter().collect()
 }
@@ -121,21 +102,31 @@ pub async fn unmanaged_rebinds(
         )
         .into());
     }
-    let list: Vec<String> = names.iter().map(|n| literal(n)).collect();
+    // The engine does the name matching, so it follows the database's own
+    // collation (accents, width and case sensitivity), which a comparison here
+    // could only approximate: a one-part reference reaches the module's own
+    // schema first and `dbo` second, a two-part one exactly its schema.
+    let pairs: Vec<String> = created
+        .iter()
+        .filter_map(lookup)
+        .map(|(schema, name)| format!("({}, {})", literal(schema), literal(name)))
+        .collect();
     let sql = format!(
         "SELECT DISTINCT CONVERT(nvarchar(128), SCHEMA_NAME(o.schema_id)) AS module_schema, \
-                o.name AS module_name, \
-                ISNULL(d.referenced_schema_name, N'') AS spelled, \
-                d.referenced_entity_name AS name \
+                o.name AS module_name, c.made_schema AS made_schema, c.made_name AS made_name \
            FROM sys.sql_expression_dependencies d \
            JOIN sys.objects o ON o.object_id = d.referencing_id \
+           JOIN (VALUES {}) c(made_schema, made_name) \
+             ON d.referenced_entity_name = c.made_name \
+            AND ((d.referenced_schema_name IS NULL \
+                  AND (SCHEMA_NAME(o.schema_id) = c.made_schema OR c.made_schema = N'dbo')) \
+                 OR d.referenced_schema_name = c.made_schema) \
           WHERE d.referenced_id IS NULL \
             AND d.referenced_server_name IS NULL AND d.referenced_database_name IS NULL \
-            AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR') \
-            AND d.referenced_entity_name IN ({});",
-        list.join(", ")
+            AND o.type IN ('V', 'P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT', 'TR');",
+        pairs.join(", ")
     );
-    let mut references = Vec::new();
+    let mut matches = Vec::new();
     for row in conn.query(&sql).await.map_err(|_| CaptureError::Read)? {
         let text = |field| -> Result<String, CaptureError> {
             row.try_get::<&str>(field)
@@ -144,14 +135,14 @@ pub async fn unmanaged_rebinds(
                 .map(str::to_owned)
                 .ok_or(CaptureError::Incomplete)
         };
-        references.push((
+        matches.push((
             text("module_schema")?,
             text("module_name")?,
-            text("spelled")?,
-            text("name")?,
+            text("made_schema")?,
+            text("made_name")?,
         ));
     }
-    Ok(rebound(&references, created, own))
+    Ok(unmanaged(&matches, created, own))
 }
 
 #[cfg(test)]
@@ -166,39 +157,13 @@ mod tests {
         }
     }
 
-    fn reference(module: (&str, &str), spelled: &str, name: &str) -> Reference {
+    fn matched(module: (&str, &str), made: (&str, &str)) -> Match {
         (
             module.0.into(),
             module.1.into(),
-            spelled.into(),
-            name.into(),
+            made.0.into(),
+            made.1.into(),
         )
-    }
-
-    #[test]
-    fn a_one_part_reference_reaches_its_own_schema_then_dbo() {
-        let created = BTreeSet::from([object("dbo", "ghost")]);
-        let none = BTreeSet::new();
-        let from_app = [reference(("app", "reader"), "", "ghost")];
-        let found = rebound(&from_app, &created, &none);
-        assert_eq!(found.len(), 1, "dbo is the fallback of every schema");
-        assert_eq!(found[0].module, vec!["app".to_owned(), "reader".to_owned()]);
-        let created = BTreeSet::from([object("other", "ghost")]);
-        assert!(
-            rebound(&from_app, &created, &none).is_empty(),
-            "a schema off the module's path is not reached"
-        );
-    }
-
-    #[test]
-    fn a_two_part_reference_reaches_exactly_its_schema() {
-        let none = BTreeSet::new();
-        let spelled = [reference(("app", "reader"), "other", "ghost")];
-        assert_eq!(
-            rebound(&spelled, &BTreeSet::from([object("other", "ghost")]), &none).len(),
-            1
-        );
-        assert!(rebound(&spelled, &BTreeSet::from([object("dbo", "ghost")]), &none).is_empty());
     }
 
     #[test]
@@ -206,31 +171,29 @@ mod tests {
         let created = BTreeSet::from([object("dbo", "ghost"), object("dbo", "made")]);
         let own = BTreeSet::from([object("dbo", "managed")]);
         let rows = [
-            reference(("dbo", "managed"), "", "ghost"),
-            reference(("dbo", "made"), "", "ghost"),
-            reference(("dbo", "outside"), "", "ghost"),
+            matched(("dbo", "managed"), ("dbo", "ghost")),
+            matched(("dbo", "made"), ("dbo", "ghost")),
+            matched(("dbo", "outside"), ("dbo", "ghost")),
         ];
-        let found = rebound(&rows, &created, &own);
+        let found = unmanaged(&rows, &created, &own);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].module[1], "outside");
+        assert_eq!(found[0].created, vec!["dbo".to_owned(), "ghost".to_owned()]);
     }
 
     #[test]
-    fn a_name_is_compared_without_case() {
-        let created = BTreeSet::from([object("dbo", "Ghost")]);
-        let rows = [reference(("dbo", "outside"), "", "GHOST")];
-        assert_eq!(rebound(&rows, &created, &BTreeSet::new()).len(), 1);
-    }
-
-    #[test]
-    fn a_created_type_is_not_what_an_unresolved_object_reference_binds() {
-        let created = BTreeSet::from([ObjectIdentity {
+    fn only_a_table_view_or_routine_name_is_looked_up() {
+        let a_type = ObjectIdentity {
             class: class::TYPE.into(),
             name: vec!["dbo".into(), "ghost".into()],
             signature: Vec::new(),
-        }]);
-        let rows = [reference(("dbo", "outside"), "", "ghost")];
-        assert!(rebound(&rows, &created, &BTreeSet::new()).is_empty());
+        };
+        assert_eq!(
+            lookup(&a_type),
+            None,
+            "an unresolved reference is never a type"
+        );
+        assert_eq!(lookup(&object("dbo", "ghost")), Some(("dbo", "ghost")));
     }
 
     #[test]
