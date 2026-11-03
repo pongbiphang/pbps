@@ -1203,6 +1203,15 @@ class LiveExecution(unittest.TestCase):
                     self.assertEqual(result.returncode, 128 + signum, result.stderr)
                     self.assertEqual(sum(c[0] == "cargo" for c in calls), 2)
 
+    def test_sigint_stops_the_runner_when_the_launcher_ignores_it(self):
+        for runner in ("mssql", "pg"):
+            with self.subTest(runner=runner):
+                result, calls, _ = self.named_fixture_script(
+                    runner, cargo_statuses={1: 37}, cargo_signal=(2, signal.SIGINT),
+                    ignore_sigint=True)
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertEqual(sum(c[0] == "cargo" for c in calls), 2)
+
     def test_setup_failure_stops_immediately_before_or_between_cargo_calls(self):
         for runner in ("mssql", "pg"):
             for failing in ("listing", "transport"):
@@ -1372,7 +1381,8 @@ class LiveExecution(unittest.TestCase):
         return [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
 
     def named_fixture_script(self, runner, overrides=None, existing=(), failing="", *,
-                             client_delay=0, cargo_statuses=None, cargo_signal=None):
+                             client_delay=0, cargo_statuses=None, cargo_signal=None,
+                             ignore_sigint=False):
         # Exercise the real scripts, including the sourced helper. Every Docker,
         # checker, transport and cargo invocation is intercepted before execution.
         with tempfile.TemporaryDirectory(prefix="pbps-fixture-names-") as directory:
@@ -1396,6 +1406,9 @@ if command[0] == "cargo":
         print(f"cargo {number} stderr", file=sys.stderr)
     interrupt = json.loads(os.environ["PBPS_NAMES_CARGO_SIGNAL"])
     if interrupt and number == interrupt[0]:
+        # Background launchers can pass down SIG_IGN; this child must die
+        # from its signal even when the runner inherited an ignored SIGINT.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
         os.kill(os.getpid(), interrupt[1])
     sys.exit(json.loads(os.environ["PBPS_NAMES_CARGO_STATUSES"]).get(str(number), 0))
 if command[:2] == ["docker", "ps"]:
@@ -1463,6 +1476,8 @@ sleep() {
                        if runner == "resolver" else
                        ["bash", "scripts/live-tests" + ("-pg" if runner == "pg" else "") + ".sh",
                         "--exact", "fixture case"])
+            if ignore_sigint:
+                command = ["bash", "-c", 'trap "" INT; exec "$@"', "ignored-sigint", *command]
             result = subprocess.run(command, cwd=ROOT, env=env, text=True,
                                     capture_output=True, timeout=30)
             fields = iter((root / "calls").read_bytes().split(b"\0")[:-1])
