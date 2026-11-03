@@ -51,7 +51,7 @@ async fn mssql_an_object_the_plan_creates_that_captures_a_reference_is_reported(
             assert_eq!(
                 plan.changes.changes().changes.len(),
                 1,
-                "the table is the plan's only change: no statement for the procedure"
+                "the table is the plan's only change"
             );
             pbps_mssql::resolver::validate_evidence(&plan.evidence).unwrap();
         })
@@ -60,7 +60,7 @@ async fn mssql_an_object_the_plan_creates_that_captures_a_reference_is_reported(
 }
 
 /// A module the plan creates binds afresh, so a name it creates beside it is
-/// no change to report, and no claim that the module receives no statement.
+/// no change to report.
 #[tokio::test]
 #[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
 async fn mssql_a_module_the_plan_creates_beside_the_object_is_not_reported_as_rebound() {
@@ -86,6 +86,43 @@ async fn mssql_a_module_the_plan_creates_beside_the_object_is_not_reported_as_re
             assert!(
                 plan.changes.changes().changes.len() >= 2,
                 "the plan creates both the module and the table"
+            );
+        })
+    }
+    both(case).await;
+}
+
+/// A kept module whose body the plan also changes still has its binding moved
+/// by the new table, and the report must not claim anything about statements.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_rebind_report_makes_no_claim_about_the_modules_own_statements() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut declared = procedure_over_nothing(target, &[]).await;
+            let (id, changed) = module(
+                ModuleKind::Procedure,
+                "dbo.p2143",
+                "AS SELECT 2 AS id FROM ghost",
+            );
+            declared.desired.modules.insert(id, changed);
+            creates(&mut declared, "dbo.ghost");
+            let (plan, _) = declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the run should seal a plan: {error}"));
+            let limitations = &plan.evidence.qualification().limitations;
+            for (name, reason) in limitations {
+                assert!(
+                    !reason.raw().to_ascii_lowercase().contains("no statement"),
+                    "{name:?}: {reason:?}"
+                );
+            }
+            assert!(
+                plan.changes.changes().changes.len() >= 2,
+                "the plan alters the procedure and creates the table"
             );
         })
     }

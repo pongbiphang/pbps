@@ -5892,7 +5892,8 @@ the plan accepted and which the seal digest covers. It is not a new envelope
 field: design item 6 asked for a typed list in the assessment output, and the
 sealed limitations are that list for evidence (#2144 apply reads the created
 object's `ObjectTransition`, not a new field), so no schema-set or state bump
-is spent. No statement is issued for the module.
+is spent. The report says nothing about statements: the module's binding changes
+when it runs whether or not the plan also alters its body.
 
 An unmanaged module is outside the capture and cannot be compared. The target
 is read for the module's references to a name the plan creates, and the engine
@@ -5910,7 +5911,7 @@ the roots the target already holds take no name. A match refuses by naming the
 module and the object. Without database `VIEW DEFINITION` the view returns
 nothing for modules the account cannot see, and nothing must not read as "no
 dependents", so that read refuses instead.
-The tests cover a managed rebind with no statement for the module, a created
+The tests cover a managed rebind reported for a module the plan keeps and not for one it creates, a created
 name nothing uses, an unmanaged module refusing by name, a shadowed `dbo`
 fallback, the call path through a principal's default schema, the engine's own
 lookup path, and a plan that creates nothing sealing despite the roots it keeps.

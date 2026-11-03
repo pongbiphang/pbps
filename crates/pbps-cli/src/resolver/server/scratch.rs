@@ -497,11 +497,9 @@ fn rebind_limitation(
     (
         format!("binding-change:{}", shown(module)),
         format!(
-            "{} binds names at run time; once applied they resolve to {} that this plan creates. \
-             No statement is issued for {}",
+            "{} binds names at run time; once applied they resolve to {} that this plan creates",
             shown(module),
             made.join(", "),
-            shown(module),
         ),
     )
 }
