@@ -485,3 +485,155 @@ fn admission_refuses_a_drop_whose_pin_was_removed() {
     let checksum = whole.wire_fingerprint();
     assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
 }
+
+/// A plan that creates `cube` and updates `earthdistance`, whose target version
+/// requires it: the update is sealed with one pin whose versions, manifests and
+/// path agree with the change, and the package it requires is created by the
+/// same plan.
+fn update_plan() -> SavedPlan {
+    let at = |version: &str| pbps_model::Extension {
+        schema: "ext".into(),
+        version: version.into(),
+    };
+    let manifest = |version: &str| pbps_model::ExtensionProvider {
+        definition: at(version),
+        requires: ["cube".to_owned()].into(),
+        members: Default::default(),
+    };
+    let mut plan = wire();
+    plan.changes.changes = vec![
+        PlannedChange::new(Change::CreateExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "cube".into(),
+            definition: at("1.5"),
+            requires: Default::default(),
+        }),
+        PlannedChange::new(Change::UpdateExtension {
+            uid: "e_000002".parse().unwrap(),
+            name: "earthdistance".into(),
+            from: at("1.1"),
+            to: at("1.3"),
+            requires: ["e_000001".parse().unwrap()].into(),
+            releases: Default::default(),
+        }),
+    ];
+    plan.ids.extensions = [("e_000001", "cube"), ("e_000002", "earthdistance")]
+        .into_iter()
+        .map(|(uid, name)| (uid.parse().unwrap(), name.into()))
+        .collect();
+    plan.extension_pins = vec![pbps_model::ExtensionPin {
+        uid: "e_000001".parse().unwrap(),
+        name: "cube".into(),
+        definition: at("1.5"),
+        manifest: pbps_model::ExtensionProvider {
+            definition: at("1.5"),
+            requires: Default::default(),
+            members: Default::default(),
+        },
+    }];
+    plan.extension_changes = vec![pbps_model::ExtensionChangePin {
+        uid: "e_000002".parse().unwrap(),
+        name: "earthdistance".into(),
+        from: at("1.1"),
+        to: at("1.3"),
+        path: ["1.1", "1.2", "1.3"].map(str::to_owned).to_vec(),
+        before: manifest("1.1"),
+        after: manifest("1.3"),
+    }];
+    plan
+}
+
+/// Each update is sealed with exactly one pin that says the same thing the
+/// change does, over the versions the engine walks, and a package it requires
+/// is created by the plan (DEC-2447.10).
+#[test]
+fn every_update_has_exactly_its_own_pin_a_path_and_the_packages_it_requires() {
+    let check = |plan: &SavedPlan| super::saved::package_pins_match_their_updates(plan);
+    assert!(check(&update_plan()).is_ok());
+    type Edit = (&'static str, fn(&mut SavedPlan));
+    let edits: [Edit; 16] = [
+        ("an update with no pin", |p| {
+            p.extension_changes.pop();
+        }),
+        ("a pin with no update", |p| {
+            p.changes.changes.pop();
+        }),
+        ("a pin twice", |p| {
+            let again = p.extension_changes[0].clone();
+            p.extension_changes.push(again);
+        }),
+        ("another version to go to", |p| {
+            p.extension_changes[0].to.version = "1.2".into();
+        }),
+        ("another version to come from", |p| {
+            p.extension_changes[0].from.version = "1.0".into();
+        }),
+        ("a manifest of another version before", |p| {
+            p.extension_changes[0].before.definition.version = "1.0".into();
+        }),
+        ("a manifest of another version after", |p| {
+            p.extension_changes[0].after.definition.schema = "other".into();
+        }),
+        ("a path that starts elsewhere", |p| {
+            p.extension_changes[0].path[0] = "1.0".into();
+        }),
+        ("a path that ends elsewhere", |p| {
+            p.extension_changes[0].path.pop();
+        }),
+        ("an empty path", |p| {
+            p.extension_changes[0].path.clear();
+        }),
+        ("another identity for the package", |p| {
+            p.ids
+                .extensions
+                .insert("e_000002".parse().unwrap(), "other".into());
+        }),
+        ("another schema for the whole update", |p| {
+            if let Change::UpdateExtension { to, .. } = &mut p.changes.changes[1].change {
+                to.schema = "other".into();
+            }
+            p.extension_changes[0].to.schema = "other".into();
+            p.extension_changes[0].after.definition.schema = "other".into();
+        }),
+        ("a pin that goes where the change does not", |p| {
+            p.extension_changes[0].to.version = "1.2".into();
+            p.extension_changes[0].after.definition.version = "1.2".into();
+            p.extension_changes[0].path[2] = "1.2".into();
+        }),
+        ("a pin that comes from where the change does not", |p| {
+            p.extension_changes[0].from.version = "1.0".into();
+            p.extension_changes[0].before.definition.version = "1.0".into();
+            p.extension_changes[0].path[0] = "1.0".into();
+        }),
+        ("a pin for another package", |p| {
+            p.extension_changes[0].name = "other".into();
+        }),
+        ("a required package the plan does not create", |p| {
+            p.changes.changes.remove(0);
+            p.extension_pins.clear();
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut plan = update_plan();
+        edit(&mut plan);
+        let error = check(&plan).expect_err(what).to_string();
+        assert!(
+            error.contains("extension evidence disagrees"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// The check is part of admission: an edited plan whose update lost its pin is
+/// refused by `admit`, and the plan as written gets past it.
+#[test]
+fn admission_refuses_an_update_whose_pin_was_removed() {
+    let mut plan = update_plan();
+    plan.extension_changes.pop();
+    let checksum = plan.wire_fingerprint();
+    let error = refusal(plan, &checksum);
+    assert!(error.contains("extension evidence disagrees"), "{error}");
+    let whole = update_plan();
+    let checksum = whole.wire_fingerprint();
+    assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
+}

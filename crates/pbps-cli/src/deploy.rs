@@ -356,6 +356,23 @@ pub(crate) fn created_extensions(
     })
 }
 
+/// The packages a plan installs or updates, by name and what is done: each
+/// runs a script pbps cannot read, so each needs a rehearsal to pin (DEC-2447.6,
+/// DEC-2447.10).
+fn changed_extensions(
+    cs: &pbps_model::ChangeSet,
+) -> impl Iterator<Item = (&pbps_model::ObjectLocalName, &'static str)> {
+    cs.changes.iter().filter_map(|p| {
+        if let pbps_model::Change::CreateExtension { name, .. } = &p.change {
+            Some((name, "created"))
+        } else if let pbps_model::Change::UpdateExtension { name, .. } = &p.change {
+            Some((name, "updated"))
+        } else {
+            None
+        }
+    })
+}
+
 /// What the target says about the packages the declaration holds and it lacks,
 /// judged before any plan is written (DEC-2447.6): every refusal names the
 /// package and the fact. The answer is each package's own prerequisites, which
@@ -400,6 +417,147 @@ async fn extension_creates(
             ))
         })
         .collect())
+}
+
+/// The packages the declarations hold at another version than the target, in
+/// the same schema, under one recorded identity: each becomes an update, judged
+/// before any plan is written (DEC-2447.10). Every refusal names the package;
+/// the facts are what the differ turns into the update's order.
+async fn extension_update_facts(
+    conn: &mut pbps_db::Conn,
+    base: &Schema,
+    declared: &Schema,
+    recorded: &IdsFile,
+    ids: &IdsFile,
+) -> anyhow::Result<BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionUpdateFacts>> {
+    let updates: BTreeMap<_, _> = declared
+        .extensions
+        .iter()
+        .filter_map(|(name, to)| {
+            let from = base.extensions.get(name)?;
+            let same = recorded.extension_uid(name).is_some()
+                && recorded.extension_uid(name) == ids.extension_uid(name);
+            (same && from.version != to.version && from.schema == to.schema)
+                .then(|| (name.clone(), (from.clone(), to.clone())))
+        })
+        .collect();
+    if updates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let creating: BTreeMap<String, pbps_model::Extension> = declared
+        .extensions
+        .iter()
+        .filter(|(name, _)| {
+            !base.extensions.contains_key(*name) && ids.extension_uid(name).is_some()
+        })
+        .map(|(name, definition)| (name.raw().to_owned(), definition.clone()))
+        .collect();
+    let named: BTreeMap<String, _> = updates
+        .iter()
+        .map(|(name, pair)| (name.raw().to_owned(), pair.clone()))
+        .collect();
+    let problems = pbps_pg::extension_provider::update_problems(conn, &named, &creating).await?;
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("\n"));
+    let available = pbps_pg::extension_provider::available(conn).await?;
+    let all = pbps_pg::extension_provider::providers(conn).await?;
+    let mut reach = pbps_pg::extension_provider::drop_facts(conn, &all).await?;
+    Ok(updates
+        .into_iter()
+        .map(|(name, (_, to))| {
+            let requires = available
+                .get(&(name.raw().to_owned(), to.version))
+                .into_iter()
+                .flat_map(|control| control.requires.iter().map(|r| r.as_str().into()))
+                .collect();
+            let reach = reach.remove(name.raw()).unwrap_or_default();
+            (name, pbps_model::ExtensionUpdateFacts { requires, reach })
+        })
+        .collect())
+}
+
+/// An update that would leave a member the declarations also manage as their
+/// own, or leave the package at another version than declared, is refused
+/// before it is sealed: one object cannot have two owners (DEC-2447.7).
+fn refuse_two_owners(
+    name: &pbps_model::ObjectLocalName,
+    after: &pbps_model::ExtensionProvider,
+    to: &pbps_model::Extension,
+    declared: &Schema,
+) -> anyhow::Result<()> {
+    let collisions = after.collisions(declared);
+    anyhow::ensure!(
+        collisions.is_empty() && after.definition == *to,
+        "extension `{}` would leave {} that the declarations also manage as their own, or not at the declared version; one object cannot have two owners",
+        name.shown(),
+        collisions
+            .iter()
+            .map(|m| format!("`{m}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// The sealed evidence of each update: the manifest the target holds now, the
+/// one the rehearsal read after running the statement, and the versions the
+/// engine reports it would walk. A package the rehearsal read no manifest for,
+/// or that the declarations also manage a member of, is refused, never sealed.
+async fn extension_change_pins(
+    conn: &mut pbps_db::Conn,
+    cs: &pbps_model::ChangeSet,
+    manifests: &crate::rehearsal::connected::Manifests,
+    declared: &Schema,
+) -> anyhow::Result<Vec<pbps_model::ExtensionChangePin>> {
+    let mut pins = Vec::new();
+    let mut held = None;
+    for planned in &cs.changes {
+        let pbps_model::Change::UpdateExtension {
+            uid,
+            name,
+            from,
+            to,
+            ..
+        } = &planned.change
+        else {
+            continue;
+        };
+        let after = manifests.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the rehearsal read no members for extension `{}`, so the plan cannot pin its update",
+                name.shown()
+            )
+        })?;
+        refuse_two_owners(name, after, to, declared)?;
+        if held.is_none() {
+            held = Some(pbps_pg::extension_provider::providers(conn).await?);
+        }
+        let before = held
+            .as_ref()
+            .and_then(|all| all.get(name.raw()))
+            .filter(|m| m.definition == *from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "extension `{}` is not installed as the plan assumed, so the plan cannot pin its update",
+                    name.shown()
+                )
+            })?;
+        let path =
+            pbps_pg::extension_provider::update_path(conn, name.raw(), &from.version, &to.version)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("extension `{}` has no update path to pin", name.shown())
+                })?;
+        pins.push(pbps_model::ExtensionChangePin {
+            uid: uid.clone(),
+            name: name.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            path,
+            before: before.clone(),
+            after: after.clone(),
+        });
+    }
+    Ok(pins)
 }
 
 /// The packages a recorded intent retires, by name: held by the target, no
@@ -5125,15 +5283,43 @@ fn refuse_pinned_movement(
             _ => None,
         })
         .collect();
+    // The packages an update moves: at the version it started from or the one
+    // it ends at while the plan runs, and at the end of it nowhere else.
+    let updates: BTreeMap<
+        &pbps_model::ObjectLocalName,
+        (&pbps_model::Extension, &pbps_model::Extension),
+    > = changes
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            pbps_model::Change::UpdateExtension { name, from, to, .. } => Some((name, (from, to))),
+            _ => None,
+        })
+        .collect();
     let extensions: BTreeSet<_> = before
         .extensions
         .keys()
         .chain(after.extensions.keys())
         .chain(installs.keys().copied())
         .chain(removals.keys().copied())
+        .chain(updates.keys().copied())
         .collect();
     for name in extensions {
         let (was, now) = (before.extensions.get(name), after.extensions.get(name));
+        if let Some((from, to)) = updates.get(name) {
+            let stands =
+                |held: Option<&pbps_model::Extension>| held.is_some_and(|d| d == *from || d == *to);
+            if !stands(was)
+                || !stands(now)
+                || (now != Some(*to) && !matches!(settled, Settled::SoFar))
+            {
+                bail!(
+                    "extension `{}` does not match what its plan promised during {label}",
+                    name.shown()
+                )
+            }
+            continue;
+        }
         if let Some(pinned) = removals.get(name) {
             if was.is_some_and(|was| was != *pinned)
                 || now.is_some_and(|now| now != *pinned)
@@ -7095,6 +7281,7 @@ async fn bootstrap_async(
                 // Nothing is created here: the packages are the prerequisites.
                 extension_requires: Default::default(),
                 extension_drops: Default::default(),
+                extension_updates: Default::default(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
                 // Carried for the same reason, and one more: it is what decides
@@ -8216,6 +8403,8 @@ async fn plan_db_selected(
             hints.domain_array_holders =
                 pbps_pg::domain_alter::array_holders(&mut conn, &domains).await?;
             hints.extension_requires = extension_creates(&mut conn, &base, &declared, &resolved.ids).await?;
+            hints.extension_updates =
+                extension_update_facts(&mut conn, &base, &declared, &recorded_ids, &resolved.ids).await?;
             hints.extension_drops = extension_drop_facts(
                 &mut conn,
                 &retired_extensions(&base, &declared, &recorded_ids, &resolved.ids),
@@ -9063,9 +9252,9 @@ async fn plan_db_selected(
         use crate::rehearsal::connected::Course;
         // A create runs code pbps cannot read, so its members are read from a
         // rehearsal and pinned: without one there is nothing to pin (DEC-2447.6).
-        if course != Course::Rehearse && let Some(name) = created_extensions(&cs).next() {
+        if course != Course::Rehearse && let Some((name, done)) = changed_extensions(&cs).next() {
             anyhow::bail!(
-                "extension `{}` is created by this plan, which runs the package's install script; its members are read from a rehearsal on the resolver scratch and pinned into the plan, and this plan is not rehearsed ({}). Select a resolver scratch entry and do not turn the rehearsal off (`rehearse: false`, `--no-rehearse`)",
+                "extension `{}` is {done} by this plan, which runs the package's script; its members are read from a rehearsal on the resolver scratch and pinned into the plan, and this plan is not rehearsed ({}). Select a resolver scratch entry and do not turn the rehearsal off (`rehearse: false`, `--no-rehearse`)",
                 name.shown(),
                 match course {
                     Course::Off => "the rehearsal is turned off",
@@ -9128,6 +9317,7 @@ async fn plan_db_selected(
         {
             return Err(error);
         }
+        let extension_changes = extension_change_pins(&mut conn, &cs, &manifests, &declared).await?;
         let extension_pins = extension_pins(&cs, manifests, &declared, &resolved.ids)?;
         let extension_drops = extension_drop_pins(&mut conn, &cs).await?;
         Ok(Connected::Ordinary(Box::new((
@@ -9165,7 +9355,7 @@ async fn plan_db_selected(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins, extension_drops),
+            (rehearsal, extension_pins, extension_drops, extension_changes),
         ))))
     }).await?;
         let (
@@ -9181,7 +9371,7 @@ async fn plan_db_selected(
             reviewed,
             resolver_assessment,
             resolution,
-            (rehearsal, extension_pins, extension_drops),
+            (rehearsal, extension_pins, extension_drops, extension_changes),
         ) = match connected {
             Connected::Ordinary(planned) => *planned,
             Connected::Refused {
@@ -9345,6 +9535,7 @@ async fn plan_db_selected(
         plan.extension_pins = extension_pins;
         plan.extension_drops = extension_drops;
         plan.target_assertions = target_assertions;
+        plan.extension_changes = extension_changes;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -10646,8 +10837,8 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     Some(&entry.snapshot.declared.overlay(&previous)),
                 )
                 .await?;
-                if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {
-                    vet_before_extension_drop(conn, dropped, &plan.extension_drops).await?;
+                if let Some(extension) = &stmt.extension {
+                    vet_before_extension(conn, extension, Some(plan)).await?;
                 }
                 conn.execute(&stmt.sql).await?;
                 retained_verified =
@@ -10664,11 +10855,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     .await?;
                 }
                 if let Some(extension) = &stmt.extension {
-                    if extension.drops {
-                        confirm_extension_dropped(conn, extension).await?;
-                    } else {
-                        vet_installed_extension(conn, extension, &plan.extension_pins).await?;
-                    }
+                    vet_after_extension(conn, extension, Some(plan)).await?;
                 }
                 crate::engine::refuse_unsafe_definers(
                     conn,
@@ -10755,12 +10942,17 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             }
         }
         if let Some(installed) = &stmt.extension {
-            if installed.drops {
-                live_ids.extensions.remove(&installed.uid);
-            } else {
-                live_ids
-                    .extensions
-                    .insert(installed.uid.clone(), installed.name.clone());
+            match installed.phase {
+                pbps_dialect::ExtensionPhase::Drop => {
+                    live_ids.extensions.remove(&installed.uid);
+                }
+                pbps_dialect::ExtensionPhase::Create => {
+                    live_ids
+                        .extensions
+                        .insert(installed.uid.clone(), installed.name.clone());
+                }
+                // The package keeps its identity.
+                pbps_dialect::ExtensionPhase::Update { .. } => {}
             }
         }
         adopt_created(&mut live_ids, &plan.ids, &stmt.creates);
@@ -11929,9 +12121,8 @@ async fn execute_statement(
     crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
     // A drop is vetted before it runs: what it would delete is judged while
     // it can still be refused, not after (DEC-2447.8).
-    if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {
-        let pins = reviewed.map_or(&[][..], |a| a.plan.extension_drops.as_slice());
-        vet_before_extension_drop(conn, dropped, pins).await?;
+    if let Some(extension) = &stmt.extension {
+        vet_before_extension(conn, extension, reviewed.map(|a| a.plan)).await?;
     }
     if let Some(progress) = progress {
         progress.started.set(true);
@@ -11963,14 +12154,79 @@ async fn execute_statement(
         .await?;
     }
     if let Some(extension) = &stmt.extension {
-        if extension.drops {
-            confirm_extension_dropped(conn, extension).await?;
-        } else {
-            let pins = reviewed.map_or(&[][..], |a| a.plan.extension_pins.as_slice());
-            vet_installed_extension(conn, extension, pins).await?;
-        }
+        vet_after_extension(conn, extension, reviewed.map(|a| a.plan)).await?;
     }
     Ok(())
+}
+
+/// What an extension statement is held to before it runs, by what it does:
+/// a drop's manifest and reach (DEC-2447.8), an update's manifest, versions
+/// and dependents (DEC-2447.10). An install is vetted after only.
+async fn vet_before_extension(
+    conn: &mut Conn,
+    extension: &pbps_dialect::ExtensionStatement,
+    plan: Option<&pbps_model::SavedPlan>,
+) -> anyhow::Result<()> {
+    use pbps_dialect::ExtensionPhase;
+    match &extension.phase {
+        ExtensionPhase::Create => Ok(()),
+        ExtensionPhase::Drop => {
+            let pins = plan.map_or(&[][..], |p| p.extension_drops.as_slice());
+            vet_before_extension_drop(conn, extension, pins).await
+        }
+        ExtensionPhase::Update { .. } => {
+            let pin = plan
+                .into_iter()
+                .flat_map(|p| p.extension_changes.iter())
+                .find(|p| p.uid == extension.uid && p.name == extension.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extension `{}` has no pinned manifest in the plan, so its update cannot be vetted",
+                        extension.name.shown()
+                    )
+                })?;
+            pbps_pg::extension_provider::vet_before_update(conn, extension.name.raw(), pin)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(error)
+                        .context("nothing was updated and nothing was recorded")
+                })
+        }
+    }
+}
+
+/// What it is held to right after, before its transaction commits.
+async fn vet_after_extension(
+    conn: &mut Conn,
+    extension: &pbps_dialect::ExtensionStatement,
+    plan: Option<&pbps_model::SavedPlan>,
+) -> anyhow::Result<()> {
+    use pbps_dialect::ExtensionPhase;
+    match &extension.phase {
+        ExtensionPhase::Create => {
+            let pins = plan.map_or(&[][..], |p| p.extension_pins.as_slice());
+            vet_installed_extension(conn, extension, pins).await
+        }
+        ExtensionPhase::Drop => confirm_extension_dropped(conn, extension).await,
+        ExtensionPhase::Update { .. } => {
+            let pin = plan
+                .into_iter()
+                .flat_map(|p| p.extension_changes.iter())
+                .find(|p| p.uid == extension.uid && p.name == extension.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "extension `{}` has no pinned manifest in the plan, so its update cannot be confirmed",
+                        extension.name.shown()
+                    )
+                })?;
+            pbps_pg::extension_provider::confirm_updated(conn, extension.name.raw(), pin)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(error)
+                        .context("the update was rolled back and nothing was recorded")
+                })
+        }
+    }
 }
 
 /// Holds what a `CREATE EXTENSION` just installed to the manifest the plan was
@@ -12066,6 +12322,27 @@ async fn recheck_extension_creates(
                 ));
             }
         }
+        anyhow::ensure!(
+            problems.is_empty(),
+            "nothing was applied: {}",
+            problems.join("; ")
+        );
+    }
+    if !plan.extension_changes.is_empty() {
+        // Each package this plan updates is still installed as it was pinned and
+        // the engine still has the path, with the planner's sentences.
+        let updates: BTreeMap<String, (pbps_model::Extension, pbps_model::Extension)> = plan
+            .extension_changes
+            .iter()
+            .map(|p| (p.name.raw().to_owned(), (p.from.clone(), p.to.clone())))
+            .collect();
+        let creating: BTreeMap<String, pbps_model::Extension> = plan
+            .extension_pins
+            .iter()
+            .map(|p| (p.name.raw().to_owned(), p.definition.clone()))
+            .collect();
+        let problems =
+            pbps_pg::extension_provider::update_problems(conn, &updates, &creating).await?;
         anyhow::ensure!(
             problems.is_empty(),
             "nothing was applied: {}",
@@ -26002,6 +26279,124 @@ mod extension_guard_tests {
                 .unwrap_err()
                 .contains("`unplanned`")
         );
+    }
+
+    #[test]
+    fn an_update_that_would_leave_a_managed_name_or_another_version_is_refused_before_it_is_sealed()
+    {
+        let at = |version: &str| pbps_model::Extension {
+            schema: "ext".into(),
+            version: version.into(),
+        };
+        let member = |name: &str| pbps_model::ProviderMember {
+            class: "function".into(),
+            names: vec!["ext".into(), name.into()],
+            args: Vec::new(),
+        };
+        let after = pbps_model::ExtensionProvider {
+            definition: at("1.1"),
+            requires: Default::default(),
+            members: [member("pkg_one"), member("pkg_two")].into(),
+        };
+        let mut declared = Schema::default();
+        declared.modules.insert(
+            "ext.pkg_two()".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS int LANGUAGE sql RETURN 2".into(),
+                options: Default::default(),
+            },
+        );
+        let name: pbps_model::ObjectLocalName = "pkg".into();
+        let error = refuse_two_owners(&name, &after, &at("1.1"), &declared)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`pkg`") && error.contains("pkg_two") && error.contains("two owners"),
+            "{error}"
+        );
+        // Negatives: an unrelated declaration is fine, and so is the same
+        // manifest when nothing manages its members; another version is not.
+        refuse_two_owners(&name, &after, &at("1.1"), &Schema::default()).unwrap();
+        assert!(refuse_two_owners(&name, &after, &at("1.2"), &Schema::default()).is_err());
+    }
+
+    #[test]
+    fn an_updated_package_stands_at_its_old_or_new_version_and_at_the_close_at_the_new_one() {
+        let at = |version: &str| pbps_model::Extension {
+            schema: "ext".into(),
+            version: version.into(),
+        };
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::UpdateExtension {
+                    uid: "e_aaaaaa".parse().unwrap(),
+                    name: "cube".into(),
+                    from: at("1.4"),
+                    to: at("1.5"),
+                    requires: Default::default(),
+                    releases: Default::default(),
+                },
+            )],
+        };
+        let mut before = Schema::default();
+        before.extensions.insert("cube".into(), at("1.4"));
+        before.extensions.insert("standing".into(), at("1.0"));
+        let ids = guard::fixture_ids(&changes, &before);
+        let plan = guard::Plan {
+            changes: &changes,
+            ids: &ids,
+        };
+        let staged = guard::Staged::new(plan).unwrap();
+        let held = |version: &str| {
+            let mut after = before.clone();
+            after.extensions.insert("cube".into(), at(version));
+            after
+        };
+        let check = |read: guard::Read<'_>, after: &Schema| {
+            refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
+                .map_err(|e| e.to_string())
+        };
+        let closing = || guard::Read::transactional(plan);
+        let midway = || {
+            staged.read(StagedRead::Checkpoint {
+                completed: 0,
+                total: 1,
+            })
+        };
+        // At the new version, at the close and at a checkpoint; the old one
+        // only while the plan runs.
+        check(closing(), &held("1.5")).unwrap();
+        check(midway(), &held("1.5")).unwrap();
+        check(midway(), &held("1.4")).unwrap();
+        let error = check(closing(), &held("1.4")).unwrap_err();
+        assert!(
+            error.contains("`cube`") && error.contains("promised"),
+            "{error}"
+        );
+        // A third version is refused wherever it is read, and so is a schema
+        // change, and a package that left.
+        for other in [
+            at("1.6"),
+            pbps_model::Extension {
+                schema: "other".into(),
+                ..at("1.5")
+            },
+        ] {
+            for read in [closing(), midway()] {
+                let mut after = before.clone();
+                after.extensions.insert("cube".into(), other.clone());
+                assert!(check(read, &after).unwrap_err().contains("promised"));
+            }
+        }
+        let mut gone = before.clone();
+        gone.extensions.remove("cube");
+        assert!(check(midway(), &gone).unwrap_err().contains("promised"));
+        // The update excuses no other package moving.
+        let mut moved = held("1.5");
+        moved.extensions.get_mut("standing").unwrap().version = "2.0".into();
+        assert!(check(closing(), &moved).unwrap_err().contains("`standing`"));
     }
 
     #[test]

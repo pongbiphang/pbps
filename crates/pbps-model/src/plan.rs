@@ -281,7 +281,9 @@ use crate::zone::SessionZone;
 // 60 adds the pinned `CREATE EXTENSION` and its sealed provider manifests (DEC-2447.6).
 // 61 adds the explicit `DROP EXTENSION` and the target's manifest and accepted outside
 // objects it is sealed with (DEC-2447.8): an older build would refuse the change as unknown.
-pub const CURRENT_VERSION: u32 = 61;
+// 63 adds the pinned `ALTER EXTENSION ... UPDATE TO` and the manifests it is sealed with
+// (DEC-2447.10); 62 belongs to another change.
+pub const CURRENT_VERSION: u32 = 63;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -481,6 +483,13 @@ pub struct SavedPlan {
     /// statement and refuses on any difference. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_drops: Vec<ExtensionDropPin>,
+    /// The packages this plan updates, each with the manifest the target held
+    /// when it was planned, the one the rehearsal read after the update, and
+    /// the version path the engine reported (DEC-2447.10). The apply re-reads
+    /// before and after the statement and rolls back on any difference.
+    /// Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_changes: Vec<ExtensionChangePin>,
 
     /// Review and pin user-written roots on referenced types' potential input paths.
     /// Omit false to preserve historical bytes; true remains checksum-pinned.
@@ -572,6 +581,26 @@ pub struct ExtensionDropPin {
     pub outside: std::collections::BTreeSet<crate::ProviderMember>,
 }
 
+/// One `ALTER EXTENSION ... UPDATE TO` of the plan and what it was approved to
+/// do: the manifest the target held, the manifest the rehearsal read from the
+/// scratch after running the same statement, and the chain of versions the
+/// engine would apply. Covered by the checksum, so none can be swapped
+/// (DEC-2447.10).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionChangePin {
+    pub uid: crate::Uid,
+    pub name: crate::ObjectLocalName,
+    pub from: crate::Extension,
+    pub to: crate::Extension,
+    /// Every version from the installed one to the target, as the engine's own
+    /// `pg_extension_update_paths` names them. Package files can change between
+    /// the plan and the apply, so the apply compares it again.
+    pub path: Vec<String>,
+    pub before: crate::ExtensionProvider,
+    pub after: crate::ExtensionProvider,
+}
+
 /// A referenced type's identity and unkeyed canonical-definition digest.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -644,6 +673,7 @@ impl SavedPlan {
             declared_type_pins: Vec::new(),
             extension_pins: Vec::new(),
             extension_drops: Vec::new(),
+            extension_changes: Vec::new(),
             pin_type_routines: false,
             type_routines: Vec::new(),
             type_routine_pins: None,
@@ -1318,9 +1348,10 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 61);
+        assert_eq!(plan.version, 63);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
+        assert!(bare.get("extension_changes").is_none(), "{bare}");
         assert!(bare.get("extension_pins").is_none());
         let mut dropping = plan.clone();
         let definition = crate::Extension {
@@ -1446,5 +1477,72 @@ mod tests {
             .unwrap()
             .replace("\"pass\"", "\"violation\"");
         assert!(serde_json::from_str::<SavedPlan>(&json).is_err());
+    }
+
+    /// An update is sealed with a manifest before and after and the path, in the
+    /// checksum, and a plan with none writes no such field, so older bytes are
+    /// kept (DEC-2447.10).
+    #[test]
+    fn a_plan_with_an_update_writes_its_pin_and_one_without_does_not() {
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            "minimal",
+            "2026-11-03T00:00:00Z",
+            PlanBaseline {
+                description: "d".into(),
+                checksum: "c".into(),
+                database_collation: None,
+                time_zone: None,
+            },
+            Default::default(),
+            Default::default(),
+        );
+        assert!(
+            serde_json::to_value(&plan)
+                .unwrap()
+                .get("extension_changes")
+                .is_none()
+        );
+        let at = |version: &str| crate::Extension {
+            schema: "ext".into(),
+            version: version.into(),
+        };
+        let provider = |version: &str| crate::ExtensionProvider {
+            definition: at(version),
+            requires: Default::default(),
+            members: Default::default(),
+        };
+        let mut updating = plan.clone();
+        updating.extension_changes.push(ExtensionChangePin {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            from: at("1.4"),
+            to: at("1.6"),
+            path: ["1.4", "1.5", "1.6"].map(str::to_owned).to_vec(),
+            before: provider("1.4"),
+            after: provider("1.6"),
+        });
+        let written = serde_json::to_value(&updating).unwrap();
+        assert_eq!(written["extension_changes"][0]["path"][2], "1.6");
+        let back: SavedPlan = serde_json::from_value(written).unwrap();
+        assert_eq!(back, updating);
+        assert_ne!(plan.wire_fingerprint(), updating.wire_fingerprint());
+        // Each part of the pin is covered: changing one changes the checksum.
+        for edit in [
+            (|p: &mut ExtensionChangePin| p.path.pop())
+                as fn(&mut ExtensionChangePin) -> Option<String>,
+            |p| {
+                p.after.requires.insert("cube".into());
+                None
+            },
+            |p| {
+                p.before.definition.version = "1.3".into();
+                None
+            },
+        ] {
+            let mut other = updating.clone();
+            edit(&mut other.extension_changes[0]);
+            assert_ne!(other.wire_fingerprint(), updating.wire_fingerprint());
+        }
     }
 }

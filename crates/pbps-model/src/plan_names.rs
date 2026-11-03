@@ -360,6 +360,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::EnumRebuild { .. }
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
+        | Change::UpdateExtension { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { .. }

@@ -265,18 +265,29 @@ pub struct DeclaredTypeStatement {
     pub after_vet: Option<String>,
 }
 
-/// A package install or drop boundary supplied by the emitter, never inferred from
-/// SQL: the executor vets the members the statement leaves against the plan's
-/// pinned manifest in its own transaction (DEC-2447.6).
+/// A package install, update or drop boundary supplied by the emitter, never
+/// inferred from SQL: the executor vets the members the statement leaves against
+/// the plan's pinned manifest in its own transaction (DEC-2447.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionStatement {
     pub uid: pbps_model::Uid,
     pub name: pbps_model::ObjectLocalName,
-    /// The statement drops the package. The executor then vets the target's
-    /// manifest and the objects outside it *before* the statement and confirms
-    /// everything sealed is gone after it, where an install is vetted after
-    /// only (DEC-2447.8).
-    pub drops: bool,
+    pub phase: ExtensionPhase,
+}
+
+/// What an extension statement does, which decides what the executor checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionPhase {
+    /// Vetted after only: the members it installed are the pinned ones.
+    Create,
+    /// Vetted before (the target is what the plan was made against, and what
+    /// depends on the package is remembered) and after (the pinned result, and
+    /// everything remembered still stands). `from` is the definition the
+    /// package must hold when the statement starts (DEC-2447.10).
+    Update { from: pbps_model::Extension },
+    /// Vetted before (the manifest and the objects outside it) and confirmed
+    /// after (everything sealed is gone) (DEC-2447.8).
+    Drop,
 }
 
 /// One executable statement.

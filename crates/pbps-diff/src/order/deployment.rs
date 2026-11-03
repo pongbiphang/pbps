@@ -3184,6 +3184,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
+            | Change::UpdateExtension { .. }
     ) {
         return false;
     }

@@ -810,6 +810,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::CreateRole { .. }
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
+        | Change::UpdateExtension { .. }
         | Change::RenameRole { .. }
         | Change::DropRole { .. }
         | Change::Grant { .. }

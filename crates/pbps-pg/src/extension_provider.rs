@@ -209,6 +209,17 @@ pub async fn drop_problems(
     conn: &mut impl QueryConnection,
     names: &BTreeSet<String>,
 ) -> Result<Vec<String>, DbError> {
+    ownership_problems(conn, names, "drop").await
+}
+
+/// The ownership rule `ALTER EXTENSION` and `DROP EXTENSION` share, for the
+/// action `verb` names (measured on 16.15 and 18.6: a stranger and a member
+/// that does not inherit get 42501, "must be owner of extension").
+async fn ownership_problems(
+    conn: &mut impl QueryConnection,
+    names: &BTreeSet<String>,
+    verb: &str,
+) -> Result<Vec<String>, DbError> {
     const WHO: &str = "SELECT e.extname::text AS name, pg_catalog.pg_get_userbyid(e.extowner)::text AS owner, (r.rolsuper OR pg_catalog.pg_has_role(current_user, e.extowner, 'USAGE'))::text AS allowed, current_user::text AS me FROM pg_catalog.pg_extension e CROSS JOIN pg_catalog.pg_roles r WHERE r.rolname = current_user";
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -219,7 +230,7 @@ pub async fn drop_problems(
         }
         if !flag(&row, "allowed")? {
             out.push(format!(
-                "extension `{}` is owned by `{}`, and the connected role `{}` is neither a superuser, that owner, nor a member of it that inherits its privileges, so the engine would refuse the drop (42501)",
+                "extension `{}` is owned by `{}`, and the connected role `{}` is neither a superuser, that owner, nor a member of it that inherits its privileges, so the engine would refuse the {verb} (42501)",
                 Escaped(&name),
                 Escaped(&text(&row, "owner")?),
                 Escaped(&text(&row, "me")?)
@@ -229,7 +240,7 @@ pub async fn drop_problems(
     }
     for missing in names.difference(&seen) {
         out.push(format!(
-            "extension `{}` is not installed on the target, so there is nothing to drop",
+            "extension `{}` is not installed on the target, so there is nothing to {verb}",
             Escaped(missing)
         ));
     }
@@ -641,23 +652,255 @@ pub fn create_problems(
             Escaped(&wanted.schema)
         )));
     }
-    if let Some(control) = target
+    out.extend(script_privilege(
+        target,
+        name,
+        wanted,
+        "install",
+        "installed",
+    ));
+    out
+}
+
+/// Whether the connected role may run the version's script at all: the same
+/// rule for an install and for an update (measured on 16.15 and 18.6, where an
+/// owner without `CREATE` on the database is refused a real update with 42501
+/// and a non-superuser is refused an untrusted package that asks for one).
+fn script_privilege(
+    target: &Target,
+    name: &str,
+    version: &Extension,
+    noun: &str,
+    verb: &str,
+) -> Option<String> {
+    let control = target
         .available
-        .get(&(name.to_owned(), wanted.version.clone()))
-        && !target.superuser
-        && control.superuser
-    {
-        if !control.trusted {
-            out.push(at(
-                "is not trusted and its install script needs a superuser; the connected role is not one".into(),
-            ));
-        } else if !target.database_create {
-            out.push(at(
-                "is installed by a role with CREATE on the database, which the connected role lacks".into(),
+        .get(&(name.to_owned(), version.version.clone()))?;
+    if target.superuser || !control.superuser {
+        return None;
+    }
+    let at = |detail: String| {
+        format!(
+            "extension `{}` version `{}` {detail}",
+            Escaped(name),
+            Escaped(&version.version)
+        )
+    };
+    Some(if !control.trusted {
+        at(format!(
+            "is not trusted and its {noun} script needs a superuser; the connected role is not one"
+        ))
+    } else if !target.database_create {
+        at(format!(
+            "is {verb} by a role with CREATE on the database, which the connected role lacks"
+        ))
+    } else {
+        return None;
+    })
+}
+
+/// The versions the engine would walk from `from` to `to`, from its own
+/// `pg_extension_update_paths`: `None` is no path (a downgrade, an unknown
+/// version, the current one), which is a refusal and never a default. A path
+/// can end at a version that has no install script, so this says nothing about
+/// whether a version is installable.
+pub async fn update_path(
+    conn: &mut impl QueryConnection,
+    name: &str,
+    from: &str,
+    to: &str,
+) -> Result<Option<Vec<String>>, DbError> {
+    // The function raises (0A000) for a package the server does not list at all,
+    // which is no path and is named by `requirement_problems`.
+    let listed = conn
+        .query(&format!(
+            "SELECT 1 AS listed FROM pg_catalog.pg_available_extensions WHERE name = {}",
+            crate::emit::literal(name)
+        ))
+        .await?;
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let rows = conn
+        .query(&format!(
+            "SELECT path::text AS path FROM pg_catalog.pg_extension_update_paths({}) \
+              WHERE source = {} AND target = {}",
+            crate::emit::literal(name),
+            crate::emit::literal(from),
+            crate::emit::literal(to)
+        ))
+        .await?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(row
+            .try_get::<&str>("path")?
+            .map(|path| path.split("--").map(str::to_owned).collect())),
+        _ => Err(DbError::BadRow(format!(
+            "extension `{}` has two update paths from `{}` to `{}`",
+            Escaped(name),
+            Escaped(from),
+            Escaped(to)
+        ))),
+    }
+}
+
+/// Why each update in `updates` (name to the version held and the version
+/// wanted) would fail or surprise on the target now, one sentence each
+/// (DEC-2447.10): installed at the version the plan assumed, the engine has a
+/// path, the target version is installable and its prerequisites are held, and
+/// the connected role may run it. `creating` are the packages this plan
+/// installs, which a prerequisite may be.
+pub async fn update_problems(
+    conn: &mut impl QueryConnection,
+    updates: &BTreeMap<String, (Extension, Extension)>,
+    creating: &BTreeMap<String, Extension>,
+) -> Result<Vec<String>, DbError> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = target(conn).await?;
+    let names: BTreeSet<String> = updates.keys().cloned().collect();
+    let mut out = ownership_problems(conn, &names, "update").await?;
+    let mut known = target.installed.clone();
+    known.extend(creating.iter().map(|(n, d)| (n.clone(), d.clone())));
+    for (name, (from, to)) in updates {
+        if target.installed.get(name).is_some_and(|held| held != from) {
+            out.push(format!(
+                "extension `{}` is not installed as the plan assumed (it is `{}` in schema `{}`, not `{}` in schema `{}`)",
+                Escaped(name),
+                Escaped(&target.installed[name].version),
+                Escaped(&target.installed[name].schema),
+                Escaped(&from.version),
+                Escaped(&from.schema)
             ));
         }
+        if update_path(conn, name, &from.version, &to.version)
+            .await?
+            .is_none()
+        {
+            out.push(format!(
+                "extension `{}` has no update path from version `{}` to `{}`; the engine applies only the versions the package ships scripts between, and pbps never guesses a downgrade or drops and recreates the package",
+                Escaped(name),
+                Escaped(&from.version),
+                Escaped(&to.version)
+            ));
+        }
+        out.extend(requirement_problems(
+            "target",
+            name,
+            to,
+            &target.available,
+            &known,
+        ));
+        out.extend(script_privilege(&target, name, to, "update", "updated"));
     }
-    out
+    Ok(out)
+}
+
+/// The check that runs in the statement's own transaction *before* an
+/// `ALTER EXTENSION ... UPDATE TO` (DEC-2447.10): the package stands as the
+/// plan assumed, its members are the ones the plan was approved over, and the
+/// engine would walk the pinned versions. What depends on the package from
+/// outside it (a column default calling a member, a view, an object marked
+/// `DEPENDS ON EXTENSION`) is remembered in a temporary table that ends with the
+/// transaction, so that [`confirm_updated`] can prove each is still there: a
+/// script that drops a member `CASCADE` takes its dependents with it, which the
+/// engine does not refuse.
+pub async fn vet_before_update(
+    conn: &mut pbps_db::Conn,
+    name: &str,
+    pin: &pbps_model::ExtensionChangePin,
+) -> Result<(), DbError> {
+    let all = providers(conn).await?;
+    let Some(actual) = all.get(name) else {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is no longer installed",
+            Escaped(name)
+        )));
+    };
+    if actual.definition != pin.from {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is `{}` in schema `{}`, not the `{}` in schema `{}` the plan was approved to update",
+            Escaped(name),
+            Escaped(&actual.definition.version),
+            Escaped(&actual.definition.schema),
+            Escaped(&pin.from.version),
+            Escaped(&pin.from.schema)
+        )));
+    }
+    let differences = pin.before.differences(actual);
+    if !differences.is_empty() {
+        return Err(DbError::Refused(format!(
+            "extension `{}` is not what the plan was approved to update (its members changed since it was planned): {}",
+            Escaped(name),
+            differences.join("; ")
+        )));
+    }
+    if update_path(conn, name, &pin.from.version, &pin.to.version)
+        .await?
+        .as_ref()
+        != Some(&pin.path)
+    {
+        return Err(DbError::Refused(format!(
+            "extension `{}` no longer updates from `{}` to `{}` by the versions the plan was approved over ({})",
+            Escaped(name),
+            Escaped(&pin.from.version),
+            Escaped(&pin.to.version),
+            pin.path.join(" -> ")
+        )));
+    }
+    conn.execute(
+        "CREATE TEMPORARY TABLE IF NOT EXISTS pg_temp.pbps_update_keep \
+         (ext text, classid oid, objid oid, objsubid int4) ON COMMIT DROP",
+    )
+    .await?;
+    conn.execute(&format!(
+        "{} INSERT INTO pg_temp.pbps_update_keep \
+         SELECT e.extname, d.classid, d.objid, d.objsubid FROM reach r \
+           JOIN pg_catalog.pg_extension e ON e.oid = r.ext \
+           JOIN pg_catalog.pg_depend d ON d.refclassid = r.classid AND d.refobjid = r.objid AND d.deptype = 'n' \
+          WHERE e.extname = {name} \
+            AND NOT EXISTS (SELECT 1 FROM reach o WHERE o.classid = d.classid AND o.objid = d.objid) \
+         UNION \
+         SELECT e.extname, d.classid, d.objid, d.objsubid FROM pg_catalog.pg_depend d \
+           JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+          WHERE d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.deptype = 'x' AND e.extname = {name}",
+        reach!(),
+        name = crate::emit::literal(name),
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The check right *after* the update, before its transaction commits: the
+/// package is at the target version with the members the rehearsal read, and
+/// every object that depended on it from outside is still there. Anything else
+/// rolls the update back with the rest.
+pub async fn confirm_updated(
+    conn: &mut impl QueryConnection,
+    name: &str,
+    pin: &pbps_model::ExtensionChangePin,
+) -> Result<(), DbError> {
+    vet(conn, name, &pin.after).await?;
+    let gone = conn
+        .query(&format!(
+            "SELECT count(*)::text AS n FROM pg_temp.pbps_update_keep t WHERE t.ext = {} \
+             AND pg_catalog.pg_describe_object(t.classid, t.objid, t.objsubid) IS NULL",
+            crate::emit::literal(name)
+        ))
+        .await?;
+    let n = gone
+        .first()
+        .map(|r| text(r, "n"))
+        .transpose()?
+        .ok_or_else(|| DbError::BadRow("the update check read no count".into()))?;
+    if n != "0" {
+        return Err(DbError::Refused(format!(
+            "{n} object(s) that depended on extension `{}` are gone after its update script ran",
+            Escaped(name)
+        )));
+    }
+    Ok(())
 }
 
 /// The vet that runs inside the transaction that installed a package: the
@@ -872,7 +1115,10 @@ mod tests {
             assert!(!statements[0].sql.contains(forbidden));
         }
         let boundary = statements[0].extension.as_ref().unwrap();
-        assert!(boundary.drops && boundary.name.raw() == "odd \"name");
+        assert!(
+            boundary.phase == pbps_dialect::ExtensionPhase::Drop
+                && boundary.name.raw() == "odd \"name"
+        );
 
         // `aaa` is required by `zzz` (dropped by the plan, sorts last), and a
         // function marked as depending on `aaa` goes with the plan.
@@ -1081,6 +1327,191 @@ mod tests {
     fn a_name_with_a_line_break_cannot_forge_a_line() {
         let found = problems("a\nforged", &wanted("ext", "1.0"), &[]);
         assert!(!found[0].contains('\n'), "{found:?}");
+    }
+
+    /// An update is exactly `ALTER EXTENSION name UPDATE TO 'version'` with the
+    /// boundary the executor vets before and after, and through the real differ
+    /// and orderer it waits for the package of its plan that its target version
+    /// requires and for the module its plan drops that uses a member of it. The
+    /// prerequisite sorts after it by name, so only the edge and the rank can put
+    /// it first.
+    #[test]
+    fn an_update_is_exactly_the_named_version_statement_and_waits_for_its_prerequisite_and_modules()
+    {
+        use pbps_model::{Change, IdsFile, Schema};
+        let pg = crate::Postgres::new();
+        let update = Change::UpdateExtension {
+            uid: "e_000001".parse().unwrap(),
+            name: "odd \"name".into(),
+            from: wanted("ext\"s", "1.0"),
+            to: wanted("ext\"s", "1.0'x"),
+            requires: Default::default(),
+            releases: Default::default(),
+        };
+        let statements = crate::emit::emit(&pg, &update, Default::default()).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "ALTER EXTENSION \"odd \"\"name\" UPDATE TO '1.0''x';"
+        );
+        for forbidden in ["CASCADE", "IF EXISTS", "SET SCHEMA", "DROP"] {
+            assert!(!statements[0].sql.contains(forbidden));
+        }
+        let boundary = statements[0].extension.as_ref().unwrap();
+        assert_eq!(
+            boundary.phase,
+            pbps_dialect::ExtensionPhase::Update {
+                from: wanted("ext\"s", "1.0")
+            }
+        );
+
+        let base = Schema {
+            extensions: [("aaa".into(), wanted("ext", "1.0"))].into(),
+            modules: [(
+                "app.marked()".parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS int LANGUAGE sql RETURN 1".into(),
+                    options: Default::default(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            extensions: [("aaa", "1.1"), ("zzz", "1.0")]
+                .map(|(n, v)| (n.into(), wanted("ext", v)))
+                .into(),
+            ..Default::default()
+        };
+        let ids = |both: bool| IdsFile {
+            extensions: [("e_000001", "aaa"), ("e_000002", "zzz")]
+                .into_iter()
+                .take(if both { 2 } else { 1 })
+                .map(|(u, n)| (u.parse().unwrap(), n.into()))
+                .collect(),
+            ..Default::default()
+        };
+        let facts = pbps_model::ExtensionUpdateFacts {
+            requires: ["zzz".into()].into(),
+            reach: pbps_model::ExtensionDropFacts {
+                outside: Default::default(),
+                blockers: [ProviderMember {
+                    class: "function".into(),
+                    names: vec!["app".into(), "marked".into()],
+                    args: Vec::new(),
+                }]
+                .into(),
+            },
+        };
+        let hints = pbps_model::Hints {
+            extension_updates: [("aaa".into(), facts)].into(),
+            extension_requires: [("zzz".into(), Default::default())].into(),
+            ..Default::default()
+        };
+        let planned = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &base,
+                ids: &ids(false),
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &ids(true),
+            },
+            &pg,
+            &hints,
+        )
+        .unwrap();
+        // The differ's own order, which its order shadow holds to the effects
+        // graph in debug builds, so a draft that disagreed with an edge would
+        // have refused the plan here.
+        let order: Vec<String> = planned
+            .changes()
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::DropModule { id, .. } = &p.change {
+                    Some(format!("drop module {}", id.shown()))
+                } else if let Change::UpdateExtension { name, to, .. } = &p.change {
+                    Some(format!("update {} to {}", name.shown(), to.version))
+                } else if let Change::CreateExtension { name, .. } = &p.change {
+                    Some(format!("create {}", name.shown()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(planned.changes().changes.len(), order.len(), "{order:?}");
+        assert_eq!(
+            order,
+            [
+                "drop module app.marked()",
+                "create zzz",
+                "update aaa to 1.1"
+            ]
+        );
+        let Change::UpdateExtension {
+            requires, releases, ..
+        } = &planned
+            .changes()
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateExtension { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!((requires.len(), releases.len()), (1, 1));
+
+        // Negative: with no facts (offline) the update is refused, not planned
+        // blind, and an unchanged version plans nothing.
+        let offline = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &base,
+                ids: &ids(false),
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &ids(true),
+            },
+            &pg,
+            &pbps_model::Hints::default(),
+        )
+        .unwrap_err();
+        assert!(
+            offline
+                .iter()
+                .any(|e| e.to_string().contains("only against a database")),
+            "{offline:?}"
+        );
+    }
+
+    /// What may update a package follows the control file of the version it
+    /// goes to, the same rule as an install (measured on 16.15 and 18.6).
+    #[test]
+    fn what_the_connected_role_may_update_follows_the_target_versions_control_file() {
+        let (plain, creator) = (facts(false, false), facts(false, true));
+        let (citext, fixed) = (wanted("ext", "1.6"), wanted("fixed", "1.0"));
+        let ask =
+            |t: &Target, n: &str, v: &Extension| script_privilege(t, n, v, "update", "updated");
+        assert!(ask(&creator, "citext", &citext).is_none());
+        let refused = ask(&plain, "citext", &citext).unwrap();
+        assert!(
+            refused.contains("is updated by a role with CREATE on the database"),
+            "{refused}"
+        );
+        let refused = ask(&creator, "fixed", &fixed).unwrap();
+        assert!(
+            refused.contains("update script needs a superuser"),
+            "{refused}"
+        );
+        assert!(ask(&facts(true, false), "fixed", &fixed).is_none());
+        // A package that asks for no superuser needs nothing, and a version the
+        // server does not list is for `requirement_problems` to name.
+        assert!(ask(&plain, "earthdistance", &wanted("ext", "1.1")).is_none());
+        assert!(ask(&plain, "nosuch", &wanted("ext", "1.0")).is_none());
     }
 
     /// A database of its own on each pinned server, so no other test sees the
@@ -1766,6 +2197,352 @@ mod tests {
             let missing: BTreeSet<String> = ["absent2447".to_owned()].into();
             let problems = drop_problems(&mut conn, &missing).await.unwrap();
             assert!(problems[0].contains("not installed"), "{problems:?}");
+            drop(conn);
+            admin
+                .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+                .await
+                .unwrap();
+            admin
+                .execute(&format!(
+                    "DROP OWNED BY {own}, {member}, {loose}, {stranger}"
+                ))
+                .await
+                .ok();
+            admin
+                .execute(&format!("DROP ROLE {own}, {member}, {loose}, {stranger}"))
+                .await
+                .unwrap();
+        }
+    }
+    /// A pin for `name`, `from` to `to`, built the way the planner does: the
+    /// manifest the target holds, and the one an engine that ran the update
+    /// holds afterwards (here the same engine, inside a transaction it rolls
+    /// back).
+    async fn change_pin(
+        conn: &mut pbps_db::Conn,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> pbps_model::ExtensionChangePin {
+        let before = providers(conn).await.unwrap().remove(name).unwrap();
+        let path = update_path(conn, name, from, to).await.unwrap().unwrap();
+        conn.execute("BEGIN").await.unwrap();
+        conn.execute(&format!("ALTER EXTENSION \"{name}\" UPDATE TO '{to}'"))
+            .await
+            .unwrap();
+        let after = providers(conn).await.unwrap().remove(name).unwrap();
+        conn.execute("ROLLBACK").await.unwrap();
+        pbps_model::ExtensionChangePin {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: name.into(),
+            from: before.definition.clone(),
+            to: after.definition.clone(),
+            path,
+            before,
+            after,
+        }
+    }
+
+    const UPDATE_WORLD: &str = "CREATE SCHEMA ext; \
+         CREATE EXTENSION upd2447 SCHEMA ext VERSION '1.0'; \
+         CREATE EXTENSION updcascade2447 SCHEMA ext VERSION '1.0'; \
+         CREATE EXTENSION updretire2447 SCHEMA ext VERSION '1.0'";
+
+    /// The engine's own update paths: the versions it walks, and no path for a
+    /// downgrade, the current version or an unknown one (measured on 16.15 and
+    /// 18.6: a path can also end at a version that cannot be installed, which is
+    /// why installability is read from the versions view and never from here).
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_engine_names_the_versions_an_update_walks_and_no_path_for_anything_else() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut conn) = fresh(variable, "path").await;
+            let path = |from: &'static str, to: &'static str| (from, to);
+            for (name, (from, to), want) in [
+                (
+                    "hstore",
+                    path("1.4", "1.8"),
+                    Some(vec!["1.4", "1.5", "1.6", "1.7", "1.8"]),
+                ),
+                ("upd2447", path("1.0", "1.1"), Some(vec!["1.0", "1.1"])),
+                ("upd2447", path("1.1", "1.0"), None),
+                ("upd2447", path("1.0", "1.0"), None),
+                ("upd2447", path("1.0", "9.9"), None),
+                ("nosuch", path("1.0", "1.1"), None),
+            ] {
+                let got = update_path(&mut conn, name, from, to).await.unwrap();
+                let want = want.map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>());
+                assert_eq!(got, want, "{variable} {name} {from} -> {to}");
+            }
+            discard(admin, db, conn).await;
+        }
+    }
+
+    /// An update is vetted before it runs and confirmed after it ran, in the
+    /// statement's own transaction: a package that is not where the plan left
+    /// it, members that changed, a path the engine no longer walks, and an
+    /// update script that takes an outside dependent along (`CASCADE`, which the
+    /// engine does not refuse) are each named, and an ordinary update passes.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn an_update_is_vetted_before_it_runs_and_confirmed_after_it_ran() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut conn) = fresh(variable, "updvet").await;
+            conn.execute(UPDATE_WORLD).await.unwrap();
+            let pin = change_pin(&mut conn, "upd2447", "1.0", "1.1").await;
+            assert!(pin.after.members.len() > pin.before.members.len());
+
+            // Before the statement the result is not there yet; after it, it is.
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_update(&mut conn, "upd2447", &pin).await.unwrap();
+            let error = confirm_updated(&mut conn, "upd2447", &pin)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("does not match"),
+                "{variable}: {error}"
+            );
+            conn.execute("ALTER EXTENSION upd2447 UPDATE TO '1.1'")
+                .await
+                .unwrap();
+            confirm_updated(&mut conn, "upd2447", &pin).await.unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // Not where the plan left it.
+            let mut elsewhere = pin.clone();
+            elsewhere.from.version = "0.9".into();
+            let error = vet_before_update(&mut conn, "upd2447", &elsewhere)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("not the `0.9`"),
+                "{variable}: {error}"
+            );
+            let error = vet_before_update(&mut conn, "nosuch", &pin)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("no longer installed"), "{error}");
+
+            // A path the engine no longer walks.
+            let mut rerouted = pin.clone();
+            rerouted.path = vec!["1.0".into(), "0.5".into(), "1.1".into()];
+            let error = vet_before_update(&mut conn, "upd2447", &rerouted)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("no longer updates"),
+                "{variable}: {error}"
+            );
+
+            // A member added since the plan stops it before the statement.
+            conn.execute(
+                "CREATE FUNCTION public.later() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+                 ALTER EXTENSION upd2447 ADD FUNCTION public.later()",
+            )
+            .await
+            .unwrap();
+            let error = vet_before_update(&mut conn, "upd2447", &pin)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("members changed")
+                    && error.to_string().contains("later"),
+                "{variable}: {error}"
+            );
+            conn.execute("ALTER EXTENSION upd2447 DROP FUNCTION public.later(); DROP FUNCTION public.later()")
+                .await
+                .unwrap();
+
+            // A script that drops a member with CASCADE takes an outside
+            // dependent along, which the engine allows and the confirm refuses.
+            let cascade = change_pin(&mut conn, "updcascade2447", "1.0", "1.1").await;
+            conn.execute("CREATE TABLE public.dep (x int DEFAULT ext.updcascade2447_gone())")
+                .await
+                .unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_update(&mut conn, "updcascade2447", &cascade)
+                .await
+                .unwrap();
+            conn.execute("ALTER EXTENSION updcascade2447 UPDATE TO '1.1'")
+                .await
+                .unwrap();
+            let error = confirm_updated(&mut conn, "updcascade2447", &cascade)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("depended on extension `updcascade2447`"),
+                "{variable}: {error}"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+            // Negative: with nothing depending on the member, the same update
+            // passes.
+            conn.execute("DROP TABLE public.dep").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_update(&mut conn, "updcascade2447", &cascade)
+                .await
+                .unwrap();
+            conn.execute("ALTER EXTENSION updcascade2447 UPDATE TO '1.1'")
+                .await
+                .unwrap();
+            confirm_updated(&mut conn, "updcascade2447", &cascade)
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // And an update the engine itself refuses (a retired member that a
+            // dependent uses, no CASCADE) never reaches the confirm: it fails
+            // inside the statement, with the dependent named.
+            conn.execute("CREATE TABLE public.dep (x int DEFAULT ext.updretire2447_gone())")
+                .await
+                .unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            let error = conn
+                .execute("ALTER EXTENSION updretire2447 UPDATE TO '1.1'")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("depend"), "{variable}: {error}");
+            conn.execute("ROLLBACK").await.unwrap();
+            discard(admin, db, conn).await;
+        }
+    }
+
+    /// An update needs ownership of the package and nothing else when the
+    /// control file asks for no superuser: the rule `update_problems` states is
+    /// what the engine does for a superuser, the owner, a member that inherits
+    /// the owner's privileges, one that does not, and a stranger (measured on
+    /// 16.15 and 18.6), and it names a package that is not at the version the
+    /// plan assumed, one with no path and one that is absent.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_connected_role_may_update_what_it_owns_and_nothing_else() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (mut admin, db, mut conn) = fresh(variable, "updown").await;
+            let tag = db.rsplit('_').next().unwrap().to_owned();
+            let [own, member, loose, stranger] =
+                ["own", "member", "loose", "stranger"].map(|r| format!("pbps_upd_{r}_{tag}"));
+            admin
+                .execute(&format!(
+                    "CREATE ROLE {own} NOLOGIN; CREATE ROLE {member} NOLOGIN; \
+                     CREATE ROLE {loose} NOLOGIN; CREATE ROLE {stranger} NOLOGIN; \
+                     GRANT {own} TO {member}; GRANT {own} TO {loose} WITH INHERIT FALSE"
+                ))
+                .await
+                .unwrap();
+            conn.execute(&format!(
+                "CREATE SCHEMA ext; GRANT ALL ON SCHEMA ext TO {own}; GRANT CREATE ON DATABASE {db} TO {own}; \
+                 SET ROLE {own}; CREATE EXTENSION upd2447 SCHEMA ext VERSION '1.0'; RESET ROLE"
+            ))
+            .await
+            .unwrap();
+            let (from, to) = (wanted("ext", "1.0"), wanted("ext", "1.1"));
+            let updates: BTreeMap<String, (Extension, Extension)> =
+                [("upd2447".to_owned(), (from.clone(), to.clone()))].into();
+            let none = BTreeMap::new();
+            assert!(
+                update_problems(&mut conn, &updates, &none)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for (role, allowed) in [
+                (&own, true),
+                (&member, true),
+                (&loose, false),
+                (&stranger, false),
+            ] {
+                conn.execute(&format!("SET ROLE {role}")).await.unwrap();
+                let problems = update_problems(&mut conn, &updates, &none).await.unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                let tried = conn
+                    .execute("ALTER EXTENSION upd2447 UPDATE TO '1.1'")
+                    .await;
+                conn.execute("ROLLBACK").await.unwrap();
+                conn.execute("RESET ROLE").await.unwrap();
+                assert_eq!(
+                    problems.is_empty(),
+                    allowed,
+                    "{variable} {role}: {problems:?}"
+                );
+                assert_eq!(
+                    tried.is_ok(),
+                    allowed,
+                    "{variable} {role}: the engine said {tried:?}"
+                );
+                if !allowed {
+                    assert!(
+                        problems[0].contains("42501") && problems[0].contains(&own),
+                        "{problems:?}"
+                    );
+                }
+            }
+            // A trusted package that asks for a superuser needs `CREATE` on the
+            // database as well, for a real update: the engine refuses the owner
+            // without it (42501), and the rule says so first.
+            conn.execute(&format!(
+                "SET ROLE {own}; CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; RESET ROLE"
+            ))
+            .await
+            .unwrap();
+            let trusted: BTreeMap<String, (Extension, Extension)> = [(
+                "hstore".to_owned(),
+                (wanted("ext", "1.4"), wanted("ext", "1.5")),
+            )]
+            .into();
+            for (create, allowed) in [(true, true), (false, false)] {
+                if !create {
+                    conn.execute(&format!("REVOKE CREATE ON DATABASE {db} FROM {own}"))
+                        .await
+                        .unwrap();
+                }
+                conn.execute(&format!("SET ROLE {own}")).await.unwrap();
+                let problems = update_problems(&mut conn, &trusted, &none).await.unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                let tried = conn.execute("ALTER EXTENSION hstore UPDATE TO '1.5'").await;
+                conn.execute("ROLLBACK").await.unwrap();
+                conn.execute("RESET ROLE").await.unwrap();
+                assert_eq!(
+                    problems.is_empty(),
+                    allowed,
+                    "{variable} create={create}: {problems:?}"
+                );
+                assert_eq!(
+                    tried.is_ok(),
+                    allowed,
+                    "{variable} create={create}: the engine said {tried:?}"
+                );
+                if !allowed {
+                    assert!(
+                        problems[0].contains("CREATE on the database"),
+                        "{problems:?}"
+                    );
+                }
+            }
+            // Negatives: not at the assumed version, no path, absent.
+            let held: BTreeMap<String, (Extension, Extension)> =
+                [("upd2447".to_owned(), (wanted("ext", "1.1"), to.clone()))].into();
+            let found = update_problems(&mut conn, &held, &none).await.unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("not installed as the plan assumed")),
+                "{found:?}"
+            );
+            let down: BTreeMap<String, (Extension, Extension)> =
+                [("upd2447".to_owned(), (from.clone(), wanted("ext", "1.0")))].into();
+            let found = update_problems(&mut conn, &down, &none).await.unwrap();
+            assert!(
+                found.iter().any(|p| p.contains("no update path")),
+                "{found:?}"
+            );
+            let absent: BTreeMap<String, (Extension, Extension)> =
+                [("absent2447".to_owned(), (from.clone(), to.clone()))].into();
+            let found = update_problems(&mut conn, &absent, &none).await.unwrap();
+            assert!(
+                found.iter().any(|p| p.contains("not installed")),
+                "{found:?}"
+            );
             drop(conn);
             admin
                 .execute(&format!("DROP DATABASE {db} WITH (FORCE)"))

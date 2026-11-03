@@ -301,7 +301,7 @@ The differ sorts every planned change by, in order:
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
    | 6 | `DropTable`; an `AlterColumnNumbering` giving up, renaming, or (on a column neither tightened nor retyped) turning into an identity an owned sequence, at (6, 1 + its depth in the chain of names they free) |
-   | 7 | `CreateExtension`, `CreateType`, `AddEnumValue`, `RenameEnumValue` before `CreateTable`; one package after the packages it requires, by an edge; a domain's `Loosen` that sets a default, after every label change (7, last) |
+   | 7 | `CreateExtension`, `UpdateExtension`, `CreateType`, `AddEnumValue`, `RenameEnumValue` before `CreateTable`; one package after the packages it requires, by an edge; a domain's `Loosen` that sets a default, after every label change (7, last) |
    | 8 | `AddColumn` |
    | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
@@ -482,6 +482,7 @@ requirement is common to all of them, so it is listed once,
 |---|---|---|---|---|
 | `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views and catalog-bound ordinary DEFAULT holders | Removes the module, frees its name | removes |
 | `CreateExtension` | 7, with `CreateType`; after each package of the plan its control file requires | The name free. P: each of those packages' final incarnation | A package, brought in by one `CREATE EXTENSION`; the objects it owns are read back and pinned, not ordered (DEC-2447.6, DEC-2447.7) | Is, creates |
+| `UpdateExtension` | 7, with `CreateExtension`; after each package of the plan the target version's control file requires, and after each module the plan drops that uses a member | P: those packages' final incarnation; each such module's absence | Updates the package in place under its identity, by one `ALTER EXTENSION ... UPDATE TO`; the members it adds or retires were rehearsed and sealed (before and after), not ordered, and what depended on it from outside is proven still there (DEC-2447.10) | Exists, rewrites, Is, Absent |
 | `DropExtension` | 18, with `DropType`; after each package of the plan that requires it, by an edge | P: each of those packages' final absence; each module the plan drops that the drop would delete (`DEPENDS ON EXTENSION`) or be blocked by | Removes the package and every object it owns, and releases its name; the objects it reaches were read and sealed, not ordered (DEC-2447.8) | Exists, Absent, removes |
 | `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
@@ -949,6 +950,8 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 | Type creation/rename → defaults, checks, modules and grants naming it | final name first | classes 1/7 before defaults/checks/modules/grants (9/13/14/16) |
 | DropTable/DropColumn/retype away → DropType | last column released first | classes 6/5/9 before 18; `Absent` table/column or final-column `Is` effects |
 | DropModule/drop default/drop check → DropType | dependent gone first | classes 0/9/2 before 18 |
+| DropModule → UpdateExtension | a module that uses a member the update may retire, gone first (a superset of what it retires, which is known only after the rehearsal) | class 0 before 7; `Absent(Module)` effect from the payload's `releases` |
+| CreateExtension → UpdateExtension | the prerequisite the target version requires, created first | class 7, the `requires` depth rank, plus `Is(Extension, Final)` from the payload's `requires` |
 | DropModule → DropExtension | a module that depends on the package, or hangs off it by `DEPENDS ON EXTENSION`, gone first | class 0 before 18; `Absent(Module)` effect from the payload's `releases` |
 | DropExtension of a package that another dropped package requires → DropExtension of it | the requirer gone first | reverse prerequisite depth rank within class 18, plus `Absent(Extension)` from the payload's `requirers` |
 | DropType of a domain → DropType of its base | dependent domain gone first | reverse baseline domain-base depth rank within class 18, plus `Absent(Type)` effect |

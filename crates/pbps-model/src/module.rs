@@ -1119,6 +1119,11 @@ pub struct Hints {
     /// Absent offline: a drop is planned only against a database.
     pub extension_drops: BTreeMap<crate::ObjectLocalName, crate::ExtensionDropFacts>,
 
+    /// What the target says about each package this plan would update
+    /// (DEC-2447.10). Absent offline: an update is planned only against a
+    /// database.
+    pub extension_updates: BTreeMap<crate::ObjectLocalName, crate::ExtensionUpdateFacts>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).

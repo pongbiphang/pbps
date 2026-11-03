@@ -654,7 +654,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // object's fingerprint reads them until a declaration does
             // (member consumers, DEC-2447.7).
             | Change::CreateExtension { .. }
-            | Change::DropExtension { .. } => continue,
+            | Change::DropExtension { .. }
+            | Change::UpdateExtension { .. } => continue,
         };
         let entry = affected.entry(surface).or_default();
         entry.children |= children;

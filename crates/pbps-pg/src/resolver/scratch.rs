@@ -35,8 +35,12 @@ pub async fn extension_prerequisites(
             None => problems.push(format!(
                 "{expectation}, but it is absent; provision it through the scratch externals file"
             )),
+            // After an update is applied the target holds the new version, so the
+            // externals file has to be raised to it before the next plan
+            // (DEC-2447.10); pbps never installs a package on the scratch itself.
             Some(actual) if actual != expected => problems.push(format!(
-                "{expectation}; installed version is `{}` in schema `{}`",
+                "{expectation}; installed version is `{}` in schema `{}`; provision exactly this \
+                 version through the scratch externals file",
                 Escaped(&actual.version),
                 Escaped(&actual.schema)
             )),

@@ -1,0 +1,4 @@
+comment = 'update that adds a member and replaces one in place (#2447)'
+default_version = '1.0'
+relocatable = true
+superuser = false

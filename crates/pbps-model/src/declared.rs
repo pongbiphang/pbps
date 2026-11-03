@@ -411,7 +411,8 @@ impl Declared {
                 // A package declares no expression text; its members are not
                 // read as declared types or defaults (DEC-2447.6).
                 | Change::CreateExtension { .. }
-                | Change::DropExtension { .. } => {}
+                | Change::DropExtension { .. }
+                | Change::UpdateExtension { .. } => {}
                 Change::AlterDomain {
                     name,
                     from,

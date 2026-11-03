@@ -190,6 +190,86 @@ pub fn drops(
     (changes, errors)
 }
 
+/// The packages the declarations hold at a version other than the base's, in
+/// the schema the base holds them in, each as an `ALTER EXTENSION ... UPDATE TO`
+/// (DEC-2447.10). Offline there are no facts, so an update is planned only
+/// against a database. The update waits for the packages this plan creates that
+/// the target version requires, and for the modules this plan drops that depend
+/// on a member: a superset of what the script will retire, which is known only
+/// after the rehearsal, and dropping a consumer first is never wrong. A package
+/// that also changes schema is refused in [`differences`].
+pub fn updates(
+    base: Side<'_>,
+    desired: Side<'_>,
+    dialect: &str,
+    facts: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        pbps_model::ExtensionUpdateFacts,
+    >,
+) -> (Vec<pbps_model::Change>, Vec<DiffError>) {
+    if dialect != "postgres" {
+        return (Vec::new(), Vec::new());
+    }
+    let removed: Vec<&pbps_model::ModuleId> = base
+        .schema
+        .modules
+        .keys()
+        .filter(|id| !desired.schema.modules.contains_key(*id))
+        .collect();
+    let created: std::collections::BTreeMap<_, _> = desired
+        .schema
+        .extensions
+        .keys()
+        .filter(|name| !base.schema.extensions.contains_key(*name))
+        .filter_map(|name| Some((name, desired.ids.extension_uid(name)?)))
+        .collect();
+    let (mut changes, mut errors) = (Vec::new(), Vec::new());
+    for (name, to) in &desired.schema.extensions {
+        let Some(from) = base.schema.extensions.get(name) else {
+            continue;
+        };
+        let (Some(uid), Some(recorded)) = (
+            base.ids.extension_uid(name),
+            desired.ids.extension_uid(name),
+        ) else {
+            continue;
+        };
+        if uid != recorded || from.version == to.version || from.schema != to.schema {
+            continue;
+        }
+        let Some(facts) = facts.get(name) else {
+            errors.push(DiffError::ExtensionUpdateNeedsDatabase {
+                name: name.clone(),
+                from: from.version.clone(),
+                to: to.version.clone(),
+            });
+            continue;
+        };
+        let carried = |members: &BTreeSet<pbps_model::ProviderMember>| {
+            members
+                .iter()
+                .filter_map(|m| m.module(removed.iter().copied()).cloned())
+                .collect::<Vec<_>>()
+        };
+        changes.push(pbps_model::Change::UpdateExtension {
+            uid: uid.clone(),
+            name: name.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            requires: facts
+                .requires
+                .iter()
+                .filter_map(|required| created.get(required).map(|uid| (*uid).clone()))
+                .collect(),
+            releases: carried(&facts.reach.outside)
+                .into_iter()
+                .chain(carried(&facts.reach.blockers))
+                .collect(),
+        });
+    }
+    (changes, errors)
+}
+
 /// How many packages of the plan each create waits behind, so that the differ's
 /// own order has a prerequisite ahead of what requires it. It is the effects
 /// graph that decides the order the plan keeps; this rank only keeps the
@@ -200,7 +280,9 @@ pub(crate) fn depths<'a>(
 ) -> std::collections::BTreeMap<pbps_model::Uid, isize> {
     let requires: std::collections::BTreeMap<_, _> = changes
         .filter_map(|c| {
-            if let pbps_model::Change::CreateExtension { uid, requires, .. } = c {
+            if let pbps_model::Change::CreateExtension { uid, requires, .. }
+            | pbps_model::Change::UpdateExtension { uid, requires, .. } = c
+            {
                 Some((uid, requires))
             // A drop waits for the drops of the packages that require it: the
             // same shape, from the other side (DEC-2447.8).
@@ -284,17 +366,21 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
                 }
             }
             (Some(old), Some(new)) => {
-                if old.version != new.version {
+                // A version change alone is an update (`updates`); with a new
+                // schema as well it is refused, because the order of the two
+                // statements is not one this slice proves (DEC-2447.10).
+                if old.version != new.version && old.schema != new.schema {
                     refuse(
                         name,
                         format!(
-                            "ALTER EXTENSION UPDATE from `{}` to `{}`",
+                            "ALTER EXTENSION UPDATE from `{}` to `{}` together with SET SCHEMA from `{}` to `{}` in one plan; update the package in one plan and move it in the next",
                             pbps_model::escape::Escaped(&old.version),
-                            pbps_model::escape::Escaped(&new.version)
+                            pbps_model::escape::Escaped(&new.version),
+                            pbps_model::escape::Escaped(&old.schema),
+                            pbps_model::escape::Escaped(&new.schema)
                         ),
                     );
-                }
-                if old.schema != new.schema {
+                } else if old.schema != new.schema {
                     refuse(
                         name,
                         format!(
@@ -346,6 +432,21 @@ pub fn prerequisite_differences(
             name: name.clone(),
             action: "DROP EXTENSION".into(),
         });
+    }
+    for name in desired.schema.extensions.keys() {
+        let (old, new) = (
+            base.schema.extensions.get(name),
+            desired.schema.extensions.get(name),
+        );
+        if let (Some(old), Some(new)) = (old, new)
+            && old.version != new.version
+            && old.schema == new.schema
+        {
+            errors.push(DiffError::ExtensionLifecycleUnsupported {
+                name: name.clone(),
+                action: "ALTER EXTENSION UPDATE".into(),
+            });
+        }
     }
     for change in creates(base, desired, dialect, &Default::default()) {
         if let pbps_model::Change::CreateExtension { name, .. } = change {
@@ -521,20 +622,6 @@ mod tests {
                     extensions: [(
                         "citext".into(),
                         Extension {
-                            schema: "ext".into(),
-                            version: "1.6".into(),
-                        },
-                    )]
-                    .into(),
-                    ..Default::default()
-                },
-                "UPDATE",
-            ),
-            (
-                Schema {
-                    extensions: [(
-                        "citext".into(),
-                        Extension {
                             schema: "other".into(),
                             version: "1.4".into(),
                         },
@@ -560,6 +647,47 @@ mod tests {
                 "{found:?}"
             );
         }
+        // A version change alone is no refusal here (it is an update, planned
+        // from facts), but the callers that install nothing still refuse it, and
+        // a version and a schema together are refused with the two-plan remedy.
+        let at = |schema: &str, version: &str| Schema {
+            extensions: [(
+                "citext".into(),
+                Extension {
+                    schema: schema.into(),
+                    version: version.into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let newer = at("ext", "1.6");
+        let newer_side = Side {
+            schema: &newer,
+            ids: &ids,
+        };
+        assert!(differences(side, newer_side, "postgres").is_empty());
+        let strict = prerequisite_differences(side, newer_side, "postgres");
+        assert!(
+            strict.iter().any(|e| e.to_string().contains("UPDATE")),
+            "{strict:?}"
+        );
+        let both = at("other", "1.6");
+        let refused = differences(
+            side,
+            Side {
+                schema: &both,
+                ids: &ids,
+            },
+            "postgres",
+        );
+        let text = refused[0].to_string();
+        assert!(
+            refused.len() == 1
+                && text.contains("together with SET SCHEMA")
+                && text.contains("update the package in one plan and move it in the next"),
+            "{refused:?}"
+        );
         let empty = Schema::default();
         let nothing = Side {
             schema: &empty,
@@ -1068,5 +1196,205 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, crate::identity::Blocker::UnusedIntent { .. }))
         );
+    }
+    /// A version change under one recorded identity is an update that waits for
+    /// the packages of the plan its target version requires and for the modules
+    /// the plan drops that use a member; what it does not drop is no refusal,
+    /// because a kept dependent is the ordinary case, and anything that is not a
+    /// version change under one identity is no update at all.
+    #[test]
+    fn a_version_change_is_an_update_that_waits_for_what_it_must_and_nothing_else_is() {
+        let at = |schema: &str, version: &str| Extension {
+            schema: schema.into(),
+            version: version.into(),
+        };
+        let mut base = Schema {
+            extensions: [("citext".into(), at("ext", "1.4"))].into(),
+            ..Default::default()
+        };
+        for dropped in ["app.marked()", "app.xmarked()"] {
+            base.modules.insert(
+                dropped.parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS int LANGUAGE sql RETURN 1".into(),
+                    options: Default::default(),
+                },
+            );
+        }
+        let desired = Schema {
+            extensions: [
+                ("citext".into(), at("ext", "1.6")),
+                ("cube".into(), at("ext", "1.5")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ids = |names: &[&str]| IdsFile {
+            extensions: names.iter().map(|n| (uid(n), (*n).into())).collect(),
+            ..Default::default()
+        };
+        let (base_ids, desired_ids) = (ids(&["citext"]), ids(&["citext", "cube"]));
+        let member = |class: &str, names: &[&str]| pbps_model::ProviderMember {
+            class: class.into(),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+            args: Vec::new(),
+        };
+        let facts: std::collections::BTreeMap<_, _> = [(
+            "citext".into(),
+            pbps_model::ExtensionUpdateFacts {
+                requires: ["cube".into(), "installed".into()].into(),
+                reach: pbps_model::ExtensionDropFacts {
+                    outside: [member("function", &["app", "xmarked"])].into(),
+                    blockers: [
+                        member("function", &["app", "marked"]),
+                        member("default value", &["app", "kept", "n"]),
+                    ]
+                    .into(),
+                },
+            },
+        )]
+        .into();
+        type Facts = std::collections::BTreeMap<
+            pbps_model::ObjectLocalName,
+            pbps_model::ExtensionUpdateFacts,
+        >;
+        fn run(
+            base: &Schema,
+            base_ids: &IdsFile,
+            desired: &Schema,
+            desired_ids: &IdsFile,
+            facts: &Facts,
+        ) -> (Vec<pbps_model::Change>, Vec<DiffError>) {
+            updates(
+                Side {
+                    schema: base,
+                    ids: base_ids,
+                },
+                Side {
+                    schema: desired,
+                    ids: desired_ids,
+                },
+                "postgres",
+                facts,
+            )
+        }
+        let (changes, errors) = run(&base, &base_ids, &desired, &desired_ids, &facts);
+        assert!(errors.is_empty(), "{errors:?}");
+        let [
+            pbps_model::Change::UpdateExtension {
+                from,
+                to,
+                requires,
+                releases,
+                ..
+            },
+        ] = changes.as_slice()
+        else {
+            panic!("{changes:?}")
+        };
+        assert_eq!((from.version.as_str(), to.version.as_str()), ("1.4", "1.6"));
+        // The package this plan creates, not the one already installed; the
+        // module this plan drops, not the default value it keeps.
+        assert_eq!(requires.iter().collect::<Vec<_>>(), [&uid("cube")]);
+        assert_eq!(
+            releases.iter().collect::<Vec<_>>(),
+            [&routine("marked"), &routine("xmarked")]
+        );
+
+        // Negatives, each producing no update: no facts (offline) is named; the
+        // same version; a new schema; another identity; another dialect.
+        let (none, errors) = run(
+            &base,
+            &base_ids,
+            &desired,
+            &desired_ids,
+            &Default::default(),
+        );
+        assert!(none.is_empty());
+        let text = errors[0].to_string();
+        assert!(
+            text.contains("from `1.4` to `1.6`") && text.contains("only against a database"),
+            "{text}"
+        );
+        let same = Schema {
+            extensions: [("citext".into(), at("ext", "1.4"))].into(),
+            ..Default::default()
+        };
+        assert!(
+            run(&base, &base_ids, &same, &desired_ids, &facts)
+                .0
+                .is_empty()
+        );
+        let moved = Schema {
+            extensions: [("citext".into(), at("other", "1.6"))].into(),
+            ..Default::default()
+        };
+        assert!(
+            run(&base, &base_ids, &moved, &desired_ids, &facts)
+                .0
+                .is_empty()
+        );
+        assert!(
+            run(&base, &base_ids, &desired, &ids(&["other"]), &facts)
+                .0
+                .is_empty()
+        );
+        // The same name under another recorded identity is a replacement, not
+        // an update.
+        let replaced = IdsFile {
+            extensions: [(uid("elsewhere"), "citext".into())].into(),
+            ..Default::default()
+        };
+        assert!(
+            run(&base, &base_ids, &desired, &replaced, &facts)
+                .0
+                .is_empty()
+        );
+        assert!(
+            run(
+                &base,
+                &IdsFile::default(),
+                &desired,
+                &IdsFile::default(),
+                &facts
+            )
+            .0
+            .is_empty()
+        );
+        let (none, errors) = updates(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            "mssql",
+            &facts,
+        );
+        assert!(none.is_empty() && errors.is_empty());
+        // The package's own prerequisite ranks it behind the create.
+        let rank = depths(
+            changes.iter().chain(
+                creates(
+                    Side {
+                        schema: &base,
+                        ids: &base_ids,
+                    },
+                    Side {
+                        schema: &desired,
+                        ids: &desired_ids,
+                    },
+                    "postgres",
+                    &[("cube".into(), Default::default())].into(),
+                )
+                .iter(),
+            ),
+        );
+        assert_eq!(rank[&uid("citext")], 1);
+        assert_eq!(rank[&uid("cube")], 0);
     }
 }

@@ -729,6 +729,22 @@
     }
   },
   {
+    "name": "UpdateExtension",
+    "change": {
+      "op": "update_extension",
+      "uid": "e_aaaaaa",
+      "name": "part",
+      "from": {
+        "schema": "ext",
+        "version": "1.0"
+      },
+      "to": {
+        "schema": "ext",
+        "version": "1.1"
+      }
+    }
+  },
+  {
     "name": "CreateRole",
     "change": {
       "op": "create_role",

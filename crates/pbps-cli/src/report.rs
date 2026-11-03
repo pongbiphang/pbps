@@ -1062,7 +1062,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -2028,6 +2028,12 @@ pub fn describe(c: &Change) -> String {
         Change::DropExtension { name, .. } => format!(
             "- drop extension {} (deletes its members and anything that depends on it)",
             name.shown()
+        ),
+        Change::UpdateExtension { name, from, to, .. } => format!(
+            "~ update extension {} from version {} to {} (runs the package's update scripts)",
+            name.shown(),
+            Escaped(&from.version),
+            Escaped(&to.version)
         ),
         Change::CreateExtension {
             name, definition, ..

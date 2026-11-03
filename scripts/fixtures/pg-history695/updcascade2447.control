@@ -1,0 +1,4 @@
+comment = 'update whose script drops a member with CASCADE (#2447)'
+default_version = '1.0'
+relocatable = true
+superuser = false

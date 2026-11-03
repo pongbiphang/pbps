@@ -68,6 +68,23 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
             CatalogObject::Extension,
         ),
         (
+            Change::UpdateExtension {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                from: pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.4".into(),
+                },
+                to: pbps_model::Extension {
+                    schema: "ext".into(),
+                    version: "1.6".into(),
+                },
+                requires: Default::default(),
+                releases: Default::default(),
+            },
+            CatalogObject::Extension,
+        ),
+        (
             Change::CreateType {
                 uid: "y_aaaaaa".parse().unwrap(),
                 name: type_name(),
@@ -227,6 +244,7 @@ fn the_classifier_names_every_variant_not_a_catalog_object() {
         "RenameType",
         "CreateExtension",
         "DropExtension",
+        "UpdateExtension",
     ];
     for variant in &variants {
         let named = body.contains(&format!("Change::{variant} "))
