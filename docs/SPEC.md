@@ -1036,6 +1036,13 @@ it. A layout-only edit remains a declaration difference. Pull/baseline and
 older states without a record compare the engine's text. The catalog read-back
 itself is unchanged and remains the evidence for drift.
 
+An omitted DEFAULT on a scalar derived PostgreSQL domain copies the base's
+current DEFAULT at creation; later base changes leave that copy alone
+(DEC-2537.1). The record retains the authored omission for semantic comparison,
+while snapshots and before-pins retain the physical copy. Per-statement and
+closing checks replay that creation-time evidence; an explicit outer SET or
+DROP remains a distinct authored change. Array bases copy no DEFAULT.
+
 PostgreSQL type names occupy `Types(schema)`. Tables (including partitioned
 tables), views and materialized views also hold this slot for their row type;
 standalone composites occupy it in the catalog. Indexes and sequences share

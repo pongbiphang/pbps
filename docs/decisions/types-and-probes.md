@@ -4816,3 +4816,41 @@ refusal of a module that names a member in an opaque body could be added later
 without reshaping anything here: it would be one more finding in
 `extensions::drops` over the sealed manifest.
 
+<a id="dec-2537-1"></a>
+
+**DEC-2537.1. A derived domain's omitted DEFAULT is a creation-time copy, while its declaration remains omitted.**
+Measured on PostgreSQL 16.15 and 18.6: `CREATE DOMAIN outer AS inner` copies
+`inner`'s current DEFAULT into `outer`'s own catalog row. Changing or dropping
+`inner`'s DEFAULT does not change the existing copy. A new outer copies the
+value current when it is created. An explicit outer DEFAULT wins, including
+one equal in value to the copy; an explicit outer DROP removes it without
+copying again. An array base copies nothing. Copied constant trees retain the
+inner CONST while explicit constants carry COERCETODOMAIN; this observation is
+not a SQL-text equality rule or a new catalog-tree parser.
+
+The existing DomainParts boundary (DEC-2469.5) replays physical DEFAULT evidence
+from approved catalog before-definitions and the executed type statements.
+Managed bases resolve through their uid at that position; unchanged external
+bases use the existing guarded catalog read. CREATE alone copies a missing
+scalar-domain DEFAULT. Later facets preserve it unless the authored change
+sets or drops DEFAULT. Authored DomainDelta/DomainHalf still supplies SQL:
+physical equality must not erase an explicit SET DEFAULT equal to a copy.
+The same replay supplies immediate vetting, executed-prefix and closing
+expectations, including ordinary/staged execution and bootstrap. Closing evidence
+is captured from the full guarded type read: a scoped snapshot omits external
+bases, and a resumed checkpoint already has later names. Managed before-pins and
+the typed CREATE/facet replay reconstruct the expected incarnation without
+borrowing a new type's observed DEFAULT. Structural
+checks and the bound-code audit remain required; missing or unreadable required
+evidence is never an absent DEFAULT.
+
+Catalog reads and snapshots retain the actual copied DEFAULT, so raw drift
+checks and approved before-pins remain catalog-to-catalog. Only the semantic
+declaration overlay restores an already-recorded scalar-derived omission;
+otherwise every unchanged plan would drop the engine's valid copy. Saved-step
+admission uses the same projection when comparing an authored `from` with its
+raw before-pin; all other anchor fields and the applying raw drift check remain
+required. Explicit outer declarations remain explicit; a baseline with no declaration record
+retains its raw evidence. The copy's historical value does not come from the
+base's current desired DEFAULT. Existing Declared.types and before-pins carry
+both facts, so no persisted field or version changes.

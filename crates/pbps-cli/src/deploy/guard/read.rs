@@ -1,4 +1,5 @@
 use pbps_model::{Change, ChangeSet, IdsFile};
+use pbps_pg::type_refs::declared::DomainDefaults;
 
 use super::{super::Settled, super::StagedRead, Plan};
 
@@ -15,6 +16,7 @@ pub(in crate::deploy) struct Read<'a> {
     plan: Plan<'a>,
     mode: Mode,
     retained: Option<&'a pbps_pg::retained::Verified>,
+    defaults: Option<&'a DomainDefaults>,
 }
 
 impl<'a> Read<'a> {
@@ -23,6 +25,7 @@ impl<'a> Read<'a> {
             plan,
             mode: Mode::Transactional,
             retained: None,
+            defaults: None,
         }
     }
 
@@ -36,6 +39,7 @@ impl<'a> Read<'a> {
             plan,
             mode,
             retained: None,
+            defaults: None,
         }
     }
 
@@ -48,6 +52,17 @@ impl<'a> Read<'a> {
     }
     pub(in crate::deploy) fn retained(&self) -> Option<&'a pbps_pg::retained::Verified> {
         self.retained
+    }
+
+    pub(in crate::deploy) fn with_domain_defaults(
+        mut self,
+        defaults: Option<&'a DomainDefaults>,
+    ) -> Self {
+        self.defaults = defaults;
+        self
+    }
+    pub(in crate::deploy) fn domain_defaults(&self) -> Option<&'a DomainDefaults> {
+        self.defaults
     }
 
     pub(in crate::deploy) fn parts(self) -> (Plan<'a>, Settled) {

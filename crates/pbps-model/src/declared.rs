@@ -237,6 +237,19 @@ fn rekey_nested<K: Ord + Clone, V>(
     }
 }
 
+impl crate::ManagedType {
+    /// The authored omission and its physical copy are different projections,
+    /// not different drift evidence. Identity/base checks remain the caller's
+    /// responsibility; a rename can change the base's spelling (DEC-2537.1).
+    pub fn projects_copied_default(&self, catalog: &Self) -> bool {
+        matches!((self, catalog),
+            (Self::Domain { base: a, default: None, .. },
+             Self::Domain { base: b, default: Some(_), .. })
+            if a.type_ref().is_some() && !a.is_array()
+                && b.type_ref().is_some() && !b.is_array())
+    }
+}
+
 impl Declared {
     pub fn is_empty(&self) -> bool {
         self.types.is_empty()
@@ -791,6 +804,10 @@ impl Declared {
     pub fn overlay(&self, read_back: &Schema) -> Schema {
         let mut base = read_back.clone();
         for (name, definition) in &self.types {
+            let copied = read_back
+                .types
+                .get(name)
+                .is_some_and(|catalog| definition.projects_copied_default(catalog));
             if let (
                 Some(crate::ManagedType::Domain {
                     default, checks, ..
@@ -802,7 +819,12 @@ impl Declared {
                 },
             ) = (base.types.get_mut(name), definition)
             {
-                if default.is_some() && declared_default.is_some() {
+                // A scalar derived domain can own a creation-time copy while
+                // its recorded declaration deliberately omits DEFAULT. Keep
+                // that omission for diffing; raw snapshots still hold the copy
+                // for drift checks (DEC-2537.1). Unrecorded/adopted types and
+                // arrays retain their catalog evidence.
+                if default.is_some() && (declared_default.is_some() || copied) {
                     *default = declared_default.clone();
                 }
                 for (key, value) in checks {
@@ -1061,6 +1083,58 @@ mod tests {
         );
         assert_eq!(record.overlay(&read_back), read_back);
         assert_eq!(Declared::default().overlay(&catalog), catalog);
+    }
+
+    #[test]
+    fn recorded_scalar_domain_omission_does_not_plan_away_a_physical_copy() {
+        let name: crate::TypeRef = "app.outer".parse().unwrap();
+        let mut copy = domain(Some("7"), "VALUE > 0");
+        let crate::ManagedType::Domain { base, .. } = &mut copy else {
+            unreachable!()
+        };
+        *base = "app.inner".parse().unwrap();
+        let read = Schema {
+            types: [(name.clone(), copy.clone())].into(),
+            ..Default::default()
+        };
+        let mut authored = copy;
+        let crate::ManagedType::Domain { default, .. } = &mut authored else {
+            unreachable!()
+        };
+        *default = None;
+        let record = Declared::from_schema(&Schema {
+            types: [(name.clone(), authored.clone())].into(),
+            ..Default::default()
+        });
+        assert_eq!(record.overlay(&read).types[&name], authored);
+        assert_eq!(
+            Declared::default().overlay(&read),
+            read,
+            "adoption has no authored omission"
+        );
+        let crate::ManagedType::Domain { default, .. } = &read.types[&name] else {
+            unreachable!()
+        };
+        assert_eq!(
+            default.as_deref(),
+            Some("7"),
+            "raw drift evidence remains physical"
+        );
+        for base in ["integer", "app.inner[]"] {
+            let mut read = read.clone();
+            let crate::ManagedType::Domain { base: at, .. } = read.types.get_mut(&name).unwrap()
+            else {
+                unreachable!()
+            };
+            *at = base.parse().unwrap();
+            let mut record = record.clone();
+            let crate::ManagedType::Domain { base: at, .. } = record.types.get_mut(&name).unwrap()
+            else {
+                unreachable!()
+            };
+            *at = base.parse().unwrap();
+            assert_eq!(record.overlay(&read), read, "{base} cannot inherit a copy");
+        }
     }
 
     /// A partition's own default is recorded as declared and put back in

@@ -192,6 +192,99 @@ fn over_the_final_name(
     }
 }
 
+pub type DomainDefaults = std::collections::BTreeMap<pbps_model::Uid, ManagedType>;
+
+/// Scoped snapshots omit external bases. Capture their pinned catalog evidence
+/// before execution; on resume, standing managed UIDs still start at their pins.
+pub async fn capture_defaults(
+    conn: &mut Conn,
+    pins: &[DeclaredTypePin],
+    changes: &pbps_model::ChangeSet,
+    within: Within,
+) -> Result<DomainDefaults, DbError> {
+    if pins.is_empty() {
+        return Ok(Default::default());
+    }
+    let mut before = definitions(conn, within).await?;
+    for was in pins.iter().filter_map(|pin| pin.before.as_ref()) {
+        before
+            .types
+            .insert(was.name.clone(), was.definition.clone());
+    }
+    let (base, _) = identities(pins, changes);
+    Ok(completed(&before, &base, changes))
+}
+
+/// Physical definitions from the same CREATE/facet replay the emitter uses.
+/// Callers with an actual baseline retain its catalog DEFAULT, not an overlay.
+pub fn completed(
+    before: &Schema,
+    ids: &IdsFile,
+    changes: &pbps_model::ChangeSet,
+) -> DomainDefaults {
+    crate::emit::DomainParts::completed(before, ids, changes)
+}
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn after(
+    live: &Schema,
+    pins: &[DeclaredTypePin],
+    changes: &pbps_model::ChangeSet,
+    executed: &[pbps_dialect::Statement],
+) -> std::collections::BTreeMap<pbps_model::Uid, ManagedType> {
+    let (base, desired) = identities(pins, changes);
+    let mut before = Schema {
+        types: live.types.clone(),
+        ..Default::default()
+    };
+    // Only unchanged external types may seed from this read. Managed types
+    // start at their approved before-definition, never a later catalog value.
+    for name in base.types.values().chain(desired.types.values()) {
+        before.types.remove(name);
+    }
+    for change in &changes.changes {
+        match &change.change {
+            pbps_model::Change::EnumRebuild { tmp, .. } => {
+                before.types.remove(tmp);
+            }
+            pbps_model::Change::RenameType { from, to, .. } => {
+                if let Ok(intermediate) = TypeRef::new(to.schema(), from.name()) {
+                    before.types.remove(&intermediate);
+                }
+            }
+            _ => {}
+        }
+    }
+    for pin in pins {
+        if let Some(was) = &pin.before {
+            before
+                .types
+                .insert(was.name.clone(), was.definition.clone());
+        }
+    }
+    crate::emit::DomainParts::after(&before, &base, changes, executed)
+}
+
+fn physical_default(
+    expected: &mut ManagedType,
+    physical: Option<&ManagedType>,
+    authored: Option<&ManagedType>,
+) {
+    if let (
+        ManagedType::Domain { default, .. },
+        Some(ManagedType::Domain {
+            default: actual, ..
+        }),
+        Some(ManagedType::Domain { default: wrote, .. }),
+    ) = (expected, physical, authored)
+        && default.is_some() == wrote.is_some()
+    {
+        // A physical copy cannot excuse a statement whose authored presence
+        // disagrees with the approved definition (DEC-2537.1).
+        *default = actual.clone();
+    }
+}
+
 fn check_definitions(
     live: &Schema,
     pins: &[DeclaredTypePin],
@@ -199,6 +292,7 @@ fn check_definitions(
     changes: &pbps_model::ChangeSet,
     executed: &[pbps_dialect::Statement],
 ) -> Result<(Vec<TypeRef>, Vec<TypeRef>), DbError> {
+    let physical = after(live, pins, changes, executed);
     let (base, desired) = identities(pins, changes);
     let mut positioned = base.clone();
     for step in executed.iter().filter_map(|s| s.declared_type.as_ref()) {
@@ -288,6 +382,13 @@ fn check_definitions(
             over_the_final_name(&mut named, &rebuilt_tmp);
             let actual = &named;
             let mut expected = definition.clone();
+            if !before {
+                physical_default(
+                    &mut expected,
+                    physical.get(&pin.uid),
+                    latest.and_then(|s| s.definition.as_ref()),
+                );
+            }
             if label_moved && let Some(was) = &pin.before {
                 let mut was = was.definition.clone();
                 renames.definition(&mut was);
@@ -319,10 +420,16 @@ fn check_definitions(
                     name.shown()
                 )));
             }
+            let mut completed = pin.definition.clone();
+            physical_default(
+                &mut completed,
+                physical.get(&pin.uid),
+                latest.and_then(|s| s.definition.as_ref()),
+            );
             if complete
                 && (matches!(pin.definition, ManagedType::Enum { .. })
                     || latest.is_some_and(|s| s.altered))
-                && !matches_declaration(&pin.definition, actual)
+                && !matches_declaration(&completed, actual)
             {
                 return Err(failed(format!(
                     "declared type `{}` does not match the completed plan",
@@ -392,8 +499,12 @@ pub async fn vet(
     conn: &mut Conn,
     statement: &pbps_dialect::DeclaredTypeStatement,
     trusted: &BTreeSet<pbps_model::RoleName>,
+    pins: &[DeclaredTypePin],
+    changes: &pbps_model::ChangeSet,
+    executed: &[pbps_dialect::Statement],
 ) -> Result<(), DbError> {
     let live = definitions(conn, Within::CallersTransaction).await?;
+    let physical = after(&live, pins, changes, executed);
     match &statement.definition {
         Some(definition) => {
             let actual = live.types.get(&statement.name).ok_or_else(|| {
@@ -402,7 +513,13 @@ pub async fn vet(
                     statement.name.shown()
                 ))
             })?;
-            if !matches_declaration(definition, actual) {
+            let mut expected = definition.clone();
+            physical_default(
+                &mut expected,
+                physical.get(&statement.uid),
+                statement.definition.as_ref(),
+            );
+            if !matches_declaration(&expected, actual) {
                 return Err(failed(format!(
                     "declared type `{}` does not match its approved definition",
                     statement.name.shown()
@@ -483,6 +600,98 @@ mod tests {
             after_vet: None,
         });
         statement
+    }
+
+    #[test]
+    fn copied_default_evidence_is_required_at_the_prefix_and_closing_guard() {
+        let domain = |base: &str, default: Option<&str>| ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null: false,
+            default: default.map(str::to_owned),
+            checks: Default::default(),
+            collation: None,
+        };
+        let desired = Schema {
+            types: [
+                ("app.inner".parse().unwrap(), domain("integer", Some("7"))),
+                ("app.outer".parse().unwrap(), domain("app.inner", None)),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: ["inner", "outer"]
+                .map(|name| {
+                    (
+                        pbps_model::Uid::derived(pbps_model::UidKind::Type, name, 0),
+                        format!("app.{name}").parse().unwrap(),
+                    )
+                })
+                .into(),
+            ..Default::default()
+        };
+        let mut pins = seal(&Schema::default(), &IdsFile::default(), &desired, &ids);
+        pins.sort_by(|a, b| a.name.cmp(&b.name));
+        let changes = pbps_model::ChangeSet {
+            changes: pins
+                .iter()
+                .map(|p| {
+                    pbps_model::PlannedChange::new(pbps_model::Change::CreateType {
+                        uid: p.uid.clone(),
+                        name: p.name.clone(),
+                        definition: Box::new(p.definition.clone()),
+                    })
+                })
+                .collect(),
+        };
+        let executed: Vec<_> = pins
+            .iter()
+            .map(|p| wrote(p, &p.name.raw().to_string()))
+            .collect();
+        let mut live = desired.clone();
+        live.types
+            .insert("app.outer".parse().unwrap(), domain("app.inner", Some("7")));
+        for complete in [false, true] {
+            check_definitions(&live, &pins, complete, &changes, &executed).unwrap();
+            for missing in [true, false] {
+                let mut bad = live.clone();
+                let ManagedType::Domain {
+                    default, not_null, ..
+                } = bad.types.get_mut(&"app.outer".parse().unwrap()).unwrap()
+                else {
+                    unreachable!()
+                };
+                if missing {
+                    *default = None;
+                } else {
+                    *not_null = true;
+                }
+                assert!(check_definitions(&bad, &pins, complete, &changes, &executed).is_err());
+            }
+        }
+        let mut unapproved = executed.clone();
+        let step = unapproved
+            .last_mut()
+            .unwrap()
+            .declared_type
+            .as_mut()
+            .unwrap();
+        step.definition = Some(domain("app.inner", Some("9")));
+        live.types
+            .insert("app.outer".parse().unwrap(), domain("app.inner", Some("9")));
+        for altered in [false, true] {
+            unapproved
+                .last_mut()
+                .unwrap()
+                .declared_type
+                .as_mut()
+                .unwrap()
+                .altered = altered;
+            assert!(
+                check_definitions(&live, &pins, true, &changes, &unapproved).is_err(),
+                "a copy must not excuse an unapproved authored DEFAULT"
+            );
+        }
     }
 
     #[test]
