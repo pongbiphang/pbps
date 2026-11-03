@@ -419,6 +419,13 @@ impl Run<'_> {
             )));
         }
         let assessment = reconstruction.assess(&compiled, &current, &staged)?;
+        // A runtime-bound module is not rebuilt for an object the plan creates
+        // that its names will resolve to, so the change is reported where the
+        // plan's accepted limitations are: named, described, sealed (DEC-2143.7).
+        for (module, arrived) in &assessment.rebinds {
+            let (name, reason) = rebind_limitation(module, arrived);
+            limitations.insert(name, reason);
+        }
         let records = compiled
             .planning_records()
             .map_err(|error| Error::Binding(error.to_string()))?;
@@ -478,6 +485,25 @@ impl Run<'_> {
         };
         Ok((ordered, sealing, recheck))
     }
+}
+
+/// The limitation that reports one module's binding change.
+fn rebind_limitation(
+    module: &pbps_model::resolver::ObjectIdentity,
+    arrived: &std::collections::BTreeSet<pbps_model::resolver::ObjectIdentity>,
+) -> (String, String) {
+    let shown = |object: &pbps_model::resolver::ObjectIdentity| object.name.join(".");
+    let made: Vec<String> = arrived.iter().map(shown).collect();
+    (
+        format!("binding-change:{}", shown(module)),
+        format!(
+            "{} binds names at run time; once applied they resolve to {} that this plan creates. \
+             No statement is issued for {}",
+            shown(module),
+            made.join(", "),
+            shown(module),
+        ),
+    )
 }
 
 #[cfg(test)]

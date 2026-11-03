@@ -1315,6 +1315,27 @@ impl Binding {
                 "the candidates of the runtime-bound names did not settle".into(),
             ));
         };
+        // A module outside the capture scope cannot be compared, but one that
+        // still has an unresolved reference to a name the plan creates will
+        // bind it once applied: refuse by name rather than report nothing
+        // (DEC-2143.7).
+        let created: BTreeSet<_> = self.reconstruction.created().into_keys().collect();
+        let rebound = capture::unmanaged_rebinds(target, &created, &scope.retained)
+            .await
+            .map_err(super::catalog_read_failed)?;
+        if let Some(first) = rebound.first() {
+            return Err(Error::Binding(format!(
+                "this plan creates {}, which the unmanaged module {} binds when it runs{}; \
+                 declare that module, or create the object in a separate plan",
+                first.created.join("."),
+                first.module.join("."),
+                if rebound.len() > 1 {
+                    format!(" (and {} more)", rebound.len() - 1)
+                } else {
+                    String::new()
+                },
+            )));
+        }
         let namespaces: BTreeSet<String> = schemas.iter().cloned().collect();
         let recorded = capture::RecordedOwnership {
             schema: desired.schema,

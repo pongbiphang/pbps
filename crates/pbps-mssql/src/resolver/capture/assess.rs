@@ -69,6 +69,7 @@ pub(super) fn assess(
         // for a newly created module as for one already on both sides.
         let mut missing_candidate = None;
         let mut unread = false;
+        let mut arrivals: BTreeSet<ObjectIdentity> = BTreeSet::new();
         if let Some(names) = desired.runtime.get(object) {
             let needed = super::select::runtime_candidates(
                 &desired.inputs,
@@ -76,11 +77,16 @@ pub(super) fn assess(
             );
             for set in needed {
                 match (target.candidates.get(&set), desired.candidates.get(&set)) {
-                    (Some(a), Some(_)) => {
+                    (Some(a), Some(b)) => {
                         if let Some(member) = a.iter().find(|member| !reproduced(member)) {
                             missing_candidate = Some(member);
                             break;
                         }
+                        // A candidate scratch holds and the target lacks is an
+                        // object the plan creates: once applied, the module's
+                        // name resolves to it, with no statement for the
+                        // module (DEC-2143.7).
+                        arrivals.extend(b.difference(a).cloned());
                     }
                     _ => unread = true,
                 }
@@ -111,6 +117,14 @@ pub(super) fn assess(
         } else {
             Verdict::Created
         };
+        if !arrivals.is_empty()
+            && matches!(
+                verdict,
+                Verdict::Unaffected | Verdict::Rebuild | Verdict::Created
+            )
+        {
+            result.rebinds.insert(object.clone(), arrivals);
+        }
         result.surfaces.insert(object.clone(), verdict);
     }
     result

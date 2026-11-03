@@ -1613,6 +1613,9 @@ mod reconstruct2374;
 #[path = "roundtrip2143_tests.rs"]
 mod roundtrip2143;
 
+#[path = "rebind2143_tests.rs"]
+mod rebind2143;
+
 #[path = "recovery2410_mssql_tests.rs"]
 mod recovery2410;
 
