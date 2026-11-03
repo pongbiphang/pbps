@@ -166,9 +166,12 @@ target: the finding is then `doctor.partition-runway` with the `pbps plan` remed
 type CHECKs and defaults; it extends owner trust only. The plan records the
 list and apply refuses a changed list or missing role (DEC-1523.1).
 Every referenced type must have an eligible potential input path, independent
-of change kind, fill or row presence (DEC-2181.1). `pin_type_routines: true`
-admits user-written roots only through a saved plan showing their complete
-source and pinning them; apply refuses a changed setting (DEC-2181.2–3).
+of change kind, fill or row presence (DEC-2181.1). A routine a role wrote is
+admitted when its owner is trusted and it sets a fixed `search_path`; it is
+never admitted as `SECURITY DEFINER` of an untrusted owner (DEC-2563.2).
+`pin_type_routines: true` admits an untrusted owner's routine through a saved
+plan showing its complete source and pinning it; apply refuses a changed
+setting (DEC-2181.2).
 `bootstrap --sql` refuses declarations with type references; use connected
 bootstrap or plan/apply against the target.
 

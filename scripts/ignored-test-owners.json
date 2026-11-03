@@ -959,7 +959,7 @@
         "type_refs::pinned_type_routines_require_owner_and_actor_trust_on_postgres_18",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_16",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_18",
-        "type_refs::superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees",
+        "type_refs::a_superuser_owned_root_is_trusted_not_reviewed_and_a_replacement_without_a_path_is_refused",
         "type_refs::an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement",
         "type_refs::a_scoped_path_overload_created_during_a_statement_is_detected_before_commit",
         "type_refs::staged_transactional_steps_rollback_changed_roots_and_concurrent_indexes_detect_them_after_commit",

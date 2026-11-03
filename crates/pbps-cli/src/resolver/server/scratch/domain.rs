@@ -130,16 +130,26 @@ pub(super) async fn run(
     .await
     .map_err(Refused::Unavailable)?;
     let result = async {
-        let read = |error: pbps_db::DbError| Refused::Unavailable(ProduceError::Run(Error::Read(error.to_string())));
+        let read = |error: pbps_db::DbError| {
+            Refused::Unavailable(ProduceError::Run(Error::Read(error.to_string())))
+        };
         let run = |error| Refused::Unavailable(ProduceError::Run(error));
         let schemas = scope::scope_schemas(Driver::Postgres, &request.schemas, &[])
             .map_err(|why| run(Error::Scope(why)))?;
         let (catalog, authorization) = scope::read_target(
-            &mut target, Driver::Postgres, &request.schemas, &[], &schemas, &[],
-        ).await.map_err(read)?;
-        let mut prepared = state.prepare_code(
-            provisioning, &mut admin, &catalog, &authorization, &schemas,
-        ).await.map_err(run)?;
+            &mut target,
+            Driver::Postgres,
+            &request.schemas,
+            &[],
+            &schemas,
+            &[],
+        )
+        .await
+        .map_err(read)?;
+        let mut prepared = state
+            .prepare_code(provisioning, &mut admin, &catalog, &authorization, &schemas)
+            .await
+            .map_err(run)?;
         let report = scope::compare_reported(Driver::Postgres, &catalog, prepared.catalog())
             .map_err(|why| run(Error::Scope(why)))?;
         // A different engine version cannot give a verdict about these trees.
@@ -149,7 +159,9 @@ pub(super) async fn run(
             return Err(run(Error::Incompatible(vec![version.into()])));
         }
         let zone = target.session_zone().cloned().ok_or_else(|| {
-            run(Error::Scope("the target reported no session time zone to vet in".into()))
+            run(Error::Scope(
+                "the target reported no session time zone to vet in".into(),
+            ))
         })?;
         let session = prepared.session(&mut admin);
         // Compile under the same pins as binding reconstruction and apply,
@@ -168,25 +180,22 @@ pub(super) async fn run(
                 if code.as_deref() == Some("42601") {
                     return Err(Refused::Code(format!(
                         "declared type `{}` could not bind {} as one statement: {error}",
-                        annotation.name.shown(), expression_parts(annotation),
+                        annotation.name.shown(),
+                        expression_parts(annotation),
                     )));
                 }
-                // Undefined functions are not proof of user code unless the
-                // missing function is declared by this project. Other compile
-                // failures are advisory; apply still owns the binding verdict.
-                let managed = code.as_deref() == Some("42883") && desired.schema.modules.keys().any(|id| {
-                    [format!("{}.{}(", id.schema(), id.name()), format!("function {}(", id.name())]
-                        .iter().any(|name| error.to_string().contains(name))
-                });
-                let missing_type = code.as_deref() == Some("42704")
-                    && error.to_string().contains("type ");
-                if missing_type || (managed && matches!(report.verdict(), Verdict::Verified)) {
-                    let note = if managed {
-                        " The function is managed and has not been created by this types-only vet; apply also refuses user-written domain code."
-                    } else { "" };
+                // A function this plan creates is not in the types-only scratch,
+                // and that is not a refusal: apply binds the domain in its
+                // creating transaction and judges the routine by the one
+                // predicate (DEC-2563.2). Other compile failures are advisory
+                // too; apply still owns the binding verdict.
+                let missing_type =
+                    code.as_deref() == Some("42704") && error.to_string().contains("type ");
+                if missing_type {
                     return Err(Refused::Code(format!(
-                        "declared domain `{}` could not be created for {}: {error}.{note}",
-                        annotation.name.shown(), expression_parts(annotation),
+                        "declared domain `{}` could not be created for {}: {error}.",
+                        annotation.name.shown(),
+                        expression_parts(annotation),
                     )));
                 }
                 return Err(read(error));
@@ -194,23 +203,31 @@ pub(super) async fn run(
             if matches!(report.verdict(), Verdict::Verified)
                 && let Some(annotation) = &statement.declared_type
             {
-                pbps_pg::type_refs::vet_code(session, pbps_pg::pins::Within::OwnTransaction,
-                    std::slice::from_ref(&annotation.name)).await
-                    .map_err(|error| match error {
-                        pbps_pg::type_refs::CodeVetError::Refused(why) => Refused::Code(why),
-                        pbps_pg::type_refs::CodeVetError::Unreadable(why) => run(Error::Read(why)),
-                    })?;
+                pbps_pg::type_refs::vet_code(
+                    session,
+                    pbps_pg::pins::Within::OwnTransaction,
+                    std::slice::from_ref(&annotation.name),
+                )
+                .await
+                .map_err(|error| match error {
+                    pbps_pg::type_refs::CodeVetError::Refused(why) => Refused::Code(why),
+                    pbps_pg::type_refs::CodeVetError::Unreadable(why) => run(Error::Read(why)),
+                })?;
             }
         }
         match report.verdict() {
             Verdict::Verified => match comparison {
-                Some(comparison) => comparison.run(session).await.map_err(|why| run(Error::Binding(why))),
+                Some(comparison) => comparison
+                    .run(session)
+                    .await
+                    .map_err(|why| run(Error::Binding(why))),
                 None => Ok(Vec::new()),
             },
             Verdict::Mismatch(facts) => Err(run(Error::Incompatible(facts))),
             Verdict::Unknown(facts) => Err(run(Error::Scope(facts.join("; ")))),
         }
-    }.await;
+    }
+    .await;
     let released = state.release(&mut admin).await;
     match released {
         Err(names) => Err(Refused::Unavailable(ProduceError::Cleanup(names))),

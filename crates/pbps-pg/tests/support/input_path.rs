@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use super::user_types_tests::{Scratch, servers};
 use super::*;
 use pbps_model::TypeRef;
+use pbps_pg::admission::Admission;
 use pbps_pg::input_path::{
     self, Added, InputPath, OwnerReason, Part, Reason, RoutineKind, RoutineReason, Unreadable, Why,
 };
@@ -40,7 +41,13 @@ async fn gate_all(conn: &mut Conn, trusted: &[&str], names: &[(&str, &str)]) -> 
         .collect();
     let columns: Vec<Added<'_>> = types.iter().map(|t| Added::new(t, false)).collect();
     let trusted: Vec<pbps_model::RoleName> = trusted.iter().map(|t| (*t).into()).collect();
-    input_path::read(conn, Within::OwnTransaction, &trusted, &columns).await
+    input_path::read(
+        conn,
+        Within::OwnTransaction,
+        &Admission::new(trusted, false),
+        &columns,
+    )
+    .await
 }
 
 async fn gate(conn: &mut Conn, trusted: &[&str], name: &str) -> InputPath {
@@ -232,7 +239,7 @@ async fn built_in_code_on_a_type_the_deployer_owns_is_admitted() {
         let inside = input_path::read(
             &mut me,
             Within::CallersTransaction,
-            &[],
+            &Admission::default(),
             &[Added::new(short, false)],
         )
         .await;
@@ -276,7 +283,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
             ddl: "CREATE DOMAIN app.u_fn AS integer CHECK (app.is_pos(VALUE))",
             identity: "app.is_pos(integer)",
             kind: RoutineKind::Function,
-            why: Why::NotBuiltin,
+            why: Why::NoSearchPath,
             default: false,
             ranged: true,
         },
@@ -285,7 +292,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
             ddl: "CREATE DOMAIN app.u_op AS integer CHECK (VALUE OPERATOR(app.@+@) 1 > 0)",
             identity: "app.@+@(integer,integer)",
             kind: RoutineKind::Operator,
-            why: Why::NotBuiltin,
+            why: Why::NoSearchPath,
             default: false,
             ranged: true,
         },
@@ -294,7 +301,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
             ddl: "CREATE DOMAIN app.u_cast AS app.ut CHECK ((VALUE)::integer > 0)",
             identity: "app.ut_int(app.ut)",
             kind: RoutineKind::Function,
-            why: Why::NotBuiltin,
+            why: Why::NoSearchPath,
             default: false,
             ranged: false,
         },
@@ -303,7 +310,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
             ddl: "CREATE DOMAIN app.u_default AS integer DEFAULT app.plus(1, 2)",
             identity: "app.plus(integer,integer)",
             kind: RoutineKind::Function,
-            why: Why::NotBuiltin,
+            why: Why::NoSearchPath,
             default: true,
             ranged: true,
         },
@@ -436,7 +443,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
                     assert!(hit.used_by.ty.ends_with(n), "{what}: {:?}", hit.used_by);
                     // The owner of what is called: the deployer's own routine,
                     // or the engine's bootstrap superuser for a built-in.
-                    if case.why == Why::NotBuiltin {
+                    if case.why == Why::NoSearchPath {
                         assert_eq!(hit.owner, me_name.clone().into(), "{what}");
                     }
                     assert_eq!(
@@ -669,7 +676,7 @@ async fn a_default_the_statement_carries_replaces_the_domains_and_its_checks_sti
             input_path::read(
                 me,
                 Within::OwnTransaction,
-                &[],
+                &Admission::default(),
                 &[Added::new(&t, own_default)],
             )
             .await
@@ -763,7 +770,7 @@ async fn a_row_comparison_runs_its_familys_comparison_function_and_not_the_opera
         let hits = routines(all);
         assert_eq!(hits.len(), 1, "on {label}: {all:?}");
         assert_eq!(hits[0].kind, RoutineKind::Operator);
-        assert_eq!(hits[0].why, Why::NotBuiltin);
+        assert_eq!(hits[0].why, Why::NoSearchPath);
         assert!(hits[0].identity.contains("@<#"), "{:?}", hits[0]);
         assert_eq!(
             hits[0].runs.as_deref(),
@@ -1190,12 +1197,18 @@ async fn a_type_that_runs_no_code_still_requires_trusted_owners() {
             Added::new(ty, true).array(true).null_fill(),
             Added::new(ty, true).array(true).empty_array_fill(),
         ] {
-            let paths = input_path::read(&mut me, Within::OwnTransaction, &[], &[column]).await;
+            let paths = input_path::read(
+                &mut me,
+                Within::OwnTransaction,
+                &Admission::default(),
+                &[column],
+            )
+            .await;
             assert!(actors(refused(&paths[0], "array owner")).contains(&stranger));
             let paths = input_path::read(
                 &mut me,
                 Within::OwnTransaction,
-                &[stranger.clone().into()],
+                &Admission::new([stranger.clone().into()], false),
                 &[column],
             )
             .await;
@@ -1292,7 +1305,13 @@ async fn a_read_that_fails_is_unreadable_and_never_admitted() {
             .collect();
         run(&mut me, label, "DROP DOMAIN app.gone").await;
         let columns: Vec<Added<'_>> = types.iter().map(|t| Added::new(t, false)).collect();
-        let paths = input_path::read(&mut me, Within::OwnTransaction, &[], &columns).await;
+        let paths = input_path::read(
+            &mut me,
+            Within::OwnTransaction,
+            &Admission::default(),
+            &columns,
+        )
+        .await;
         assert_eq!(paths.len(), 2);
         // A failed read is a failed read for every type: nothing was learned.
         for path in &paths {
@@ -1306,8 +1325,13 @@ async fn a_read_that_fails_is_unreadable_and_never_admitted() {
         // too, not admitted.
         run(&mut me, label, "BEGIN").await;
         assert!(me.execute("SELECT 1/0").await.is_err());
-        let aborted =
-            input_path::read(&mut me, Within::CallersTransaction, &[], &columns[1..]).await;
+        let aborted = input_path::read(
+            &mut me,
+            Within::CallersTransaction,
+            &Admission::default(),
+            &columns[1..],
+        )
+        .await;
         assert!(
             matches!(aborted[0], InputPath::Unreadable(Unreadable::Failed(_))),
             "{:?}",
@@ -1491,7 +1515,7 @@ async fn a_null_fill_checks_domains_but_not_composite_attributes_array_elements_
         let answer = input_path::read(
             &mut db.conn,
             Within::OwnTransaction,
-            &[],
+            &Admission::default(),
             &[Added::new(&checked, false).array(true)],
         )
         .await;
@@ -1572,7 +1596,7 @@ async fn constructed_defaults_check_composite_attributes_array_elements_and_rang
             let answer = input_path::read(
                 &mut db.conn,
                 Within::OwnTransaction,
-                &[],
+                &Admission::default(),
                 &[Added::new(&ty, own_default).array(array)],
             )
             .await;
@@ -1618,7 +1642,7 @@ async fn constructing_two_composite_levels_evaluates_and_refuses_the_nested_untr
         let answer = input_path::read(
             &mut me,
             Within::OwnTransaction,
-            &[],
+            &Admission::default(),
             &[Added::new(&ty, true)],
         )
         .await;
@@ -1627,7 +1651,7 @@ async fn constructing_two_composite_levels_evaluates_and_refuses_the_nested_untr
                 .iter()
                 .any(|r| r.identity == "app.seen(integer)"
                     && r.owner.raw() == stranger.as_str()
-                    && r.why == Why::NotBuiltin)
+                    && r.why == Why::NoSearchPath)
         );
         assert_eq!(
             number(&mut me, "SELECT count(*)::integer FROM app.calls").await,
@@ -2084,7 +2108,7 @@ async fn a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason() {
             .filter(|r| r.identity == "app.far1(integer)")
             .collect();
         assert_eq!(hits.len(), 1, "{all:?}");
-        assert_eq!(hits[0].why, Why::NotBuiltin);
+        assert_eq!(hits[0].why, Why::NoSearchPath);
         let detail = hits[0].detail.as_deref().unwrap_or_default();
         assert!(
             detail.contains("nested more than 16 deep"),
@@ -2166,7 +2190,7 @@ async fn a_function_that_cannot_be_proven_is_refused_by_name_and_by_reason() {
                 if case.name == "runs_sql" {
                     Why::RunsSql
                 } else {
-                    Why::NotBuiltin
+                    Why::NoSearchPath
                 },
                 "{}",
                 case.name
@@ -2305,6 +2329,275 @@ async fn a_function_replaced_between_two_reads_is_judged_by_its_current_body() {
         )
         .await;
         assert!(admitted(&gate(&mut me, &[], "swapped").await, "restored"));
+        drop(me);
+        db.drop().await;
+    }
+}
+
+// -- #2563, slice 2: the admission predicate (DEC-2563.2) ---------------------
+
+/// The type, read as `conn` and put through the gate under `admission`.
+async fn judge(conn: &mut Conn, admission: &Admission, name: &str) -> InputPath {
+    let reference = TypeRef::new("app", name).unwrap();
+    let reads = user_types::read(conn, Within::OwnTransaction, &[reference]).await;
+    let [TypeRead::Present(ty)] = reads.as_slice() else {
+        panic!("app.{name} should be present: {reads:?}");
+    };
+    input_path::read(
+        conn,
+        Within::OwnTransaction,
+        admission,
+        &[Added::new(ty, false)],
+    )
+    .await
+    .remove(0)
+}
+
+fn reviewed(path: &InputPath, what: &str) -> BTreeSet<i64> {
+    match path {
+        InputPath::Admitted(a) => a.reviewed().clone(),
+        other @ (InputPath::Refused(_) | InputPath::Unreadable(_)) => {
+            panic!("{what} should be admitted: {other:?}")
+        }
+    }
+}
+
+async fn oid_of(conn: &mut Conn, regprocedure: &str) -> i64 {
+    conn.query(&format!(
+        "SELECT '{regprocedure}'::regprocedure::oid::int8 AS oid"
+    ))
+    .await
+    .unwrap()[0]
+        .try_get::<i64>("oid")
+        .unwrap()
+        .unwrap()
+}
+
+/// Rule 3 admits a trusted owner's routine without a review, and rule 2's
+/// companion refuses one that resolves names at run time without a fixed path,
+/// with the exact line that fixes it. The line is run and the domain admitted.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_trusted_owners_routine_needs_a_fixed_search_path_and_the_refusal_gives_the_fix() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gadmitfixed").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.fixed(integer) RETURNS boolean LANGUAGE plpgsql
+                 SET search_path = pg_catalog AS $$ BEGIN RETURN $1 > 0; END $$;
+             CREATE FUNCTION app.open(integer) RETURNS boolean LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN $1 > 0; END $$;
+             CREATE DOMAIN app.uses_fixed AS integer CHECK (app.fixed(VALUE));
+             CREATE DOMAIN app.uses_open AS integer CHECK (app.open(VALUE));",
+        )
+        .await;
+        for pin in [false, true] {
+            let admission = Admission::new([], pin);
+            let fixed = judge(&mut me, &admission, "uses_fixed").await;
+            assert!(admitted(&fixed, "uses_fixed"));
+            assert!(
+                reviewed(&fixed, "uses_fixed").is_empty(),
+                "a trusted owner is admitted without a review, pin {pin} on {label}"
+            );
+            let open = judge(&mut me, &admission, "uses_open").await;
+            let reasons = refused(&open, "uses_open");
+            assert!(
+                matches!(reasons, [Reason::Routine(r)] if r.why == Why::NoSearchPath),
+                "on {label}: {reasons:?}"
+            );
+            let fix = "ALTER FUNCTION app.open(integer) SET search_path = pg_catalog, pg_temp";
+            let message = open
+                .refusal(&TypeRef::new("app", "uses_open").unwrap(), &admission)
+                .unwrap();
+            assert!(message.contains(fix), "on {label}: {message}");
+            // The missing path has its own fix: no trust remedy is offered.
+            assert!(!message.contains("trusted_roles"), "on {label}: {message}");
+        }
+        run(
+            &mut me,
+            label,
+            "ALTER FUNCTION app.open(integer) SET search_path = pg_catalog, pg_temp",
+        )
+        .await;
+        assert!(admitted(
+            &judge(&mut me, &Admission::default(), "uses_open").await,
+            "uses_open after the line the refusal named"
+        ));
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// The hijack, measured: a role with CREATE on a schema searched earlier
+/// replaces an unqualified call inside a function that sets no path, and not
+/// inside one that does. The predicate refuses the first and admits the second.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_role_with_create_on_an_earlier_schema_hijacks_only_a_function_without_a_search_path() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gadmithijack").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        let mallory = db.role("mallory", "LOGIN").await;
+        db.sql(&format!(
+            "CREATE SCHEMA early; GRANT USAGE, CREATE ON SCHEMA early TO {mallory};
+             GRANT USAGE ON SCHEMA early TO PUBLIC; GRANT USAGE ON SCHEMA app TO {mallory}"
+        ))
+        .await;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.helper(integer) RETURNS integer LANGUAGE sql IMMUTABLE
+                 AS 'SELECT $1 + 1';
+             CREATE FUNCTION app.open_call(integer) RETURNS boolean LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN helper($1) > 0; END $$;
+             CREATE FUNCTION app.open_value(integer) RETURNS integer LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN helper($1); END $$;
+             CREATE FUNCTION app.fixed_value(integer) RETURNS integer LANGUAGE plpgsql
+                 SET search_path = app, pg_catalog AS $$ BEGIN RETURN helper($1); END $$;
+             CREATE FUNCTION app.fixed_call(integer) RETURNS boolean LANGUAGE plpgsql
+                 SET search_path = app, pg_catalog AS $$ BEGIN RETURN helper($1) > 0; END $$;
+             CREATE DOMAIN app.calls_open AS integer CHECK (app.open_call(VALUE));
+             CREATE DOMAIN app.calls_fixed AS integer CHECK (app.fixed_call(VALUE));",
+        )
+        .await;
+        let mut theirs = db.as_role(&mallory).await;
+        run(
+            &mut theirs,
+            label,
+            "CREATE FUNCTION early.helper(integer) RETURNS integer LANGUAGE sql AS 'SELECT 999'",
+        )
+        .await;
+        run(&mut me, label, "SET search_path = early, app").await;
+        let value = |name: &'static str| format!("SELECT app.{name}(1)::int4 AS v");
+        let mut seen = Vec::new();
+        for name in ["open_value", "fixed_value"] {
+            let rows = me.query(&value(name)).await.unwrap();
+            seen.push(rows[0].try_get::<i32>("v").unwrap().unwrap());
+        }
+        assert_eq!(seen, [999, 2], "the hijack is real on {label}");
+        run(&mut me, label, "RESET search_path").await;
+        let admission = Admission::default();
+        let open = judge(&mut me, &admission, "calls_open").await;
+        assert!(
+            matches!(refused(&open, "calls_open"), [Reason::Routine(r)] if r.why == Why::NoSearchPath),
+            "on {label}"
+        );
+        assert!(admitted(
+            &judge(&mut me, &admission, "calls_fixed").await,
+            "calls_fixed"
+        ));
+        drop(theirs);
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// Rule 4 and its limits: an untrusted owner's routine is refused by name with
+/// the three remedies, admitted by the review (and reported, to be shown and
+/// pinned), or by declaring its owner trusted; still needs its path; and a
+/// `SECURITY DEFINER` of an untrusted owner is never admitted.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn an_untrusted_owners_routine_is_admitted_only_by_the_review_and_never_as_a_definer() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gadmitreview").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        db.sql(&format!(
+            "GRANT USAGE ON SCHEMA app TO {stranger};
+             CREATE FUNCTION app.theirs(integer) RETURNS boolean LANGUAGE plpgsql
+                 SET search_path = pg_catalog AS $$ BEGIN RETURN $1 > 0; END $$;
+             CREATE FUNCTION app.their_open(integer) RETURNS boolean LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN $1 > 0; END $$;
+             CREATE FUNCTION app.their_definer(integer) RETURNS boolean LANGUAGE plpgsql
+                 SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN RETURN $1 > 0; END $$;
+             ALTER FUNCTION app.theirs(integer) OWNER TO {stranger};
+             ALTER FUNCTION app.their_open(integer) OWNER TO {stranger};
+             ALTER FUNCTION app.their_definer(integer) OWNER TO {stranger};
+             CREATE DOMAIN app.uses_theirs AS integer CHECK (app.theirs(VALUE));
+             CREATE DOMAIN app.uses_open AS integer CHECK (app.their_open(VALUE));
+             CREATE DOMAIN app.uses_definer AS integer CHECK (app.their_definer(VALUE));
+             ALTER DOMAIN app.uses_theirs OWNER TO CURRENT_USER;
+             ALTER DOMAIN app.uses_open OWNER TO CURRENT_USER;
+             ALTER DOMAIN app.uses_definer OWNER TO CURRENT_USER;"
+        ))
+        .await;
+        let oid = oid_of(&mut me, "app.theirs(integer)").await;
+        let reference = TypeRef::new("app", "uses_theirs").unwrap();
+
+        // Refused by name, and the refusal offers all three ways out.
+        let offering = Admission::new([], false);
+        let path = judge(&mut me, &offering, "uses_theirs").await;
+        let named: Vec<_> = refused(&path, "an untrusted owner without the review")
+            .iter()
+            .filter_map(|r| match r {
+                Reason::RoutineOwner(o) => Some((o.identity.clone(), o.actor.raw().to_owned())),
+                Reason::Routine(_) | Reason::Owner(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [("app.theirs(integer)".to_owned(), stranger.clone())],
+            "on {label}"
+        );
+        let message = path.refusal(&reference, &offering).unwrap();
+        for remedy in [
+            "bring the routine into the project",
+            "`trusted_roles`",
+            "`pin_type_routines: true`",
+        ] {
+            assert!(message.contains(remedy), "on {label}: {message}");
+        }
+        // A site that cannot review does not offer it.
+        let message = path
+            .refusal(&reference, &Admission::without_review([]))
+            .unwrap();
+        assert!(
+            !message.contains("pin_type_routines"),
+            "on {label}: {message}"
+        );
+
+        // Admitted by the review, which reports the routine for the plan to pin.
+        let path = judge(&mut me, &Admission::new([], true), "uses_theirs").await;
+        assert_eq!(
+            reviewed(&path, "uses_theirs under the review"),
+            BTreeSet::from([oid])
+        );
+        // Admitted by declaring the owner trusted, with nothing to review.
+        let trusted = Admission::new([stranger.clone().into()], false);
+        let path = judge(&mut me, &trusted, "uses_theirs").await;
+        assert!(reviewed(&path, "uses_theirs, declared").is_empty());
+
+        // The review does not excuse a missing path.
+        let path = judge(&mut me, &Admission::new([], true), "uses_open").await;
+        assert!(
+            routines(refused(&path, "reviewed, without a path"))
+                .iter()
+                .all(|r| r.why == Why::NoSearchPath),
+            "on {label}"
+        );
+
+        // A definer of an untrusted owner is never admitted, reviewed or not.
+        let path = judge(&mut me, &Admission::new([], true), "uses_definer").await;
+        let reasons = refused(&path, "a definer of an untrusted owner");
+        assert!(
+            routines(reasons)
+                .iter()
+                .any(|r| r.why == Why::SecurityDefiner),
+            "on {label}: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| matches!(r, Reason::RoutineOwner(_))),
+            "on {label}"
+        );
+        // Once its owner is trusted it runs as a trusted role, and is admitted.
+        let path = judge(&mut me, &trusted, "uses_definer").await;
+        assert!(reviewed(&path, "a trusted owner's definer").is_empty());
         drop(me);
         db.drop().await;
     }

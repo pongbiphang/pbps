@@ -364,7 +364,7 @@ fn type_refusals_escape_once_at_whole_and_individual_boundaries() {
     let input = pbps_pg::input_path::InputPath::Unreadable(
         pbps_pg::input_path::Unreadable::Failed("unavailable".into()),
     )
-    .refusal(&reference)
+    .refusal(&reference, &pbps_pg::admission::Admission::default())
     .unwrap();
     assert_eq!(
         input,

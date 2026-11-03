@@ -20,6 +20,28 @@ fn plan(d: &Demo, connection: &str) -> PathBuf {
     path
 }
 
+/// Hands a routine to a role nobody trusts, so that the review of
+/// `pin_type_routines` is the only way in (rule 4 of DEC-2563.2).
+fn hand_over(db: &str, role: &UntrustedRole, routine: &str) {
+    on_server(
+        db,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {role}; ALTER FUNCTION {routine} OWNER TO {role}",
+            role = role.name
+        ),
+    );
+}
+
+/// [`hand_over`] to a role of its own, left to the cluster: the fixture's
+/// builder cannot hold it, and its name is unique to the process and the call.
+fn leave_with_untrusted_role(db: &str, slug: &str, routine: &str) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let role = UntrustedRole::new(db, &format!("{}_{n}", slug.replace('-', "_")));
+    hand_over(db, &role, routine);
+    std::mem::forget(role);
+}
+
 struct UntrustedRole {
     server: String,
     name: String,
@@ -552,7 +574,7 @@ fn a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows() {
         assert_ne!(code(&out), 0);
         assert!(
             stderr(&out).contains("app.seen(integer)")
-                && stderr(&out).contains("not built into PostgreSQL"),
+                && stderr(&out).contains("sets no `search_path`"),
             "{}{}",
             stdout(&out),
             stderr(&out)
@@ -586,9 +608,7 @@ fn a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows() {
         assert_ne!(code(&out), 0);
         assert!(
             stderr(&out).contains("app.seen(integer)")
-                && stderr(&out).contains("not built into PostgreSQL")
-                && stderr(&out).contains("trusted_roles")
-                && stderr(&out).contains("source review and pins"),
+                && stderr(&out).contains("ALTER FUNCTION app.seen(integer) SET search_path"),
             "{}{}",
             stdout(&out),
             stderr(&out)
@@ -699,7 +719,7 @@ fn a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_ar
         let next: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
         assert!(next.changes.is_empty(), "the domain NULL default converges");
-        on_server(db, "CREATE FUNCTION app.never(integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'nested CHECK ran'; END $$;
+        on_server(db, "CREATE FUNCTION app.never(integer) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RAISE EXCEPTION 'nested CHECK ran'; END $$;
             CREATE DOMAIN app.trap AS integer CHECK (app.never(VALUE));
             CREATE TYPE app.pair AS (v app.trap); CREATE DOMAIN app.holder AS app.pair");
         opt_in(&d, db, true);
@@ -1173,7 +1193,7 @@ fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
             db,
             "CREATE SCHEMA app;
                  CREATE TABLE app.calls (n integer);
-                 CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+                 CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
                  BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
                  CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
                  CREATE TYPE app.pair AS (n app.checked);
@@ -1191,6 +1211,8 @@ fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
             2
         );
         on_server(db, "DROP TABLE app.measure");
+        let role = UntrustedRole::new(&server, "generated_null");
+        hand_over(db, &role, "app.seen(integer)");
         let d = Demo::new("refs-generated-null");
         d.table(&declarations(""));
         succeeds(d.run(&["plan"]));
@@ -1449,7 +1471,7 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
             &format!(
                 "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {};
             CREATE TABLE app.calls (n integer);
-            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
             BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
             ALTER FUNCTION app.seen(text) OWNER TO {};
             CREATE DOMAIN app.checked AS text CHECK (app.seen(VALUE));
@@ -1546,6 +1568,8 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
                 serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
             assert!(next.changes.is_empty(), "{expr}: {:?}", next.changes);
         }
+        // Declared trusted and reviewed before; without a fixed path it is refused.
+        on_server(db, "ALTER FUNCTION app.seen(text) RESET search_path");
         opt_in(&d, db, false);
         for expr in ["ARRAY['x']::app.checked[]", "'{x}'::app.checked[]"] {
             let extra = format!(
@@ -1581,7 +1605,7 @@ fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
         format!(
             "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {role};
             CREATE TABLE app.calls (n integer);
-            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
             BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
             ALTER FUNCTION app.seen(text) OWNER TO {role};
             CREATE DOMAIN app.checked AS text CHECK (app.seen(VALUE))"
@@ -1659,6 +1683,7 @@ fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
         let next: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
         assert!(next.changes.is_empty());
+        on_server(db, "ALTER FUNCTION app.seen(text) RESET search_path");
         opt_in(&d, db, false);
         d.table(&declarations(&format!(
             "{generated}  refused: {{type: 'app.checked[]', generated: {{expression: \"'{{x}}'::app.checked[]\", stored: true}}}}\n"
@@ -1693,10 +1718,10 @@ fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership
         let db = own.connection();
         on_server(db, &format!("CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {};
             CREATE TABLE app.calls (kind text);
-            CREATE FUNCTION app.element_seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            CREATE FUNCTION app.element_seen(text) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
             BEGIN INSERT INTO app.calls VALUES ('element'); RETURN true; END $$;
             CREATE DOMAIN app.checked AS text CHECK (app.element_seen(VALUE));
-            CREATE FUNCTION app.outer_seen(app.checked[]) RETURNS boolean LANGUAGE plpgsql AS $$
+            CREATE FUNCTION app.outer_seen(app.checked[]) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
             BEGIN INSERT INTO app.calls VALUES ('outer'); RETURN true; END $$;
             ALTER FUNCTION app.outer_seen(app.checked[]) OWNER TO {};
             CREATE DOMAIN app.outer_array AS app.checked[] CHECK (app.outer_seen(VALUE));
@@ -2019,7 +2044,15 @@ fn potential_type_paths_are_checked_even_without_an_added_column() {
     }
 }
 
+/// A root `app.root(varchar)` owned by a role nobody trusts, so that review is
+/// the only way in (rule 4 of DEC-2563.2). The role is left to the cluster.
 fn root_demo(db: &str, slug: &str, root: &str) -> Demo {
+    let d = root_demo_unowned(db, slug, root);
+    leave_with_untrusted_role(db, slug, "app.root(varchar)");
+    d
+}
+
+fn root_demo_unowned(db: &str, slug: &str, root: &str) -> Demo {
     on_server(
         db,
         &format!(
@@ -2046,9 +2079,9 @@ fn root_demo(db: &str, slug: &str, root: &str) -> Demo {
 fn any_language_roots_require_source_review_and_the_saved_opt_in() {
     for server in servers() {
         for (index, body) in [
-            "LANGUAGE plpgsql AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
-            "LANGUAGE sql AS $$ SELECT lower($1) = 'x' $$",
-            "LANGUAGE sql RETURN lower($1) = 'x'",
+            "LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
+            "LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT lower($1) = 'x' $$",
+            "LANGUAGE sql SET search_path = pg_catalog RETURN lower($1) = 'x'",
         ]
         .into_iter()
         .enumerate()
@@ -2334,16 +2367,21 @@ fn pinned_type_routines_require_owner_and_actor_trust_on_postgres_18() {
     pinned_type_routine_owners(&server());
 }
 
+/// The review replaces owner trust for a routine (rule 4 of DEC-2563.2): an
+/// untrusted owner's root is admitted when `pin_type_routines` shows and pins
+/// it, refused with all three remedies when it is off, and, once its owner is
+/// declared trusted, admitted without a review. An actor that can act as a
+/// trusted owner is still named.
 fn pinned_type_routine_owners(server: &str) {
     for operator in [false, true] {
         let owner = UntrustedRole::new(server, "routine_owner");
         let actor = UntrustedRole::new(server, "routine_actor");
         let own = OwnDatabase::new(server, "routine_owners");
         let db = own.connection();
-        let d = root_demo(
+        let d = root_demo_unowned(
             db,
             "routine-owners",
-            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$",
         );
         if operator {
             // The operator remains superuser-owned. Its implementation's
@@ -2355,34 +2393,45 @@ fn pinned_type_routine_owners(server: &str) {
                  ALTER DOMAIN app.checked ADD CONSTRAINT checked_check CHECK (OPERATOR(app.!) VALUE)",
             );
         }
-        on_server(
-            db,
-            &format!(
-                "GRANT USAGE ON SCHEMA app TO {owner}; ALTER FUNCTION app.root(varchar) OWNER TO {owner}",
-                owner = owner.name
-            ),
-        );
-        opt_in(&d, db, true);
+        hand_over(db, &owner, "app.root(varchar)");
+
+        // Without the review, the owner is named with the three remedies.
+        opt_in(&d, db, false);
         let refused = d.dir.join("untrusted.json");
         let out = d.run(&["plan", "--db", db, "--out", refused.to_str().unwrap()]);
         assert_ne!(code(&out), 0, "{}", stdout(&out));
-        for message in ["app.root", &owner.name, "trusted_roles"] {
+        for message in [
+            "app.root",
+            &owner.name,
+            "bring the routine into the project",
+            "trusted_roles",
+            "pin_type_routines",
+        ] {
             assert!(stderr(&out).contains(message), "{}", stderr(&out));
         }
         assert!(!refused.exists());
+
+        // With it, the routine is admitted, and the plan shows and pins it.
+        opt_in(&d, db, true);
+        let reviewed = plan(&d, db);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&reviewed).unwrap()).unwrap();
+        assert_eq!(saved.type_routines.len(), 1);
+        assert!(saved.type_routine_pins.is_some());
         assert_eq!(
             scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
             0
         );
 
+        // Declared trusted, the owner needs no review: nothing is shown.
+        opt_in(&d, db, false);
         let config = d.dir.join("pbps.yml");
         let text = std::fs::read_to_string(&config).unwrap();
         std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", owner.name)).unwrap();
         let path = plan(&d, db);
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved.type_routines.len(), 1);
-        assert!(saved.type_routine_pins.is_some());
+        assert!(saved.type_routines.is_empty() && saved.type_routine_pins.is_none());
 
         // ADMIN alone can obtain SET later, so trusting the direct owner
         // cannot admit code an untrusted actor can still replace.
@@ -2447,12 +2496,14 @@ fn io_coercion_roots_require_source_review(server: &str) {
     on_server(
         db,
         "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
-         CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+         CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
            BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
          CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
          CREATE DOMAIN app.outer_text AS text DEFAULT '{1}'
            CHECK (VALUE::app.checked[] IS NOT NULL);",
     );
+    let role = UntrustedRole::new(server, "io_review");
+    hand_over(db, &role, "app.seen(integer)");
     let d = Demo::new("io-review");
     d.keyed(db);
     d.table(&declarations(""));
@@ -2490,19 +2541,25 @@ fn io_coercion_roots_require_source_review(server: &str) {
     succeeds(d.run(&["verify", "--db", db]));
 }
 
+/// A superuser's routine is trusted (rule 3 of DEC-2563.2): admitted without a
+/// review, so nothing of it is shown or pinned. A replacement that sets no
+/// `search_path` is refused before the first statement.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees() {
+fn a_superuser_owned_root_is_trusted_not_reviewed_and_a_replacement_without_a_path_is_refused() {
     for server in servers() {
         let own = OwnDatabase::new(&server, "root_pin");
         let db = own.connection();
-        let d = root_demo(
+        let d = root_demo_unowned(
             db,
             "root-pin",
-            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN true; END $$",
         );
         opt_in(&d, db, true);
         let path = plan(&d, db);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.type_routines.is_empty() && saved.type_routine_pins.is_none());
         on_server(
             db,
             "CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; RETURN true; END $$",
@@ -2510,7 +2567,7 @@ fn superuser_owned_root_replacements_are_pinned_separately_from_replaceable_call
         let out = apply_plan(&d, db, &path, false);
         assert_ne!(code(&out), 0);
         assert!(
-            stderr(&out).contains("reviewed type routines changed"),
+            stderr(&out).contains("sets no `search_path`"),
             "{}",
             stderr(&out)
         );
@@ -2535,7 +2592,7 @@ fn an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement() 
             let d = root_demo(
                 db,
                 "callee-pin",
-                "CREATE FUNCTION app.leaf(varchar) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$; CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf($1); END $$",
+                "CREATE FUNCTION app.leaf(varchar) RETURNS boolean LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT true $$; CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN app.leaf($1); END $$",
             );
             on_server(
                 db,
@@ -2594,7 +2651,7 @@ fn a_scoped_path_overload_created_during_a_statement_is_detected_before_commit()
         let d = root_demo(
             db,
             "scoped-overload",
-            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
         );
         opt_in(&d, db, true);
         let path = plan(&d, db);
@@ -2622,9 +2679,11 @@ fn a_scoped_path_overload_created_during_a_statement_is_detected_before_commit()
         let out = apply_plan(&d, db, &path, false);
         assert_ne!(code(&out), 0);
         assert!(stderr(&out).contains("DEC-319.1"), "{}", stderr(&out));
+        // The root sets a fixed path (DEC-2563.2), so the overload that
+        // appeared in `app` never ran; arriving was still detected.
         assert_eq!(
             scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
-            1
+            0
         );
         assert_eq!(
             root,
@@ -2675,7 +2734,7 @@ fn staged_transactional_steps_rollback_changed_roots_and_concurrent_indexes_dete
         for online in [false, true] {
             let own = OwnDatabase::new(&server, "staged_root");
             let db = own.connection();
-            let original = "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$";
+            let original = "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN true; END $$";
             let d = root_demo(db, "staged-root", original);
             opt_in(&d, db, true);
             let initial = plan(&d, db);
@@ -2700,7 +2759,7 @@ fn staged_transactional_steps_rollback_changed_roots_and_concurrent_indexes_dete
                 r#"CREATE FUNCTION app.replace_root() RETURNS event_trigger LANGUAGE plpgsql AS $outer$
                 BEGIN
                   IF TG_TAG = 'CREATE INDEX' THEN
-                    EXECUTE 'CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $inner$ BEGIN PERFORM nextval(''app.calls''); RETURN true; END $inner$';
+                    EXECUTE 'CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $inner$ BEGIN PERFORM nextval(''app.calls''); RETURN true; END $inner$';
                   END IF;
                 END $outer$;
                 CREATE EVENT TRIGGER replace_root ON ddl_command_start EXECUTE FUNCTION app.replace_root()"#,
@@ -2760,8 +2819,10 @@ fn immediate_bootstrap_requires_reviewed_plans_for_user_written_type_roots() {
         let db = own.connection();
         on_server(
             db,
-            "CREATE SCHEMA app; CREATE FUNCTION app.root(integer) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$; CREATE DOMAIN app.checked AS integer CHECK(app.root(VALUE))",
+            "CREATE SCHEMA app; CREATE FUNCTION app.root(integer) RETURNS boolean LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT true $$; CREATE DOMAIN app.checked AS integer CHECK(app.root(VALUE))",
         );
+        let role = UntrustedRole::new(&server, "bootstrap_review");
+        hand_over(db, &role, "app.root(integer)");
         let d = Demo::new("bootstrap-review");
         opt_in(&d, db, true);
         d.table(&declarations("  n: {type: app.checked}\n"));
@@ -2795,10 +2856,11 @@ fn partition_review_demo(db: &str) -> Demo {
     on_server(
         db,
         "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
-         CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$
+         CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$
          BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
          CREATE DOMAIN app.checked AS varchar CHECK(app.root(VALUE))",
     );
+    leave_with_untrusted_role(db, "partition_review", "app.root(varchar)");
     let d = Demo::new("partition-source-review");
     opt_in(&d, db, true);
     d.table(&partition_review_declarations(""));
@@ -3007,8 +3069,10 @@ fn reviewed_domain_defaults_execute_at_ddl_time_but_sql_running_builtins_stay_re
         let db = own.connection();
         on_server(
             db,
-            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; CREATE FUNCTION app.fill() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN 7; END $$; CREATE DOMAIN app.checked AS integer DEFAULT app.fill()",
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; CREATE FUNCTION app.fill() RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.calls'); RETURN 7; END $$; CREATE DOMAIN app.checked AS integer DEFAULT app.fill()",
         );
+        let role = UntrustedRole::new(&server, "default_review");
+        hand_over(db, &role, "app.fill()");
         let d = Demo::new("default-review");
         d.keyed(db);
         d.table(&declarations(""));
@@ -3060,7 +3124,7 @@ fn set_default_and_create_parse_nested_domain_literals_while_stored_values_do_no
         let own = OwnDatabase::new(&server, "definition_input");
         let db = own.connection();
         on_server(db, "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
-            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
             CREATE DOMAIN app.checked AS integer CHECK(app.seen(VALUE));
             CREATE TYPE app.pair AS (n app.checked)");
         for sql in [
@@ -3122,7 +3186,7 @@ fn generated_expression_replacement_rechecks_domains_on_18_and_is_refused_on_16(
         let own = OwnDatabase::new(&server, "expression_input");
         let db = own.connection();
         on_server(db, "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
-            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
             CREATE DOMAIN app.checked AS integer CHECK(app.seen(VALUE));
             CREATE TABLE app.t (id integer PRIMARY KEY, n app.checked GENERATED ALWAYS AS (id*2) STORED);
             INSERT INTO app.t (id) VALUES (1),(2)");
@@ -3142,6 +3206,8 @@ fn generated_expression_replacement_rechecks_domains_on_18_and_is_refused_on_16(
             measured.unwrap();
             assert_eq!(scalar(db, "SELECT last_value::bigint FROM app.calls"), 2);
         }
+        let role = UntrustedRole::new(&server, "expression_input");
+        hand_over(db, &role, "app.seen(integer)");
         let d = Demo::new("expression-input");
         d.keyed(db);
         d.table(&declarations(&format!(
@@ -3321,13 +3387,14 @@ fn an_existing_reference_cannot_be_unpinned_from_a_saved_default_change() {
 fn empty_apply_checks_referenced_type_prerequisites(server: &str) {
     let own = OwnDatabase::new(server, "refs_empty_apply");
     let db = own.connection();
-    let root = "CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$";
+    let root = "CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$";
     on_server(
         db,
         &format!(
             "CREATE SCHEMA app; CREATE SEQUENCE app.calls; {root}; CREATE DOMAIN app.checked AS varchar CHECK (app.root(VALUE)); CREATE TABLE app.t(id integer PRIMARY KEY,n app.checked)"
         ),
     );
+    leave_with_untrusted_role(db, "empty_apply", "app.root(varchar)");
     let d = Demo::new("refs-empty-apply");
     opt_in(&d, db, true);
     d.table(&declarations("  n: {type: app.checked}\n"));

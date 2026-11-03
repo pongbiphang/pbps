@@ -58,6 +58,7 @@ impl Verification {
 /// Complete catalog reads and typed recipes, in the caller's transaction.
 pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
     conn: &mut Conn,
+    admission: &crate::admission::Admission,
     changes: pbps_diff::order::PlanningPlan<S>,
     before: Side<'_>,
     desired: Side<'_>,
@@ -159,7 +160,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
             }
         })
         .ok_or_else(|| "prepared rebuild has no copy".to_owned())?;
-    let (rows, bytes) = observe(conn, &parts, copy).await?;
+    let (rows, bytes) = observe(conn, admission, &parts, copy).await?;
     let verification = Verification {
         root: root.clone(),
         prepared: prepared.clone(),
@@ -178,6 +179,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
 /// bounds over the exact typed copy projection. No rows are copied here.
 pub async fn observe(
     conn: &mut Conn,
+    admission: &crate::admission::Admission,
     changes: &ChangeSet,
     copy: &CopyTableRows,
 ) -> Result<(i64, i64), Error> {
@@ -187,7 +189,8 @@ pub async fn observe(
             let mut from = c.source.as_ref().map(|s| &s.ty);
             for stage in &c.stages {
                 if let (Some(ty), Some(using)) = (from, &stage.using) {
-                    crate::input_path::vet_copy_conversion(conn, &stage.input, ty, using).await?;
+                    crate::input_path::vet_copy_conversion(conn, admission, &stage.input, ty, using)
+                        .await?;
                 }
                 from = Some(&stage.cast);
             }
@@ -236,7 +239,12 @@ pub async fn observe(
 }
 
 /// Lock the recursive source tree before reading the dependency closure again.
-pub async fn window(conn: &mut Conn, before: Side<'_>, changes: &ChangeSet) -> Result<(), Error> {
+pub async fn window(
+    conn: &mut Conn,
+    admission: &crate::admission::Admission,
+    before: Side<'_>,
+    changes: &ChangeSet,
+) -> Result<(), Error> {
     for copy in changes.changes.iter().filter_map(|p| {
         if let Change::CopyTableRows(c) = &p.change {
             Some(c)
@@ -265,7 +273,7 @@ pub async fn window(conn: &mut Conn, before: Side<'_>, changes: &ChangeSet) -> R
         )
         .await?;
         pbps_diff::order::rebuild::recertify(&catalog, copy, before, changes)?;
-        observe(conn, changes, copy).await?;
+        observe(conn, admission, changes, copy).await?;
     }
     Ok(())
 }

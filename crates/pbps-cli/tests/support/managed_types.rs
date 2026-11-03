@@ -3882,7 +3882,7 @@ fn enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns() {
             CREATE FUNCTION app.n() RETURNS int LANGUAGE sql
               BEGIN ATOMIC SELECT count(*)::int FROM app.t WHERE m = 'ok'; END;
             CREATE FUNCTION app.s() RETURNS bigint LANGUAGE sql AS $$ SELECT count(*) FROM app.t $$;
-            CREATE FUNCTION app.tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+            CREATE FUNCTION app.tf() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
             CREATE TRIGGER tr BEFORE UPDATE OF m ON app.t FOR EACH ROW EXECUTE FUNCTION app.tf();";
         let (own, d) = adopted(&server, "rebuild_modules1635", sql);
         let db = own.connection();
@@ -8439,7 +8439,7 @@ fn signature_rebuild_dependents(ty: &str) -> String {
          CREATE TABLE app.t (id int PRIMARY KEY, v {ty}, tags {ty}[] DEFAULT app.arr(),
              CONSTRAINT accepted CHECK (app.accepts(v)));
          CREATE VIEW app.v AS SELECT app.accepts(v) AS accepted FROM app.t;
-         CREATE FUNCTION app.trig() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+         CREATE FUNCTION app.trig() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
          CREATE TRIGGER accepted BEFORE INSERT OR UPDATE ON app.t FOR EACH ROW
              WHEN (app.accepts(NEW.v)) EXECUTE FUNCTION app.trig();
          INSERT INTO app.t(id,v) VALUES (1,'ok');"
@@ -8789,3 +8789,80 @@ const TIER1_RESTORE: &str = "
         BEGIN ATOMIC SELECT $1 > 0; END;
     CREATE OR REPLACE FUNCTION app.has_at(text) RETURNS boolean LANGUAGE SQL IMMUTABLE
         RETURN position('@' IN $1) > 0";
+
+/// A created domain's CHECK may call a routine a role wrote (#2563, DEC-2563.2,
+/// which supersedes DEC-1635.4's built-in-only rule): vetted in the creating
+/// transaction by the one predicate, a trusted owner's routine with a fixed
+/// `search_path` is admitted and one without is refused with the line that
+/// fixes it, creating nothing.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_created_domain_may_call_a_trusted_routine_that_sets_a_search_path() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "created_domain2563");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.lower_only(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SET search_path = pg_catalog AS $$ BEGIN RETURN $1 ~ '^[a-z]+$'; END $$;
+             CREATE FUNCTION app.sloppy(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$ BEGIN RETURN true; END $$",
+        );
+        let d = Demo::new("created-domain2563");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        let table = |extra: &str| {
+            format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  w: {{type: app.word}}\n{extra}primary_key: [id]\n"
+            )
+        };
+        std::fs::write(
+            d.dir.join("schema/app.word.type.yml"),
+            "domain: app.word\ntype: text\nchecks:\n  lower_only: \"app.lower_only(VALUE)\"\n",
+        )
+        .unwrap();
+        d.table(&table(""));
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("created-domain.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert!(try_on_server(db, "INSERT INTO app.t VALUES (1, 'ABC')").is_err());
+        on_server(db, "INSERT INTO app.t VALUES (2, 'abc')");
+
+        // The same shape with a routine that sets no path is refused at apply,
+        // with the exact fix, and the domain is not created.
+        std::fs::write(
+            d.dir.join("schema/app.loose.type.yml"),
+            "domain: app.loose\ntype: text\nchecks:\n  sloppy: \"app.sloppy(VALUE)\"\n",
+        )
+        .unwrap();
+        d.table(&table("").replace(
+            "w: {type: app.word}",
+            "w: {type: app.word}\n  v: {type: app.loose}",
+        ));
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let refused = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains(
+                "ALTER FUNCTION app.sloppy(pg_catalog.text) SET search_path = pg_catalog, pg_temp"
+            ),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_type WHERE typname = 'loose'"
+            ),
+            0
+        );
+    }
+}

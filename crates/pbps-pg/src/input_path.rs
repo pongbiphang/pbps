@@ -10,7 +10,10 @@
 //!
 //! # The two questions
 //!
-//! A type is admitted when both hold (#2046):
+//! A type is admitted when both hold (#2046). Slice 2 of #2563 widened (a): a
+//! routine a role wrote is admitted by the one predicate of [`crate::admission`]
+//! (a trusted owner and a fixed `search_path`, or a reviewed pin), the same at
+//! every site that runs user code.
 //!
 //! - **(a) the code is built in.** Every function, every operator's function and
 //!   every cast or coercion function that a CHECK or a DEFAULT on the input path
@@ -34,8 +37,9 @@
 //!   can act as an owner without being trusted is named in the refusal.
 //!
 //! Ownership applies to the whole input path, even where no code runs now:
-//! an untrusted owner could add code after validation. Pins detect changes;
-//! they add to owner trust rather than replacing it (DEC-2181.3).
+//! an untrusted owner could add code after validation. For a type that stays so.
+//! For a routine, the review of `pin_type_routines` replaces owner trust
+//! (DEC-2563.2): the plan shows the complete source and pins it.
 //!
 //! # The input path
 //!
@@ -114,6 +118,7 @@ use std::fmt;
 use pbps_db::{Conn, DbError, Param};
 use pbps_model::TypeRef;
 
+use crate::admission::{self, Admission, Cause, Judgement};
 use crate::catalog::untrusted_role_walk;
 use crate::pins::Within;
 use crate::resolver::capture::{Bound, bound_objects};
@@ -196,6 +201,8 @@ pub enum InputPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted {
     runs_code: bool,
+    /// The routines rule 4 admitted: the plan shows and pins them.
+    reviewed: BTreeSet<Oid>,
 }
 
 impl Admitted {
@@ -205,6 +212,12 @@ impl Admitted {
     #[must_use]
     pub fn runs_code(&self) -> bool {
         self.runs_code
+    }
+
+    /// The routines admitted by review (`pg_proc.oid`), which the plan pins.
+    #[must_use]
+    pub fn reviewed(&self) -> &BTreeSet<Oid> {
+        &self.reviewed
     }
 }
 
@@ -238,10 +251,13 @@ impl RoutineKind {
 /// Why a routine is not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Why {
-    /// A function a role wrote (OID at or above 16384).
-    NotBuiltin,
     /// A built-in on [`RUNS_SQL`].
     RunsSql,
+    /// A function a role wrote that resolves names when it runs and sets no
+    /// `search_path` (DEC-2563.2).
+    NoSearchPath,
+    /// A `SECURITY DEFINER` function whose owner an untrusted role can act as.
+    SecurityDefiner,
 }
 
 /// Where in a type the expression sits.
@@ -301,7 +317,8 @@ pub struct RoutineReason {
     /// The implementation function, including operator support functions.
     pub oid: Oid,
     /// For a function a role wrote, why it could not be proven to run only
-    /// built-in code (#2563): a clause continuing "it".
+    /// built-in code (#2563), a clause continuing "it": the other way to
+    /// need no `search_path`.
     pub detail: Option<String>,
 }
 
@@ -346,9 +363,10 @@ impl InputPath {
     }
 
     /// Why this potential input path requires refusal, regardless of row presence,
-    /// or `None` when it can. Each refusal says which case it is.
+    /// or `None` when it can. Each refusal says which case it is and, from `admission`,
+    /// which remedies the site has.
     #[must_use]
-    pub fn refusal(&self, reference: &TypeRef) -> Option<String> {
+    pub fn refusal(&self, reference: &TypeRef, admission: &Admission) -> Option<String> {
         let name = reference.shown().to_string();
         Some(match self {
             Self::Admitted(_) => return None,
@@ -363,10 +381,9 @@ impl InputPath {
                 }
                 format!(
                     "the potential input path of type `{name}` requires eligible code and trusted \
-                     owners regardless of row presence: {}. To admit an untrusted owner, \
-                     list the named role in `trusted_roles` in `pbps.yml`; user-written \
-                     routines require pin_type_routines: true, source review and pins",
-                    lines.join("; ")
+                     owners regardless of row presence: {}.{}",
+                    lines.join("; "),
+                    remedies_for(reasons, admission).map_or_else(String::new, |r| format!(" {r}"))
                 )
             }
             Self::Unreadable(Unreadable::TrustedRolesMissing(roles)) => format!(
@@ -386,13 +403,22 @@ impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Routine(r) => {
-                let what = match (r.why, &r.detail) {
-                    (Why::NotBuiltin, None) => "is not built into PostgreSQL".to_owned(),
-                    (Why::NotBuiltin, Some(detail)) => format!(
-                        "is not built into PostgreSQL and cannot be proven to run only built-in \
-                         code: {detail}"
+                let function = r.runs.as_deref().unwrap_or(&r.identity);
+                let what = match r.why {
+                    Why::RunsSql => "runs SQL or code named by its arguments".to_owned(),
+                    Why::NoSearchPath => format!(
+                        "sets no `search_path`, so a role that can create objects in a schema \
+                         searched earlier can replace what it calls; run `{}` (naming before \
+                         `pg_temp` any other schema its body needs){}",
+                        admission::search_path_fix(function),
+                        r.detail.as_ref().map_or_else(String::new, |detail| format!(
+                            ", or write it as built-in-only code, which it is not because it {}",
+                            detail.strip_prefix("it ").unwrap_or(detail)
+                        ))
                     ),
-                    (Why::RunsSql, _) => "runs SQL or code named by its arguments".to_owned(),
+                    Why::SecurityDefiner => "is SECURITY DEFINER and owned by a role that is \
+                         not trusted, so it would run with that role's rights"
+                        .to_owned(),
                 };
                 match &r.runs {
                     None => write!(
@@ -434,7 +460,7 @@ impl fmt::Display for Reason {
             ),
             Self::RoutineOwner(o) => write!(
                 f,
-                "the input-path {} `{}` is owned by `{}`, and untrusted role `{}` can act as that owner; pinning does not replace owner trust",
+                "the input-path {} `{}` is owned by `{}`, and untrusted role `{}` can act as that owner and so replace it after it is read",
                 o.kind.as_str(),
                 o.identity,
                 o.owner.shown(),
@@ -442,6 +468,15 @@ impl fmt::Display for Reason {
             ),
         }
     }
+}
+
+/// The ways out of a trust refusal, when there is one. A missing `search_path`
+/// has its own fix, named with the routine.
+fn remedies_for(reasons: &[Reason], admission: &Admission) -> Option<String> {
+    reasons
+        .iter()
+        .any(|r| matches!(r, Reason::Owner(_) | Reason::RoutineOwner(_)))
+        .then(|| admission::remedies(admission.offers_review()))
 }
 
 fn quoted(names: &[pbps_model::RoleName]) -> String {
@@ -463,15 +498,25 @@ fn is_builtin(oid: Oid) -> bool {
     oid < Oid::from(FIRST_NORMAL_OBJECT_ID)
 }
 
-/// Why a function is not admitted, or `None` when it is built-in, SQL-free code.
+/// What a function is to the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Built in, and runs nothing it does not name.
+    Builtin,
+    /// A built-in on [`RUNS_SQL`]: no owner or pin admits it.
+    RunsSql,
+    /// A function a role wrote, for the admission predicate.
+    User,
+}
+
 #[must_use]
-fn why_not_admitted(oid: Oid, runs_sql: &BTreeSet<Oid>) -> Option<Why> {
+fn classify(oid: Oid, runs_sql: &BTreeSet<Oid>) -> Class {
     if runs_sql.contains(&oid) {
-        Some(Why::RunsSql)
-    } else if !is_builtin(oid) {
-        Some(Why::NotBuiltin)
+        Class::RunsSql
+    } else if is_builtin(oid) {
+        Class::Builtin
     } else {
-        None
+        Class::User
     }
 }
 
@@ -482,11 +527,13 @@ struct Facts {
     runs_code: bool,
     /// Includes built-ins: rollback does not undo every non-immutable call.
     non_immutable: bool,
-    /// The routines that are not admitted, with where each is used.
+    /// The built-ins that run SQL, with where each is used.
     routines: Vec<RoutineReason>,
+    /// The routines a role wrote, for the admission predicate.
+    user: Vec<UserRoutine>,
     /// All structural types, even when the fill evaluates no code in them.
     types: Vec<OwnedType>,
-    /// Includes built-ins and operator implementations, before code eligibility.
+    /// Built-ins, operators and type handlers: owner trust only.
     routine_owners: Vec<OwnedRoutine>,
 }
 
@@ -500,15 +547,89 @@ struct OwnedType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnedRoutine {
+    oid: Oid,
     kind: RoutineKind,
     identity: String,
     owner: pbps_model::RoleName,
     owner_oid: Oid,
 }
 
+/// One use of a function a role wrote, with what [`admission::judge`] needs.
+/// The function of an operator or a row comparison is the one judged, and the
+/// operator is how it is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserRoutine {
+    /// How a refusal names this use. Its `why` is a placeholder: the judgement
+    /// decides it.
+    reason: RoutineReason,
+    /// The identity of the function itself, which `ALTER FUNCTION` names.
+    function: String,
+    function_owner: pbps_model::RoleName,
+    function_owner_oid: Oid,
+    tier1: bool,
+    secdef: bool,
+    fixed_search_path: bool,
+    language: String,
+}
+
+type Actors = BTreeMap<Oid, Vec<pbps_model::RoleName>>;
+
+/// The admission predicate over every use of a routine a role wrote: what it
+/// refuses goes to `reasons`, and the routines that only a review admits are
+/// returned. `actors` maps an owner to the untrusted roles that can act as it.
+fn judge_routines(
+    user: Vec<UserRoutine>,
+    actors: &Actors,
+    pin: bool,
+    reasons: &mut Vec<Reason>,
+) -> BTreeSet<Oid> {
+    let mut reviewed = BTreeSet::new();
+    for u in user {
+        let who: &[pbps_model::RoleName] =
+            actors.get(&u.function_owner_oid).map_or(&[], Vec::as_slice);
+        let routine = admission::Routine {
+            tier1: u.tier1,
+            secdef: u.secdef,
+            fixed_search_path: u.fixed_search_path,
+            language: &u.language,
+            untrusted_owner: !who.is_empty(),
+        };
+        match admission::judge(&routine, pin) {
+            Judgement::Admit => {}
+            Judgement::Review => {
+                reviewed.insert(u.reason.oid);
+            }
+            Judgement::Refuse(causes) => {
+                for cause in causes {
+                    if cause != Cause::NoSearchPath {
+                        reasons.extend(who.iter().map(|actor| {
+                            Reason::RoutineOwner(RoutineOwnerReason {
+                                kind: RoutineKind::Function,
+                                identity: u.function.clone(),
+                                owner: u.function_owner.clone(),
+                                actor: actor.clone(),
+                            })
+                        }));
+                    }
+                    let why = match cause {
+                        Cause::UntrustedOwner => continue,
+                        Cause::SecurityDefiner => Why::SecurityDefiner,
+                        Cause::NoSearchPath => Why::NoSearchPath,
+                    };
+                    reasons.push(Reason::Routine(RoutineReason {
+                        why,
+                        ..u.reason.clone()
+                    }));
+                }
+            }
+        }
+    }
+    reviewed
+}
+
 /// The verdict on what was read. `actors` maps an owner to the untrusted roles
 /// that can act as it. Key by OID so a rename cannot hide an untrusted owner.
-fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<pbps_model::RoleName>>) -> InputPath {
+fn verdict(facts: Facts, actors: &Actors, pin: bool) -> InputPath {
     let mut reasons: Vec<Reason> = facts.routines.into_iter().map(Reason::Routine).collect();
     for t in &facts.types {
         for actor in actors.get(&t.owner_oid).into_iter().flatten() {
@@ -529,11 +650,13 @@ fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<pbps_model::RoleName>>) -> I
             }));
         }
     }
+    let reviewed = judge_routines(facts.user, actors, pin, &mut reasons);
     reasons.sort();
     reasons.dedup();
     if reasons.is_empty() {
         InputPath::Admitted(Admitted {
             runs_code: facts.runs_code,
+            reviewed,
         })
     } else {
         InputPath::Refused(reasons)
@@ -624,11 +747,12 @@ impl<'a> Added<'a> {
 /// Reads whether `ADD COLUMN` over existing rows may run each column's type's
 /// input path, one answer per column, in order.
 ///
-/// `trusted` are the roles a human has declared trusted, over and above the
+/// `admission` carries the roles a human has declared trusted, over and above the
 /// engine's rule (a superuser, or a role that can `SET ROLE` to the deploying
-/// role or to a superuser). It extends (b) only: it never admits a function.
-/// A name that is not a role is [`Unreadable::TrustedRolesMissing`] for every
-/// type, however many there are; [`missing_roles`] asks the same question alone.
+/// role or to a superuser), and whether `pin_type_routines` is on. Trust extends
+/// the owner rule of types and routines alike. A name that is not a role is
+/// [`Unreadable::TrustedRolesMissing`] for every type, however many there are;
+/// [`missing_roles`] asks the same question alone.
 ///
 /// In a transaction of its own that is one snapshot of the catalog tables; in
 /// the caller's it is the caller's. A read that fails is
@@ -637,10 +761,10 @@ impl<'a> Added<'a> {
 pub async fn read(
     conn: &mut Conn,
     within: Within,
-    trusted: &[pbps_model::RoleName],
+    admission: &Admission,
     added: &[Added<'_>],
 ) -> Vec<InputPath> {
-    match read_all(conn, within, trusted, added).await {
+    match read_all(conn, within, admission, added).await {
         Ok(reads) => reads,
         Err(e) => added
             .iter()
@@ -682,13 +806,13 @@ const SAVEPOINT: &str = "pbps_input_path";
 async fn read_all(
     conn: &mut Conn,
     within: Within,
-    trusted: &[pbps_model::RoleName],
+    admission: &Admission,
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     match within {
         Within::OwnTransaction => {
             conn.begin(&OWN_TRANSACTION).await?;
-            let result = read_each(conn, trusted, added).await;
+            let result = read_each(conn, admission, added).await;
             let closed = conn.rollback(&OWN_TRANSACTION).await;
             let reads = result?;
             closed?;
@@ -696,7 +820,7 @@ async fn read_all(
         }
         Within::CallersTransaction => {
             conn.execute(&format!("SAVEPOINT {SAVEPOINT}")).await?;
-            match read_each(conn, trusted, added).await {
+            match read_each(conn, admission, added).await {
                 Ok(reads) => {
                     conn.execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
                         .await?;
@@ -722,7 +846,7 @@ async fn read_all(
 
 async fn read_each(
     conn: &mut Conn,
-    trusted: &[pbps_model::RoleName],
+    admission: &Admission,
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     // Names in the stored expressions' text, in the identities and in the
@@ -732,8 +856,8 @@ async fn read_each(
     // Read the whole set twice and compare (see `user_types`): the queries of a
     // pass are separate statements and in a READ COMMITTED transaction share no
     // snapshot.
-    let first = pass(conn, trusted, added).await?;
-    let second = pass(conn, trusted, added).await?;
+    let first = pass(conn, admission, added).await?;
+    let second = pass(conn, admission, added).await?;
     Ok(first
         .into_iter()
         .zip(second)
@@ -804,10 +928,10 @@ impl From<DbError> for Failure {
 
 async fn pass(
     conn: &mut Conn,
-    trusted: &[pbps_model::RoleName],
+    admission: &Admission,
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
-    let missing = missing_roles(conn, trusted).await?;
+    let missing = missing_roles(conn, admission.trusted()).await?;
     if !missing.is_empty() {
         return Ok(added
             .iter()
@@ -842,13 +966,14 @@ async fn pass(
                 .iter()
                 .map(|t| t.owner_oid)
                 .chain(f.routine_owners.iter().map(|r| r.owner_oid))
+                .chain(f.user.iter().map(|u| u.function_owner_oid))
         })
         .collect();
-    let actors = untrusted_actors(conn, trusted, &wanted).await?;
+    let actors = untrusted_actors(conn, admission.trusted(), &wanted).await?;
     Ok(gathered
         .into_iter()
         .map(|facts| match facts {
-            Ok(facts) => verdict(facts, &actors),
+            Ok(facts) => verdict(facts, &actors, admission.pin()),
             Err(why) => InputPath::Unreadable(Unreadable::Failed(why)),
         })
         .collect())
@@ -876,11 +1001,12 @@ async fn pass(
 /// can quote a value.
 pub async fn vet_conversion(
     conn: &mut Conn,
+    admission: &Admission,
     column: &pbps_model::ColumnRef,
     from: &pbps_model::ColumnType,
     using: &str,
 ) -> Result<(), String> {
-    vet_conversion_bound(conn, column, from, using, None)
+    vet_conversion_bound(conn, admission, column, from, using, None)
         .await
         .map(|_| ())
 }
@@ -890,16 +1016,18 @@ pub async fn vet_conversion(
 /// comparison must predict the same stored value across separate evaluations.
 pub async fn vet_conversion_for_probe(
     conn: &mut Conn,
+    admission: &Admission,
     column: &pbps_model::ColumnRef,
     from: &pbps_model::ColumnType,
     to: &pbps_model::ColumnType,
     using: &str,
 ) -> Result<bool, String> {
-    vet_conversion_bound(conn, column, from, using, Some(to)).await
+    vet_conversion_bound(conn, admission, column, from, using, Some(to)).await
 }
 
 async fn vet_conversion_bound(
     conn: &mut Conn,
+    admission: &Admission,
     column: &pbps_model::ColumnRef,
     from: &pbps_model::ColumnType,
     using: &str,
@@ -950,7 +1078,7 @@ async fn vet_conversion_bound(
             ), &[]).await.map_err(|_| unvetted("could not be vetted: its parameter binding table could not be created".into()))?;
             inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), false).await.map_err(unvetted)?;
         }
-        vet_in_transaction(conn, quoted, ty, VetExpression { text: using, bound }, shown, 1, false).await.map(|v| v.immutable)
+        vet_in_transaction(conn, admission, quoted, ty, VetExpression { text: using, bound }, shown, 1, false).await.map(|v| v.immutable)
     }
     .await;
     let closed = conn.rollback(&WRITABLE).await;
@@ -964,6 +1092,7 @@ async fn vet_conversion_bound(
 /// All callers (record, plan and apply) use this same security boundary.
 pub async fn vet_requirement(
     conn: &mut Conn,
+    admission: &Admission,
     within: Within,
     table: &pbps_model::TableName,
     predicate: &str,
@@ -1013,7 +1142,7 @@ pub async fn vet_requirement(
             conn.execute_with(&format!("CREATE TEMPORARY TABLE pg_temp.pbps_conversion_input (LIKE {qualified} EXCLUDING ALL) ON COMMIT DROP"), &[]).await.map_err(|_| refused("could not be vetted: its binding table could not be created"))?;
             inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), true).await?;
         }
-        vet_in_transaction(conn, &format!("LIKE {qualified} EXCLUDING ALL"), "", predicate.into(), &table.shown().to_string(), columns, true).await.map(|v| v.columns)
+        vet_in_transaction(conn, admission, &format!("LIKE {qualified} EXCLUDING ALL"), "", predicate.into(), &table.shown().to_string(), columns, true).await.map(|v| v.columns)
     }.await;
     let closed = conn.rollback(&framing).await;
     let columns = result?;
@@ -1041,8 +1170,11 @@ struct VettedExpression {
     immutable: bool,
 }
 
+// One argument per fact of the binding table; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn vet_in_transaction(
     conn: &mut Conn,
+    admission: &Admission,
     column: &str,
     ty: &str,
     expression: VetExpression<'_>,
@@ -1213,7 +1345,7 @@ async fn vet_in_transaction(
             row_compares.insert((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]);
         }
     }
-    let (reasons, non_immutable, owners) = unadmitted_routines(
+    let found = unadmitted_routines(
         conn,
         &denied,
         &functions,
@@ -1226,16 +1358,27 @@ async fn vet_in_transaction(
         Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
         Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
     })?;
-    let mut reasons: Vec<Reason> = reasons.into_iter().map(Reason::Routine).collect();
-    // The engine made every built-in, so only an admitted user function has an
-    // owner to trust. Whoever can act as it can replace its body after this
-    // read, so the owner rule of the module docs applies here as it does to a
-    // type; no role is declared trusted at this site.
-    if !proven.is_empty() {
-        let wanted: BTreeSet<Oid> = owners.iter().map(|o| o.owner_oid).collect();
-        let actors = untrusted_actors(conn, &[], &wanted).await.map_err(|_| {
-            refuse("could not be vetted: the owners of the routines it calls could not be read")
-        })?;
+    let non_immutable = found.non_immutable;
+    let mut reasons: Vec<Reason> = found.runs_sql.into_iter().map(Reason::Routine).collect();
+    // The engine made every built-in, so only a routine a role wrote has an owner
+    // to trust. Whoever can act as it can replace its body after this read, so
+    // the owner rule of the module docs applies here as it does to a type.
+    let owners: Vec<_> = found
+        .owners
+        .into_iter()
+        .filter(|o| !is_builtin(o.oid))
+        .collect();
+    if !owners.is_empty() || !found.user.is_empty() {
+        let wanted: BTreeSet<Oid> = owners
+            .iter()
+            .map(|o| o.owner_oid)
+            .chain(found.user.iter().map(|u| u.function_owner_oid))
+            .collect();
+        let actors = untrusted_actors(conn, admission.trusted(), &wanted)
+            .await
+            .map_err(|_| {
+                refuse("could not be vetted: the owners of the routines it calls could not be read")
+            })?;
         for routine in owners {
             for actor in actors.get(&routine.owner_oid).into_iter().flatten() {
                 reasons.push(Reason::RoutineOwner(RoutineOwnerReason {
@@ -1246,17 +1389,22 @@ async fn vet_in_transaction(
                 }));
             }
         }
+        let reviewed = judge_routines(found.user, &actors, admission.pin(), &mut reasons);
+        if reasons.is_empty() {
+            admission.review(reviewed);
+        }
     }
     if !reasons.is_empty() {
         reasons.sort();
         reasons.dedup();
         return Err(format!(
-            "{}; nothing has been changed",
+            "{}; nothing has been changed{}",
             reasons
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("; "),
+            remedies_for(&reasons, admission).map_or_else(String::new, |r| format!(". {r}"))
         ));
     }
     if !predicate {
@@ -1589,7 +1737,7 @@ async fn gather(
         roots = next;
     }
 
-    let (routines, non_immutable, mut routine_owners) = unadmitted_routines(
+    let found = unadmitted_routines(
         conn,
         runs_sql,
         &functions,
@@ -1598,6 +1746,7 @@ async fn gather(
         &proven,
     )
     .await?;
+    let mut routine_owners = found.owners;
     let handler_rows = function_rows(conn, &handlers.iter().copied().collect::<Vec<_>>()).await?;
     for oid in handlers {
         let row = handler_rows.get(&oid).ok_or_else(|| {
@@ -1606,6 +1755,7 @@ async fn gather(
             ))
         })?;
         routine_owners.push(OwnedRoutine {
+            oid,
             kind: RoutineKind::Function,
             identity: row.identity.clone(),
             owner: row.owner.clone(),
@@ -1614,8 +1764,9 @@ async fn gather(
     }
     Ok(Facts {
         runs_code,
-        non_immutable,
-        routines,
+        non_immutable: found.non_immutable,
+        routines: found.runs_sql,
+        user: found.user,
         types: owners.into_values().collect(),
         routine_owners,
     })
@@ -1777,12 +1928,29 @@ struct FunctionRow {
     owner: pbps_model::RoleName,
     owner_oid: Oid,
     volatility: String,
+    language: String,
+    secdef: bool,
+    /// `proconfig` holds a `search_path`: the function resolves names on its own
+    /// path and not on its caller's.
+    fixed_search_path: bool,
 }
 
-/// The functions and operators of the path that are not admitted, with where
-/// each is used, and whether any executed routine is non-immutable. Built-ins
-/// also need a catalog read: deployment eligibility alone does not make them
-/// safe to execute in a plan-time probe.
+/// What the routines of a path come to, before they are judged.
+struct Routines {
+    /// The built-ins that run SQL, which no owner or pin admits.
+    runs_sql: Vec<RoutineReason>,
+    /// The routines a role wrote, for the admission predicate.
+    user: Vec<UserRoutine>,
+    /// Whether any executed routine is non-immutable.
+    non_immutable: bool,
+    /// Built-in functions and operators: owner trust only.
+    owners: Vec<OwnedRoutine>,
+}
+
+/// The routines of the path, sorted into the built-ins that run SQL, the ones a
+/// role wrote and the rest, with where each is used. Built-ins also need a
+/// catalog read: deployment eligibility alone does not make them safe to
+/// execute in a plan-time probe.
 async fn unadmitted_routines(
     conn: &mut Conn,
     runs_sql: &BTreeSet<Oid>,
@@ -1790,16 +1958,7 @@ async fn unadmitted_routines(
     operators: &BTreeMap<Oid, Vec<Use>>,
     row_compares: &BTreeMap<(Oid, Oid), Vec<Use>>,
     proven: &body::Proven,
-) -> Result<(Vec<RoutineReason>, bool, Vec<OwnedRoutine>), Failure> {
-    // A function a role wrote is not admitted unless its body was proven
-    // (#2563); the reason it was not is the proof's own sentence.
-    let unproven = |oid: Oid| -> Option<(Why, Option<String>)> {
-        match why_not_admitted(oid, runs_sql)? {
-            Why::NotBuiltin if proven.admits(oid) => None,
-            Why::NotBuiltin => Some((Why::NotBuiltin, proven.refusal(oid).map(str::to_owned))),
-            why => Some((why, None)),
-        }
-    };
+) -> Result<Routines, Failure> {
     let mut operator_ids: BTreeSet<Oid> = operators.keys().copied().collect();
     operator_ids.extend(row_compares.keys().map(|(operator, _)| *operator));
     let operator_rows = operator_rows(conn, &operator_ids.into_iter().collect::<Vec<_>>()).await?;
@@ -1841,17 +2000,22 @@ async fn unadmitted_routines(
             }
         }
     }
-    // Retain all routine owners before any built-in eligibility shortcut.
+    // Retain all routine owners before any built-in eligibility shortcut. A
+    // function a role wrote is judged by the predicate instead, which asks for
+    // its owner's trust itself.
     let mut owners: Vec<_> = function_rows
-        .values()
-        .map(|r| OwnedRoutine {
+        .iter()
+        .filter(|(oid, _)| is_builtin(**oid))
+        .map(|(oid, r)| OwnedRoutine {
+            oid: *oid,
             kind: RoutineKind::Function,
             identity: r.identity.clone(),
             owner: r.owner.clone(),
             owner_oid: r.owner_oid,
         })
         .collect();
-    owners.extend(operator_rows.values().map(|r| OwnedRoutine {
+    owners.extend(operator_rows.iter().map(|(oid, r)| OwnedRoutine {
+        oid: *oid,
         kind: RoutineKind::Operator,
         identity: r.identity.clone(),
         owner: r.owner.clone(),
@@ -1866,47 +2030,76 @@ async fn unadmitted_routines(
         .filter_map(|(oid, uses)| operator_rows.get(oid).map(|row| (row.code, uses)))
         .flat_map(|(code, uses)| uses.iter().map(move |used_by| (code, used_by)))
         .collect();
-    let mut out = Vec::new();
+    let mut found = Routines {
+        runs_sql: Vec::new(),
+        user: Vec::new(),
+        non_immutable,
+        owners,
+    };
+    // One use of `oid`, as the audited list or the predicate will judge it.
+    let mut sort = |oid: Oid, reason: RoutineReason| -> Result<(), Failure> {
+        match classify(oid, runs_sql) {
+            Class::Builtin => {}
+            Class::RunsSql => found.runs_sql.push(RoutineReason {
+                why: Why::RunsSql,
+                ..reason
+            }),
+            Class::User => {
+                let row = function(oid)?;
+                found.user.push(UserRoutine {
+                    reason,
+                    function: row.identity.clone(),
+                    function_owner: row.owner.clone(),
+                    function_owner_oid: row.owner_oid,
+                    tier1: proven.admits(oid),
+                    secdef: row.secdef,
+                    fixed_search_path: row.fixed_search_path,
+                    language: row.language.clone(),
+                });
+            }
+        }
+        Ok(())
+    };
     for (oid, uses) in functions {
-        let Some((why, detail)) = unproven(*oid) else {
-            continue;
-        };
         let row = function(*oid)?;
         for used_by in uses {
             if beside_operator.contains(&(*oid, used_by)) {
                 continue;
             }
-            out.push(RoutineReason {
-                oid: *oid,
-                kind: RoutineKind::Function,
-                identity: row.identity.clone(),
-                runs: None,
-                owner: row.owner.clone(),
-                why,
-                used_by: used_by.clone(),
-                detail: detail.clone(),
-            });
+            sort(
+                *oid,
+                RoutineReason {
+                    oid: *oid,
+                    kind: RoutineKind::Function,
+                    identity: row.identity.clone(),
+                    runs: None,
+                    owner: row.owner.clone(),
+                    why: Why::NoSearchPath,
+                    used_by: used_by.clone(),
+                    detail: proven.refusal(*oid).map(str::to_owned),
+                },
+            )?;
         }
     }
     for (oid, uses) in operators {
         let row = operator_rows.get(oid).ok_or_else(|| {
             Failure::Uncertified(format!("the operator with OID {oid} is not in the catalog"))
         })?;
-        let Some((why, detail)) = unproven(row.code) else {
-            continue;
-        };
         let runs = function(row.code)?;
         for used_by in uses {
-            out.push(RoutineReason {
-                oid: row.code,
-                kind: RoutineKind::Operator,
-                identity: row.identity.clone(),
-                runs: Some(runs.identity.clone()),
-                owner: row.owner.clone(),
-                why,
-                used_by: used_by.clone(),
-                detail: detail.clone(),
-            });
+            sort(
+                row.code,
+                RoutineReason {
+                    oid: row.code,
+                    kind: RoutineKind::Operator,
+                    identity: row.identity.clone(),
+                    runs: Some(runs.identity.clone()),
+                    owner: row.owner.clone(),
+                    why: Why::NoSearchPath,
+                    used_by: used_by.clone(),
+                    detail: proven.refusal(row.code).map(str::to_owned),
+                },
+            )?;
         }
     }
     // A row comparison runs its operator family's btree comparison function for
@@ -1924,24 +2117,24 @@ async fn unadmitted_routines(
                 row.identity
             ))
         })?;
-        let Some((why, detail)) = unproven(*support) else {
-            continue;
-        };
         let runs = function(*support)?;
         for used_by in uses {
-            out.push(RoutineReason {
-                oid: *support,
-                kind: RoutineKind::Operator,
-                identity: row.identity.clone(),
-                runs: Some(runs.identity.clone()),
-                owner: row.owner.clone(),
-                why,
-                used_by: used_by.clone(),
-                detail: detail.clone(),
-            });
+            sort(
+                *support,
+                RoutineReason {
+                    oid: *support,
+                    kind: RoutineKind::Operator,
+                    identity: row.identity.clone(),
+                    runs: Some(runs.identity.clone()),
+                    owner: row.owner.clone(),
+                    why: Why::NoSearchPath,
+                    used_by: used_by.clone(),
+                    detail: proven.refusal(*support).map(str::to_owned),
+                },
+            )?;
         }
     }
-    Ok((out, non_immutable, owners))
+    Ok(found)
 }
 
 /// The btree comparison function (support function 1) of the operator family
@@ -2034,9 +2227,14 @@ async fn function_rows(
                     i.identity AS identity,
                     p.provolatile::pg_catalog.text AS volatility,
                     ow.rolname::pg_catalog.text AS owner,
-                    ow.oid::pg_catalog.int8 AS owner_oid
+                    ow.oid::pg_catalog.int8 AS owner_oid,
+                    l.lanname::pg_catalog.text AS language,
+                    p.prosecdef AS secdef,
+                    EXISTS (SELECT FROM pg_catalog.unnest(p.proconfig) AS c(setting)
+                             WHERE pg_catalog.starts_with(c.setting, 'search_path=')) AS fixed_search_path
                FROM pg_catalog.pg_proc p
                JOIN pg_catalog.pg_roles ow ON ow.oid = p.proowner
+               JOIN pg_catalog.pg_language l ON l.oid = p.prolang
               CROSS JOIN LATERAL pg_catalog.pg_identify_object(
                         'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, 0) i
               WHERE p.oid = ANY({})",
@@ -2052,6 +2250,9 @@ async fn function_rows(
                     owner: need::<&str>(row, "owner")?.into(),
                     owner_oid: need(row, "owner_oid")?,
                     volatility: need::<&str>(row, "volatility")?.to_owned(),
+                    language: need::<&str>(row, "language")?.to_owned(),
+                    secdef: need(row, "secdef")?,
+                    fixed_search_path: need(row, "fixed_search_path")?,
                 },
             ))
         })
@@ -2065,7 +2266,7 @@ async fn function_rows(
 /// the owner by membership with `SET`, `INHERIT` or `ADMIN`. It is the walk of
 /// DEC-1663.1 ([`untrusted_role_walk`]) with `trusted` as the roles a human
 /// declared trusted.
-async fn untrusted_actors(
+pub(crate) async fn untrusted_actors(
     conn: &mut Conn,
     trusted: &[pbps_model::RoleName],
     owners: &BTreeSet<Oid>,
@@ -2107,6 +2308,7 @@ async fn untrusted_actors(
 /// temporary binding even when decoding or vetting refuses the expression.
 pub(crate) async fn vet_copy_conversion(
     conn: &mut Conn,
+    admission: &Admission,
     column: &pbps_model::ColumnName,
     from: &pbps_model::ColumnType,
     using: &str,
@@ -2121,6 +2323,7 @@ pub(crate) async fn vet_copy_conversion(
     let ty = crate::types::normalize(from).map_err(|e| e.to_string())?;
     vet_in_transaction(
         conn,
+        admission,
         &name,
         &ty.raw().to_string(),
         using.into(),
@@ -2137,6 +2340,8 @@ pub(crate) async fn vet_copy_conversion(
 
 #[cfg(test)]
 mod tests {
+    use crate::admission::Admission;
+
     #[tokio::test]
     #[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
     async fn conversion_vetters_refuse_unbalanced_using_before_binding_on_both_majors() {
@@ -2148,9 +2353,10 @@ mod tests {
             let column = pbps_model::TableName::new("app", "t").column("amount");
             let from = "text".parse().unwrap();
             for using in ["amount) IS NULL OR (amount", "(amount"] {
-                let why = super::vet_conversion(&mut conn, &column, &from, using)
-                    .await
-                    .unwrap_err();
+                let why =
+                    super::vet_conversion(&mut conn, &Admission::default(), &column, &from, using)
+                        .await
+                        .unwrap_err();
                 assert!(why.contains("has unbalanced parentheses"), "{key}: {why}");
                 assert!(why.contains("pbps convert app.t.amount --using -"), "{why}");
             }
@@ -2159,7 +2365,7 @@ mod tests {
                 "(nullif(\"amount\", '(' /* ) */))::integer",
             ];
             for using in controls {
-                super::vet_conversion(&mut conn, &column, &from, using)
+                super::vet_conversion(&mut conn, &Admission::default(), &column, &from, using)
                     .await
                     .unwrap();
             }
@@ -2167,16 +2373,28 @@ mod tests {
                 .await
                 .unwrap();
             for using in ["amount) IS NULL OR (amount", "(amount"] {
-                let why = super::vet_copy_conversion(&mut conn, &column.name, &from, using)
-                    .await
-                    .unwrap_err();
+                let why = super::vet_copy_conversion(
+                    &mut conn,
+                    &Admission::default(),
+                    &column.name,
+                    &from,
+                    using,
+                )
+                .await
+                .unwrap_err();
                 assert!(why.contains("has unbalanced parentheses"), "{key}: {why}");
                 assert!(why.contains("re-record"), "{why}");
             }
             for using in controls {
-                super::vet_copy_conversion(&mut conn, &column.name, &from, using)
-                    .await
-                    .unwrap();
+                super::vet_copy_conversion(
+                    &mut conn,
+                    &Admission::default(),
+                    &column.name,
+                    &from,
+                    using,
+                )
+                .await
+                .unwrap();
             }
             conn.execute("ROLLBACK").await.unwrap();
         }
@@ -2235,16 +2453,25 @@ mod tests {
             super::InputPath::Unreadable(super::Unreadable::TrustedRolesMissing(vec![name]));
         assert_eq!(
             missing
-                .refusal(&pbps_model::TypeRef::new("app", "t").unwrap())
+                .refusal(
+                    &pbps_model::TypeRef::new("app", "t").unwrap(),
+                    &Admission::default()
+                )
                 .unwrap(),
             format!(
                 "the type `app.t` cannot be checked: the role(s) `{shown}` declared trusted do not exist"
             )
         );
         assert!(
-            super::InputPath::Admitted(super::Admitted { runs_code: false })
-                .refusal(&pbps_model::TypeRef::new("app", "t").unwrap())
-                .is_none()
+            super::InputPath::Admitted(super::Admitted {
+                runs_code: false,
+                reviewed: BTreeSet::new()
+            })
+            .refusal(
+                &pbps_model::TypeRef::new("app", "t").unwrap(),
+                &Admission::default()
+            )
+            .is_none()
         );
     }
 
@@ -2259,16 +2486,25 @@ mod tests {
         }
     }
 
-    fn user_function() -> RoutineReason {
-        RoutineReason {
-            oid: 16384,
-            kind: RoutineKind::Function,
-            identity: "app.is_positive(integer)".to_owned(),
-            runs: None,
-            owner: "alice".to_owned().into(),
-            why: Why::NotBuiltin,
-            used_by: used("app.positive"),
-            detail: None,
+    fn user_function() -> UserRoutine {
+        UserRoutine {
+            reason: RoutineReason {
+                oid: 16384,
+                kind: RoutineKind::Function,
+                identity: "app.is_positive(integer)".to_owned(),
+                runs: None,
+                owner: "alice".to_owned().into(),
+                why: Why::NoSearchPath,
+                used_by: used("app.positive"),
+                detail: None,
+            },
+            function: "app.is_positive(integer)".to_owned(),
+            function_owner: "alice".to_owned().into(),
+            function_owner_oid: 7,
+            tier1: false,
+            secdef: false,
+            fixed_search_path: false,
+            language: "plpgsql".to_owned(),
         }
     }
 
@@ -2281,7 +2517,7 @@ mod tests {
         }
     }
 
-    fn no_actors() -> BTreeMap<Oid, Vec<pbps_model::RoleName>> {
+    fn no_actors() -> Actors {
         BTreeMap::new()
     }
 
@@ -2296,17 +2532,17 @@ mod tests {
     }
 
     #[test]
-    fn a_function_is_admitted_only_when_built_in_and_not_on_the_runs_sql_list() {
+    fn a_function_is_built_in_runs_sql_or_a_roles_by_oid_and_the_list() {
         let denied = BTreeSet::from([2924, 6210]);
-        assert_eq!(why_not_admitted(1317, &denied), None);
-        assert_eq!(why_not_admitted(16383, &denied), None);
-        assert_eq!(why_not_admitted(16384, &denied), Some(Why::NotBuiltin));
-        assert_eq!(why_not_admitted(1_213_810, &denied), Some(Why::NotBuiltin));
+        assert_eq!(classify(1317, &denied), Class::Builtin);
+        assert_eq!(classify(16383, &denied), Class::Builtin);
+        assert_eq!(classify(16384, &denied), Class::User);
+        assert_eq!(classify(1_213_810, &denied), Class::User);
         // Built in and still refused: the list is the second condition.
-        assert_eq!(why_not_admitted(2924, &denied), Some(Why::RunsSql));
-        assert_eq!(why_not_admitted(6210, &denied), Some(Why::RunsSql));
+        assert_eq!(classify(2924, &denied), Class::RunsSql);
+        assert_eq!(classify(6210, &denied), Class::RunsSql);
         // Negative: a function not on the list is not refused for being near it.
-        assert_eq!(why_not_admitted(2925, &denied), None);
+        assert_eq!(classify(2925, &denied), Class::Builtin);
     }
 
     #[test]
@@ -2362,16 +2598,20 @@ mod tests {
             non_immutable: false,
             routines: Vec::new(),
             routine_owners: Vec::new(),
+            user: Vec::new(),
             types: vec![owned(40001, "app.mood", "mallory")],
         };
         let actors = BTreeMap::from([(40001, vec!["mallory".into()])]);
-        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors) else {
+        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors, false) else {
             panic!("a code-free path still requires trusted owners");
         };
         assert_eq!(reasons.len(), 1);
         assert_eq!(
-            verdict(facts, &no_actors()),
-            InputPath::Admitted(Admitted { runs_code: false })
+            verdict(facts, &no_actors(), false),
+            InputPath::Admitted(Admitted {
+                runs_code: false,
+                reviewed: BTreeSet::new()
+            })
         );
     }
 
@@ -2381,10 +2621,11 @@ mod tests {
             runs_code: true,
             non_immutable: false,
             routine_owners: Vec::new(),
+            user: Vec::new(),
             routines: Vec::new(),
             types: vec![owned(40002, "app.positive", "deployer")],
         };
-        let InputPath::Admitted(admitted) = verdict(facts, &no_actors()) else {
+        let InputPath::Admitted(admitted) = verdict(facts, &no_actors(), false) else {
             panic!("built-in code on a trusted type must be admitted");
         };
         assert!(admitted.runs_code());
@@ -2396,37 +2637,117 @@ mod tests {
             runs_code: false,
             non_immutable: false,
             routine_owners: Vec::new(),
+            user: Vec::new(),
             routines: Vec::new(),
             types: vec![owned(40002, "app.checked", "owner_role")],
         };
         let actors = BTreeMap::from([(40002, vec!["member".into()])]);
-        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors) else {
+        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors, false) else {
             panic!("an empty array still requires a trusted target owner");
         };
         assert!(reasons[0].to_string().contains("member"));
         assert_eq!(
-            verdict(facts, &no_actors()),
-            InputPath::Admitted(Admitted { runs_code: false })
+            verdict(facts, &no_actors(), false),
+            InputPath::Admitted(Admitted {
+                runs_code: false,
+                reviewed: BTreeSet::new()
+            })
         );
     }
 
-    #[test]
-    fn a_user_routine_refuses_a_path_that_runs_code_and_is_named() {
-        let facts = Facts {
+    fn facts_with(user: Vec<UserRoutine>) -> Facts {
+        Facts {
             runs_code: true,
             non_immutable: false,
             routine_owners: Vec::new(),
-            routines: vec![user_function()],
+            user,
+            routines: Vec::new(),
             types: vec![owned(40002, "app.positive", "deployer")],
+        }
+    }
+
+    fn fixed(mut routine: UserRoutine) -> UserRoutine {
+        routine.fixed_search_path = true;
+        routine
+    }
+
+    #[test]
+    fn a_user_routine_without_a_search_path_is_refused_with_the_exact_fix() {
+        let InputPath::Refused(reasons) =
+            verdict(facts_with(vec![user_function()]), &no_actors(), false)
+        else {
+            panic!("a function that resolves names at run time needs a fixed search_path");
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
-            panic!("a user function must refuse");
-        };
-        assert_eq!(reasons, vec![Reason::Routine(user_function())]);
         let message = reasons[0].to_string();
         assert!(message.contains("app.is_positive(integer)"), "{message}");
         assert!(message.contains("alice"), "{message}");
         assert!(message.contains("app.positive_check"), "{message}");
+        assert!(
+            message.contains(
+                "ALTER FUNCTION app.is_positive(integer) SET search_path = pg_catalog, pg_temp"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_trusted_owner_with_a_fixed_search_path_is_admitted_without_a_review() {
+        for pin in [false, true] {
+            assert_eq!(
+                verdict(facts_with(vec![fixed(user_function())]), &no_actors(), pin),
+                InputPath::Admitted(Admitted {
+                    runs_code: true,
+                    reviewed: BTreeSet::new()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_untrusted_owner_is_refused_by_name_unless_the_review_is_on() {
+        let actors = BTreeMap::from([(7, vec!["mallory".into()])]);
+        let facts = || facts_with(vec![fixed(user_function())]);
+        let InputPath::Refused(reasons) = verdict(facts(), &actors, false) else {
+            panic!("an untrusted owner needs the review");
+        };
+        let text = reasons[0].to_string();
+        assert!(
+            text.contains("`alice`") && text.contains("`mallory`"),
+            "{text}"
+        );
+        assert!(!text.contains("pinning does not replace"), "{text}");
+        assert_eq!(
+            verdict(facts(), &actors, true),
+            InputPath::Admitted(Admitted {
+                runs_code: true,
+                reviewed: BTreeSet::from([16384])
+            })
+        );
+        // Reviewed code still has to set its search_path.
+        let InputPath::Refused(reasons) = verdict(facts_with(vec![user_function()]), &actors, true)
+        else {
+            panic!("a reviewed routine still needs a fixed search_path");
+        };
+        assert!(matches!(&reasons[..], [Reason::Routine(r)] if r.why == Why::NoSearchPath));
+    }
+
+    #[test]
+    fn a_security_definer_of_an_untrusted_owner_is_never_admitted() {
+        let actors = BTreeMap::from([(7, vec!["mallory".into()])]);
+        let mut definer = fixed(user_function());
+        definer.secdef = true;
+        let InputPath::Refused(reasons) = verdict(facts_with(vec![definer.clone()]), &actors, true)
+        else {
+            panic!("the review does not admit a definer of an untrusted owner");
+        };
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, Reason::Routine(r) if r.why == Why::SecurityDefiner))
+        );
+        assert!(reasons.iter().any(|r| matches!(r, Reason::RoutineOwner(_))));
+        // Negative: the same definer of a trusted owner runs as a trusted role.
+        assert!(verdict(facts_with(vec![definer]), &no_actors(), false).is_admitted());
     }
 
     #[test]
@@ -2435,6 +2756,7 @@ mod tests {
             runs_code: true,
             non_immutable: false,
             routine_owners: Vec::new(),
+            user: Vec::new(),
             routines: Vec::new(),
             types: vec![
                 owned(40002, "app.positive", "owner_role"),
@@ -2442,7 +2764,7 @@ mod tests {
             ],
         };
         let actors = BTreeMap::from([(40002, vec!["member_a".into(), "owner_role".into()])]);
-        let InputPath::Refused(reasons) = verdict(facts, &actors) else {
+        let InputPath::Refused(reasons) = verdict(facts, &actors, false) else {
             panic!("an untrusted actor must refuse");
         };
         assert_eq!(reasons.len(), 2, "{reasons:?}");
@@ -2467,10 +2789,11 @@ mod tests {
             runs_code: true,
             non_immutable: false,
             routine_owners: Vec::new(),
-            routines: vec![user_function(), user_function()],
+            user: vec![user_function(), user_function()],
+            routines: Vec::new(),
             types: Vec::new(),
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
+        let InputPath::Refused(reasons) = verdict(facts, &no_actors(), false) else {
             panic!("refused");
         };
         assert_eq!(reasons.len(), 1);
@@ -2478,8 +2801,13 @@ mod tests {
 
     #[test]
     fn two_passes_that_differ_are_a_failed_read_and_two_that_agree_are_the_read() {
-        let admitted = || InputPath::Admitted(Admitted { runs_code: true });
-        let refused = || InputPath::Refused(vec![Reason::Routine(user_function())]);
+        let admitted = || {
+            InputPath::Admitted(Admitted {
+                runs_code: true,
+                reviewed: BTreeSet::new(),
+            })
+        };
+        let refused = || InputPath::Refused(vec![Reason::Routine(user_function().reason)]);
         assert_eq!(settled(admitted(), admitted()), admitted());
         assert_eq!(settled(refused(), refused()), refused());
         let InputPath::Unreadable(Unreadable::Failed(why)) = settled(admitted(), refused()) else {
@@ -2491,34 +2819,40 @@ mod tests {
     #[test]
     fn only_an_admitted_answer_is_admitted() {
         let reference = TypeRef::new("app", "positive").unwrap();
-        let admitted = InputPath::Admitted(Admitted { runs_code: true });
+        let admitted = InputPath::Admitted(Admitted {
+            runs_code: true,
+            reviewed: BTreeSet::new(),
+        });
         assert!(admitted.is_admitted());
-        assert_eq!(admitted.refusal(&reference), None);
+        assert_eq!(admitted.refusal(&reference, &Admission::default()), None);
         for not in [
-            InputPath::Refused(vec![Reason::Routine(user_function())]),
+            InputPath::Refused(vec![Reason::Routine(user_function().reason)]),
             InputPath::Unreadable(Unreadable::Failed("boom".to_owned())),
             InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![
                 "ghost".to_owned().into(),
             ])),
         ] {
             assert!(!not.is_admitted(), "{not:?}");
-            assert!(not.refusal(&reference).is_some(), "{not:?}");
+            assert!(
+                not.refusal(&reference, &Admission::default()).is_some(),
+                "{not:?}"
+            );
         }
     }
 
     #[test]
     fn each_outcome_has_its_own_message() {
         let reference = TypeRef::new("app", "positive").unwrap();
-        let refused = InputPath::Refused(vec![Reason::Routine(user_function())])
-            .refusal(&reference)
+        let refused = InputPath::Refused(vec![Reason::Routine(user_function().reason)])
+            .refusal(&reference, &Admission::default())
             .unwrap();
         let missing = InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![
             "ghost".to_owned().into(),
         ]))
-        .refusal(&reference)
+        .refusal(&reference, &Admission::default())
         .unwrap();
         let failed = InputPath::Unreadable(Unreadable::Failed("boom".to_owned()))
-            .refusal(&reference)
+            .refusal(&reference, &Admission::default())
             .unwrap();
         assert!(refused.contains("app.is_positive(integer)"), "{refused}");
         assert!(
@@ -2546,7 +2880,9 @@ mod tests {
                 })
             })
             .collect();
-        let message = InputPath::Refused(reasons).refusal(&reference).unwrap();
+        let message = InputPath::Refused(reasons)
+            .refusal(&reference, &Admission::default())
+            .unwrap();
         assert!(message.contains("member_00"), "{message}");
         assert!(
             !message.contains(&format!("member_{:02}", SHOWN + 4)),

@@ -8396,6 +8396,10 @@ async fn plan_db_async(
             )?;
         }
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        // The one admission rule of every site that runs code the plan holds
+        // (DEC-2563.2). Review admits routines into it as the sites vet; the plan
+        // shows and pins them when it seals.
+        let site_admission = crate::pins::admission(project);
         conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
             .await?;
         let checks = async {
@@ -8503,7 +8507,7 @@ async fn plan_db_async(
             };
             let mut rebuild_verification = None;
             let (mut cs, dependents) = if cs.changes.iter().any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))) {
-                let (changes, check, verification) = crate::engine::expand_table_rebuild(&mut conn, cs,
+                let (changes, check, verification) = crate::engine::expand_table_rebuild(&mut conn, &site_admission, cs,
                     pbps_diff::Side { schema: &base, ids: &recorded_ids },
                     pbps_diff::Side { schema: &declared, ids: &resolved.ids },
                     &hints, dialect.as_ref()).await?;
@@ -8618,8 +8622,14 @@ async fn plan_db_async(
             .await?;
             let slots = crate::engine::logical_slots(&mut conn, &cs).await?;
             let fills = crate::engine::numbered_column_fills(&mut conn, &cs, &resolved.ids).await?;
-            crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
-                .await?;
+            crate::engine::prepare_data_writes(
+                &mut conn,
+                &site_admission,
+                &cs,
+                &entry.snapshot,
+                &resolved.ids,
+            )
+            .await?;
             Ok::<_, anyhow::Error>((
                 cs,
                 rename_evidence,
@@ -8638,7 +8648,14 @@ async fn plan_db_async(
             checks?;
         rollback?;
         let requirement_names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
-        crate::engine::vet_drop_requirements(&mut conn, &requirement_names).await?;
+        crate::engine::vet_drop_requirements(&mut conn, &site_admission, &requirement_names)
+            .await?;
+        // A conversion is judged at apply, before its first evaluation
+        // (DEC-2331.1). Here it only tells which routines the review admits, so
+        // the plan can show and pin them; a refusal waits for apply, which
+        // judges it again, and a routine missed here fails closed there.
+        let _ = crate::engine::vet_conversions(&mut conn, &site_admission, requirement_names.changes())
+            .await;
         // Rows that hold a label an enum rebuild removes, or that a domain's
         // narrower base cannot hold, are counted now, by the same probes the
         // apply runs, so the plan is refused by name and with a count before
@@ -8657,6 +8674,7 @@ async fn plan_db_async(
             let observation = services::Progress::default();
             let result = run_probes_observed(
                 &mut conn,
+                &site_admission,
                 dialect.as_ref(),
                 &names,
                 &probe_partitions(&recorded_snapshot.schema, &names),
@@ -8877,7 +8895,9 @@ async fn plan_db_async(
             project.config.pin_type_routines,
         )
         .await?;
-        let reviewed = crate::pins::seal_selected(&mut conn, project, target, &type_pins).await?;
+        let reviewed =
+            crate::pins::seal_selected(&mut conn, project, target, &type_pins, &site_admission)
+                .await?;
         // Last, so that the routines are sealed as close to the gate as the
         // plan can get them. The managed set is the one `apply` rebuilds from
         // the ledger and the plan: what was recorded, and what is declared.
@@ -9728,8 +9748,10 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
+        let admission = approved.admission();
         crate::engine::rebuild_window(
             conn,
+            &admission,
             pbps_diff::Side {
                 schema: &entry.snapshot.schema,
                 ids: &recorded_ids,
@@ -9737,6 +9759,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.changes,
         )
         .await?;
+        approved.require_reviewed(&admission)?;
         let retained = crate::engine::hold_retained(
             conn,
             &plan.changes,
@@ -9764,9 +9787,14 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &recorded_ids,
         )
         .await?;
-        let data_guard =
-            crate::engine::prepare_data_writes(conn, &plan.changes, &entry.snapshot, &plan.ids)
-                .await?;
+        let data_guard = crate::engine::prepare_data_writes(
+            conn,
+            &approved.admission(),
+            &plan.changes,
+            &entry.snapshot,
+            &plan.ids,
+        )
+        .await?;
         // Again, because the probes ran in transactions of their own and a
         // routine could be replaced after them.
         crate::pins::check(
@@ -10493,6 +10521,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             let result = async {
                 let guard = crate::engine::prepare_data_writes(
                     conn,
+                    &pbps_pg::admission::Admission::without_review(
+                        project.config.trusted_roles.iter().cloned(),
+                    ),
                     &plan.changes,
                     &entry.snapshot,
                     &plan.ids,
@@ -11419,8 +11450,10 @@ async fn preflight<D: crate::emission::Engine>(
     // its new name, so the stored relation is brought under those names
     // (#1751 review).
     let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
+    let admission = approved.admission();
     run_probes_observed(
         conn,
+        &admission,
         dialect,
         &names,
         &probe_partitions(stored, &names),
@@ -11431,7 +11464,8 @@ async fn preflight<D: crate::emission::Engine>(
         Some(approved),
         progress,
     )
-    .await
+    .await?;
+    approved.require_reviewed(&admission)
 }
 
 /// The partitions the probes read the plan against: the relation as the
@@ -11503,11 +11537,23 @@ async fn run_probes(
     sources: Option<pbps_model::operation::Snapshot<'_>>,
     approved: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
-    run_probes_observed(conn, dialect, names, partitions, sources, approved, None).await
+    run_probes_observed(
+        conn,
+        &pbps_pg::admission::Admission::default(),
+        dialect,
+        names,
+        partitions,
+        sources,
+        approved,
+        None,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_probes_observed(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     dialect: &dyn pbps_dialect::Dialect,
     names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
@@ -11518,8 +11564,8 @@ async fn run_probes_observed(
     pin_session(conn, dialect).await?;
     // A recorded conversion's expression is judged before any probe evaluates
     // it: the probe would run non-built-in code as the deployer, unvetted.
-    let immutable = crate::engine::vet_conversions(conn, names.changes()).await?;
-    crate::engine::vet_drop_requirements(conn, names).await?;
+    let immutable = crate::engine::vet_conversions(conn, admission, names.changes()).await?;
+    crate::engine::vet_drop_requirements(conn, admission, names).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
@@ -11797,7 +11843,14 @@ async fn execute_statement(
             .context("Nothing has been applied — the transaction was rolled back.")?;
     }
     crate::engine::check_data_write(conn, stmt, data_guard).await?;
-    crate::engine::check_drop_requirement(conn, stmt).await?;
+    let admission = reviewed.map_or_else(
+        || pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
+        crate::pins::Approved::admission,
+    );
+    crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
+    if let Some(approved) = reviewed {
+        approved.require_reviewed(&admission)?;
+    }
     // A drop is vetted before it runs: what it would delete is judged while
     // it can still be refused, not after (DEC-2447.8).
     if let Some(dropped) = stmt.extension.as_ref().filter(|e| e.drops) {

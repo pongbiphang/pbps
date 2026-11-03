@@ -809,7 +809,7 @@ fn pull_preserves_trigger_definitions_with_yaml_controls() {
     on_server(
         connection,
         "CREATE SCHEMA app;
-         CREATE FUNCTION app.skip() RETURNS trigger LANGUAGE plpgsql AS
+         CREATE FUNCTION app.skip() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS
              $$ BEGIN RETURN NULL; END $$;",
     );
     for (i, name) in ["ordinary", "multi\nline", "guard\n\x1b[31m"]
@@ -14454,7 +14454,7 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     // is the partition's own once attached, and not counted.
     on_server(
         &connection,
-        "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+        "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS 'BEGIN RETURN NEW; END';
          CREATE TRIGGER noop BEFORE INSERT ON app.ev FOR EACH ROW EXECUTE FUNCTION app.noop();
          CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
          CREATE TRIGGER other BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
@@ -16110,7 +16110,7 @@ fn a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger(
         format!(
             "CREATE TABLE app.{name} (id integer PRIMARY KEY, a integer NOT NULL, b integer, \
                                      g integer GENERATED ALWAYS AS (a * 2) STORED); \
-             CREATE FUNCTION app.fill_{name}() RETURNS trigger LANGUAGE plpgsql AS \
+             CREATE FUNCTION app.fill_{name}() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
                $$ BEGIN NEW.a := 0; RETURN NEW; END $$; \
              CREATE TRIGGER fill BEFORE INSERT ON app.{name} \
                FOR EACH ROW EXECUTE FUNCTION app.fill_{name}();"
@@ -18308,7 +18308,7 @@ fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
         connection,
         "CREATE SCHEMA app; \
          CREATE TABLE app.t (id integer PRIMARY KEY); \
-         CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; \
+         CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$; \
          CREATE CONSTRAINT TRIGGER n_pkey AFTER INSERT ON app.t \
              FOR EACH ROW EXECUTE FUNCTION app.f()",
     );
@@ -18383,7 +18383,7 @@ fn constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach() {
             "CREATE SCHEMA app; CREATE SCHEMA parts;
              CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
              CREATE TABLE parts.n(id integer NOT NULL, label text);
-             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$;
              CREATE CONSTRAINT TRIGGER n_pkey AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f();
              {}",
             if attach { "CREATE TABLE parts.p1(id integer)" }
@@ -18462,7 +18462,7 @@ fn unmanaged_constraint_trigger_clones_predict_the_later_key_name_on_both_server
                     "CREATE SCHEMA app; CREATE SCHEMA parts;
                      CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
                      CREATE TABLE parts.n(id integer NOT NULL, label text);
-                     CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+                     CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$;
                      {}",
                     if attach { "CREATE TABLE parts.p1(id integer)" } else { "" }
                 ));
@@ -18573,7 +18573,7 @@ fn an_attach_refuses_unmanaged_names_of_planned_parent_row_triggers() {
             on_server(connection,
                 "CREATE SCHEMA app; CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
                  CREATE TABLE app.p1(id integer);
-                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;");
+                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$;");
             if rebuilt {
                 on_server(
                     connection,
@@ -18668,7 +18668,7 @@ fn a_routine_rebuild_refuses_its_constraint_triggers_own_comment() {
         let connection = own.connection();
         on_server(connection, &format!(
             "CREATE SCHEMA app; CREATE TABLE app.t(id integer){};
-             {}CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+             {}CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$;
              CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();
              COMMENT ON CONSTRAINT audit ON app.t IS 'keep the audit constraint comment';",
             if partitioned { " PARTITION BY RANGE(id)" } else { "" },
@@ -18741,7 +18741,7 @@ fn a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key() {
             };
             on_server(connection, &format!(
                 "CREATE SCHEMA app;
-                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
                  CREATE TABLE app.r (id integer PRIMARY KEY); INSERT INTO app.r VALUES (1);
                  {create}
                  CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();
@@ -18831,7 +18831,7 @@ fn a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it()
             CREATE TABLE app.t (id integer NOT NULL);
             CREATE TABLE app.c (id integer);
             CREATE TABLE app.r (id integer PRIMARY KEY);
-            CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+            CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
             CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();");
         let d = Demo::new(&slug);
         succeeds(d.run(&["pull", "--db", connection]));
@@ -18897,7 +18897,7 @@ fn a_partition_takes_a_released_constraint_trigger_name(attach: bool) {
         on_server(connection, &format!(
             "CREATE SCHEMA app;
              CREATE TABLE app.t (id integer) PARTITION BY RANGE (id);
-             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
              CREATE {}TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();{}",
             if was_constraint { "CONSTRAINT " } else { "" },
             if attach {
@@ -20338,7 +20338,7 @@ fn a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_o
         connection,
         "CREATE TABLE public.secret(value text); \
          INSERT INTO public.secret VALUES ('super-secret-value-167'); \
-         CREATE FUNCTION app.reject() RETURNS trigger LANGUAGE plpgsql AS \
+         CREATE FUNCTION app.reject() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
          $$DECLARE v text; BEGIN SELECT value INTO v FROM public.secret; \
            RAISE EXCEPTION 'rejected: %', v; END$$; \
          CREATE TRIGGER reject BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.reject()",
@@ -20447,7 +20447,7 @@ fn an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger() {
     let plan = connected_artifact(&d, connection, false);
     on_server(
         connection,
-        "CREATE FUNCTION app.audit() RETURNS trigger LANGUAGE plpgsql AS \
+        "CREATE FUNCTION app.audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
          $$BEGIN RETURN NEW; END$$; \
          CREATE TRIGGER audit BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.audit()",
     );
@@ -20629,7 +20629,7 @@ fn constraint_triggers_pull_bootstrap_and_plan_without_duplicate_constraints() {
         CREATE TABLE app.t (id integer PRIMARY KEY);
         CREATE TABLE app.child (id integer REFERENCES app.t(id));
         CREATE TABLE app.calls (id integer);
-        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS
+        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS
             $$BEGIN INSERT INTO app.calls VALUES (NEW.id); RETURN NEW; END$$;
         CREATE CONSTRAINT TRIGGER \"constraint name\" AFTER INSERT ON app.t
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
@@ -20763,7 +20763,7 @@ fn adopted_constraint_trigger(connection: &str, slug: &str, function_body: &str)
     on_server(
         connection,
         &format!(
-            "CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql AS $$ {function_body} $$;
+            "CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ {function_body} $$;
         CREATE CONSTRAINT TRIGGER late AFTER INSERT ON app.t
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.late()"
         ),
@@ -20880,10 +20880,10 @@ fn indirect_constraint_trigger_effects_are_settled_before_recording() {
     on_server(
         connection,
         "CREATE TABLE app.side (code varchar(20));
-        CREATE FUNCTION app.forward() RETURNS trigger LANGUAGE plpgsql AS
+        CREATE FUNCTION app.forward() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS
             $$BEGIN INSERT INTO app.side VALUES (NEW.code); RETURN NEW; END$$;
         CREATE TRIGGER forward AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.forward();
-        CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql AS
+        CREATE FUNCTION app.late() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS
             $$BEGIN UPDATE app.t SET label='rewritten' WHERE code=NEW.code; RETURN NEW; END$$;
         CREATE CONSTRAINT TRIGGER late AFTER INSERT ON app.side
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.late()",
@@ -20932,7 +20932,7 @@ fn nonordinary_trigger_modes_are_reported_instead_of_recorded() {
     );
     on_server(
         connection,
-        "CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+        "CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$;
         CREATE TRIGGER ordinary BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.fire();
         CREATE CONSTRAINT TRIGGER deferred AFTER INSERT ON app.t
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
@@ -21045,7 +21045,7 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
     on_server(
         connection,
         "CREATE SCHEMA app; CREATE TABLE app.t (id integer);
-        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+        CREATE FUNCTION app.fire() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$;
         CREATE CONSTRAINT TRIGGER guarded AFTER INSERT ON app.t
             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.fire()",
     );
@@ -21071,6 +21071,7 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                 .unwrap();
             let guard = pbps_pg::data_triggers::prepare(
                 &mut conn,
+                &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&write),
                 &baseline,
                 &Default::default(),
@@ -21102,6 +21103,7 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
                 assert!(
                     pbps_pg::data_triggers::prepare(
                         &mut conn,
+                        &pbps_pg::admission::Admission::default(),
                         std::slice::from_ref(&write),
                         &record,
                         &Default::default()
@@ -22692,7 +22694,7 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
             // guard's to refuse (DECISIONS 445), not the pins'.
             on_server(
                 &attack,
-                "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+                "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS \
                  $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
                  IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
             );
@@ -22716,7 +22718,7 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
                     let recorded = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
                     let dialect = pbps_pg::Postgres::new();
                     conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-                    let refused = pbps_pg::data_triggers::prepare(&mut conn, &[pbps_dialect::RowWrite {
+                    let refused = pbps_pg::data_triggers::prepare(&mut conn, &pbps_pg::admission::Admission::default(), &[pbps_dialect::RowWrite {
                         table: pbps_model::TableName::new("app", "t"), operation: pbps_dialect::RowOperation::Insert,
                     }], &recorded, &Default::default()).await;
                     assert!(refused.is_err(), "recording a lower-privileged owner's invoker trigger must not authorize it");
@@ -22796,7 +22798,7 @@ fn recorded_triggers_run_but_their_names_cannot_authorize_replacements() {
     on_server(
         connection,
         "CREATE TABLE app.calls (value integer); \
-        CREATE FUNCTION app.record_call() RETURNS trigger LANGUAGE plpgsql AS \
+        CREATE FUNCTION app.record_call() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
         $$BEGIN INSERT INTO app.calls VALUES (1); RETURN NEW; END$$; \
         CREATE TRIGGER record_call BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.record_call()",
     );
@@ -22821,7 +22823,7 @@ fn recorded_triggers_run_but_their_names_cannot_authorize_replacements() {
     let plan = connected_artifact(&d, connection, false);
     on_server(
         connection,
-        "CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        "CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; \
         CREATE OR REPLACE TRIGGER record_call BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.replacement()",
     );
     let refused = approved_apply(&d, connection, &plan, &[]);
@@ -22851,8 +22853,8 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
     on_server(
         connection,
         "CREATE SCHEMA app; CREATE TABLE app.t (id integer); \
-        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
-        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; \
         CREATE TRIGGER guarded BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.trusted()",
     );
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -22862,7 +22864,7 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
         let dialect = pbps_pg::Postgres::new();
         let mut write = RowWrite { table: pbps_model::TableName::new("app", "t"), operation: RowOperation::Insert };
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
+        let guard = pbps_pg::data_triggers::prepare(&mut writer, &pbps_pg::admission::Admission::default(), std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
         other.execute("SET lock_timeout = '100ms'").await.unwrap();
         let replace = "CREATE OR REPLACE TRIGGER guarded BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.replacement()";
         let blocked = other.execute(replace).await.unwrap_err();
@@ -22877,7 +22879,7 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
             other.execute(&replace.replace("ON app.t", "ON app.renamed")).await.unwrap();
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
+        let refused = pbps_pg::data_triggers::prepare(&mut writer, &pbps_pg::admission::Admission::default(), &[write], &baseline, &Default::default()).await;
         assert!(refused.is_err());
         writer.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
@@ -22891,7 +22893,7 @@ fn bootstrap_checks_triggers_that_arrive_with_a_created_table() {
     on_server(
         connection,
         "CREATE SCHEMA app; CREATE TABLE public.marker (value integer); \
-        CREATE FUNCTION public.row_hook() RETURNS trigger LANGUAGE plpgsql AS \
+        CREATE FUNCTION public.row_hook() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
         $$BEGIN INSERT INTO public.marker VALUES (1); RETURN NEW; END$$; \
         CREATE FUNCTION public.attach_hook() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
         BEGIN \
@@ -22956,7 +22958,7 @@ fn update_of_triggers_only_guard_columns_the_statement_can_fire() {
                 connection,
                 &format!(
                     "CREATE TABLE public.fired (value integer); \
-                 CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS \
+                 CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
                  $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NEW; END$$; \
                  CREATE TRIGGER untouched BEFORE UPDATE OF audit ON app.t FOR EACH {level} EXECUTE FUNCTION public.mark(); \
                  BEGIN; UPDATE app.t SET label = 'Measured'; SELECT 1; COMMIT;"
@@ -23019,7 +23021,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
         connection,
         "CREATE SCHEMA app; CREATE TABLE app.t (label text, audit text, size integer GENERATED ALWAYS AS (length(label)) STORED); \
          INSERT INTO app.t (label) VALUES ('Old'); CREATE TABLE public.fired (value integer); \
-         CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NEW; END$$; \
+         CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NEW; END$$; \
          CREATE TRIGGER derived AFTER UPDATE OF size ON app.t FOR EACH ROW EXECUTE FUNCTION public.mark(); \
          UPDATE app.t SET audit = 'untouched'",
     );
@@ -23044,7 +23046,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             };
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 &[write],
                 &Default::default(),
                 &Default::default(),
@@ -23058,7 +23060,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             );
             conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         }
-        conn.execute("CREATE FUNCTION public.noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; CREATE TRIGGER before_update BEFORE UPDATE ON app.t FOR EACH ROW EXECUTE FUNCTION public.noop(); ALTER TABLE app.t DISABLE TRIGGER before_update; TRUNCATE public.fired; UPDATE app.t SET audit = 'again'").await.unwrap();
+        conn.execute("CREATE FUNCTION public.noop() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; CREATE TRIGGER before_update BEFORE UPDATE ON app.t FOR EACH ROW EXECUTE FUNCTION public.noop(); ALTER TABLE app.t DISABLE TRIGGER before_update; TRUNCATE public.fired; UPDATE app.t SET audit = 'again'").await.unwrap();
         let rows = conn.query("SELECT count(*)::int8 AS n FROM public.fired").await.unwrap();
         assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
         let write = RowWrite {
@@ -23066,7 +23068,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             operation: RowOperation::Update { columns: ["audit".into()].into() },
         };
         conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
+        let checked = pbps_pg::data_triggers::prepare(&mut conn, &pbps_pg::admission::Admission::default(), &[write], &Default::default(), &Default::default()).await;
         assert!(checked.is_err(), "a disabled BEFORE ROW trigger still widens generated-column updates");
         conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // Unless the plan drops it first: `DropModule` is `order_key` 0, so by
@@ -23084,7 +23086,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             ..Default::default()
         };
         conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &removed).await;
+        let checked = pbps_pg::data_triggers::prepare(&mut conn, &pbps_pg::admission::Admission::default(), &[write], &Default::default(), &removed).await;
         assert!(checked.is_ok(), "a widener the plan drops widens nothing: {:?}", checked.err().map(|e| e.to_string()));
         conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
@@ -23255,7 +23257,7 @@ fn inherited_owner_topology(admin: &str, slug: &str) -> Topology {
              GRANT USAGE ON SCHEMA hook TO {deployer}; GRANT CREATE ON SCHEMA public TO {deployer}; \
              CREATE TABLE hook.calls (value integer); ALTER TABLE hook.calls OWNER TO {owner}; \
              GRANT INSERT, SELECT ON hook.calls TO {deployer}; \
-             CREATE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+             CREATE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO hook.calls VALUES (1); \
              IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
              ALTER FUNCTION hook.audit() OWNER TO {owner}"
@@ -23409,6 +23411,7 @@ fn effective_ownership_decides_trust(admin: &str, slug: &str) {
                     .unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
                     &mut conn,
+                    &pbps_pg::admission::Admission::default(),
                     &[pbps_dialect::RowWrite {
                         table: pbps_model::TableName::new("app", "t"),
                         operation: pbps_dialect::RowOperation::Insert,
@@ -23485,6 +23488,7 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
                 .unwrap();
             let guard = pbps_pg::data_triggers::prepare(
                 &mut writer,
+                &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&write),
                 &recorded,
                 &Default::default(),
@@ -23634,7 +23638,7 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
         );
         on_server(
             &attack,
-            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO leak.copied SELECT value FROM secrets.vault; \
              IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
         );
@@ -23692,7 +23696,7 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
         on_server(&connection, &format!("REVOKE {owner} FROM {inheritor}"));
         on_server(
             &connection,
-            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO hook.calls VALUES (1); \
              IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
         );
@@ -23841,7 +23845,7 @@ fn referential_actions_cannot_reach_an_unapproved_trigger() {
             &deployment,
             &format!(
                 "CREATE TABLE public.fired(value integer); \
-             CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql AS \
+             CREATE FUNCTION public.mark() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO public.fired VALUES (1); RETURN NULL; END$$; \
              CREATE TRIGGER control AFTER {fires} ON {reached} FOR EACH {level} EXECUTE FUNCTION public.mark(); \
              INSERT INTO app.t VALUES ('control', 'c1', 'Control'); \
@@ -23879,7 +23883,7 @@ fn referential_actions_cannot_reach_an_unapproved_trigger() {
         // (DEC-319.1); only the trigger that calls it arrives afterwards.
         on_server(
             &attack,
-            "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+            "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
              IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
         );
@@ -23998,7 +24002,7 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
     let connection = own.connection();
     on_server(
         connection,
-        "CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
+        "CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NULL; END$$",
     );
     let update = |columns: &[&str]| RowOperation::Update {
         columns: columns.iter().map(|c| (*c).into()).collect(),
@@ -24357,6 +24361,7 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
                 .unwrap();
             let checked = pbps_pg::data_triggers::prepare(
                 &mut conn,
+                &pbps_pg::admission::Admission::default(),
                 &[write],
                 &Default::default(),
                 &Default::default(),
@@ -24389,8 +24394,8 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         "CREATE SCHEMA app; \
         CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
         CREATE TABLE app.c(id integer PRIMARY KEY, ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE); \
-        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
-        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.trusted() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; \
+        CREATE FUNCTION app.replacement() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NEW; END$$; \
         CREATE TRIGGER guarded BEFORE UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION app.trusted(); \
         INSERT INTO app.p VALUES ('first', 'k1'); INSERT INTO app.c VALUES (1, 'k1')",
     );
@@ -24404,7 +24409,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
             operation: RowOperation::Update { columns: ["ukey".into()].into() },
         };
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
+        let guard = pbps_pg::data_triggers::prepare(&mut writer, &pbps_pg::admission::Admission::default(), std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
         other.execute("SET lock_timeout = '100ms'").await.unwrap();
         // The named table is not the one under contention here: `app.c` is
         // only ever written by the cascade the guard followed.
@@ -24419,7 +24424,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
         other.execute(replace).await.unwrap();
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
-        let refused = pbps_pg::data_triggers::prepare(&mut writer, &[write], &baseline, &Default::default()).await;
+        let refused = pbps_pg::data_triggers::prepare(&mut writer, &pbps_pg::admission::Admission::default(), &[write], &baseline, &Default::default()).await;
         assert!(refused.is_err(), "a replaced trigger on the cascade's table must refuse the next write");
         writer.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
     });
@@ -24443,7 +24448,7 @@ fn a_child_committed_while_a_guarded_delete_waits_fires_cascade_row_triggers() {
         CREATE TABLE app.c(k text PRIMARY KEY REFERENCES app.p(k) ON DELETE CASCADE); \
         CREATE TABLE app.g(k text PRIMARY KEY REFERENCES app.c(k) ON DELETE CASCADE); \
         CREATE TABLE app.fired(relation text, level text); \
-        CREATE FUNCTION app.log_delete() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+        CREATE FUNCTION app.log_delete() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN \
             INSERT INTO app.fired VALUES (TG_TABLE_NAME, TG_LEVEL); RETURN OLD; END$$; \
         CREATE TRIGGER row_hook AFTER DELETE ON app.c FOR EACH ROW EXECUTE FUNCTION app.log_delete(); \
         CREATE TRIGGER statement_hook AFTER DELETE ON app.c FOR EACH STATEMENT EXECUTE FUNCTION app.log_delete(); \
@@ -24639,6 +24644,7 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
                 .unwrap();
             let refused = pbps_pg::data_triggers::prepare(
                 &mut conn,
+                &pbps_pg::admission::Admission::default(),
                 &[write],
                 &Default::default(),
                 &Default::default(),
@@ -24754,6 +24760,7 @@ fn referential_action_locks(admin: &str) {
             };
             let guard = pbps_pg::data_triggers::prepare(
                 &mut writer,
+                &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&write),
                 &Default::default(),
                 &Default::default(),
@@ -24811,6 +24818,7 @@ fn referential_action_locks(admin: &str) {
             };
             let refused = pbps_pg::data_triggers::prepare(
                 &mut writer,
+                &pbps_pg::admission::Admission::default(),
                 &[direct],
                 &Default::default(),
                 &Default::default(),
@@ -24828,6 +24836,7 @@ fn referential_action_locks(admin: &str) {
             writer.begin(&framing).await.unwrap();
             pbps_pg::data_triggers::prepare(
                 &mut writer,
+                &pbps_pg::admission::Admission::default(),
                 &[write],
                 &Default::default(),
                 &Default::default(),
@@ -24968,7 +24977,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$; \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$BEGIN RETURN NULL; END$$; \
         CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
         CREATE TABLE app.c(id integer PRIMARY KEY, ukey text, \
             CONSTRAINT fk_c FOREIGN KEY (ukey) REFERENCES app.p(ukey) ON UPDATE CASCADE); \
@@ -25005,7 +25014,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             ] {
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &dropped,
@@ -25024,7 +25033,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             // followed whatever the plan said about it.
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let guard = pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&write),
                 &Default::default(),
                 &Dropped {
@@ -25071,7 +25080,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             ] {
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &dropped,
@@ -25110,7 +25119,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 conn.execute(sql).await.unwrap();
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &Dropped::default(),
@@ -25125,7 +25134,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 conn.execute(reset).await.unwrap();
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &Dropped::default(),
@@ -25170,7 +25179,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 conn.execute(sql).await.unwrap();
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &Dropped::default(),
@@ -25185,7 +25194,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 conn.execute(reset).await.unwrap();
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     &Default::default(),
                     &Dropped::default(),
@@ -25218,9 +25227,9 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
         CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE, other text UNIQUE); \
         CREATE TABLE app.c(id integer PRIMARY KEY, other text REFERENCES app.p(other) ON UPDATE CASCADE); \
         CREATE TABLE public.reached(value integer); \
-        CREATE FUNCTION app.rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+        CREATE FUNCTION app.rewrite() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
         $$BEGIN NEW.other := 'rewritten'; RETURN NEW; END$$; \
-        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
         $$BEGIN INSERT INTO public.reached VALUES (1); RETURN NULL; END$$; \
         CREATE TRIGGER rewrite BEFORE UPDATE ON app.p FOR EACH ROW EXECUTE FUNCTION app.rewrite(); \
         INSERT INTO app.p VALUES ('first', 'k1', 'o1'); INSERT INTO app.c VALUES (1, 'o1')",
@@ -25265,7 +25274,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             let wide = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&write),
                 &wide,
                 &Default::default(),
@@ -25339,7 +25348,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
                 .unwrap();
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let checked = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     std::slice::from_ref(&write),
                     baseline,
                     dropped,
@@ -25364,7 +25373,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             .unwrap();
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked =
-                pbps_pg::data_triggers::prepare(&mut conn, &[write], &wide, &Default::default())
+                pbps_pg::data_triggers::prepare(&mut conn, &pbps_pg::admission::Admission::default(), &[write], &wide, &Default::default())
                     .await;
             assert!(
                 checked.is_ok(),
@@ -25390,7 +25399,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
         CREATE TABLE app.p(code text PRIMARY KEY, ukey text UNIQUE); \
         CREATE TABLE app.c(ukey text REFERENCES app.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
         CREATE TABLE app.side(value text); \
-        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS \
+        CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
         $$BEGIN INSERT INTO public.reached VALUES (1); RETURN NULL; END$$; \
         CREATE TRIGGER hook AFTER INSERT ON app.side FOR EACH STATEMENT EXECUTE FUNCTION public.hook(); \
         INSERT INTO app.p VALUES ('first', 'k1'); INSERT INTO app.c VALUES ('k1')",
@@ -25431,7 +25440,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
             ] {
                 conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                 let message = pbps_pg::data_triggers::prepare(
-                    &mut conn,
+                    &mut conn, &pbps_pg::admission::Admission::default(),
                     &[write],
                     &Default::default(),
                     &Default::default(),
@@ -25461,7 +25470,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
             .unwrap();
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&updates),
                 &Default::default(),
                 &Default::default(),
@@ -25480,7 +25489,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
             .unwrap();
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let message = pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 std::slice::from_ref(&updates),
                 &Default::default(),
                 &Default::default(),
@@ -25507,7 +25516,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 .unwrap();
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
             let checked = pbps_pg::data_triggers::prepare(
-                &mut conn,
+                &mut conn, &pbps_pg::admission::Admission::default(),
                 &[updates],
                 &Default::default(),
                 &Default::default(),
@@ -27682,7 +27691,7 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         on_server(
             &deployment,
             &format!(
-                "CREATE FUNCTION public.hold428() RETURNS trigger LANGUAGE plpgsql AS \
+                "CREATE FUNCTION public.hold428() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
                  $$BEGIN PERFORM pg_advisory_xact_lock(428); RETURN NULL; END$$; {triggers}"
             ),
         );
@@ -27776,7 +27785,7 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         );
         on_server(
             &as_role(&connection, &topology.inheritor),
-            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
              $$BEGIN INSERT INTO hook.calls VALUES (428); RETURN NEW; END$$",
         );
         rt.block_on(async {
@@ -33870,7 +33879,7 @@ fn a_partition_trees_triggers_go_through_the_cli() {
         &src,
         "CREATE SCHEMA app; \
          CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql \
-             AS $$BEGIN RETURN COALESCE(NEW, OLD); END$$; \
+             SET search_path = pg_catalog AS $$BEGIN RETURN COALESCE(NEW, OLD); END$$; \
          CREATE TABLE app.kinds (code text NOT NULL PRIMARY KEY, label text); \
          CREATE TABLE app.ev (kind text NOT NULL PRIMARY KEY \
              REFERENCES app.kinds (code) ON DELETE CASCADE, label text) \

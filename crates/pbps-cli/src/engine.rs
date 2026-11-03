@@ -87,6 +87,7 @@ pub async fn execute_staged_statement(
 /// DEC-2331.1). Nothing to vet on an engine that records none.
 pub async fn vet_conversions(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     changes: &[pbps_model::PlannedChange],
 ) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ColumnRef>> {
     let mut immutable = std::collections::BTreeSet::new();
@@ -104,7 +105,7 @@ pub async fn vet_conversions(
         else {
             continue;
         };
-        if pbps_pg::input_path::vet_conversion_for_probe(conn, column, from, to, using)
+        if pbps_pg::input_path::vet_conversion_for_probe(conn, admission, column, from, to, using)
             .await
             .map_err(|why| anyhow::anyhow!("{why}"))?
         {
@@ -116,6 +117,7 @@ pub async fn vet_conversions(
 
 pub async fn vet_drop_requirements(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     names: &pbps_model::plan_names::PlanNames<'_>,
 ) -> anyhow::Result<()> {
     for (index, step) in names.changes().iter().enumerate() {
@@ -130,7 +132,8 @@ pub async fn vet_drop_requirements(
                 anyhow::anyhow!("the requirement's table identity has no stored target")
             })?;
         for requirement in guard.requirements.values() {
-            let columns = vet_drop_requirement(conn, table, &requirement.predicate).await?;
+            let columns =
+                vet_drop_requirement(conn, admission, table, &requirement.predicate).await?;
             pbps_diff::drop_requirements::check_columns(guard, index, names, &columns)
                 .map_err(anyhow::Error::msg)?;
         }
@@ -140,12 +143,14 @@ pub async fn vet_drop_requirements(
 
 pub async fn vet_drop_requirement(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     table: &TableName,
     predicate: &str,
 ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
     match conn.driver() {
         Driver::Postgres => pbps_pg::input_path::vet_requirement(
             conn,
+            admission,
             pbps_pg::pins::Within::OwnTransaction,
             table,
             predicate,
@@ -160,13 +165,14 @@ pub async fn vet_drop_requirement(
 
 pub async fn check_drop_requirement(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     statement: &pbps_dialect::Statement,
 ) -> Result<(), DbError> {
     let Some(guard) = &statement.drop_guard else {
         return Ok(());
     };
     match conn.driver() {
-        Driver::Postgres => pbps_pg::drop_requirements::check(conn, guard)
+        Driver::Postgres => pbps_pg::drop_requirements::check(conn, admission, guard)
             .await
             .map_err(DbError::Refused),
         Driver::Mssql => Box::pin(pbps_mssql::drop_requirements::check(conn, guard))
@@ -4378,6 +4384,7 @@ pub struct DataWriteGuard {
 
 pub async fn prepare_data_writes(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     changes: &ChangeSet,
     baseline: &StateSnapshot,
     planned_ids: &pbps_model::IdsFile,
@@ -4465,8 +4472,14 @@ pub async fn prepare_data_writes(
             }
             Ok(DataWriteGuard {
                 postgres: Some(
-                    pbps_pg::data_triggers::prepare(conn, &writes, &baseline.schema, &dropped)
-                        .await?,
+                    pbps_pg::data_triggers::prepare(
+                        conn,
+                        admission,
+                        &writes,
+                        &baseline.schema,
+                        &dropped,
+                    )
+                    .await?,
                 ),
             })
         }
@@ -6640,16 +6653,9 @@ pub async fn type_input_routines(
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
-            Ok(
-                pbps_pg::type_refs::input_routines(
-                    conn,
-                    within,
-                    &references,
-                    trusted,
-                    pin_routines,
-                )
-                .await?,
-            )
+            let admission =
+                pbps_pg::admission::Admission::new(trusted.iter().cloned(), pin_routines);
+            Ok(pbps_pg::type_refs::input_routines(conn, within, &references, &admission).await?)
         }
         Driver::Mssql if !pin_routines && pins.is_empty() => Ok(BTreeSet::new()),
         Driver::Mssql => anyhow::bail!("pin_type_routines is supported only on PostgreSQL"),
@@ -6742,6 +6748,7 @@ pub async fn expand_table_rebuild<
     D: crate::emission::Engine,
 >(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     changes: PlanningPlan<S>,
     before: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -6764,7 +6771,7 @@ pub async fn expand_table_rebuild<
         })
         .ok_or_else(|| anyhow::anyhow!("missing qualified rebuild root"))?;
     let (changes, rows, bytes, verification) =
-        pbps_pg::rebuild::plan(conn, changes, before, desired, hints, dialect).await?;
+        pbps_pg::rebuild::plan(conn, admission, changes, before, desired, hints, dialect).await?;
     Ok((
         changes,
         ConnectedCheck {
@@ -6781,11 +6788,12 @@ pub async fn expand_table_rebuild<
 
 pub async fn rebuild_window(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     before: pbps_diff::Side<'_>,
     changes: &ChangeSet,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
-        pbps_pg::rebuild::window(conn, before, changes).await?;
+        pbps_pg::rebuild::window(conn, admission, before, changes).await?;
     }
     Ok(())
 }

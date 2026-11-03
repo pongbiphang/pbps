@@ -16,6 +16,7 @@ use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::{Conn, Driver};
 use pbps_model::escape::Escaped;
 use pbps_model::{ModuleId, RoutineArg, RoutineId, RoutinePin, RoutinePins, TableName};
+use pbps_pg::admission::Admission;
 
 use crate::db::Target;
 use pbps_config::Project;
@@ -180,6 +181,38 @@ impl Approved<'_> {
     pub async fn check(&self, conn: &mut Conn, at: Check<'_>) -> anyhow::Result<()> {
         check(conn, self.project, self.target, self.plan, self.managed, at).await
     }
+
+    /// The admission rule of the plan's own project and saved opt-in.
+    #[must_use]
+    pub fn admission(&self) -> Admission {
+        Admission::new(
+            self.project.config.trusted_roles.iter().cloned(),
+            self.plan.pin_type_routines,
+        )
+    }
+
+    /// Review admits only what the plan showed and pinned (DEC-2563.2). A site
+    /// that reached a reviewed routine the plan does not hold is refused: the
+    /// catalog changed since planning, and the pin never covered that routine.
+    pub fn require_reviewed(&self, admission: &Admission) -> anyhow::Result<()> {
+        let shown: BTreeSet<i64> = self.plan.type_routines.iter().map(|r| r.oid).collect();
+        match admission.reviewed().difference(&shown).next() {
+            None => Ok(()),
+            Some(oid) => bail!(
+                "the routine with OID {oid} is admitted by `pin_type_routines` but the plan did \
+                 not show and pin it; plan again against the database (DEC-2563.2)"
+            ),
+        }
+    }
+}
+
+/// The admission rule of a command that is about to plan.
+#[must_use]
+pub fn admission(project: &Project) -> Admission {
+    Admission::new(
+        project.config.trusted_roles.iter().cloned(),
+        project.config.pin_type_routines,
+    )
 }
 
 /// The pins `plan` writes into a PostgreSQL plan, or `None` when nothing is
@@ -340,8 +373,11 @@ pub async fn seal_selected(
     project: &Project,
     target: &Target,
     types: &[pbps_model::TypePin],
+    sites: &Admission,
 ) -> anyhow::Result<(Vec<pbps_model::TypeRoutine>, Option<RoutinePins>)> {
-    let roots = crate::engine::type_input_routines(
+    // The referenced types' routines, and those the plan's expressions reached
+    // (`sites`: conversions, requirements and copy conversions, vetted by now).
+    let mut roots = crate::engine::type_input_routines(
         conn,
         types,
         &project.config.trusted_roles,
@@ -349,6 +385,7 @@ pub async fn seal_selected(
         false,
     )
     .await?;
+    roots.extend(sites.reviewed());
     if roots.is_empty() {
         return Ok((Vec::new(), None));
     }
@@ -385,18 +422,21 @@ async fn check_selected(
         matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
     )
     .await?;
+    // The plan also holds what its expressions reached; the sites that run them
+    // check that set themselves (`Approved::require_reviewed`).
     let expected: BTreeSet<_> = plan.type_routines.iter().map(|r| r.oid).collect();
-    if roots != expected || expected.len() != plan.type_routines.len() {
-        bail!("the referenced types' reviewed routine set changed; plan again (DEC-2181.2)");
+    if !roots.is_subset(&expected) || expected.len() != plan.type_routines.len() {
+        bail!("the reviewed routine set changed; plan again (DEC-2181.2, DEC-2563.2)");
     }
     let Some(pins) = &plan.type_routine_pins else {
-        if roots.is_empty() {
+        if expected.is_empty() {
             return Ok(());
         }
         bail!("the plan has no reviewed type routine pins; plan again");
     };
     let (read, sources) =
-        pbps_pg::pins::selected(conn, at.within(), &roots.into_iter().collect::<Vec<_>>()).await?;
+        pbps_pg::pins::selected(conn, at.within(), &expected.into_iter().collect::<Vec<_>>())
+            .await?;
     let key = key(project, target).map_err(anyhow::Error::msg)?;
     let now = digests(&key, &unmanaged(read.routines, &BTreeSet::new()));
     let changed = differing(&pins.routines, &now);

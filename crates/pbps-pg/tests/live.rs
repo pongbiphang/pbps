@@ -19203,6 +19203,108 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
     drop_schema(&mut conn, &s).await;
 }
 
+/// The reference-data guard asks the admission predicate of the function a
+/// recorded trigger runs (#2563, DEC-2563.3): a trusted owner's function with a
+/// fixed `search_path` passes, one without a path is refused with the exact
+/// `ALTER FUNCTION` line, an untrusted owner's is refused until its owner is
+/// declared trusted (which the guard's own rule never honored), and a
+/// `SECURITY DEFINER` of an untrusted owner is refused whatever is declared
+/// short of trusting the owner.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_trigger_guard_judges_a_triggers_function_by_the_admission_predicate() {
+    let s = emit_schema("guard_predicate");
+    let mut conn = TestDb::create("guard_predicate").await;
+    fresh(&mut conn, &s).await;
+    let stranger = format!("{s}_stranger");
+    let body = "AS $$ BEGIN RETURN NEW; END $$";
+    let mut setup = vec![format!("CREATE ROLE {stranger}")];
+    for (table, function, attributes, owner) in [
+        ("t_fixed", "fixed", "SET search_path = pg_catalog", false),
+        ("t_open", "open", "", false),
+        ("t_theirs", "theirs", "SET search_path = pg_catalog", true),
+        (
+            "t_definer",
+            "definer",
+            "SECURITY DEFINER SET search_path = pg_catalog",
+            true,
+        ),
+    ] {
+        setup.push(format!(
+            "CREATE FUNCTION {s}.{function}() RETURNS trigger LANGUAGE plpgsql {attributes} {body}"
+        ));
+        if owner {
+            setup.push(format!(
+                "ALTER FUNCTION {s}.{function}() OWNER TO {stranger}"
+            ));
+        }
+        setup.push(format!("CREATE TABLE {s}.{table} (id integer)"));
+        setup.push(format!(
+            "CREATE TRIGGER watch AFTER INSERT ON {s}.{table} FOR EACH ROW \
+             EXECUTE FUNCTION {s}.{function}()"
+        ));
+    }
+    for sql in setup {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let baseline = pull(&mut conn).await.schema;
+    let trusting_nobody = pbps_pg::admission::Admission::default();
+    let trusting_stranger = pbps_pg::admission::Admission::new([stranger.clone().into()], false);
+    let fix = format!("ALTER FUNCTION {s}.open() SET search_path = pg_catalog, pg_temp");
+    // (table, what the guard says under no declared role, and under the stranger)
+    let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+        ("t_fixed", None, None),
+        ("t_open", Some(fix.as_str()), Some(fix.as_str())),
+        (
+            "t_theirs",
+            Some("owned by a role an untrusted role can act as"),
+            None,
+        ),
+        ("t_definer", Some("SECURITY DEFINER"), None),
+    ];
+    for (table, alone, declared) in cases {
+        for (admission, expected) in [(&trusting_nobody, alone), (&trusting_stranger, declared)] {
+            let write = pbps_dialect::RowWrite {
+                table: TableName::new(&s, table),
+                operation: pbps_dialect::RowOperation::Insert,
+            };
+            conn.execute("BEGIN").await.unwrap();
+            let guard = pbps_pg::data_triggers::prepare(
+                &mut conn,
+                admission,
+                std::slice::from_ref(&write),
+                &baseline,
+                &Default::default(),
+            )
+            .await;
+            let rechecked = match &guard {
+                Ok(guard) => pbps_pg::data_triggers::check(&mut conn, &write, guard).await,
+                Err(_) => Ok(()),
+            };
+            conn.execute("ROLLBACK").await.unwrap();
+            match (expected, guard) {
+                (None, Ok(_)) => rechecked.unwrap_or_else(|e| panic!("{table}: recheck: {e:?}")),
+                (Some(phrase), Err(e)) => {
+                    let text = format!("{e:?}");
+                    assert!(text.contains(phrase), "{table}: {text}");
+                    assert!(
+                        text.contains("unsafe data trigger `watch`"),
+                        "{table}: {text}"
+                    );
+                }
+                (None, Err(e)) => panic!("{table} should pass: {e:?}"),
+                (Some(phrase), Ok(_)) => panic!("{table} should be refused for `{phrase}`"),
+            }
+        }
+    }
+    drop_schema(&mut conn, &s).await;
+    conn.execute(&format!("DROP ROLE {stranger}"))
+        .await
+        .unwrap();
+}
+
 /// A partitioned parent's row trigger the plan drops takes its clones out of
 /// the reference-data guard's widening scan too (#1632 review). Measured on
 /// 16 and 18, the clone goes with its parent's drop. Here a `SET NULL`
@@ -19219,7 +19321,7 @@ async fn a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_wideni
     fresh(&mut conn, &s).await;
     for sql in [
         format!(
-            "CREATE FUNCTION {s}.tg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+            "CREATE FUNCTION {s}.tg() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; \
              END $$"
         ),
         format!("CREATE TABLE {s}.kinds (code text PRIMARY KEY)"),
@@ -19260,8 +19362,14 @@ async fn a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_wideni
     };
     for (dropped, refused) in [(None, true), (Some(&widen), false)] {
         conn.execute("BEGIN").await.unwrap();
-        let outcome =
-            pbps_pg::data_triggers::prepare(&mut conn, &writes, &baseline, &guarded(dropped)).await;
+        let outcome = pbps_pg::data_triggers::prepare(
+            &mut conn,
+            &pbps_pg::admission::Admission::default(),
+            &writes,
+            &baseline,
+            &guarded(dropped),
+        )
+        .await;
         conn.execute("ROLLBACK").await.unwrap();
         match outcome {
             Err(e) => assert!(

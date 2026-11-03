@@ -3,6 +3,7 @@ use pbps_dialect::Dialect;
 use pbps_model::{DropGuard, DropRequirement};
 use pbps_pg::{
     Postgres,
+    admission::Admission,
     drop_requirements::check,
     input_path::{vet_conversion, vet_requirement},
 };
@@ -28,7 +29,7 @@ fn guard(predicate: &str) -> DropGuard {
 async fn checked(db: &mut Scratch, guard: &DropGuard) -> Result<(), String> {
     let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
     db.conn.begin(&framing).await.unwrap();
-    let result = check(&mut db.conn, guard).await;
+    let result = check(&mut db.conn, &Admission::default(), guard).await;
     db.conn.rollback(&framing).await.unwrap();
     result
 }
@@ -55,6 +56,7 @@ async fn parentheses(index: usize) {
         assert_eq!(
             vet_requirement(
                 &mut db.conn,
+                &Admission::default(),
                 pbps_pg::pins::Within::OwnTransaction,
                 &table,
                 predicate
@@ -74,6 +76,7 @@ async fn parentheses(index: usize) {
         "((amount = 1)) AND \")\" = 1 AND '(' = '(' AND E')' = $$)$$ /* ) /* ( */ */ -- (\n";
     vet_requirement(
         &mut db.conn,
+        &Admission::default(),
         pbps_pg::pins::Within::OwnTransaction,
         &table,
         balanced,
@@ -103,6 +106,7 @@ async fn binding(index: usize) {
     assert_eq!(
         vet_requirement(
             &mut db.conn,
+            &Admission::default(),
             pbps_pg::pins::Within::OwnTransaction,
             &table,
             "cents = amount * 100 AND length(status) > 0"
@@ -113,6 +117,7 @@ async fn binding(index: usize) {
     );
     let udf = vet_requirement(
         &mut db.conn,
+        &Admission::default(),
         pbps_pg::pins::Within::OwnTransaction,
         &table,
         "app.user_check(amount)",
@@ -121,11 +126,12 @@ async fn binding(index: usize) {
     .unwrap_err();
     assert_eq!(
         udf,
-        "the row requirement of app.t calls the function `app.user_check(integer)` (owned by `postgres`), which is not built into PostgreSQL and cannot be proven to run only built-in code: it has a string body (AS '...' or AS $$...$$), which the catalog keeps as text and not as a parsed tree; only a BEGIN ATOMIC or RETURN body can be proven; nothing has been changed"
+        "the row requirement of app.t calls the function `app.user_check(integer)` (owned by `postgres`), which sets no `search_path`, so a role that can create objects in a schema searched earlier can replace what it calls; run `ALTER FUNCTION app.user_check(integer) SET search_path = pg_catalog, pg_temp` (naming before `pg_temp` any other schema its body needs), or write it as built-in-only code, which it is not because it has a string body (AS '...' or AS $$...$$), which the catalog keeps as text and not as a parsed tree; only a BEGIN ATOMIC or RETURN body can be proven; nothing has been changed"
     );
     assert_eq!(
         vet_requirement(
             &mut db.conn,
+            &Admission::default(),
             pbps_pg::pins::Within::OwnTransaction,
             &table,
             "random() > 0"
@@ -141,6 +147,7 @@ async fn binding(index: usize) {
     ] {
         let refused = vet_requirement(
             &mut db.conn,
+            &Admission::default(),
             pbps_pg::pins::Within::OwnTransaction,
             &table,
             predicate,
@@ -164,6 +171,7 @@ async fn binding(index: usize) {
         ALTER TABLE app.t ADD COLUMN hidden app.modtype(1); SELECT pg_advisory_lock(2400)").await;
     vet_requirement(
         &mut db.conn,
+        &Admission::default(),
         pbps_pg::pins::Within::OwnTransaction,
         &table,
         "cents = amount * 100",
@@ -210,15 +218,21 @@ async fn refusals(index: usize) {
     let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
     let mut actor = db.as_role(&role).await;
     actor.begin(&framing).await.unwrap();
-    let refused = check(&mut actor, &guard("amount = 1")).await.unwrap_err();
+    let refused = check(&mut actor, &Admission::default(), &guard("amount = 1"))
+        .await
+        .unwrap_err();
     assert!(refused.contains("42501"), "{refused}");
     actor.rollback(&framing).await.unwrap();
     db.sql(&format!("ALTER TABLE app.t OWNER TO {role}; ALTER TABLE app.t ENABLE ROW LEVEL SECURITY; ALTER TABLE app.t FORCE ROW LEVEL SECURITY; CREATE POLICY hidden ON app.t USING (false)")).await;
     actor.begin(&framing).await.unwrap();
     assert_eq!(
-        check(&mut actor, &guard("cents = amount * 100"))
-            .await
-            .unwrap_err(),
+        check(
+            &mut actor,
+            &Admission::default(),
+            &guard("cents = amount * 100")
+        )
+        .await
+        .unwrap_err(),
         "the row requirement of app.t cannot count all rows while row security is active"
     );
     actor.rollback(&framing).await.unwrap();
@@ -255,7 +269,9 @@ async fn partition_lock(index: usize) {
         .unwrap();
     let framing = Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
     db.conn.begin(&framing).await.unwrap();
-    check(&mut db.conn, &guard("amount = 1")).await.unwrap();
+    check(&mut db.conn, &Admission::default(), &guard("amount = 1"))
+        .await
+        .unwrap();
     // This return is the test-only barrier between the production check and
     // the drop. Inspect real locks before allowing the writer to proceed.
     let locks = db.conn.query("SELECT count(*)::bigint AS n FROM pg_locks WHERE pid=pg_backend_pid() AND granted AND mode='AccessExclusiveLock' AND relation IN ('app.t'::regclass,'app.leaf'::regclass)").await.unwrap();
@@ -337,6 +353,7 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
         for predicate in ["app.positive(amount)", "app.chained(cents) AND amount > 0"] {
             let columns = vet_requirement(
                 &mut db.conn,
+                &Admission::default(),
                 pbps_pg::pins::Within::OwnTransaction,
                 &table,
                 predicate,
@@ -365,6 +382,7 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
         ] {
             let why = vet_requirement(
                 &mut db.conn,
+                &Admission::default(),
                 pbps_pg::pins::Within::OwnTransaction,
                 &table,
                 predicate,
@@ -381,6 +399,7 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
         // in a row requirement, which cannot hold one.
         let why = vet_requirement(
             &mut db.conn,
+            &Admission::default(),
             pbps_pg::pins::Within::OwnTransaction,
             &table,
             "app.volatile_inside(amount)",
@@ -391,6 +410,7 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
         // The owner rule, with no role declared trusted at this site.
         let why = vet_requirement(
             &mut db.conn,
+            &Admission::default(),
             pbps_pg::pins::Within::OwnTransaction,
             &table,
             "app.theirs(amount)",
@@ -405,9 +425,15 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
         // The same proof judges a conversion's `USING`.
         let column = table.column("amount");
         let integer = ColumnType::simple("integer");
-        vet_conversion(&mut db.conn, &column, &integer, "app.clamped(amount)")
-            .await
-            .unwrap_or_else(|why| panic!("a conversion on {label}: {why}"));
+        vet_conversion(
+            &mut db.conn,
+            &Admission::default(),
+            &column,
+            &integer,
+            "app.clamped(amount)",
+        )
+        .await
+        .unwrap_or_else(|why| panic!("a conversion on {label}: {why}"));
         for (using, identity, phrase) in [
             (
                 "CASE WHEN app.stable_check(amount) THEN 1 ELSE 0 END",
@@ -420,13 +446,136 @@ async fn requirements_and_conversions_admit_a_function_with_a_built_in_only_body
                 "language `plpgsql`",
             ),
         ] {
-            let why = vet_conversion(&mut db.conn, &column, &integer, using)
-                .await
-                .expect_err(using);
+            let why = vet_conversion(
+                &mut db.conn,
+                &Admission::default(),
+                &column,
+                &integer,
+                using,
+            )
+            .await
+            .expect_err(using);
             assert!(
                 why.contains(identity) && why.contains(phrase),
                 "{using} on {label}: {why}"
             );
+        }
+        db.drop().await;
+    }
+}
+
+/// One predicate at every site (#2563, DEC-2563.2): a row requirement and a
+/// conversion `USING` judge a routine a role wrote as a domain does. A trusted
+/// owner's routine with a fixed `search_path` is admitted without a review, one
+/// without a path is refused with the line that fixes it, an untrusted owner's
+/// is admitted by the review (and reported) or by declaring its owner, and a
+/// `SECURITY DEFINER` of an untrusted owner is never admitted.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn requirements_and_conversions_judge_a_routine_a_role_wrote_by_one_predicate() {
+    use pbps_model::ColumnType;
+    for server in servers() {
+        let mut db = Scratch::create(&server, "requirements_admission_2563").await;
+        let label = server.label;
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        let body = "AS $$ BEGIN RETURN $1 > 0; END $$";
+        db.sql(&format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t (amount integer NOT NULL);
+             GRANT USAGE ON SCHEMA app TO {stranger};
+             CREATE FUNCTION app.mine(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SET search_path = pg_catalog {body};
+             CREATE FUNCTION app.open(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE {body};
+             CREATE FUNCTION app.theirs(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SET search_path = pg_catalog {body};
+             CREATE FUNCTION app.definer(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 SECURITY DEFINER SET search_path = pg_catalog {body};
+             ALTER FUNCTION app.theirs(integer) OWNER TO {stranger};
+             ALTER FUNCTION app.definer(integer) OWNER TO {stranger};"
+        ))
+        .await;
+        let theirs: i64 = db
+            .conn
+            .query("SELECT 'app.theirs(integer)'::regprocedure::oid::int8 AS oid")
+            .await
+            .unwrap()[0]
+            .try_get("oid")
+            .unwrap()
+            .unwrap();
+        let table: pbps_model::TableName = "app.t".parse().unwrap();
+        let column = table.column("amount");
+        let integer = ColumnType::simple("integer");
+        // The same expression at both sites: a requirement and a conversion.
+        let sites = ["requirement", "conversion"];
+        for site in sites {
+            for (function, admission, expect) in [
+                ("mine", Admission::default(), Ok(0)),
+                (
+                    "open",
+                    Admission::default(),
+                    Err("ALTER FUNCTION app.open(integer) SET search_path = pg_catalog, pg_temp"),
+                ),
+                (
+                    "theirs",
+                    Admission::new([], false),
+                    Err("pin_type_routines"),
+                ),
+                ("theirs", Admission::new([], true), Ok(1)),
+                (
+                    "theirs",
+                    Admission::new([stranger.clone().into()], false),
+                    Ok(0),
+                ),
+                ("definer", Admission::new([], true), Err("SECURITY DEFINER")),
+                (
+                    "definer",
+                    Admission::new([stranger.clone().into()], false),
+                    Ok(0),
+                ),
+            ] {
+                let predicate = format!("app.{function}(amount)");
+                let using = format!("CASE WHEN {predicate} THEN 1 ELSE 0 END");
+                let outcome = if site == "requirement" {
+                    vet_requirement(
+                        &mut db.conn,
+                        &admission,
+                        pbps_pg::pins::Within::OwnTransaction,
+                        &table,
+                        &predicate,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    vet_conversion(&mut db.conn, &admission, &column, &integer, &using).await
+                };
+                let routines = admission.reviewed();
+                match expect {
+                    Ok(reviewed) => {
+                        outcome.unwrap_or_else(|why| {
+                            panic!("{function} at the {site} on {label}: {why}")
+                        });
+                        assert_eq!(
+                            routines.len(),
+                            reviewed,
+                            "{function} at the {site} on {label}: {routines:?}"
+                        );
+                        if reviewed == 1 {
+                            assert!(routines.contains(&theirs), "{routines:?}");
+                        }
+                    }
+                    Err(phrase) => {
+                        let why =
+                            outcome.expect_err(&format!("{function} at the {site} on {label}"));
+                        assert!(
+                            why.contains(phrase),
+                            "{function} at the {site} on {label}: {why}"
+                        );
+                        assert!(
+                            routines.is_empty(),
+                            "a refused expression reviews nothing: {routines:?}"
+                        );
+                    }
+                }
+            }
         }
         db.drop().await;
     }

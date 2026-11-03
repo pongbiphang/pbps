@@ -13,7 +13,11 @@ fn qualified(table: &TableName) -> Result<String, String> {
 /// The caller must already have opened the drop's transaction. These locks are
 /// deliberately acquired before the vetter's savepoint, so its rollback keeps
 /// them held until the DDL and the caller's commit. Never use ONLY here.
-pub async fn check(conn: &mut Conn, guard: &DropGuard) -> Result<(), String> {
+pub async fn check(
+    conn: &mut Conn,
+    admission: &crate::admission::Admission,
+    guard: &DropGuard,
+) -> Result<(), String> {
     for table in guard
         .detach_from
         .iter()
@@ -58,6 +62,7 @@ pub async fn check(conn: &mut Conn, guard: &DropGuard) -> Result<(), String> {
     for requirement in guard.requirements.values() {
         crate::input_path::vet_requirement(
             conn,
+            admission,
             crate::pins::Within::CallersTransaction,
             &guard.table,
             &requirement.predicate,
