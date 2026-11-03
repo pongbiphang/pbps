@@ -69,3 +69,20 @@ fn authorization_status_must_agree_with_the_recorded_postgres_layout() {
     owned["analysis"]["evidence"]["qualification"]["authorization"] = json!("login_standin");
     assert!(!readable(owned));
 }
+
+/// SQL Server enters a sandbox user that reproduces the deployer under either
+/// layout, so its evidence cannot claim a login stand-in, and a supplied
+/// database does not lower it to one (DEC-2143.2).
+#[test]
+fn sql_server_evidence_claims_the_reproduced_deployer_under_either_layout() {
+    for layout in ["supplied", "run-owned"] {
+        let mut value = wire();
+        let q = &mut value["analysis"]["evidence"]["qualification"];
+        q["rule"] = json!("mssql-reported-scope-v2");
+        q["runtime"]["layout"] = json!(layout);
+        q["authorization"] = json!("reproduced");
+        assert!(readable(value.clone()), "{layout}");
+        value["analysis"]["evidence"]["qualification"]["authorization"] = json!("login_standin");
+        assert!(!readable(value), "{layout}");
+    }
+}

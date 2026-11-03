@@ -23,7 +23,7 @@
 //! reports about itself.
 //! SQL Server records its run-owned resources before creation too, executes
 //! setup and externals in NO REVERT sandboxes, compiles as the reproduced deployer, and
-//! refuses where planning from evidence begins (#2143).
+//! plans from the captured evidence through the shared settle route (#2143).
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
@@ -47,7 +47,7 @@ mod supervised;
 /// releases everything it created before any result leaves, and a cleanup it
 /// could not confirm names exactly what may remain.
 #[allow(clippy::too_many_arguments)]
-pub async fn produce(
+pub async fn produce<D: super::PlanningDialect>(
     driver: Driver,
     scratch: &str,
     target_connection: &str,
@@ -62,8 +62,8 @@ pub async fn produce(
     standard: impl Into<Standard>,
     externals: Option<&str>,
     provenance: &Provenance,
-) -> Result<ResolvedPlan, ProduceError> {
-    let unsealed = produce_unsealed(
+) -> Result<ResolvedPlan<pbps_diff::order::Canonical<D>>, ProduceError> {
+    let unsealed = produce_unsealed::<D>(
         driver,
         scratch,
         target_connection,
@@ -100,7 +100,7 @@ pub async fn produce(
 /// [`produce`]'s run, its plan returned before the evidence is sealed: the
 /// publishing caller runs its ordinary passes and the recheck first (#1516).
 #[allow(clippy::too_many_arguments)]
-pub async fn produce_unsealed(
+pub async fn produce_unsealed<D: super::PlanningDialect>(
     driver: Driver,
     scratch: &str,
     target_connection: &str,
@@ -115,7 +115,12 @@ pub async fn produce_unsealed(
     standard: impl Into<Standard>,
     externals: Option<&str>,
     provenance: &Provenance,
-) -> Result<Unsealed, ProduceError> {
+) -> Result<Unsealed<D>, ProduceError> {
+    if driver != D::DRIVER {
+        return Err(ProduceError::Run(Error::Binding(
+            "the resolver planning dialect and selected driver belong to different engines".into(),
+        )));
+    }
     if binding.base != base.schema || binding.desired != desired.schema {
         return Err(ProduceError::Run(Error::Binding(
             "the binding request and recorded planning sides disagree".into(),
@@ -143,7 +148,7 @@ pub async fn produce_unsealed(
         externals: externals.map(str::to_owned),
         provenance: provenance.clone(),
     }
-    .start()
+    .start::<D>()
     .await
 }
 
@@ -216,7 +221,7 @@ struct Run<'a> {
 
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
-    async fn resolve(
+    async fn resolve<D: super::PlanningDialect>(
         &mut self,
         provisioning: Provisioning,
         target: &mut Conn,
@@ -227,7 +232,7 @@ impl Run<'_> {
         hints: &Hints,
     ) -> Result<
         (
-            pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>,
+            pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>,
             Sealing,
             Opening,
         ),
@@ -417,7 +422,7 @@ impl Run<'_> {
         let records = compiled
             .planning_records()
             .map_err(|error| Error::Binding(error.to_string()))?;
-        let surfaces = engine::surfaces(
+        let surfaces = engine::surfaces::<D>(
             driver,
             base,
             desired,
@@ -425,7 +430,7 @@ impl Run<'_> {
             &records,
             &assessment,
         )?;
-        let ordered = reconstruction.plan(base, desired, hints, extras, &surfaces)?;
+        let ordered = reconstruction.plan::<D>(base, desired, hints, extras, &surfaces)?;
         let identity = Identity {
             rule: engine::reported_rule(driver)?,
             resolver_build: engine::reported_build(driver, self.key, prepared.catalog())?,
@@ -449,12 +454,14 @@ impl Run<'_> {
             opening_build: engine::reported_build(driver, self.key, &opening_catalog)?,
             surfaces,
         };
+        let authorization_condition = prepared.authorization_condition(target).await?;
         let sealing = Sealing {
             planned: request.planned.clone(),
             opening_catalog,
             target_catalog,
             scratch_catalog: prepared.into_catalog(),
             authorization,
+            authorization_condition,
             schemas: request.schemas.clone(),
             write_path_extras: request.write_path_extras.clone(),
             identity,
@@ -552,30 +559,35 @@ mod tests {
                 base: if disagrees { &different } else { &schema },
                 desired: &schema,
             };
-            let run = async |driver| match produce_unsealed(
-                driver,
-                "invalid scratch connection",
-                "invalid target connection",
-                "",
-                &binding,
-                side,
-                side,
-                &hints,
-                &[],
-                &project,
-                None,
-                &standard,
-                None,
-                &provenance,
-            )
-            .await
-            {
-                Err(ProduceError::Run(Error::Binding(reason))) => reason,
-                Err(other) => panic!("not the first binding refusal: {other}"),
-                Ok(_) => panic!("a run without a key or connections"),
-            };
-            let postgres = run(Driver::Postgres).await;
-            assert_eq!(run(Driver::Mssql).await, postgres);
+            // One run per engine: the planning dialect is part of the call's type.
+            macro_rules! run {
+                ($dialect:ty, $driver:expr) => {
+                    match produce_unsealed::<$dialect>(
+                        $driver,
+                        "invalid scratch connection",
+                        "invalid target connection",
+                        "",
+                        &binding,
+                        side,
+                        side,
+                        &hints,
+                        &[],
+                        &project,
+                        None,
+                        &standard,
+                        None,
+                        &provenance,
+                    )
+                    .await
+                    {
+                        Err(ProduceError::Run(Error::Binding(reason))) => reason,
+                        Err(other) => panic!("not the first binding refusal: {other}"),
+                        Ok(_) => panic!("a run without a key or connections"),
+                    }
+                };
+            }
+            let postgres = run!(pbps_pg::Postgres, Driver::Postgres);
+            assert_eq!(run!(pbps_mssql::Mssql, Driver::Mssql), postgres);
             if disagrees {
                 assert_eq!(
                     postgres,
@@ -614,7 +626,7 @@ mod tests {
         let bootstrap =
             pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
                 .unwrap();
-        let outcome = produce_unsealed(
+        let outcome = produce_unsealed::<pbps_mssql::Mssql>(
             Driver::Mssql,
             r"Server=(localdb)\x;Integrated Security=SSPI",
             "Server=127.0.0.1,1;User Id=sa;Password=never-tried",

@@ -22,11 +22,11 @@ async fn file_case(file: &'static str) {
         }
         let missing = Box::pin(refusal_policy_inner(&target, &scratch, None, &policy(SameInstance::NotApplicable))).await;
         assert!(matches!(&missing, ProduceError::Run(Error::Unusable(reason)) if reason.contains("same_instance runtime")), "{missing}");
-        let allowed = Box::pin(refusal_policy_inner(&target, &scratch, Some(file), &policy(SameInstance::Allowed))).await;
+        let allowed = Box::pin(outcome_policy_inner(&target, &scratch, Some(file), &policy(SameInstance::Allowed))).await;
         if file.is_empty() {
-            assert!(matches!(&allowed, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2143")), "{allowed}");
+            assert!(allowed.is_ok(), "{}", why(&allowed));
         } else {
-            assert!(matches!(&allowed, ProduceError::Run(Error::Externals(reasons)) if reasons.iter().any(|r| r.contains("file-ran-2270"))), "{allowed}");
+            assert!(matches!(&allowed, Err(ProduceError::Run(Error::Externals(reasons))) if reasons.iter().any(|r| r.contains("file-ran-2270"))), "{}", why(&allowed));
         }
         assert!(sql::inventory::read(&mut connection(&scratch).await, None).await.unwrap().is_empty());
     }).await;

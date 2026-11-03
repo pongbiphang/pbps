@@ -22,7 +22,7 @@
 //!   class SPEC §7.6 excludes.
 //!
 //! Scratch, separation, the externals comparison and assessment are #2142;
-//! nothing here is wired into planning yet (#2143).
+//! planning and sealing from this capture are #2143.
 
 mod assess;
 mod catalog;

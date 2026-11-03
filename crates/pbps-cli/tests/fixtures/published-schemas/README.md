@@ -76,3 +76,4 @@ DECISIONS 465).
 - `84/` adds retained column DEFAULT writebacks to plan explanations (#2354 PR 2).
 - `85/` adds exact read-only PostgreSQL extension declarations and state identities (#2447 PR A).
 - `86/` adds owned PostgreSQL `test` results: frozen input provenance, replay/candidate phases, assertion evidence and confirmed cleanup (#1165).
+- `87/` generalizes the resolver authorization-reproduction and assessment descriptions to name both engines, and documents an empty `approve_with` for a plan this build cannot enforce (#2143 c1).

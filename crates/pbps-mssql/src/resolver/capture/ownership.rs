@@ -200,7 +200,7 @@ pub(super) fn classify(
                 assign(
                     &mut owned,
                     column_id,
-                    Surface::Column(name.column(computed)),
+                    Surface::Default(name.column(computed)),
                 )?;
             }
         }

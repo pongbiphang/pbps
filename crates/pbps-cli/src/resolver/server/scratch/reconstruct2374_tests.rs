@@ -1,9 +1,8 @@
 //! The declarations compile on scratch, as the reproduced deployer (#2374).
 //!
-//! Every case runs on the warm separate-instance scratch fixture. A successful
-//! run still ends in an error, the planning
-//! boundary (#2143), so reaching exactly that error is the proof that the
-//! compile and both captures passed; each negative names what refused.
+//! Every case runs on the warm separate-instance scratch fixture. A run that
+//! succeeds completes with a plan from evidence, which proves the compile and
+//! both captures passed; each negative names what refused.
 
 use super::*;
 use indexmap::IndexMap;
@@ -36,7 +35,7 @@ async fn run(target: &str, deployer: Option<&str>, scratch: &str, declared: &Dec
         || target.to_owned(),
         |login| format!("{target};User Id={login};Password={PASSWORD}"),
     );
-    let outcome = Box::pin(declared_refusal(
+    let outcome = Box::pin(declared_outcome(
         &target,
         scratch,
         declared,
@@ -44,37 +43,37 @@ async fn run(target: &str, deployer: Option<&str>, scratch: &str, declared: &Dec
         &provenance(),
     ))
     .await;
-    outcome.to_string()
+    why(&outcome)
 }
 
 async fn run_with_file(target: &str, scratch: &str, declared: &Declared, file: &str) -> String {
-    Box::pin(declared_refusal(
+    why(&Box::pin(declared_outcome(
         target,
         scratch,
         declared,
         Some(file),
         &provenance(),
     ))
-    .await
-    .to_string()
+    .await)
 }
 
-/// The boundary a successful run ends at.
-fn reached_the_boundary(outcome: &str) {
-    assert!(
-        outcome.contains("planning from evidence") && outcome.contains("#2143"),
-        "{outcome}"
-    );
+/// A run that passed the compile and both captures completes with a plan.
+fn completed(outcome: &str) {
+    assert_eq!(outcome, COMPLETED);
 }
 
-fn int() -> Column {
+pub(super) fn int() -> Column {
     Column::new("int".parse().unwrap())
 }
 
 /// A view is named by itself; SQL Server's functions and procedures are
 /// routines with no arguments, so `f()`: the capture refuses a function
 /// declared under a view's identity.
-fn module(kind: ModuleKind, id: &str, definition: &str) -> (pbps_model::ModuleId, Module) {
+pub(super) fn module(
+    kind: ModuleKind,
+    id: &str,
+    definition: &str,
+) -> (pbps_model::ModuleId, Module) {
     let id = match kind {
         ModuleKind::View => id.to_owned(),
         ModuleKind::Function | ModuleKind::Procedure | ModuleKind::Trigger => format!("{id}()"),
@@ -90,7 +89,7 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> (pbps_model::ModuleId
     )
 }
 
-fn declared(modules: &[(pbps_model::ModuleId, Module)]) -> Declared {
+pub(super) fn declared(modules: &[(pbps_model::ModuleId, Module)]) -> Declared {
     let mut desired = Schema::default();
     desired.modules.extend(modules.iter().cloned());
     Declared {
@@ -99,7 +98,7 @@ fn declared(modules: &[(pbps_model::ModuleId, Module)]) -> Declared {
     }
 }
 
-fn table(name: &str) -> (pbps_model::TableName, Table) {
+pub(super) fn table(name: &str) -> (pbps_model::TableName, Table) {
     (
         name.parse().unwrap(),
         Table {
@@ -109,7 +108,7 @@ fn table(name: &str) -> (pbps_model::TableName, Table) {
     )
 }
 
-async fn exec(url: &str, statements: &[&str]) {
+pub(super) async fn exec(url: &str, statements: &[&str]) {
     let mut conn = connection(url).await;
     for statement in statements {
         conn.execute(statement).await.unwrap();
@@ -336,7 +335,7 @@ async fn mssql_managed_view_over_an_external_table_compiles_and_a_missing_one_re
                 "CREATE SCHEMA ext AUTHORIZATION dbo;\nGO\nCREATE TABLE ext.x(i int);",
             )
             .await;
-            reached_the_boundary(&by_file);
+            completed(&by_file);
             // The renderer stages it: the target already holds a managed view
             // over it, so the table is a standing external no file describes.
             exec(target, &["CREATE VIEW dbo.v_render AS SELECT i FROM ext.x"]).await;
@@ -354,7 +353,7 @@ async fn mssql_managed_view_over_an_external_table_compiles_and_a_missing_one_re
                     definition: "SELECT i FROM ext.x".into(),
                 },
             );
-            reached_the_boundary(&run(target, None, scratch, &rendered).await);
+            completed(&run(target, None, scratch, &rendered).await);
             // Neither the file nor the target holds the table.
             let missing = run(
                 target,
@@ -460,7 +459,7 @@ async fn mssql_declarations_the_deployer_may_run_compile_in_dependency_order() {
                 ),
             ]);
             wanted.desired.tables.extend([table("dbo.t")]);
-            reached_the_boundary(&run(target, None, scratch, &wanted).await);
+            completed(&run(target, None, scratch, &wanted).await);
         })
     }
     both(case).await;
@@ -493,7 +492,7 @@ async fn mssql_a_module_the_plan_drops_does_not_refuse_the_capture() {
             );
             dropped.base.modules.insert(id, procedure);
             let outcome = run(target, None, scratch, &dropped).await;
-            reached_the_boundary(&outcome);
+            completed(&outcome);
         })
     }
     both(case).await;

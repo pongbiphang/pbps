@@ -1,6 +1,6 @@
 //! SQL Server's acquisition boundary, exercised through the shared producer.
 
-use super::super::{BindingRequest, Error, ProduceError};
+use super::super::{BindingRequest, Error, ProduceError, Unsealed};
 use super::fixtures::{ENVIRONMENT, KEY_LINE, ProjectKey};
 use super::{Provenance, Standard};
 use pbps_db::{Conn, Driver};
@@ -158,6 +158,42 @@ pub(super) async fn refusal_policy_inner(
     declared_refusal(target, scratch, &Declared::default(), externals, provenance).await
 }
 
+/// What a SQL Server run ends on. A run that completes has already released
+/// everything it created, so its result carries no scratch state.
+pub(super) type Outcome = Result<Unsealed<pbps_mssql::Mssql>, ProduceError>;
+
+/// What `why` says of a run that completed.
+pub(super) const COMPLETED: &str = "the run completed";
+
+/// The failure text of a run, or `COMPLETED`.
+pub(super) fn why(outcome: &Outcome) -> String {
+    outcome
+        .as_ref()
+        .err()
+        .map_or_else(|| COMPLETED.into(), ToString::to_string)
+}
+
+pub(super) fn outcome<'a>(target: &'a str, scratch: &'a str) -> impl Future<Output = Outcome> + 'a {
+    Box::pin(outcome_file_inner(target, scratch, None))
+}
+
+pub(super) async fn outcome_file_inner(
+    target: &str,
+    scratch: &str,
+    externals: Option<&str>,
+) -> Outcome {
+    outcome_policy_inner(target, scratch, externals, &provenance()).await
+}
+
+pub(super) async fn outcome_policy_inner(
+    target: &str,
+    scratch: &str,
+    externals: Option<&str>,
+    provenance: &Provenance,
+) -> Outcome {
+    declared_outcome(target, scratch, &Declared::default(), externals, provenance).await
+}
+
 /// The managed declarations a run is asked about: what the target holds as
 /// managed, and what the plan makes of it.
 #[derive(Default)]
@@ -166,10 +202,7 @@ struct Declared {
     desired: Schema,
 }
 
-/// Every run here ends in an error: until planning from evidence exists
-/// (#2143) the run stops at the first step that needs it, so reaching that
-/// boundary is the proof that everything before it, the compile and both
-/// captures included, succeeded.
+/// A run expected to refuse. One that completes is a test failure here.
 async fn declared_refusal(
     target: &str,
     scratch: &str,
@@ -177,6 +210,25 @@ async fn declared_refusal(
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> ProduceError {
+    match declared_outcome(target, scratch, declared, externals, provenance).await {
+        Err(error) => error,
+        Ok(_) => panic!("the run was expected to refuse, but it completed"),
+    }
+}
+
+/// What a declared run needs besides the connections, formed as the planner
+/// forms it.
+struct Begun {
+    key: ProjectKey,
+    /// The cluster identity the target string reached, as the planning read records it.
+    identity: String,
+    base_ids: IdsFile,
+    desired_ids: IdsFile,
+    bootstrap: pbps_diff::order::DiffPlan,
+    dependencies: pbps_model::dependency::Dependencies,
+}
+
+async fn begin(target: &str, declared: &Declared) -> Begun {
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
@@ -186,11 +238,13 @@ async fn declared_refusal(
     let path = key.project.root.join("pbps.yml");
     std::fs::write(&path, &config).unwrap();
     key.project.config = pbps_config::Config::parse(&config, &path).unwrap();
-    let ids = |schema: &Schema| {
+    // The desired side continues the base side's identities, as the recorded
+    // ids file does; resolved apart, a kept role would be a different one.
+    let ids = |schema: &Schema, previous: &IdsFile, intents: &[pbps_model::Intent]| {
         pbps_diff::resolve(
             schema,
-            &IdsFile::default(),
-            &[],
+            previous,
+            intents,
             &pbps_diff::Context {
                 operator: "resolver-live-tests".into(),
                 today: "2026-10-25".into(),
@@ -199,16 +253,21 @@ async fn declared_refusal(
         .unwrap()
         .ids
     };
-    let (base_ids, desired_ids) = (ids(&declared.base), ids(&declared.desired));
+    // A table the declarations no longer hold is dropped on purpose, as its
+    // recorded intent says.
+    let drops: Vec<_> = declared
+        .base
+        .tables
+        .keys()
+        .filter(|table| !declared.desired.tables.contains_key(*table))
+        .map(|table| pbps_model::Intent::DropTable {
+            table: table.clone(),
+            reason: pbps_model::Reason::new("dropped by the live test").unwrap(),
+        })
+        .collect();
+    let base_ids = ids(&declared.base, &IdsFile::default(), &[]);
+    let desired_ids = ids(&declared.desired, &base_ids, &drops);
     let nothing = (Schema::default(), IdsFile::default());
-    let base = pbps_diff::Side {
-        schema: &declared.base,
-        ids: &base_ids,
-    };
-    let desired = pbps_diff::Side {
-        schema: &declared.desired,
-        ids: &desired_ids,
-    };
     // As the planner forms it: the differ's plan from nothing to the
     // declarations, which may name a function a computed column calls
     // before it exists (`ordinary` refuses that, and is not the bootstrap).
@@ -217,37 +276,112 @@ async fn declared_refusal(
             schema: &nothing.0,
             ids: &nothing.1,
         },
-        desired,
+        pbps_diff::Side {
+            schema: &declared.desired,
+            ids: &desired_ids,
+        },
         &pbps_mssql::Mssql,
         &Hints::default(),
     )
     .expect("the declared schema has a bootstrap plan");
-    match super::produce_unsealed(
+    Begun {
+        key,
+        identity,
+        base_ids,
+        desired_ids,
+        bootstrap,
+        dependencies: Default::default(),
+    }
+}
+
+impl Begun {
+    fn sides<'a>(&'a self, declared: &'a Declared) -> (pbps_diff::Side<'a>, pbps_diff::Side<'a>) {
+        (
+            pbps_diff::Side {
+                schema: &declared.base,
+                ids: &self.base_ids,
+            },
+            pbps_diff::Side {
+                schema: &declared.desired,
+                ids: &self.desired_ids,
+            },
+        )
+    }
+
+    fn binding<'a>(&'a self, declared: &'a Declared) -> BindingRequest<'a> {
+        BindingRequest {
+            dependencies: &self.dependencies,
+            bootstrap: &self.bootstrap,
+            base: &declared.base,
+            desired: &declared.desired,
+        }
+    }
+}
+
+/// The run's own result: a plan from evidence, or the refusal that stopped it.
+async fn declared_outcome(
+    target: &str,
+    scratch: &str,
+    declared: &Declared,
+    externals: Option<&str>,
+    provenance: &Provenance,
+) -> Outcome {
+    let run = begin(target, declared).await;
+    let (base, desired) = run.sides(declared);
+    super::produce_unsealed::<pbps_mssql::Mssql>(
         Driver::Mssql,
         scratch,
         target,
-        &identity,
-        &BindingRequest {
-            dependencies: &Default::default(),
-            bootstrap: &bootstrap,
-            base: &declared.base,
-            desired: &declared.desired,
-        },
+        &run.identity,
+        &run.binding(declared),
         base,
         desired,
         &Hints::default(),
         &[],
-        &key.project,
+        &run.key.project,
         Some(ENVIRONMENT),
         Standard::Mssql,
         externals,
         provenance,
     )
     .await
-    {
-        Err(error) => error,
-        Ok(_) => panic!("SQL Server must refuse where planning from evidence begins (#2143)"),
-    }
+}
+
+/// The sealed plan of a declared run, past the publication recheck, or the
+/// refusal that stopped it. `planned_identity` overrides the cluster identity
+/// the planning read recorded, to give the recheck another cluster to find.
+async fn declared_plan(
+    target: &str,
+    scratch: &str,
+    declared: &Declared,
+    planned_identity: Option<&str>,
+) -> Result<
+    (
+        crate::resolver::server::ResolvedPlan<pbps_diff::order::Canonical<pbps_mssql::Mssql>>,
+        Begun,
+    ),
+    ProduceError,
+> {
+    let run = begin(target, declared).await;
+    let (base, desired) = run.sides(declared);
+    let plan = super::produce::<pbps_mssql::Mssql>(
+        Driver::Mssql,
+        scratch,
+        target,
+        planned_identity.unwrap_or(&run.identity),
+        &run.binding(declared),
+        base,
+        desired,
+        &Hints::default(),
+        &[],
+        &run.key.project,
+        Some(ENVIRONMENT),
+        Standard::Mssql,
+        None,
+        &provenance(),
+    )
+    .await?;
+    Ok((plan, run))
 }
 
 pub(super) async fn create_database(url: &str) -> (String, String) {
@@ -292,7 +426,7 @@ async fn supplied_contract(target: &str, server: &str) {
         .await
         .unwrap();
     let supplied = format!("{server};Database={name};User Id={login};Password={password}");
-    let positive = refusal(target, &supplied).await;
+    let positive = outcome(target, &supplied).await;
     let clean = sql::inventory::read(&mut connection(&on).await, None)
         .await
         .unwrap();
@@ -339,7 +473,7 @@ async fn supplied_contract(target: &str, server: &str) {
         .query("SELECT log_reuse_wait_desc FROM sys.databases WHERE database_id=DB_ID();")
         .await
         .unwrap();
-    let full_recovery = refusal(target, &supplied).await;
+    let full_recovery = outcome(target, &supplied).await;
     dirty
         .execute(&format!(
             "EXEC master.sys.xp_delete_files N'{backup}'; ALTER DATABASE [{name}] SET \
@@ -406,13 +540,7 @@ async fn supplied_contract(target: &str, server: &str) {
         .execute(&format!("USE master; DROP LOGIN [{login}];"))
         .await
         .unwrap();
-    assert!(
-        matches!(
-            positive,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
-        ),
-        "{positive}"
-    );
+    assert!(positive.is_ok(), "{}", why(&positive));
     assert!(clean.is_empty(), "{:?}", clean.names());
     assert!(guest_refusal.contains(&guest_name), "{guest_refusal}");
     assert!(hidden.contains("VIEW ANY DATABASE"), "{hidden}");
@@ -420,13 +548,7 @@ async fn supplied_contract(target: &str, server: &str) {
         status[0].try_get::<&str>("log_reuse_wait_desc").unwrap(),
         Some("LOG_BACKUP")
     );
-    assert!(
-        matches!(
-            full_recovery,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
-        ),
-        "{full_recovery}"
-    );
+    assert!(full_recovery.is_ok(), "{}", why(&full_recovery));
     assert!(persistent.contains("is_auto_shrink_on"), "{persistent}");
     assert!(
         dirty_refusal.contains("COLUMN MASTER KEY")
@@ -495,12 +617,8 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
                 if reason.contains("target database")),
                 "{same}"
             );
-            let owned = refusal(target, scratch).await;
-            assert!(
-                matches!(owned, ProduceError::Run(Error::Binding(ref reason))
-                if reason.contains("#2143")),
-                "{owned}"
-            );
+            let owned = outcome(target, scratch).await;
+            assert!(owned.is_ok(), "{}", why(&owned));
             supplied_contract(target, scratch).await;
             inherited_model_refusal(target, scratch).await;
         })
@@ -541,12 +659,8 @@ async fn mssql_docker_acquisition_keeps_the_run_owned_contract() {
                     if reason.contains("target database")),
                     "{same}"
                 );
-                let owned = refusal(&target_for_run, &scratch).await;
-                assert!(
-                    matches!(owned, ProduceError::Run(Error::Binding(ref reason))
-                    if reason.contains("#2143")),
-                    "{owned}"
-                );
+                let owned = outcome(&target_for_run, &scratch).await;
+                assert!(owned.is_ok(), "{}", why(&owned));
                 supplied_contract(&target_for_run, &scratch).await;
                 inherited_model_refusal(&target_for_run, &scratch).await;
             })
@@ -598,7 +712,7 @@ async fn mssql_run_owned_acquisition_needs_only_login_and_database_creation_priv
         .await
         .unwrap();
     let source = format!("{scratch};Database=master;User Id={login};Password={password}");
-    let outcome = refusal(&target, &source).await;
+    let outcome = outcome(&target, &source).await;
     let remaining = admin
         .query(&format!(
             "SELECT name FROM sys.databases WHERE owner_sid=SUSER_SID(N'{login}');"
@@ -609,10 +723,7 @@ async fn mssql_run_owned_acquisition_needs_only_login_and_database_creation_priv
         .execute(&format!("DROP LOGIN [{login}];"))
         .await
         .unwrap();
-    assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
-        "{outcome}"
-    );
+    assert!(outcome.is_ok(), "{}", why(&outcome));
     assert!(remaining.is_empty());
 }
 
@@ -749,7 +860,7 @@ async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_external
     let primary = server("PBPS_TEST_DB");
     let (name, on) = create_database(&primary).await;
     let target = refusal(&on, &on).await;
-    let boundary = refusal(&primary, &on).await;
+    let boundary = outcome(&primary, &on).await;
     let empty = sql::inventory::read(&mut connection(&on).await, None)
         .await
         .unwrap();
@@ -761,14 +872,7 @@ async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_external
         ),
         "{target}"
     );
-    assert!(
-        matches!(
-            boundary,
-            ProduceError::Run(Error::Binding(ref reason))
-                if reason == "SQL Server planning from evidence is not implemented yet (#2143)"
-        ),
-        "{boundary}"
-    );
+    assert!(boundary.is_ok(), "{}", why(&boundary));
     assert!(empty.is_empty(), "{:?}", empty.names());
 }
 
@@ -820,7 +924,7 @@ async fn instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans
             .unwrap();
         let mut allowed = Vec::new();
         for (target, source) in [(&primary, &scratch), (&scratch, &supplied)] {
-            allowed.push(refusal(target, source).await);
+            allowed.push(outcome(target, source).await);
         }
         let after_control = inventory().await;
         let supplied_after_control = sql::inventory::read(&mut connection(&supplied).await, None)
@@ -883,10 +987,7 @@ async fn instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans
         );
     }
     for outcome in allowed {
-        assert!(
-            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
-            "{outcome}"
-        );
+        assert!(outcome.is_ok(), "{}", why(&outcome));
     }
 }
 
@@ -910,13 +1011,10 @@ async fn mssql_run_owned_acquisition_removes_its_login_database_and_reference_on
             .collect::<Vec<_>>()
     };
     let before = inventory().await;
-    let outcome = refusal(&primary, &scratch).await;
+    let outcome = outcome(&primary, &scratch).await;
     let after = inventory().await;
     inherited_model_refusal(&primary, &scratch).await;
-    assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
-        "{outcome}"
-    );
+    assert!(outcome.is_ok(), "{}", why(&outcome));
     assert_eq!(after, before);
 }
 
@@ -1148,7 +1246,8 @@ async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_reh
             let before = conn.query(catalog_cases::BUILTIN_STATE).await
                 .map_err(|error| error.to_string())?;
             let before = before[0].try_get::<&str>("state").unwrap().unwrap().to_owned();
-            let refused = refusal(&target, &supplied).await.to_string();
+            let outcome = outcome(&target, &supplied).await;
+            let refused = why(&outcome);
             let names = sql::inventory::read(&mut conn, None).await
                 .map_err(|error| error.to_string())?.names();
             let cleanup = sql::inventory::cleanup(&mut conn, None).await;
@@ -1166,7 +1265,7 @@ async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_reh
                         )))
                     && remaining == names && before == after
             } else {
-                refused.contains("#2143") && names.is_empty() && cleanup.is_ok()
+                outcome.is_ok() && names.is_empty() && cleanup.is_ok()
                     && remaining.is_empty() && before == after
             };
             if !valid {
@@ -1247,7 +1346,7 @@ async fn mssql_externals_file_is_compared_then_reaches_reconstruction_refusal() 
         .await
         .unwrap();
     connection(&target).await.execute("GRANT SELECT ON SCHEMA::unused2269 TO public; CREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT SELECT ON unused2269.external2269 TO public;").await.unwrap();
-    let outcome = Box::pin(refusal_file_inner(
+    let outcome = Box::pin(outcome_file_inner(
         &target,
         &scratch_server,
         Some("CREATE SCHEMA unused2269 AUTHORIZATION dbo;\nGO\nCREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT SELECT ON unused2269.external2269 TO public;"),
@@ -1255,10 +1354,7 @@ async fn mssql_externals_file_is_compared_then_reaches_reconstruction_refusal() 
     .await;
     let extra_acl = Box::pin(refusal_file_inner(&target,&scratch_server,Some("CREATE SCHEMA unused2269 AUTHORIZATION dbo;\nGO\nCREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT INSERT ON unused2269.external2269 TO public;"))).await;
     drop_database(&target_server, &name).await;
-    assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
-        "{outcome}"
-    );
+    assert!(outcome.is_ok(), "{}", why(&outcome));
     assert!(
         matches!(&extra_acl,ProduceError::Run(Error::Externals(findings)) if findings.iter().any(|f| f.contains("staged:permissions"))),
         "{extra_acl}"
@@ -1379,6 +1475,132 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
     result.unwrap();
 }
 
+/// Case 14: a reconnect that reaches a backend differing in a compared fact
+/// refuses, naming the fact; one that reaches an equal backend does not.
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_not() {
+    let target_server = server("PBPS_TEST_DB");
+    let scratch_server = target_server.clone();
+    let (target_name, target_url) = create_database(&target_server).await;
+    let (scratch_name, scratch_url) = create_database(&scratch_server).await;
+    let scratch_database = scratch_name.clone();
+    let result = tokio::spawn(async move {
+        let mut target = connection(&target_url).await;
+        target
+            .execute("CREATE TABLE dbo.t2143(id int NOT NULL);")
+            .await
+            .unwrap();
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            "dbo.v2143".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "CREATE VIEW dbo.v2143 AS SELECT id FROM dbo.t2143;".into(),
+                options: Default::default(),
+            },
+        );
+        let ids = IdsFile::default();
+        let side = pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        let bootstrap =
+            pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
+                .unwrap();
+        let binding = BindingRequest {
+            dependencies: &Default::default(),
+            bootstrap: &bootstrap,
+            base: &schema,
+            desired: &schema,
+        };
+        let request = super::super::ScopeRequest {
+            schemas: vec!["dbo".into()],
+            ..Default::default()
+        };
+        let tokens = super::Tokens::generate();
+        let provenance = provenance();
+        let identity = sql::cluster_identity(&mut target).await.unwrap();
+        let mut admin = connection(&scratch_url).await;
+        let (provisioning, mut state) = super::engine::scratch(
+            Driver::Mssql,
+            &mut target,
+            &mut admin,
+            &tokens,
+            &identity,
+            &scratch_url,
+            &request,
+            &Standard::Mssql,
+            None,
+            &provenance,
+        )
+        .await
+        .unwrap();
+        let (catalog, authorization) = crate::resolver::scope::read_target(
+            &mut target,
+            Driver::Mssql,
+            &request.schemas,
+            &[],
+            &request.schemas,
+            &[],
+        )
+        .await
+        .unwrap();
+        let prepared = state
+            .prepare(
+                provisioning,
+                &mut admin,
+                &mut target,
+                &catalog,
+                &authorization,
+                &request.schemas,
+                &binding,
+                &[],
+                Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
+            )
+            .await
+            .unwrap();
+        let super::engine::Prepared::Mssql(prepared) = prepared else {
+            panic!("wrong engine");
+        };
+        let reach = prepared.reach();
+        let option = |on: bool| {
+            format!(
+                "ALTER DATABASE [{scratch_database}] SET ANSI_PADDING {}",
+                if on { "ON" } else { "OFF" }
+            )
+        };
+        let equal = reach
+            .open()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        admin.execute(&option(true)).await.unwrap();
+        let differing = reach
+            .open()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        admin.execute(&option(false)).await.unwrap();
+        let restored = reach
+            .open()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        drop(prepared);
+        state.release(&mut admin).await.unwrap();
+        assert!(equal.is_ok(), "{equal:?}");
+        let refusal = differing.expect_err("a differing backend must refuse");
+        assert!(refusal.contains("database_ansi_padding"), "{refusal}");
+        assert!(restored.is_ok(), "{restored:?}");
+    })
+    .await;
+    drop_database(&target_server, &target_name).await;
+    drop_database(&scratch_server, &scratch_name).await;
+    result.unwrap();
+}
+
 #[path = "same_instance2270_tests.rs"]
 mod same_instance2270;
 
@@ -1387,6 +1609,9 @@ mod dependencies2323;
 
 #[path = "reconstruct2374_tests.rs"]
 mod reconstruct2374;
+
+#[path = "roundtrip2143_tests.rs"]
+mod roundtrip2143;
 
 #[path = "recovery2410_mssql_tests.rs"]
 mod recovery2410;

@@ -2228,19 +2228,8 @@ pub(super) fn ordinary(
 }
 
 impl Binding {
-    pub(super) fn plan(
-        &self,
-        base: pbps_diff::Side<'_>,
-        desired: pbps_diff::Side<'_>,
-        hints: &pbps_model::Hints,
-        extras: &[String],
-        surfaces: &[pbps_model::resolver::SurfaceResolution],
-    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>, Error>
-    {
-        let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec())
-            .with_server_version(self.generation_version);
-        pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
-            .map_err(|error| Error::Binding(error.to_string()))
+    pub(super) fn generation_version(&self) -> i64 {
+        self.generation_version
     }
 }
 

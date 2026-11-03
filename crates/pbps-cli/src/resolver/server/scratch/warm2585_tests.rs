@@ -429,8 +429,8 @@ async fn the_warm_model_is_restored_before_a_callback_panic_is_reported() {
     );
     assert_eq!(remaining, None);
     let target = server("PBPS_TEST_DB");
-    let outcome = super::refusal(&target, &scratch).await.to_string();
-    assert!(outcome.contains("#2143"), "{outcome}");
+    let outcome = super::outcome(&target, &scratch).await;
+    assert!(outcome.is_ok(), "{}", super::why(&outcome));
 }
 
 #[tokio::test]
@@ -494,8 +494,8 @@ async fn the_warm_system_context_is_restored_before_a_callback_panic_is_reported
     );
     assert_eq!(after, before);
     let target = server("PBPS_TEST_DB");
-    let outcome = super::refusal(&target, &scratch).await.to_string();
-    assert!(outcome.contains("#2143"), "{outcome}");
+    let outcome = super::outcome(&target, &scratch).await;
+    assert!(outcome.is_ok(), "{}", super::why(&outcome));
 }
 
 #[tokio::test]

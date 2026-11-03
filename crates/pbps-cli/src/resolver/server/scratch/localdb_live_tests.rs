@@ -19,7 +19,8 @@
 
 use super::super::{Error, ProduceError};
 use super::mssql_live_tests::{
-    connection, create_database, drop_database, provenance, refusal, refusal_policy_inner, server,
+    connection, create_database, drop_database, outcome, outcome_policy_inner, provenance, refusal,
+    refusal_policy_inner, server, why,
 };
 use pbps_db::{Conn, DbError, Driver, LocalDbSelector};
 use pbps_mssql::resolver::localdb::{self, Failure};
@@ -176,10 +177,11 @@ async fn localdb2271_a_selector_run_reaches_reconstruction_and_leaves_both_insta
             "supplied"
         }
     );
-    let outcome = refusal(&target, &selector).await;
+    let outcome = outcome(&target, &selector).await;
     assert!(
-        matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
-        "the run reaches the boundary it reaches on every other instance: {outcome}"
+        outcome.is_ok(),
+        "the run completes as it does on every other instance: {}",
+        why(&outcome)
     );
     assert_eq!(inventory(&target).await, before_target);
     assert_eq!(inventory(&scratch_url).await, before_scratch);
@@ -212,7 +214,7 @@ async fn localdb2271_the_marker_separates_instances_and_same_instance_controls_h
     let policy = refusal_policy_inner(&target, &on, Some(""), &provenance())
         .await
         .to_string();
-    let allowed = refusal_policy_inner(
+    let allowed = outcome_policy_inner(
         &target,
         &on,
         Some(""),
@@ -228,10 +230,7 @@ async fn localdb2271_the_marker_separates_instances_and_same_instance_controls_h
         "{itself}"
     );
     assert!(policy.contains("same_instance: allow"), "{policy}");
-    assert!(
-        matches!(allowed, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2143")),
-        "{allowed}"
-    );
+    assert!(allowed.is_ok(), "{}", why(&allowed));
 }
 
 #[tokio::test]
@@ -319,11 +318,8 @@ async fn localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifi
     drop(fresh);
 
     // A new invocation discovers the instance again and qualifies it anew.
-    let outcome = refusal(&target, &disposable).await;
-    assert!(
-        matches!(outcome, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2143")),
-        "{outcome}"
-    );
+    let outcome = outcome(&target, &disposable).await;
+    assert!(outcome.is_ok(), "{}", why(&outcome));
 }
 
 /// What the scratch check sees as dbo of a database the Windows login owns.

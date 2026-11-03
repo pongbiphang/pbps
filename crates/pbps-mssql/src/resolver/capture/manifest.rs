@@ -155,6 +155,28 @@ impl CapturedInputs {
         scope
     }
 
+    /// The engine's own records this capture's closure binds to and holds no
+    /// root for: built-in types and engine-owned objects, never a user's
+    /// (DEC-2143.6). A record the engine ships exists on every instance, so
+    /// another capture may retain it as a root; reading it there is a read of
+    /// a fact, and a later difference in it is a real one.
+    pub fn engine_builtins(&self) -> BTreeSet<ObjectIdentity> {
+        self.inputs
+            .values()
+            .flat_map(|input| input.bindings.iter().map(|binding| &binding.target))
+            .filter(|target| !self.scope.retained.contains(*target))
+            .filter(|target| {
+                self.inputs.get(*target).is_some_and(|input| {
+                    input.properties.get("engine") == Some(&serde_json::Value::Bool(true))
+                        || (target.class == super::class::TYPE
+                            && input.properties.get("user_defined")
+                                == Some(&serde_json::Value::Bool(false)))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Refuse a capture whose scope lacks a set its own runtime-bound names
     /// need. Sealed so, a later recapture would reuse the short scope, and an
     /// object arriving under the omitted name would rebind the module with no

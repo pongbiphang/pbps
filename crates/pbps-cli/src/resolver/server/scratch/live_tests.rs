@@ -2077,6 +2077,55 @@ fn assert_staged(result: Result<ResolvedPlan, ProduceError>, staged: &str, conte
     assert!(created, "{context}: the plan creates b");
 }
 
+/// A PostgreSQL plan that drops a managed view reads one scope on both sides.
+/// Measured for #2143, whose SQL Server runs read two: the dropped root must
+/// leave the closing scope there, and here it must not matter (DEC-2143.5).
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_a_plan_that_drops_a_managed_view_seals_and_reads_back() {
+    let inputs = Inputs::from_pair((
+        declared(
+            &[("a", &reading("id", "t")), ("b", &reading("name", "t"))],
+            &[],
+        ),
+        declared(&[("a", &reading("id", "t"))], &[]),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let mut setup = guarded_target();
+    setup.push(format!(
+        "CREATE VIEW {MANAGED}.b AS SELECT name FROM {EXTERNAL}.t"
+    ));
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &plain_externals("integer"),
+    )
+    .await;
+    target.drop().await;
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(error) => panic!("a drop plan did not seal: {error}"),
+    };
+    plan.evidence.validate(&plan.changes).unwrap();
+    pbps_pg::resolver::validate_evidence(&plan.evidence).unwrap();
+    assert!(
+        plan.changes
+            .changes
+            .iter()
+            .any(|step| matches!(&step.change, Change::DropModule { id, .. } if id.name() == "b")),
+        "the plan drops b"
+    );
+    assert_eq!(
+        plan.evidence.before().scope().candidates,
+        plan.evidence.after().scope().candidates
+    );
+}
+
 /// The external table, with what the comparison skips: a foreign key, a
 /// CHECK, a default, a trigger and a plain index.
 fn guarded_target() -> Vec<String> {

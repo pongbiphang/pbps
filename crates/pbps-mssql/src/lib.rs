@@ -213,6 +213,10 @@ impl pbps_dialect::PlanDialect for Mssql {
 }
 
 impl Dialect for Mssql {
+    fn filter_binds_expression(&self) -> bool {
+        false
+    }
+
     fn validate_plan_analysis(
         &self,
         plan: &pbps_model::SavedPlan,
@@ -223,11 +227,7 @@ impl Dialect for Mssql {
                 .qualification()
                 .runtime
                 .validate_dependencies("mssql", plan.dependencies.keys())?;
-            // Full evidence admission belongs to #2143; checking placements
-            // must not prematurely authorize an unsupported artifact.
-            return Err(pbps_dialect::PlanAnalysisError::Unsupported(
-                plan.dialect.clone(),
-            ));
+            resolver::validate_evidence(evidence)?;
         }
         Ok(())
     }

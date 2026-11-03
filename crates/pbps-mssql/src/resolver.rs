@@ -2,13 +2,15 @@
 //! dedicated-server instance and session reads, and the analysis-scope
 //! qualification — environment facts, the versioned compatibility rule and
 //! the deployment authorization context (#611) — and the target capture
-//! (#2141). Planning does not use the capture yet (#2143).
+//! (#2141). Planning orders from the capture and seals it as evidence (#2143).
 
 pub mod authorization;
 pub mod capture;
 pub mod compatibility;
 pub mod dependencies;
 pub mod environment;
+mod evidence;
+pub use evidence::{binding_classes, dependent_object, validate_evidence};
 pub mod externals;
 pub mod localdb;
 pub mod reconstruct;
@@ -49,7 +51,8 @@ pub async fn scope_facts(
         // Inside the bracket, so a principal renamed while the scope is read
         // is a difference between the two reads, not a spelling sealed from a
         // later state than the rest of the context (review of #1010).
-        authorization::resolve_spellings(conn, &mut authorization, planned_principals).await?;
+        authorization::read_planned_principals(conn, &mut authorization, planned_principals)
+            .await?;
         let catalog = environment::read(conn, scope).await?;
         reads.push((catalog, authorization));
     }

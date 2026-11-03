@@ -1006,6 +1006,6 @@
       "additionalProperties": false
     }
   },
-  "x-pbps-schema-version": 86,
+  "x-pbps-schema-version": 87,
   "x-pbps-tool-version": "0.0.0"
 }

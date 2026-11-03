@@ -2607,7 +2607,8 @@
         "resolver::server::scratch::live_tests::resolver_refuses_the_target_as_scratch",
         "resolver::server::scratch::live_tests::resolver_runs_in_a_precreated_database_with_a_confined_account",
         "resolver::server::scratch::live_tests::catalog_prose_shared_comments_are_shown_once_by_externals_and_fill",
-        "resolver::server::scratch::live_tests::catalog_prose_scratch_refusals_show_descriptions_without_changing_authority"
+        "resolver::server::scratch::live_tests::catalog_prose_scratch_refusals_show_descriptions_without_changing_authority",
+        "resolver::server::scratch::live_tests::resolver_a_plan_that_drops_a_managed_view_seals_and_reads_back"
       ]
     },
     {
@@ -2867,7 +2868,17 @@
       "resolver::server::scratch::mssql_live_tests::warm2585::a_warm_case_reports_and_recovers_database_and_login_leaks_without_touching_a_baseline",
       "resolver::server::scratch::mssql_live_tests::warm2585::limited_catalog_visibility_never_counts_as_an_empty_warm_inventory",
       "resolver::server::scratch::mssql_live_tests::warm2585::the_warm_model_is_restored_before_a_callback_panic_is_reported",
-      "resolver::server::scratch::mssql_live_tests::warm2585::the_warm_system_context_is_restored_before_a_callback_panic_is_reported"
+      "resolver::server::scratch::mssql_live_tests::warm2585::the_warm_system_context_is_restored_before_a_callback_panic_is_reported",
+        "resolver::server::scratch::mssql_live_tests::mssql_a_reconnect_to_a_differing_backend_refuses_and_an_equal_one_does_not",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_computed_column_binds_as_a_surface_and_a_changed_expression_is_assessed",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_filtered_index_is_no_resolver_surface",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_planned_grant_moves_the_sealed_authorization_condition",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_plan_that_creates_a_typed_table_seals_and_reads_back",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_plan_that_creates_a_view_seals_its_root",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_plan_that_drops_objects_releases_their_roots",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_target_reaching_another_cluster_is_not_sealed",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_user_defined_type_absent_from_opening_is_not_admitted_as_a_built_in",
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_shared_evidence_reads_back_through_the_sql_server_reader"
       ]
     },
     {
@@ -2968,7 +2979,14 @@
         "predicate2400::case_regeneration_matches_native_three_valued_logic",
         "predicate2400::grouping_quoting_and_plain_strings_preserve_native_results",
         "predicate2400::current_engine_and_compatibility_facts_gate_new_function_shapes",
-        "predicate2400::datefirst_and_dateformat_remain_session_dependent"
+        "predicate2400::datefirst_and_dateformat_remain_session_dependent",
+        "authorization2143::schema_control_records_the_schema_owner_as_grantor",
+        "authorization2143::grant_option_records_the_deployer_as_grantor",
+        "authorization2143::a_plain_grant_preserves_an_existing_grant_option",
+        "authorization2143::revoking_grant_option_without_cascade_refuses_before_a_condition_exists",
+        "authorization2143::revoking_a_role_deny_restores_engine_reported_schema_and_column_permissions",
+        "authorization2143::an_unmapped_scratch_principal_is_named_and_never_sealed",
+        "builtins2143::engine_builtins_are_the_shipped_types_and_never_a_user_defined_one"
       ]
     },
     {

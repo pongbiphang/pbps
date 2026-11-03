@@ -91,6 +91,10 @@ ALLOWED = {
         1,
         "renders validated raw type arguments as SQL, not diagnostic prose (#2400)",
     ),
+    "crates/pbps-mssql/src/resolver/authorization/condition.rs": (
+        None,
+        "builds a catalog lookup of a planned principal's kind; diagnostic sinks remain checked",
+    ),
     "crates/pbps-mssql/src/resolver/dependencies.rs": (
         None,
         "builds companion declaration SQL; diagnostic sinks remain checked",
