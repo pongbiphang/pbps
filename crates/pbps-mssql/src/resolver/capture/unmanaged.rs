@@ -8,7 +8,7 @@
 //! names, whether the first match on its lookup path moves once the objects the
 //! plan creates exist.
 
-use super::{CandidateSet, CaptureError, CaptureScope, ObjectIdentity, Uncovered, class};
+use super::{CaptureError, CaptureScope, ObjectIdentity, Uncovered, class};
 use pbps_db::transport::QueryConnection;
 use std::collections::BTreeSet;
 
@@ -31,30 +31,6 @@ fn lookup(created: &ObjectIdentity) -> Option<(&str, &str)> {
 
 fn literal(text: &str) -> String {
     format!("N'{}'", text.replace('\'', "''"))
-}
-
-/// The arrival that becomes the first match on `path`, the ordered candidate
-/// sets of one runtime-bound name, if one does. `target` and `scratch` hold
-/// what each side found in them. Only an arrival counts: what scratch lacks of
-/// the target's own (unmanaged objects it was never given) is no drop the plan
-/// makes. The first set the target already fills keeps the binding, unless
-/// scratch holds a second candidate there, which the path does not order.
-pub(crate) fn arrival_on_path(
-    path: &[CandidateSet],
-    target: &super::CapturedInputs,
-    scratch: &super::CapturedInputs,
-) -> Result<Option<ObjectIdentity>, CaptureError> {
-    for set in path {
-        let held = target.members(set).ok_or(CaptureError::Incomplete)?;
-        let there = scratch.members(set).ok_or(CaptureError::Incomplete)?;
-        if !held.is_empty() {
-            return Ok(there.difference(held).next().cloned());
-        }
-        if let Some(arrival) = there.iter().next() {
-            return Ok(Some(arrival.clone()));
-        }
-    }
-    Ok(None)
 }
 
 /// Reads the unmanaged modules the plan's created objects rebind. Without
@@ -153,7 +129,7 @@ pub async fn unmanaged_rebinds(
     let mut found = BTreeSet::new();
     for (module, paths) in modules.lookup_paths() {
         for path in paths {
-            if let Some(arrival) = arrival_on_path(&path, &on_target, &on_scratch)? {
+            if let Some(arrival) = super::select::arrival_on_path(&path, &on_target, &on_scratch)? {
                 found.insert(Rebound {
                     module: module.name.clone(),
                     created: arrival.name,

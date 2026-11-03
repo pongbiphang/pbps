@@ -457,3 +457,48 @@ async fn mssql_a_name_that_resolves_earlier_on_the_path_than_the_arrival_is_not_
     }
     both(case).await;
 }
+
+/// A managed module whose name already resolves in its own schema keeps that
+/// binding when the plan creates the same name in `dbo`, later on its path, so
+/// nothing is reported for it.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_managed_module_whose_name_resolves_earlier_than_the_arrival_is_not_reported() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE TABLE app2143.thing2143(id int NOT NULL);",
+                    "CREATE PROCEDURE app2143.reader2143 AS SELECT 1 AS id FROM thing2143;",
+                ],
+            )
+            .await;
+            let mut declared = declared(&[module(
+                ModuleKind::Procedure,
+                "app2143.reader2143",
+                "AS SELECT 1 AS id FROM thing2143",
+            )]);
+            kept(&mut declared, "app2143.thing2143");
+            declared.base = declared.desired.clone();
+            creates(&mut declared, "dbo.thing2143");
+            let (plan, _) = declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the run should seal a plan: {error}"));
+            assert!(
+                plan.evidence
+                    .qualification()
+                    .limitations
+                    .keys()
+                    .all(|name| !name.raw().starts_with("binding-change:")),
+                "{:?}",
+                plan.evidence.qualification().limitations
+            );
+        })
+    }
+    both(case).await;
+}

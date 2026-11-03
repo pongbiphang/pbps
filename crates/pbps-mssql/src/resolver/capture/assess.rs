@@ -77,18 +77,32 @@ pub(super) fn assess(
             );
             for set in needed {
                 match (target.candidates.get(&set), desired.candidates.get(&set)) {
-                    (Some(a), Some(b)) => {
+                    (Some(a), Some(_)) => {
                         if let Some(member) = a.iter().find(|member| !reproduced(member)) {
                             missing_candidate = Some(member);
                             break;
                         }
-                        // A candidate scratch holds and the target lacks is an
-                        // object the plan creates: once applied, the module's
-                        // name resolves to it, with no statement for the
-                        // module (DEC-2143.7).
-                        arrivals.extend(b.difference(a).cloned());
                     }
                     _ => unread = true,
+                }
+            }
+        }
+        // An object scratch holds and the target lacks is an arrival the plan
+        // creates; the module's binding moves only when it becomes the first
+        // match on a lookup path, which `select::runtime_paths` alone defines
+        // (DEC-2143.7, #2665).
+        if let Some(names) = desired.runtime.get(object) {
+            let one = BTreeMap::from([(object.clone(), names.clone())]);
+            for path in super::select::runtime_paths(&desired.inputs, &one)
+                .into_values()
+                .flatten()
+            {
+                match super::select::arrival_on_path(&path, target, desired) {
+                    Ok(Some(arrival)) => {
+                        arrivals.insert(arrival);
+                    }
+                    Ok(None) => {}
+                    Err(_) => unread = true,
                 }
             }
         }

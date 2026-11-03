@@ -1250,6 +1250,32 @@ pub(super) fn runtime_paths(
     paths
 }
 
+/// The arrival that becomes the first match on `path`, the ordered candidate
+/// sets of one runtime-bound name, if one does. `target` and `scratch` hold
+/// what each side found in them. Only an arrival counts: what scratch lacks of
+/// the target's own (unmanaged objects it was never given) is no drop the plan
+/// makes. The first set the target already fills keeps the binding, unless
+/// scratch holds a second candidate there, which the path does not order.
+pub(super) fn arrival_on_path(
+    path: &[CandidateSet],
+    target: &super::CapturedInputs,
+    scratch: &super::CapturedInputs,
+) -> Result<Option<ObjectIdentity>, super::CaptureError> {
+    for set in path {
+        let held = target.members(set).ok_or(super::CaptureError::Incomplete)?;
+        let there = scratch
+            .members(set)
+            .ok_or(super::CaptureError::Incomplete)?;
+        if !held.is_empty() {
+            return Ok(there.difference(held).next().cloned());
+        }
+        if let Some(arrival) = there.iter().next() {
+            return Ok(Some(arrival.clone()));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 #[path = "translation2162_tests.rs"]
 mod translation2162;

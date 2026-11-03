@@ -5885,8 +5885,9 @@ not hide it.
 
 For a managed module the compiled capture already holds the candidates of each
 runtime-bound name on scratch and on the target. A candidate scratch holds and
-the target lacks is an object the plan creates, and the assessment lists it per
-module as a rebind. The producer seals it as a named limitation,
+the target lacks is an object the plan creates; when it becomes the first match
+on a lookup path of the module's names (the same paths as for an unmanaged
+module below), the assessment lists it per module as a rebind. The producer seals it as a named limitation,
 `binding-change:<module>`, which `plan` and `explain` print under the limitations
 the plan accepted and which the seal digest covers. It is not a new envelope
 field: design item 6 asked for a typed list in the assessment output, and the
