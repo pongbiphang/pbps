@@ -455,6 +455,24 @@ class IndependentFailures(Harness):
                                       shards=1, check=1)
                 self.assertFalse(after.exists())
 
+    def test_a_python_resume_refuses_changed_gate_context(self):
+        context = {"EVENT": "pull_request", "BASE_SHA": self.master, "ProgramFiles": r"C:\Program Files"}
+        _, before = self.drive(suite="python", env=context, check=0)
+        # A changed outcome in the stub must not execute a previously proven check.
+        context["FAKE_PY_FAIL"] = "1"
+        _, carried = self.drive("--resume", str(before), suite="python", env=context, check=0)
+        receipt, = (carried / "python/0").glob("*.json")
+        row = json.loads(receipt.read_text())
+        self.assertEqual(row["reported"], {})
+        self.assertEqual(set(row["carried"]), {"scripts/check_demo.py"})
+        for name, value in (("EVENT", "schedule"), ("BASE_SHA", "1" * 40),
+                            ("ProgramFiles", r"D:\Program Files")):
+            with self.subTest(name=name):
+                result, refused = self.drive("--resume", str(before), suite="python",
+                    env=dict(context, **{name: value}), check=1)
+                self.assertIn("previous inputs", result.stderr)
+                self.assertFalse(refused.exists())
+
     def test_a_python_check_reruns_once_as_a_whole_and_a_second_failure_blocks(self):
         for fails in (False, True):
             with self.subTest(fails=fails):
@@ -1422,7 +1440,8 @@ class Identity(unittest.TestCase):
         reference = self.digest()
         self.assertEqual(self.digest(), reference)
         for name in ("PBPS_TEST_DEV_IMAGE", "PBPS_TEST_PG_SCRATCH_IMAGE", "RUSTFLAGS", "INSTA_UPDATE",
-                     "CARGO_PROFILE_DEV_DEBUG", "PBPS_SOMETHING_NEW"):
+                     "CARGO_PROFILE_DEV_DEBUG", "PBPS_SOMETHING_NEW", "EVENT", "BASE_SHA",
+                     "ProgramFiles", "PROGRAMFILES"):
             with self.subTest(name):
                 self.assertNotEqual(self.digest(**{name: "x"}), reference)
 

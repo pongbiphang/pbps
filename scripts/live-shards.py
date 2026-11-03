@@ -60,7 +60,10 @@ REGISTER = "scripts/known-flakes.json"
 MAX_FLAKE_FAILURES = 2
 # Default-include: any variable with these spellings may change a verdict.
 INPUT_PREFIXES = ("PBPS_", "INSTA_", "CARGO_PROFILE_")
-INPUT_NAMES = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS"}
+# Python checks read CI expiry scope and the LocalDB install root. Windows
+# uppercases environment keys, so compare their normalized spelling below.
+INPUT_NAMES = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS",
+               "EVENT", "BASE_SHA", "PROGRAMFILES"}
 FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
@@ -395,7 +398,7 @@ def inputs_digest(env):
         return result.stdout
     names = sorted(name for name in env
                    if name not in FIXTURE_VARIABLES and not name.startswith("PBPS_LIVE_")
-                   and (name in INPUT_NAMES or name.startswith(INPUT_PREFIXES)))
+                   and (name.upper() in INPUT_NAMES or name.startswith(INPUT_PREFIXES)))
     # rustc's commit and host identify the toolchain; cargo ships with it.
     body = {"version": 1, "rustc": tool(["rustc", "-vV"]), "python": sys.version,
             "env": {name: env[name] for name in names}}
