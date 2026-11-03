@@ -455,6 +455,70 @@ impl TestManifest {
     }
 }
 
+impl TestManifest {
+    /// `text` (the bytes this manifest was parsed from) with fixture `index`'s
+    /// `at` changed to `to` and every other byte kept: a re-pin edits one pin,
+    /// not the user's layout or comments.
+    ///
+    /// The splice is located by the YAML parser's byte span and then proved:
+    /// the result must parse to this manifest with exactly that pin changed,
+    /// so a span that landed on another occurrence of the same id (another
+    /// fixture's pin, or `base`) is refused instead of written.
+    pub fn with_pin(&self, text: &str, index: usize, to: &CommitId) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct Spans {
+            fixtures: Vec<SpanFixture>,
+        }
+        #[derive(serde::Deserialize)]
+        struct SpanFixture {
+            at: serde_saphyr::Spanned<String>,
+        }
+        let spans: Spans = serde_saphyr::from_str(text).map_err(|e| e.to_string())?;
+        let at = &spans
+            .fixtures
+            .get(index)
+            .ok_or("the manifest has no such fixture entry")?
+            .at;
+        let span = at.referenced.span();
+        let (Some(offset), Some(len)) = (span.byte_offset(), span.byte_len()) else {
+            return Err("the parser gave no byte position for the pin".to_owned());
+        };
+        let (start, end) = (offset as usize, (offset + len) as usize);
+        let scalar = text
+            .get(start..end)
+            .ok_or("the pin's position is not inside the manifest")?;
+        // An alias (`at: *pin`) is replaced whole by the new scalar. Changing
+        // the anchor it points at would move every alias of it, which the
+        // reparse below refuses.
+        let old = self.fixtures[index].at.as_str();
+        let (from, until) = if scalar.starts_with('*') {
+            (start, end)
+        } else {
+            // Lowercasing ASCII keeps every byte position, so a pin typed in
+            // capitals is found and replaced in place.
+            let lowered = scalar.to_ascii_lowercase();
+            let found = lowered.matches(old).count();
+            let Some(inside) = lowered.find(old).filter(|_| found == 1) else {
+                return Err("the pin's text is not found once at its position".to_owned());
+            };
+            (start + inside, start + inside + old.len())
+        };
+        let mut rewritten = String::with_capacity(text.len());
+        rewritten.push_str(&text[..from]);
+        rewritten.push_str(to.as_str());
+        rewritten.push_str(&text[until..]);
+        let mut expected = self.clone();
+        expected.fixtures[index].at = to.clone();
+        match Self::parse(&rewritten) {
+            Ok(parsed) if parsed == expected => Ok(rewritten),
+            _ => Err(
+                "the edited manifest would not equal the old one with only that pin changed"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 /// Why `rev` cannot be handed to git as a revision, if it cannot. It is
 /// resolved by the caller, and git alone judges the expression: `HEAD^{/some
 /// text}` is a revision with spaces in it. This only keeps it from being read

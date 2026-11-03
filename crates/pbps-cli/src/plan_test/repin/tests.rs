@@ -1,4 +1,121 @@
-use super::{declared_path, forget_observations, runs};
+use super::*;
+
+struct Dir(std::path::PathBuf);
+impl Dir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("pbps-repin-{:x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn manifest(&self) -> std::path::PathBuf {
+        let path = self.0.join("pbps-tests.yml");
+        std::fs::write(&path, "old\n").unwrap();
+        path
+    }
+    fn leftovers(&self) -> Vec<String> {
+        std::fs::read_dir(&self.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "pbps-tests.yml")
+            .collect()
+    }
+}
+impl Drop for Dir {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ =
+            std::fs::set_permissions(&self.0, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn changed() -> Vec<Refusal> {
+    vec![Refusal::Repin("an input moved".into())]
+}
+
+#[test]
+#[cfg(unix)]
+fn a_replacement_publishes_whole_bytes_keeps_the_mode_and_leaves_no_temporary() {
+    let dir = Dir::new();
+    let path = dir.manifest();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+    replace(&path, b"new\n", || Ok(())).unwrap_or_else(|_| panic!("replace failed"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o640);
+    assert!(dir.leftovers().is_empty(), "{:?}", dir.leftovers());
+}
+
+#[test]
+fn a_changed_input_at_the_last_check_leaves_the_manifest_and_no_temporary() {
+    let dir = Dir::new();
+    let path = dir.manifest();
+    let blocked = replace(&path, b"new\n", || Err(changed()));
+    assert!(matches!(blocked, Err(Blocked::Input(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+    assert!(dir.leftovers().is_empty(), "{:?}", dir.leftovers());
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unwritable_directory_refuses_without_touching_the_manifest() {
+    let dir = Dir::new();
+    let path = dir.manifest();
+    std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+    // A superuser is not stopped by the mode; the property needs an ordinary user.
+    if std::fs::File::create(dir.0.join("probe")).is_ok() {
+        return;
+    }
+    let blocked = replace(&path, b"new\n", || Ok(()));
+    assert!(matches!(blocked, Err(Blocked::Write(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+}
+
+#[test]
+fn a_missing_target_refuses_and_the_check_never_runs() {
+    let dir = Dir::new();
+    let path = dir.0.join("absent.yml");
+    let blocked = replace(&path, b"new\n", || panic!("the check ran"));
+    assert!(matches!(blocked, Err(Blocked::Write(_))));
+    assert!(dir.leftovers().is_empty(), "{:?}", dir.leftovers());
+}
+
+fn passed(name: &str) -> Phase {
+    let mut p = Phase::new(name, "x");
+    p.outcome = Status::Passed;
+    p
+}
+
+fn finished() -> TestData {
+    let mut data = TestData::for_repin();
+    data.cleanup_confirmed = true;
+    data.inputs_reverified = true;
+    data.phases = vec![passed("input"), passed("compare_rows"), passed("cleanup")];
+    data
+}
+
+#[test]
+fn the_pin_moves_only_when_every_phase_passed_and_cleanup_is_confirmed() {
+    assert!(may_publish(&finished()));
+    let mut data = finished();
+    data.cleanup_confirmed = false;
+    assert!(!may_publish(&data), "unconfirmed cleanup");
+    let mut data = finished();
+    data.inputs_reverified = false;
+    assert!(!may_publish(&data), "inputs not reverified");
+    for outcome in [Status::Failed, Status::Unanswerable, Status::Skipped] {
+        let mut data = finished();
+        data.phases[1].outcome = outcome;
+        assert!(!may_publish(&data), "{outcome:?}");
+    }
+    let mut data = finished();
+    data.phases.push(Phase::new("manifest_write", "m"));
+    assert!(
+        may_publish(&data),
+        "the write phase itself is not a precondition"
+    );
+}
 
 #[test]
 fn the_second_side_runs_only_after_the_first_completed_and_was_cleaned() {
@@ -27,4 +144,70 @@ fn a_second_scratch_starts_without_the_first_ones_observations() {
     data.engine_build = Some("PostgreSQL 16".into());
     forget_observations(&mut data);
     assert!(data.run_id.is_none() && data.acquired_image.is_none() && data.engine_build.is_none());
+}
+
+#[test]
+fn a_replaced_manifest_is_never_reported_as_not_moved() {
+    let fresh = || ManifestWrite {
+        status: "not_attempted".into(),
+        old_sha256: "old".into(),
+        new_sha256: None,
+        reason: None,
+    };
+    let mut m = fresh();
+    let (_, message) = record_blocked(Blocked::Write(anyhow::anyhow!("no space")), "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("failed", None)
+    );
+    assert!(message.starts_with("the pin was not moved"), "{message}");
+    // Replaced and read back, but not synced: the pin did move.
+    let mut m = fresh();
+    let replaced = Blocked::Replaced {
+        error: anyhow::anyhow!("sync failed"),
+        confirmed: true,
+    };
+    let (_, message) = record_blocked(replaced, "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("written", Some("new"))
+    );
+    assert!(
+        message.contains("was replaced") && !message.contains("not moved"),
+        "{message}"
+    );
+    // Replaced but not read back: the bytes are unknown, and the report says so.
+    let mut m = fresh();
+    let replaced = Blocked::Replaced {
+        error: anyhow::anyhow!("unreadable"),
+        confirmed: false,
+    };
+    let (_, message) = record_blocked(replaced, "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("failed", None)
+    );
+    assert!(
+        message.contains("was replaced") && !message.contains("not moved"),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_opened_refuses_before_anything_is_replaced() {
+    let dir = Dir::new();
+    let path = dir.manifest();
+    // Write and search, but no read: files can be replaced, the directory cannot be opened.
+    std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&dir.0).is_ok() {
+        std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        return;
+    }
+    let blocked = replace(&path, b"new\n", || Ok(()));
+    std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert!(matches!(blocked, Err(Blocked::Write(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+    assert!(dir.leftovers().is_empty());
 }

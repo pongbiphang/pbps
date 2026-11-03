@@ -947,5 +947,19 @@ when there is one. A difference is a finding (2); an unreadable or exhausted
 allocator, an unreadable table, differing engines or a changed input is
 unanswerable (1). The envelope gains a `repin` record and a phase `side` (schema
 set 89; the manifest write status is text so the write that follows needs no new
-set). This slice only verifies: the manifest is left untouched and says so.
-SQL Server re-pin remains a later #1165 slice.
+set). SQL Server re-pin remains a later #1165 slice.
+
+<a id="dec-1165-13"></a>
+
+**DEC-1165.13. The re-pin writes the manifest only after a verified match and confirmed cleanup.**
+The selected `at` scalar is spliced by its YAML byte span and proved by reparsing
+to the old manifest with exactly that pin changed, so another occurrence of the
+same id (another fixture, or `base`) can never be the one written. The result is
+written to a synced temporary file beside the manifest, checked against the
+inputs and `HEAD` once more, renamed over it and read back. It happens only when
+every other phase passed and both cleanups are confirmed; otherwise the manifest
+keeps its exact bytes and the report says `not_attempted` or `failed`. A crash
+leaves the whole old or whole new manifest and at most one orphan
+`.…repin-….tmp`. A writer that replaces the manifest between the last check and
+the rename is not detected: POSIX offers no compare-and-swap for a file, and a
+lock would not bind editors, so that window is documented, not closed.

@@ -353,3 +353,79 @@ fn messages_show_user_text_escaped() {
     .to_string();
     assert!(!shown.contains('\n'));
 }
+
+fn pinned(entries: &str) -> String {
+    format!(
+        "# keep me\nversion: 1\ndialect: postgres\nbase: {BASE}\nengine:\n  image: {IMAGE}\n\
+         fixtures:{entries}\nassertions:\n  - name: a\n    file: a.sql\n"
+    )
+}
+
+const NEW: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+#[test]
+fn a_pin_rewrite_changes_only_the_selected_pin_in_block_and_flow_style() {
+    let old = "1111111111111111111111111111111111111111";
+    let block = pinned(&format!(
+        "\n  - name: x # why\n    file: x.sql\n    at: {old}\n  - name: y\n    file: y.sql\n    at: {old}"
+    ));
+    let flow = pinned(&format!(
+        "\n  - {{name: x, file: x.sql, at: \"{old}\"}}\n  - {{name: y, file: y.sql, at: {old}}}"
+    ));
+    let to = CommitId::parse(NEW).unwrap();
+    for text in [block, flow] {
+        let manifest = TestManifest::parse(&text).unwrap();
+        let edited = manifest.with_pin(&text, 0, &to).unwrap();
+        // Same-length ids: the only differing bytes are the selected pin's.
+        assert_eq!(edited.len(), text.len());
+        assert_eq!(edited.replacen(NEW, old, 1), text, "{edited}");
+        let parsed = TestManifest::parse(&edited).unwrap();
+        assert_eq!(parsed.fixtures[0].at, to);
+        assert_eq!(parsed.fixtures[1].at.as_str(), old, "the other pin moved");
+        assert_eq!(parsed.base.as_str(), BASE);
+    }
+}
+
+#[test]
+fn a_pin_equal_to_the_base_is_not_confused_with_the_base() {
+    let text = pinned(&format!("\n  - name: x\n    file: x.sql\n    at: {BASE}"));
+    let manifest = TestManifest::parse(&text).unwrap();
+    let edited = manifest
+        .with_pin(&text, 0, &CommitId::parse(NEW).unwrap())
+        .unwrap();
+    assert!(edited.contains(&format!("base: {BASE}")), "{edited}");
+    assert!(edited.contains(&format!("at: {NEW}")), "{edited}");
+}
+
+#[test]
+fn a_pin_rewrite_refuses_a_missing_entry_and_a_stale_manifest() {
+    let text = pinned(&format!("\n  - name: x\n    file: x.sql\n    at: {BASE}"));
+    let manifest = TestManifest::parse(&text).unwrap();
+    let to = CommitId::parse(NEW).unwrap();
+    assert!(manifest.with_pin(&text, 1, &to).is_err());
+    // The text is not what this manifest was parsed from: the pin is not at its span.
+    let other = text.replace(&format!("at: {BASE}"), &format!("at: {NEW}"));
+    assert!(manifest.with_pin(&other, 0, &to).is_err());
+}
+
+#[test]
+fn a_pin_shared_by_an_alias_moves_only_through_the_alias() {
+    let old = "1111111111111111111111111111111111111111";
+    let text = pinned(&format!(
+        "\n  - {{name: x, file: x.sql, at: &shared {old}}}\n  - {{name: y, file: y.sql, at: *shared}}"
+    ));
+    let manifest = TestManifest::parse(&text).unwrap();
+    let to = CommitId::parse(NEW).unwrap();
+    // The alias entry takes the new scalar and the anchor keeps the old one.
+    let edited = manifest.with_pin(&text, 1, &to).unwrap();
+    assert!(edited.contains(&format!("at: &shared {old}")), "{edited}");
+    assert!(
+        edited.contains(&format!("file: y.sql, at: {NEW}")),
+        "{edited}"
+    );
+    let parsed = TestManifest::parse(&edited).unwrap();
+    assert_eq!(parsed.fixtures[0].at.as_str(), old);
+    assert_eq!(parsed.fixtures[1].at.as_str(), NEW);
+    // Rewriting the anchor would move its alias too, so it is refused.
+    assert!(manifest.with_pin(&text, 0, &to).is_err());
+}

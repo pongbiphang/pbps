@@ -237,10 +237,10 @@ other roles can create in are #1004.
 PostgreSQL `pbps test` replays pinned fixture revisions and tests a working-tree
 or committed candidate through the ordinary deployment services in owned scratch.
 It reports typed evidence without an applyable plan file; `test --cleanup`
-reconciles owned dead runs. `test fixtures repin` verifies in two scratches
-that an edited fixture at a newer pin leaves the same rows and next allocator
-values (DEC-1165.12); writing the manifest is the next slice. SQL Server
-execution remains a later #1165 slice (ADR-0019, DEC-1165.11).
+reconciles owned dead runs. `test fixtures repin` moves one fixture pin only
+after the edited SQL provably leaves the same rows and next allocator values
+(DEC-1165.12, DEC-1165.13). SQL Server execution remains a later #1165 slice
+(ADR-0019, DEC-1165.11).
 
 ## Live tests
 
