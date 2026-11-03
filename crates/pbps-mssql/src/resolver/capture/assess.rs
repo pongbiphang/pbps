@@ -117,12 +117,10 @@ pub(super) fn assess(
         } else {
             Verdict::Created
         };
-        if !arrivals.is_empty()
-            && matches!(
-                verdict,
-                Verdict::Unaffected | Verdict::Rebuild | Verdict::Created
-            )
-        {
+        // Only a module the plan keeps as it is has its binding changed with
+        // no statement. A created or rebuilt one binds afresh when the plan
+        // runs it, so there is no change to report for it.
+        if !arrivals.is_empty() && verdict == Verdict::Unaffected {
             result.rebinds.insert(object.clone(), arrivals);
         }
         result.surfaces.insert(object.clone(), verdict);

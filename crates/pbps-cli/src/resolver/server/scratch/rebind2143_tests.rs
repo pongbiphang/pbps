@@ -59,6 +59,39 @@ async fn mssql_an_object_the_plan_creates_that_captures_a_reference_is_reported(
     both(case).await;
 }
 
+/// A module the plan creates binds afresh, so a name it creates beside it is
+/// no change to report, and no claim that the module receives no statement.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_module_the_plan_creates_beside_the_object_is_not_reported_as_rebound() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut declared = declared(&[module(ModuleKind::Procedure, "dbo.new2143", BODY)]);
+            creates(&mut declared, "dbo.ghost");
+            let (plan, _) = declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the run should seal a plan: {error}"));
+            assert!(
+                plan.evidence
+                    .qualification()
+                    .limitations
+                    .keys()
+                    .all(|name| !name.raw().starts_with("binding-change:")),
+                "{:?}",
+                plan.evidence.qualification().limitations
+            );
+            assert!(
+                plan.changes.changes().changes.len() >= 2,
+                "the plan creates both the module and the table"
+            );
+        })
+    }
+    both(case).await;
+}
+
 /// The negatives: a created name no module mentions reports nothing, and a
 /// plan that creates nothing reports nothing.
 #[tokio::test]
