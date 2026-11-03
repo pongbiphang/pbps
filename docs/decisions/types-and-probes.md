@@ -4935,7 +4935,7 @@ its replacement when a role short of a superuser can replace it. The refusal
 text changes: "is not built into PostgreSQL" is now the missing `search_path`
 with its exact fix, or the owner with the three remedies. No plan format
 changes: `type_routines` still holds the reviewed routines, and only what it
-holds widens (plan 60, state 36 and the schema set are unchanged). A later slice
+holds widens (plan and state versions and the schema set are unchanged). A later slice
 judges the expressions of tables, indexes, policies and partition keys the plan
 introduces, and the compatibility change that comes with it (untrusted-owner
 helpers there are refused); they stay change-detected by DEC-319.1 until then.
