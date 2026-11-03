@@ -202,6 +202,7 @@ pub fn admission(project: &Project) -> Admission {
         project.config.trusted_roles.iter().cloned(),
         project.config.pin_type_routines,
     )
+    .deferring()
 }
 
 /// The pins `plan` writes into a PostgreSQL plan, or `None` when nothing is

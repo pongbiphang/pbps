@@ -29,6 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pbps_model::RoleName;
 
@@ -47,6 +48,11 @@ pub struct Admission {
     /// The routines a saved plan showed and pinned. When set, a site refuses a
     /// reviewed routine outside it, before it evaluates anything.
     approved: Option<BTreeSet<Oid>>,
+    /// Plan time: code that only the review admits is not evaluated before the
+    /// human has read it, so a site that would evaluate defers to apply.
+    defer: bool,
+    /// How many vets so far have relied on the review.
+    reliances: AtomicUsize,
     reviewed: Mutex<BTreeSet<Oid>>,
 }
 
@@ -58,8 +64,32 @@ impl Admission {
             pin,
             can_review: true,
             approved: None,
+            defer: false,
+            reliances: AtomicUsize::new(0),
             reviewed: Mutex::default(),
         }
+    }
+
+    /// Plan's admission: a site still vets (so the plan can show and pin the
+    /// routine) but must not evaluate an expression whose admission relies on
+    /// the review (rule 4). Apply evaluates it, after the approval.
+    #[must_use]
+    pub fn deferring(mut self) -> Self {
+        self.defer = true;
+        self
+    }
+
+    /// A mark for [`Self::relied_since`], taken before a site vets.
+    #[must_use]
+    pub fn mark(&self) -> usize {
+        self.reliances.load(Ordering::SeqCst)
+    }
+
+    /// Whether this admission defers and a vet since `mark` relied on the
+    /// review: the site must then skip its evaluation.
+    #[must_use]
+    pub fn relied_since(&self, mark: usize) -> bool {
+        self.defer && self.mark() > mark
     }
 
     /// Apply's admission: review admits only the routines the plan holds. A
@@ -106,10 +136,15 @@ impl Admission {
     }
 
     pub(crate) fn review(&self, oids: impl IntoIterator<Item = Oid>) {
-        self.reviewed
+        let mut reviewed = self
+            .reviewed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(oids);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut any = false;
+        reviewed.extend(oids.into_iter().inspect(|_| any = true));
+        if any {
+            self.reliances.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// The routines rule 4 admitted so far, by `pg_proc.oid`.
@@ -325,6 +360,24 @@ mod tests {
         assert_eq!(approving.unapproved(&BTreeSet::from([2])), None);
         assert_eq!(approving.unapproved(&BTreeSet::from([2, 9])), Some(9));
         assert_eq!(approving.unapproved(&BTreeSet::new()), None);
+    }
+
+    #[test]
+    fn only_a_deferring_admission_skips_after_a_vet_that_relied_on_the_review() {
+        for (admission, defers) in [
+            (Admission::new([], true).deferring(), true),
+            (Admission::new([], true), false),
+        ] {
+            let mark = admission.mark();
+            admission.review([]);
+            assert!(!admission.relied_since(mark));
+            admission.review([7]);
+            assert_eq!(admission.relied_since(mark), defers);
+            // The same routine reviewed again at another site still counts.
+            let mark = admission.mark();
+            admission.review([7]);
+            assert_eq!(admission.relied_since(mark), defers);
+        }
     }
 
     #[test]

@@ -4946,3 +4946,13 @@ the types-only scratch vet, which cannot hold that function. The plan carries
 the advisory warning, and apply judges the routine by this predicate in the
 creating transaction (a missing fixed `search_path` is refused there with the
 exact `ALTER FUNCTION` line). The one-statement and missing-type refusals stay.
+
+Plan time evaluates nothing the review alone admits. `plan --db` still vets every
+conversion, requirement and copy conversion, so the plan can show and pin the
+routines (rule 4), but a site whose vet relied on the review does not evaluate
+its expression before the human has read the source: the rebuild's copy
+projection (`rebuild::observe`) is reported unchecked, and the pre-flight probes
+of `run_probes_observed` are skipped with the notice that apply checks them
+(`Admission::deferring`, `relied_since`). Apply evaluates them after the
+approval, through the approved set. Expressions admitted by owner trust or tier 1
+are evaluated at plan time as before.

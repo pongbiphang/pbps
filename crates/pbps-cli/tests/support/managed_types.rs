@@ -8866,3 +8866,69 @@ fn a_created_domain_may_call_a_trusted_routine_that_sets_a_search_path() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn the_preflight_runs_a_reviewed_conversion_at_apply_and_never_at_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood, amount varchar(20));
+            INSERT INTO app.t VALUES (1,'ok','abc');";
+        let (own, d) = adopted(&server, "rebuild_reviewed2563", sql);
+        let db = own.connection();
+        d.keyed(db);
+        let config = d.dir.join("pbps.yml");
+        let current = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{current}pin_type_routines: true\n")).unwrap();
+        // A routine a role short of a superuser owns: only the review admits
+        // it, so the plan must show it and must not run it over the rows.
+        let stranger = format!("pbps_preflight2563_{}", std::process::id());
+        on_server(
+            &server,
+            &format!("DROP ROLE IF EXISTS {stranger}; CREATE ROLE {stranger}"),
+        );
+        on_server(
+            db,
+            &format!(
+                "GRANT USAGE ON SCHEMA app TO {stranger}; \
+                 CREATE FUNCTION app.size(text) RETURNS integer LANGUAGE plpgsql IMMUTABLE \
+                 SET search_path = pg_catalog AS $$ BEGIN RAISE EXCEPTION 'reviewed code ran' USING ERRCODE = 'PB001'; \
+                 RETURN length($1); END $$; ALTER FUNCTION app.size(text) OWNER TO {stranger}"
+            ),
+        );
+        let table = std::fs::read_to_string(d.dir.join("schema/app.t.yml")).unwrap();
+        assert!(table.contains("type: character varying(20)"), "{table}");
+        let retyped = table.replace("type: character varying(20)", "type: integer");
+        std::fs::write(d.dir.join("schema/app.t.yml"), retyped).unwrap();
+        declare_mood(&d, "[ok, happy]");
+        succeeds(d.run(&[
+            "convert",
+            "app.t.amount",
+            "--using",
+            "app.size(amount)",
+            "--from",
+            "varchar(20)",
+        ]));
+        let path = d.dir.join("reviewed.plan.json");
+        let planned = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        let text = format!("{}{}", stdout(&planned), stderr(&planned));
+        assert_eq!(code(&planned), 0, "{text}");
+        assert!(text.contains("unchecked until source review"), "{text}");
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(plan.type_routines.len(), 1);
+        assert!(rebuild_steps(&plan) > 0);
+        // After the approval, apply runs the probes, and the routine with them:
+        // its own error code is how the test sees it ran (the probe is
+        // read-only, so it cannot leave a counter).
+        let applied = apply_rebuild(&d, db, &path, &["--allow", "narrowing"]);
+        assert_ne!(code(&applied), 0);
+        let text = format!("{}{}", stdout(&applied), stderr(&applied));
+        assert!(text.contains("PB001"), "{text}");
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "nothing was changed");
+    }
+}

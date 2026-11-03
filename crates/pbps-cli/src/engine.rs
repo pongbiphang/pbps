@@ -6770,17 +6770,26 @@ pub async fn expand_table_rebuild<
             }
         })
         .ok_or_else(|| anyhow::anyhow!("missing qualified rebuild root"))?;
-    let (changes, rows, bytes, verification) =
+    let (changes, observed, verification) =
         pbps_pg::rebuild::plan(conn, admission, changes, before, desired, hints, dialect).await?;
     Ok((
         changes,
         ConnectedCheck {
             name: "blocking_rewrite",
             engine: "PostgreSQL",
-            status: "checked",
-            message: format!(
-                "blocking rewrite composed over {links} approved links: {rows} observed rows, max_rows {cap}, {bytes} total bytes; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
-            ),
+            status: if observed.is_some() {
+                "checked"
+            } else {
+                "unchecked"
+            },
+            message: match observed {
+                Some((rows, bytes)) => format!(
+                    "blocking rewrite composed over {links} approved links: {rows} observed rows, max_rows {cap}, {bytes} total bytes; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
+                ),
+                None => format!(
+                    "blocking rewrite composed over {links} approved links, max_rows {cap}: the rows were not observed because a conversion routine awaits source review; apply observes them before copying; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
+                ),
+            },
         },
         verification,
     ))

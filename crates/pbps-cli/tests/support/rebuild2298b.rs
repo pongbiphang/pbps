@@ -626,3 +626,82 @@ fn rebuild2520_probe_cannot_execute_declared_expressions() {
         ]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_copy_conversions_reviewed_routine_runs_at_apply_and_never_at_plan() {
+    for server in [server(), old_server()] {
+        let own = OwnDatabase::new(&server, "rebuild2563_review");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; CREATE TABLE app.p(k integer NOT NULL,bucket integer NOT NULL,label text) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p VALUES(1,2,'a'),(3,4,'b')",
+        );
+        let d = Demo::new("rebuild2563-review");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.keyed(connection);
+        let config = d.dir.join("pbps.yml");
+        let current = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{current}pin_type_routines: true\n")).unwrap();
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        // A routine a role short of a superuser owns: only the review admits
+        // it, so the plan must show it and must not run it.
+        let stranger = format!("pbps_rebuild2563_{}", std::process::id());
+        on_server(
+            &server,
+            &format!("DROP ROLE IF EXISTS {stranger}; CREATE ROLE {stranger}"),
+        );
+        on_server(
+            connection,
+            &format!(
+                "CREATE SEQUENCE app.ran; GRANT USAGE ON SCHEMA app TO {stranger}; \
+                 CREATE FUNCTION app.bump(integer) RETURNS bigint LANGUAGE plpgsql IMMUTABLE \
+                 SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.ran'); \
+                 RETURN $1::bigint + 1; END $$; \
+                 ALTER FUNCTION app.bump(integer) OWNER TO {stranger}"
+            ),
+        );
+        let mut desired = latest_snapshot(connection).schema;
+        let root: pbps_model::TableName = "app.p".parse().unwrap();
+        desired
+            .tables
+            .get_mut(&root)
+            .unwrap()
+            .columns
+            .get_mut("k")
+            .unwrap()
+            .ty = "bigint".parse().unwrap();
+        write_tree(&d, &desired);
+        succeeds(d.run(&["convert", "app.p.k", "--using", "app.bump(k)"]));
+        approve(&d, "10");
+        let ran = || scalar(connection, "SELECT is_called::int::bigint FROM app.ran");
+        let path = d.dir.join("rebuild.json");
+        let planned =
+            succeeds(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        assert_eq!(
+            ran(),
+            0,
+            "the plan ran the reviewed routine: {}",
+            stdout(&planned)
+        );
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(plan.type_routines.len(), 1);
+        assert!(
+            stdout(&planned).contains("awaits source review"),
+            "{}",
+            stdout(&planned)
+        );
+        // After the approval, apply observes and copies through the routine.
+        succeeds(apply(&d, connection, &path));
+        assert!(ran() > 0, "apply never ran the reviewed routine");
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.p WHERE (k,bucket) IN ((2,2),(4,4))"
+            ),
+            2
+        );
+    }
+}

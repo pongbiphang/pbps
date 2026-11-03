@@ -11562,8 +11562,21 @@ async fn run_probes_observed(
     pin_session(conn, dialect).await?;
     // A recorded conversion's expression is judged before any probe evaluates
     // it: the probe would run non-built-in code as the deployer, unvetted.
+    let mark = admission.mark();
     let immutable = crate::engine::vet_conversions(conn, admission, names.changes()).await?;
     crate::engine::vet_drop_requirements(conn, admission, names).await?;
+    if admission.relied_since(mark) {
+        // Plan time, and a conversion or requirement is admitted only by the
+        // review: no probe evaluates it before the human has read the source.
+        // Apply runs every probe after the approval (DEC-2563.2).
+        services::notice(
+            progress,
+            "apply.preflight",
+            "Pre-flight: the probes are unchecked until source review, because a conversion or requirement calls a routine admitted only by `pin_type_routines`; apply checks them."
+                .to_owned(),
+        );
+        return Ok(());
+    }
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
