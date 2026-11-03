@@ -809,7 +809,7 @@
         "retained2354::retained2354_million_rows_keep_the_check_and_advance_only_the_approved_record",
         "retained2354::retained2354_text_semantics_and_missing_resolver_keep_the_rebuild",
         "retained2354::retained2354_tampered_payloads_refuse_and_fresh_binding_cannot_be_skipped",
-        "domain_vet2309::domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_warn",
+        "domain_vet2309::domain_vet2309_managed_functions_are_judged_at_apply_and_other_compile_errors_warn",
         "domain_vet2309::domain_vet2309_xml_fragments_use_deployment_pins_with_database_and_role_defaults",
         "domain_vet2309::domain_vet2309_refuses_check_default_operator_and_nested_types_before_writing",
         "domain_vet2309::domain_vet2309_compliant_staged_and_no_resolver_plans_keep_apply_vetting",

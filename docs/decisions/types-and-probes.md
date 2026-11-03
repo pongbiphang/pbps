@@ -4939,3 +4939,10 @@ holds widens (plan and state versions and the schema set are unchanged). A later
 judges the expressions of tables, indexes, policies and partition keys the plan
 introduces, and the compatibility change that comes with it (untrusted-owner
 helpers there are refused); they stay change-detected by DEC-319.1 until then.
+
+It also supersedes DEC-2309.1's plan-time refusal of managed domain code: a CHECK
+or DEFAULT that calls a function the project declares is no longer refused by
+the types-only scratch vet, which cannot hold that function. The plan carries
+the advisory warning, and apply judges the routine by this predicate in the
+creating transaction (a missing fixed `search_path` is refused there with the
+exact `ALTER FUNCTION` line). The one-statement and missing-type refusals stay.
