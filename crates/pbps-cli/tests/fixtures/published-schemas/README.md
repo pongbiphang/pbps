@@ -77,3 +77,4 @@ DECISIONS 465).
 - `85/` adds exact read-only PostgreSQL extension declarations and state identities (#2447 PR A).
 - `86/` adds owned PostgreSQL `test` results: frozen input provenance, replay/candidate phases, assertion evidence and confirmed cleanup (#1165).
 - `87/` generalizes the resolver authorization-reproduction and assessment descriptions to name both engines, and documents an empty `approve_with` for a plan this build cannot enforce (#2143 c1).
+- `89/` adds the verified fixture re-pin result: the `repin` record (both input hash sets, per-side runs, row and allocator comparisons, manifest write) and a phase's `side` (#1165).

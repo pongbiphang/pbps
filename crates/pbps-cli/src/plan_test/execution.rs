@@ -211,6 +211,9 @@ impl Control {
                 phase.outcome = super::report::Status::Passed;
             }
             result => {
+                // A re-pin cleans up two scratches: a later failure must not
+                // inherit the earlier one's confirmation.
+                data.cleanup_confirmed = false;
                 phase.outcome = super::report::Status::Unanswerable;
                 phase.findings.push(crate::output::Finding::error(
                     "test.cleanup",

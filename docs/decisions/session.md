@@ -927,3 +927,25 @@ PG16/18 regressions cover retained rows, replay order, candidate checksums,
 assertion/fixture refusals, cancellation and input changes. SQL Server and verified
 fixture re-pinning remain later #1165 slices; #2552 and the deferred reporting
 findings retain their existing scope (ADR-0019).
+
+<a id="dec-1165-12"></a>
+
+**DEC-1165.12. A fixture re-pin compares rows and allocators in two fresh scratches.**
+`pbps test fixtures repin` reuses the pinned replay of DEC-1165.11 twice, each
+time in its own fresh owned scratch: the original side loads the committed
+(`HEAD`) fixture at its old pin and replays through the new revision, the
+proposed side loads the edited working file at the new revision, and both load
+every other fixture pinned at or before it in manifest order. Separate scratches
+keep a replayed role rename from leaking across sides; the cost is one more
+container start. Rows are compared as multisets of each column's text, columns
+sorted by name (a hop appends a column that a bootstrap declares in order), with
+NULL, duplicates, case and whitespace all differences. Allocators are every user
+sequence except the ledger tables' own, so one reached only through a default
+function is still compared, each by an engine `nextval` probe in the discarded
+database, never `last_value + 1`; the table and column that own it are reported
+when there is one. A difference is a finding (2); an unreadable or exhausted
+allocator, an unreadable table, differing engines or a changed input is
+unanswerable (1). The envelope gains a `repin` record and a phase `side` (schema
+set 89; the manifest write status is text so the write that follows needs no new
+set). This slice only verifies: the manifest is left untouched and says so.
+SQL Server re-pin remains a later #1165 slice.

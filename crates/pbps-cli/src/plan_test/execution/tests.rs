@@ -104,6 +104,8 @@ fn d2b1_1165_start_cleanup_preserves_primary_resource_and_remedy_evidence() {
             remedy: "inspect the recorded container and volume".into(),
         }),
     };
+    // A confirmation from an earlier scratch must not survive this failure.
+    data.cleanup_confirmed = true;
     data.startup_failure(0, &error);
     let report = data.finish();
     assert!(matches!(

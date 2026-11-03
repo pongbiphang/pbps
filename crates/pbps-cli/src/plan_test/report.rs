@@ -1,5 +1,6 @@
 //! Test evidence is a report; no executable artifact is a field (ADR-0019 §9).
 use crate::output::{Finding, Report};
+use pbps_config::test_manifest::CommitId;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -17,6 +18,10 @@ pub(crate) enum Status {
 pub(crate) struct Phase {
     pub phase: String,
     pub identity: String,
+    /// Which comparison database a re-pin phase worked in (`original` or
+    /// `proposed`); absent for an ordinary run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
     pub outcome: Status,
     pub elapsed_ms: u64,
     pub findings: Vec<Finding>,
@@ -126,6 +131,64 @@ impl Assertion {
         self.truncated = evidence.truncated;
     }
 }
+/// What a verified re-pin compared and decided (ADR-0019 §5, §9).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct Repin {
+    pub fixture: String,
+    pub path: String,
+    pub from: CommitId,
+    pub to: CommitId,
+    /// Everything the original side consumed: the committed manifest and fixture
+    /// at `HEAD`, and each replayed revision's files.
+    pub original_inputs: Vec<super::ConsumedFile>,
+    /// Everything the proposed side consumed: the working files and revisions.
+    pub proposed_inputs: Vec<super::ConsumedFile>,
+    pub sides: Vec<Side>,
+    pub tables: Vec<TableComparison>,
+    pub allocators: Vec<AllocatorComparison>,
+    pub manifest: ManifestWrite,
+}
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct Side {
+    pub label: String,
+    pub run_id: Option<String>,
+    pub acquired_image: Option<String>,
+    pub engine_build: Option<String>,
+}
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct RowDifference {
+    pub original_count: u64,
+    pub proposed_count: u64,
+    pub row: Vec<Cell>,
+}
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct TableComparison {
+    pub table: String,
+    pub equal: bool,
+    pub original_columns: Vec<String>,
+    pub proposed_columns: Vec<String>,
+    pub original_rows: u64,
+    pub proposed_rows: u64,
+    /// Bounded: the equality test sees every row, the report only some.
+    pub differences: Vec<RowDifference>,
+    pub truncated: bool,
+}
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct AllocatorComparison {
+    pub sequence: String,
+    pub used_by: Option<String>,
+    pub original_next: Option<String>,
+    pub proposed_next: Option<String>,
+    pub equal: bool,
+}
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ManifestWrite {
+    /// `not_attempted`, `written` or `failed`.
+    pub status: String,
+    pub old_sha256: String,
+    pub new_sha256: Option<String>,
+    pub reason: Option<String>,
+}
 #[derive(Default, Serialize, JsonSchema)]
 pub(crate) struct TestData {
     pub operation: String,
@@ -146,6 +209,9 @@ pub(crate) struct TestData {
     pub replay_hops: usize,
     pub replay_ms: u64,
     pub cleanup_confirmed: bool,
+    /// Present only for `operation: "repin"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repin: Option<Repin>,
 }
 // Preserve the JSON findings while showing optional values and lists plainly to people.
 fn summary_values<I>(values: I, human: bool) -> String
@@ -170,6 +236,12 @@ impl TestData {
     pub fn new(cleanup: bool) -> Self {
         Self {
             operation: if cleanup { "cleanup" } else { "run" }.into(),
+            ..Self::default()
+        }
+    }
+    pub fn for_repin() -> Self {
+        Self {
+            operation: "repin".into(),
             ..Self::default()
         }
     }
@@ -244,7 +316,10 @@ impl TestData {
                         "entry {}; risks {}"
                     ),
                     p.phase,
-                    Escaped(&p.identity),
+                    Escaped(&match &p.side {
+                        Some(side) => format!("{side}: {}", p.identity),
+                        None => p.identity.clone(),
+                    }),
                     outcome,
                     p.elapsed_ms,
                     summary_values(&p.checksum, human),
@@ -269,6 +344,9 @@ impl TestData {
                 "test.unavailable",
                 format!("{}: {reason}", Escaped(field)),
             ));
+        }
+        if let Some(repin) = &self.repin {
+            notes.extend(repin.summary(human));
         }
         for assertion in &self.assertions {
             let evidence =
@@ -302,6 +380,8 @@ impl TestData {
     }
     pub(crate) fn startup_failure(&mut self, phase: usize, error: &crate::test_scratch::Error) {
         if let crate::test_scratch::Error::StartCleanup { cleanup, .. } = error {
+            // An earlier scratch's confirmation says nothing about this one.
+            self.cleanup_confirmed = false;
             self.run_id = Some(cleanup.run_id.clone());
             let mut p = Phase::new("cleanup", &cleanup.run_id);
             p.outcome = Status::Unanswerable;
@@ -396,12 +476,13 @@ impl TestData {
             if absent {
                 self.unavailable.insert(
                     field.into(),
-                    if self.operation == "cleanup" {
-                        "not applicable to cleanup-only operation"
-                    } else {
-                        reason
-                    }
-                    .into(),
+                    match self.operation.as_str() {
+                        "cleanup" => "not applicable to cleanup-only operation".to_owned(),
+                        "repin" if field.starts_with("candidate_") => {
+                            "not applicable to a re-pin: it plans no candidate".to_owned()
+                        }
+                        _ => reason.to_owned(),
+                    },
                 );
             }
         }
@@ -440,5 +521,67 @@ impl TestData {
         } else {
             report
         }
+    }
+}
+
+impl Repin {
+    fn summary(&self, human: bool) -> Vec<Finding> {
+        use pbps_model::escape::Escaped;
+        let header = (
+            "test.repin",
+            format!(
+                "fixture `{}` ({}): {} -> {}",
+                Escaped(&self.fixture),
+                Escaped(&self.path),
+                self.from,
+                self.to
+            ),
+        );
+        let tables = self.tables.iter().map(|t| {
+            (
+                "test.repin.table",
+                format!(
+                    "`{}`: {}; original {} rows, proposed {} rows; {} difference(s){}",
+                    Escaped(&t.table),
+                    if t.equal { "equal" } else { "different" },
+                    t.original_rows,
+                    t.proposed_rows,
+                    t.differences.len(),
+                    if t.truncated {
+                        " shown (more exist)"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+        });
+        let allocators = self.allocators.iter().map(|a| {
+            (
+                "test.repin.allocator",
+                format!(
+                    "`{}` (used by {}): original next {}, proposed next {}: {}",
+                    Escaped(&a.sequence),
+                    summary_values(&a.used_by, human),
+                    summary_values(&a.original_next, human),
+                    summary_values(&a.proposed_next, human),
+                    if a.equal { "equal" } else { "different" }
+                ),
+            )
+        });
+        let manifest = (
+            "test.repin.manifest",
+            format!(
+                "manifest write {}; old {}; new {}",
+                self.manifest.status,
+                self.manifest.old_sha256,
+                summary_values(&self.manifest.new_sha256, human)
+            ),
+        );
+        std::iter::once(header)
+            .chain(tables)
+            .chain(allocators)
+            .chain([manifest])
+            .map(|(id, message)| Finding::note(id, message))
+            .collect()
     }
 }

@@ -180,8 +180,34 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+enum TestAction {
+    /// Maintain the fixtures a test manifest pins
+    Fixtures {
+        #[command(subcommand)]
+        action: FixtureAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FixtureAction {
+    /// Advance one fixture's pin, only if its edited SQL leaves the same data and allocators
+    Repin {
+        /// The fixture's name in the manifest
+        name: String,
+        /// The full commit id to advance the pin to
+        #[arg(long)]
+        at: String,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Test a candidate in an owned disposable PostgreSQL database; writes no plan file
+    #[command(args_conflicts_with_subcommands = true)]
     Test {
         #[arg(long, conflicts_with = "cleanup")]
         manifest: Option<PathBuf>,
@@ -190,6 +216,8 @@ enum Command {
         cleanup: bool,
         #[arg(long, default_value = "human")]
         format: OutputFormat,
+        #[command(subcommand)]
+        action: Option<TestAction>,
     },
     /// Record several explicit rename/drop decisions together, or none
     // Keep large argument construction in its own frame, as for drop options:
@@ -608,6 +636,13 @@ impl Command {
     /// eleven review rounds.
     fn json_envelope(&self) -> Option<&'static str> {
         let (name, format) = match self {
+            Command::Test {
+                action:
+                    Some(TestAction::Fixtures {
+                        action: FixtureAction::Repin { format, .. },
+                    }),
+                ..
+            } => ("test", *format),
             Command::Test { format, .. } => ("test", *format),
             Command::Plan { format, .. } => ("plan", *format),
             Command::Doctor { format, .. } => ("doctor", *format),
@@ -1144,9 +1179,32 @@ fn run() -> anyhow::Result<()> {
         );
     }
     if let Command::Test {
+        action:
+            Some(TestAction::Fixtures {
+                action:
+                    FixtureAction::Repin {
+                        name,
+                        at,
+                        manifest,
+                        format,
+                    },
+            }),
+        ..
+    } = &cli.command
+    {
+        return plan_test::repin(
+            &start,
+            name,
+            at,
+            manifest.as_deref(),
+            *format == OutputFormat::Json,
+        );
+    }
+    if let Command::Test {
         manifest,
         cleanup,
         format,
+        action: None,
     } = &cli.command
     {
         return plan_test::command(

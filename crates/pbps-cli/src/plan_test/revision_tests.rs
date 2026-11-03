@@ -183,6 +183,7 @@ fn at<'a>(refusals: &'a [Refusal], commit: &CommitId) -> Vec<&'a RevisionProblem
             | Refusal::Changed { .. }
             | Refusal::Git { .. }
             | Refusal::Chain(_)
+            | Refusal::Repin(_)
             | Refusal::HeadMoved { .. } => None,
         })
         .collect()
@@ -828,6 +829,7 @@ fn reverify_passes_when_nothing_moved_and_names_each_kind_of_movement() {
                 | Refusal::DuplicateFile { .. }
                 | Refusal::Git { .. }
                 | Refusal::Chain(_)
+                | Refusal::Repin(_)
                 | Refusal::At { .. }) => (String::new(), other.to_string()),
             })
             .collect()
