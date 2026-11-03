@@ -7857,11 +7857,10 @@ async fn plan_db_selected(
         // First, before the resolver and rehearsal: a violation stops cheaply,
         // and a refused login never reaches the expensive steps (DEC-2401.4).
         // Run on fresh assertion connections; the planning session only names
-        // the target they must match. Boxed: the engines' runner futures are
-        // large and would otherwise grow every frame that holds this block,
-        // overflowing a test thread's stack in the rehearsal tests.
+        // the target they must match. `run` returns a boxed future so the
+        // engines' large runner futures stay out of this block's frame.
         if let Some(selection) = assertions {
-            match Box::pin(selection.run(&mut conn)).await {
+            match selection.run(&mut conn).await {
                 Ok(passed) => target_assertions = passed,
                 Err(crate::plan_assert::Stop::Refused(finding)) => {
                     return Ok(Connected::Refused { finding, findings: checkout_findings.clone() });

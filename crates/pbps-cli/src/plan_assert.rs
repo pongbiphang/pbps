@@ -145,7 +145,20 @@ impl Selection {
     /// Runs each assertion in order on its own fresh connection and stops at
     /// the first one that is not a pass. The planning connection supplies the
     /// identity the assertion login must match, never the session itself.
-    pub(crate) async fn run(&self, planning: &mut Conn) -> Result<Vec<TargetAssertion>, Stop> {
+    ///
+    /// Boxed here, not at the call site: a debug build gives the caller's frame
+    /// a slot for every temporary, so building this large future inline there
+    /// cost the connected-planning block hundreds of KiB and overflowed a 2 MiB
+    /// test thread. Built in this small frame, the temporary dies on return.
+    pub(crate) fn run<'a>(
+        &'a self,
+        planning: &'a mut Conn,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TargetAssertion>, Stop>> + 'a>>
+    {
+        Box::pin(self.run_unboxed(planning))
+    }
+
+    async fn run_unboxed(&self, planning: &mut Conn) -> Result<Vec<TargetAssertion>, Stop> {
         let timeout = Duration::from_millis(u64::from(
             pbps_config::test_manifest::Timeouts::default()
                 .assertion_ms
