@@ -832,7 +832,7 @@ writes no plan; a record naming no file or hash is refused by
 `validate_analysis`. `apply` copies the list into the ledger entry
 (`StateSnapshot::target_assertions`, snapshot version 37, omitted when empty;
 staged checkpoints are unchanged and the closing entry carries it) and runs
-nothing: SPEC §7.5 stands. The published schema set moves to 88 for the plan
+nothing: SPEC §7.5 stands. The published schema set moves to 90 for the plan
 and `explain` JSON fields.
 
 Outcomes map to findings. A violation, SQL error, invalid result, boundary
