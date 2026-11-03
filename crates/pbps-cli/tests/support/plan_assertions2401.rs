@@ -219,7 +219,25 @@ impl Case {
         args.extend_from_slice(extra);
         // Always set, even blank: a stray variable in the runner's own
         // environment must not decide a test.
-        self.d.run_with_env(&args, &[(VAR, conn.unwrap_or(""))])
+        //
+        // The 10 s assertion deadline also covers the engine's admission
+        // checks, which a heavily loaded shared server can exceed. That says
+        // nothing about the classification under test, and a read-only plan
+        // is safe to repeat; the deadline's own typed outcome is pinned by
+        // the engines' native tests, which set their own deadline. A real
+        // misclassification repeats every time and still fails.
+        let mut out = self.d.run_with_env(&args, &[(VAR, conn.unwrap_or(""))]);
+        for attempt in 1..=2 {
+            let text = format!("{}{}", stdout(&out), stderr(&out));
+            if !text.contains("assertion deadline exceeded") {
+                break;
+            }
+            eprintln!(
+                "plan --assert hit its deadline under load; repeating it (retry {attempt} of 2)"
+            );
+            out = self.d.run_with_env(&args, &[(VAR, conn.unwrap_or(""))]);
+        }
+        out
     }
 
     fn out(&self, name: &str) -> PathBuf {
