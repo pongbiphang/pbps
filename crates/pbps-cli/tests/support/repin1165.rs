@@ -86,7 +86,7 @@ impl World {
         assert_eq!(v["data"]["operation"], "repin");
         for raw in [
             include_str!("../../../../schemas/envelope.schema.json"),
-            include_str!("../fixtures/published-schemas/88/envelope.schema.json"),
+            include_str!("../fixtures/published-schemas/89/envelope.schema.json"),
         ] {
             let schema = serde_json::from_str(raw).unwrap();
             jsonschema::validator_for(&schema)

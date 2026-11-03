@@ -41,8 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 88;
-// 88: verified fixture re-pin results of `pbps test fixtures repin` (issue #1165).
+pub const SCHEMA_VERSION: u32 = 89;
+// 89: verified fixture re-pin results of `pbps test fixtures repin` (issue #1165).
 // 87: resolver authorization reproduction and assessment descriptions name both engines;
 // an empty explain `approve_with` for evidence this build cannot enforce (#2143 c1).
 // 86: owned PostgreSQL test results (issue #1165).

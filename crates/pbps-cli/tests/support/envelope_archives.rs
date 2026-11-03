@@ -9,10 +9,10 @@ use std::path::PathBuf;
 /// The first schema set the current envelopes must still validate against.
 /// Sets before 16 predate DEC-997.1 (DECISIONS 435's `denied` variant).
 /// Before the first release a breaking change raises it to its own set
-/// instead of moving the wire version (DEC-1734.1): 88 adds the `repin`
+/// instead of moving the wire version (DEC-1734.1): 89 adds the `repin`
 /// operation's closed `repin` record and phase `side`, which every older set
 /// refuses.
-const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 88;
+const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 89;
 
 fn wire(document: &serde_json::Value) -> serde_json::Value {
     document["$defs"]["envelope.status"]["properties"]["schema_version"]["const"].clone()

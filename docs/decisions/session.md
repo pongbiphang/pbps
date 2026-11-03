@@ -946,6 +946,6 @@ database, never `last_value + 1`; the table and column that own it are reported
 when there is one. A difference is a finding (2); an unreadable or exhausted
 allocator, an unreadable table, differing engines or a changed input is
 unanswerable (1). The envelope gains a `repin` record and a phase `side` (schema
-set 88; the manifest write status is text so the write that follows needs no new
+set 89; the manifest write status is text so the write that follows needs no new
 set). This slice only verifies: the manifest is left untouched and says so.
 SQL Server re-pin remains a later #1165 slice.
