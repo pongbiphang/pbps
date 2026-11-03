@@ -487,18 +487,26 @@ impl TestManifest {
         let scalar = text
             .get(start..end)
             .ok_or("the pin's position is not inside the manifest")?;
-        // Lowercasing ASCII keeps every byte position, so a pin typed in
-        // capitals is found and replaced in place.
+        // An alias (`at: *pin`) is replaced whole by the new scalar. Changing
+        // the anchor it points at would move every alias of it, which the
+        // reparse below refuses.
         let old = self.fixtures[index].at.as_str();
-        let lowered = scalar.to_ascii_lowercase();
-        let found = lowered.matches(old).count();
-        let Some(inside) = lowered.find(old).filter(|_| found == 1) else {
-            return Err("the pin's text is not found once at its position".to_owned());
+        let (from, until) = if scalar.starts_with('*') {
+            (start, end)
+        } else {
+            // Lowercasing ASCII keeps every byte position, so a pin typed in
+            // capitals is found and replaced in place.
+            let lowered = scalar.to_ascii_lowercase();
+            let found = lowered.matches(old).count();
+            let Some(inside) = lowered.find(old).filter(|_| found == 1) else {
+                return Err("the pin's text is not found once at its position".to_owned());
+            };
+            (start + inside, start + inside + old.len())
         };
         let mut rewritten = String::with_capacity(text.len());
-        rewritten.push_str(&text[..start + inside]);
+        rewritten.push_str(&text[..from]);
         rewritten.push_str(to.as_str());
-        rewritten.push_str(&text[start + inside + old.len()..]);
+        rewritten.push_str(&text[until..]);
         let mut expected = self.clone();
         expected.fixtures[index].at = to.clone();
         match Self::parse(&rewritten) {

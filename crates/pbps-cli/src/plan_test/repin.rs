@@ -581,20 +581,9 @@ async fn execute(plan: &Plan, data: &mut TestData) {
                 data.phases[write].outcome = Status::Passed;
             }
             Err(blocked) => {
-                let (id, message) = match blocked {
-                    Blocked::Input(refusals) => (
-                        "test.input",
-                        refusals
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    ),
-                    Blocked::Write(error) => ("test.repin.manifest", format!("{error:#}")),
-                };
-                manifest.status = "failed".to_owned();
-                manifest.reason = Some(message.clone());
-                data.failure(write, id, format!("the pin was not moved: {message}"), true);
+                let (id, message) =
+                    record_blocked(blocked, &sha256(plan.new_manifest.as_bytes()), manifest);
+                data.failure(write, id, message, true);
             }
         }
     }
@@ -676,7 +665,57 @@ fn may_publish(data: &TestData) -> bool {
 enum Blocked {
     /// An input moved after it was read, so what was compared is not what is on disk.
     Input(Vec<Refusal>),
+    /// Nothing was replaced: the manifest still has its old bytes.
     Write(anyhow::Error),
+    /// The manifest was already replaced when this went wrong. `confirmed` says
+    /// the new bytes were read back.
+    Replaced {
+        error: anyhow::Error,
+        confirmed: bool,
+    },
+}
+
+/// Records a write that did not complete and returns the finding to raise. A
+/// replaced manifest is never reported as "not moved".
+fn record_blocked(
+    blocked: Blocked,
+    new_sha256: &str,
+    manifest: &mut ManifestWrite,
+) -> (&'static str, String) {
+    let (id, message) = match blocked {
+        Blocked::Input(refusals) => (
+            "test.input",
+            format!(
+                "the pin was not moved: {}",
+                refusals
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
+        Blocked::Write(error) => (
+            "test.repin.manifest",
+            format!("the pin was not moved: {error:#}"),
+        ),
+        Blocked::Replaced { error, confirmed } => {
+            if confirmed {
+                manifest.status = "written".to_owned();
+                manifest.new_sha256 = Some(new_sha256.to_owned());
+            }
+            (
+                "test.repin.manifest",
+                format!(
+                    "the manifest was replaced but {error:#}; inspect it before relying on the pin"
+                ),
+            )
+        }
+    };
+    if manifest.status != "written" {
+        manifest.status = "failed".to_owned();
+    }
+    manifest.reason = Some(message.clone());
+    (id, message)
 }
 
 fn publish_pin(plan: &Plan) -> Result<(), Blocked> {
@@ -719,6 +758,11 @@ fn replace(
         let io = |what: &'static str| {
             move |e: std::io::Error| Blocked::Write(anyhow::Error::new(e).context(what))
         };
+        // Opened before anything changes, so a directory that cannot be synced
+        // is refused while the old manifest is still the only one.
+        #[cfg(unix)]
+        let directory =
+            std::fs::File::open(dir).map_err(io("cannot open the manifest's directory"))?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -736,17 +780,30 @@ fn replace(
         drop(file);
         check().map_err(Blocked::Input)?;
         std::fs::rename(&temporary, target).map_err(io("cannot replace the manifest"))?;
-        #[cfg(unix)]
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io("cannot sync the manifest's directory"))?;
+        let replaced = |error: anyhow::Error, confirmed| Blocked::Replaced { error, confirmed };
         match std::fs::read(target) {
-            Ok(now) if now == bytes => Ok(()),
-            Ok(_) => Err(Blocked::Write(anyhow::anyhow!(
-                "the manifest was changed again right after the replacement"
-            ))),
-            Err(e) => Err(io("cannot read the manifest back")(e)),
+            Ok(now) if now == bytes => {}
+            Ok(_) => {
+                return Err(replaced(
+                    anyhow::anyhow!("it was changed again right after the replacement"),
+                    false,
+                ));
+            }
+            Err(e) => {
+                return Err(replaced(
+                    anyhow::Error::new(e).context("it cannot be read back"),
+                    false,
+                ));
+            }
         }
+        #[cfg(unix)]
+        directory.sync_all().map_err(|e| {
+            replaced(
+                anyhow::Error::new(e).context("its directory could not be synced"),
+                true,
+            )
+        })?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);

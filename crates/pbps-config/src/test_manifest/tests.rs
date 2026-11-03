@@ -407,3 +407,25 @@ fn a_pin_rewrite_refuses_a_missing_entry_and_a_stale_manifest() {
     let other = text.replace(&format!("at: {BASE}"), &format!("at: {NEW}"));
     assert!(manifest.with_pin(&other, 0, &to).is_err());
 }
+
+#[test]
+fn a_pin_shared_by_an_alias_moves_only_through_the_alias() {
+    let old = "1111111111111111111111111111111111111111";
+    let text = pinned(&format!(
+        "\n  - {{name: x, file: x.sql, at: &shared {old}}}\n  - {{name: y, file: y.sql, at: *shared}}"
+    ));
+    let manifest = TestManifest::parse(&text).unwrap();
+    let to = CommitId::parse(NEW).unwrap();
+    // The alias entry takes the new scalar and the anchor keeps the old one.
+    let edited = manifest.with_pin(&text, 1, &to).unwrap();
+    assert!(edited.contains(&format!("at: &shared {old}")), "{edited}");
+    assert!(
+        edited.contains(&format!("file: y.sql, at: {NEW}")),
+        "{edited}"
+    );
+    let parsed = TestManifest::parse(&edited).unwrap();
+    assert_eq!(parsed.fixtures[0].at.as_str(), old);
+    assert_eq!(parsed.fixtures[1].at.as_str(), NEW);
+    // Rewriting the anchor would move its alias too, so it is refused.
+    assert!(manifest.with_pin(&text, 0, &to).is_err());
+}

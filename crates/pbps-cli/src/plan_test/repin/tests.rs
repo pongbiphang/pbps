@@ -145,3 +145,69 @@ fn a_second_scratch_starts_without_the_first_ones_observations() {
     forget_observations(&mut data);
     assert!(data.run_id.is_none() && data.acquired_image.is_none() && data.engine_build.is_none());
 }
+
+#[test]
+fn a_replaced_manifest_is_never_reported_as_not_moved() {
+    let fresh = || ManifestWrite {
+        status: "not_attempted".into(),
+        old_sha256: "old".into(),
+        new_sha256: None,
+        reason: None,
+    };
+    let mut m = fresh();
+    let (_, message) = record_blocked(Blocked::Write(anyhow::anyhow!("no space")), "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("failed", None)
+    );
+    assert!(message.starts_with("the pin was not moved"), "{message}");
+    // Replaced and read back, but not synced: the pin did move.
+    let mut m = fresh();
+    let replaced = Blocked::Replaced {
+        error: anyhow::anyhow!("sync failed"),
+        confirmed: true,
+    };
+    let (_, message) = record_blocked(replaced, "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("written", Some("new"))
+    );
+    assert!(
+        message.contains("was replaced") && !message.contains("not moved"),
+        "{message}"
+    );
+    // Replaced but not read back: the bytes are unknown, and the report says so.
+    let mut m = fresh();
+    let replaced = Blocked::Replaced {
+        error: anyhow::anyhow!("unreadable"),
+        confirmed: false,
+    };
+    let (_, message) = record_blocked(replaced, "new", &mut m);
+    assert_eq!(
+        (m.status.as_str(), m.new_sha256.as_deref()),
+        ("failed", None)
+    );
+    assert!(
+        message.contains("was replaced") && !message.contains("not moved"),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_opened_refuses_before_anything_is_replaced() {
+    let dir = Dir::new();
+    let path = dir.manifest();
+    // Write and search, but no read: files can be replaced, the directory cannot be opened.
+    std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&dir.0).is_ok() {
+        std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        return;
+    }
+    let blocked = replace(&path, b"new\n", || Ok(()));
+    std::fs::set_permissions(&dir.0, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert!(matches!(blocked, Err(Blocked::Write(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+    assert!(dir.leftovers().is_empty());
+}
