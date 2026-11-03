@@ -23,9 +23,13 @@ pub struct Rebound {
 /// spelled none) and the name.
 pub(crate) type Reference = (String, String, String, String);
 
+/// The created objects an unresolved reference can bind. A type is not one:
+/// the catalog lists the unresolved references of `OBJECT_OR_COLUMN` class
+/// only, and a module naming a type that does not exist cannot be created at
+/// all (measured on 17.0), so creating a type can never satisfy one.
 fn lookup(created: &ObjectIdentity) -> Option<(&str, &str)> {
     match (created.class.as_str(), created.name.as_slice()) {
-        (class::OBJECT | class::TYPE, [schema, name]) => Some((schema, name)),
+        (class::OBJECT, [schema, name]) => Some((schema, name)),
         _ => None,
     }
 }
@@ -216,6 +220,17 @@ mod tests {
         let created = BTreeSet::from([object("dbo", "Ghost")]);
         let rows = [reference(("dbo", "outside"), "", "GHOST")];
         assert_eq!(rebound(&rows, &created, &BTreeSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn a_created_type_is_not_what_an_unresolved_object_reference_binds() {
+        let created = BTreeSet::from([ObjectIdentity {
+            class: class::TYPE.into(),
+            name: vec!["dbo".into(), "ghost".into()],
+            signature: Vec::new(),
+        }]);
+        let rows = [reference(("dbo", "outside"), "", "ghost")];
+        assert!(rebound(&rows, &created, &BTreeSet::new()).is_empty());
     }
 
     #[test]
