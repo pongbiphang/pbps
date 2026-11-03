@@ -5895,23 +5895,25 @@ object's `ObjectTransition`, not a new field), so no schema-set or state bump
 is spent. The report says nothing about statements: the module's binding changes
 when it runs whether or not the plan also alters its body.
 
-An unmanaged module is outside the capture and cannot be compared. The target
-is read for the module's references to a name the plan creates, and the engine
-does the matching under the database collation. A created object rebinds a
-module when it becomes the first match on the module's lookup path (DEC-619.2):
-a name spelled with a schema reaches exactly that schema, and only an unresolved
-one can still be taken; a one-part name reaches the module's own schema, then
-`dbo`, so an unresolved one is taken by either and one that resolves to the
-`dbo` fallback is shadowed by the module's own schema; a one-part call reaches
-the executing principal's default schema, then `dbo`, the module's fixed
-principal or every principal's when it runs as its caller, as the capture's
-candidate sets model it. A schema-bound reference is bound by id and cannot move.
+An unmanaged module is outside the capture's scope and cannot be compared
+without reading it. The target is read for the modules that mention a created
+name (a name filter, the engine matching under the database collation), those
+modules are captured with the reader the managed modules use, and the lookup
+rules are the ones the managed assessment uses, in `select::runtime_paths`
+(#2665): an object or type reference reaches the module's own schema, then
+`dbo`; a call reaches the executing principal's default schema, then `dbo`,
+for the module's fixed principal or for every principal when it runs as its
+caller. A created object rebinds a module when it becomes the first match on
+such a path, so a name that already resolves earlier on its path is not
+rebound by an arrival later on it. There is no second model of the lookup.
 Only an arrival counts: the scratch bootstrap creates every declared object, and
-the roots the target already holds take no name. A match refuses by naming the
+the roots the target already holds take no name, and objects scratch was never
+given are no drop the plan makes. A match refuses by naming the
 module and the object. Without database `VIEW DEFINITION` the view returns
 nothing for modules the account cannot see, and nothing must not read as "no
 dependents", so that read refuses instead.
 The tests cover a managed rebind reported for a module the plan keeps and not for one it creates, a created
 name nothing uses, an unmanaged module refusing by name, a shadowed `dbo`
-fallback, the call path through a principal's default schema, the engine's own
-lookup path, and a plan that creates nothing sealing despite the roots it keeps.
+fallback, the call path through a principal's default schema, a fixed principal
+whose default schema already holds the callee, a name that resolves earlier than
+the arrival, and a plan that creates nothing sealing despite the roots it keeps.

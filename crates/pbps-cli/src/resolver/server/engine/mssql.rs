@@ -1332,9 +1332,10 @@ impl Binding {
             .into_keys()
             .filter(|object| !on_target_now.contains(object))
             .collect();
-        let rebound = capture::unmanaged_rebinds(target, &created, &scope.retained)
-            .await
-            .map_err(super::catalog_read_failed)?;
+        let rebound =
+            capture::unmanaged_rebinds(target, &mut scratch, &created, &scope.retained, key)
+                .await
+                .map_err(super::catalog_read_failed)?;
         if let Some(first) = rebound.first() {
             return Err(Error::Binding(format!(
                 "this plan creates {}, which the unmanaged module {} binds when it runs{}; \

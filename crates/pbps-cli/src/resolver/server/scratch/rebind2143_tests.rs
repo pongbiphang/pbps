@@ -377,3 +377,83 @@ async fn mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_p
     }
     both(case).await;
 }
+
+/// A module that runs as a fixed principal whose default schema already holds
+/// the callee keeps its binding when the plan creates the name in `dbo`, which
+/// is later on the path. One that runs as its caller is not spared, since
+/// another principal may reach `dbo` first.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_fixed_principal_whose_default_schema_holds_the_callee_keeps_its_binding() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let kept = procedure_over_nothing(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE USER user2143 WITHOUT LOGIN WITH DEFAULT_SCHEMA = app2143;",
+                    "CREATE PROCEDURE app2143.task2143 AS SELECT 1 AS id;",
+                    "CREATE PROCEDURE dbo.fixed2143 WITH EXECUTE AS N'user2143' AS EXEC task2143;",
+                ],
+            )
+            .await;
+            let (id, procedure) =
+                module(ModuleKind::Procedure, "dbo.task2143", "AS SELECT 1 AS id");
+            let mut declared = Declared {
+                base: kept.base.clone(),
+                desired: kept.desired.clone(),
+            };
+            declared.desired.modules.insert(id, procedure);
+            declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("an earlier match keeps the binding: {error}"));
+            // The same arrival moves a caller-run call's binding for a
+            // principal that defaults to `dbo`.
+            exec(
+                target,
+                &["CREATE PROCEDURE dbo.caller2143 AS EXEC task2143;"],
+            )
+            .await;
+            let Err(error) = declared_plan(target, scratch, &declared, None).await else {
+                panic!("a plan sealed over a caller-run call it can move");
+            };
+            let text = error.to_string();
+            assert!(
+                text.contains("caller2143") && !text.contains("fixed2143"),
+                "{text}"
+            );
+        })
+    }
+    both(case).await;
+}
+
+/// A one-part name that resolves in the module's own schema keeps resolving
+/// there when the plan creates the same name in `dbo`.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_name_that_resolves_earlier_on_the_path_than_the_arrival_is_not_refused() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut declared = procedure_over_nothing(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE TABLE app2143.thing2143(id int NOT NULL);",
+                    "CREATE PROCEDURE app2143.reader2143 AS SELECT 1 AS id FROM thing2143;",
+                ],
+            )
+            .await;
+            creates(&mut declared, "dbo.thing2143");
+            declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the own schema is first on the path: {error}"));
+        })
+    }
+    both(case).await;
+}
