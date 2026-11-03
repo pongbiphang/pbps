@@ -6,6 +6,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -24,6 +25,11 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(__file__).resolve()
+# Callers also load this driver by file path from a temporary entry point.
+# Resolve its sibling explicitly instead of relying on the caller's sys.path.
+_rerun_spec = importlib.util.spec_from_file_location("pbps_gate_rerun", SCRIPT.with_name("gate_rerun.py"))
+RERUN = importlib.util.module_from_spec(_rerun_spec)
+_rerun_spec.loader.exec_module(RERUN)
 RUNNERS = {"mssql": "live-tests.sh", "pg": "live-tests-pg.sh"}
 MSSQL_SET_GIB = 9
 MSSQL_WITHOUT_EXPRESS_GIB = 4
@@ -134,7 +140,7 @@ class FixtureRun:
     def __enter__(self):
         # Reusing a container would make an assignment insufficient proof of
         # ownership. Canonical runners may reuse; the whole-run driver may not.
-        existing = self.names.intersection(container_names())
+        existing = self.names.intersection(container_names()) if self.names else set()
         require(not existing, "fixture containers already exist: " + ", ".join(sorted(existing)))
         for sig in (signal.SIGINT, signal.SIGTERM):
             self.handlers[sig] = signal.signal(sig, self.interrupt)
@@ -236,7 +242,7 @@ class FixtureRun:
             signal.signal(sig, signal.SIG_IGN)
         try:
             self.stop()
-            remaining = self.names.intersection(container_names())
+            remaining = self.names.intersection(container_names()) if self.names else set()
             errors = []
             for name in sorted(remaining):
                 try:
@@ -391,7 +397,7 @@ def inputs_digest(env):
                    if name not in FIXTURE_VARIABLES and not name.startswith("PBPS_LIVE_")
                    and (name in INPUT_NAMES or name.startswith(INPUT_PREFIXES)))
     # rustc's commit and host identify the toolchain; cargo ships with it.
-    body = {"version": 1, "rustc": tool(["rustc", "-vV"]),
+    body = {"version": 1, "rustc": tool(["rustc", "-vV"]), "python": sys.version,
             "env": {name: env[name] for name in names}}
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest(), names
 
@@ -482,7 +488,11 @@ def load_inherited(previous, manifest, tree, inputs, suites):
     return snapshot["keys"]
 
 
-def load_resume(previous, tree, inputs, suites, flakes):
+def receipt_selector(args):
+    return tuple(args) if args[:1] == ["python"] else tuple(libtest_args(args)[0])
+
+
+def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
     """Read what a previous run on this head proved; refuse anything else (DEC-2553.1).
 
     A missing receipt only means a name is not proven yet. A receipt that is
@@ -491,6 +501,8 @@ def load_resume(previous, tree, inputs, suites, flakes):
     register entry. Returns (proven, failures, waived): proven names per suite
     and invocation key, FAILED totals per head, and the register entries used.
     """
+    unregistered = unregistered or {}
+    used, new_targeted = set(), []
     previous = Path(previous)
     manifest = read_json(previous / MANIFEST, "manifest")
     require(isinstance(manifest, dict) and manifest.get("version") == 1
@@ -506,6 +518,11 @@ def load_resume(previous, tree, inputs, suites, flakes):
     history = manifest.get("failed", {})
     require(isinstance(history, dict), "malformed failure history")
     inherited = load_inherited(previous, manifest, tree, inputs, suites)
+    targeted = manifest.get("targeted", [])
+    require(isinstance(targeted, list) and all(isinstance(e, dict) and isinstance(e.get("cargo"), list)
+            and isinstance(e.get("test"), str) and e.get("suite") in suites
+            and isinstance(e.get("invocation"), str) for e in targeted), "malformed targeted rerun history")
+    attempted = {(tuple(e["cargo"]), e["test"]) for e in targeted}
     proven, failures, waived, refused = {}, {}, [], []
     for suite in suites:
         directory = previous / suite
@@ -542,7 +559,7 @@ def load_resume(previous, tree, inputs, suites, flakes):
                     f"receipts of invocation {key} carry what the inherited snapshot never proved")
             ok = dict(first["carried"])
             counts = dict(history.get(suite, {}).get(key, {}))
-            cargo = tuple(libtest_args(first["args"])[0])
+            cargo = receipt_selector(first["args"])
             failed = set()
             for row in group:
                 for name, result in row["reported"].items():
@@ -550,7 +567,13 @@ def load_resume(previous, tree, inputs, suites, flakes):
                         failed.add(name)
                         counts[name] = counts.get(name, 0) + 1
                         flake = flakes.get((cargo, name))
-                        if flake is None or counts[name] > MAX_FLAKE_FAILURES:
+                        selected = (cargo, name)
+                        if selected in attempted:
+                            refused.append(f"{suite}: targeted rerun failed: {name}")
+                        elif flake is None and selected in unregistered and counts[name] == 1:
+                            used.add(selected)
+                            new_targeted.append(dict(unregistered[selected], suite=suite, invocation=key))
+                        elif flake is None or counts[name] > MAX_FLAKE_FAILURES:
                             refused.append(f"{suite}: {name}")
                         else:
                             waived.append(flake)
@@ -567,6 +590,15 @@ def load_resume(previous, tree, inputs, suites, flakes):
             failures.setdefault(suite, {}).setdefault(key, counts)
     require(not refused, "FAILED outside the unexpired known-flake register, or failed more than "
             f"{MAX_FLAKE_FAILURES} times on this head: " + ", ".join(sorted(set(refused))))
+    require(used == set(unregistered), "rerun evidence must name exactly the unregistered FAILED checks")
+    for entry in targeted:
+        name = entry["test"]
+        proven_entry = proven.get(entry["suite"], {}).get(entry["invocation"], {})
+        # Do not turn an interrupted targeted attempt into a second retry.
+        # A carried proof remains sufficient on a later, unrelated resume.
+        require(name in proven_entry.get("ok", {}),
+                f"targeted rerun has no passing receipt: {name}; fix it and run a new full gate")
+    manifest = dict(manifest, targeted=[*targeted, *new_targeted])
     return proven, failures, waived, manifest
 
 
@@ -918,7 +950,8 @@ def sample_memory(stop, samples, errors):
 def drive(args, *, automatic=True):
     suites = list(RUNNERS) if args.suite == "all" else [args.suite]
     memory = available_gb()
-    counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
+    counts = {"python": 1} if suites == ["python"] else shard_counts(
+        suites, memory, args.mssql_shards, args.pg_shards)
     print(f"available memory: {memory:.2f} GiB; shards: "
           + ", ".join(f"{suite}={counts[suite]}" for suite in suites), flush=True)
     env = dict(os.environ, PBPS_LIVE_PREFIX=args.prefix)
@@ -931,13 +964,24 @@ def drive(args, *, automatic=True):
         inputs, inputs_env = None, []
     run_id = uuid.uuid4().hex
     previous = getattr(args, "resume", None)
+    evidence_path = getattr(args, "rerun_unregistered", None)
+    require(not evidence_path or previous, "--rerun-unregistered requires --resume")
+    unregistered = RERUN.load(evidence_path, ROOT, tree, inputs)
     proven, failures, waived, origin = {}, {}, [], None
     if previous:
         require(args.output and Path(previous).resolve() != Path(args.output).resolve(),
                 "--resume needs a fresh --output of its own")
         proven, failures, waived, origin = load_resume(
-            previous, tree, inputs, suites, register_flakes(getattr(args, "flakes_ref", "origin/master")))
+            previous, tree, inputs, suites, register_flakes(getattr(args, "flakes_ref", "origin/master")),
+            unregistered)
     output = Path(args.output or tempfile.mkdtemp(prefix="pbps-live-shards-"))
+    continuation = (not automatic and previous
+                    and Path(previous).resolve() == (output / "original").resolve())
+    require(not output.exists() or not any(output.iterdir()) or continuation
+            and {p.name for p in output.iterdir()} == {"original"},
+            "driver output directory is not fresh")
+    if unregistered:
+        RERUN.claim(ROOT, tree, unregistered)
     output.mkdir(parents=True, exist_ok=True)
     weights = read_weights(args.weights)
     # One immutable snapshot for the whole run prevents different shards from
@@ -969,7 +1013,8 @@ def drive(args, *, automatic=True):
     write_atomic(output / MANIFEST, json.dumps(
         {"version": 1, "run_id": run_id, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
          "suites": suites, "shards": counts, "tree": tree, "inputs": inputs, "inputs_env": inputs_env,
-         "failed": failures, "resumed_from": resumed_from}, indent=2) + "\n")
+         "failed": failures, "resumed_from": resumed_from,
+         "targeted": origin.get("targeted", []) if origin else []}, indent=2) + "\n")
     summary, measured = {}, {}
     used_names, used_ports = set(), set()
     tasks = []
@@ -977,6 +1022,9 @@ def drive(args, *, automatic=True):
         count = counts[suite]
         suite_root = output / suite
         suite_root.mkdir()
+        if suite == "python":
+            tasks.append((suite, 0))
+            continue
         identities = [fixture_env(suite, i, env) for i in range(count)]
         for slot in (0, 1):
             selected = [settings[fixture[slot]] for settings in identities for fixture in FIXTURES[suite]]
@@ -994,10 +1042,12 @@ def drive(args, *, automatic=True):
         suite_root = output / suite
         shard_dir = (suite_root / str(index)).resolve()
         shard_env = dict(env, PBPS_LIVE_SHARD=f"{index}/{counts[suite]}",
-                         PBPS_LIVE_SHARD_DIR=str(shard_dir))
+                         PBPS_LIVE_SHARD_DIR=str(shard_dir), PBPS_LIVE_SUITE=suite)
         try:
             with (suite_root / f"{index}.log").open("w") as log:
-                code = fixtures.run(["bash", str(ROOT / "scripts" / RUNNERS[suite])], cwd=ROOT,
+                command = ([sys.executable, str(SCRIPT), "python-shard"] if suite == "python" else
+                           ["bash", str(ROOT / "scripts" / RUNNERS[suite])])
+                code = fixtures.run(command, cwd=ROOT,
                                     env=shard_env, stdout=log, stderr=subprocess.STDOUT)
         except OSError as error:
             print(f"{suite}/{index}: {error}", file=sys.stderr, flush=True)
@@ -1053,6 +1103,8 @@ def drive(args, *, automatic=True):
                       "minimum_available_gib": min(memory_samples), "memory_samples": len(memory_samples),
                       "memory_sample_seconds": MEMORY_SAMPLE_SECONDS, "memory_errors": memory_errors}
     summary["run"].update(run_id=run_id, tree=tree, inputs=inputs, resumed_from=resumed_from)
+    if origin and origin.get("targeted"):
+        summary["run"]["targeted"] = origin["targeted"]
     summary["run"]["express_tests_on_shard_zero"] = express
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"total: {elapsed:.2f}s; minimum available memory: {min(memory_samples):.2f} GiB; "
@@ -1061,7 +1113,7 @@ def drive(args, *, automatic=True):
         weights = weights or {}
         weights.update(measured)
         Path(args.measure).write_text(json.dumps(weights, indent=2, sort_keys=True) + "\n")
-    if failed and automatic:
+    if failed and automatic and suites != ["python"] and not unregistered:
         try:
             missing = lost_tests(output, summary, tree, inputs)
         except (ValueError, OSError, LookupError, TypeError, AttributeError) as error:
@@ -1129,7 +1181,84 @@ def rerun_missing(args, output, original_summary, missing, started):
     return code
 
 
+def python_checks():
+    """Whole Python steps of the CI lint/quick jobs, in execution order."""
+    return RERUN.python_checks(ROOT)
+
+
+def python_shard():
+    env = os.environ
+    root = Path(env["PBPS_LIVE_SHARD_DIR"])
+    root.mkdir(parents=True)
+    (root / "expected").mkdir()
+    failed = False
+    for name in python_checks():
+        args = ["python", name]
+        key = invocation_id(args) + "-0"
+        carried = resumed(env, key, [name])
+        assigned = [] if carried else [name]
+        row = {"args": args, "identity": invocation_id(args), "listed": [name],
+               "groups": [assigned], "assigned": assigned, "pinned": False, "carried": carried,
+               "tree": tree_identity(ROOT), "inputs": env["PBPS_LIVE_INPUTS"]}
+        write_atomic(root / "expected" / (key + ".json"), json.dumps(row))
+        reported, code, seconds = {}, 0, 0.0
+        if assigned:
+            started = time.monotonic()
+            with (root / (key + ".log")).open("w") as log:
+                result = subprocess.run([sys.executable, name], cwd=ROOT, env=env,
+                                        stdout=log, stderr=subprocess.STDOUT)
+            code, seconds = result.returncode, time.monotonic() - started
+            reported[name] = {"status": "FAILED" if code else "ok", "seconds": seconds}
+        row.update(reported=reported, seconds=seconds, valid=True, tree=tree_identity(ROOT))
+        write_atomic(root / (key + ".json"), json.dumps(row))
+        print(f"{name}: {'carried' if carried else code}", flush=True)
+        stop_interrupted_cargo(code)
+        failed |= bool(code)
+    return int(failed)
+
+
+def record_proof(argv):
+    global ROOT
+    parser = argparse.ArgumentParser(description="Record one isolated pass for rerun independence evidence")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--worktree", type=Path, help="clean tree to prove, including an origin/master worktree")
+    parser.add_argument("--python", help="whole Python check path, instead of a cargo test")
+    parser.add_argument("--name", help="exact Rust test name")
+    parser.add_argument("cargo", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    args.output = args.output.resolve()
+    if args.worktree is not None:
+        ROOT = args.worktree.resolve(strict=True)
+    os.chdir(ROOT)
+    tree = tree_identity(ROOT)
+    require(tree is not None, "an isolated pass proof requires a clean worktree")
+    inputs, _ = inputs_digest(os.environ)
+    require(not args.output.exists(), "pass proof output already exists")
+    if args.python:
+        require(not args.cargo and not args.name and args.python in python_checks(),
+                "proof must run one whole CI Python check")
+        cargo, name = ["python", args.python], args.python
+        code = subprocess.run([sys.executable, name], cwd=ROOT).returncode
+        valid = True
+    else:
+        require(args.name and args.cargo, "proof needs a cargo invocation and exact --name")
+        cargo, flags, _ = libtest_args(args.cargo)
+        results, code, _, valid, _ = run_tests(
+            ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
+             "--color=never", args.name], [args.name])
+    require(tree_identity(ROOT) == tree, "worktree changed during the isolated check")
+    proof = {"version": 1, "commit": git_output(ROOT, "rev-parse", "HEAD").strip(),
+             "tree": tree, "inputs": inputs, "cargo": cargo, "test": name if args.python else args.name,
+             "returncode": code, "valid": valid, "status": "ok" if valid and code == 0 else "FAILED"}
+    write_atomic(args.output, json.dumps(proof, indent=2) + "\n")
+    return int(not valid or code != 0)
+
+
 def main():
+    if sys.argv[1:2] == ["proof"]:
+        return record_proof(sys.argv[2:])
+    if sys.argv[1:2] == ["python-shard"]:
+        return python_shard()
     if sys.argv[1:2] == ["ci"]:
         parser = argparse.ArgumentParser(description="Shard one ignored cargo test selection")
         parser.add_argument("--expected-tests", type=int)
@@ -1162,7 +1291,7 @@ def main():
         names = carried_attestation(sys.stdin.read(), json.loads(sys.argv[3]), os.environ, int(sys.argv[2]))
         return 0 if names else 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["all", *RUNNERS], default="all")
+    parser.add_argument("--suite", choices=["all", "python", *RUNNERS], default="all")
     parser.add_argument("--mssql-shards", type=int)
     parser.add_argument("--pg-shards", type=int)
     parser.add_argument("--prefix", default="pbps-live")
@@ -1171,6 +1300,8 @@ def main():
     parser.add_argument("--output", help="fresh directory for receipts, per-shard logs and summary")
     parser.add_argument("--resume", metavar="PREVIOUS_OUTPUT",
                         help="finish a stopped run of this same head: rerun only the names it did not prove")
+    parser.add_argument("--rerun-unregistered", metavar="NAMES_FILE",
+                        help="one targeted retry with recorded independence evidence (DEC-2651.1)")
     parser.add_argument("--flakes-ref", default="origin/master",
                         help="git ref whose scripts/known-flakes.json may waive FAILED names on --resume")
     return drive(parser.parse_args())

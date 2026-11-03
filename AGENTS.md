@@ -120,6 +120,13 @@ Read before changing things:
   - A resume of a resume is supported: resume the latest output, which carries
     the whole chain, and a flake still counts at most twice per head across it.
   - Record both outputs' `summary.json` paths and the head tree in the PR.
+- An unregistered failure may use `--resume ... --rerun-unregistered <names-file>`
+  once per name per head (DEC-2651.1). Record isolated passes on `origin/master`
+  and the PR tree, the complete module/fixture scope, and a tracking issue in
+  the PR. Refuse a name whose scope the diff touches. A failed or interrupted
+  targeted attempt requires a fix and a new full gate. Non-live Python checks
+  use the same rule as whole checks with `--suite python`; see
+  [the evidence format](docs/GATE-RERUN.md). Follow up with an ordinary register PR.
 - Register a flake only for an open issue, with an expiry at most 30 days out.
   The register is read from `origin/master`, so an entry waives nothing in the
   PR that adds it. An expired entry is inactive; the check refuses it only in

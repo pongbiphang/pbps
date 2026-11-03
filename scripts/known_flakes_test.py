@@ -71,6 +71,20 @@ class Active(unittest.TestCase):
 
 
 class Check(unittest.TestCase):
+    def test_whole_python_checks_can_be_registered_but_subtests_and_vanished_checks_cannot(self):
+        name = "scripts/live_test_runners_test.py"
+        item = entry(cargo=["python", name], test=name)
+        entries = kf.load(register(item))
+        kf.check(entries, TODAY, {}, True, python_checks=[name])
+        self.assertIn((("python", name), name), kf.active(entries, TODAY))
+        with self.assertRaisesRegex(kf.RegisterError, "no longer exists"):
+            kf.check(entries, TODAY, {}, True, python_checks=[])
+        with self.assertRaises(kf.RegisterError):
+            kf.load(register(entry(cargo=["python", name, "Test.case"], test=name)))
+        with self.assertRaises(kf.RegisterError):
+            kf.check(kf.load(register(dict(item, expires="2026-10-01"))), TODAY, {}, True,
+                     python_checks=[name])
+
     def run_check(self, *entries, strict=False, today=TODAY):
         kf.check(kf.load(register(*entries)), today, TARGETS, strict)
 

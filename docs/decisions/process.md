@@ -1798,3 +1798,41 @@ first; an interrupted listing produces no test proof. Incomplete reports stay
 invalid; the ordinary audit and continuation proof still decide their disposition.
 Test arguments, output, CI step semantics and DEC-2584.1's first-pass FAILED
 policy are unchanged.
+
+<a id="dec-2651-1"></a>
+
+**DEC-2651.1. An unregistered failure independent of the PR gets one explicit
+targeted rerun per name per head.** DEC-2553.1/.2 required a register PR before
+a new environmental failure could be completed, but that register PR's full
+gate could meet another new flake (#2651). `--resume` accepts an explicit
+`--rerun-unregistered <names-file>` with an issue for every name, the PR where
+the evidence is recorded, a reviewed complete module/fixture scope and isolated
+pass proofs on both the current `origin/master` and the exact PR tree and inputs.
+The `proof` entry point records the exact cargo name or whole Python check it
+actually executed; a failed, incomplete, stale or mismatched proof is refused.
+Git checks every declared scope against the PR's merge-base diff, with renames
+expanded to deletion and addition. The defining source and its module subtree
+are always included; the operator must review and list external modules and
+fixtures too. Unknown scope cannot be vouched independent. Changes to shared
+gate/build inputs refuse the exception conservatively. Missing, unreadable,
+empty or extra evidence is a refusal, never an empty retry set.
+
+Only the unregistered failed selectors in the previous output may consume this
+exception. Existing valid `ok` receipts are carried, missing names retain their
+ordinary obligation, and the combined union must still equal `--list`. Before
+execution an exclusive claim is persisted in the common Git directory, keyed
+by head tree and selector, so a sibling resume from the original output or
+another worktree cannot obtain another attempt. A killed attempt consumes the
+allowance as well. The manifest and summary retain the evidence and attempt
+history across resume chains. A failed or unproven targeted attempt requires a
+fix and a new full gate, even if the name subsequently becomes registered.
+The ordinary register follows in a separate PR; the exception does not add or
+waive a register entry itself.
+
+`--suite python` records each non-live Python step from CI's lint and quick jobs
+as one check with the same identity, failure history and resume protocol. It
+reruns a whole failed check once, carries successful checks, and fails on its
+second failure. Python interpreter identity joins the inputs digest. This
+amends DEC-2553.1/.2 only for explicit, evidenced failures; registered-flake
+limits, the exact union audit and DEC-2584.1's missing-only automatic
+continuation stay in force. See `docs/GATE-RERUN.md` for the evidence schema.
