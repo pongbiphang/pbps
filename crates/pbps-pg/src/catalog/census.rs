@@ -5,9 +5,27 @@ use serde_json::Value;
 // Object addresses let PostgreSQL render identities uniformly, including
 // operator signatures and objects without a namespace. Large objects use
 // pg_largeobject's address, although only its readable metadata is queried.
+//
+// `session_owned` is what the engine deletes when a session's temporary schema
+// is cleaned (`RemoveTempRelations` cascades from the schema through
+// pg_depend): what is recorded in a temporary schema, own or another
+// session's, and its dependents. It is state of that session and not of the
+// database, and it vanishes in the backend's exit, after its client is gone,
+// so a census row for it can be dropped before its identity is resolved. The
+// rows are omitted, decided from the statement's own snapshot, before
+// DEC-2558.1 can read the loss as catalog movement (DEC-2681.1). A cast has no
+// schema, so membership follows dependencies and not a namespace column.
 pub(super) const QUERY: &str = concat!(
     r#"
-WITH RECURSIVE used_types(oid) AS (
+WITH RECURSIVE session_owned(classid, objid) AS (
+    SELECT d.classid, d.objid FROM pg_catalog.pg_depend d
+      JOIN pg_catalog.pg_namespace s ON s.oid = d.refobjid
+     WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass AND d.deptype = 'n'
+       AND (s.oid = pg_catalog.pg_my_temp_schema() OR pg_catalog.pg_is_other_temp_schema(s.oid))
+    UNION
+    SELECT d.classid, d.objid FROM session_owned o JOIN pg_catalog.pg_depend d
+      ON d.refclassid = o.classid AND d.refobjid = o.objid AND d.deptype IN ('n', 'a', 'i')
+), used_types(oid) AS (
     SELECT atttypid FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped
     UNION
     SELECT d.refobjid FROM used_types u JOIN pg_catalog.pg_depend d
@@ -68,6 +86,7 @@ SELECT o.kind, i.identity,
        EXISTS (SELECT 1 FROM extension_members e WHERE e.classid = o.classid AND e.objid = o.oid) AS extension_member,
        o.model_owned
   FROM objects o CROSS JOIN LATERAL pg_catalog.pg_identify_object(o.classid, o.oid, 0) i
+ WHERE NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = o.classid AND s.objid = o.oid)
 "#
 );
 
@@ -263,6 +282,13 @@ mod tests {
         let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
         let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
         let mut dropper = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        // Another session's temporary objects do not excuse a persistent loss
+        // (DEC-2681.1): the drop below must still read as catalog movement.
+        let mut bystander = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        bystander
+            .execute("CREATE TEMP TABLE census2681_bystander (id serial)")
+            .await
+            .unwrap();
         let schema = format!("census2558_{}", std::process::id());
         dropper
             .execute(&format!(
@@ -358,6 +384,7 @@ mod tests {
             .execute(&format!("DROP SCHEMA {schema}"))
             .await
             .unwrap();
+        drop(bystander);
         let rows = rows.unwrap();
         assert_eq!(
             rows.len(),
@@ -372,5 +399,169 @@ mod tests {
             "the identity lookup must observe the drop: {row}"
         );
         assert_catalog_moved(&[row]);
+    }
+
+    // Every kind of census row a session's temporary schema can hold, measured
+    // on PostgreSQL 16.15 and 18.6: array types of a table, enum, composite
+    // and range, the range and its multirange, the cast PostgreSQL makes
+    // between them (which has no schema), an operator, operator class,
+    // collation, extended statistics, and a standalone and a column-owned
+    // sequence.
+    const TEMPORARY_OBJECTS: &str = "\
+        CREATE TEMP TABLE census2681_t (id serial, v int); \
+        CREATE TEMP SEQUENCE census2681_s; \
+        CREATE TYPE pg_temp.census2681_rng AS RANGE (subtype = int4); \
+        CREATE TYPE pg_temp.census2681_en AS ENUM ('a'); \
+        CREATE TEMP TABLE census2681_te (e pg_temp.census2681_en); \
+        CREATE TYPE pg_temp.census2681_comp AS (a int); \
+        CREATE OPERATOR pg_temp.=== (leftarg = int4, rightarg = int4, function = int4eq); \
+        CREATE COLLATION pg_temp.census2681_col (provider = libc, locale = 'C'); \
+        CREATE STATISTICS pg_temp.census2681_st (ndistinct) ON id, v FROM census2681_t; \
+        CREATE OPERATOR CLASS pg_temp.census2681_oc FOR TYPE int4 USING btree AS OPERATOR 1 <";
+
+    async fn read_census(conn: &mut pbps_db::Conn) -> Vec<Value> {
+        let rows = conn
+            .query(&format!(
+                "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(r) \
+                 ORDER BY kind, identity), '[]'::jsonb)::text AS payload FROM ({QUERY}) r"
+            ))
+            .await
+            .unwrap();
+        serde_json::from_str(&super::super::text(&rows[0], "payload").unwrap()).unwrap()
+    }
+
+    fn listed(rows: &[Value]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r["kind"].as_str().unwrap().to_owned(),
+                    r["identity"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+    async fn census2681_temporary_objects_are_not_census_rows_on_pg16() {
+        temporary_objects("PBPS_TEST_PG_OLD_DB").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+    async fn census2681_temporary_objects_are_not_census_rows_on_pg18() {
+        temporary_objects("PBPS_TEST_PG_DB").await;
+    }
+
+    async fn temporary_objects(variable: &str) {
+        use pbps_db::{Conn, Driver};
+
+        let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
+        let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let mut other = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let schema = format!("census2681_{}", std::process::id());
+        reader
+            .execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                 CREATE SEQUENCE {schema}.lonely"
+            ))
+            .await
+            .unwrap();
+        let before = read_census(&mut reader).await;
+        other.execute(TEMPORARY_OBJECTS).await.unwrap();
+        // The reading session's own temporary schema is session state too.
+        reader
+            .execute("CREATE TEMP TABLE census2681_mine (id serial); CREATE TEMP SEQUENCE census2681_own")
+            .await
+            .unwrap();
+        let during = read_census(&mut reader).await;
+        // The held session must really have its objects while the census reads.
+        let held = reader
+            .query(
+                "SELECT count(*)::int8 AS n FROM pg_catalog.pg_class \
+                 WHERE relname IN ('census2681_t', 'census2681_s', 'census2681_mine')",
+            )
+            .await
+            .unwrap();
+        let held = super::super::number(&held[0], "n").unwrap();
+        drop(other);
+        reader
+            .execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert_eq!(held, 3, "the temporary objects were not there to be read");
+        assert!(
+            listed(&before).contains(&("standalone sequence".into(), format!("{schema}.lonely"))),
+            "a persistent unheld object is still a census row"
+        );
+        let (before, rows) = (listed(&before), during);
+        let during = listed(&rows);
+        let extra: Vec<_> = during.iter().filter(|r| !before.contains(r)).collect();
+        let missing: Vec<_> = before.iter().filter(|r| !during.contains(r)).collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "a session's temporary objects must not change the census: extra {extra:?}, missing {missing:?}"
+        );
+        assert!(during.iter().all(|(_, i)| !i.contains("pg_temp")));
+        assert!(notices(&rows).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+    async fn census2681_sessions_ending_during_the_read_do_not_move_the_catalog_on_pg16() {
+        ending_sessions("PBPS_TEST_PG_OLD_DB").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+    async fn census2681_sessions_ending_during_the_read_do_not_move_the_catalog_on_pg18() {
+        ending_sessions("PBPS_TEST_PG_DB").await;
+    }
+
+    // A session's backend deletes its temporary objects after its client has
+    // gone, while the pull reads. The overlap cannot be paused inside the
+    // statement, so this is statistical: before DEC-2681.1 a pull was refused
+    // as catalog movement on about half its reads under this load. A correct
+    // census cannot fail it, and the invariance test above is the pin.
+    async fn ending_sessions(variable: &str) {
+        use pbps_db::{Conn, Driver};
+
+        const WRITERS: usize = 4;
+        const SESSIONS_EACH: usize = 25;
+        let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let server = server.clone();
+                let finished = finished.clone();
+                tokio::spawn(async move {
+                    for _ in 0..SESSIONS_EACH {
+                        let mut session = Conn::connect(Driver::Postgres, &server).await.unwrap();
+                        session
+                            .execute("CREATE TEMP TABLE census2681_helper (n serial)")
+                            .await
+                            .unwrap();
+                        // Ended the way a fixture session is: the client only drops it.
+                        drop(session);
+                    }
+                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let mut reads = 0;
+        loop {
+            let done = finished.load(std::sync::atomic::Ordering::SeqCst) == WRITERS;
+            let pulled = super::super::introspect(&mut reader).await;
+            assert!(pulled.is_ok(), "{:?}", pulled.err());
+            reads += 1;
+            if done {
+                break;
+            }
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        assert!(reads > 0);
     }
 }

@@ -1116,3 +1116,44 @@ errors; an empty rowset remains empty. Do not skip or coalesce a lost row, alter
 the census query, or change the caller's READ COMMITTED scope (decision 423).
 Held-statement scan/drop regressions pin the engine's NULL and the decoder's
 refusal on PostgreSQL 16 and 18 without a timing sleep.
+
+DEC-2681.1 amends the rule against altering the census query for objects that
+belong to a session's temporary schema.
+
+<a id="dec-2681-1"></a>
+
+**DEC-2681.1. The census omits what a session's temporary schema owns.** This
+amends DEC-2558.1 for one class. A TEMP table leaves implicit array types, a
+serial leaves a sequence, and a temporary range type leaves a multirange and a
+cast, in `pg_temp_N`. When the session ends, its backend deletes all of it
+after the client has gone, so a pull running at that moment scanned rows whose
+identity was gone before it resolved them. DEC-2558.1 read that NULL as
+someone's DDL and refused: `d2b2_1165_pg16_replays_pins_and_keeps_the_candidate_seal`
+failed that way in a merge group, because the test runner drops its fixture
+connection (`CREATE TEMP TABLE helper`) and the next hop's pull overlaps the
+backend's exit. The same refusal hits any pull while an application session
+that holds temporary tables ends.
+
+Those objects are state of one session and never of the database: no
+declaration can hold them, and no plan can change them. The census query
+therefore defines `session_owned` and omits its members. It is what
+PostgreSQL itself deletes when it cleans a temporary schema
+(`RemoveTempRelations` cascades from the schema through `pg_depend`): the
+objects recorded in the reading session's temporary schema or another
+session's (`pg_my_temp_schema()`, `pg_is_other_temp_schema()`), and their
+dependents through `n`, `a` and `i` dependencies. Membership follows
+dependencies and not a namespace column because a cast has no schema. The
+test is made from the statement's own snapshot, so no row can be listed and
+then found missing, and no sleep or retry is needed. Measured on 16.15 and
+18.6, the set covers every census row a foreign temporary schema produces and
+no row of a database without one.
+
+DEC-2558.1 keeps governing every object the census still lists: a persistent
+type, sequence or any other row that disappears between scan and identity is
+still catalog movement and still refuses, whatever temporary objects exist
+beside it. Tests pin the census as unchanged by another session's or its own
+temporary objects of every listed kind, the persistent refusal with a
+temporary table alive, and a bounded load of sessions ending during full pulls
+on both versions. That last test is statistical, because the overlap cannot be
+paused inside the production statement; the invariance test is the pin. The
+runner's own session handling (`drop(conn)`) is unchanged.
