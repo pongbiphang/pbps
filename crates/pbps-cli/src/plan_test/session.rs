@@ -184,6 +184,9 @@ impl<'a> Session<'a> {
     pub fn target(&self) -> &Target {
         &self.target
     }
+    /// The assertion login's connection string, for the Linux lifecycle tests
+    /// that open it themselves; the command goes through [`Self::run_assertion`].
+    #[cfg(all(test, target_os = "linux"))]
     pub fn assertion(&self) -> &str {
         &self.assertion
     }
