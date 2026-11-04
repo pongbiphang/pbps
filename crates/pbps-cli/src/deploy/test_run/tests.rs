@@ -96,14 +96,37 @@ async fn admin(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result
     )
     .await?)
 }
+/// Awaits the future that `make` builds on the heap. The closure is tiny, so the
+/// caller's debug-build frame holds a pointer instead of a slot the size of the
+/// future (#2661).
+fn heap<'a, F, Fut>(
+    make: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Fut::Output> + 'a>>
+where
+    F: FnOnce() -> Fut + 'a,
+    Fut: std::future::Future + 'a,
+{
+    Box::pin(make())
+}
+
 async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<()> {
     use pbps_pg::assertions::{self, AssertionResult};
-    ensure!(scratch.acquired_image().await?.starts_with("sha256:"));
+    // Each large future below is made inside `heap` (#2661), not in this frame.
+    // A debug build reserves a stack slot here for every future this function
+    // awaits, about 19 KB each, so the frame was 477 KB whatever their lifetimes;
+    // `heap` builds the future in its own short-lived frame and hands this one a
+    // pointer. Tests run on libtest's 2 MiB thread, production on the 8 MiB main
+    // thread.
+    ensure!(
+        heap(|| scratch.acquired_image())
+            .await?
+            .starts_with("sha256:")
+    );
     let fixture = Fixture::new()?;
     let base = fixture.input(&IdsFile::default(), false, false)?;
     let candidate = fixture.input(&base.ids, true, false)?;
     let before = fixture.bytes()?;
-    let session = Session::new(scratch).await?;
+    let session = heap(|| Session::new(scratch)).await?;
     ensure!(session.target().environment() == Some("test"));
     ensure!(base.config.select_resolver(None, None)?.is_some());
     ensure!(
@@ -133,17 +156,17 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
     }
     eprintln!("D2a bootstrap starting");
     let mut bootstrap_phase = Phase::new("bootstrap", "base");
-    let entry = bootstrap(&session, &base, &mut bootstrap_phase).await?;
+    let entry = heap(|| bootstrap(&session, &base, &mut bootstrap_phase)).await?;
     ensure!(bootstrap_phase.entry == Some(entry));
     eprintln!("D2a bootstrap committed");
     ensure!(entry > 0);
-    session.grants(&base.loaded.schema).await?;
-    let mut c = admin(scratch).await?;
+    heap(|| session.grants(&base.loaded.schema)).await?;
+    let mut c = heap(|| admin(scratch)).await?;
     let apply_role = format!("pbps_test_apply_{}", scratch.run_id());
     let fixture_role = format!("pbps_test_fixture_{}", scratch.run_id());
     c.execute(&format!("CREATE FUNCTION app.d2a_helper() RETURNS integer LANGUAGE SQL RETURN 1; ALTER FUNCTION app.d2a_helper() OWNER TO {apply_role}")).await?;
     // This normal plan must load the private key to pin the non-superuser's helper.
-    let mut fixtures = session.fixtures().await?;
+    let mut fixtures = heap(|| session.fixtures()).await?;
     let role = fixtures.query("SELECT current_user::text AS role").await?;
     ensure!(role[0].try_get::<&str>("role")? == Some(fixture_role.as_str()));
     fixtures.execute("INSERT INTO app.orders(code,amount) VALUES ('kept',1164); CREATE TEMP TABLE ids AS SELECT id FROM app.orders; INSERT INTO app.orders(code,amount) SELECT 'temporary',1164 FROM ids; DELETE FROM app.orders WHERE code='temporary'").await?;
@@ -180,8 +203,7 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
         ),
     ] {
         c.execute(grant).await?;
-        let error = session
-            .grants(&base.loaded.schema)
+        let error = heap(|| session.grants(&base.loaded.schema))
             .await
             .err()
             .context("broad permanent CREATE grant was admitted")?;
@@ -189,8 +211,7 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
         c.execute(revoke).await?;
     }
     c.execute("GRANT INSERT ON app.codes TO PUBLIC").await?;
-    let unsafe_grant = session
-        .grants(&base.loaded.schema)
+    let unsafe_grant = heap(|| session.grants(&base.loaded.schema))
         .await
         .err()
         .context("broad PUBLIC grant was admitted")?;
@@ -249,12 +270,13 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
         wire == planned.artifact.wire().wire_fingerprint(),
         "execution changed the sealed wire"
     );
-    session.grants(&candidate.loaded.schema).await?;
+    heap(|| session.grants(&candidate.loaded.schema)).await?;
     for (sql, passes) in [
         ("SELECT total FROM app.orders WHERE total<>1164", true),
         ("SELECT total FROM app.orders WHERE total<>999", false),
     ] {
-        let result = assertions::run(session.assertion(), sql, Duration::from_secs(10)).await;
+        let result =
+            heap(|| assertions::run(session.assertion(), sql, Duration::from_secs(10))).await;
         ensure!(
             matches!(
                 (&result, passes),
@@ -263,14 +285,17 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
             "{result:?}"
         );
     }
-    let denied = assertions::run(
-        session.assertion(),
-        "INSERT INTO app.orders(code,total) VALUES ('escape',1) RETURNING total",
-        Duration::from_secs(10),
-    )
+    let denied = heap(|| {
+        assertions::run(
+            session.assertion(),
+            "INSERT INTO app.orders(code,total) VALUES ('escape',1) RETURNING total",
+            Duration::from_secs(10),
+        )
+    })
     .await;
     ensure!(matches!(denied, AssertionResult::SqlError(_)), "{denied:?}");
-    let boundary = assertions::run(session.assertion(), "COMMIT", Duration::from_secs(10)).await;
+    let boundary =
+        heap(|| assertions::run(session.assertion(), "COMMIT", Duration::from_secs(10))).await;
     ensure!(
         matches!(boundary, AssertionResult::BoundaryViolation),
         "{boundary:?}"

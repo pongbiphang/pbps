@@ -45,7 +45,25 @@ pub(crate) async fn bootstrap(
     )?;
     Ok(built.entry)
 }
-pub(crate) async fn plan(
+/// Boxed future of the test hops. #2661: an `async fn` hands its caller the whole
+/// future by value, and a debug build reserves that slot in the caller's frame
+/// (the lifecycle test's own frame was 610 KB), so a caller that merely wraps the
+/// call in `Box::pin` still pays for it. The slot lives in this small wrapper's
+/// frame instead, which is gone before the deep calls start. The tests run on
+/// libtest's 2 MiB thread; production runs the same planning on the 8 MiB main
+/// thread.
+pub(crate) type HopFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'a>>;
+
+pub(crate) fn plan<'a>(
+    session: &'a Session<'_>,
+    input: &'a Assembled,
+    phase: &'a mut Phase,
+) -> HopFuture<'a, Box<Planned>> {
+    Box::pin(plan_hop(session, input, phase))
+}
+
+async fn plan_hop(
     session: &Session<'_>,
     input: &Assembled,
     phase: &mut Phase,
@@ -55,7 +73,9 @@ pub(crate) async fn plan(
     let project = session.project(input);
     let selected = project.config.select_resolver(None, Some("test"))?;
     let mut carried = Vec::new();
-    let result = super::plan_db_async(
+    // Boxed for the same reason: its future is large and this frame is on the
+    // test stack (#2661).
+    let result = Box::pin(super::plan_db_async(
         &project,
         session.target(),
         declarations(input),
@@ -67,7 +87,7 @@ pub(crate) async fn plan(
         false,
         &mut carried,
         true,
-    )
+    ))
     .await;
     phase.findings.extend(carried);
     match result? {
@@ -85,7 +105,20 @@ pub(crate) async fn plan(
         }
     }
 }
-pub(crate) async fn apply(
+pub(crate) fn apply<'a>(
+    session: &'a Session<'_>,
+    input: &'a Assembled,
+    planned: &'a Planned,
+    phase: &'a mut Phase,
+    approved: &'a str,
+    progress: &'a Progress,
+) -> HopFuture<'a, ()> {
+    Box::pin(apply_hop(
+        session, input, planned, phase, approved, progress,
+    ))
+}
+
+async fn apply_hop(
     session: &Session<'_>,
     input: &Assembled,
     planned: &Planned,
