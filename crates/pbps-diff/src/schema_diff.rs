@@ -13080,7 +13080,7 @@ mod tests {
         let allowed = [Intent::MoveRows {
             table: "app.ev_2025".parse().unwrap(),
             max_rows: 10,
-            reason: "no CDC".into(),
+            reason: "no CDC".parse().unwrap(),
         }];
         // Negative: no DEFAULT beside it, so nothing moves and no bound is
         // carried, though the file holds one.

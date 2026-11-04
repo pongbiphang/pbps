@@ -4738,7 +4738,7 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
         bound(&[pbps_model::Intent::MoveRows {
             table: "app.ev_2025".parse().unwrap(),
             max_rows: 7,
-            reason: "no CDC".into(),
+            reason: "no CDC".parse().unwrap(),
         }]),
         Some(7)
     );

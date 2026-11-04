@@ -6482,7 +6482,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
                 &[Intent::MoveRows {
                     table: t("ev_2027"),
                     max_rows: 1,
-                    reason: "a live test of the move".into(),
+                    reason: "a live test of the move".parse().unwrap(),
                 }],
             ),
         );
@@ -8901,7 +8901,7 @@ fn mint_moving_and(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFi
                 .map(|(name, _)| Intent::MoveRows {
                     table: name.clone(),
                     max_rows: 1_000_000,
-                    reason: "a live test of the move".into(),
+                    reason: "a live test of the move".parse().unwrap(),
                 }),
         )
         .collect();

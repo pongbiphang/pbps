@@ -86,7 +86,7 @@ pub enum Intent {
     MoveRows {
         table: TableName,
         max_rows: u64,
-        reason: String,
+        reason: Reason,
     },
 }
 
@@ -145,6 +145,26 @@ mod tests {
     }
 
     #[test]
+    fn serialized_move_rows_intent_cannot_bypass_nonblank_reasons() {
+        let value = |reason: &str| {
+            serde_json::json!({
+                "intent": "move_rows", "table": "app.ev_2025",
+                "max_rows": 5, "reason": reason
+            })
+        };
+        for reason in ["", " ", "   ", "\t", "\n\t ", "\u{3000}", "\u{a0}"] {
+            assert!(
+                serde_json::from_value::<Intent>(value(reason)).is_err(),
+                "accepted a blank move reason: {reason:?}"
+            );
+        }
+        let reason = " \t核准 REG-1846: \"CDC\"\n ";
+        let json = value(reason);
+        let intent: Intent = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&intent).unwrap(), json);
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let all = vec![
             Intent::RenameTable {
@@ -175,7 +195,7 @@ mod tests {
             Intent::MoveRows {
                 table: t("dbo.ev_2030"),
                 max_rows: 5000,
-                reason: "REG-4".into(),
+                reason: "REG-4".parse().unwrap(),
             },
         ];
         let back: Vec<Intent> =

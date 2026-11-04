@@ -1597,7 +1597,7 @@ fn run() -> anyhow::Result<()> {
             Intent::MoveRows {
                 table: table.parse::<TableName>()?,
                 max_rows,
-                reason: reason.to_string(),
+                reason,
             }
             .into(),
         ),

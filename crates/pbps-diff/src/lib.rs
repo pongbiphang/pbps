@@ -2065,7 +2065,7 @@ mod tests {
         Intent::MoveRows {
             table: t(table),
             max_rows,
-            reason: reason.into(),
+            reason: reason.parse().unwrap(),
         }
     }
 

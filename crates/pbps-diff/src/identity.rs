@@ -1691,14 +1691,14 @@ fn resolve_moves(
             .ids
             .moves
             .get(&uid)
-            .is_some_and(|m| m.max_rows == *max_rows && m.reason == *reason);
+            .is_some_and(|m| m.max_rows == *max_rows && m.reason == reason.as_ref());
         if !kept {
             r.ids.moves.insert(
                 uid,
                 pbps_model::Move {
                     max_rows: *max_rows,
                     allowed_at: ctx.today.clone(),
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                     operator: ctx.operator.clone(),
                 },
             );
