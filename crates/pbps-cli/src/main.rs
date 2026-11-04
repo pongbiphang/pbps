@@ -205,6 +205,74 @@ enum FixtureAction {
     },
 }
 
+/// Arguments of `pbps plan`.
+#[derive(Args)]
+struct PlanArgs {
+    /// Compute an applyable plan against this environment as queried
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// Which git revision to use as the baseline
+    #[arg(long, default_value = "HEAD")]
+    since: String,
+
+    /// Use the named state snapshot as the baseline instead (for use without git)
+    #[arg(long, conflicts_with = "since")]
+    base: Option<PathBuf>,
+
+    /// CI mode: change no files, and fail if the identity file is out of date
+    #[arg(long)]
+    check: bool,
+
+    /// Write the change set out as JSON
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Write the plan as a SQL script (a preview; never hand-edited)
+    #[arg(long)]
+    sql: Option<PathBuf>,
+
+    /// Plan one logical change for a staged apply: run outside a transaction,
+    /// one statement at a time, with a checkpoint in the ledger. Needs --db/--env
+    #[arg(long)]
+    staged: bool,
+
+    /// Rehearse the plan against a throwaway engine: "docker://<image>", or a
+    /// connection string to a server pbps may create a scratch database on
+    #[arg(long)]
+    dev: Option<String>,
+
+    /// Skip configured dev rehearsal while still resolving and recording ids
+    #[arg(long)]
+    no_dev: bool,
+
+    /// Select a named resolver for PostgreSQL target planning. When needed, it
+    /// resolves bindings and publishes a plan for transactional apply, which
+    /// rechecks the saved evidence. SQL Server resolution is refused by name
+    #[arg(long, value_name = "PROFILE")]
+    resolve_with: Option<String>,
+
+    /// Skip the rehearsal of a connected plan on the selected resolver's scratch,
+    /// and seal the plan as not rehearsed. Needs --db/--env; the same switch as
+    /// `rehearse: false` under an environment
+    #[arg(long)]
+    no_rehearse: bool,
+
+    /// Run this reviewed read-only SQL assertion against the target while
+    /// planning (repeatable; needs --db/--env). Zero rows is a pass; a plan
+    /// is written only if every one passes. The login comes from
+    /// PBPS_ASSERTION_CONN, never from --db. Recorded in the plan; never
+    /// run again at apply
+    #[arg(long = "assert", value_name = "FILE")]
+    assertions: Vec<PathBuf>,
+
+    /// human (default) or json. With --db/--env, JSON reports change counts,
+    /// connected checks and findings. --out writes the separate saved plan
+    /// accepted by apply; inspect it with `pbps explain --plan`
+    #[arg(long, default_value = "human")]
+    format: OutputFormat,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Test a candidate in an owned disposable PostgreSQL database; writes no plan file
@@ -232,71 +300,9 @@ enum Command {
     Init(init::InitArgs),
 
     /// Compare the declarations against a baseline and produce a change plan
-    Plan {
-        /// Compute an applyable plan against this environment as queried
-        #[command(flatten)]
-        target: TargetArgs,
-
-        /// Which git revision to use as the baseline
-        #[arg(long, default_value = "HEAD")]
-        since: String,
-
-        /// Use the named state snapshot as the baseline instead (for use without git)
-        #[arg(long, conflicts_with = "since")]
-        base: Option<PathBuf>,
-
-        /// CI mode: change no files, and fail if the identity file is out of date
-        #[arg(long)]
-        check: bool,
-
-        /// Write the change set out as JSON
-        #[arg(long)]
-        out: Option<PathBuf>,
-
-        /// Write the plan as a SQL script (a preview; never hand-edited)
-        #[arg(long)]
-        sql: Option<PathBuf>,
-
-        /// Plan one logical change for a staged apply: run outside a transaction,
-        /// one statement at a time, with a checkpoint in the ledger. Needs --db/--env
-        #[arg(long)]
-        staged: bool,
-
-        /// Rehearse the plan against a throwaway engine: "docker://<image>", or a
-        /// connection string to a server pbps may create a scratch database on
-        #[arg(long)]
-        dev: Option<String>,
-
-        /// Skip configured dev rehearsal while still resolving and recording ids
-        #[arg(long)]
-        no_dev: bool,
-
-        /// Select a named resolver for PostgreSQL target planning. When needed, it
-        /// resolves bindings and publishes a plan for transactional apply, which
-        /// rechecks the saved evidence. SQL Server resolution is refused by name
-        #[arg(long, value_name = "PROFILE")]
-        resolve_with: Option<String>,
-
-        /// Skip the rehearsal of a connected plan on the selected resolver's scratch,
-        /// and seal the plan as not rehearsed. Needs --db/--env; the same switch as
-        /// `rehearse: false` under an environment
-        #[arg(long)]
-        no_rehearse: bool,
-
-        /// Run this reviewed read-only SQL assertion against the target while
-        /// planning (repeatable; needs --db/--env). Zero rows is a pass; a plan
-        /// is written only if every one passes. The login comes from
-        /// PBPS_ASSERTION_CONN, never from --db. Recorded in the plan; never
-        /// run again at apply
-        #[arg(long = "assert", value_name = "FILE")]
-        assertions: Vec<PathBuf>,
-
-        /// human (default) or json. With --db/--env, JSON reports change counts,
-        /// connected checks and findings. --out writes the separate saved plan
-        /// accepted by apply; inspect it with `pbps explain --plan`
-        #[arg(long, default_value = "human")]
-        format: OutputFormat,
-    },
+    // Boxed like `Intent`: the flags are many, and an inline payload grew `Command`
+    // past the Windows stack-size bound (command_stack_tests).
+    Plan(Box<PlanArgs>),
 
     /// Print the JSON Schema for the declaration format or for pbps.yml
     ///
@@ -653,7 +659,7 @@ impl Command {
                 ..
             } => ("test", *format),
             Command::Test { format, .. } => ("test", *format),
-            Command::Plan { format, .. } => ("plan", *format),
+            Command::Plan(args) => ("plan", args.format),
             Command::Doctor { format, .. } => ("doctor", *format),
             Command::Validate { format, .. } => ("validate", *format),
             Command::Fmt { format, .. } => ("fmt", *format),
@@ -1017,7 +1023,7 @@ fn run() -> anyhow::Result<()> {
     // commands can still inspect history while that configuration is repaired.
     match &cli.command {
         Command::Init(_)
-        | Command::Plan { .. }
+        | Command::Plan(_)
         | Command::Apply { .. }
         | Command::Pull { .. }
         | Command::Snapshot { .. }
@@ -1283,21 +1289,22 @@ fn run() -> anyhow::Result<()> {
         | Command::Explain { .. } => {
             unreachable!("these return before project discovery")
         }
-        Command::Plan {
-            target,
-            since,
-            base,
-            check,
-            out,
-            sql,
-            staged,
-            dev,
-            no_dev,
-            resolve_with,
-            no_rehearse,
-            assertions,
-            format,
-        } => {
+        Command::Plan(args) => {
+            let PlanArgs {
+                target,
+                since,
+                base,
+                check,
+                out,
+                sql,
+                staged,
+                dev,
+                no_dev,
+                resolve_with,
+                no_rehearse,
+                assertions,
+                format,
+            } = *args;
             // Every refusal below goes through the envelope, not `bail!`. These
             // are flag validations, so they run *before* `cmd_plan` and its
             // JSON handling — which is exactly why they escaped it. A consumer
@@ -7299,8 +7306,10 @@ mod command_stack_tests {
     use std::mem::{size_of, size_of_val};
 
     // clap's generated constructors need larger frames than their final values.
-    // x86_64 Linux: Command is 200 bytes boxed or unboxed; its Intent payload is
-    // 8 versus 192. Windows' boxed Command is 224 bytes because paths are wider.
+    // x86_64 Linux: Command is 128 bytes with Intent and Plan boxed; their
+    // payloads are 8 versus 192 (Intent) and about 200 (Plan, once `--assert`
+    // joined its flags: Command was 224 unboxed and failed Windows at 248).
+    // Windows' Command is larger because paths are wider.
     // Allow that enum size, but check the payload too: another variant can hide
     // its growth. The 128-byte payload budget still rejects unboxing by 64 bytes.
     #[test]
@@ -7319,6 +7328,20 @@ mod command_stack_tests {
         assert!(
             bytes <= 16 * size_of::<usize>(),
             "Intent payload grew to {bytes} bytes; box large command arguments"
+        );
+        let cli = super::Cli::try_parse_from([
+            "pbps", "plan", "--assert", "a.sql", "--assert", "b.sql", "--format", "json",
+        ])
+        .unwrap();
+        let super::Command::Plan(args) = cli.command else {
+            panic!("expected plan command");
+        };
+        // Boxing must not change what parses: the flag stays repeatable.
+        assert_eq!(args.assertions.len(), 2);
+        let bytes = size_of_val(&args);
+        assert!(
+            bytes <= 16 * size_of::<usize>(),
+            "Plan payload grew to {bytes} bytes; box large command arguments"
         );
     }
 
