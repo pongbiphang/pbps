@@ -992,3 +992,29 @@ statement timeout, so a fixture's bound is the deadline dropping its connection.
 two sides of a re-pin must agree on the one setting the image chooses that
 changes how text compares; no format version changes. Measured: the SQL Server
 image declares no volume, so a run has no volume to confirm gone.
+
+<a id="dec-1165-15"></a>
+
+**DEC-1165.15. A SQL Server run seals its owned database READ_ONLY, and error numbers are read by engine.**
+`pbps test` runs on SQL Server through the same `Session`, which gains two
+methods the runner calls without naming an engine: `seal`, after the last
+grants refresh and before the first assertion, and `run_assertion`. PostgreSQL's
+write boundary is the READ ONLY transaction each assertion opens, so its `seal`
+does nothing. SQL Server has no such transaction, so the boundary is the database
+mode. The seal reads `sys.dm_exec_sessions` first and refuses while any other
+user session is on the database, naming it, and never evicts one: a plain
+`ALTER DATABASE … SET READ_ONLY` waits without limit behind a held session and
+`LOCK_TIMEOUT` and `NO_WAIT` do not bound it (measured), so the refusal comes
+first and the statement runs under the driver deadline. It then reads
+`DATABASEPROPERTYEX(…, 'Updateability')`. Each assertion connection reads that
+mode again before its SQL, so a zero-row pass never rests on a database nothing
+sealed. A failed seal is a `test.infrastructure` finding and no assertion runs.
+There is no report or manifest field for it: the typed result of a sealed run is
+the same as before, and no format version changes. `Phase` takes the run's
+engine at construction (`on`) or declares itself database-free (`offline`), and
+`unanswerable` reads a server error code by it: SQLSTATE classes 08, 53, 58 and
+XX on PostgreSQL, a short list of engine fault numbers on SQL Server (resources,
+storage, a session the server ended). A SQL Server number is not a SQLSTATE: a
+user `THROW 53300` is the user's own, and a permission error (229) or a write to
+the sealed database (3906) is a finding. `fixtures repin` still refuses SQL
+Server until F3.

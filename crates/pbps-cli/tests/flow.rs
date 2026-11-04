@@ -100,6 +100,8 @@ fn plan_assertion_logins_that_can_write_are_refused_on_mssql() {
 mod dependencies2322;
 #[path = "support/dev587.rs"]
 mod dev587;
+#[path = "support/plan_test1165_mssql.rs"]
+mod plan_test1165_mssql;
 #[path = "support/recovery2410_mssql.rs"]
 mod recovery2410_mssql;
 

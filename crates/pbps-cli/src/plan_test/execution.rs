@@ -51,10 +51,6 @@ impl Control {
             })),
         }
     }
-    // Only the Linux-gated SQL Server session test names an engine until the
-    // public command does (F2); gating it keeps a Windows test build free of a
-    // dead-code warning that `cfg_attr(not(test), expect(dead_code))` cannot cover.
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_driver(mut self, driver: pbps_db::Driver) -> Self {
         self.driver = driver;
         self
@@ -218,8 +214,23 @@ impl Control {
         phase.record(started, "test.infrastructure", &result);
         result
     }
+    /// Closes the assertions' write boundary: the budget is what remains of the
+    /// run, at most one assertion's. A failure here is a setup failure, so it is
+    /// recorded as infrastructure and the assertions do not run.
+    pub(crate) async fn seal(
+        &mut self,
+        session: &Session<'_>,
+        phase: &mut Phase,
+    ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let result = self
+            .bounded(ms(self.timeouts.assertion_ms), session.seal())
+            .await;
+        phase.record(started, "test.infrastructure", &result);
+        result
+    }
     pub(crate) async fn finish(&self, scratch: test_scratch::TestScratch<'_>, data: &mut TestData) {
-        let mut phase = Phase::new("cleanup", "owned resources");
+        let mut phase = Phase::offline("cleanup", "owned resources");
         let started = Instant::now();
         match tokio::time::timeout(ms(self.timeouts.cleanup_ms), scratch.finish()).await {
             Ok(Ok(())) => {

@@ -109,3 +109,79 @@ fn d2b2_1165_human_values_are_plain_and_json_findings_keep_their_shape() {
     );
     assert_eq!(serde_json::to_value(&data).unwrap(), before);
 }
+
+fn coded(code: &str) -> anyhow::Error {
+    pbps_db::DbError::Driver {
+        message: "server said".into(),
+        code: Some(code.into()),
+        diagnostic: None,
+    }
+    .into()
+}
+
+fn outcome_on(engine: pbps_db::Driver, error: anyhow::Error) -> Status {
+    let mut phase = Phase::on(engine, "assertion", "a");
+    phase.record(Instant::now(), "test.assertion", &Err::<(), _>(error));
+    phase.outcome
+}
+
+#[test]
+fn sql_server_engine_faults_are_unanswerable_and_the_users_own_errors_are_findings() {
+    use pbps_db::Driver::Mssql;
+    // Resources, storage and a session the server ended: the run could not look.
+    for code in ["701", "1105", "9002", "823", "825", "596", "8645"] {
+        assert!(
+            matches!(outcome_on(Mssql, coded(code)), Status::Unanswerable),
+            "{code}"
+        );
+    }
+    // Negative: what the SQL itself causes is a finding, a write to the sealed
+    // database (3906) and a missing permission (229) included.
+    for code in ["102", "208", "229", "547", "3906", "8134", "50000"] {
+        assert!(
+            matches!(outcome_on(Mssql, coded(code)), Status::Failed),
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn a_number_that_is_a_postgres_class_is_only_a_fault_on_postgres() {
+    use pbps_db::Driver::{Mssql, Postgres};
+    // `THROW 53300` is the user's own number on SQL Server and `too_many_connections`
+    // on PostgreSQL; the engine, not the digits, says which.
+    for code in ["53300", "58030", "57014", "08006", "XX000"] {
+        assert!(
+            matches!(outcome_on(Postgres, coded(code)), Status::Unanswerable),
+            "{code}"
+        );
+    }
+    for code in ["53300", "58030"] {
+        assert!(
+            matches!(outcome_on(Mssql, coded(code)), Status::Failed),
+            "{code}"
+        );
+    }
+    // Negative: an ordinary PostgreSQL error stays a finding.
+    assert!(matches!(
+        outcome_on(Postgres, coded("42P01")),
+        Status::Failed
+    ));
+}
+
+#[test]
+fn an_uncoded_database_error_never_answered_on_either_engine_and_an_offline_phase_reads_no_number()
+{
+    use pbps_db::Driver::{Mssql, Postgres};
+    for engine in [Postgres, Mssql] {
+        let timed_out = pbps_db::DbError::DeadlineExceeded("deadline").into();
+        assert!(matches!(
+            outcome_on(engine, timed_out),
+            Status::Unanswerable
+        ));
+    }
+    // Negative: a phase with no database gives a coded error no engine to be read by.
+    let mut offline = Phase::offline("input", "x");
+    offline.record(Instant::now(), "test.input", &Err::<(), _>(coded("53300")));
+    assert!(matches!(offline.outcome, Status::Failed));
+}

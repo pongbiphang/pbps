@@ -18,6 +18,7 @@
     {"target": ["pbps-cli", "test", "flow"], "prefix": "drop_requirements2400_mssql::", "owner": "mssql"},
     {"target": ["pbps-cli", "test", "flow"], "prefix": "recovery2410::", "owner": "resolver-mssql"},
     {"target": ["pbps-cli", "test", "flow"], "prefix": "recovery2410_docker::", "owner": "rehearsal"},
+    {"target": ["pbps-cli", "test", "flow"], "prefix": "plan_test1165_mssql::", "owner": "rehearsal"},
     {"target": ["pbps-cli", "test", "flow_pg"], "prefix": "", "owner": "pg"},
     {"target": ["pbps-db", "test", "live_mssql"], "prefix": "", "owner": "mssql"},
     {"target": ["pbps-db", "test", "live_pg"], "prefix": "", "owner": "pg"},

@@ -17,6 +17,8 @@ use std::{
 /// load each group's fixtures. `pbps test` replays to the base; a re-pin replays
 /// the same way, twice, to the new revision (ADR-0019 §4, §5).
 pub(super) struct Replay<'a> {
+    /// The engine of the run, which its phases read their error numbers by.
+    pub driver: pbps_db::Driver,
     pub chain: &'a ReplayChain,
     pub revisions: &'a BTreeMap<CommitId, Assembled>,
     /// Name and SQL by manifest index; an entry the chain does not name is unused.
@@ -28,6 +30,7 @@ pub(super) struct Replay<'a> {
 impl Inputs {
     fn replay(&self) -> Replay<'_> {
         Replay {
+            driver: crate::db::driver_for(self.identity.dialect),
             chain: &self.chain,
             revisions: &self.revisions,
             fixtures: self
@@ -46,11 +49,11 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
     let first = phases.len();
     for (index, group) in r.chain.groups.iter().enumerate() {
         if index == 0 {
-            phases.push(Phase::new("bootstrap", group.commit.to_string()));
+            phases.push(Phase::on(r.driver, "bootstrap", group.commit.to_string()));
         } else {
             let hop = &r.chain.hops[index - 1];
             for phase in ["replay_plan", "replay_apply"] {
-                let mut p = Phase::new(phase, group.commit.to_string());
+                let mut p = Phase::on(r.driver, phase, group.commit.to_string());
                 p.from = Some(hop.from.to_string());
                 p.to = Some(hop.to.to_string());
                 p.distance = Some(hop.distance);
@@ -58,7 +61,7 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
             }
         }
         for f in &group.fixtures {
-            phases.push(Phase::new("fixture", r.fixtures[*f].0));
+            phases.push(Phase::on(r.driver, "fixture", r.fixtures[*f].0));
         }
     }
     for p in &mut phases[first..] {
@@ -67,19 +70,28 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
 }
 
 fn prepare(data: &mut TestData, inputs: &Inputs) {
-    data.phases
-        .push(Phase::new("provision", "owned PostgreSQL scratch"));
+    let driver = crate::db::driver_for(inputs.identity.dialect);
+    data.phases.push(Phase::on(
+        driver,
+        "provision",
+        match driver {
+            pbps_db::Driver::Postgres => "owned PostgreSQL scratch",
+            pbps_db::Driver::Mssql => "owned SQL Server scratch",
+        },
+    ));
     replay_phases(&inputs.replay(), &mut data.phases);
-    data.phases.push(Phase::new(
+    data.phases.push(Phase::on(
+        driver,
         "candidate_plan",
         inputs.candidate.revision.to_string(),
     ));
-    data.phases.push(Phase::new(
+    data.phases.push(Phase::on(
+        driver,
         "candidate_apply",
         inputs.candidate.revision.to_string(),
     ));
     for a in &inputs.frozen.assertions {
-        data.phases.push(Phase::new("assertion", &a.name));
+        data.phases.push(Phase::on(driver, "assertion", &a.name));
         data.assertions.push(Assertion {
             name: a.name.clone(),
             path: a.file.path.clone(),
@@ -186,17 +198,24 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
     {
         return;
     }
+    // The write boundary comes after the last grants and before any assertion
+    // SQL; a run with no assertion has nothing to seal.
+    if !inputs.frozen.assertions.is_empty()
+        && control
+            .seal(session, &mut data.phases[phase - 1])
+            .await
+            .is_err()
+    {
+        return;
+    }
     for (index, assertion) in inputs.frozen.assertions.iter().enumerate() {
-        use pbps_pg::assertions::AssertionResult as A;
+        use pbps_db::query::AssertionResult as A;
         let start = Instant::now();
         let result = control
             .bounded(ms(timeouts.assertion_ms), async {
-                Ok(pbps_pg::assertions::run(
-                    session.assertion(),
-                    &assertion.text,
-                    ms(timeouts.assertion_ms),
-                )
-                .await)
+                Ok(session
+                    .run_assertion(&assertion.text, ms(timeouts.assertion_ms))
+                    .await)
             })
             .await;
         let result = match result {
@@ -337,7 +356,7 @@ pub(crate) fn command(
 ) -> anyhow::Result<()> {
     let mut data = TestData::new(cleanup);
     data.phases
-        .push(Phase::new("input", "manifest and frozen revisions"));
+        .push(Phase::offline("input", "manifest and frozen revisions"));
     let started = Instant::now();
     let inputs = if cleanup {
         None
@@ -358,16 +377,6 @@ pub(crate) fn command(
         match checked {
             Ok(inputs) => {
                 data.input = Some(inputs.identity.clone());
-                if inputs.identity.dialect != pbps_config::DialectName::Postgres {
-                    data.failure(
-                        0,
-                        "test.input",
-                        "pbps test currently supports PostgreSQL; SQL Server follows in #1165"
-                            .into(),
-                        false,
-                    );
-                    return publish(data.finish(), json);
-                }
                 prepare(&mut data, &inputs);
                 Some(inputs)
             }
@@ -407,7 +416,8 @@ async fn execute(inputs: Option<&Inputs>, data: &mut TestData) {
         data.cleanup_confirmed = true;
         return;
     };
-    let mut control = Control::new(inputs.frozen.manifest.timeouts, tokio::signal::ctrl_c());
+    let mut control = Control::new(inputs.frozen.manifest.timeouts, tokio::signal::ctrl_c())
+        .with_driver(crate::db::driver_for(inputs.identity.dialect));
     let Some(scratch) =
         test_run::boxed_future(|| control.start(&dir, &inputs.identity.image, data, 1)).await
     else {

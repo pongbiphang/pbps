@@ -234,13 +234,14 @@ pin `search_path` with `pg_temp` last. The stored `proconfig` is checked
 inside the writing transaction (DEC-322.1, #322). Schemas on that path that
 other roles can create in are #1004.
 
-PostgreSQL `pbps test` replays pinned fixture revisions and tests a working-tree
-or committed candidate through the ordinary deployment services in owned scratch.
-It reports typed evidence without an applyable plan file; `test --cleanup`
-reconciles owned dead runs. `test fixtures repin` moves one fixture pin only
-after the edited SQL provably leaves the same rows and next allocator values
-(DEC-1165.12, DEC-1165.13). SQL Server execution remains a later #1165 slice
-(ADR-0019, DEC-1165.11).
+`pbps test` replays pinned fixture revisions and tests a working-tree or
+committed candidate through the ordinary deployment services in owned scratch,
+on PostgreSQL and on SQL Server. It reports typed evidence without an applyable
+plan file; `test --cleanup` reconciles owned dead runs. `test fixtures repin`
+moves one fixture pin only after the edited SQL provably leaves the same rows
+and next allocator values (DEC-1165.12, DEC-1165.13); it is PostgreSQL only
+until the SQL Server re-pin lands (#1165 F3). A SQL Server run seals its
+database READ_ONLY before any assertion (DEC-1165.15; ADR-0019).
 
 ## Live tests
 

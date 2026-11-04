@@ -2403,7 +2403,7 @@ full state.
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
-| `pbps test`, `pbps test --cleanup` | Test fixtures and a candidate in owned PostgreSQL scratch, or reconcile owned leftovers (§9.9) |
+| `pbps test`, `pbps test --cleanup` | Test fixtures and a candidate in owned scratch on either engine, or reconcile owned leftovers (§9.9) |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state list` | This environment's history, newest first |
 | `pbps state record-data-work` | Record self-reported external work after a retained successful expand apply; never execute it |
@@ -4025,8 +4025,9 @@ the third system copies and edits it (14.3).
 candidate declaration change using SQL fixtures and assertions in a scratch
 **it created**. The accepted contract is
 [ADR-0019](ADR-0019-plan-tests.md); implementation is #1165 (PostgreSQL first,
-then SQL Server, both required). The PostgreSQL run, `test --cleanup`
-and `test fixtures repin` are implemented for PostgreSQL; SQL Server execution remains pending. It accepts no `--db`, `--env`, supplied server
+then SQL Server, both required). The run and `test --cleanup` are implemented
+for both engines; `test fixtures repin` for PostgreSQL only, until the SQL Server
+re-pin lands. It accepts no `--db`, `--env`, supplied server
 or production plan, and writes **no applyable plan file**. The result reports
 the exact executed test-plan checksum, not a promise that a future production
 plan will have identical bytes. §9.3's preview/rehearsal remains separate.

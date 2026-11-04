@@ -10,8 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_db::query::AssertionResult;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
-use pbps_db::{DbError, Row};
+use pbps_db::{Conn, DbError, Driver, Row};
 use pbps_model::Schema;
 
 use crate::ident::quote;
@@ -497,6 +498,134 @@ pub async fn run_fixture(conn: &mut impl ExecuteConnection, sql: &str) -> Result
         return Err(FixtureError::OpenTransaction(open));
     }
     Ok(())
+}
+
+/// Switches the owned database READ_ONLY, the scratch write boundary of an
+/// assertion (ADR-0019 §7). `conn` is the administrator's connection to
+/// `master`; the caller bounds the whole call with a deadline.
+///
+/// It refuses while any other user session is on the database and never evicts
+/// one: `ROLLBACK IMMEDIATE` would hide a leaked client. The refusal comes
+/// first because a plain `ALTER DATABASE … SET READ_ONLY` waits without limit
+/// behind a held session, and neither `LOCK_TIMEOUT` nor `NO_WAIT` bounds it
+/// (measured on #1165). A deadline that drops the connection leaves that
+/// statement pending server-side, so a failure here ends the run.
+pub async fn seal(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    let database = name(DATABASE)?;
+    let holders = rows_of(
+        conn.query(&format!(
+            "SELECT CONVERT(nvarchar(20), session_id) AS session, \
+             ISNULL(login_name, N'') AS login FROM sys.dm_exec_sessions \
+             WHERE is_user_process = 1 AND database_id = DB_ID({}) \
+             AND session_id <> @@SPID ORDER BY session_id",
+            literal(DATABASE)
+        ))
+        .await?,
+        &["session", "login"],
+    )?;
+    if !holders.is_empty() {
+        return Err(refused(format!(
+            "the owned database still has {} open session(s) ({}); it is not \
+             switched read-only while anything is connected",
+            holders.len(),
+            holders
+                .iter()
+                .map(|h| format!("{} as {}", h[0], h[1]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    conn.execute(&format!("ALTER DATABASE {database} SET READ_ONLY"))
+        .await?;
+    let mode = rows_of(
+        conn.query(&format!(
+            "SELECT CONVERT(nvarchar(60), DATABASEPROPERTYEX({}, N'Updateability')) AS mode",
+            literal(DATABASE)
+        ))
+        .await?,
+        &["mode"],
+    )?;
+    match mode.first().map(|row| row[0].as_str()) {
+        Some("READ_ONLY") => Ok(()),
+        other => Err(refused(format!(
+            "the owned database is not read-only after the switch (updateability {})",
+            other.unwrap_or("unreadable")
+        ))),
+    }
+}
+
+/// Runs one assertion file as the assertion login, in the sealed database. The
+/// connection is fresh and consumed, so no assertion shares a session. The mode
+/// is read again here: a zero-row result is a pass only when nothing could have
+/// written, so an unsealed database must not reach the user's SQL.
+pub async fn run_assertion(
+    connection: &str,
+    sql: &str,
+    timeout: std::time::Duration,
+) -> Result<AssertionResult, DbError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    tokio::time::timeout_at(deadline, async {
+        let mut conn = Conn::connect(Driver::Mssql, connection).await?;
+        let rows = rows_of(
+            conn.query(
+                "SELECT DB_NAME() AS name, \
+                 CONVERT(nvarchar(60), DATABASEPROPERTYEX(DB_NAME(), N'Updateability')) AS mode",
+            )
+            .await?,
+            &["name", "mode"],
+        )?;
+        if rows.first().map(|r| (r[0].as_str(), r[1].as_str())) != Some((DATABASE, "READ_ONLY")) {
+            return Err(refused(
+                "the assertion connection is not on the sealed owned database",
+            ));
+        }
+        // The engine parses the batch (DEC-2401.2): result shape and the
+        // deadline bound execution, and READ_ONLY is the write boundary.
+        Ok(
+            match conn
+                .query_bounded(
+                    sql,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+            {
+                Ok(evidence) => AssertionResult::from_evidence(evidence),
+                Err(error) if error.server_error_code().is_some() => {
+                    AssertionResult::SqlError(error)
+                }
+                Err(error) => AssertionResult::Unanswerable(error),
+            },
+        )
+    })
+    .await
+    .map_err(|_| DbError::DeadlineExceeded("assertion deadline exceeded"))?
+}
+
+/// Whether a SQL Server error number is the engine or its host failing rather
+/// than the user's SQL. These are numbers, not SQLSTATEs: a user `THROW` may
+/// use any number from 50000 up, so a PostgreSQL-style prefix rule would read
+/// one as a fault. Only the faults a test run can meet are listed: resources
+/// exhausted (701, 802, 1101, 1105, 1204, 8645, 9001, 9002), storage failing
+/// (823, 824, 825) and a session the server ended (596, 6005). Anything else
+/// the user's SQL can cause, a permission (229) or a write to the read-only
+/// database (3906) among them, is a finding.
+pub fn infrastructure_fault(code: &str) -> bool {
+    matches!(
+        code,
+        "596"
+            | "701"
+            | "802"
+            | "823"
+            | "824"
+            | "825"
+            | "1101"
+            | "1105"
+            | "1204"
+            | "6005"
+            | "8645"
+            | "9001"
+            | "9002"
+    )
 }
 
 #[cfg(test)]
