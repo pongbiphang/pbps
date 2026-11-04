@@ -1016,5 +1016,7 @@ engine at construction (`on`) or declares itself database-free (`offline`), and
 XX on PostgreSQL, a short list of engine fault numbers on SQL Server (resources,
 storage, a session the server ended). A SQL Server number is not a SQLSTATE: a
 user `THROW 53300` is the user's own, and a permission error (229) or a write to
-the sealed database (3906) is a finding. `fixtures repin` still refuses SQL
+the sealed database (3906) is a finding. The same reading applies to the error
+an assertion itself returns: a coded engine fault there is unanswerable (exit 1),
+not a finding about the SQL, on either engine. `fixtures repin` still refuses SQL
 Server until F3.

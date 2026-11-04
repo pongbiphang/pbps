@@ -101,16 +101,29 @@ impl Phase {
 pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Error) -> bool {
     if let Some(db) = error.downcast_ref::<pbps_db::DbError>() {
         return db.server_error_code().is_none_or(|c| match engine {
-            Some(pbps_db::Driver::Postgres) => {
-                ["08", "53", "58", "XX"].iter().any(|p| c.starts_with(p)) || c == "57014"
-            }
-            Some(pbps_db::Driver::Mssql) => pbps_mssql::test_scratch::infrastructure_fault(&c),
+            Some(driver) => fault_code(driver, &c),
             None => false,
         });
     }
     error
         .chain()
         .any(|e| e.is::<tokio::time::error::Elapsed>() || e.is::<std::io::Error>())
+}
+/// Whether a server-coded error is the engine or its host failing, by the
+/// engine's own numbering.
+fn fault_code(driver: pbps_db::Driver, code: &str) -> bool {
+    match driver {
+        pbps_db::Driver::Postgres => {
+            ["08", "53", "58", "XX"].iter().any(|p| code.starts_with(p)) || code == "57014"
+        }
+        pbps_db::Driver::Mssql => pbps_mssql::test_scratch::infrastructure_fault(code),
+    }
+}
+/// [`fault_code`] for a database error an assertion returned.
+pub(super) fn engine_fault(driver: pbps_db::Driver, error: &pbps_db::DbError) -> bool {
+    error
+        .server_error_code()
+        .is_some_and(|code| fault_code(driver, &code))
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct Column {

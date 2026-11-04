@@ -185,3 +185,57 @@ fn an_uncoded_database_error_never_answered_on_either_engine_and_an_offline_phas
     offline.record(Instant::now(), "test.input", &Err::<(), _>(coded("53300")));
     assert!(matches!(offline.outcome, Status::Failed));
 }
+
+fn sql_error(code: &str) -> pbps_db::query::AssertionResult {
+    pbps_db::query::AssertionResult::SqlError(pbps_db::DbError::Driver {
+        message: "server said".into(),
+        code: Some(code.into()),
+        diagnostic: None,
+    })
+}
+
+#[test]
+fn an_engine_fault_an_assertion_returns_is_unanswerable_and_the_users_own_error_is_a_finding() {
+    use pbps_db::Driver::{Mssql, Postgres};
+    let faults = [
+        (Mssql, "9002"),
+        (Mssql, "701"),
+        (Postgres, "53300"),
+        (Postgres, "08006"),
+    ];
+    for (driver, code) in faults {
+        let (outcome, finding, _) = judge(driver, sql_error(code));
+        assert_eq!(outcome, "unanswerable", "{code}");
+        let (id, _, unknown) = finding.unwrap();
+        assert_eq!(
+            (id, unknown),
+            ("test.assertion.unanswerable", true),
+            "{code}"
+        );
+    }
+    // Negative: what the SQL itself caused is a finding about it, and the same
+    // digits are not a fault on the engine that does not number them so.
+    let findings = [
+        (Mssql, "229"),
+        (Mssql, "3906"),
+        (Mssql, "50000"),
+        (Mssql, "53300"),
+        (Postgres, "42P01"),
+    ];
+    for (driver, code) in findings {
+        let (outcome, finding, _) = judge(driver, sql_error(code));
+        assert_eq!(outcome, "sql_error", "{code}");
+        let (id, _, unknown) = finding.unwrap();
+        assert_eq!((id, unknown), ("test.assertion.sql", false), "{code}");
+    }
+    // Negative: a violation stays a finding on both engines.
+    let rows = pbps_db::query::QueryEvidence {
+        columns: vec![],
+        rows: vec![],
+        truncated: true,
+    };
+    let (outcome, finding, evidence) =
+        judge(Mssql, pbps_db::query::AssertionResult::Violation(rows));
+    assert_eq!(outcome, "violation");
+    assert!(!finding.unwrap().2 && evidence.is_some());
+}

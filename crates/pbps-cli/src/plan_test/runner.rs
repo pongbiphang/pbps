@@ -181,6 +181,7 @@ pub(super) async fn run_replay(
 }
 async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, control: &mut Control) {
     let timeouts = inputs.frozen.manifest.timeouts;
+    let driver = crate::db::driver_for(inputs.identity.dialect);
     let replay = inputs.replay();
     let Some(mut phase) =
         test_run::boxed_future(|| run_replay(&replay, session, data, control, 2)).await
@@ -222,42 +223,7 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
             Ok(result) => result,
             Err(error) => A::Unanswerable(pbps_db::DbError::BadRow(error.to_string())),
         };
-        let (outcome, finding, evidence) = match result {
-            A::Pass(e) => ("pass", None, Some(e)),
-            A::Violation(e) => (
-                "violation",
-                Some((
-                    "test.assertion.rows",
-                    "assertion returned violation rows".into(),
-                    false,
-                )),
-                Some(e),
-            ),
-            A::InvalidResult { message } => (
-                "invalid_result",
-                Some(("test.assertion.invalid-result", message, false)),
-                None,
-            ),
-            A::SqlError(e) => (
-                "sql_error",
-                Some(("test.assertion.sql", e.to_string(), false)),
-                None,
-            ),
-            A::BoundaryViolation => (
-                "boundary_violation",
-                Some((
-                    "test.assertion.boundary",
-                    "assertion changed its read-only transaction".into(),
-                    false,
-                )),
-                None,
-            ),
-            A::Unanswerable(e) => (
-                "unanswerable",
-                Some(("test.assertion.unanswerable", e.to_string(), true)),
-                None,
-            ),
-        };
+        let (outcome, finding, evidence) = judge(driver, result);
         let a = &mut data.assertions[index];
         a.outcome = outcome.into();
         if let Some(e) = evidence {
@@ -275,6 +241,63 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
         }
         data.phases[phase].outcome = Status::Passed;
         phase += 1;
+    }
+}
+/// An assertion's outcome name, the finding it raises (id, message, whether the
+/// run could not look) and its evidence.
+type Judged = (
+    &'static str,
+    Option<(&'static str, String, bool)>,
+    Option<pbps_db::query::QueryEvidence>,
+);
+
+/// What one assertion's result means for the run: its outcome name, the finding
+/// it raises (id, message, whether the run could not look), and its evidence.
+fn judge(driver: pbps_db::Driver, result: pbps_db::query::AssertionResult) -> Judged {
+    use pbps_db::query::AssertionResult as A;
+    match result {
+        A::Pass(e) => ("pass", None, Some(e)),
+        A::Violation(e) => (
+            "violation",
+            Some((
+                "test.assertion.rows",
+                "assertion returned violation rows".into(),
+                false,
+            )),
+            Some(e),
+        ),
+        A::InvalidResult { message } => (
+            "invalid_result",
+            Some(("test.assertion.invalid-result", message, false)),
+            None,
+        ),
+        // A coded engine fault (resources, storage, a session the server ended)
+        // says the run could not look, not what the SQL did: the same reading
+        // `Phase::record` gives a step's error.
+        A::SqlError(e) if super::report::engine_fault(driver, &e) => (
+            "unanswerable",
+            Some(("test.assertion.unanswerable", e.to_string(), true)),
+            None,
+        ),
+        A::SqlError(e) => (
+            "sql_error",
+            Some(("test.assertion.sql", e.to_string(), false)),
+            None,
+        ),
+        A::BoundaryViolation => (
+            "boundary_violation",
+            Some((
+                "test.assertion.boundary",
+                "assertion changed its read-only transaction".into(),
+                false,
+            )),
+            None,
+        ),
+        A::Unanswerable(e) => (
+            "unanswerable",
+            Some(("test.assertion.unanswerable", e.to_string(), true)),
+            None,
+        ),
     }
 }
 async fn hop(
