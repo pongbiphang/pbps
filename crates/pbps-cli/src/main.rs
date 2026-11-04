@@ -1354,7 +1354,14 @@ fn run() -> anyhow::Result<()> {
                          environment; run them separately",
                     )?;
                 }
-                refuse_aliased_outputs(&project, out.as_deref(), sql.as_deref(), None, json)?;
+                refuse_aliased_outputs(
+                    &project,
+                    out.as_deref(),
+                    sql.as_deref(),
+                    None,
+                    &assertions,
+                    json,
+                )?;
                 let resolver_selection = match project
                     .config
                     .select_resolver(resolve_with.as_deref(), target.env.as_deref())
@@ -1480,6 +1487,7 @@ fn run() -> anyhow::Result<()> {
                 out.as_deref(),
                 sql.as_deref(),
                 base.as_deref(),
+                &assertions,
                 json,
             )?;
             let source = match base {
@@ -4920,6 +4928,7 @@ fn refuse_aliased_outputs(
     out: Option<&Path>,
     sql: Option<&Path>,
     base: Option<&Path>,
+    assertions: &[PathBuf],
     json: bool,
 ) -> anyhow::Result<()> {
     if out.is_none() && sql.is_none() {
@@ -4958,6 +4967,14 @@ fn refuse_aliased_outputs(
         inputs.extend(files);
     }
     inputs.extend(base.map(Path::to_owned));
+    // Use the SQL reader's resolution, including its working-directory base.
+    // Selection::prepare owns unusable inputs; keep their original paths here
+    // so even an absent assertion cannot also be an artifact destination.
+    inputs.extend(
+        assertions
+            .iter()
+            .map(|path| plan_test::files::resolve(path).unwrap_or_else(|_| path.clone())),
+    );
     // Replacing a key invalidates plans already sealed under it, including
     // plans for environments this invocation does not select.
     for environment in project.config.environments.values() {

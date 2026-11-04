@@ -41,19 +41,25 @@ pub(crate) struct Frozen {
     manifest_resolved: PathBuf,
 }
 
+/// Resolve SQL inputs the same way before reading and before checking output
+/// aliases. Relative CLI paths start at the working directory, not the project.
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf, Problem> {
+    path.canonicalize().map_err(|e| {
+        if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
+            Problem::Missing
+        } else {
+            Problem::Unreadable(e.to_string())
+        }
+    })
+}
+
 /// Reads `path`, which must name a regular file inside `root` (canonical).
 ///
 /// The containment test is on the *resolved* path: a lexical `..` check passes
 /// `a/../b` and a symlink inside the project can lead anywhere.
 pub(crate) fn read(root: &Path, path: &Path) -> Result<Read, Problem> {
     let unreadable = |e: std::io::Error| Problem::Unreadable(e.to_string());
-    let resolved = path.canonicalize().map_err(|e| {
-        if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
-            Problem::Missing
-        } else {
-            unreadable(e)
-        }
-    })?;
+    let resolved = resolve(path)?;
     let inside = resolved
         .strip_prefix(root)
         .map_err(|_| Problem::OutsideProject)?;
