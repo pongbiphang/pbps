@@ -1115,6 +1115,92 @@ fn blank_audit_reasons_refuse_before_project_or_connection_io() {
 }
 
 #[test]
+fn move_rows_reasons_refuse_blanks_and_preserve_identity_bytes() {
+    let d = Demo::new("move-reason1846");
+    d.table(
+        "table: app.ev\ncolumns:\n  id: {type: bigint, nullable: false}\n  \
+         ts: {type: date, nullable: false}\nprimary_key: [id, ts]\npartition_by: [ts]\n\
+         partitions:\n  ev_2025: {from: ['2025-01-01'], to: ['2026-01-01']}\n  \
+         ev_rest: default\n",
+    );
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let path = d.dir.join("schema.ids.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = d.dir.join("missing-project");
+    for reason in ["", "   ", "\t", "\n\t ", "\u{3000}", "\u{a0}"] {
+        let args = [
+            "move-rows",
+            "app.ev_2025",
+            "--max-rows",
+            "5",
+            "--reason",
+            reason,
+        ];
+        for out in [
+            d.run(&args),
+            Command::new(BIN)
+                .arg("--project")
+                .arg(&missing)
+                .args(args)
+                .output()
+                .unwrap(),
+        ] {
+            assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+            assert!(stderr(&out).contains("reason"), "{}", stderr(&out));
+            assert!(
+                stderr(&out).contains("empty") || stderr(&out).contains("whitespace"),
+                "{}",
+                stderr(&out)
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!missing.exists());
+    }
+
+    let reason = " \t核准 REG-1846: \"CDC\"\n ";
+    let args = [
+        "move-rows",
+        "app.ev_2025",
+        "--max-rows",
+        "5",
+        "--reason",
+        reason,
+    ];
+    succeeds(d.run(&args));
+    let recorded = std::fs::read(&path).unwrap();
+    let ids: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
+    assert_eq!(ids.moves.len(), 1);
+    let uid = ids.table_uid(&"app.ev_2025".parse().unwrap()).unwrap();
+    assert_eq!(ids.moves[uid].reason, reason);
+    assert_eq!(ids.moves[uid].max_rows, 5);
+    succeeds(d.run(&args));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+
+    for (table, max_rows) in [("app.ev_2025", "0"), ("app.ev", "5")] {
+        let out = d.run(&[
+            "move-rows",
+            table,
+            "--max-rows",
+            max_rows,
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+        assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    }
+
+    for reason in ["", "   ", "\t\n", "\u{3000}"] {
+        let mut historical = ids.clone();
+        historical.moves.get_mut(uid).unwrap().reason = reason.into();
+        let bytes = serde_json::to_vec_pretty(&historical).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        succeeds(d.run(&["plan", "--check"]));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
 #[ignore = "needs live postgres"]
 fn blank_baseline_reasons_leave_the_live_ledger_unchanged() {
     let own = OwnDatabase::new(&server(), "reasons1796");

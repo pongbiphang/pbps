@@ -1221,6 +1221,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn historical_move_reasons_remain_text_on_load() {
+        for reason in ["", "   ", "\t\n", "\u{3000}", " 核准 \"CDC\" "] {
+            let mut ids = sample();
+            ids.moves.insert(
+                uid("t_a9k2mq"),
+                Move {
+                    max_rows: 5,
+                    allowed_at: "2026-10-11".into(),
+                    reason: reason.into(),
+                    operator: "old-client".into(),
+                },
+            );
+            let json = serde_json::to_value(&ids).unwrap();
+            let back: IdsFile = serde_json::from_value(json.clone()).unwrap();
+            back.validate().unwrap();
+            assert_eq!(back, ids);
+
+            // Keeping historical text readable does not supply a missing or
+            // non-string reason on a damaged record (DEC-1846.1).
+            let mut invalid = json;
+            invalid["moves"]["t_a9k2mq"]["reason"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<IdsFile>(invalid.clone()).is_err());
+            invalid["moves"]["t_a9k2mq"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reason");
+            assert!(serde_json::from_value::<IdsFile>(invalid).is_err());
+        }
+    }
+
     fn recorded() -> Conversion {
         Conversion {
             from: "text".into(),

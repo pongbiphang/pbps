@@ -1316,3 +1316,25 @@ readers cannot accidentally flatten a new instance project before A3 exists.
 Absent databases retains existing configuration bytes and the existing loader.
 Only the editor-schema set advances; Schema, ids, plan and ledger wire formats
 do not change in this slice.
+
+<a id="dec-1846-1"></a>
+
+**DEC-1846.1. New move-row reasons use the shared nonblank value; historical moves keep text.**
+`Intent::MoveRows.reason` carries `pbps_model::Reason`, as the drop intents do
+(DEC-1796.1). The CLI already parses this type before project discovery; it
+now passes the value through dispatch rather than turning it back into text.
+Checking only CLI input leaves JSON deserialization able to supply a blank
+new intent, which the resolver measured as recording unchanged. The shared
+type refuses empty and whitespace-only values, including Unicode whitespace,
+without another validator, and preserves meaningful text verbatim. Convert
+to text only when writing the historical `Move` record.
+
+`Move.reason` stays `String`: existing blank reasons in `schema.ids.json`
+remain readable and are not repaired or reinterpreted. Missing and non-string
+historical reasons still refuse. Serialized valid intents and stored moves
+retain their shape, so no identity, plan, state or published-schema format
+version changes. Valid bounds and idempotent repeated intent are unchanged.
+
+Pinned by JSON intent refusal (the revert witness), historical identity
+loading with damaged-record controls, and an offline CLI regression for
+unchanged identity bytes on refusal, verbatim recording and repeated intent.

@@ -1523,6 +1523,11 @@ bound and reason again changes nothing. It is refused for a table that is not a
 range partition whose parent declares a DEFAULT partition, where no row can
 move. The entry follows the partition through a rename and goes with its drop.
 
+The reason must contain a non-whitespace character. A blank CLI reason is a
+usage error (exit 2) before project discovery or writes; a serialized new
+`MoveRows` intent must meet the same rule. Meaningful reasons are recorded
+verbatim. Historical blank reasons in `moves` remain readable (DEC-1846.1).
+
 - **Without a move allowed**, any row of the DEFAULT inside the range refuses
   the apply by name, before its first statement, with the command that allows
   the move and the move written out to run by hand: lock the DEFAULT, create
