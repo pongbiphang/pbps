@@ -142,7 +142,7 @@ pub(super) async fn run_replay(
             };
             for f in &group.fixtures {
                 let start = Instant::now();
-                // PostgreSQL uses i32 milliseconds; zero would disable the limit.
+                // Whole milliseconds, never zero: PostgreSQL reads zero as no limit.
                 let timeout_ms = control
                     .deadline(ms(timeouts.fixture_ms))
                     .saturating_duration_since(tokio::time::Instant::now())
@@ -150,12 +150,10 @@ pub(super) async fn run_replay(
                     .div_ceil(1_000_000)
                     .clamp(1, i32::MAX as u128);
                 let result = control
-                    .bounded(ms(timeouts.fixture_ms), async {
-                        conn.execute(&format!("SET statement_timeout = '{timeout_ms}ms'"))
-                            .await?;
-                        conn.execute(r.fixtures[*f].1).await?;
-                        Ok(())
-                    })
+                    .bounded(
+                        ms(timeouts.fixture_ms),
+                        session.run_fixture(&mut conn, r.fixtures[*f].1, timeout_ms),
+                    )
                     .await;
                 data.phases[phase].record(start, "test.fixture", &result);
                 if result.is_err() {

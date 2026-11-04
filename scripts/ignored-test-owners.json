@@ -3245,6 +3245,26 @@
         "consumer_effective_columns::partition_membership_attachment_keeps_the_reader_bound_to_its_effective_column",
         "consumer_effective_columns::partition_membership_detachment_keeps_domain_nullability_visible_to_readers"
       ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "bin",
+        "pbps"
+      ],
+      "owner": "rehearsal",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "plan_test::session::mssql_tests::m1165_mssql_session_owns_least_privilege_identities_and_executes_only_accepted_sealed_plans",
+        "test_scratch::tests::live_mssql::a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record",
+        "test_scratch::tests::live_mssql::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
+        "test_scratch::tests::live_mssql::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone"
+      ]
     }
   ]
 }

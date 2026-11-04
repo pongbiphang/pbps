@@ -27,6 +27,8 @@ pub(crate) struct Control {
     end: Deadline,
     timeouts: Timeouts,
     cancel: Pin<Box<dyn Future<Output = std::io::Result<()>>>>,
+    /// The engine of the manifest's dialect; PostgreSQL until a caller says so.
+    driver: pbps_db::Driver,
 }
 impl Control {
     pub(crate) fn new(
@@ -38,6 +40,7 @@ impl Control {
         Self {
             end: Deadline::now() + ms(timeouts.run_ms),
             timeouts,
+            driver: pbps_db::Driver::Postgres,
             cancel: Box::pin(poll_fn(move |cx| {
                 if observed {
                     return std::task::Poll::Ready(Ok(()));
@@ -47,6 +50,10 @@ impl Control {
                 result
             })),
         }
+    }
+    pub(crate) fn with_driver(mut self, driver: pbps_db::Driver) -> Self {
+        self.driver = driver;
+        self
     }
     pub(super) fn deadline(&self, allowance: Duration) -> Deadline {
         self.end.min(Deadline::now() + allowance)
@@ -80,7 +87,7 @@ impl Control {
         let started = Instant::now();
         let result = test_scratch::TestScratch::start_cancelled(
             dir,
-            pbps_db::Driver::Postgres,
+            self.driver,
             image,
             pbps_config::resolver::PullPolicy::IfMissing,
             Some(self.deadline(ms(self.timeouts.startup_ms))),
@@ -113,16 +120,21 @@ impl Control {
                 test_run::boxed_future(|| async {
                     data.acquired_image = Some(scratch.acquired_image().await?);
                     let mut conn =
-                        pbps_db::Conn::connect(pbps_db::Driver::Postgres, scratch.connection())
-                            .await?;
-                    let rows = conn.query("SELECT version() AS version").await?;
-                    data.engine_build = Some(
-                        rows.first()
-                            .context("engine build is unreadable")?
-                            .try_get::<&str>("version")?
-                            .context("missing engine build")?
-                            .into(),
-                    );
+                        pbps_db::Conn::connect(scratch.driver(), scratch.connection()).await?;
+                    data.engine_build = Some(match scratch.driver() {
+                        pbps_db::Driver::Postgres => {
+                            let rows = conn.query("SELECT version() AS version").await?;
+                            rows.first()
+                                .context("engine build is unreadable")?
+                                .try_get::<&str>("version")?
+                                .context("missing engine build")?
+                                .into()
+                        }
+                        pbps_db::Driver::Mssql => {
+                            pbps_mssql::test_scratch::engine_build(&mut conn).await?
+                        }
+                    });
+                    drop(conn);
                     Session::new(scratch).await
                 }),
             )

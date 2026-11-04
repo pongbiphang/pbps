@@ -928,8 +928,8 @@ mod live {
             .expect("PBPS_TEST_PG_SCRATCH_IMAGE must name the pinned PostgreSQL image")
     }
 
-    async fn start(d: &Dir) -> TestScratch<'_> {
-        TestScratch::start(&d.dir, Driver::Postgres, &image(), PullPolicy::Never)
+    async fn start_on<'d>(d: &'d Dir, driver: Driver, image: &str) -> TestScratch<'d> {
+        TestScratch::start(&d.dir, driver, image, PullPolicy::Never)
             .await
             .unwrap()
     }
@@ -940,7 +940,7 @@ mod live {
 
     /// The owner dies: its lock goes with its process and its process is gone.
     fn kill(d: &Dir, scratch: TestScratch<'_>) -> (String, String) {
-        let TestScratch { held, journal } = scratch;
+        let TestScratch { held, journal, .. } = scratch;
         let record = journal.record.clone();
         held.disown();
         drop(journal);
@@ -954,12 +954,10 @@ mod live {
         super::super::recover(&d.dir, soon()).await.unwrap()
     }
 
-    #[tokio::test]
-    #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
-    async fn a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone() {
+    pub(super) async fn recorded_and_finished(driver: Driver, image: &str) {
         let d = Dir::new();
-        let scratch = start(&d).await;
-        pbps_db::Conn::connect(Driver::Postgres, scratch.connection())
+        let scratch = Box::pin(start_on(&d, driver, image)).await;
+        pbps_db::Conn::connect(driver, scratch.connection())
             .await
             .unwrap();
         let record = d.dir.read(scratch.run_id()).unwrap().unwrap();
@@ -969,7 +967,10 @@ mod live {
             .await
             .unwrap();
         assert_eq!(inspected.trim(), cid, "the recorded id is the runtime's");
-        assert!(!record.volumes.is_empty() && exists(&cid).await);
+        // The PostgreSQL image declares its data directory a volume; the SQL
+        // Server image declares none (measured), so it has none to confirm gone.
+        assert!(driver != Driver::Postgres || !record.volumes.is_empty());
+        assert!(exists(&cid).await);
         scratch.finish().await.unwrap();
         assert!(!exists(&cid).await);
         for volume in &record.volumes {
@@ -986,9 +987,16 @@ mod live {
 
     #[tokio::test]
     #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
-    async fn a_killed_run_is_removed_by_the_next_and_a_live_one_is_not() {
+    async fn a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone() {
+        Box::pin(recorded_and_finished(Driver::Postgres, &image())).await;
+    }
+
+    pub(super) async fn killed_and_live(driver: Driver, image: &str) {
         let d = Dir::new();
-        let (dead, alive) = (start(&d).await, start(&d).await);
+        let (dead, alive) = (
+            Box::pin(start_on(&d, driver, image)).await,
+            Box::pin(start_on(&d, driver, image)).await,
+        );
         let alive_id = alive.journal.record.container.id.clone().unwrap();
         let (dead_run, dead_id) = kill(&d, dead);
         assert!(
@@ -1008,7 +1016,11 @@ mod live {
 
     #[tokio::test]
     #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
-    async fn a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record() {
+    async fn a_killed_run_is_removed_by_the_next_and_a_live_one_is_not() {
+        Box::pin(killed_and_live(Driver::Postgres, &image())).await;
+    }
+
+    pub(super) async fn failed_removal(driver: Driver, image: &str) {
         struct Refusing;
         impl Runtime for Refusing {
             async fn list(&self, label: &str) -> Result<Vec<String>, Fail> {
@@ -1028,12 +1040,12 @@ mod live {
             }
         }
         let d = Dir::new();
-        let scratch = start(&d).await;
+        let scratch = Box::pin(start_on(&d, driver, image)).await;
         let (run_id, cid) = (
             scratch.run_id().to_owned(),
             scratch.journal.record.container.id.clone().unwrap(),
         );
-        let failure = scratch.finish_with(&Refusing).await.unwrap_err();
+        let failure = Box::pin(scratch.finish_with(&Refusing)).await.unwrap_err();
         assert_eq!(failure.kind, FailureKind::NotRemoved);
         assert!(failure.to_string().contains(&run_id));
         assert!(
@@ -1044,8 +1056,14 @@ mod live {
         let mut dead = d.dir.read(&run_id).unwrap().unwrap();
         dead.process.pid = GONE;
         d.dir.write(&dead).unwrap();
-        assert_eq!(recover(&d).await.removed, vec![run_id]);
+        assert_eq!(Box::pin(recover(&d)).await.removed, vec![run_id]);
         assert!(!exists(&cid).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
+    async fn a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record() {
+        Box::pin(failed_removal(Driver::Postgres, &image())).await;
     }
 
     #[tokio::test]
@@ -1361,4 +1379,33 @@ async fn d2a1165_interrupted_start_keeps_pending_recovery_evidence_through_empty
         .unwrap_err();
     assert_eq!(error.kind, FailureKind::Unprovable);
     assert_eq!(std::fs::read(path).unwrap(), b"not a run record");
+}
+
+/// The same three lifecycle properties on the SQL Server scratch image.
+mod live_mssql {
+    use super::live;
+    use pbps_db::Driver;
+
+    fn image() -> String {
+        std::env::var("PBPS_TEST_DEV_IMAGE")
+            .expect("PBPS_TEST_DEV_IMAGE must name the pinned SQL Server image")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned SQL Server scratch image"]
+    async fn a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone() {
+        Box::pin(live::recorded_and_finished(Driver::Mssql, &image())).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned SQL Server scratch image"]
+    async fn a_killed_run_is_removed_by_the_next_and_a_live_one_is_not() {
+        Box::pin(live::killed_and_live(Driver::Mssql, &image())).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned SQL Server scratch image"]
+    async fn a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record() {
+        Box::pin(live::failed_removal(Driver::Mssql, &image())).await;
+    }
 }

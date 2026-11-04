@@ -1,4 +1,10 @@
 //! Credentials and targets can only be derived from this run's owned handle.
+//!
+//! One `Session` serves both engines: the PostgreSQL code below is the original,
+//! and each method hands a SQL Server run to [`mssql`], whose SQL lives in
+//! `pbps_mssql::test_scratch`. Callers name no engine (DEC-1165.14).
+mod mssql;
+
 use super::revision::Assembled;
 use crate::{db::Target, test_scratch::TestScratch};
 use anyhow::{Context as _, ensure};
@@ -11,8 +17,10 @@ pub(crate) struct Session<'a> {
     target: Target,
     fixture: String,
     assertion: String,
+    /// Apply, fixture and assertion identities, in that order, on either engine.
     roles: [String; 3],
     key: std::path::PathBuf,
+    driver: Driver,
 }
 pub(super) fn quoted(name: &str) -> anyhow::Result<String> {
     Ok(pbps_pg::Postgres::new().quote_ident(name)?)
@@ -22,6 +30,10 @@ pub(super) fn table(name: &TableName) -> anyhow::Result<String> {
 }
 impl<'a> Session<'a> {
     pub async fn new(scratch: &'a TestScratch<'a>) -> anyhow::Result<Self> {
+        // Boxed so the larger arm does not grow the frame of the other.
+        if scratch.driver() == Driver::Mssql {
+            return Box::pin(mssql::new(scratch)).await;
+        }
         let admin = scratch.connection();
         ensure!(
             !admin.contains("://"),
@@ -89,13 +101,22 @@ impl<'a> Session<'a> {
             assertion: connection(assertion, &passwords[2]),
             roles,
             key,
+            driver: Driver::Postgres,
         })
     }
     pub(super) async fn admin(&self) -> anyhow::Result<Conn> {
+        if self.driver == Driver::Mssql {
+            return mssql::admin(self.scratch).await;
+        }
         let db = format!("{} dbname=pbps_test", self.scratch.connection());
         Ok(Conn::connect(Driver::Postgres, &db).await?)
     }
     pub async fn revoke_fixture_routines(&self) -> anyhow::Result<()> {
+        // A SQL Server fixture is granted tables only (ADR-0019 §6), so there is
+        // no routine grant to take back before a plan reads the catalog.
+        if self.driver == Driver::Mssql {
+            return Ok(());
+        }
         let mut conn = self.admin().await?;
         let fixture = &self.roles[1];
         // Temporary runner grants are not declaration grants; leave the ordinary
@@ -125,6 +146,9 @@ impl<'a> Session<'a> {
     // Prepare only the current revision, before its capture/plan. Preparing a
     // future union would make those future roles unmanaged in an earlier hop.
     pub async fn prepare(&self, schema: &Schema) -> anyhow::Result<()> {
+        if self.driver == Driver::Mssql {
+            return mssql::namespaces(self, schema).await;
+        }
         let mut conn = self.admin().await?;
         // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
         // Only this owned cluster's administrator supplies those prerequisites;
@@ -140,6 +164,9 @@ impl<'a> Session<'a> {
         self.namespaces(schema).await
     }
     pub async fn namespaces(&self, schema: &Schema) -> anyhow::Result<()> {
+        if self.driver == Driver::Mssql {
+            return mssql::namespaces(self, schema).await;
+        }
         let mut conn = self.admin().await?;
         let apply = &self.roles[0];
         // Namespaces are provisioning prerequisites of ordinary bootstrap,
@@ -201,6 +228,9 @@ impl<'a> Session<'a> {
         }
     }
     pub async fn grants(&self, schema: &Schema) -> anyhow::Result<()> {
+        if self.driver == Driver::Mssql {
+            return Box::pin(mssql::grants(self, schema)).await;
+        }
         let mut conn = self.admin().await?;
         let [_, fixture, assertion] = &self.roles;
         // Check every permanent namespace, including those with no managed table.
@@ -338,6 +368,29 @@ impl<'a> Session<'a> {
         Ok(())
     }
     pub async fn fixtures(&self) -> anyhow::Result<Conn> {
-        Ok(Conn::connect(Driver::Postgres, &self.fixture).await?)
+        Ok(Conn::connect(self.driver, &self.fixture).await?)
+    }
+    /// Runs one fixture file on `fixtures()`'s connection. PostgreSQL bounds it
+    /// by the server's own `statement_timeout`; SQL Server has none, so its
+    /// bound is the caller's deadline dropping the connection.
+    pub async fn run_fixture(
+        &self,
+        conn: &mut Conn,
+        sql: &str,
+        timeout_ms: u128,
+    ) -> anyhow::Result<()> {
+        match self.driver {
+            Driver::Postgres => {
+                // PostgreSQL uses i32 milliseconds; zero would disable the limit.
+                conn.execute(&format!("SET statement_timeout = '{timeout_ms}ms'"))
+                    .await?;
+                conn.execute(sql).await?;
+                Ok(())
+            }
+            Driver::Mssql => Box::pin(mssql::fixture(conn, sql)).await,
+        }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod mssql_tests;

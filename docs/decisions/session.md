@@ -963,3 +963,32 @@ leaves the whole old or whole new manifest and at most one orphan
 `.…repin-….tmp`. A writer that replaces the manifest between the last check and
 the rename is not detected: POSIX offers no compare-and-swap for a file, and a
 lock would not bind editors, so that window is documented, not closed.
+
+<a id="dec-1165-14"></a>
+
+**DEC-1165.14. The SQL Server test session is the same `Session`, with its SQL in `pbps-mssql`.**
+`Session` keeps its method names and dispatches by the scratch's engine, so the
+ordinary plan, apply and replay adapters, the fixture loop and `Control` run
+SQL Server unchanged; the PostgreSQL arm is the original code. The SQL is in
+`pbps_mssql::test_scratch` (dialect boundary), the connections and cleanup in the
+CLI. Three generated logins exist per run and only the administrator creates
+them. The apply login is `dbo` of the owned database by
+`ALTER AUTHORIZATION ON DATABASE` (measured: bootstrap, plan and apply need no
+server-level right), and declared schemas are created `AUTHORIZATION dbo`, so
+every managed object has one owner and ownership chaining reaches the
+functions a default or check calls without a fixture EXECUTE grant. The fixture
+and assertion users hold exactly ADR-0019 §6 on the tables (`data:` tables
+SELECT only), re-granted after every hop; each grant refresh then reads
+`sys.fn_my_permissions` *as* each user for the database, every schema and
+every managed table, and the logins' server permissions and database access
+are read once at provisioning, so a role, `public` or inherited right is found
+as readily as a direct one. A fixture file is split at standalone `GO` lines
+outside any literal, identifier or comment and run batch by batch in one
+session (`#temp` objects survive a `GO`); `GO <count>` and SQLCMD lines are
+refused before anything runs. A fixture that leaves a transaction open fails:
+closing its session would discard the writes with no error. SQL Server has no
+statement timeout, so a fixture's bound is the deadline dropping its connection.
+`engine_build` is the first `@@VERSION` line plus the server collation, so the
+two sides of a re-pin must agree on the one setting the image chooses that
+changes how text compares; no format version changes. Measured: the SQL Server
+image declares no volume, so a run has no volume to confirm gone.
