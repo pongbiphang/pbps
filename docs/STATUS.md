@@ -200,7 +200,7 @@ commands emit has a published schema of its own (`schema --kind envelope`,
 output against it.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
-(`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with`), `apply` (`--plan` /
+(`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with` / `--assert`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),

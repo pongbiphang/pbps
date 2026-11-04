@@ -1284,3 +1284,31 @@ async fn database_grant_options_refuse_before_assertion_sql() {
 async fn server_grant_options_refuse_before_assertion_sql() {
     delegation_is_refused("", "SERVER", true, "grantsrv2401").await;
 }
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_target_deadline_is_a_typed_error_never_a_refusal() {
+    let _case = TARGET_CASE.lock().await;
+    let mut f = Fixture::new("assert_late2401").await;
+    let target = f.target().await;
+    // Already expired when the connection is first polled: the answer is
+    // unknown, which the caller must not read as "refused" (DEC-2401.4).
+    let error = run_target(
+        &f.assertion,
+        &target,
+        "SELECT 1 WHERE 1=0",
+        Duration::from_nanos(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, pbps_db::DbError::DeadlineExceeded(_)),
+        "{error:?}"
+    );
+    // The login of the planning session is an admission refusal, not a deadline.
+    let error = run_target(&conn_str(), &target, "SELECT 1", DEADLINE)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, pbps_db::DbError::Refused(_)), "{error:?}");
+    f.finish().await;
+}

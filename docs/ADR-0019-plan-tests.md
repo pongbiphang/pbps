@@ -541,8 +541,9 @@ runs during apply. Target assertion hashes/outcomes enter the plan checksum,
 plan-to-apply window is closed only for the specific predicates covered by
 constraints or recorded drop preconditions, not arbitrary target assertions.
 
-#2401 PR A supplies the target engine entry points; the CLI selection and saved
-observation fields follow in PR B. SQL Server's assertion credential also needs
+#2401 PR A supplies the target engine entry points; PR B adds the CLI selection
+(`plan --assert`, `PBPS_ASSERTION_CONN`) and the saved observation fields
+(DEC-2401.4). SQL Server's assertion credential also needs
 `VIEW DEFINITION` on the target database so hidden securables cannot appear to
 have no write permissions. The server metadata requirements above likewise
 prevent hidden databases or default linked-server mappings from reading empty.

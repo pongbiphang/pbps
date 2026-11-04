@@ -811,3 +811,36 @@ including columns, schemas, databases and the server. Native GRANT AS role still
 succeeds when the login's data permission is denied; do not filter delegation
 through a data-right verdict. A DENY replacing the sole W grant removes that
 option; unreadable metadata still refuses. Keep ordinary non-delegable reads.
+
+<a id="dec-2401-4"></a>
+
+**DEC-2401.4. `plan --assert` records plan-time observations; it adds no
+guarantee at apply (#2401 PR B).** The assertions run through PR A's
+`run_target` entry points, one fresh connection each, in the order given and
+before the resolver and rehearsal, so a violation or a refused login stops
+before any costly work. The connection is read only from
+`PBPS_ASSERTION_CONN`; absent, blank or non-UTF-8 refuses naming it, and the
+engines refuse the planning login itself. Files are read once with the same
+containment and SHA-256 as `pbps test` (`plan_test::files::read`), so the same
+bytes have the same hash in a manifest and on the command line; every input
+problem is reported together, before any connection. A pass is recorded as
+`SavedPlan::target_assertions` (path, hash, `pass`), omitted when empty: like
+`rehearsal` (DEC-2379.1) the plan version stands, plans without `--assert` keep
+their bytes, an older reader refuses the field, and the wire fingerprint seals
+it, order included. The outcome type has one variant because every other result
+writes no plan; a record naming no file or hash is refused by
+`validate_analysis`. `apply` copies the list into the ledger entry
+(`StateSnapshot::target_assertions`, snapshot version 37, omitted when empty;
+staged checkpoints are unchanged and the closing entry carries it) and runs
+nothing: SPEC §7.5 stands. The published schema set moves to 90 for the plan
+and `explain` JSON fields.
+
+Outcomes map to findings. A violation, SQL error, invalid result, boundary
+violation or admission refusal is an answer (`plan.assertion.rows`, `.sql`,
+`.boundary`, `.refused`; exit 2). An unreadable answer, transport failure or
+deadline is not (`plan.assertion.unanswerable`; exit 1). The deadline needed its
+own type: `DbError::DeadlineExceeded` replaces the `Refused` sentence PR A's two
+`run_target` paths used, so "took too long" is never read as "refused" and no
+code matches message text. The default timeout is the manifest's
+`assertion_ms` default. Assertions are an observation: a row added after `plan`
+is not caught at apply, and the docs' guarantee table says so (SPEC §14.1).

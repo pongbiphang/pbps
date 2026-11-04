@@ -7620,9 +7620,10 @@ fn plan_db(
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
+    assertions: Option<&crate::plan_assert::Selection>,
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<services::PlanResult> {
-    db::runtime()?.block_on(plan_db_async(
+    db::runtime()?.block_on(plan_db_selected(
         project,
         target,
         declarations,
@@ -7632,13 +7633,48 @@ fn plan_db(
         json,
         resolver_selection,
         no_rehearse,
+        assertions,
         carried,
         false,
     ))
 }
 
+/// A plan with no target assertions: the scratch test runner plans this way
+/// and runs its own assertions on its own database. Not an `async fn`: an
+/// extra async layer would hold the whole planning future twice, which
+/// overflows a test thread's stack in a debug build.
 #[allow(clippy::too_many_arguments)]
-async fn plan_db_async(
+fn plan_db_async<'a>(
+    project: &'a Project,
+    target: &'a Target,
+    declarations: services::Declarations,
+    dialect: crate::emission::SelectedDialect,
+    script: bool,
+    staged: bool,
+    json: bool,
+    resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
+    no_rehearse: bool,
+    carried: &'a mut Vec<crate::output::Finding>,
+    quiet: bool,
+) -> impl std::future::Future<Output = anyhow::Result<services::PlanResult>> + 'a {
+    plan_db_selected(
+        project,
+        target,
+        declarations,
+        dialect,
+        script,
+        staged,
+        json,
+        resolver_selection,
+        no_rehearse,
+        None,
+        carried,
+        quiet,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_db_selected(
     project: &Project,
     target: &Target,
     declarations: services::Declarations,
@@ -7648,6 +7684,7 @@ async fn plan_db_async(
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
+    assertions: Option<&crate::plan_assert::Selection>,
     carried: &mut Vec<crate::output::Finding>,
     quiet: bool,
 ) -> anyhow::Result<services::PlanResult> {
@@ -7815,7 +7852,24 @@ async fn plan_db_async(
 
         let (mut conn, mut entry) = checked_target?;
         let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
+        let mut target_assertions = Vec::new();
         let connected = Box::pin(async {
+        // First, before the resolver and rehearsal: a violation stops cheaply,
+        // and a refused login never reaches the expensive steps (DEC-2401.4).
+        // Run on fresh assertion connections; the planning session only names
+        // the target they must match. `run` returns a boxed future so the
+        // engines' large runner futures stay out of this block's frame.
+        if let Some(selection) = assertions {
+            match selection.run(&mut conn).await {
+                Ok(passed) => target_assertions = passed,
+                Err(crate::plan_assert::Stop::Refused(finding)) => {
+                    return Ok(Connected::Refused { finding, findings: checkout_findings.clone() });
+                }
+                Err(crate::plan_assert::Stop::Unanswerable(finding)) => {
+                    return Err(crate::plan_assert::Unanswerable(finding).into());
+                }
+            }
+        }
         // The selected resolver entry's scratch, acquired at most once for the
         // resolver and the rehearsal both (#2379).
         let mut scratch = resolver_selection
@@ -9187,10 +9241,18 @@ async fn plan_db_async(
             resolver_selection,
             resolver_assessment,
             rehearsal: rehearsal.as_ref().map(crate::explain::rehearsal_detail),
+            target_assertions: target_assertions.clone(),
         };
         if !json {
             print!("{}", crate::dependencies::render(&dependencies));
             println!("Baseline: {baseline_description}");
+            if !target_assertions.is_empty() {
+                // Said where the approver reads it: this is not a check apply repeats.
+                println!(
+                    "Target assertions: {} passed while planning; apply does not run them.",
+                    target_assertions.len()
+                );
+            }
             if let Some(zone) = &baseline_zone {
                 // Named because nothing in a statement shows it: the same
                 // `2026-02-01` is another instant in another zone (DEC-1916.1).
@@ -9262,6 +9324,7 @@ async fn plan_db_async(
         plan.rehearsal = rehearsal;
         plan.extension_pins = extension_pins;
         plan.extension_drops = extension_drops;
+        plan.target_assertions = target_assertions;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -9493,6 +9556,9 @@ fn failed_apply_snapshot(
     let is_staged_checkpoint = current.staged.is_some();
     current.kind = StateKind::Failed;
     current.data_work = None;
+    // The newest row's assertions passed for the plan that wrote it; this row
+    // records a failed attempt and must not attribute them to another plan.
+    current.target_assertions.clear();
     current.operator = operator.to_owned();
     if !is_staged_checkpoint {
         current.git_sha = attempted_git_sha;
@@ -9934,6 +10000,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         snapshot.module_deps = plan.module_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
+        snapshot.target_assertions = plan.target_assertions.clone();
         // What the previous state declared, advanced by what this plan wrote:
         // from the plan alone, since `apply --plan` needs nothing else.
         snapshot.declared = entry.snapshot.declared.clone();
@@ -10904,6 +10971,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         snapshot.module_deps = plan.module_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
+        snapshot.target_assertions = plan.target_assertions.clone();
         // What the previous state declared, advanced by what this plan wrote: from
         // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
         snapshot.declared = entry.snapshot.declared.clone();
@@ -25677,6 +25745,12 @@ mod data_work_failure_tests {
                 None,
             )
             .unwrap();
+        let mut current = current;
+        current.target_assertions = vec![pbps_model::TargetAssertion {
+            path: "checks/a.sql".into(),
+            sha256: "c".repeat(64),
+            outcome: pbps_model::AssertionOutcome::Pass,
+        }];
         let failed = super::failed_apply_snapshot(
             pbps_db::Driver::Mssql,
             current,
@@ -25687,6 +25761,7 @@ mod data_work_failure_tests {
         );
         assert_eq!(failed.kind, pbps_model::StateKind::Failed);
         assert!(failed.data_work.is_none());
+        assert!(failed.target_assertions.is_empty());
         assert_eq!(failed.schema, before.schema);
         assert!(
             pbps_model::StateSnapshot::from_json(&serde_json::to_string(&failed).unwrap()).is_ok()

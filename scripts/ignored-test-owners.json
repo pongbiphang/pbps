@@ -600,6 +600,11 @@
         "data_work_refuses_missing_and_unreadable_evidence",
         "data_work_serializes_writers_and_preserves_staged_checkpoints",
         "data_work_does_not_replace_deployed_commit_evidence",
+        "plan_assertion_errors_and_write_attempts_are_not_passes_on_mssql",
+        "plan_assertion_logins_that_can_write_are_refused_on_mssql",
+        "plan_assertion_violations_write_no_plan_on_mssql",
+        "plan_assertions_need_their_own_connection_on_mssql",
+        "plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_mssql",
         "state_history_uses_recorded_uids_and_preserves_later_rename_intent",
         "state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids",
         "state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids",
@@ -1382,6 +1387,12 @@
         "data_work_refuses_missing_and_unreadable_evidence",
         "data_work_serializes_writers_and_preserves_staged_checkpoints",
         "data_work_does_not_replace_deployed_commit_evidence",
+        "plan_assertion_errors_and_write_attempts_are_not_passes_on_postgres",
+        "plan_assertion_logins_that_can_write_are_refused_on_postgres",
+        "plan_assertion_violations_write_no_plan_on_postgres",
+        "plan_assertions_need_their_own_connection_on_postgres",
+        "plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres",
+        "plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres_16",
         "state_history_uses_recorded_uids_and_preserves_later_rename_intent",
         "state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids",
         "state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids",
@@ -1836,7 +1847,8 @@
         "assertions2401::column_grant_options_refuse_before_assertion_sql",
         "assertions2401::schema_grant_options_refuse_before_assertion_sql",
         "assertions2401::database_grant_options_refuse_before_assertion_sql",
-        "assertions2401::server_grant_options_refuse_before_assertion_sql"
+        "assertions2401::server_grant_options_refuse_before_assertion_sql",
+        "assertions2401::a_target_deadline_is_a_typed_error_never_a_refusal"
       ]
     },
     {
@@ -2462,6 +2474,7 @@
         "assertions1165::target2401::read_server_files_is_refused_through_the_actor_closure",
         "assertions1165::target2401::write_server_files_is_refused_through_the_actor_closure",
         "assertions1165::target2401::execute_server_program_is_refused_through_the_actor_closure",
+        "assertions1165::target2401::a_target_deadline_is_a_typed_error_never_a_refusal",
         "domain2469::domain_check_uses_the_bare_type_before_its_function_and_enforces_values",
         "domain2469::domain_facets_keep_vetted_intermediates_authored_text_and_execution_modes",
         "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks",

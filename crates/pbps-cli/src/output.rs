@@ -308,12 +308,20 @@ pub fn or_unanswerable_beside<T>(
     or_unanswerable_with(command, json, step, |e| failure_findings(e, id, warnings))
 }
 
-fn failure_findings(error: &anyhow::Error, id: &str, warnings: Vec<Finding>) -> Vec<Finding> {
+pub(crate) fn failure_findings(
+    error: &anyhow::Error,
+    id: &str,
+    warnings: Vec<Finding>,
+) -> Vec<Finding> {
     // Anyhow context keeps the typed cause: classify that cause, never its
     // display text, and keep the warnings after every individual refusal.
     let mut findings = match error.downcast_ref::<crate::Unexpressible>() {
         Some(errors) => errors.findings(),
-        None => vec![Finding::error(id, format!("{error:#}"))],
+        // The assertion's own finding keeps its id and location (#2401).
+        None => match error.downcast_ref::<crate::plan_assert::Unanswerable>() {
+            Some(unanswerable) => vec![unanswerable.0.clone()],
+            None => vec![Finding::error(id, format!("{error:#}"))],
+        },
     };
     findings.extend(warnings);
     findings

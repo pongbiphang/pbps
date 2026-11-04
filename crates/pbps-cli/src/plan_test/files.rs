@@ -11,11 +11,11 @@ use super::{Change, ConsumedFile, Problem, Refusal, Revision, Role};
 /// One input as it was read. `source` is the path that was asked for and
 /// `resolved` what it named then; both are kept so that the recheck can tell
 /// a symlink moved from a file edited.
-struct Read {
-    resolved: PathBuf,
-    project_path: String,
-    text: Result<String, Problem>,
-    sha256: String,
+pub(crate) struct Read {
+    pub resolved: PathBuf,
+    pub project_path: String,
+    pub text: Result<String, Problem>,
+    pub sha256: String,
 }
 
 /// A fixture's or assertion's SQL exactly as read, with the facts that
@@ -45,7 +45,7 @@ pub(crate) struct Frozen {
 ///
 /// The containment test is on the *resolved* path: a lexical `..` check passes
 /// `a/../b` and a symlink inside the project can lead anywhere.
-fn read(root: &Path, path: &Path) -> Result<Read, Problem> {
+pub(crate) fn read(root: &Path, path: &Path) -> Result<Read, Problem> {
     let unreadable = |e: std::io::Error| Problem::Unreadable(e.to_string());
     let resolved = path.canonicalize().map_err(|e| {
         if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {

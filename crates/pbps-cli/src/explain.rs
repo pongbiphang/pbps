@@ -105,6 +105,11 @@ pub struct Explanation {
     /// asked for. Absence is not "rehearsed".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rehearsal: Option<rehearsal::RehearsalDetail>,
+    /// The reviewed assertions that passed against the target while the plan
+    /// was computed (#2401), in the order given. Present only if some were
+    /// asked for: absence is not "all passed". An observation; apply runs none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_assertions: Vec<pbps_model::TargetAssertion>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -499,6 +504,7 @@ fn explain(
             pbps_model::resolver::PlanAnalysis::Ordinary => None,
         },
         rehearsal: plan.rehearsal.as_ref().map(rehearsal::detail),
+        target_assertions: plan.target_assertions.clone(),
     })
 }
 
@@ -679,6 +685,12 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     if let Some(detail) = &e.rehearsal {
         out.push_str(&format!("  rehearsal   {}\n", rehearsal::line(detail)));
     }
+    if !e.target_assertions.is_empty() {
+        out.push_str(&format!(
+            "  assertions  {} passed against the target while planning; not run again at apply\n",
+            e.target_assertions.len()
+        ));
+    }
     out.push_str(&format!("  dialect     {}\n", Escaped(&e.dialect)));
     out.push_str(&format!("  created     {}\n", e.created_at.shown()));
     if let Some(sha) = &e.git_sha {
@@ -786,6 +798,22 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     }
     if let Some(detail) = &e.rehearsal {
         out.push_str(&rehearsal::render(detail));
+    }
+    if !e.target_assertions.is_empty() {
+        out.push_str("\nTarget assertions\n");
+        for a in &e.target_assertions {
+            out.push_str(&format!(
+                "  {}  {}  sha256 {}\n",
+                a.outcome.as_str(),
+                a.path.shown(),
+                Escaped(&a.sha256)
+            ));
+        }
+        out.push_str(
+            "  Each ran read-only against the target while this plan was computed and returned\n  \
+             no rows. Nothing user-supplied runs at apply, so a row added after `plan` is not\n  \
+             caught there. A changed file has another hash: plan again to see it.\n",
+        );
     }
 
     out.push_str("\nThe environment\n");

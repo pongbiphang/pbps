@@ -48,6 +48,54 @@ fn drop_intent2414_removals_require_recorded_reasons_on_mssql() {
     drop_intent2414::check(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[path = "support/plan_assertions2401.rs"]
+mod plan_assertions2401;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_mssql() {
+    plan_assertions2401::passing_assertions_are_recorded_explained_and_kept_in_the_ledger(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn plan_assertion_violations_write_no_plan_on_mssql() {
+    plan_assertions2401::a_violation_writes_no_plan_and_names_the_rows(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn plan_assertion_errors_and_write_attempts_are_not_passes_on_mssql() {
+    plan_assertions2401::errors_and_write_attempts_are_errors_not_passes(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn plan_assertions_need_their_own_connection_on_mssql() {
+    plan_assertions2401::the_assertion_connection_is_required_and_never_the_planning_login(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn plan_assertion_logins_that_can_write_are_refused_on_mssql() {
+    plan_assertions2401::a_login_that_can_write_is_refused_and_a_read_only_login_runs(
+        &std::env::var("PBPS_TEST_DB").unwrap(),
+        false,
+    );
+}
+
 #[path = "support/dependencies2322.rs"]
 mod dependencies2322;
 #[path = "support/dev587.rs"]

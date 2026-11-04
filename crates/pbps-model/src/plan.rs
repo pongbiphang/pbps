@@ -502,6 +502,18 @@ pub struct SavedPlan {
     /// direction (DEC-2379.1). `apply` displays it and never rehearses again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rehearsal: Option<crate::Rehearsal>,
+
+    /// The reviewed assertions that passed against the target while this plan
+    /// was computed (#2401, DEC-2401.4), in the order they were given.
+    ///
+    /// An observation, not a guarantee: nothing user-supplied runs at `apply`,
+    /// so a row added after `plan` is not caught there. Omitted when none was
+    /// asked for, so plans written without `--assert` keep their bytes and the
+    /// version stands; an older reader refuses the field through
+    /// `deny_unknown_fields`, the safe direction (DEC-2379.1). A failing
+    /// assertion writes no plan, so there is no failed outcome to record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_assertions: Vec<crate::TargetAssertion>,
 }
 
 /// Complete catalog source of a reviewed input-path root (DEC-2181.2).
@@ -637,6 +649,7 @@ impl SavedPlan {
             type_routine_pins: None,
             trusted_roles: Default::default(),
             rehearsal: None,
+            target_assertions: Vec::new(),
         }
     }
 
@@ -658,6 +671,10 @@ impl SavedPlan {
     pub fn validate_analysis(&self) -> Result<(), crate::resolver::EvidenceError> {
         use crate::resolver::{EvidenceError, PlanAnalysis};
         if self.rehearsal.as_ref().is_some_and(|r| !r.is_complete()) {
+            return Err(EvidenceError::Incomplete);
+        }
+        // A record naming no file or no content hash observed nothing.
+        if self.target_assertions.iter().any(|a| !a.is_complete()) {
             return Err(EvidenceError::Incomplete);
         }
         match (&self.analysis, self.origin, self.mode) {
@@ -1345,5 +1362,89 @@ mod tests {
             payload.get("requirers").is_none() && payload.get("releases").is_none(),
             "{change}"
         );
+    }
+
+    fn bare_plan() -> SavedPlan {
+        SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-11-02T00:00:00Z",
+            PlanBaseline {
+                time_zone: None,
+                description: "d".into(),
+                checksum: "c".into(),
+                database_collation: None,
+            },
+            ChangeSet::default(),
+            IdsFile::default(),
+        )
+    }
+
+    fn passed(path: &str, sha: char) -> crate::TargetAssertion {
+        crate::TargetAssertion {
+            path: path.into(),
+            sha256: sha.to_string().repeat(64),
+            outcome: crate::AssertionOutcome::Pass,
+        }
+    }
+
+    /// DEC-2401.4: a plan with no assertion keeps its bytes (and the version),
+    /// and a recorded one is sealed by the checksum, by content and by order.
+    #[test]
+    fn target_assertions_are_absent_when_empty_and_sealed_by_the_checksum() {
+        let plain = bare_plan();
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("target_assertions")
+        );
+
+        let mut one = plain.clone();
+        one.target_assertions = vec![passed("a.sql", 'a')];
+        assert_ne!(plain.wire_fingerprint(), one.wire_fingerprint());
+        let back: SavedPlan = serde_json::from_str(&serde_json::to_string(&one).unwrap()).unwrap();
+        assert_eq!(back, one);
+        assert_eq!(back.wire_fingerprint(), one.wire_fingerprint());
+
+        let mut edited = one.clone();
+        edited.target_assertions[0].sha256 = "b".repeat(64);
+        assert_ne!(one.wire_fingerprint(), edited.wire_fingerprint());
+
+        let mut two = plain.clone();
+        two.target_assertions = vec![passed("a.sql", 'a'), passed("b.sql", 'b')];
+        let mut swapped = plain;
+        swapped.target_assertions = vec![passed("b.sql", 'b'), passed("a.sql", 'a')];
+        assert_ne!(two.wire_fingerprint(), swapped.wire_fingerprint());
+    }
+
+    #[test]
+    fn a_record_naming_no_file_or_hash_is_refused_not_read_as_observed() {
+        let mut plan = bare_plan();
+        plan.target_assertions = vec![passed("a.sql", 'a')];
+        assert!(plan.validate_analysis().is_ok());
+        for broken in [
+            crate::TargetAssertion {
+                path: "".into(),
+                ..passed("a.sql", 'a')
+            },
+            crate::TargetAssertion {
+                sha256: "abc".into(),
+                ..passed("a.sql", 'a')
+            },
+        ] {
+            plan.target_assertions = vec![passed("ok.sql", 'a'), broken];
+            assert!(plan.validate_analysis().is_err());
+        }
+    }
+
+    /// The field is part of the format: an unknown outcome is not a pass.
+    #[test]
+    fn a_plan_file_with_a_non_pass_outcome_is_not_readable() {
+        let mut plan = bare_plan();
+        plan.target_assertions = vec![passed("a.sql", 'a')];
+        let json = serde_json::to_string(&plan)
+            .unwrap()
+            .replace("\"pass\"", "\"violation\"");
+        assert!(serde_json::from_str::<SavedPlan>(&json).is_err());
     }
 }

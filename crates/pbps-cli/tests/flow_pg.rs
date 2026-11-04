@@ -70,6 +70,63 @@ mod conversions2359;
 #[path = "support/foreign_keys2395.rs"]
 mod foreign_keys2395;
 
+#[path = "support/plan_assertions2401.rs"]
+mod plan_assertions2401;
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres() {
+    plan_assertions2401::passing_assertions_are_recorded_explained_and_kept_in_the_ledger(
+        &std::env::var("PBPS_TEST_PG_DB").unwrap(),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_assertion_violations_write_no_plan_on_postgres() {
+    plan_assertions2401::a_violation_writes_no_plan_and_names_the_rows(
+        &std::env::var("PBPS_TEST_PG_DB").unwrap(),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_assertion_errors_and_write_attempts_are_not_passes_on_postgres() {
+    plan_assertions2401::errors_and_write_attempts_are_errors_not_passes(
+        &std::env::var("PBPS_TEST_PG_DB").unwrap(),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_assertions_need_their_own_connection_on_postgres() {
+    plan_assertions2401::the_assertion_connection_is_required_and_never_the_planning_login(
+        &std::env::var("PBPS_TEST_PG_DB").unwrap(),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn plan_assertion_logins_that_can_write_are_refused_on_postgres() {
+    plan_assertions2401::a_login_that_can_write_is_refused_and_a_read_only_login_runs(
+        &std::env::var("PBPS_TEST_PG_DB").unwrap(),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres_16() {
+    plan_assertions2401::passing_assertions_are_recorded_explained_and_kept_in_the_ledger(
+        &old_server(),
+        true,
+    );
+}
+
 #[path = "support/census2444.rs"]
 mod census2444;
 

@@ -4106,14 +4106,25 @@ fails the run and discards the connection. In SQL Server scratch, close runner
 connections first and set the database READ_ONLY with a bounded wait, **without
 ROLLBACK IMMEDIATE**, before asserting with a separate least-privilege login.
 
-#2401 reuses that query format with repeatable `plan --assert <file>` at **plan
-time**, and a separate `PBPS_ASSERTION_CONN` credential. PostgreSQL retains its
-transaction boundary; a SQL Server target uses **least privilege only**, since
-the target is not switched read-only. File hashes/outcomes are checksum-covered
-plan evidence, shown by `explain` and retained in the ledger. A failure/error
-writes no plan. This accepts the plan-to-apply window; constraints and recorded
-drop preconditions cover their own stronger guarantees (§14.1). Production
-`apply` executes no fixture or arbitrary assertion SQL; §7.5 is unchanged.
+#2401 reuses that query format with repeatable `plan --assert <file>` (with
+`--db` or `--env`) at **plan time**, and a separate `PBPS_ASSERTION_CONN`
+credential. When the variable is absent or blank the command refuses naming it;
+it never falls back to the planning login. PostgreSQL retains its transaction
+boundary; a SQL Server target uses **least privilege only**, since the target is
+not switched read-only. The assertions run in the order given, before the
+resolver and rehearsal, and stop at the first one that is not a pass. A
+violation, an SQL error, an invalid result, an admission refusal or a timeout
+writes **no plan** (findings `plan.assertion.rows`, `.sql`, `.boundary`,
+`.refused`, exit 2; an unreadable answer or a deadline is
+`plan.assertion.unanswerable`, exit 1). Each pass records the file's
+project-relative path, SHA-256 and outcome in the saved plan's
+`target_assertions`, covered by the plan checksum; `explain` shows them and the
+ledger entry written by `apply` keeps them (snapshot version 37). A plan without
+`--assert` keeps its bytes and the plan version. The file hash identifies the
+bytes that ran at plan time; a plan made with an older file differs from a
+replan. This accepts the plan-to-apply window; constraints and recorded drop
+preconditions cover their own stronger guarantees (§14.1). Production `apply`
+executes no fixture or arbitrary assertion SQL; §7.5 is unchanged.
 
 ---
 
@@ -4726,7 +4737,7 @@ around the typed plan and its checksum.
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet. Every change is classified through the selected dialect's `Dialect::change_risks`, which starts from `Change::intrinsic_risks_with` under that engine's identifier boundary, and its findings are attached to `PlannedChange::risks`. Saved-plan validation re-derives them the same way (DEC-399.1). Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
 | Wire pbps into a pipeline that stays upgradeable | The documented pipelines of 10 are copy-pasted, and a copy cannot be upgraded — the same objection that rules out a generator | A first-party, versioned CI component (a GitHub Action, a GitLab CI template) wrapping the existing commands and their exit codes. It differs from a generator in the one way that matters: it is *referenced* by version, so a fix reaches every user, and it adds no capability the CLI lacks | **P2** |
-| Assert domain invariants beyond structural convergence | Derived probes cover hazards implied by the change; teams also have domain rules no diff can imply ("every order has a customer") | The `tests:` capability is defined by [ADR-0019](ADR-0019-plan-tests.md) and §9.9: pinned SQL fixtures and one-query/zero-rows-pass assertions in an owned disposable `pbps test` run. Target assertions (#2401) reuse the format **at plan time**, with hashes/outcomes covered by the plan checksum; they are never target pre-flight user SQL. Constraints and recorded drop preconditions supply the other contract-verification layers below. Derived probes of §7.5 remain mandatory and are never replaced by hand-written assertions | **P2** |
+| Assert domain invariants beyond structural convergence | Derived probes cover hazards implied by the change; teams also have domain rules no diff can imply ("every order has a customer") | The `tests:` capability is defined by [ADR-0019](ADR-0019-plan-tests.md) and §9.9: pinned SQL fixtures and one-query/zero-rows-pass assertions in an owned disposable `pbps test` run. Target assertions (#2401, `plan --assert`) reuse the format **at plan time**, with hashes/outcomes covered by the plan checksum; they are an observation, never target pre-flight user SQL and never run at apply. Constraints and recorded drop preconditions supply the other contract-verification layers below. Derived probes of §7.5 remain mandatory and are never replaced by hand-written assertions | **P2** |
 
 Contract verification has three layers, with different timing and guarantees
 ([#1156 decisions](https://github.com/pongbiphang/pbps/issues/1156#issuecomment-6401634798)):
@@ -4744,12 +4755,28 @@ built-ins; it regenerates only after scope and engine/compatibility vetting
 the apply lock. Session dependence, including DATEFIRST/DATEFORMAT and similar
 settings, remains; the parser does not analyse it. PR 2b may pin session settings
 for the check statement. Unsupported forms name both remedies: a plan-time
-assertion (#2401, planned), or a CHECK constraint for the transition.
+assertion (`plan --assert`, #2401), or a CHECK constraint for the transition.
+
+What each layer guarantees, in plain words:
+
+| Layer | What it gives you | Protected at the drop? |
+|---|---|---|
+| 1. Constraints | Enforced by the engine **at all times**, including a write that races the apply | Yes |
+| 2. The single-table drop precondition (#2400) | Checked **under the apply lock**, immediately before the drop | Yes, for the one table's rows it names |
+| 3. Target assertions (#2401) | A **plan-time observation only**: the query returned no rows when `plan` ran | **No** |
+
+Never call a cross-table invariant "protected". An assertion such as "every
+order has its moved child rows" observed true when the plan was made; a row
+written to the target afterwards, and never moved, is **not caught at apply**,
+because nothing user-supplied runs there. Close that window by stopping the old
+writes, taking a final catch-up and re-planning (the cutover procedure of the
+#1166 guide), not by trusting the recorded assertion.
 
 Layer 3 accepts the window between plan and apply. It is not re-executed by
 `apply` and cannot replace a constraint or layer-2 predicate that must hold at
 the drop itself. SQL Server's target boundary is the separate least-privilege
-login, weaker than the scratch runner's READ_ONLY database. Fixtures and
+login, weaker than the scratch runner's READ_ONLY database; the runner refuses a
+login with any write or DDL permission, direct or inherited. Fixtures and
 arbitrary assertions never become production apply hooks (§7.5, §14.3).
 
 ### 14.2 The recommended first slice

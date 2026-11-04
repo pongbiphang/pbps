@@ -87,6 +87,7 @@ pub mod schema;
 pub mod state;
 pub mod storage;
 pub mod strategy;
+pub mod target_assertion;
 pub mod text;
 pub mod types;
 pub mod uid;
@@ -146,6 +147,7 @@ pub use schema::{
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
+pub use target_assertion::{AssertionOutcome, TargetAssertion};
 pub use text::Text;
 pub use types::{CollationName, ColumnType, OpClassRef, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
