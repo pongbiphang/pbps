@@ -154,6 +154,72 @@ fn loaded_descriptions_deprecations_and_tombstones_keep_their_cells() {
 }
 
 #[test]
+fn loaded_prose_preserves_comparisons_and_escapes_html_openers_on_both_dialects() {
+    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+        for (authored, escaped) in [
+            (
+                "Use `amount < 10 | mask` and a < b",
+                "Use `amount < 10 \\| mask` and a < b",
+            ),
+            (
+                "[link](url`) </td></tr><tr><td>tail `",
+                "[link](url`) &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail `",
+            ),
+            (
+                "`<x` | <!-- note --> <?pi?>",
+                "`&lt;x` \\| &lt;!-- note --> &lt;?pi?>",
+            ),
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let project = Project::new(dialect, schema, "sales");
+                let value = format!("{authored}{newline}</td></tr><tr><td>tail");
+                let quoted = serde_json::to_string(&value).unwrap();
+                project.write("schema/table.yml", &format!(
+                    "table: {schema}.sales\ncolumns:\n  id: {{type: bigint, nullable: false, description: {quoted}, deprecated: {quoted}}}\n"
+                ));
+                let mut ids = pbps_model::IdsFile::default();
+                ids.tombstones.insert(
+                    "c_k7x2mq".parse().unwrap(),
+                    pbps_model::Tombstone {
+                        was: format!("{schema}.sales.old"),
+                        dropped_at: value.clone(),
+                        operator: value.clone(),
+                        reason: value,
+                        require: None,
+                    },
+                );
+                project.write(
+                    "schema.ids.json",
+                    &serde_json::to_string_pretty(&ids).unwrap(),
+                );
+                project.run(&["validate"]);
+                let out = project.run(&["docs", "--format", "markdown"]);
+                let plain = format!("{escaped} &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail");
+                for row in [
+                    format!("| `id` ~~deprecated~~ | `bigint` | no | — | {plain} |\n"),
+                    format!("| `{schema}.sales.id` | {plain} |\n"),
+                    format!("| `{schema}.sales.old` | {plain} | {plain} | {plain} |\n"),
+                ] {
+                    assert!(out.contains(&row), "missing {row:?}: {out}");
+                }
+                assert!(!out.contains("amount &lt; 10"), "{out}");
+                project.run(&[
+                    "docs",
+                    "--format",
+                    "markdown",
+                    "--out",
+                    project.0.join("schema.md").to_str().unwrap(),
+                ]);
+                assert_eq!(
+                    std::fs::read_to_string(project.0.join("schema.md")).unwrap(),
+                    out
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn ordinary_grants_empty_roles_and_no_roles_keep_their_markdown_bytes() {
     for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
         let project = Project::new(dialect, schema, "sales");

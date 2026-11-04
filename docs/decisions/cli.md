@@ -1638,3 +1638,28 @@ requirements: they still bound command-tree values and removing them would
 be a separate, unqualified startup-cost change. An isolated 1 MiB caller and
 negative small-stack child pin the worker's headroom without making a clap
 overflow threshold part of the cross-platform test contract.
+
+<a id="dec-2676-1"></a>
+
+**DEC-2676.1. Markdown prose cells escape potential HTML openers and preserve
+other less-than signs.** Replacing every `<` with `&lt;` changes visible code:
+Markdown treats entities literally inside a code span. The existing `cell()`
+helper therefore escapes `<` only before an ASCII letter, `/`, `!` or `?`,
+which can start raw HTML. Comparisons such as `amount < 10`, `a < b`, `<10`
+and `<=`, and a trailing `<`, keep their literal spelling everywhere.
+
+This rule does not interpret backticks or add a Markdown parser. A backtick
+inside a link destination is not a code delimiter: the paired-run approach
+left actual closing HTML unescaped in ``[link](url`) </td></tr><tr><td>tail ` ``.
+Escaping potential HTML openers in every context prevents that breakout.
+Accepted residual: an authored prose code span containing tag-like `<x` is
+still emitted as `&lt;x` and displays that entity spelling literally. This is
+the price of keeping raw HTML unable to close a cell without parsing Markdown.
+
+GFM splits table rows and cells before parsing inline code, so pipe escaping
+and CR/LF folding still apply everywhere. Authored literal entities keep the
+existing behavior: `&` is not escaped. No persisted format or dependency changes.
+Renderer and offline CLI regressions cover comparisons and raw HTML openers
+in descriptions, deprecation reasons and graveyard metadata, LF/CRLF, pipes
+inside spans, backticks, backslashes and the link-destination breakout. The
+ordinary output golden stays byte-identical.

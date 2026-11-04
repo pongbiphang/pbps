@@ -257,6 +257,13 @@ fn prose_cells_cannot_emit_a_new_row_or_close_the_table_with_html() {
         ("a\\|b", "a\\\\|b"),
         ("名|`字", "名\\|`字"),
         ("</td></tr><tr><td>bad", "&lt;/td>&lt;/tr>&lt;tr>&lt;td>bad"),
+        ("`<x`", "`&lt;x`"),
+        (
+            "[link](url`) </td></tr><tr><td>tail `",
+            "[link](url`) &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail `",
+        ),
+        ("`<!-- note --><?pi?>`", "`&lt;!-- note -->&lt;?pi?>`"),
+        ("a < b; amount<10; <=", "a < b; amount<10; <="),
     ] {
         let (mut schema, mut ids) = documented("ordinary");
         let column = schema
@@ -284,6 +291,41 @@ fn prose_cells_cannot_emit_a_new_row_or_close_the_table_with_html() {
         ] {
             assert!(out.contains(&row), "{value:?}: missing {row:?}: {out}");
         }
+    }
+}
+
+#[test]
+fn comparisons_in_descriptions_deprecations_and_graveyards_keep_their_text() {
+    for newline in ["\n", "\r", "\r\n"] {
+        let value = format!("Use `amount < 10 | mask` and a < b{newline}</td></tr><tr><td>tail");
+        let expected = "Use `amount < 10 \\| mask` and a < b &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail";
+        let (mut schema, mut ids) = documented("ordinary");
+        let column = schema
+            .tables
+            .values_mut()
+            .next()
+            .unwrap()
+            .columns
+            .values_mut()
+            .next()
+            .unwrap();
+        column.description = Some(value.as_str().into());
+        column.deprecated = Some(value.as_str().into());
+        let stone = ids.tombstones.values_mut().next().unwrap();
+        stone.dropped_at = value.clone();
+        stone.operator = value.clone();
+        stone.reason = value;
+        let out = render(&schema, &ids, "Schema");
+        for row in [
+            format!(
+                "| `ordinary` ~~deprecated~~ | `app.ordinary` | yes | `ordinary` | {expected} |\n"
+            ),
+            format!("| `app.customer.ordinary` | {expected} |\n"),
+            format!("| `ordinary` | {expected} | {expected} | {expected} |\n"),
+        ] {
+            assert!(out.contains(&row), "{newline:?}: missing {row:?}: {out}");
+        }
+        assert!(!out.contains("amount &lt; 10"), "{out}");
     }
 }
 
