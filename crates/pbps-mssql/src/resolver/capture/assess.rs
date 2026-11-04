@@ -69,6 +69,7 @@ pub(super) fn assess(
         // for a newly created module as for one already on both sides.
         let mut missing_candidate = None;
         let mut unread = false;
+        let mut arrivals: BTreeSet<ObjectIdentity> = BTreeSet::new();
         if let Some(names) = desired.runtime.get(object) {
             let needed = super::select::runtime_candidates(
                 &desired.inputs,
@@ -83,6 +84,25 @@ pub(super) fn assess(
                         }
                     }
                     _ => unread = true,
+                }
+            }
+        }
+        // An object scratch holds and the target lacks is an arrival the plan
+        // creates; the module's binding moves only when it becomes the first
+        // match on a lookup path, which `select::runtime_paths` alone defines
+        // (DEC-2143.7, #2665).
+        if let Some(names) = desired.runtime.get(object) {
+            let one = BTreeMap::from([(object.clone(), names.clone())]);
+            for path in super::select::runtime_paths(&desired.inputs, &one)
+                .into_values()
+                .flatten()
+            {
+                match super::select::arrival_on_path(&path, target, desired) {
+                    Ok(Some(arrival)) => {
+                        arrivals.insert(arrival);
+                    }
+                    Ok(None) => {}
+                    Err(_) => unread = true,
                 }
             }
         }
@@ -111,6 +131,12 @@ pub(super) fn assess(
         } else {
             Verdict::Created
         };
+        // Only a module the plan keeps as it is has its binding changed with
+        // no statement. A created or rebuilt one binds afresh when the plan
+        // runs it, so there is no change to report for it.
+        if !arrivals.is_empty() && verdict == Verdict::Unaffected {
+            result.rebinds.insert(object.clone(), arrivals);
+        }
         result.surfaces.insert(object.clone(), verdict);
     }
     result

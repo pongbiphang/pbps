@@ -1166,6 +1166,24 @@ pub(super) fn runtime_candidates(
     inputs: &BTreeMap<ObjectIdentity, Input>,
     runtime: &BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
 ) -> BTreeSet<CandidateSet> {
+    runtime_paths(inputs, runtime)
+        .into_values()
+        .flatten()
+        .flatten()
+        .collect()
+}
+
+/// The lookup paths behind [`runtime_candidates`]: for each module, every
+/// ordered list of candidate sets one of its runtime-bound names can be
+/// resolved through, first match first. An object or type reference has one
+/// (the module's schema, then `dbo`); a call has one per principal it can run
+/// as (`sys`, that principal's default schema, `dbo`). The first set holding a
+/// member is what the name binds to, so a created object moves a binding only
+/// when it changes that first match (DEC-619.2, DEC-2143.7).
+pub(super) fn runtime_paths(
+    inputs: &BTreeMap<ObjectIdentity, Input>,
+    runtime: &BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
+) -> BTreeMap<ObjectIdentity, Vec<Vec<CandidateSet>>> {
     let set = |class, schema: &str, name: &str| CandidateSet {
         class,
         schema: schema.into(),
@@ -1184,24 +1202,24 @@ pub(super) fn runtime_candidates(
         .filter_map(default_schema)
         .collect();
     every.insert("dbo".into());
-    let mut candidates = BTreeSet::new();
+    let mut paths: BTreeMap<ObjectIdentity, Vec<Vec<CandidateSet>>> = BTreeMap::new();
     for (module, names) in runtime {
         let Some(own) = module.name.first() else {
             continue;
         };
         let properties = inputs.get(module).map(|input| &input.properties);
+        let out = paths.entry(module.clone()).or_default();
         for name in names {
             match name {
-                RuntimeName::Type(name) => {
-                    candidates.insert(set(CandidateClass::Type, own, name));
-                    candidates.insert(set(CandidateClass::Type, "dbo", name));
-                }
-                RuntimeName::Object(name) => {
-                    candidates.insert(set(CandidateClass::Object, own, name));
-                    candidates.insert(set(CandidateClass::Object, "dbo", name));
-                }
+                RuntimeName::Type(name) => out.push(vec![
+                    set(CandidateClass::Type, own, name),
+                    set(CandidateClass::Type, "dbo", name),
+                ]),
+                RuntimeName::Object(name) => out.push(vec![
+                    set(CandidateClass::Object, own, name),
+                    set(CandidateClass::Object, "dbo", name),
+                ]),
                 RuntimeName::Call(name) => {
-                    candidates.insert(set(CandidateClass::SystemProcedure, "sys", name));
                     let fixed = properties
                         .and_then(|p| p.get("execute_as"))
                         .and_then(|value| match value.as_str() {
@@ -1211,21 +1229,51 @@ pub(super) fn runtime_candidates(
                                 .and_then(|owner| serde_json::from_value(owner.clone()).ok()),
                             _ => serde_json::from_value::<ObjectIdentity>(value.clone()).ok(),
                         });
-                    let schemas = match fixed {
-                        Some(principal) => default_schema(&principal)
-                            .into_iter()
-                            .chain(["dbo".to_owned()])
-                            .collect(),
-                        None => every.clone(),
+                    // One path per principal the call can run as: its default
+                    // schema (when it has one), then `dbo`.
+                    let defaults: BTreeSet<Option<String>> = match fixed {
+                        Some(principal) => BTreeSet::from([default_schema(&principal)]),
+                        None => every.iter().cloned().map(Some).collect(),
                     };
-                    for schema in schemas {
-                        candidates.insert(set(CandidateClass::Object, &schema, name));
+                    for default in defaults {
+                        let mut path = vec![set(CandidateClass::SystemProcedure, "sys", name)];
+                        if let Some(schema) = default.filter(|schema| schema != "dbo") {
+                            path.push(set(CandidateClass::Object, &schema, name));
+                        }
+                        path.push(set(CandidateClass::Object, "dbo", name));
+                        out.push(path);
                     }
                 }
             }
         }
     }
-    candidates
+    paths
+}
+
+/// The arrival that becomes the first match on `path`, the ordered candidate
+/// sets of one runtime-bound name, if one does. `target` and `scratch` hold
+/// what each side found in them. Only an arrival counts: what scratch lacks of
+/// the target's own (unmanaged objects it was never given) is no drop the plan
+/// makes. The first set the target already fills keeps the binding, unless
+/// scratch holds a second candidate there, which the path does not order.
+pub(super) fn arrival_on_path(
+    path: &[CandidateSet],
+    target: &super::CapturedInputs,
+    scratch: &super::CapturedInputs,
+) -> Result<Option<ObjectIdentity>, super::CaptureError> {
+    for set in path {
+        let held = target.members(set).ok_or(super::CaptureError::Incomplete)?;
+        let there = scratch
+            .members(set)
+            .ok_or(super::CaptureError::Incomplete)?;
+        if !held.is_empty() {
+            return Ok(there.difference(held).next().cloned());
+        }
+        if let Some(arrival) = there.iter().next() {
+            return Ok(Some(arrival.clone()));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

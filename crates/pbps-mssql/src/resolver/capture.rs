@@ -36,6 +36,7 @@ mod read;
 mod references;
 mod select;
 mod staged;
+mod unmanaged;
 mod whole;
 
 pub use compiled::{BindingRecord, CompiledCapture, capture_desired_for_plan};
@@ -47,6 +48,7 @@ pub use staged::{
     ExternalInputs, StageError, Staged, cascade_scope, compare_staged, compare_staged_declared,
     compare_staged_pending, required_externals, required_externals_declared,
 };
+pub use unmanaged::{Rebound, unmanaged_rebinds};
 
 use std::collections::BTreeSet;
 

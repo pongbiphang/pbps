@@ -155,6 +155,12 @@ impl CapturedInputs {
         scope
     }
 
+    /// For each module with runtime-bound names, the ordered lookup paths of
+    /// those names (see [`super::select::runtime_paths`]).
+    pub(super) fn lookup_paths(&self) -> BTreeMap<ObjectIdentity, Vec<Vec<super::CandidateSet>>> {
+        super::select::runtime_paths(&self.inputs, &self.runtime)
+    }
+
     /// The engine's own records this capture's closure binds to and holds no
     /// root for: built-in types and engine-owned objects, never a user's
     /// (DEC-2143.6). A record the engine ships exists on every instance, so

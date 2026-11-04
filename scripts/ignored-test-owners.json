@@ -2901,7 +2901,20 @@
         "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_plan_that_drops_objects_releases_their_roots",
         "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_target_reaching_another_cluster_is_not_sealed",
         "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_user_defined_type_absent_from_opening_is_not_admitted_as_a_built_in",
-        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_shared_evidence_reads_back_through_the_sql_server_reader"
+        "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_shared_evidence_reads_back_through_the_sql_server_reader",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_object_the_plan_creates_that_captures_a_reference_is_reported",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_managed_module_an_unmanaged_one_calls_is_not_refused_as_unmanaged",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_managed_module_whose_name_resolves_earlier_than_the_arrival_is_not_reported",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_fixed_principal_whose_default_schema_holds_the_callee_keeps_its_binding",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_name_that_resolves_earlier_on_the_path_than_the_arrival_is_not_refused",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_rebind_report_makes_no_claim_about_the_modules_own_statements",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_module_the_plan_creates_beside_the_object_is_not_reported_as_rebound",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_created_name_no_runtime_bound_module_uses_is_not_reported",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_module_that_would_bind_a_created_name_refuses_by_name",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_reference_is_matched_by_the_engines_own_lookup_path",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_created_object_that_shadows_a_resolved_fallback_refuses_by_name",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_plan_that_creates_nothing_is_not_refused_for_the_roots_it_keeps",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_path"
       ]
     },
     {

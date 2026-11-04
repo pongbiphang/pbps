@@ -54,6 +54,12 @@ pub struct Assessment {
     /// Routines whose body is runtime-bound: their header and defaults are
     /// compared, their body is outside this proof (ADR-0016 decision 3).
     pub runtime_bound: std::collections::BTreeSet<ObjectIdentity>,
+    /// For a runtime-bound module, the objects the plan creates that become
+    /// the first match on a lookup path of its names (DEC-2143.7, #2665). The
+    /// module is not rebuilt; its binding changes with no statement of its
+    /// own, so the plan reports it (#2143 c2).
+    pub rebinds:
+        std::collections::BTreeMap<ObjectIdentity, std::collections::BTreeSet<ObjectIdentity>>,
 }
 
 /// A safe, named coverage refusal; no source or property value is included.

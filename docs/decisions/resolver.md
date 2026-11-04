@@ -5872,3 +5872,49 @@ apply. One that is missing on the target is a compiled-only root no transition
 installs, and the projection refuses it. The tests cover a created table over
 `int`, a changed built-in record refused at closing, and the exclusion of a
 user-defined type.
+
+<a id="dec-2143-7"></a>
+
+**DEC-2143.7. A plan that creates an object a runtime-bound module's names will
+resolve to reports that module's binding change; an unmanaged module that would
+bind it refuses (#2143 c2).** A procedure or function body that names an object
+with one part binds at run time, not when the module is created, so creating
+the object later changes what the module reads without any statement for the
+module. The engine's catalog cannot show that before apply, and the plan must
+not hide it.
+
+For a managed module the compiled capture already holds the candidates of each
+runtime-bound name on scratch and on the target. A candidate scratch holds and
+the target lacks is an object the plan creates; when it becomes the first match
+on a lookup path of the module's names (the same paths as for an unmanaged
+module below), the assessment lists it per module as a rebind. The producer seals it as a named limitation,
+`binding-change:<module>`, which `plan` and `explain` print under the limitations
+the plan accepted and which the seal digest covers. It is not a new envelope
+field: design item 6 asked for a typed list in the assessment output, and the
+sealed limitations are that list for evidence (#2144 apply reads the created
+object's `ObjectTransition`, not a new field), so no schema-set or state bump
+is spent. The report says nothing about statements: the module's binding changes
+when it runs whether or not the plan also alters its body.
+
+An unmanaged module is outside the capture's scope and cannot be compared
+without reading it. The target is read for the modules that mention a created
+name (a name filter, the engine matching under the database collation), those
+modules are captured with the reader the managed modules use, and the lookup
+rules are the ones the managed assessment uses, in `select::runtime_paths`
+(#2665): an object or type reference reaches the module's own schema, then
+`dbo`; a call reaches the executing principal's default schema, then `dbo`,
+for the module's fixed principal or for every principal when it runs as its
+caller. A created object rebinds a module when it becomes the first match on
+such a path, so a name that already resolves earlier on its path is not
+rebound by an arrival later on it. There is no second model of the lookup.
+Only an arrival counts: the scratch bootstrap creates every declared object, and
+the roots the target already holds take no name, and objects scratch was never
+given are no drop the plan makes. A match refuses by naming the
+module and the object. Without database `VIEW DEFINITION` the view returns
+nothing for modules the account cannot see, and nothing must not read as "no
+dependents", so that read refuses instead.
+The tests cover a managed rebind reported for a module the plan keeps and not for one it creates, a created
+name nothing uses, an unmanaged module refusing by name, a shadowed `dbo`
+fallback, the call path through a principal's default schema, a fixed principal
+whose default schema already holds the callee, a name that resolves earlier than
+the arrival, and a plan that creates nothing sealing despite the roots it keeps.

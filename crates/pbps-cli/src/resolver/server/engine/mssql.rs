@@ -1305,16 +1305,50 @@ impl Binding {
             // record the opening never saw (DEC-2143.6).
             next.retained.extend(on_scratch.engine_builtins());
             if next == scope {
-                settled = Some((held(&scope, &on_scratch), held(&scope, &on_target)));
+                let on_target_now: BTreeSet<_> = on_target.objects().cloned().collect();
+                settled = Some((
+                    held(&scope, &on_scratch),
+                    held(&scope, &on_target),
+                    on_target_now,
+                ));
                 break;
             }
             scope = next;
         }
-        let Some((scratch_scope, target_scope)) = settled else {
+        let Some((scratch_scope, target_scope, on_target_now)) = settled else {
             return Err(Error::Read(
                 "the candidates of the runtime-bound names did not settle".into(),
             ));
         };
+        // A module outside the capture scope cannot be compared, but one that
+        // still has an unresolved reference to a name the plan creates will
+        // bind it once applied: refuse by name rather than report nothing
+        // (DEC-2143.7).
+        // Only an arrival can take a name: the scratch bootstrap also creates
+        // the roots the target already holds, and those move nothing.
+        let created: BTreeSet<_> = self
+            .reconstruction
+            .created()
+            .into_keys()
+            .filter(|object| !on_target_now.contains(object))
+            .collect();
+        let rebound =
+            capture::unmanaged_rebinds(target, &mut scratch, &created, &scope.retained, key)
+                .await
+                .map_err(super::catalog_read_failed)?;
+        if let Some(first) = rebound.first() {
+            return Err(Error::Binding(format!(
+                "this plan creates {}, which the unmanaged module {} binds when it runs{}; \
+                 declare that module, or create the object in a separate plan",
+                first.created.join("."),
+                first.module.join("."),
+                if rebound.len() > 1 {
+                    format!(" (and {} more)", rebound.len() - 1)
+                } else {
+                    String::new()
+                },
+            )));
+        }
         let namespaces: BTreeSet<String> = schemas.iter().cloned().collect();
         let recorded = capture::RecordedOwnership {
             schema: desired.schema,
