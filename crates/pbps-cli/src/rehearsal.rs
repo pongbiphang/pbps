@@ -590,11 +590,15 @@ async fn run_statements(
             .await
             .context("cannot open the rehearsal's transaction")?;
     }
+    // A scratch holds no declared role and reviews nothing: what runs there is
+    // judged as the target's apply will judge it.
+    let admission = pbps_pg::admission::Admission::default();
     for (i, statement) in statements.iter().enumerate() {
-        let executed = match crate::engine::check_drop_requirement(conn, statement).await {
-            Ok(()) => conn.execute(&statement.sql).await,
-            Err(error) => Err(error),
-        };
+        let executed =
+            match crate::engine::check_drop_requirement(conn, &admission, statement).await {
+                Ok(()) => conn.execute(&statement.sql).await,
+                Err(error) => Err(error),
+            };
         if let Err(e) = executed {
             if let Some(framing) = &framing {
                 // Its own error must not replace the statement's.

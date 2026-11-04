@@ -1615,3 +1615,27 @@ Pinned by `one_changed_routine_among_several_is_the_only_one_named`,
 `a_routine_added_or_removed_after_approval_is_named`,
 `an_overload_replaced_after_approval_is_named_by_its_signature` and
 `an_approved_schema_rename_does_not_read_as_a_routine_change`).
+
+<a id="dec-2563-3"></a>
+
+**DEC-2563.3. The reference-data trigger guard judges a trigger's function by the admission predicate (PostgreSQL).**
+
+(#2563, slice 2a.) The guard authenticated a trigger by its recorded definition
+and by an owner rule of its own, written in SQL with the current user only
+(DECISIONS 445, 451). It now asks the predicate of DEC-2563.2 of the function the
+trigger runs, in the same snapshot as the trigger is read: the owner is trusted
+by the existing walk (a superuser, the deployer, a role that can act as one, a
+`trusted_roles` member), the function sets a fixed `search_path` unless it is `c`
+or `internal`, and it is not `SECURITY DEFINER` with an untrusted owner. The
+guard now honors `trusted_roles`, which its own rule never did. The roles are
+held by the guard that `prepare` returns, so the recheck before each row
+statement judges as `prepare` did. A refusal names the function, the cause and
+the exact `ALTER FUNCTION` line.
+
+A trigger is declared and recorded, so rule 2 holds of it, and the review of
+`pin_type_routines` is not offered here: a trigger function is not on a path the
+plan can name before the guard runs, and the guard exists to refuse code no
+approval covered (a plan that must run one is a plan to bring it into the
+project). Compatibility: a recorded trigger whose function sets no `search_path`
+is refused for reference-data writes where it was admitted, with the `ALTER
+FUNCTION` that admits it.

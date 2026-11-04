@@ -90,7 +90,8 @@ pub(super) fn record(
                             "the requirement's table identity is absent from the target baseline"
                         )
                     })?;
-                engine::vet_drop_requirement(&mut conn, table, predicate).await?;
+                let admission = crate::pins::admission(project);
+                engine::vet_drop_requirement(&mut conn, &admission, table, predicate).await?;
                 return Ok(Some(table_uid));
             }
             Ok::<_, anyhow::Error>(None)

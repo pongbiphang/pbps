@@ -43,7 +43,7 @@ pub fn check(server: &str, pg: bool) {
                     connection,
                     &format!(
                         "CREATE SCHEMA app; CREATE TABLE {qualified}(code varchar(20) NOT NULL PRIMARY KEY, label varchar(50) NOT NULL); \
-                     CREATE FUNCTION app.skip() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;"
+                     CREATE FUNCTION app.skip() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NULL; END $$;"
                     ),
                 );
             } else {

@@ -814,7 +814,7 @@
         "retained2354::retained2354_million_rows_keep_the_check_and_advance_only_the_approved_record",
         "retained2354::retained2354_text_semantics_and_missing_resolver_keep_the_rebuild",
         "retained2354::retained2354_tampered_payloads_refuse_and_fresh_binding_cannot_be_skipped",
-        "domain_vet2309::domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_warn",
+        "domain_vet2309::domain_vet2309_managed_functions_are_judged_at_apply_and_other_compile_errors_warn",
         "domain_vet2309::domain_vet2309_xml_fragments_use_deployment_pins_with_database_and_role_defaults",
         "domain_vet2309::domain_vet2309_refuses_check_default_operator_and_nested_types_before_writing",
         "domain_vet2309::domain_vet2309_compliant_staged_and_no_resolver_plans_keep_apply_vetting",
@@ -964,7 +964,7 @@
         "type_refs::pinned_type_routines_require_owner_and_actor_trust_on_postgres_18",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_16",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_18",
-        "type_refs::superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees",
+        "type_refs::a_superuser_owned_root_is_trusted_not_reviewed_and_a_replacement_without_a_path_is_refused",
         "type_refs::an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement",
         "type_refs::a_scoped_path_overload_created_during_a_statement_is_detected_before_commit",
         "type_refs::staged_transactional_steps_rollback_changed_roots_and_concurrent_indexes_detect_them_after_commit",
@@ -1407,7 +1407,12 @@
         "step5_connected_module_rebuild_refusals_show_each_name_once",
         "late_dependent_descriptions_are_shown_once_in_plan_and_apply",
         "step5_connected_ordering_refusals_show_subjects_and_descriptions_once",
-        "step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json"
+        "step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json",
+        "conversions2331::a_conversions_routine_of_an_untrusted_owner_is_reviewed_and_pinned_by_the_plan",
+        "conversions2331::a_routine_the_conversions_plan_did_not_hold_never_runs_in_the_preflight",
+        "managed_types::a_created_domain_may_call_a_trusted_routine_that_sets_a_search_path",
+        "managed_types::the_preflight_runs_a_reviewed_conversion_at_apply_and_never_at_plan",
+        "rebuild2298b::a_copy_conversions_reviewed_routine_runs_at_apply_and_never_at_plan"
       ]
     },
     {
@@ -1981,7 +1986,8 @@
         "resolver::reconstruct::trial_tests::retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects",
         "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",
         "resolver::capture::nodes::partition1566::actual_partition_bounds_have_closed_layouts_on_both_majors",
-        "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges"
+        "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges",
+        "input_path::tests::a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs"
       ]
     },
     {
@@ -2478,7 +2484,13 @@
         "domain2469::domain_check_uses_the_bare_type_before_its_function_and_enforces_values",
         "domain2469::domain_facets_keep_vetted_intermediates_authored_text_and_execution_modes",
         "domain2469::scalar_domain_columns_unlock_facets_without_changing_defaults_or_checks",
-        "domain2469::split_derived_defaults_override_temporary_inheritance"
+        "domain2469::split_derived_defaults_override_temporary_inheritance",
+        "drop_requirements2400::a_routine_the_plan_did_not_hold_is_refused_before_anything_is_evaluated",
+        "drop_requirements2400::requirements_and_conversions_judge_a_routine_a_role_wrote_by_one_predicate",
+        "input_path_tests::a_role_with_create_on_an_earlier_schema_hijacks_only_a_function_without_a_search_path",
+        "input_path_tests::a_trusted_owners_routine_needs_a_fixed_search_path_and_the_refusal_gives_the_fix",
+        "input_path_tests::an_untrusted_owners_routine_is_admitted_only_by_the_review_and_never_as_a_definer",
+        "the_trigger_guard_judges_a_triggers_function_by_the_admission_predicate"
       ]
     },
     {

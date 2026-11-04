@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::admission::{self, Admission, Cause, Judgement};
 use pbps_db::{Conn, DbError};
 use pbps_dialect::{RowOperation, RowWrite};
 use pbps_model::{ModuleId, ModuleKind, Schema, TableName};
@@ -29,6 +30,8 @@ const UPDATE: i16 = 16;
 #[derive(Default)]
 pub struct Guard {
     approved: BTreeMap<i64, i64>,
+    /// The roles declared trusted, which `check` judges function owners by.
+    trusted: Vec<pbps_model::RoleName>,
 }
 
 /// What the plan takes away before its row statements run, in the spelling the
@@ -55,6 +58,7 @@ pub struct Dropped {
 /// not allowed: it must actually be gone by the time a row statement runs.
 pub async fn prepare(
     conn: &mut Conn,
+    admission: &Admission,
     writes: &[RowWrite],
     baseline: &Schema,
     dropped: &Dropped,
@@ -62,9 +66,12 @@ pub async fn prepare(
     let mut writes = writes.to_vec();
     writes.sort_by(|a, b| a.table.cmp(&b.table).then(a.operation.cmp(&b.operation)));
     writes.dedup();
-    let mut guard = Guard::default();
+    let mut guard = Guard {
+        trusted: admission.trusted().to_vec(),
+        ..Guard::default()
+    };
     for write in writes {
-        for trigger in reachable(conn, &write, dropped).await? {
+        for trigger in reachable(conn, &write, dropped, &guard.trusted).await? {
             let id = ModuleId::Trigger {
                 on: trigger.table.clone(),
                 name: trigger.name.clone(),
@@ -77,7 +84,7 @@ pub async fn prepare(
                     && crate::introspect::trigger_definition(&trigger.definition).as_deref()
                         == Some(m.definition.as_str())
             });
-            if !matches_record || !trigger.trusted_owner {
+            if !matches_record || !trigger.causes.is_empty() {
                 return Err(refused(&trigger, &write.table));
             }
             guard.approved.insert(trigger.oid, trigger.function_oid);
@@ -108,10 +115,10 @@ pub async fn settle(conn: &mut Conn) -> Result<(), DbError> {
 /// Recheck immediately before each row statement, including on a newly created
 /// or renamed table. The lock stays held through that statement's transaction.
 pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
-    for trigger in reachable(conn, write, &Dropped::default()).await? {
+    for trigger in reachable(conn, write, &Dropped::default(), &guard.trusted).await? {
         let approved = |oid: i64| guard.approved.get(&oid) == Some(&trigger.function_oid);
         if !(approved(trigger.oid) || trigger.parent_oid.is_some_and(approved))
-            || !trigger.trusted_owner
+            || !trigger.causes.is_empty()
         {
             return Err(refused(&trigger, &write.table));
         }
@@ -127,6 +134,16 @@ fn event(operation: &RowOperation) -> i16 {
     }
 }
 
+/// What the catalog says of a trigger's function.
+struct FunctionFacts {
+    owner_oid: i64,
+    secdef: bool,
+    fixed_search_path: bool,
+    language: String,
+    /// `app.audit()`: the identity `ALTER FUNCTION` names.
+    function: String,
+}
+
 struct Trigger {
     oid: i64,
     /// The parent's row trigger this is a clone of, on a partition (#1632).
@@ -135,7 +152,10 @@ struct Trigger {
     function_oid: i64,
     name: String,
     definition: String,
-    trusted_owner: bool,
+    /// What the admission predicate refuses of the trigger's function (DEC-2563.2).
+    /// Empty when it is admitted.
+    causes: Vec<Cause>,
+    facts: FunctionFacts,
     /// False for the table the plan writes by name; true for a table the
     /// engine writes on its own behalf through a referential action.
     through_an_action: bool,
@@ -167,6 +187,7 @@ async fn reachable(
     conn: &mut Conn,
     write: &RowWrite,
     dropped: &Dropped,
+    trusted: &[pbps_model::RoleName],
 ) -> Result<Vec<Trigger>, DbError> {
     let table = &write.table;
     // No ONLY: PostgreSQL DML can reach inheritance descendants, and locking
@@ -185,7 +206,7 @@ async fn reachable(
         .to_owned();
     conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
         .await?;
-    let result = walk(conn, write, dropped).await;
+    let result = walk(conn, write, dropped, trusted).await;
     // On a query error the caller must roll back the transaction. On success,
     // restore its path before returning; no setting leaks into emitted SQL.
     if result.is_ok() {
@@ -202,6 +223,7 @@ async fn walk(
     conn: &mut Conn,
     write: &RowWrite,
     dropped: &Dropped,
+    trusted: &[pbps_model::RoleName],
 ) -> Result<Vec<Trigger>, DbError> {
     let table = &write.table;
     let rows = conn
@@ -272,6 +294,23 @@ async fn walk(
                 partitions_only: statement.partitions_only,
                 rows_only: true,
             }));
+        }
+    }
+    // The one predicate, over each trigger's function, in the same snapshot and
+    // under the same empty path as the triggers were read.
+    let owners = triggers.iter().map(|t| t.facts.owner_oid).collect();
+    let actors = crate::input_path::untrusted_actors(conn, trusted, &owners).await?;
+    for trigger in &mut triggers {
+        let facts = &trigger.facts;
+        let routine = admission::Routine {
+            tier1: false,
+            secdef: facts.secdef,
+            fixed_search_path: facts.fixed_search_path,
+            language: &facts.language,
+            untrusted_owner: actors.contains_key(&facts.owner_oid),
+        };
+        if let Judgement::Refuse(causes) = admission::judge(&routine, false) {
+            trigger.causes = causes;
         }
     }
     Ok(triggers)
@@ -519,14 +558,15 @@ async fn read_triggers(
                     COALESCE(pc.relname, c.relname) AS table_name,
                     COALESCE(pt.tgname, t.tgname) AS name,
                     pg_catalog.pg_get_triggerdef(COALESCE(pt.oid, t.oid)) AS definition,
-                    NOT EXISTS (
-                        SELECT 1 FROM pg_catalog.pg_roles editor
-                        WHERE pg_catalog.pg_has_role(editor.oid, p.proowner, 'USAGE')
-                          AND NOT pg_catalog.pg_has_role(editor.oid, current_user::regrole::oid, 'SET')
-                    ) AS trusted_owner
+                    p.proowner::int8 AS owner_oid, p.prosecdef AS secdef,
+                    l.lanname::text AS language,
+                    p.oid::pg_catalog.regprocedure::text AS function,
+                    EXISTS (SELECT FROM pg_catalog.unnest(p.proconfig) AS c(setting)
+                             WHERE pg_catalog.starts_with(c.setting, 'search_path=')) AS fixed_search_path
              FROM pg_catalog.pg_trigger t
              JOIN relations r ON r.oid = t.tgrelid
              JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+             JOIN pg_catalog.pg_language l ON l.oid = p.prolang
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              LEFT JOIN pg_catalog.pg_trigger pt ON pt.oid = t.tgparentid
@@ -573,7 +613,20 @@ async fn read_triggers(
                     .try_get::<&str>("definition")?
                     .ok_or_else(missing)?
                     .to_owned(),
-                trusted_owner: r.try_get("trusted_owner")?.ok_or_else(missing)?,
+                causes: Vec::new(),
+                facts: FunctionFacts {
+                    owner_oid: r.try_get("owner_oid")?.ok_or_else(missing)?,
+                    secdef: r.try_get("secdef")?.ok_or_else(missing)?,
+                    fixed_search_path: r.try_get("fixed_search_path")?.ok_or_else(missing)?,
+                    language: r
+                        .try_get::<&str>("language")?
+                        .ok_or_else(missing)?
+                        .to_owned(),
+                    function: r
+                        .try_get::<&str>("function")?
+                        .ok_or_else(missing)?
+                        .to_owned(),
+                },
                 through_an_action: false,
             })
         })
@@ -834,8 +887,28 @@ fn refused(trigger: &Trigger, written: &TableName) -> DbError {
     } else {
         String::new()
     };
+    let function = &trigger.facts.function;
+    let why: String = trigger
+        .causes
+        .iter()
+        .map(|cause| match cause {
+            Cause::UntrustedOwner => {
+                format!(
+                    " Its function `{function}` is owned by a role an untrusted role can act as."
+                )
+            }
+            Cause::SecurityDefiner => {
+                format!(" Its function `{function}` is SECURITY DEFINER with an untrusted owner.")
+            }
+            Cause::NoSearchPath => format!(
+                " Its function `{function}` sets no `search_path`; run `{}`.",
+                admission::search_path_fix(function)
+            ),
+        })
+        .collect();
     DbError::Refused(format!(
-        "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code.",
+        "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function is owned by a trusted role and sets a fixed `search_path`.{reached}{why} Remove the trigger or establish that managed/trusted definition before planning again. {} `unmanaged: ignore` and `warn` do not authorize executing external trigger code.",
+        admission::remedies(false),
         table = table.shown()
     ))
 }

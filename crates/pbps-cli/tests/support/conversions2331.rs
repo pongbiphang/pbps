@@ -689,14 +689,14 @@ fn an_expression_is_bound_to_the_column_and_vetted_before_any_row_evaluates_it()
     // pre-flight's evaluation: a function that raises would then be reported
     // as a failing row (SQLSTATE P0001), which is the order this pins.
     let cases: [(&str, &str); 5] = [
-        ("app.boom(amount)", "is not built into PostgreSQL"),
+        ("app.boom(amount)", "sets no `search_path`"),
         (
             "(amount || query_to_xml('select 1', true, true, ''))::integer",
             "runs SQL or code named by its arguments",
         ),
         (
             "(amount OPERATOR(app.@@) 1)::integer",
-            "is not built into PostgreSQL",
+            "sets no `search_path`",
         ),
         (
             "(amount || id)::integer",
@@ -1282,5 +1282,166 @@ fn legacy_unbalanced_using_refuses_planning_and_balanced_controls_apply_on_both_
         let artifact = connected_artifact(&d, connection, false);
         succeeds(approved_apply(&d, connection, &artifact, GATE));
         assert_eq!(scalar(connection, "SELECT amount::bigint FROM app.t"), 5);
+    }
+}
+
+/// The review reaches a recorded conversion (#2563, DEC-2563.2): a routine of a
+/// role nobody trusts is refused at apply by name with its remedies; under
+/// `pin_type_routines` the plan shows it and pins it, the conversion applies,
+/// and a routine replaced after approval is refused before the first statement.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_conversions_routine_of_an_untrusted_owner_is_reviewed_and_pinned_by_the_plan() {
+    for (version, url) in servers() {
+        let slug = format!("convert2563-review{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, TEXT);
+        // A routine a role short of a superuser owns is pinned (DEC-319.1), which
+        // needs the environment's key.
+        d.keyed(connection);
+        let stranger = format!("pbps_conv2563_{version}_{}", std::process::id());
+        on_server(&url, &format!("CREATE ROLE {stranger}"));
+        let function = |body: &str| {
+            format!(
+                "CREATE OR REPLACE FUNCTION app.size(text) RETURNS integer LANGUAGE plpgsql \
+                 IMMUTABLE SET search_path = pg_catalog AS $$ BEGIN {body} END $$"
+            )
+        };
+        on_server(
+            connection,
+            &format!(
+                "INSERT INTO app.t VALUES (1,'abc'); GRANT USAGE ON SCHEMA app TO {stranger}; {}; \
+                 ALTER FUNCTION app.size(text) OWNER TO {stranger}",
+                function("RETURN length($1);")
+            ),
+        );
+        d.table(INTEGER);
+        succeeds(with_stdin(&d, &FROM_TEXT, b"app.size(amount)"));
+
+        // Without the review: refused by name, with the three remedies.
+        let artifact = connected_artifact(&d, connection, false);
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        let text = stderr(&refused);
+        assert_eq!(code(&refused), 1, "PG{version}: {text}");
+        for needle in [
+            "app.size(text)",
+            stranger.as_str(),
+            "bring the routine into the project",
+            "`trusted_roles`",
+            "`pin_type_routines: true`",
+        ] {
+            assert!(text.contains(needle), "PG{version} {needle}: {text}");
+        }
+        assert!(still_text(connection), "PG{version}: nothing was converted");
+
+        // With it: the plan shows the routine and pins it, and the apply runs.
+        let config = d.dir.join("pbps.yml");
+        let current = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{current}pin_type_routines: true\n")).unwrap();
+        let reviewed = d.dir.join("reviewed-plan.json");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            reviewed.to_str().unwrap(),
+        ]));
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&reviewed).unwrap()).unwrap();
+        assert_eq!(saved.type_routines.len(), 1, "PG{version}");
+        assert_eq!(saved.type_routines[0].name, "size", "PG{version}");
+        assert!(saved.type_routine_pins.is_some(), "PG{version}");
+
+        // A routine replaced after approval is not the one that was reviewed.
+        on_server(connection, &function("RETURN length($1) + 1;"));
+        let swapped = approved_apply(&d, connection, &reviewed, GATE);
+        assert_eq!(code(&swapped), 1, "PG{version}: {}", stderr(&swapped));
+        assert!(
+            stderr(&swapped).contains("reviewed type routines changed"),
+            "PG{version}: {}",
+            stderr(&swapped)
+        );
+        assert!(still_text(connection), "PG{version}: nothing was converted");
+
+        // Planned again against what stands, it applies.
+        let again = d.dir.join("again-plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", again.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &again, GATE));
+        assert_eq!(scalar(connection, "SELECT amount::bigint FROM app.t"), 4);
+    }
+}
+
+/// Review admits only what the plan showed and pinned, and apply refuses the
+/// rest where the conversion is vetted, before the pre-flight evaluates it
+/// over the rows (#2563, DEC-2563.2): a new overload that the expression now
+/// binds to is never run, and the apply is refused.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_routine_the_conversions_plan_did_not_hold_never_runs_in_the_preflight() {
+    let varchar = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  amount: {type: 'varchar(20)'}\nprimary_key: {name: pk_t, columns: [id]}\n";
+    for (version, url) in servers() {
+        let slug = format!("convert2563-held{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, varchar);
+        d.keyed(connection);
+        let stranger = format!("pbps_conv2563h_{version}_{}", std::process::id());
+        on_server(&url, &format!("CREATE ROLE {stranger}"));
+        let function = |argument: &str| {
+            format!(
+                "CREATE FUNCTION app.size({argument}) RETURNS integer LANGUAGE plpgsql IMMUTABLE \
+                 SET search_path = pg_catalog AS $$ BEGIN PERFORM nextval('app.ran'); \
+                 RETURN length($1); END $$; ALTER FUNCTION app.size({argument}) OWNER TO {stranger}"
+            )
+        };
+        on_server(
+            connection,
+            &format!(
+                "CREATE SEQUENCE app.ran; INSERT INTO app.t VALUES (1,'abc'), (2,'de'); \
+                 GRANT USAGE ON SCHEMA app TO {stranger}; {}",
+                function("text")
+            ),
+        );
+        let config = d.dir.join("pbps.yml");
+        let current = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{current}pin_type_routines: true\n")).unwrap();
+        d.table(INTEGER);
+        succeeds(with_stdin(
+            &d,
+            &[
+                "convert",
+                "app.t.amount",
+                "--using",
+                "-",
+                "--from",
+                "varchar(20)",
+            ],
+            b"app.size(amount)",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(saved.type_routines.len(), 1, "PG{version}");
+        let ran = || scalar(connection, "SELECT is_called::int::bigint FROM app.ran");
+        assert_eq!(ran(), 0, "PG{version}: planning evaluated nothing");
+
+        // After approval, the expression binds to a routine the plan does not hold.
+        on_server(connection, &function("varchar"));
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        assert_eq!(code(&refused), 1, "PG{version}: {}", stderr(&refused));
+        assert_eq!(
+            ran(),
+            0,
+            "PG{version}: the routine ran before it was refused"
+        );
+        assert!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'app' \
+                 AND table_name = 't' AND column_name = 'amount' AND data_type = 'character varying'"
+            ) == 1,
+            "PG{version}: nothing was converted"
+        );
     }
 }

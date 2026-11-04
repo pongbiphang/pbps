@@ -1,6 +1,7 @@
 //! Parse analysis must not call an extension's input before the bound-tree vet.
 use super::user_types_tests::{Scratch, servers};
 use pbps_model::{ColumnRef, ColumnType, TypeRef};
+use pbps_pg::admission::Admission;
 use pbps_pg::input_path::vet_conversion;
 
 async fn install(db: &mut Scratch) {
@@ -97,8 +98,14 @@ async fn literal_input_lock_witness(index: usize) {
         ] {
             db.sql("SELECT pg_advisory_lock(2378)").await;
             assert_eq!(locks(&mut db).await, 1);
-            let result =
-                vet_conversion(&mut db.conn, &column, &ColumnType::simple("text"), using).await;
+            let result = vet_conversion(
+                &mut db.conn,
+                &Admission::default(),
+                &column,
+                &ColumnType::simple("text"),
+                using,
+            )
+            .await;
             let held = locks(&mut db).await;
             db.sql("SELECT pg_advisory_unlock_all()").await;
             assert_eq!(
@@ -129,7 +136,8 @@ async fn literal_input_lock_witness(index: usize) {
                 .unwrap()
                 .column(name);
             let using = format!("COALESCE(\"{name}\", 'x')");
-            let result = vet_conversion(&mut db.conn, &column, &ty, &using).await;
+            let result =
+                vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, &using).await;
             let held = locks(&mut db).await;
             db.sql("SELECT pg_advisory_unlock_all()").await;
             assert_eq!(held, 1, "PG{}: column input ran: {result:?}", server.label);
@@ -178,7 +186,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             "date '2000-01-01'",
             "timestamp with time zone '2000-01-01 UTC'",
         ] {
-            vet_conversion(&mut db.conn, &column, &ty, using)
+            vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
                 .await
                 .unwrap();
         }
@@ -189,7 +197,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
                 install(&mut db).await;
             }
             for using in expressions {
-                vet_conversion(&mut db.conn, &column, &ty, using)
+                vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
                     .await
                     .unwrap_or_else(|why| {
                         panic!("PG{} installed={installed} {using}: {why}", server.label)
@@ -198,6 +206,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
         }
         vet_conversion(
             &mut db.conn,
+            &Admission::default(),
             &column,
             &ColumnType::simple("timestamp with time zone"),
             "status AT TIME ZONE 'UTC'",
@@ -207,6 +216,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
         let spaced = column.table.column("Unsafe Type Extended");
         vet_conversion(
             &mut db.conn,
+            &Admission::default(),
             &spaced,
             &ty,
             r#""Unsafe Type Extended" = 'active'"#,
@@ -214,7 +224,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
         .await
         .unwrap();
         for using in ["NULL::app.unsafe", "app.accepts(NULL)"] {
-            let why = vet_conversion(&mut db.conn, &column, &ty, using)
+            let why = vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
                 .await
                 .unwrap_err();
             assert!(
@@ -232,7 +242,8 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             ("'x'", "42P18"),
         ] {
             db.sql("SELECT pg_advisory_lock(2378)").await;
-            let result = vet_conversion(&mut db.conn, &column, &ty, using).await;
+            let result =
+                vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using).await;
             let held = locks(&mut db).await;
             db.sql("SELECT pg_advisory_unlock_all()").await;
             assert_eq!(held, 1, "PG{} {using}: input ran: {result:?}", server.label);
@@ -249,6 +260,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             .await;
         vet_conversion(
             &mut db.conn,
+            &Admission::default(),
             &column,
             &ty,
             "pg_catalog.length(status || 'x')",
@@ -274,6 +286,7 @@ async fn an_unreadable_literal_input_catalog_is_a_refusal() {
         let column: ColumnRef = "app.t.status".parse().unwrap();
         let literal_free = vet_conversion(
             &mut conn,
+            &Admission::default(),
             &column,
             &ColumnType::simple("text"),
             "status::integer",
@@ -281,6 +294,7 @@ async fn an_unreadable_literal_input_catalog_is_a_refusal() {
         .await;
         let result = vet_conversion(
             &mut conn,
+            &Admission::default(),
             &column,
             &ColumnType::simple("text"),
             "'x'::app.unsafe",
@@ -289,6 +303,7 @@ async fn an_unreadable_literal_input_catalog_is_a_refusal() {
         db.sql("GRANT SELECT ON pg_catalog.pg_range TO PUBLIC; REVOKE SELECT ON pg_catalog.pg_type FROM PUBLIC").await;
         let modifiers = vet_conversion(
             &mut conn,
+            &Admission::default(),
             &column,
             &ColumnType::simple("text"),
             "status::integer",
@@ -335,9 +350,15 @@ async fn modifier_lock_witness(index: usize) {
     let column: ColumnRef = "app.t.status".parse().unwrap();
     let ty = ColumnType::simple("text");
     // With the set empty, ordinary built-in modifiers add no refusal.
-    vet_conversion(&mut db.conn, &column, &ty, "CAST(status AS varchar(3))")
-        .await
-        .unwrap();
+    vet_conversion(
+        &mut db.conn,
+        &Admission::default(),
+        &column,
+        &ty,
+        "CAST(status AS varchar(3))",
+    )
+    .await
+    .unwrap();
     for name in ["modtype", "ModType", "length", "numeric", "as", "Mod\"Type"] {
         let q = format!("\"{}\"", name.replace('"', "\"\""));
         db.sql(&format!("CREATE TYPE app.{q};
@@ -354,7 +375,7 @@ async fn modifier_lock_witness(index: usize) {
         "status::int",
         "status::double precision",
     ] {
-        vet_conversion(&mut db.conn, &column, &ty, using)
+        vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
             .await
             .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
     }
@@ -363,9 +384,15 @@ async fn modifier_lock_witness(index: usize) {
         vec![pbps_model::TypeArg::Int(10), pbps_model::TypeArg::Int(2)],
     );
     for source in [numeric.clone(), numeric.into_array()] {
-        vet_conversion(&mut db.conn, &column, &source, "status::text")
-            .await
-            .unwrap();
+        vet_conversion(
+            &mut db.conn,
+            &Admission::default(),
+            &column,
+            &source,
+            "status::text",
+        )
+        .await
+        .unwrap();
     }
     // A source type with custom typmodin is refused before either temporary
     // binding table can parse its declaration, arrays included.
@@ -373,7 +400,14 @@ async fn modifier_lock_witness(index: usize) {
     custom.args.push(pbps_model::TypeArg::Int(1));
     for source in [custom.clone(), custom.into_array()] {
         db.sql("SELECT pg_advisory_lock(2378)").await;
-        let result = vet_conversion(&mut db.conn, &column, &source, "status::text").await;
+        let result = vet_conversion(
+            &mut db.conn,
+            &Admission::default(),
+            &column,
+            &source,
+            "status::text",
+        )
+        .await;
         assert_eq!(
             locks(&mut db).await,
             1,
@@ -409,7 +443,7 @@ async fn modifier_lock_witness(index: usize) {
         (r#"status::app.U&"modt\0079pe"(1)"#, "modtype"),
     ] {
         db.sql("SELECT pg_advisory_lock(2378)").await;
-        let result = vet_conversion(&mut db.conn, &column, &ty, using).await;
+        let result = vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using).await;
         let held = locks(&mut db).await;
         db.sql("SELECT pg_advisory_unlock_all()").await;
         assert_eq!(
@@ -430,22 +464,34 @@ async fn modifier_lock_witness(index: usize) {
         "status /* app.modtype(1) */",
         "status -- app.modtype(1)\n",
     ] {
-        vet_conversion(&mut db.conn, &column, &ty, using)
+        vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
             .await
             .unwrap();
     }
-    let why = vet_conversion(&mut db.conn, &column, &ty, "status::pg_catalog.length(1)")
-        .await
-        .unwrap_err();
+    let why = vet_conversion(
+        &mut db.conn,
+        &Admission::default(),
+        &column,
+        &ty,
+        "status::pg_catalog.length(1)",
+    )
+    .await
+    .unwrap_err();
     assert!(!why.contains("modifier routine"), "{why}");
     assert!(why.contains("42704"), "{why}");
     let role = db.role("lookup", "LOGIN").await;
     db.sql("REVOKE EXECUTE ON FUNCTION pg_catalog.to_regtype(text) FROM PUBLIC")
         .await;
     let mut limited = db.as_role(&role).await;
-    let why = vet_conversion(&mut limited, &column, &ty, "length(status)")
-        .await
-        .unwrap_err();
+    let why = vet_conversion(
+        &mut limited,
+        &Admission::default(),
+        &column,
+        &ty,
+        "length(status)",
+    )
+    .await
+    .unwrap_err();
     assert!(
         why.contains("modifier-input type names could not be resolved"),
         "{why}"
@@ -455,9 +501,15 @@ async fn modifier_lock_witness(index: usize) {
         .await;
     // Quoted spelling is exact: this type does not exist, and binding (rather
     // than the modifier guard) must say so, without calling either routine.
-    let why = vet_conversion(&mut db.conn, &column, &ty, r#"status::app."MODTYPE"(1)"#)
-        .await
-        .unwrap_err();
+    let why = vet_conversion(
+        &mut db.conn,
+        &Admission::default(),
+        &column,
+        &ty,
+        r#"status::app."MODTYPE"(1)"#,
+    )
+    .await
+    .unwrap_err();
     assert!(!why.contains("modifier routine"), "{why}");
     assert!(why.contains("42704"), "{why}");
     db.drop().await;
@@ -477,9 +529,15 @@ async fn replacement_parameters_keep_neighboring_tokens_separate() {
             "'a'||'b'",
             "CASE WHEN status = 'active'THEN'a'ELSE'b'END",
         ] {
-            vet_conversion(&mut db.conn, &column, &ColumnType::simple("text"), using)
-                .await
-                .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
+            vet_conversion(
+                &mut db.conn,
+                &Admission::default(),
+                &column,
+                &ColumnType::simple("text"),
+                using,
+            )
+            .await
+            .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
         }
         db.drop().await;
     }
@@ -514,9 +572,15 @@ async fn recorded_conversion_path(index: usize) {
     let ty = ColumnType::simple("text");
     // This session would resolve the call to user code. Vetting chooses
     // the builtin, then rollback restores the caller's path.
-    vet_conversion(&mut db.conn, &column, &ty, "length(status)")
-        .await
-        .unwrap();
+    vet_conversion(
+        &mut db.conn,
+        &Admission::default(),
+        &column,
+        &ty,
+        "length(status)",
+    )
+    .await
+    .unwrap();
     let path = db.conn.query("SHOW search_path").await.unwrap();
     assert_eq!(
         path[0].try_get::<&str>("search_path").unwrap(),
@@ -526,7 +590,7 @@ async fn recorded_conversion_path(index: usize) {
         if using.starts_with("app_only") {
             db.sql("CREATE FUNCTION app.app_only(text) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 7'").await;
         }
-        let why = vet_conversion(&mut db.conn, &column, &ty, using)
+        let why = vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
             .await
             .unwrap_err();
         // The user function is now absent during binding. An unconstrained
@@ -534,7 +598,7 @@ async fn recorded_conversion_path(index: usize) {
         assert!(why.contains(code), "PG{} {using}: {why}", server.label);
     }
     let using = "length('123')::text::integer";
-    vet_conversion(&mut db.conn, &column, &ty, using)
+    vet_conversion(&mut db.conn, &Admission::default(), &column, &ty, using)
         .await
         .unwrap();
     let change = Change::AlterColumnType {

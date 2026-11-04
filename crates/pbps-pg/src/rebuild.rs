@@ -58,6 +58,7 @@ impl Verification {
 /// Complete catalog reads and typed recipes, in the caller's transaction.
 pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
     conn: &mut Conn,
+    admission: &crate::admission::Admission,
     changes: pbps_diff::order::PlanningPlan<S>,
     before: Side<'_>,
     desired: Side<'_>,
@@ -66,8 +67,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
 ) -> Result<
     (
         pbps_diff::order::PlanningPlan<S::Output>,
-        i64,
-        i64,
+        Option<(i64, i64)>,
         Verification,
     ),
     Error,
@@ -159,7 +159,7 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
             }
         })
         .ok_or_else(|| "prepared rebuild has no copy".to_owned())?;
-    let (rows, bytes) = observe(conn, &parts, copy).await?;
+    let observed = observe(conn, admission, &parts, copy).await?;
     let verification = Verification {
         root: root.clone(),
         prepared: prepared.clone(),
@@ -168,29 +168,36 @@ pub async fn plan<S: pbps_diff::order::RouteState<D>, D: pbps_dialect::Dialect>(
     };
     Ok((
         continue_plan(changes, &input, prepared, dialect)?,
-        rows,
-        bytes,
+        observed,
         verification,
     ))
 }
 
 /// The database, rather than a second range comparator, evaluates the new
 /// bounds over the exact typed copy projection. No rows are copied here.
+/// `None` when a conversion relies on the review and the admission defers (plan
+/// time): the projection would run unreviewed code, so apply observes it.
 pub async fn observe(
     conn: &mut Conn,
+    admission: &crate::admission::Admission,
     changes: &ChangeSet,
     copy: &CopyTableRows,
-) -> Result<(i64, i64), Error> {
+) -> Result<Option<(i64, i64)>, Error> {
     conn.execute("SAVEPOINT pbps_rebuild_probe").await?;
+    let mark = admission.mark();
     let result = async {
         for c in &copy.columns {
             let mut from = c.source.as_ref().map(|s| &s.ty);
             for stage in &c.stages {
                 if let (Some(ty), Some(using)) = (from, &stage.using) {
-                    crate::input_path::vet_copy_conversion(conn, &stage.input, ty, using).await?;
+                    crate::input_path::vet_copy_conversion(conn, admission, &stage.input, ty, using)
+                        .await?;
                 }
                 from = Some(&stage.cast);
             }
+        }
+        if admission.relied_since(mark) {
+            return Ok(None);
         }
         let relations: Vec<_> = std::iter::once(&copy.target).chain(&copy.target_partitions).collect();
         let temporary: std::collections::BTreeMap<_, _> = relations.iter().map(|r| (r.name.clone(), TableName::new("pg_temp", format!("probe_{}", Uid::generate(UidKind::Table))))).collect();
@@ -224,7 +231,7 @@ pub async fn observe(
         let sizes = std::iter::once(&copy.source).chain(&copy.source_partitions).map(|r| Ok(format!("pg_catalog.pg_total_relation_size({}::pg_catalog.regclass)", literal(&qualified(&r.name)?)))).collect::<Result<Vec<_>, pbps_dialect::DialectError>>()?.join(" + ");
         let bytes = conn.query(&format!("SELECT ({sizes})::bigint AS bytes")).await?;
         let bytes = bytes.first().ok_or_else(|| "rebuild size was not read".to_owned())?.try_get::<i64>("bytes")?.ok_or_else(|| "rebuild size is unreadable".to_owned())?;
-        Ok((count, bytes))
+        Ok(Some((count, bytes)))
     }.await;
     let closed = conn
         .execute("ROLLBACK TO SAVEPOINT pbps_rebuild_probe; RELEASE SAVEPOINT pbps_rebuild_probe")
@@ -236,7 +243,12 @@ pub async fn observe(
 }
 
 /// Lock the recursive source tree before reading the dependency closure again.
-pub async fn window(conn: &mut Conn, before: Side<'_>, changes: &ChangeSet) -> Result<(), Error> {
+pub async fn window(
+    conn: &mut Conn,
+    admission: &crate::admission::Admission,
+    before: Side<'_>,
+    changes: &ChangeSet,
+) -> Result<(), Error> {
     for copy in changes.changes.iter().filter_map(|p| {
         if let Change::CopyTableRows(c) = &p.change {
             Some(c)
@@ -265,7 +277,7 @@ pub async fn window(conn: &mut Conn, before: Side<'_>, changes: &ChangeSet) -> R
         )
         .await?;
         pbps_diff::order::rebuild::recertify(&catalog, copy, before, changes)?;
-        observe(conn, changes, copy).await?;
+        observe(conn, admission, changes, copy).await?;
     }
     Ok(())
 }

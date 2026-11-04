@@ -403,7 +403,7 @@ fn domain_vet2309_unavailable_warns_policy_escalates_and_unrelated_plans_do_not_
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_warn() {
+fn domain_vet2309_managed_functions_are_judged_at_apply_and_other_compile_errors_warn() {
     for var in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
         let server = std::env::var(var).unwrap();
         let own = OwnDatabase::new(&server, "domain2309managed");
@@ -420,19 +420,96 @@ fn domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_w
         ]));
         config(&d, "");
         std::fs::write(d.dir.join("externals.sql"), "").unwrap();
-        std::fs::write(d.dir.join("schema/app.bad.yml"), "function: app.bad(text)\ndefinition: '(text) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN true'\n").unwrap();
-        declaration(
-            &d,
+        // A routine the plan creates is not in the types-only scratch, and that
+        // is no refusal: apply judges it by the one predicate (DEC-2563.2).
+        let module = |name: &str, path: &str| {
+            std::fs::write(
+                d.dir.join(format!("schema/app.{name}.yml")),
+                format!("function: app.{name}(text)\ndefinition: '(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE {path}AS $$BEGIN RETURN true; END$$'\n"),
+            )
+            .unwrap();
+        };
+        // The routine exists in the database first: modules are created after
+        // types, so a domain cannot lean on a function created beside it.
+        let path = d.dir.join("vet.plan.json");
+        let plain = d.dir.join("module.plan.json");
+        let install = |name: &str, path_clause: &str, domain: &str| {
+            module(name, path_clause);
+            d.commit();
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                own.connection(),
+                "--out",
+                plain.to_str().unwrap(),
+            ]));
+            succeeds(apply_plan(&d, own.connection(), &plain, false));
+            declaration(&d, domain);
+        };
+        install(
+            "good",
+            "SET search_path = pg_catalog, pg_temp ",
+            "domain: app.d\ntype: text\nchecks: {managed_check: 'app.good(VALUE)'}\n",
+        );
+        let out = succeeds(plan(&d, own.connection(), &scratch.connection, &[]));
+        scratch.released();
+        let applied = apply_plan(&d, own.connection(), &path, false);
+        scratch.released();
+        assert_eq!(
+            code(&applied),
+            0,
+            "{}{}{}",
+            stdout(&out),
+            stdout(&applied),
+            stderr(&applied)
+        );
+        // Without a fixed `search_path` it still plans, and apply refuses it
+        // with the exact fix.
+        install(
+            "bad",
+            "",
             "domain: app.d\ntype: text\nchecks: {managed_check: 'app.bad(VALUE)'}\n",
         );
-        let out = plan(&d, own.connection(), &scratch.connection, &[]);
+        std::fs::remove_file(&path).unwrap();
+        succeeds(plan(&d, own.connection(), &scratch.connection, &[]));
         scratch.released();
-        assert_ne!(code(&out), 0);
-        let text = format!("{}{}", stdout(&out), stderr(&out));
-        for expected in ["app.d", "app.bad", "managed", "does not exist"] {
+        let checksum = plan_checksum(&path);
+        let applied = d.run(&[
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "constraint",
+        ]);
+        scratch.released();
+        assert_ne!(code(&applied), 0);
+        let text = format!("{}{}", stdout(&applied), stderr(&applied));
+        for expected in [
+            "app.d",
+            "app.bad",
+            "ALTER FUNCTION app.bad(pg_catalog.text) SET search_path = pg_catalog, pg_temp",
+        ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
-        assert!(!d.dir.join("vet.plan.json").exists());
+        // One statement and a missing type are still refused at plan time.
+        for check in [
+            "length(VALUE) > 0; SELECT 1",
+            "VALUE::app.absent_type IS NULL",
+        ] {
+            declaration(
+                &d,
+                &format!("domain: app.d\ntype: text\nchecks: {{c: \"{check}\"}}\n"),
+            );
+            std::fs::remove_file(&path).unwrap_or(());
+            let out = plan(&d, own.connection(), &scratch.connection, &[]);
+            scratch.released();
+            assert_ne!(code(&out), 0, "{check}: {}{}", stdout(&out), stderr(&out));
+            assert!(!path.exists());
+        }
         declaration(
             &d,
             "domain: app.d\ntype: text\nchecks: {missing_check: 'ext.absent(VALUE)'}\n",

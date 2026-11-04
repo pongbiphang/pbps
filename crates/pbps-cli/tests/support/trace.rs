@@ -305,7 +305,7 @@ impl Fixture {
                  CREATE VIEW ext.v AS SELECT id, '{}'::text || '{}'::text AS label FROM ext.t;\n\
                  CREATE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE \
                    AS $$SELECT length('{}')$$;\n\
-                 CREATE FUNCTION ext.fire() RETURNS trigger LANGUAGE plpgsql AS \
+                 CREATE FUNCTION ext.fire() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
                    $$BEGIN PERFORM '{}'; RETURN NEW; END$$;\n\
                  CREATE TRIGGER private_trigger BEFORE INSERT ON ext.t FOR EACH ROW \
                    EXECUTE FUNCTION ext.fire();",

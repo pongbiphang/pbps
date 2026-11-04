@@ -69,6 +69,7 @@ impl Proven {
         self.refused.get(&oid).map(String::as_str)
     }
 
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.admitted.is_empty()
     }

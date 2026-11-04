@@ -6,6 +6,7 @@ use pbps_db::{Conn, DbError};
 use pbps_model::{DeclaredTypeBefore, DeclaredTypePin, IdsFile, ManagedType, Schema, TypeRef};
 
 use super::{failed, input_routines};
+use crate::admission::Admission;
 use crate::pins::Within;
 use pbps_diff::identity::type_refs::{TypeResolver, TypeSide, after_changes, before_changes};
 
@@ -489,7 +490,8 @@ pub async fn check(
             )));
         }
     }
-    input_routines(conn, within, &present, trusted, false).await?;
+    let admission = Admission::without_review(trusted.iter().cloned());
+    input_routines(conn, within, &present, &admission).await?;
     Ok(())
 }
 
@@ -525,12 +527,12 @@ pub async fn vet(
                     statement.name.shown()
                 )));
             }
+            let admission = Admission::without_review(trusted.iter().cloned());
             input_routines(
                 conn,
                 Within::CallersTransaction,
                 std::slice::from_ref(&statement.name),
-                trusted,
-                false,
+                &admission,
             )
             .await?;
             // A check added `NOT VALID` binds its expression and evaluates no

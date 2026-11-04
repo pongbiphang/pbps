@@ -39,6 +39,7 @@ use pbps_model::{
     Strategy, Table, TableName,
 };
 
+pub mod admission;
 mod ambiguity;
 pub mod assertions;
 pub mod catalog;

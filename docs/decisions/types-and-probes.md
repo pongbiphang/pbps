@@ -4854,3 +4854,105 @@ required. Explicit outer declarations remain explicit; a baseline with no declar
 retains its raw evidence. The copy's historical value does not come from the
 base's current desired DEFAULT. Existing Declared.types and before-pins carry
 both facts, so no persisted field or version changes.
+
+<a id="dec-2563-2"></a>
+
+**DEC-2563.2. One admission predicate decides every routine at every site that runs user-written code (PostgreSQL).**
+
+(#2563, slice 2a.) Before this, the sites disagreed. Domain code, referenced
+types, `USING` conversions, row requirements and copy conversions were judged:
+built-in only, or a trusted owner and `pin_type_routines` together. A created
+domain was built-in only (DEC-1635.4). The reference-data trigger guard had an
+owner rule of its own. One predicate now answers for all of them
+(`crates/pbps-pg/src/admission.rs`), and no site keeps a private one. A routine
+is admitted when it is:
+
+1. built in, or provably built-in-only (tier 1, DEC-2563.1);
+2. managed by the project: the deployer created it, so rule 3 holds of it;
+3. owned by a trusted role: a superuser, the deployer, a role that can `SET
+   ROLE` to one of them, or a `trusted_roles` member, by the existing walk
+   (DEC-1663.1);
+4. otherwise, accepted through `pin_type_routines`: the plan shows the complete
+   source and pins it (DEC-2181.2), and approving the plan accepts that code.
+
+**Routines admitted by 2 to 4 must also** set a fixed `search_path` (a
+`search_path` entry in `proconfig`, which the pin covers) and must not be
+`SECURITY DEFINER` with an untrusted owner. A role with CREATE on a schema
+searched earlier replaced an unqualified call inside a trusted function on both
+16 and 18, and a function-level `SET` was immune (the survey of #2563). The
+refusal gives the exact line, `ALTER FUNCTION app.f(integer) SET search_path =
+pg_catalog, pg_temp`, and says to name before `pg_temp` any other schema the
+body needs. The value is not judged: a fixed path that includes a schema anyone
+can write to is the author's choice, as it is for the owner of any function.
+
+**Which routines need it** (maintainer decision of 2026-11-03, measured on
+16.15 and 18.6). The requirement is for code that resolves names when it runs:
+every language but `c` and `internal`, which only a superuser can create. Every
+extension routine measured (`uuid_generate_v4`, `crypt`, `gen_salt`,
+`citext_eq`, `citextin`) is owned by the bootstrap superuser, has no
+`proconfig`, and is `c` or `internal`; the literal rule would have refused
+`DEFAULT uuid_generate_v4()` and every citext column. Owner trust still applies
+to them. A tier 1 function has no names to resolve (its body is a parsed tree of
+OIDs) and so needs none either.
+
+**Owner trust.** A refusal names the untrusted role that can act as the owner,
+and the three remedies: bring the routine into the project, add its owner to
+`trusted_roles`, or enable `pin_type_routines`. Review replaces owner trust for
+a routine and never for a type: a type's owner can still add code to its input
+path after it is read (DEC-2181.3 stands for types, and for operators and type
+handlers, which a pin on `pg_proc` cannot cover). A missing `search_path` has
+its own fix and no trust remedy. A site that cannot review omits the third
+remedy.
+
+**What changes.** Supersedes DEC-1635.4's built-in-only rule for a created
+domain: its CHECK and DEFAULT are vetted in the creating transaction by this
+predicate, at rules 2 to 4 minus the review (a routine the plan has not yet
+created cannot be read at plan time, so there is nothing to show or pin; a
+routine that exists and is untrusted waits for plan-time binding, the next slice
+of #2563). Widens DEC-2181.2: `pin_type_routines` admits a routine at every
+judged site, not only a referenced type's. The conversions, row requirements and
+copy conversions the plan holds are vetted at plan time and their reviewed
+routines join `type_routines`. Apply's admission holds that set, and a site
+refuses a reviewed routine outside it where it vets the expression, before
+anything evaluates it (a name that binds to a new overload after planning never
+runs). Supersedes two sentences of DEC-2181.3 for routines: "pinning never
+replaces owner trust" and "do not require a function-level `search_path`".
+DEC-2563.1's sentence that a refused user function "keeps `Why::NotBuiltin`" no
+longer applies: a function that is not tier 1 is judged by this predicate, and
+the reason a function could not be proven stays in the refusal as the other way
+to need no `search_path`.
+
+**Compatibility.** Refused now, admitted before: a trusted owner's routine that
+sets no `search_path` and was admitted only because `pin_type_routines` pinned it
+(it needs the `SET` first), a `SECURITY DEFINER` function of an untrusted
+owner whose owner the reviewer had declared, and a recorded trigger whose
+function sets no path (DEC-2563.3). Admitted now, refused before: a trusted
+owner's routine with a fixed `search_path`, with no `pin_type_routines` and no
+source review, at every judged site; and an untrusted owner's routine under
+`pin_type_routines`. With the setting on, a trusted owner's routine is no longer
+shown or pinned by the plan (it is not a reviewed root); DEC-319.1 still detects
+its replacement when a role short of a superuser can replace it. The refusal
+text changes: "is not built into PostgreSQL" is now the missing `search_path`
+with its exact fix, or the owner with the three remedies. No plan format
+changes: `type_routines` still holds the reviewed routines, and only what it
+holds widens (plan and state versions and the schema set are unchanged). A later slice
+judges the expressions of tables, indexes, policies and partition keys the plan
+introduces, and the compatibility change that comes with it (untrusted-owner
+helpers there are refused); they stay change-detected by DEC-319.1 until then.
+
+It also supersedes DEC-2309.1's plan-time refusal of managed domain code: a CHECK
+or DEFAULT that calls a function the project declares is no longer refused by
+the types-only scratch vet, which cannot hold that function. The plan carries
+the advisory warning, and apply judges the routine by this predicate in the
+creating transaction (a missing fixed `search_path` is refused there with the
+exact `ALTER FUNCTION` line). The one-statement and missing-type refusals stay.
+
+Plan time evaluates nothing the review alone admits. `plan --db` still vets every
+conversion, requirement and copy conversion, so the plan can show and pin the
+routines (rule 4), but a site whose vet relied on the review does not evaluate
+its expression before the human has read the source: the rebuild's copy
+projection (`rebuild::observe`) is reported unchecked, and the pre-flight probes
+of `run_probes_observed` are skipped with the notice that apply checks them
+(`Admission::deferring`, `relied_since`). Apply evaluates them after the
+approval, through the approved set. Expressions admitted by owner trust or tier 1
+are evaluated at plan time as before.
