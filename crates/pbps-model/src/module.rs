@@ -1124,6 +1124,13 @@ pub struct Hints {
     /// database.
     pub extension_updates: BTreeMap<crate::ObjectLocalName, crate::ExtensionUpdateFacts>,
 
+    /// The members each package this plan would move holds, as they would be
+    /// named in the destination schema (DEC-2447.11): what the move would take
+    /// a name of there. Absent offline: a move is planned only against a
+    /// database.
+    pub extension_moves:
+        BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ProviderMember>>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).

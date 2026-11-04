@@ -283,7 +283,9 @@ use crate::zone::SessionZone;
 // objects it is sealed with (DEC-2447.8): an older build would refuse the change as unknown.
 // 63 adds the pinned `ALTER EXTENSION ... UPDATE TO` and the manifests it is sealed with
 // (DEC-2447.10); 62 belongs to another change.
-pub const CURRENT_VERSION: u32 = 63;
+// 64 adds the pinned `ALTER EXTENSION ... SET SCHEMA`, which an older build would refuse as an
+// unknown change (DEC-2447.11).
+pub const CURRENT_VERSION: u32 = 64;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1348,7 +1350,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 63);
+        assert_eq!(plan.version, 64);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");
@@ -1527,6 +1529,30 @@ mod tests {
         let back: SavedPlan = serde_json::from_value(written).unwrap();
         assert_eq!(back, updating);
         assert_ne!(plan.wire_fingerprint(), updating.wire_fingerprint());
+        // A move alone is the same pin with no versions walked, and it keeps the
+        // empty path in the bytes it writes (DEC-2447.11).
+        let mut moving = plan.clone();
+        moving.extension_changes.push(ExtensionChangePin {
+            uid: "e_aaaaaa".parse().unwrap(),
+            name: "citext".into(),
+            from: at("1.6"),
+            to: crate::Extension {
+                schema: "app".into(),
+                version: "1.6".into(),
+            },
+            path: Vec::new(),
+            before: provider("1.6"),
+            after: provider("1.6"),
+        });
+        let written = serde_json::to_value(&moving).unwrap();
+        assert_eq!(
+            written["extension_changes"][0]["path"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::from_value::<SavedPlan>(written).unwrap(),
+            moving
+        );
         // Each part of the pin is covered: changing one changes the checksum.
         for edit in [
             (|p: &mut ExtensionChangePin| p.path.pop())

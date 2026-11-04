@@ -776,7 +776,8 @@ impl Operation {
             | Change::RenameRole { uid, .. } => ObjectKey::Role(recorded(uid)),
             Change::CreateExtension { uid, .. }
             | Change::DropExtension { uid, .. }
-            | Change::UpdateExtension { uid, .. } => ObjectKey::Extension(recorded(uid)),
+            | Change::UpdateExtension { uid, .. }
+            | Change::SetExtensionSchema { uid, .. } => ObjectKey::Extension(recorded(uid)),
             Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } => {
                 ObjectKey::Grant {
                     grantee: Grantee::Role(role.clone()),
@@ -942,6 +943,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::RenameType { .. }
             // A package updated in place stands before and after it.
             | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
             | Change::RenameTable { .. }

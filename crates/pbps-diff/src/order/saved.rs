@@ -709,14 +709,16 @@ pub(super) fn package_pins_match_their_drops(plan: &SavedPlan) -> Result<(), Adm
     Ok(())
 }
 
-/// The same for `ALTER EXTENSION ... UPDATE TO` (DEC-2447.10): every update is
-/// sealed with exactly one pin and every pin belongs to one update; the pin
-/// repeats the change's versions and the plan's identities, its manifests agree
-/// with them, the path starts at the installed version and ends at the target,
-/// and a required package is created by the same plan. An update whose own
-/// parts disagree never reaches a statement.
+/// The same for `ALTER EXTENSION ... UPDATE TO` and `... SET SCHEMA`
+/// (DEC-2447.10, DEC-2447.11): every package change is sealed with exactly one
+/// pin per package and every pin belongs to one. The package's changes are a
+/// chain, an update and then a move, each starting where the one before ends;
+/// the pin repeats where the chain starts and ends and the plan's identities, its
+/// manifests agree with them, the path starts at the installed version and ends at
+/// the target (and is empty for a move alone), and a required package is created
+/// by the same plan. A change whose own parts disagree never reaches a statement.
 pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), AdmissionError> {
-    use pbps_model::{Change, UidKind};
+    use pbps_model::{Change, Extension, UidKind};
     let creates: std::collections::BTreeSet<_> = plan
         .changes
         .changes
@@ -729,55 +731,104 @@ pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), A
             }
         })
         .collect();
-    let updates: std::collections::BTreeMap<_, _> = plan
-        .changes
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let Change::UpdateExtension {
-                uid,
-                name,
-                from,
-                to,
-                requires,
-                ..
-            } = &p.change
-            {
-                Some((uid, (name, from, to, requires)))
-            } else {
-                None
-            }
-        })
-        .collect();
+    #[derive(Default)]
+    struct Chain<'a> {
+        name: Option<&'a pbps_model::ObjectLocalName>,
+        update: Option<(&'a Extension, &'a Extension)>,
+        movement: Option<(&'a Extension, &'a Extension)>,
+        requires: Option<&'a std::collections::BTreeSet<pbps_model::Uid>>,
+        twice: bool,
+    }
+    let mut chains: std::collections::BTreeMap<&pbps_model::Uid, Chain<'_>> = Default::default();
+    for p in &plan.changes.changes {
+        let (uid, name, step, requires) = if let Change::UpdateExtension {
+            uid,
+            name,
+            from,
+            to,
+            requires,
+            ..
+        } = &p.change
+        {
+            (uid, name, (from, to), Some(requires))
+        } else if let Change::SetExtensionSchema {
+            uid,
+            name,
+            from,
+            to,
+            ..
+        } = &p.change
+        {
+            (uid, name, (from, to), None)
+        } else {
+            continue;
+        };
+        let chain = chains.entry(uid).or_default();
+        let slot = if requires.is_some() {
+            &mut chain.update
+        } else {
+            &mut chain.movement
+        };
+        chain.twice |= slot.replace(step).is_some() || chain.name.is_some_and(|n| n != name);
+        chain.name = Some(name);
+        chain.requires = chain.requires.or(requires);
+    }
     let disagree = |name: &pbps_model::ObjectLocalName| {
         AdmissionError::message(format!(
-            "extension evidence disagrees with the plan's update of `{}`",
+            "extension evidence disagrees with the plan's change of `{}`",
             name.shown()
         ))
     };
     let mut pinned = std::collections::BTreeSet::new();
     for pin in &plan.extension_changes {
-        let Some((name, from, to, _)) = updates.get(&pin.uid) else {
+        let Some(chain) = chains.get(&pin.uid) else {
             return Err(disagree(&pin.name));
         };
-        if **name != pin.name
-            || **from != pin.from
-            || **to != pin.to
+        // Where the chain starts and ends: the update's `from` and the move's
+        // `to`, or whichever is there.
+        let (start, end) = (
+            chain.update.or(chain.movement).map(|(from, _)| from),
+            chain.movement.or(chain.update).map(|(_, to)| to),
+        );
+        let path_fits = match chain.update {
+            Some((from, to)) => {
+                pin.path.first() == Some(&from.version) && pin.path.last() == Some(&to.version)
+            }
+            None => pin.path.is_empty(),
+        };
+        if chain.name != Some(&pin.name)
+            || chain.twice
+            || start != Some(&pin.from)
+            || end != Some(&pin.to)
             || pin.before.definition != pin.from
             || pin.after.definition != pin.to
-            || pin.from.schema != pin.to.schema
-            || pin.path.first() != Some(&pin.from.version)
-            || pin.path.last() != Some(&pin.to.version)
+            || !path_fits
             || !pinned.insert(&pin.uid)
         {
             return Err(disagree(&pin.name));
         }
     }
-    for (uid, (name, _, _, requires)) in &updates {
+    for (uid, chain) in &chains {
+        let name = chain.name.expect("a chain has a change");
+        // An update keeps the schema it starts in, a move keeps the version, and
+        // the move starts where the update ends.
+        let steps_fit = chain
+            .update
+            .is_none_or(|(from, to)| from.schema == to.schema && from.version != to.version)
+            && chain
+                .movement
+                .is_none_or(|(from, to)| from.version == to.version && from.schema != to.schema)
+            && match (chain.update, chain.movement) {
+                (Some((_, left)), Some((entry, _))) => left == entry,
+                _ => true,
+            };
         if !pinned.contains(uid)
+            || !steps_fit
             || uid.kind() != UidKind::Extension
-            || plan.ids.extensions.get(*uid) != Some(*name)
-            || requires.iter().any(|r| r == *uid || !creates.contains(r))
+            || plan.ids.extensions.get(*uid) != Some(name)
+            || chain
+                .requires
+                .is_some_and(|r| r.iter().any(|r| r == *uid || !creates.contains(r)))
         {
             return Err(disagree(name));
         }

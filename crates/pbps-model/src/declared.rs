@@ -412,7 +412,8 @@ impl Declared {
                 // read as declared types or defaults (DEC-2447.6).
                 | Change::CreateExtension { .. }
                 | Change::DropExtension { .. }
-                | Change::UpdateExtension { .. } => {}
+                | Change::UpdateExtension { .. }
+                | Change::SetExtensionSchema { .. } => {}
                 Change::AlterDomain {
                     name,
                     from,

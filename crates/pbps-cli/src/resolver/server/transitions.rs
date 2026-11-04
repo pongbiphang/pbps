@@ -655,7 +655,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // (member consumers, DEC-2447.7).
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. } => continue,
+            | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. } => continue,
         };
         let entry = affected.entry(surface).or_default();
         entry.children |= children;

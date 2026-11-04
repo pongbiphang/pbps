@@ -1356,6 +1356,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. }
             | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }

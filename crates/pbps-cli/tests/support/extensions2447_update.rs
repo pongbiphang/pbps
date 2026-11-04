@@ -12,19 +12,25 @@ use super::rehearsal2379::{Fixture, Kind, Options};
 use super::{approved_apply, code, json_output, on_server, stderr, stdout, succeeds, text_of};
 use std::process::Output;
 
-fn servers(mut check: impl FnMut(&str, &str)) {
+pub(super) fn servers(mut check: impl FnMut(&str, &str)) {
     for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
         check(&std::env::var(variable).unwrap(), variable);
     }
 }
 
-fn said(output: &Output) -> String {
+pub(super) fn said(output: &Output) -> String {
     format!("{}{}", stdout(output), stderr(output))
 }
 
 /// A project that holds `name` at `version` on its target and on its scratch
 /// (the externals file installs it on both), adopted the way an operator does.
-fn adopted(server: &str, slug: &str, name: &str, version: &str, options: &Options<'_>) -> Fixture {
+pub(super) fn adopted(
+    server: &str,
+    slug: &str,
+    name: &str,
+    version: &str,
+    options: &Options<'_>,
+) -> Fixture {
     let externals = format!(
         "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION {name} SCHEMA ext VERSION '{version}'"
     );
@@ -50,7 +56,7 @@ fn adopted(server: &str, slug: &str, name: &str, version: &str, options: &Option
 }
 
 /// Writes the declaration of `name` at `version` in `schema`, uncommitted.
-fn write_declaration(f: &Fixture, name: &str, schema: &str, version: &str) {
+pub(super) fn write_declaration(f: &Fixture, name: &str, schema: &str, version: &str) {
     std::fs::create_dir_all(f.d.dir.join("schema/extensions")).unwrap();
     std::fs::write(
         f.d.dir.join(format!("schema/extensions/{name}.yml")),
@@ -60,23 +66,23 @@ fn write_declaration(f: &Fixture, name: &str, schema: &str, version: &str) {
 }
 
 /// [`write_declaration`], committed.
-fn declare(f: &Fixture, name: &str, schema: &str, version: &str) {
+pub(super) fn declare(f: &Fixture, name: &str, schema: &str, version: &str) {
     write_declaration(f, name, schema, version);
     f.d.commit();
 }
 
 /// The newest ledger entry is a failure, and still holds the package as it was.
-fn failed_leaving(f: &Fixture, name: &str, version: &str) {
+pub(super) fn failed_leaving(f: &Fixture, name: &str, version: &str) {
     let latest = super::latest_snapshot(f.target());
     assert_eq!(latest.kind, pbps_model::StateKind::Failed);
     assert_eq!(latest.schema.extensions[name].version, version);
 }
 
-fn saved(f: &Fixture) -> pbps_model::SavedPlan {
+pub(super) fn saved(f: &Fixture) -> pbps_model::SavedPlan {
     serde_json::from_slice(&std::fs::read(f.artifact()).unwrap()).unwrap()
 }
 
-fn held(f: &Fixture, names: &str) -> String {
+pub(super) fn held(f: &Fixture, names: &str) -> String {
     text_of(
         f.target(),
         &format!(
@@ -86,11 +92,11 @@ fn held(f: &Fixture, names: &str) -> String {
     )
 }
 
-fn entries(f: &Fixture) -> String {
+pub(super) fn entries(f: &Fixture) -> String {
     text_of(f.target(), "SELECT count(*)::text FROM public.__pbps_state")
 }
 
-const ALLOW: &str = "extension-code,destructive";
+pub(super) const ALLOW: &str = "extension-code,destructive";
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
@@ -379,46 +385,13 @@ fn an_update_beside_a_resolver_bound_change_is_refused_by_name_and_writes_nothin
         let message = said(&planned);
         assert!(
             message.contains("this plan also updates extension `upd2447`")
-                && message.contains("Plan the update alone first")
+                && message.contains("Plan the update or move alone first")
                 && !message.contains("this is a bug in pbps"),
             "{message}"
         );
         assert!(!f.artifact().exists(), "a refused plan wrote a file");
         assert_eq!(entries(&f), before);
         assert_eq!(held(&f, "'upd2447'"), "upd2447@ext@1.0");
-    });
-}
-
-#[test]
-#[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_version_and_a_schema_change_in_one_plan_is_refused_with_the_two_plan_remedy() {
-    servers(|server, slug| {
-        let f = adopted(
-            server,
-            &format!("update2447-move-{slug}"),
-            "upd2447",
-            "1.0",
-            &Options::default(),
-        );
-        declare(&f, "upd2447", "moved", "1.1");
-        let both = f.plan(&[]);
-        assert_ne!(code(&both), 0, "{}", said(&both));
-        assert!(
-            said(&both).contains("together with SET SCHEMA")
-                && said(&both).contains("update the package in one plan and move it in the next"),
-            "{}",
-            said(&both)
-        );
-        // The schema alone keeps its refusal; the version alone is the update.
-        declare(&f, "upd2447", "moved", "1.0");
-        let moved = f.plan(&[]);
-        assert_ne!(code(&moved), 0, "{}", said(&moved));
-        assert!(said(&moved).contains("SET SCHEMA"), "{}", said(&moved));
-        assert!(!f.artifact().exists());
-        declare(&f, "upd2447", "ext", "1.1");
-        let update = f.plan(&[]);
-        assert_eq!(code(&update), 0, "{}", said(&update));
-        assert_eq!(saved(&f).extension_changes.len(), 1);
     });
 }
 

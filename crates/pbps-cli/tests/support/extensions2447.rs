@@ -213,7 +213,8 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
             (
                 "hstore",
                 Some("extension: hstore\nschema: other\nversion: '1.4'\n"),
-                "SET SCHEMA",
+                // A move is rehearsed and pinned too (DEC-2447.11).
+                "is moved by this plan",
             ),
         ] {
             let path = extension_file(&d, name);

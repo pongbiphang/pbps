@@ -385,6 +385,25 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         releases: BTreeSet<crate::ModuleId>,
     },
+    /// `ALTER EXTENSION name SET SCHEMA s` of a package the declarations hold in
+    /// another schema than the target does (DEC-2447.11). The package keeps its
+    /// identity and every member keeps its object number: the engine moves them
+    /// with it, which is why a declaration that spells a member with the old
+    /// schema is not rewritten here. It is a `rename`, and is sealed with the
+    /// manifest the target held and the one the rehearsal read afterwards
+    /// (`Plan::extension_changes`). Beside a version change the update is
+    /// planned first, and this change starts from the version it leaves.
+    SetExtensionSchema {
+        uid: Uid,
+        name: ObjectLocalName,
+        from: crate::Extension,
+        to: crate::Extension,
+        /// The modules of this plan's base that hold a name in the destination
+        /// schema which a member of the package would take, and which this plan
+        /// drops: the move waits for each, so the name is free (a handover).
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        releases: BTreeSet<crate::ModuleId>,
+    },
     CreateTable {
         uid: Uid,
         name: TableName,
@@ -1549,6 +1568,7 @@ macro_rules! catalog_change {
         $crate::Change::CreateExtension { .. }
             | $crate::Change::DropExtension { .. }
             | $crate::Change::UpdateExtension { .. }
+            | $crate::Change::SetExtensionSchema { .. }
     };
 }
 
@@ -1651,7 +1671,8 @@ impl Change {
             }
             Change::CreateExtension { name, .. }
             | Change::DropExtension { name, .. }
-            | Change::UpdateExtension { name, .. } => {
+            | Change::UpdateExtension { name, .. }
+            | Change::SetExtensionSchema { name, .. } => {
                 format!("extension {}", name.raw())
             }
             // The routine, not the grantee. `PUBLIC` is every principal at
@@ -2415,6 +2436,7 @@ impl Change {
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2914,6 +2936,7 @@ impl Change {
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -3192,6 +3215,11 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             Change::UpdateExtension { .. } => {
                 r.insert(RiskClass::ExtensionCode);
                 r.insert(RiskClass::Destructive);
+            }
+            // The members keep their identity and only their schema changes, but
+            // what spells one with the old schema stops finding it (DEC-2447.11).
+            Change::SetExtensionSchema { .. } => {
+                r.insert(RiskClass::Rename);
             }
             // The loosening statements carry no class, as `DropCheck` does
             // (DECISIONS 486). A check added or changed validates every row

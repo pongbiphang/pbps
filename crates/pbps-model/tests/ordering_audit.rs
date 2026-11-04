@@ -1025,6 +1025,22 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "SetExtensionSchema",
+                Change::SetExtensionSchema {
+                    uid: uid(UidKind::Extension, "earthdistance"),
+                    name: "earthdistance".into(),
+                    from: pbps_model::Extension {
+                        schema: "ext".into(),
+                        version: "1.2".into(),
+                    },
+                    to: pbps_model::Extension {
+                        schema: "app".into(),
+                        version: "1.2".into(),
+                    },
+                    releases: ["app.f(integer)".parse().unwrap()].into(),
+                },
+            ),
+            (
                 "CreateRole",
                 Change::CreateRole {
                     uid: uid(UidKind::Role, "new"),

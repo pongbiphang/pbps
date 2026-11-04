@@ -66,6 +66,12 @@ pub enum DiffError {
     },
     #[error("extension `{}`: CREATE EXTENSION runs the package's install script, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what the script installs (DEC-2447.6)", .name.shown())]
     ExtensionCreateNeedsDatabase { name: pbps_model::ObjectLocalName },
+    #[error("extension `{}`: ALTER EXTENSION SET SCHEMA from `{}` to `{}` is judged against the members, owners and relocatability the target holds, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what it leaves (DEC-2447.11)", .name.shown(), pbps_model::escape::Escaped(.from), pbps_model::escape::Escaped(.to))]
+    ExtensionMoveNeedsDatabase {
+        name: pbps_model::ObjectLocalName,
+        from: String,
+        to: String,
+    },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
     EnumValueUse {
         name: pbps_model::TypeRef,
@@ -893,6 +899,13 @@ pub(crate) fn diff_partial_rebuilding(
         crate::extensions::updates(base, declared, dialect.name(), &hints.extension_updates);
     changes.extend(extension_updates);
     errs.extend(extension_update_errors);
+    // After the updates: a move of a package that is also updated starts from
+    // the version the update leaves, and the plan's own order keeps them so
+    // (DEC-2447.11).
+    let (extension_moves, extension_move_errors) =
+        crate::extensions::moves(base, declared, dialect.name(), &hints.extension_moves);
+    changes.extend(extension_moves);
+    errs.extend(extension_move_errors);
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2695,6 +2708,11 @@ pub(crate) fn diff_partial_rebuilding(
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
                 extension_rank.get(uid).copied().unwrap_or(0)
+            } else if let Change::SetExtensionSchema { uid, .. } = &p.change {
+                // One rank behind the package's own update, whose result the
+                // move starts from: the two rewrite one package, and the draft
+                // is what orders two writes (DEC-2447.11).
+                extension_rank.get(uid).copied().unwrap_or(0) + 1
             } else {
                 dependency_rank(
                     &p.change,
@@ -7198,6 +7216,7 @@ fn dependency_rank(
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
         | Change::UpdateExtension { .. }
+        | Change::SetExtensionSchema { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -8147,7 +8166,8 @@ fn order_key(c: &Change) -> u8 {
         // packages is the `requires` edge, not this number (DEC-2447.6).
         | Change::CreateType { .. }
         | Change::CreateExtension { .. }
-        | Change::UpdateExtension { .. } => 7,
+        | Change::UpdateExtension { .. }
+        | Change::SetExtensionSchema { .. } => 7,
         // A domain's checks and NOT NULL are dropped with a table's, before
         // the plan's rows, and added with them after the rows (DEC-1635.8).
         // A default the half sets can name a label the plan renames or adds,

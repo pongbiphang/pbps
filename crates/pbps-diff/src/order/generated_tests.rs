@@ -750,6 +750,24 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
     pin(
+        Change::SetExtensionSchema {
+            uid: "e_015033".parse().unwrap(),
+            name: "citext".into(),
+            from: pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+            to: pbps_model::Extension {
+                schema: "app".into(),
+                version: "1.6".into(),
+            },
+            releases: Default::default(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
         Change::Grant {
             role: "reader".into(),
             target: GrantTarget::Schema("app".into()),

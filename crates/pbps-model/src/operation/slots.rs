@@ -603,6 +603,7 @@ pub fn names(
         | Change::EnumRebuild { .. }
         | Change::AlterModule { .. }
         | Change::UpdateExtension { .. }
+        | Change::SetExtensionSchema { .. }
         | Change::AttachPartition { .. }
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }

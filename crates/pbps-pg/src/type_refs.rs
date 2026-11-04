@@ -67,7 +67,8 @@ fn reference_uses<'a>(
             | Change::AnalyzeTableTree(_)
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. } => {}
+            | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. } => {}
             Change::CreateTable { table, .. }
             | Change::AttachPartition { shape: table, .. }
             | Change::DetachPartition { shape: table, .. } => {

@@ -1423,6 +1423,17 @@ impl Cx<'_> {
                     self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
                 }
             }
+            // A move waits for the modules this plan drops that hold a name a
+            // member would take. It rewrites the package like an update, and the
+            // two are ordered by the plan's own order, update first (DEC-2447.11).
+            Change::SetExtensionSchema { uid, releases, .. } => {
+                let key = ObjectKey::Extension(Recorded(uid.clone()));
+                self.exists(key.clone());
+                self.rewrites(Resource::Object(key, Incarnation::Final));
+                for id in releases {
+                    self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
+                }
+            }
             Change::DropExtension {
                 uid,
                 requirers,

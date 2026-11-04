@@ -318,6 +318,7 @@ pub async fn rehearse_in(
     use pbps_dialect::ExtensionPhase;
     let mut created = std::collections::BTreeMap::new();
     let mut changed = std::collections::BTreeMap::new();
+    let mut moved_into = std::collections::BTreeSet::new();
     let mut standing: std::collections::BTreeMap<_, _> = declared
         .extensions
         .iter()
@@ -332,9 +333,19 @@ pub async fn rehearse_in(
                 standing.remove(&marker.name);
                 created.insert(marker.name.clone(), wanted.clone());
             }
-            ExtensionPhase::Update { from } => {
-                standing.insert(marker.name.clone(), from.clone());
-                changed.insert(marker.name.clone(), wanted.clone());
+            // The first statement of a package says where the scratch starts: a
+            // move after an update starts from the version the update leaves,
+            // which the scratch gets by running the update (DEC-2447.11).
+            ExtensionPhase::Update { from } | ExtensionPhase::SetSchema { from } => {
+                if changed
+                    .insert(marker.name.clone(), wanted.clone())
+                    .is_none()
+                {
+                    standing.insert(marker.name.clone(), from.clone());
+                }
+                if matches!(marker.phase, ExtensionPhase::SetSchema { .. }) {
+                    moved_into.insert(wanted.schema.clone());
+                }
             }
             ExtensionPhase::Drop => {}
         }
@@ -343,14 +354,17 @@ pub async fn rehearse_in(
     if !created.is_empty() {
         let problems = pbps_pg::resolver::scratch::extension_requirements(conn, &created).await?;
         anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
-        // The target was checked for the schema, so the scratch that stands for
-        // it has it: a package is installed into a schema that is there.
-        let schemas: Vec<String> = created
-            .values()
-            .map(|definition| definition.schema.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+    }
+    // The target was checked for the schema, so the scratch that stands for it
+    // has it: a package is installed or moved into a schema that is there.
+    let schemas: Vec<String> = created
+        .values()
+        .map(|definition| definition.schema.clone())
+        .chain(moved_into)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !schemas.is_empty() {
         pbps_pg::resolver::scratch::create_schemas(conn, &schemas).await?;
     }
     // The rehearsal reads the rows back and compares; a spelling the engine
