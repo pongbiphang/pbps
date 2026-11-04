@@ -174,6 +174,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
                     &reversed,
                     order::shadow::Stage::Final,
                     Some(&facts),
+                    &Default::default(),
                 )
             })
             .is_err();

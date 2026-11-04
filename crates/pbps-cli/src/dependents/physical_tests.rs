@@ -249,7 +249,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
                 let cs = pbps_diff::order::propose(cs);
     let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
-                    &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
+                    &ModuleDeps::default(), None, &Default::default(), &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
                 crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.unwrap();
@@ -280,7 +280,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
         let cs = pbps_diff::order::propose(cs);
     let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
-            &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
+            &ModuleDeps::default(), None, &Default::default(), &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
         crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.unwrap();
@@ -505,6 +505,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         sources,
         &ModuleDeps::default(),
         None,
+        &Default::default(),
         &pg,
         &|_| panic!("the plan already rebuilds the function"),
     )

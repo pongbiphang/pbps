@@ -61,9 +61,21 @@ pub struct Facts<'a> {
     role_members: Option<&'a RoleMembers>,
     policy_dependents: Option<&'a crate::order::row_security::PolicyDependents>,
     membership_catalog: Option<&'a pbps_model::operation::MembershipCatalog>,
+    captured: Option<&'a pbps_model::operation::Captured>,
 }
 
 impl<'a> Facts<'a> {
+    /// The bindings a connected capture read, which the dialect's effects
+    /// take in place of their lexical guess (DEC-2143.8). Plan-time only: the
+    /// order they produce is sealed in the plan, and a saved plan is never
+    /// ordered again.
+    pub fn with_captured(self, captured: &'a pbps_model::operation::Captured) -> Self {
+        Self {
+            captured: Some(captured),
+            ..self
+        }
+    }
+
     /// The dependents of every module the plan drops or rebuilds, as read.
     pub fn with_module_dependents(self, found: &'a ModuleDependents) -> Self {
         Self {
@@ -371,6 +383,8 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     facts: &Facts<'_>,
     dialect: &dyn Dialect,
 ) -> Result<Scheduled<S, D>, Refusal> {
+    let no_capture = pbps_model::operation::Captured::default();
+    let captured = facts.captured.unwrap_or(&no_capture);
     crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
         .map_err(Refusal)?;
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
@@ -491,7 +505,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }
             }
-            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+            keep_handover_dependents(&cs, declared, dialect, captured, &mut handovers)?;
         }
         moved += after_the_rebuilds(
             &mut cs,
@@ -549,7 +563,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                     .map_err(Refusal::module_passes)?,
             )
             .map_err(Refusal)?;
-            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+            keep_handover_dependents(&cs, declared, dialect, captured, &mut handovers)?;
             cs = handovers
                 .settle(cs.clone())
                 .map_err(|why| Refusal(why.describe(&cs)))?
@@ -642,6 +656,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         &cs,
         crate::order::shadow::Stage::Differ,
         None,
+        captured,
     );
     crate::order::boundaries::replay(
         &mut cs,
@@ -721,6 +736,7 @@ fn keep_handover_dependents(
     cs: &ChangeSet,
     declared: &Declarations<'_>,
     dialect: &dyn Dialect,
+    captured: &pbps_model::operation::Captured,
     handovers: &mut crate::order::Schedule,
 ) -> Result<(), Refusal> {
     use crate::order::{Schedule, edges, shadow};
@@ -757,7 +773,8 @@ fn keep_handover_dependents(
         schema: declared.schema,
         ids: declared.sources.after,
     };
-    let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
+    let effects =
+        shadow::analyse_captured(&operations, &owners, before, after, dialect, None, captured);
     if let Some((_, error)) = effects.unowned.first() {
         return Err(Refusal(error.to_string()));
     }

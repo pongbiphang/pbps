@@ -71,9 +71,19 @@ pub(crate) struct Facts<'a> {
     role_members: Option<&'a RoleMembers>,
     policy_dependents: Option<&'a crate::row_security::PolicyDependents>,
     membership_catalog: Option<&'a pbps_model::operation::MembershipCatalog>,
+    captured: Option<&'a pbps_model::operation::Captured>,
 }
 
 impl<'a> Facts<'a> {
+    /// The bindings the resolver's run captured, for the plan it ordered
+    /// (DEC-2143.8). An empty capture is no capture.
+    pub(crate) fn with_captured(self, captured: &'a pbps_model::operation::Captured) -> Self {
+        Self {
+            captured: Some(captured).filter(|captured| !captured.is_empty()),
+            ..self
+        }
+    }
+
     /// The same facts, in the form the pure schedule takes.
     fn owned(&self) -> pbps_diff::order::deployment::schedule::Facts<'a> {
         let mut read = pbps_diff::order::deployment::schedule::Facts::default();
@@ -88,6 +98,9 @@ impl<'a> Facts<'a> {
         }
         if let Some(found) = self.membership_catalog {
             read = read.with_membership_catalog(found);
+        }
+        if let Some(found) = self.captured {
+            read = read.with_captured(found);
         }
         read
     }
@@ -202,18 +215,23 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
         module_deps: declared.module_deps,
     };
     let read = facts.owned();
+    // The frozen oracle predates captured bindings and orders by the lexical
+    // guess alone, so it is compared only where no capture applies.
     #[cfg(test)]
-    let expected = oracle_schedule(
-        pbps_diff::order::propose(cs.changes().clone()),
-        declared,
-        facts,
-        dialect,
-    );
+    let expected = facts.captured.is_none().then(|| {
+        oracle_schedule(
+            pbps_diff::order::propose(cs.changes().clone()),
+            declared,
+            facts,
+            dialect,
+        )
+    });
     let actual = owned::schedule::schedule(cs, &declarations, &read, dialect)
         .map_err(|why| Refusal(why.to_string()));
     #[cfg(test)]
-    match (&actual, &expected) {
-        (Ok(actual), Ok(expected)) => {
+    match (&actual, expected.as_ref()) {
+        (_, None) => {}
+        (Ok(actual), Some(Ok(expected))) => {
             assert_eq!(actual.changes.changes(), expected.changes.changes());
             assert_eq!(
                 (actual.added, actual.split, actual.moved),
@@ -232,7 +250,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
                     .collect::<Vec<_>>()
             );
         }
-        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        (Err(actual), Some(Err(expected))) => assert_eq!(actual, expected),
         _ => panic!("canonical route and frozen schedule disagree: {actual:?} / {expected:?}"),
     }
     actual
@@ -490,6 +508,7 @@ fn oracle_schedule(
         &cs,
         pbps_diff::order::shadow::Stage::Differ,
         None,
+        &Default::default(),
     );
     Ok(OracleScheduled {
         changes: cs,

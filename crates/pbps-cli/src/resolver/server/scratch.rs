@@ -437,7 +437,9 @@ impl Run<'_> {
             &records,
             &assessment,
         )?;
-        let ordered = reconstruction.plan::<D>(base, desired, hints, extras, &surfaces)?;
+        let captured = engine::captured_bindings(&compiled, &current, base.schema, desired.schema);
+        let ordered =
+            reconstruction.plan::<D>(base, desired, hints, extras, &surfaces, &captured)?;
         let identity = Identity {
             rule: engine::reported_rule(driver)?,
             resolver_build: engine::reported_build(driver, self.key, prepared.catalog())?,
@@ -460,6 +462,7 @@ impl Run<'_> {
             compiled,
             opening_build: engine::reported_build(driver, self.key, &opening_catalog)?,
             surfaces,
+            captured,
         };
         let authorization_condition = prepared.authorization_condition(target).await?;
         let sealing = Sealing {

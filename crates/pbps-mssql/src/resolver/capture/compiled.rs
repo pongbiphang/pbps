@@ -39,6 +39,11 @@ impl CompiledCapture {
         })
     }
 
+    /// The scratch capture of the declarations, for ordering (DEC-2143.8).
+    pub fn captured(&self) -> &CapturedInputs {
+        &self.captured
+    }
+
     pub fn assess_staged(
         &self,
         target: &CapturedInputs,

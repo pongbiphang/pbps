@@ -1183,6 +1183,17 @@ impl Closing {
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         self.captured.seal_for_plan()
     }
+    /// The schema-bound callees of each declared module the scratch capture
+    /// read whole (DEC-2143.8).
+    pub(super) fn schema_bound_callees(
+        &self,
+        schema: &pbps_model::Schema,
+    ) -> std::collections::BTreeMap<
+        pbps_model::ModuleId,
+        std::collections::BTreeSet<pbps_model::ModuleId>,
+    > {
+        self.captured.captured().schema_bound_callees(schema)
+    }
 }
 
 /// The compiled scratch capture and the exact scope its opening read uses.

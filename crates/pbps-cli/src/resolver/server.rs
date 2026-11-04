@@ -138,6 +138,9 @@ struct ProducerOutcome {
     compiled: engine::CompiledCapture,
     opening_build: String,
     surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
+    /// What the run bound at creation, which ordered the plan and must order
+    /// whatever later passes reorder it. In process only (DEC-2143.8).
+    captured: pbps_model::operation::Captured,
 }
 
 /// The names of a run-owned scratch, each carrying `token` (#2410): what ties

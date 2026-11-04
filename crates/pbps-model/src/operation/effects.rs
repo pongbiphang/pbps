@@ -51,7 +51,7 @@
 //!   position.
 
 use crate::ColumnName;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     ColumnKey, Definition, Incarnation, ObjectKey, Operation, OwnerError, Owners, PartKey,
@@ -228,6 +228,30 @@ impl Effects {
             }
         }
         self
+    }
+}
+
+/// The schema-bound references of each module, as a connected capture read
+/// them from the engine rather than as the lexer guesses them (DEC-2143.8).
+///
+/// A caller present in a map has complete coverage: its callees are exactly
+/// the listed modules, and the lexical approximation is not consulted for it.
+/// A caller absent from it keeps the approximation, so a plan without a
+/// capture orders as it always did. Typed data, never a query: the dialect
+/// stays pure (like the server version `with_server_version` hands PostgreSQL).
+/// It is an input to ordering at plan time only; it is not part of a saved
+/// plan or of its evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Captured {
+    /// By module, as the target holds it now.
+    pub before: BTreeMap<crate::ModuleId, BTreeSet<crate::ModuleId>>,
+    /// By module, as the declarations compile on the scratch database.
+    pub after: BTreeMap<crate::ModuleId, BTreeSet<crate::ModuleId>>,
+}
+
+impl Captured {
+    pub fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
     }
 }
 

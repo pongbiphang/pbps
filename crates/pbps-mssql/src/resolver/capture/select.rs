@@ -53,6 +53,8 @@ pub(super) struct Selected {
     pub candidates: BTreeMap<CandidateSet, BTreeSet<ObjectIdentity>>,
     /// Modules with a runtime-bound name, and the names.
     pub runtime: BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
+    /// Each schema-bound module, and the objects the engine bound it to.
+    pub schema_bound: BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>>,
 }
 
 /// The names `scope` asks the engine to match.
@@ -436,6 +438,11 @@ impl Builder<'_> {
                 json!(module.quoted_identifier),
             );
             properties.insert("is_schema_bound".into(), json!(module.schema_bound));
+            if module.schema_bound {
+                // Present even when empty: the capture read this module's
+                // references whole, so "none" is an answer (DEC-2143.8).
+                self.result.schema_bound.entry(me.clone()).or_default();
+            }
             properties.insert("execute_as".into(), execute_as);
         }
         if let Some(base) = catalog.synonyms.get(&id) {
@@ -780,6 +787,16 @@ impl Builder<'_> {
             if policy {
                 path.push(dependency.referencing_column.to_string());
             }
+            // The object the engine bound at creation, which is what the
+            // lexer can only guess for ordering (DEC-2143.8). A column or a
+            // type is not a module a plan could tear down by name.
+            if dependency.schema_bound && target.class == class::OBJECT {
+                self.result
+                    .schema_bound
+                    .entry(me.clone())
+                    .or_default()
+                    .insert(target.clone());
+            }
             let binding = Binding {
                 node: "sys.sql_expression_dependencies".into(),
                 path,
@@ -1003,6 +1020,7 @@ pub(super) fn select(
             inputs: BTreeMap::new(),
             candidates: BTreeMap::new(),
             runtime: BTreeMap::new(),
+            schema_bound: BTreeMap::new(),
         },
     };
     // Schemas and principals are complete sets: a procedure call's candidates

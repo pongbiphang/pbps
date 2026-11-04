@@ -1664,6 +1664,7 @@ fn the_scheduled_observer_accepts_the_right_order_and_refuses_a_wrong_one() {
                 &changes,
                 stage,
                 None,
+                &Default::default(),
             );
         })
         .is_ok()

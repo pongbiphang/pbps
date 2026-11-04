@@ -688,6 +688,7 @@ impl Binding {
         hints: &Hints,
         extras: &[String],
         surfaces: &[SurfaceResolution],
+        captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<D>>, Error> {
         let version = match self {
             Self::Postgres(binding) if D::DRIVER == Driver::Postgres => {
@@ -701,8 +702,29 @@ impl Binding {
             }
         };
         let dialect = D::configured(extras, version);
-        pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
+        pbps_diff::resolver::plan_captured(base, desired, hints, surfaces, &dialect, captured)
             .map_err(|error| Error::Binding(error.to_string()))
+    }
+}
+
+/// What the run bound at creation, for ordering: the schema-bound callees of
+/// each module the capture read whole, on the target now and on the scratch
+/// database the declarations compiled on (DEC-2143.8). PostgreSQL has no
+/// such lexical guess to replace, so it brings none.
+pub(super) fn captured_bindings(
+    compiled: &CompiledCapture,
+    current: &CapturedInputs,
+    base: &pbps_model::Schema,
+    desired: &pbps_model::Schema,
+) -> pbps_model::operation::Captured {
+    match (compiled, current) {
+        (CompiledCapture::Mssql(compiled), CapturedInputs::Mssql(current)) => {
+            pbps_model::operation::Captured {
+                before: current.schema_bound_callees(base),
+                after: compiled.schema_bound_callees(desired),
+            }
+        }
+        _ => Default::default(),
     }
 }
 

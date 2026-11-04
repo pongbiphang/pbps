@@ -79,6 +79,11 @@ pub mod validate;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mssql;
 
+/// The managed modules a schema-bound caller binds. A caller the capture read
+/// has exactly the callees it reported (DEC-2143.8): the engine bound them at
+/// creation, so no name needs guessing. Any other caller keeps the lexical
+/// match below.
+///
 /// Match managed names within one snapshot. Without a connected comparison,
 /// case-only neighbours disable folding; calls never mean alias columns.
 fn schema_bound_callees(
@@ -87,7 +92,11 @@ fn schema_bound_callees(
     module: &Module,
     schema: &Schema,
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    captured: &std::collections::BTreeMap<ModuleId, std::collections::BTreeSet<ModuleId>>,
 ) -> std::collections::BTreeSet<ModuleId> {
+    if let Some(callees) = captured.get(caller) {
+        return callees.clone();
+    }
     let calls = dialect.qualified_calls(&module.definition);
     let managed: Vec<_> = schema
         .modules
@@ -329,6 +338,7 @@ impl Dialect for Mssql {
         before: pbps_model::operation::Snapshot<'_>,
         after: pbps_model::operation::Snapshot<'_>,
         catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+        captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{
@@ -353,7 +363,9 @@ impl Dialect for Mssql {
             // endpoint.
             && binding::is_schema_bound(module)
         {
-            for callee in schema_bound_callees(self, id, module, after.schema, catalog) {
+            for callee in
+                schema_bound_callees(self, id, module, after.schema, catalog, &captured.after)
+            {
                 fx.requires.push(Requirement::Is(
                     ObjectKey::Module(callee),
                     Incarnation::Final,
@@ -375,9 +387,13 @@ impl Dialect for Mssql {
         {
             let kept = replacement
                 .filter(|module| binding::is_schema_bound(module))
-                .map(|module| schema_bound_callees(self, id, module, after.schema, catalog))
+                .map(|module| {
+                    schema_bound_callees(self, id, module, after.schema, catalog, &captured.after)
+                })
                 .unwrap_or_default();
-            for callee in schema_bound_callees(self, id, old, before.schema, catalog) {
+            for callee in
+                schema_bound_callees(self, id, old, before.schema, catalog, &captured.before)
+            {
                 if !kept.contains(&callee) {
                     fx.requires
                         .push(Requirement::BeforeRewrite(ObjectKey::Module(callee)));

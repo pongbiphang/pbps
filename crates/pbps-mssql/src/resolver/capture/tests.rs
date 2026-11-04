@@ -743,6 +743,7 @@ fn skipped_children_do_not_enter_authorization_ownership_without_being_roots() {
                 ]),
                 candidates: BTreeMap::new(),
                 runtime: BTreeMap::new(),
+                schema_bound: BTreeMap::new(),
             },
             CaptureScope {
                 retained: roots,

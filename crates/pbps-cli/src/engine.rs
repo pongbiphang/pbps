@@ -4079,6 +4079,7 @@ pub async fn account_for_module_dependents<
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
+    captured: &pbps_model::operation::Captured,
     dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
 ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
@@ -4094,6 +4095,9 @@ pub async fn account_for_module_dependents<
         Some(members) => crate::dependents::schedule::Facts::default().with_role_members(members),
         None => crate::dependents::schedule::Facts::default(),
     };
+    // What the resolver's run captured orders the plan it produced, here as
+    // there: left out, this pass would rebuild the lexical guess it replaced.
+    let read = read.with_captured(captured);
     if conn.driver() != Driver::Postgres {
         let found = module_dependents(conn, &changes).await?;
         let read = read.with_module_dependents(&found);

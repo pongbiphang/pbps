@@ -1327,7 +1327,7 @@ mod stored;
 pub use stored::{MembershipCatalog, StoredColumn};
 pub mod symbolic;
 pub use effects::{
-    BaseTable, BoundInput, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot,
+    BaseTable, BoundInput, Captured, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot,
     base_table_named, baseline_bindings, baseline_keys, column_key, column_types, final_table,
     holds_unknown, module_key,
 };

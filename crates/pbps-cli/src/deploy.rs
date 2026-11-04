@@ -8509,6 +8509,13 @@ async fn plan_db_selected(
             } else {
                 None
             };
+            // What the resolver's run bound at creation orders the plan it
+            // produced; every later pass that orders again reads it too, or it
+            // would rebuild the lexical guess it replaced (DEC-2143.8).
+            let captured = resolution
+                .as_ref()
+                .map(|(_, unsealed, _)| unsealed.captured().clone())
+                .unwrap_or_default();
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
@@ -8577,6 +8584,7 @@ async fn plan_db_selected(
                 },
                 &hints.module_deps,
                 role_members.as_ref(),
+                &captured,
                 dialect.as_ref(),
                 &rediff,
             )
@@ -8656,6 +8664,7 @@ async fn plan_db_selected(
                         .or_else(|| name_facts.as_ref().map(crate::engine::NameFacts::slots))
                         .unwrap_or_default(),
                 ),
+                &captured,
             ); }
             // The observer's own gate: a release test build has `cfg(test)`
             // but no observer, so the facts are spent here too (#2089).

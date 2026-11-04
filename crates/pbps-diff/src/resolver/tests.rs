@@ -343,6 +343,7 @@ mod unowned_steps {
                 ids: &after_ids,
             },
             &Candidates,
+            &Default::default(),
         );
         (changes, schedule)
     }
@@ -2653,6 +2654,7 @@ mod generated_surface_coverage {
                 ids: &after_ids,
             },
             &pbps_dialect::MinimalDialect,
+            &Default::default(),
         );
         let edges = schedule.constraints();
         let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);

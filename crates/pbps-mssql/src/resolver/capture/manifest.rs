@@ -21,6 +21,7 @@ pub struct CapturedInputs {
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
     pub(super) candidates: BTreeMap<CandidateSet, BTreeSet<ObjectIdentity>>,
     pub(super) runtime: BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
+    schema_bound: BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>>,
 }
 
 impl CapturedInputs {
@@ -110,7 +111,50 @@ impl CapturedInputs {
             inputs: selected.inputs,
             candidates: selected.candidates,
             runtime: selected.runtime,
+            schema_bound: selected.schema_bound,
         }
+    }
+
+    /// Each schema-bound module the capture read, and the objects the engine
+    /// bound it to. Not sealed and not compared: it feeds ordering at plan
+    /// time only (DEC-2143.8).
+    pub fn schema_bound(&self) -> &BTreeMap<ObjectIdentity, BTreeSet<ObjectIdentity>> {
+        &self.schema_bound
+    }
+
+    /// [`Self::schema_bound`] by the modules `schema` declares: a caller and
+    /// its callees by their names, so ordering can use them without the
+    /// capture's identities (DEC-2143.8). A module this capture did not read
+    /// whole is absent, and orders by the lexical match as before; a callee
+    /// that is not a managed module is no edge a plan could order.
+    pub fn schema_bound_callees(
+        &self,
+        schema: &pbps_model::Schema,
+    ) -> BTreeMap<pbps_model::ModuleId, BTreeSet<pbps_model::ModuleId>> {
+        let named: BTreeMap<_, _> = schema
+            .modules
+            .keys()
+            .filter_map(|id| {
+                let name = id.referenced_name()?;
+                Some(((name.schema, name.name), id))
+            })
+            .collect();
+        let module = |object: &ObjectIdentity| match (object.class.as_str(), object.name.as_slice())
+        {
+            (super::class::OBJECT, [schema, name]) => {
+                named.get(&(schema.clone(), name.clone())).copied().cloned()
+            }
+            _ => None,
+        };
+        self.schema_bound
+            .iter()
+            .filter_map(|(caller, callees)| {
+                Some((
+                    module(caller)?,
+                    callees.iter().filter_map(module).collect::<BTreeSet<_>>(),
+                ))
+            })
+            .collect()
     }
 
     pub fn scope(&self) -> &CaptureScope {
