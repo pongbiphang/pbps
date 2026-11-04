@@ -48,6 +48,7 @@ pub mod resolver;
 pub mod rows;
 pub mod state;
 pub mod temporal;
+pub mod test_scratch;
 pub mod types;
 pub mod validate;
 

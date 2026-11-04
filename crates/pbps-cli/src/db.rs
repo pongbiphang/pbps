@@ -55,11 +55,21 @@ impl Target {
         connection: String,
         infrastructure_roles: Vec<pbps_model::RoleName>,
     ) -> Self {
+        Self::test_owned_with_driver(pbps_db::Driver::Postgres, connection, infrastructure_roles)
+    }
+
+    /// The owned scratch of whichever engine the run started. Kept beside
+    /// [`Target::test_owned`] so a PostgreSQL caller is unchanged.
+    pub(crate) fn test_owned_with_driver(
+        driver: pbps_db::Driver,
+        connection: String,
+        infrastructure_roles: Vec<pbps_model::RoleName>,
+    ) -> Self {
         Self {
             label: "owned test scratch".into(),
             connection,
             environment: Some("test".into()),
-            driver: pbps_db::Driver::Postgres,
+            driver,
             infrastructure_roles,
         }
     }

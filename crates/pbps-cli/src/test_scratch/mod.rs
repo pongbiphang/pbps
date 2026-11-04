@@ -261,6 +261,7 @@ impl ContainerOwner for RunOwner<'_, '_> {
 pub(crate) struct TestScratch<'d> {
     held: Held,
     journal: Journal<'d>,
+    driver: Driver,
 }
 
 impl<'d> TestScratch<'d> {
@@ -373,7 +374,11 @@ impl<'d> TestScratch<'d> {
             None => start.await,
         };
         match started {
-            Ok(held) => Ok(TestScratch { held, journal }),
+            Ok(held) => Ok(TestScratch {
+                held,
+                journal,
+                driver,
+            }),
             Err(error) => {
                 // A start that failed leaves a record; it is deleted only once
                 // the runtime confirms nothing of the run exists.
@@ -400,6 +405,11 @@ impl<'d> TestScratch<'d> {
                 }
             }
         }
+    }
+
+    /// Which engine the owned server runs; the caller chose it at `start`.
+    pub(crate) fn driver(&self) -> Driver {
+        self.driver
     }
 
     /// The superuser connection to the owned server.

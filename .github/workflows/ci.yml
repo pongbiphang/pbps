@@ -662,7 +662,7 @@ jobs:
       # is that the probes are answered under the settings the statements they
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
-      - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 --skip engine::mssql_live_tests
+      - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 --skip engine::mssql_live_tests --skip plan_test::session::mssql_tests --skip test_scratch::tests::live_mssql
         if: matrix.suite == 'dialect'
       # The resolver end to end (#1672): no root, the three servers above,
       # and the runner's own Docker for a Docker scratch (#1674). The filter
@@ -809,6 +809,18 @@ jobs:
           echo "$out"
           echo "$out" | grep -qE '^test result: ok\. 3 passed' || {
             echo "expected the three Docker SQL Server tests to run and pass" >&2
+            exit 1
+          }
+      # `pbps test` owns its SQL Server containers (#1165): the session on the
+      # pinned image and the run record's lifecycle. Asserted, as above.
+      - name: pbps test on an owned SQL Server
+        run: |
+          out=$(cargo test -p pbps-cli --bin pbps -- \
+                  --ignored --test-threads=1 plan_test::session::mssql_tests \
+                  test_scratch::tests::live_mssql 2>&1)
+          echo "$out"
+          echo "$out" | grep -qE '^test result: ok\. 4 passed' || {
+            echo "expected the four owned SQL Server tests to run and pass" >&2
             exit 1
           }
 

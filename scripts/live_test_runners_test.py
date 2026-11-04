@@ -1740,7 +1740,8 @@ elif command[0] != 'sleep':
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-pg", "--lib", "--", "--ignored", "--test-threads=1"],
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
             ["python3", "scripts/live-transport.py", "pg"],
-            ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1", "--skip", "engine::mssql_live_tests"],
+            ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1", "--skip", "engine::mssql_live_tests",
+             "--skip", "plan_test::session::mssql_tests", "--skip", "test_scratch::tests::live_mssql"],
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::scratch::live_tests"],
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])
