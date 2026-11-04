@@ -150,6 +150,13 @@ fn with(path: &str, text: String) -> BTreeMap<String, String> {
     t
 }
 
+fn bad_name(err: TreeError) -> String {
+    let TreeError::BadName { name, .. } = err else {
+        panic!("not a bad name: {err:?}");
+    };
+    name
+}
+
 fn refuses(path: &str, text: String) -> TreeError {
     assemble(&with(path, text)).unwrap_err()
 }
@@ -695,17 +702,81 @@ fn the_assembled_mapping_must_still_be_valid() {
 }
 
 #[test]
-fn a_name_that_does_not_parse_is_refused() {
+fn a_name_the_mapping_cannot_read_back_is_refused_wherever_the_file_stores_one() {
     let t = tree();
-    let bad = edit(
-        &t["dbo/customer.json"],
-        "\"table\": \"dbo.customer\"",
-        "\"table\": \"no_schema\"",
+    let bad = |path: &str, from: &str, to: &str| bad_name(refuses(path, edit(&t[path], from, to)));
+    let customer = "dbo/customer.json";
+    // The table in the header, with too many or too few parts or an empty one.
+    assert_eq!(
+        bad(
+            customer,
+            "\"table\": \"dbo.customer\"",
+            "\"table\": \"no_schema\""
+        ),
+        "no_schema"
     );
-    assert!(matches!(
-        refuses("dbo/customer.json", bad),
-        TreeError::Malformed { message, .. } if message.starts_with("name:")
-    ));
+    assert_eq!(
+        bad(
+            customer,
+            "\"table\": \"dbo.customer\"",
+            "\"table\": \"dbo.\""
+        ),
+        "dbo."
+    );
+    // A live column: empty, or holding the separator.
+    assert_eq!(bad(customer, "\"full_name\"", "\"\""), "");
+    assert_eq!(bad(customer, "\"full_name\"", "\"a.b\""), "a.b");
+    // A retired column or partition remembers a name of the same shape.
+    assert_eq!(
+        bad(
+            customer,
+            "\"dbo.customer.national_id\"",
+            "\"dbo.customer.a.b\""
+        ),
+        "dbo.customer.a.b"
+    );
+    assert_eq!(
+        bad("app/events.json", "\"app.events_2026_01\"", "\"app.a.b\""),
+        "app.a.b"
+    );
+    assert_eq!(
+        bad("app/events.json", "\"app.events_2025_12\"", "\"events\""),
+        "events"
+    );
+    // The names of the other kinds.
+    assert_eq!(bad("roles/app_reader.json", "\"app_reader\"", "\"\""), "");
+    assert_eq!(bad("extensions/pgcrypto.json", "\"pgcrypto\"", "\"\""), "");
+    assert_eq!(
+        bad("types/status.json", "\"dbo.status\"", "\"status\""),
+        "status"
+    );
+    // The `was` of a dropped object, and of a retired record, is stored too.
+    let was = |path: &str, from: &str, to: &str| bad_name(refuses(path, edit(&t[path], from, to)));
+    assert_eq!(
+        was(
+            "dbo/legacy.json",
+            "\"was\": \"dbo.legacy\"",
+            "\"was\": \"legacy\""
+        ),
+        "legacy"
+    );
+    assert_eq!(
+        was(
+            "roles/old_role.json",
+            "\"was\": \"old_role\"",
+            "\"was\": \"\""
+        ),
+        ""
+    );
+    // A dropped table keeps its last name in the header, which must parse too.
+    assert_eq!(
+        bad(
+            "dbo/legacy.json",
+            "\"table\": \"dbo.legacy\"",
+            "\"table\": \"legacy\""
+        ),
+        "legacy"
+    );
 }
 
 // ---- splitter refusals -------------------------------------------------
@@ -749,6 +820,33 @@ fn two_objects_cannot_share_a_path() {
     assert!(matches!(
         split(&ids, &p).unwrap_err(),
         TreeError::PathCollision { .. }
+    ));
+}
+
+#[test]
+fn a_name_the_mapping_cannot_read_back_is_not_written() {
+    for (column, why) in [("a.b", "separator"), ("", "empty")] {
+        let (mut ids, p) = sample();
+        ids.columns.insert(
+            uid("c_aaaaa2"),
+            ColumnRef::new("dbo.customer".parse().unwrap(), column),
+        );
+        assert!(
+            matches!(split(&ids, &p).unwrap_err(), TreeError::BadName { name, .. } if name == column),
+            "{why}"
+        );
+    }
+    let (mut ids, p) = sample();
+    ids.tombstones.get_mut(&uid("r_bbbbbb")).unwrap().was = String::new();
+    assert!(matches!(
+        split(&ids, &p).unwrap_err(),
+        TreeError::BadName { .. }
+    ));
+    let (mut ids, p) = sample();
+    ids.roles.insert(uid("r_aaaaaa"), RoleName::new(""));
+    assert!(matches!(
+        split(&ids, &p).unwrap_err(),
+        TreeError::BadName { .. }
     ));
 }
 

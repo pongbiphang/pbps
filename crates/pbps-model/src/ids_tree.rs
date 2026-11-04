@@ -63,6 +63,15 @@ pub enum TreeError {
         section: &'static str,
         uid: Uid,
     },
+    #[error(
+        "{path}: `{}` is not a name the identity mapping can read back: {why}",
+        crate::escape::Escaped(.name)
+    )]
+    BadName {
+        path: String,
+        name: String,
+        why: String,
+    },
     #[error("{0}")]
     Ids(IdsError),
     #[error("no identity file is placed for {uid}")]
@@ -435,6 +444,7 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
             uid: file.uid.clone(),
         });
     }
+    check_names(path, file)?;
     let Body::Table(t) = &file.body else {
         return Ok(());
     };
@@ -477,6 +487,68 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
         .find(|(_, r)| r.replacement_root != file.uid)
     {
         return Err(misplaced("rebuilds", uid));
+    }
+    Ok(())
+}
+
+/// Every name the file stores must read back through the unchanged
+/// `IdsFile` JSON, which joins a column as `schema.table.column` and splits it
+/// on `.`. A local column name that is empty or holds a `.` serializes into a
+/// string `ColumnRef::from_str` refuses, so the mapping would validate here and
+/// then fail in a plan or snapshot that embeds it. The writer runs this too:
+/// `IdsFile` does not stop `ColumnRef::new` from building such a name.
+fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
+    let bad = |name: &str, why: &dyn std::fmt::Display| TreeError::BadName {
+        path: path.to_owned(),
+        name: name.to_owned(),
+        why: why.to_string(),
+    };
+    let table = |name: &str| {
+        name.parse::<TableName>()
+            .map(drop)
+            .map_err(|e| bad(name, &e))
+    };
+    let local = |name: &str| {
+        if name.is_empty() {
+            return Err(bad(name, &"a name cannot be empty"));
+        }
+        crate::name::check_segment(name).map_err(|e| bad(name, &e))
+    };
+    // The `was` of a dropped object is read back as the same kind of name.
+    if let Some(tomb) = &file.dropped {
+        match &file.body {
+            Body::Table(_) => table(&tomb.was)?,
+            Body::Type(_) => tomb
+                .was
+                .parse::<TypeRef>()
+                .map(drop)
+                .map_err(|e| bad(&tomb.was, &e))?,
+            Body::Role(_) | Body::Extension(_) => local(&tomb.was)?,
+        }
+    }
+    match &file.body {
+        Body::Role(n) | Body::Extension(n) => local(n)?,
+        Body::Type(n) => n.parse::<TypeRef>().map(drop).map_err(|e| bad(n, &e))?,
+        Body::Table(t) => {
+            table(&t.table)?;
+            for (_, rec) in &t.columns {
+                match rec {
+                    Rec::Live(name) => local(name)?,
+                    Rec::Dead(tomb) => {
+                        tomb.was
+                            .parse::<ColumnRef>()
+                            .map(drop)
+                            .map_err(|e| bad(&tomb.was, &e))?;
+                    }
+                }
+            }
+            for (_, rec) in &t.partitions {
+                match rec {
+                    Rec::Live(name) => table(name)?,
+                    Rec::Dead(tomb) => table(&tomb.was)?,
+                }
+            }
+        }
     }
     Ok(())
 }
