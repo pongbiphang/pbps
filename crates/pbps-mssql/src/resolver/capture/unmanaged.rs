@@ -109,7 +109,7 @@ pub async fn unmanaged_rebinds(
     let modules = super::capture(
         target,
         &CaptureScope {
-            retained: referrers,
+            retained: referrers.clone(),
             candidates: BTreeSet::new(),
         },
         key,
@@ -128,6 +128,12 @@ pub async fn unmanaged_rebinds(
     .await?;
     let mut found = BTreeSet::new();
     for (module, paths) in modules.lookup_paths() {
+        // The capture follows id-bound dependencies, so it also reads modules
+        // the selected ones call, among them managed ones, whose own report is
+        // the assessment's. Only the selected modules are asked.
+        if !referrers.contains(&module) {
+            continue;
+        }
         for path in paths {
             if let Some(arrival) = super::select::arrival_on_path(&path, &on_target, &on_scratch)? {
                 found.insert(Rebound {

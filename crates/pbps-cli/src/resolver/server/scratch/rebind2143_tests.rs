@@ -502,3 +502,51 @@ async fn mssql_a_managed_module_whose_name_resolves_earlier_than_the_arrival_is_
     }
     both(case).await;
 }
+
+/// The capture of an unmanaged module follows what it calls, so a managed
+/// module it calls is read too; that module's rebind is the assessment's to
+/// report, not a reason to refuse the unmanaged one, whose own names do not
+/// move.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_a_managed_module_an_unmanaged_one_calls_is_not_refused_as_unmanaged() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(
+                target,
+                &[
+                    "CREATE SCHEMA app2143;",
+                    "CREATE TABLE app2143.thing2143(id int NOT NULL);",
+                    "CREATE PROCEDURE dbo.worker2143 AS SELECT 1 AS id FROM ghost2143;",
+                    "CREATE PROCEDURE app2143.caller2143 AS EXEC dbo.worker2143; \
+                     SELECT 1 AS id FROM thing2143;",
+                ],
+            )
+            .await;
+            let mut declared = declared(&[module(
+                ModuleKind::Procedure,
+                "dbo.worker2143",
+                "AS SELECT 1 AS id FROM ghost2143",
+            )]);
+            declared.base = declared.desired.clone();
+            creates(&mut declared, "dbo.thing2143");
+            creates(&mut declared, "dbo.ghost2143");
+            let (plan, _) = declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the unmanaged caller does not move: {error}"));
+            assert!(
+                plan.evidence
+                    .qualification()
+                    .limitations
+                    .keys()
+                    .any(|name| name.raw() == "binding-change:dbo.worker2143"),
+                "{:?}",
+                plan.evidence.qualification().limitations
+            );
+        })
+    }
+    both(case).await;
+}
