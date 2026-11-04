@@ -5946,10 +5946,14 @@ a PostgreSQL plan keep the lexical match, so none of them changes.
 when the plan is made and sealed in it; `apply`, `explain` and the evidence
 reader never order a saved plan again, so they need no map and the sealed
 format is unchanged (no schema-set, plan or state number). The map does have to
-reach every pass that orders the plan after the resolver: the dependents
-schedule that `plan --db` runs on the resolver's order (`Facts::with_captured`),
-and the debug observer that judges the final order, which would otherwise read
-the lexical edges back into a plan ordered without them. `rehearsal` orders a
+reach every pass that orders the plan after the resolver. The plan carries it
+(`PlanningPlan::with_captured`, copied wherever the plan is rebuilt, like its
+annotations), so the rewrite settlements, `catalog_requirements` and the
+dependents schedule `plan --db` runs on the resolver's order read the same
+bindings without each being handed them. Only the debug observer judges a
+finished `ChangeSet`, so it is given them from the run. A pass that left them
+out would read the lexical edges back into a plan ordered without them, which
+the review of #2680 found in `catalog_requirements`. `rehearsal` orders a
 baseline with no resolver, and the frozen `dependents::schedule` oracle orders
 by the lexical match alone, so it is compared only where no capture applies.
 

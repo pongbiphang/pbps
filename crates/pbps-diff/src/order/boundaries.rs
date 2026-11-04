@@ -436,7 +436,7 @@ pub(super) fn replay<S>(
         stored,
         true,
         &annotations,
-        &Default::default(),
+        plan.captured(),
     );
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());

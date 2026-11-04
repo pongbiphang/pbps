@@ -735,7 +735,6 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
         },
         &Default::default(),
         None,
-        &Default::default(),
         &pbps_pg::Postgres::new(),
         &|_| panic!("the policy-owner drop needs no module rediff"),
     )
@@ -920,7 +919,6 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                 },
                 &Default::default(),
                 None,
-                &Default::default(),
                 &pbps_pg::Postgres::new(),
                 &|_| panic!("no retained module needs a rediff"),
             )

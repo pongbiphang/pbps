@@ -231,6 +231,12 @@ pub fn plan_operations_captured<D: Dialect + ?Sized>(
         dialect,
         module_edits,
     )?;
+    // The plan carries what ordered it, so every pass that reads its effects
+    // again (the rewrites, the dependents schedule) reads the same bindings.
+    let ordered = Ordered {
+        changes: ordered.changes.with_captured(captured),
+        ..ordered
+    };
     #[cfg(any(test, debug_assertions))]
     crate::order::shadow::observe_captured(
         base,

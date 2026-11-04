@@ -8509,9 +8509,11 @@ async fn plan_db_selected(
             } else {
                 None
             };
-            // What the resolver's run bound at creation orders the plan it
-            // produced; every later pass that orders again reads it too, or it
-            // would rebuild the lexical guess it replaced (DEC-2143.8).
+            // The plan carries what the resolver's run bound at creation, so
+            // every pass that orders it again reads the same bindings. Only the
+            // observer below judges the finished `ChangeSet`, which does not
+            // (DEC-2143.8).
+            #[cfg(debug_assertions)]
             let captured = resolution
                 .as_ref()
                 .map(|(_, unsealed, _)| unsealed.captured().clone())
@@ -8584,7 +8586,6 @@ async fn plan_db_selected(
                 },
                 &hints.module_deps,
                 role_members.as_ref(),
-                &captured,
                 dialect.as_ref(),
                 &rediff,
             )

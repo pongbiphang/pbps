@@ -150,7 +150,7 @@ pub(super) fn analyse_planning<S>(
         stored,
         !plan.boundaries.is_empty(),
         annotations,
-        &Default::default(),
+        plan.captured(),
     )
 }
 

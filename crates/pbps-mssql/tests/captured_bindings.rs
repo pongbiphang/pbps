@@ -175,3 +175,55 @@ fn a_captured_callee_the_text_does_not_name_is_still_waited_for() {
     let lexical = plan(&before, &after, &Captured::default()).unwrap();
     assert_eq!(lexical.len(), 2);
 }
+
+/// The passes that settle the plan again after the resolver, the catalog-backed
+/// requirements, read the plan's effects a second
+/// time. The plan carries the capture that ordered it, so they read the same
+/// bindings and do not bring the lexical edge back (review of #2680).
+#[test]
+fn the_passes_after_the_resolver_read_the_bindings_that_ordered_the_plan() {
+    let (before, after) = alias_column();
+    let ids = IdsFile::default();
+    let sides = || {
+        (
+            pbps_diff::Side {
+                schema: &before,
+                ids: &ids,
+            },
+            pbps_diff::Side {
+                schema: &after,
+                ids: &ids,
+            },
+        )
+    };
+    let ordered = |captured: &Captured| {
+        let (b, a) = sides();
+        pbps_diff::resolver::plan_captured(
+            b,
+            a,
+            &Default::default(),
+            &observed(&before),
+            &Mssql,
+            captured,
+        )
+    };
+    let settle = |plan: pbps_diff::order::CanonicalPlan<Mssql>| {
+        let (b, a) = sides();
+        let catalog = pbps_dialect::slots::CatalogFacts::default();
+        pbps_diff::order::catalog_requirements(
+            plan,
+            b,
+            a,
+            &Mssql,
+            &Default::default(),
+            &catalog,
+            &[],
+        )
+        .map(|_| ())
+    };
+    let captured = ordered(&captured_alias_column()).expect("planned from the capture");
+    assert_eq!(settle(captured.changes), Ok(()));
+    // A plan that was not ordered from a capture reads the lexical edges on
+    // every pass, as it always did.
+    assert!(ordered(&Captured::default()).is_err());
+}

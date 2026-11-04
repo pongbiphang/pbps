@@ -71,19 +71,9 @@ pub(crate) struct Facts<'a> {
     role_members: Option<&'a RoleMembers>,
     policy_dependents: Option<&'a crate::row_security::PolicyDependents>,
     membership_catalog: Option<&'a pbps_model::operation::MembershipCatalog>,
-    captured: Option<&'a pbps_model::operation::Captured>,
 }
 
 impl<'a> Facts<'a> {
-    /// The bindings the resolver's run captured, for the plan it ordered
-    /// (DEC-2143.8). An empty capture is no capture.
-    pub(crate) fn with_captured(self, captured: &'a pbps_model::operation::Captured) -> Self {
-        Self {
-            captured: Some(captured).filter(|captured| !captured.is_empty()),
-            ..self
-        }
-    }
-
     /// The same facts, in the form the pure schedule takes.
     fn owned(&self) -> pbps_diff::order::deployment::schedule::Facts<'a> {
         let mut read = pbps_diff::order::deployment::schedule::Facts::default();
@@ -98,9 +88,6 @@ impl<'a> Facts<'a> {
         }
         if let Some(found) = self.membership_catalog {
             read = read.with_membership_catalog(found);
-        }
-        if let Some(found) = self.captured {
-            read = read.with_captured(found);
         }
         read
     }
@@ -218,7 +205,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
     // The frozen oracle predates captured bindings and orders by the lexical
     // guess alone, so it is compared only where no capture applies.
     #[cfg(test)]
-    let expected = facts.captured.is_none().then(|| {
+    let expected = (!cs.has_captured()).then(|| {
         oracle_schedule(
             pbps_diff::order::propose(cs.changes().clone()),
             declared,
