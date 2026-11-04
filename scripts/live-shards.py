@@ -579,6 +579,11 @@ def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
                         elif flake is None or counts[name] > MAX_FLAKE_FAILURES:
                             refused.append(f"{suite}: {name}")
                         else:
+                            # The selected output can predate a targeted attempt
+                            # in another resume chain or worktree (DEC-2651.1).
+                            require(not RERUN.claimed(ROOT, tree, cargo, name),
+                                    f"targeted rerun already attempted on this head: {name}; "
+                                    "fix it and run a new full gate")
                             waived.append(flake)
                     elif row["valid"]:
                         ok[name] = {"status": "ok", "seconds": result["seconds"], "run": manifest["run_id"]}

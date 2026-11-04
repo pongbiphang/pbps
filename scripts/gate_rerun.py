@@ -142,18 +142,32 @@ def load(path, root, tree, inputs):
     return entries
 
 
+def claim_path(root, tree, cargo, name):
+    directory = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    key = hashlib.sha256(identity(cargo, name).encode()).hexdigest()
+    return directory / "pbps-targeted-reruns" / tree / (key + ".json")
+
+
+def claimed(root, tree, cargo, name):
+    # Creation consumes the allowance even if killed before writing evidence.
+    # lstat also treats an empty claim or a dangling symlink as consumed; only
+    # absence permits a retry, and other I/O errors must refuse the resume.
+    try:
+        claim_path(root, tree, cargo, name).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def claim(root, tree, entries):
     """Reserve before starting; resuming an older output cannot mint a retry.
 
     Keep the ledger in the common Git directory so other worktrees and sibling
     resume chains share the allowance. A killed attempt consumes it as well.
     """
-    directory = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    directory = directory / "pbps-targeted-reruns" / tree
-    directory.mkdir(parents=True, exist_ok=True)
     for cargo, name in sorted(entries):
-        key = hashlib.sha256(identity(cargo, name).encode()).hexdigest()
-        path = directory / (key + ".json")
+        path = claim_path(root, tree, cargo, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with path.open("x") as output:
                 json.dump(entries[(cargo, name)], output, indent=2)

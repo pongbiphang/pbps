@@ -365,6 +365,40 @@ class IndependentFailures(Harness):
         result, _ = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
         self.assertIn("already attempted", result.stderr)
 
+    def test_a_later_register_cannot_bypass_a_targeted_attempt_in_the_shared_ledger(self):
+        for suite, lost in (("pg", False), ("pg", True), ("python", False)):
+            with self.subTest(suite=suite, lost=lost):
+                # Each case owns a distinct tree and starts with no registration.
+                self.setUp()
+                with (self.repo / "notes.md").open("a") as out:
+                    out.write(f"{suite} {lost}\n")
+                git(self.repo, "commit", "-q", "-am", "distinct attempted head")
+                head = git(self.repo, "rev-parse", "HEAD")
+                name = "scripts/check_demo.py" if suite == "python" else "a05"
+                cargo = ["python", name] if suite == "python" else CARGO
+                failing = {"env": {"FAKE_PY_FAIL": "1"}} if suite == "python" else {"fail": [name]}
+                _, before = self.drive(suite=suite, shards=1, check=1, **failing)
+                evidence = self.evidence(before, name, python=suite == "python")
+                _, after = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence),
+                    suite=suite, shards=1, check=1, **({"die": name} if lost else failing))
+                self.assertEqual(len(self.summary(after)["run"]["targeted"]), 1)
+                self.assertEqual(self.summary(before)["run"].get("targeted", []), [])
+                # Publish the later register on origin/master while keeping the
+                # PR tree and original output unchanged, with no rerun evidence.
+                self.set_register([{"test": name, "cargo": cargo, "issue": 2650,
+                                    "expires": Resume.soon(self)}])
+                register = git(self.repo, "rev-parse", "HEAD")
+                git(self.repo, "reset", "--hard", head)
+                git(self.repo, "update-ref", "refs/remotes/origin/master", register)
+                try:
+                    result, refused = self.drive("--resume", str(before), "--flakes-ref", "origin/master",
+                                                 suite=suite, shards=1, check=1)
+                    self.assertIn("targeted rerun already attempted", result.stderr)
+                    self.assertFalse(refused.exists())
+                    self.assertFalse(self.trace.exists(), "a refused waiver must execute no tests")
+                finally:
+                    git(self.repo, "update-ref", "refs/remotes/origin/master", self.master)
+
     def test_a_lost_targeted_rerun_cannot_get_another_attempt(self):
         _, before = self.drive(fail=["a05"], shards=1, check=1)
         evidence = self.evidence(before)
