@@ -284,7 +284,8 @@ pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::
     )
 }
 
-/// A plan that creates or drops a package and also needs the resolver (DEC-2447.6, .8).
+/// A plan that creates, drops or updates a package and also needs the resolver
+/// (DEC-2447.6, .8, .10).
 /// The resolver reconstructs the desired namespace on a scratch that does not
 /// hold a package the target lacks, so it cannot seal evidence over the create;
 /// measured, it failed late with an internal error. The two plans taken in
@@ -310,7 +311,33 @@ fn package_created(request: &Request<'_>) -> Option<crate::output::Finding> {
             .map(|n| format!("`{}`", n.shown()))
             .collect();
         if dropped.is_empty() {
-            return None;
+            // An update: the scratch holds the version the target does, not the
+            // one the plan leaves (DEC-2447.10).
+            let updated: Vec<_> = (want.iter())
+                .filter(|(n, to)| {
+                    base.ids.extension_uid(n).is_some()
+                        && base
+                            .schema
+                            .extensions
+                            .get(*n)
+                            .is_some_and(|f| f.version != to.version)
+                })
+                .map(|(n, _)| format!("`{}`", n.shown()))
+                .collect();
+            if updated.is_empty() {
+                return None;
+            }
+            return Some(gated(
+                request.selection,
+                request.assessment,
+                &format!(
+                    "this plan also updates extension {}, and the resolver cannot describe a \
+                     package whose scratch holds another version than the plan leaves",
+                    updated.join(", ")
+                ),
+                "Plan the update alone first and apply it. Then raise the version in the \
+                 scratch's externals file (DEC-2447.2) and plan the rest.",
+            ));
         }
         return Some(gated(
             request.selection,
@@ -352,7 +379,7 @@ pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
     entry: &mut Entry<'_>,
 ) -> Result<pbps_cli::resolver::server::Unsealed<D>, Refused> {
     // The only way into a resolver run, so this is the one place a package
-    // create or drop is turned away: before the key is read or a scratch is touched.
+    // create, drop or update is turned away: before the key is read or a scratch is touched.
     if let Some(finding) = package_created(request) {
         return Err(Refused::Finding(finding));
     }

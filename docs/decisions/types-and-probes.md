@@ -4956,3 +4956,98 @@ of `run_probes_observed` are skipped with the notice that apply checks them
 (`Admission::deferring`, `relied_since`). Apply evaluates them after the
 approval, through the approved set. Expressions admitted by owner trust or tier 1
 are evaluated at plan time as before.
+
+<a id="dec-2447-10"></a>
+
+**DEC-2447.10. A package is updated by an `ALTER EXTENSION UPDATE TO` that is rehearsed from the version the target holds, sealed before and after, and proven to lose nothing.**
+
+A declaration that holds an `e_` identity at another version than the target, in
+the same schema, is `Change::UpdateExtension { uid, name, from, to, requires,
+releases }`, emitted as `ALTER EXTENSION name UPDATE TO 'v'` and nothing else:
+the version is always named, so no default is chosen, and a version with no path
+is the engine's refusal, not a downgrade pbps guesses or a drop and recreate. The
+update scripts are code pbps did not write, and no version path is a promise
+about the data they touch, so it carries `extension-code` **and** `destructive`
+(a trusted package is not made additive by its flag). Plan format is **63**
+(62 belongs to another change); state and ids are unchanged, because the schema
+and version were already in the state and the identity is kept.
+
+Measured on PostgreSQL 16.15 and 18.6 (identical on both): a real update keeps
+the extension and every member function's identity in place for citext and
+pgcrypto, but can **retire and add members**: hstore 1.4 to 1.8 adds three and
+removes two, and citext 1.4 to 1.6 adds twelve, with a user table, a GIN index
+and a view over it still standing. A path can end at a version that has no install
+script (hstore 1.1 to 1.3), which is why installability is read from
+`pg_available_extension_versions` and the path from `pg_extension_update_paths`,
+which raises 0A000 for a package the server does not list at all (read as no
+path). `UPDATE TO` needs ownership of the package ("must be owner of extension"
+for a stranger and a member that does not inherit), and, for a control file that
+asks for a superuser, what an install needs: `CREATE` on the database for a
+trusted one, a superuser for an untrusted one (42501 otherwise); one rule serves
+both statements. An update script that drops a member without `CASCADE` while a
+default uses it fails inside the statement (2BP01); with `CASCADE` it silently
+deletes the dependent default, which the engine does not refuse. A version whose
+control file requires a package that is not installed fails ("required extension
+is not installed") and passes once that package is created earlier in the same
+transaction. A member the script adds under a name an object holds fails
+(42723) and rolls back.
+
+The plan is **rehearsed**, always, as a create is and for the same reason: the
+members an update adds or retires are known only from an engine that ran the
+scripts. The scratch must hold the package at the version the **target** holds
+now, because installing the final version would not rehearse the transition: the
+externals file installs it (DEC-2447.2), the apply of the update is followed by
+raising the file to the new version, and until then every plan fails the exact
+scratch check by name and says to provision exactly that version. pbps never
+installs a package on the scratch itself. The replay runs the real update and
+reads the manifest afterwards; an update with no scratch, with the rehearsal off,
+or offline is refused by package name, and the scratch must also list the target
+version. A package that also changes schema is refused (`together with SET
+SCHEMA`: update in one plan, move in the next), and a schema change alone keeps
+its refusal.
+
+The plan **seals** (`Plan::extension_changes`, one `ExtensionChangePin { uid,
+name, from, to, path, before, after }` per update, in the checksum): the target's
+manifest at plan time, the rehearsal's manifest after the update, and the versions
+the engine reports. Admission demands one pin per update and the converse, that
+`from`, `to`, both manifests, the identity and the path (starting at `from`,
+ending at `to`) agree, and that a prerequisite is created by the same plan. A
+member that the declarations also manage is refused after the rehearsal, before
+the seal (the create's rule, DEC-2447.7); a retired member that a **managed**
+module uses fails the rehearsal itself, where the scratch holds the managed
+objects, and an unmanaged dependent is covered by the apply below. Planning and
+the apply's opening ask the role and the path with one set of sentences. In the
+statement's own transaction (staged runs too): **before** it the package stands
+as `from`, the live manifest equals the sealed `before`, the engine still walks
+the sealed path, and what depends on the package from outside it (normal
+dependents of any member, and `DEPENDS ON EXTENSION` marks) is remembered in a
+temporary table that ends with the transaction; **after** it the manifest equals
+the sealed `after` and **every remembered object still exists**
+(`pg_describe_object` is NULL for a vanished one, measured), otherwise the update
+is rolled back and nothing is recorded. The closing guard allows the package
+only at `from` or `to` while the plan runs and at `to` at the close.
+
+Order is by facts. An update shares class 7 with the creates, waits for each
+package of the plan that **any version on its path** requires (measured on 16.15
+and 18.6: the engine reads each version's control file, so a middle version's
+prerequisite is needed although the last one's is not; `path_requires` is the one
+function that feeds both the check and the edge), ranked as a create's
+prerequisite (`Is(Extension, Final)`), and for **every** module the plan drops that depends
+on a member of the package (`Absent`, mapped with the members' module addresses of
+DEC-2447.8): a superset of what the script retires, which is known only after the
+rehearsal, and dropping a consumer first is never wrong. It claims no member
+name (DEC-2447.7): a collision with an unmanaged object is the engine's refusal
+inside the rolled-back transaction. **`moves_bindings` stays `false`** and a plan
+that also needs the resolver is refused by name before it runs, as for a create
+and a drop (`resolution::package_changed`): the scratch holds the version the
+target holds, not the one the plan leaves.
+
+All 41 `catalog_change!()` arms (40, and `resolver/scope.rs`, converted by B2
+after the refactor) were read for an update, and all join, as for a drop, none
+reads a table, column, row, constraint or existing binding, and SQL Server never
+receives the change (the differ refuses packages there and the emitter names the
+extension). Limits, stated: an update that retires a member that a **kept**
+managed object uses is refused by the rehearsal's own statement error, not a
+named finding; carrying a name collision through an edge needs a rehearsal before
+the order is decided; version strings are never ordered; relocation (SET SCHEMA)
+and the combined plan are the next slice.

@@ -285,9 +285,9 @@ pub struct Findings {
     pub structural: Vec<String>,
     pub spelling: Vec<String>,
     pub externals_staged: bool,
-    /// What each package the plan installed owns on the scratch after the
-    /// replay, read from the scratch itself: the manifest the plan pins
-    /// (DEC-2447.6). Empty for a plan that installs none.
+    /// What each package the plan installed or updated owns on the scratch after
+    /// the replay, read from the scratch itself: the manifest the plan pins
+    /// (DEC-2447.6, DEC-2447.10). Empty for a plan that changes none.
     pub extensions:
         std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionProvider>,
 }
@@ -311,18 +311,34 @@ pub async fn rehearse_in(
     // A scratch bootstrap assumes package state, never permission to install
     // it: every declared package is already there, except the ones this plan
     // installs, which the scratch must be able to install the same way the
-    // target is checked (DEC-2447.6).
-    let created: std::collections::BTreeMap<_, _> = plan
-        .iter()
-        .filter_map(|s| s.extension.as_ref())
-        .filter_map(|e| Some((e.name.clone(), declared.extensions.get(&e.name)?.clone())))
-        .collect();
-    let standing: std::collections::BTreeMap<_, _> = declared
+    // target is checked (DEC-2447.6). A package the plan updates is there at
+    // the version the target holds, provisioned through the externals file,
+    // because installing the final version would not rehearse the update
+    // (DEC-2447.10); `changed` is what each ends at.
+    use pbps_dialect::ExtensionPhase;
+    let mut created = std::collections::BTreeMap::new();
+    let mut changed = std::collections::BTreeMap::new();
+    let mut standing: std::collections::BTreeMap<_, _> = declared
         .extensions
         .iter()
-        .filter(|(name, _)| !created.contains_key(*name))
         .map(|(name, definition)| (name.clone(), definition.clone()))
         .collect();
+    for marker in plan.iter().filter_map(|s| s.extension.as_ref()) {
+        let Some(wanted) = declared.extensions.get(&marker.name) else {
+            continue;
+        };
+        match &marker.phase {
+            ExtensionPhase::Create => {
+                standing.remove(&marker.name);
+                created.insert(marker.name.clone(), wanted.clone());
+            }
+            ExtensionPhase::Update { from } => {
+                standing.insert(marker.name.clone(), from.clone());
+                changed.insert(marker.name.clone(), wanted.clone());
+            }
+            ExtensionPhase::Drop => {}
+        }
+    }
     crate::engine::require_scratch_extensions(conn, &standing).await?;
     if !created.is_empty() {
         let problems = pbps_pg::resolver::scratch::extension_requirements(conn, &created).await?;
@@ -401,10 +417,11 @@ pub async fn rehearse_in(
 
     // Read before anything else touches the scratch: it is what the engine
     // holds for the package after the plan's own statements, not a guess.
-    let extensions = if created.is_empty() {
+    let extensions = if created.is_empty() && changed.is_empty() {
         Default::default()
     } else {
-        pbps_pg::resolver::scratch::extension_manifests(conn, &created.keys().collect::<Vec<_>>())
+        let names: Vec<_> = created.keys().chain(changed.keys()).collect();
+        pbps_pg::resolver::scratch::extension_manifests(conn, &names)
             .await
             .context(words.read)?
     };

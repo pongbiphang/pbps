@@ -602,6 +602,7 @@ pub fn names(
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::AlterModule { .. }
+        | Change::UpdateExtension { .. }
         | Change::AttachPartition { .. }
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }

@@ -4852,7 +4852,7 @@ pub(crate) fn emit_in(
             statement.extension = Some(pbps_dialect::ExtensionStatement {
                 uid: uid.clone(),
                 name: name.clone(),
-                drops: false,
+                phase: pbps_dialect::ExtensionPhase::Create,
             });
             Ok(vec![statement])
         }
@@ -4866,7 +4866,29 @@ pub(crate) fn emit_in(
             statement.extension = Some(pbps_dialect::ExtensionStatement {
                 uid: uid.clone(),
                 name: name.clone(),
-                drops: true,
+                phase: pbps_dialect::ExtensionPhase::Drop,
+            });
+            Ok(vec![statement])
+        }
+        // The version is named, never the default, and a path the engine
+        // cannot walk is its own error: no downgrade guess, no drop and
+        // recreate (DEC-2447.10).
+        Change::UpdateExtension {
+            uid,
+            name,
+            from,
+            to,
+            ..
+        } => {
+            let mut statement = Statement::new(format!(
+                "ALTER EXTENSION {} UPDATE TO {};",
+                quote(name.raw())?,
+                literal(&to.version)
+            ));
+            statement.extension = Some(pbps_dialect::ExtensionStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                phase: pbps_dialect::ExtensionPhase::Update { from: from.clone() },
             });
             Ok(vec![statement])
         }

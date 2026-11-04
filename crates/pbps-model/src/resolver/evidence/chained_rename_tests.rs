@@ -32,6 +32,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::DetachPartition { .. }
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
+        | Change::UpdateExtension { .. }
         | Change::AttachPartition { .. }
         | Change::DropTable { .. }
         | Change::AddColumn { .. }

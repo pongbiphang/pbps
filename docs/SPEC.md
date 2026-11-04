@@ -1222,10 +1222,30 @@ refused by name and is planned in two steps, the package first (DEC-2447.6). A
 package whose members the declarations also manage as their own is
 refused after the rehearsal, and a collision with an unmanaged object of the
 target is the engine's own refusal inside the rolled-back transaction
-(DEC-2447.7). ALTER EXTENSION UPDATE and ALTER EXTENSION SET SCHEMA differences
-are named refusals and named drift, with no partial executable plan.
+(DEC-2447.7). ALTER EXTENSION SET SCHEMA differences are named refusals and named
+drift, with no partial executable plan, and so is a version change together with
+a new schema (update the package in one plan and move it in the next).
 Provider-type admission and the use of a package's members by declarations
 remain later slices.
+
+**Updating a package (DEC-2447.10).** A declaration at another version than the
+target holds, in the same schema, is one `ALTER EXTENSION name UPDATE TO 'v'`:
+`extension-code` and `destructive`, because the update scripts are code pbps did
+not write and nothing proves them additive. It is planned only with a rehearsal,
+as a create is, and on a scratch that holds the version the **target** holds now
+(the externals file installs it; after the apply the operator raises the file to
+the new version, and until then every plan names the exact check that fails).
+The plan seals the manifest the target holds, the one the rehearsal read after
+the update, and the versions the engine reports it walks
+(`pg_extension_update_paths`), in plan format 63. A version with no path, one the
+package does not list as installable, a prerequisite that is neither declared nor
+installed, and a role that does not own the package (and, for a control file that
+asks for a superuser, lacks what an install needs) are refused by name before a
+plan exists. `apply` checks the same under the lock, then in the statement's own
+transaction vets the manifest and the path before it and, after it, the pinned
+result and that every object outside the package that depended on it is still
+there (a script that drops a member `CASCADE` takes its dependents along, which
+the engine does not refuse); any difference rolls it back and records nothing.
 
 **Dropping a package (DEC-2447.8, DEC-2447.9).** Removing a declaration is not a
 drop: `plan` names the package and the command, and a human runs `pbps
@@ -1983,11 +2003,13 @@ two halves:
    Untouched policies keep their exact catalog predicates. Both RLS flags
    match the values the plan leaves, independently of whether any policy exists.
    Managed extensions retain their exact name, schema and version. A plan admits
-   only creates and drops (DEC-2447.6, DEC-2447.8), so every package keeps these
-   fields unchanged, except that each one the plan installs stands in exactly
-   its pinned definition at the close and in none other before it, and each one
-   the plan drops stands as pinned until its statement and is absent from the
-   close on; installed packages outside the declarations are not compared.
+   only creates, updates and drops (DEC-2447.6, DEC-2447.8, DEC-2447.10), so every
+   package keeps these fields unchanged, except that each one the plan installs
+   stands in exactly its pinned definition at the close and in none other before
+   it, each one it updates stands at the version it came from or the one it goes
+   to and at the close at the latter, and each one the plan drops stands as pinned
+   until its statement and is absent from the close on; installed packages
+   outside the declarations are not compared.
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.
 

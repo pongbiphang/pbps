@@ -556,6 +556,7 @@ pub fn validate_saved_plan(
     }
     package_pins_match_their_creates(plan)?;
     package_pins_match_their_drops(plan)?;
+    package_pins_match_their_updates(plan)?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 
@@ -701,6 +702,82 @@ pub(super) fn package_pins_match_their_drops(plan: &SavedPlan) -> Result<(), Adm
             || requirers
                 .iter()
                 .any(|r| r == *uid || !drops.contains_key(r))
+        {
+            return Err(disagree(name));
+        }
+    }
+    Ok(())
+}
+
+/// The same for `ALTER EXTENSION ... UPDATE TO` (DEC-2447.10): every update is
+/// sealed with exactly one pin and every pin belongs to one update; the pin
+/// repeats the change's versions and the plan's identities, its manifests agree
+/// with them, the path starts at the installed version and ends at the target,
+/// and a required package is created by the same plan. An update whose own
+/// parts disagree never reaches a statement.
+pub(super) fn package_pins_match_their_updates(plan: &SavedPlan) -> Result<(), AdmissionError> {
+    use pbps_model::{Change, UidKind};
+    let creates: std::collections::BTreeSet<_> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateExtension { uid, .. } = &p.change {
+                Some(uid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let updates: std::collections::BTreeMap<_, _> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::UpdateExtension {
+                uid,
+                name,
+                from,
+                to,
+                requires,
+                ..
+            } = &p.change
+            {
+                Some((uid, (name, from, to, requires)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let disagree = |name: &pbps_model::ObjectLocalName| {
+        AdmissionError::message(format!(
+            "extension evidence disagrees with the plan's update of `{}`",
+            name.shown()
+        ))
+    };
+    let mut pinned = std::collections::BTreeSet::new();
+    for pin in &plan.extension_changes {
+        let Some((name, from, to, _)) = updates.get(&pin.uid) else {
+            return Err(disagree(&pin.name));
+        };
+        if **name != pin.name
+            || **from != pin.from
+            || **to != pin.to
+            || pin.before.definition != pin.from
+            || pin.after.definition != pin.to
+            || pin.from.schema != pin.to.schema
+            || pin.path.first() != Some(&pin.from.version)
+            || pin.path.last() != Some(&pin.to.version)
+            || !pinned.insert(&pin.uid)
+        {
+            return Err(disagree(&pin.name));
+        }
+    }
+    for (uid, (name, _, _, requires)) in &updates {
+        if !pinned.contains(uid)
+            || uid.kind() != UidKind::Extension
+            || plan.ids.extensions.get(*uid) != Some(*name)
+            || requires.iter().any(|r| r == *uid || !creates.contains(r))
         {
             return Err(disagree(name));
         }

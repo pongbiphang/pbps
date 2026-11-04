@@ -1,0 +1,1 @@
+DROP FUNCTION updcascade2447_gone() CASCADE;

@@ -1008,6 +1008,23 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "UpdateExtension",
+                Change::UpdateExtension {
+                    uid: uid(UidKind::Extension, "earthdistance"),
+                    name: "earthdistance".into(),
+                    from: pbps_model::Extension {
+                        schema: "ext".into(),
+                        version: "1.1".into(),
+                    },
+                    to: pbps_model::Extension {
+                        schema: "ext".into(),
+                        version: "1.2".into(),
+                    },
+                    requires: [uid(UidKind::Extension, "cube")].into(),
+                    releases: ["app.f(integer)".parse().unwrap()].into(),
+                },
+            ),
+            (
                 "CreateRole",
                 Change::CreateRole {
                     uid: uid(UidKind::Role, "new"),

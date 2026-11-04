@@ -206,7 +206,9 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
             (
                 "citext",
                 Some("extension: citext\nschema: ext\nversion: '1.5'\n"),
-                "UPDATE",
+                // An update runs vendor scripts, so like a create it is pinned
+                // from a rehearsal, which a project with no scratch lacks.
+                "is updated by this plan",
             ),
             (
                 "hstore",
@@ -222,9 +224,6 @@ fn changed_lifecycles_never_publish_a_partial_executable_plan() {
             }
             let ordinary = d.dir.join("schema/ext.ordinary.yml");
             let table = std::fs::read(&ordinary).unwrap();
-            if action == "UPDATE" {
-                std::fs::write(&ordinary, "table: ext.ordinary\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n").unwrap();
-            }
             // A new declaration gets its identity from an offline plan first,
             // as any new object does.
             let creates = action == "is created by this plan";
@@ -523,18 +522,15 @@ fn scratch_bootstrap_does_not_authorize_real_extension_lifecycle_changes() {
             &format!("extensions2447-lifecycle-scratch-{variable}"),
             false,
         );
-        for (name, text, action) in [
-            (
-                "citext",
-                "extension: citext\nschema: ext\nversion: '1.6'\n",
-                "UPDATE",
-            ),
-            (
+        // A version change is an update now, planned from the target (and refused
+        // for every caller that installs nothing, which the baseline and
+        // bootstrap cases below pin); a new schema is still refused.
+        {
+            let (name, text, action) = (
                 "hstore",
                 "extension: hstore\nschema: other\nversion: '1.4'\n",
                 "SET SCHEMA",
-            ),
-        ] {
+            );
             let path = extension_file(&case.demo, name);
             let old = std::fs::read(&path).ok();
             std::fs::write(&path, text).unwrap();

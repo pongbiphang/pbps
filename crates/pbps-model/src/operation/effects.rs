@@ -1401,6 +1401,28 @@ impl Cx<'_> {
             // require it, and after the modules of this plan that its removal
             // would delete or be blocked by: factual edges named by the
             // payload, so a saved plan orders the same way (DEC-2447.8).
+            // An update waits for the packages of this plan that the target
+            // version requires, and for the modules this plan drops that use a
+            // member it may retire: both named by the payload (DEC-2447.10).
+            Change::UpdateExtension {
+                uid,
+                requires,
+                releases,
+                ..
+            } => {
+                let key = ObjectKey::Extension(Recorded(uid.clone()));
+                self.exists(key.clone());
+                self.rewrites(Resource::Object(key, Incarnation::Final));
+                for required in requires {
+                    self.requires(Requirement::Is(
+                        ObjectKey::Extension(Recorded(required.clone())),
+                        Incarnation::Final,
+                    ));
+                }
+                for id in releases {
+                    self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
+                }
+            }
             Change::DropExtension {
                 uid,
                 requirers,

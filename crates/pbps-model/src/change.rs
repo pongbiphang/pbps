@@ -361,6 +361,30 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         releases: BTreeSet<crate::ModuleId>,
     },
+    /// `ALTER EXTENSION name UPDATE TO 'version'` of a package the declarations
+    /// hold at a version other than the target's, in the same schema
+    /// (DEC-2447.10). It runs the package's update scripts, code pbps did not
+    /// write, so it is `extension-code` and `destructive` and is sealed with the
+    /// manifest the target held and the one the rehearsal read afterwards
+    /// (`Plan::extension_changes`).
+    UpdateExtension {
+        uid: Uid,
+        name: ObjectLocalName,
+        /// The package as the target holds it, and as the plan leaves it.
+        from: crate::Extension,
+        to: crate::Extension,
+        /// The packages of this plan that the target version's control file
+        /// requires, by uid: the update waits for each, as a create does.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        requires: BTreeSet<Uid>,
+        /// The modules this plan also drops that depend on a member of the
+        /// package: the update waits for each, because it may retire the member
+        /// they use. Dropping a consumer first is never wrong, so this is every
+        /// such module and not only the ones the update retires, which is known
+        /// only after the rehearsal.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        releases: BTreeSet<crate::ModuleId>,
+    },
     CreateTable {
         uid: Uid,
         name: TableName,
@@ -1522,7 +1546,9 @@ macro_rules! catalog_change {
             | $crate::Change::RenameType { .. }
     };
     (extensions) => {
-        $crate::Change::CreateExtension { .. } | $crate::Change::DropExtension { .. }
+        $crate::Change::CreateExtension { .. }
+            | $crate::Change::DropExtension { .. }
+            | $crate::Change::UpdateExtension { .. }
     };
 }
 
@@ -1623,7 +1649,9 @@ impl Change {
             Change::RenameRole { from, .. } => {
                 format!("role {}", from.raw())
             }
-            Change::CreateExtension { name, .. } | Change::DropExtension { name, .. } => {
+            Change::CreateExtension { name, .. }
+            | Change::DropExtension { name, .. }
+            | Change::UpdateExtension { name, .. } => {
                 format!("extension {}", name.raw())
             }
             // The routine, not the grantee. `PUBLIC` is every principal at
@@ -2386,6 +2414,7 @@ impl Change {
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
+            | Change::UpdateExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2884,6 +2913,7 @@ impl Change {
             | Change::RenameType { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
+            | Change::UpdateExtension { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -3155,6 +3185,13 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             }
             Change::CreateExtension { .. } => {
                 r.insert(RiskClass::ExtensionCode);
+            }
+            // The update script is code pbps did not write, and nothing proves it
+            // additive: a version path is not a promise about the data it
+            // touches, so the label is conservative (DEC-2447.10).
+            Change::UpdateExtension { .. } => {
+                r.insert(RiskClass::ExtensionCode);
+                r.insert(RiskClass::Destructive);
             }
             // The loosening statements carry no class, as `DropCheck` does
             // (DECISIONS 486). A check added or changed validates every row

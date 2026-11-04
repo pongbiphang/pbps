@@ -1,0 +1,4 @@
+comment = 'update through a version that requires another package (#2447)'
+default_version = '1.0'
+relocatable = true
+superuser = false

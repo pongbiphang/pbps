@@ -58,6 +58,12 @@ pub enum DiffError {
         name: pbps_model::ObjectLocalName,
         found: Vec<String>,
     },
+    #[error("extension `{}`: ALTER EXTENSION UPDATE from `{}` to `{}` runs the package's update scripts, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what they leave (DEC-2447.10)", .name.shown(), pbps_model::escape::Escaped(.from), pbps_model::escape::Escaped(.to))]
+    ExtensionUpdateNeedsDatabase {
+        name: pbps_model::ObjectLocalName,
+        from: String,
+        to: String,
+    },
     #[error("extension `{}`: CREATE EXTENSION runs the package's install script, so it is planned only against a database (`plan --db`), where a rehearsal reads and pins what the script installs (DEC-2447.6)", .name.shown())]
     ExtensionCreateNeedsDatabase { name: pbps_model::ObjectLocalName },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
@@ -883,6 +889,10 @@ pub(crate) fn diff_partial_rebuilding(
         crate::extensions::drops(base, declared, dialect.name(), &hints.extension_drops);
     changes.extend(extension_drops);
     errs.extend(extension_drop_errors);
+    let (extension_updates, extension_update_errors) =
+        crate::extensions::updates(base, declared, dialect.name(), &hints.extension_updates);
+    changes.extend(extension_updates);
+    errs.extend(extension_update_errors);
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2678,8 +2688,9 @@ pub(crate) fn diff_partial_rebuilding(
                 && let Some(rank) = late_attach.get(table)
             {
                 *rank
-            } else if let Change::CreateExtension { uid, .. } | Change::DropExtension { uid, .. } =
-                &p.change
+            } else if let Change::CreateExtension { uid, .. }
+            | Change::DropExtension { uid, .. }
+            | Change::UpdateExtension { uid, .. } = &p.change
             {
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
@@ -7186,6 +7197,7 @@ fn dependency_rank(
         Change::CreateTable { .. }
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
+        | Change::UpdateExtension { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -8134,7 +8146,8 @@ fn order_key(c: &Change) -> u8 {
         // the plan may use, so it goes with the type creates; the order among
         // packages is the `requires` edge, not this number (DEC-2447.6).
         | Change::CreateType { .. }
-        | Change::CreateExtension { .. } => 7,
+        | Change::CreateExtension { .. }
+        | Change::UpdateExtension { .. } => 7,
         // A domain's checks and NOT NULL are dropped with a table's, before
         // the plan's rows, and added with them after the rows (DEC-1635.8).
         // A default the half sets can name a label the plan renames or adds,

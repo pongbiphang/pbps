@@ -125,6 +125,17 @@ pub struct ExtensionDropFacts {
     pub blockers: std::collections::BTreeSet<ProviderMember>,
 }
 
+/// What the target says about a package the plan updates (DEC-2447.10): the
+/// packages its target version's control file requires, the versions the
+/// engine would apply, and what depends on the package, so that the plan can
+/// wait for the modules it drops that use a member.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionUpdateFacts {
+    pub requires: std::collections::BTreeSet<crate::ObjectLocalName>,
+    pub reach: ExtensionDropFacts,
+}
+
 /// An installed package and everything it owns or requires.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,

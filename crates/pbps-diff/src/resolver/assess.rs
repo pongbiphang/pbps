@@ -297,6 +297,10 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         // (and the plan refuses it first, by name); only a body bound at call
         // time, such as plpgsql's, finds nothing once the member is gone, which
         // is the resolver's documented observation limit (DEC-2447.8).
+        //
+        // An **update** is the same answer for the same reason: its scratch holds
+        // the version the target holds, so a plan that also needs the resolver is
+        // refused by name first (DEC-2447.10).
         | pbps_model::catalog_change!()
         | Change::PublicExecution { .. } => false,
     }
