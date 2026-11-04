@@ -51,6 +51,10 @@ impl Control {
             })),
         }
     }
+    // Only the Linux-gated SQL Server session test names an engine until the
+    // public command does (F2); gating it keeps a Windows test build free of a
+    // dead-code warning that `cfg_attr(not(test), expect(dead_code))` cannot cover.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_driver(mut self, driver: pbps_db::Driver) -> Self {
         self.driver = driver;
         self
