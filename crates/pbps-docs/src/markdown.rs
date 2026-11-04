@@ -171,9 +171,9 @@ fn roles_section(s: &mut String, roles: &BTreeMap<pbps_model::RoleName, Role>) {
             let list: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
             let _ = writeln!(
                 s,
-                "| `{target}` | {} |",
-                list.join(", "),
-                target = target.raw()
+                "| {} | {} |",
+                code_cell(&target.raw().to_string()),
+                list.join(", ")
             );
         }
     }
@@ -201,8 +201,8 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         }
         let _ = writeln!(
             s,
-            "| {label} | `{}` | {} | {} | {} |",
-            c.ty.raw(),
+            "| {label} | {} | {} | {} | {} |",
+            code_cell(&c.ty.raw().to_string()),
             if c.nullable { "yes" } else { "no" },
             match &c.value_source {
                 pbps_model::ValueSource::Default(text) => code_cell(text),
@@ -326,7 +326,7 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
     s.push_str("\n## Do not use\n\nThese columns still exist but are on their way out.\n\n");
     s.push_str("| Column | Reason |\n|---|---|\n");
     for (name, reason) in rows {
-        let _ = writeln!(s, "| `{name}` | {} |", reason.raw());
+        let _ = writeln!(s, "| {} | {} |", code_cell(&name), cell(Some(reason.raw())));
     }
 }
 
@@ -348,8 +348,11 @@ fn graveyard(s: &mut String, ids: &IdsFile) {
     for t in stones {
         let _ = writeln!(
             s,
-            "| `{}` | {} | {} | {} |",
-            t.was, t.dropped_at, t.operator, t.reason
+            "| {} | {} | {} | {} |",
+            code_cell(&t.was),
+            cell(Some(&t.dropped_at)),
+            cell(Some(&t.operator)),
+            cell(Some(&t.reason))
         );
     }
 }
@@ -391,8 +394,13 @@ fn code_cell(text: &str) -> String {
 
 fn cell(v: Option<&str>) -> String {
     match v {
-        // A pipe inside a cell would end it and shift every later column.
-        Some(d) => d.replace('|', "\\|"),
+        // Line endings and pipes delimit rows and cells before inline Markdown
+        // is parsed. Inline HTML can close the table even without either.
+        Some(d) => d
+            .replace("\r\n", " ")
+            .replace(['\r', '\n'], " ")
+            .replace('|', "\\|")
+            .replace('<', "&lt;"),
         None => "—".into(),
     }
 }
