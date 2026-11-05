@@ -302,6 +302,43 @@ fn declaration_paths_equal_ignoring_case_collide() {
 }
 
 #[test]
+fn declarations_differing_in_case_and_extension_collide_on_their_ids_paths() {
+    let mut d = decls();
+    d.push(decl(
+        "schema/DBO/customer.yaml",
+        UidKind::Table,
+        "dbo.other",
+    ));
+    let found = run(&tree(), &d, false);
+    let f = found
+        .iter()
+        .find(|f| f.code == Code::CaseCollision)
+        .unwrap();
+    assert_eq!(
+        f.message,
+        ".pbps/ids/DBO/customer.json and .pbps/ids/dbo/customer.json differ only in case"
+    );
+}
+
+#[test]
+fn a_yml_and_a_yaml_in_one_directory_collide_on_one_ids_path_not_on_case() {
+    let mut d = decls();
+    d.push(decl(
+        "schema/dbo/customer.yaml",
+        UidKind::Table,
+        "dbo.other",
+    ));
+    let codes = codes(&run(&tree(), &d, false));
+    assert!(codes.contains(&Code::PathCollision));
+    assert!(!codes.contains(&Code::CaseCollision));
+}
+
+#[test]
+fn one_path_declared_once_is_not_a_case_collision() {
+    assert!(!codes(&run(&tree(), &decls(), false)).contains(&Code::CaseCollision));
+}
+
+#[test]
 fn identity_paths_equal_ignoring_case_collide() {
     let mut ids = tree();
     ids.insert("DBO/customer.json".into(), ids["dbo/customer.json"].clone());

@@ -405,24 +405,30 @@ impl Run<'_> {
                 "rename one",
             );
         }
-        let (yaml, ids): (Vec<String>, Vec<String>) = (
-            input.declared.iter().map(|d| d.yaml.clone()).collect(),
-            input.ids.keys().map(|p| self.shown(p)).collect(),
-        );
-        for paths in [yaml, ids] {
-            let mut folded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            for p in paths {
-                folded.entry(p.to_lowercase()).or_default().insert(p);
-            }
-            for set in folded.values().filter(|s| s.len() > 1) {
-                let list: Vec<&str> = set.iter().map(String::as_str).collect();
-                self.add(
-                    Code::CaseCollision,
-                    list[0].to_owned(),
-                    format!("{} differ only in case", list.join(" and ")),
-                    "rename one",
-                );
-            }
+        // Fold the ids paths, not the YAML paths: `a.yml` and `A.yaml` differ in
+        // case and extension, yet map to `a.json` and `A.json`, which cannot
+        // coexist on a case-insensitive checkout. The YAML tree is covered
+        // too, since two YAML paths equal ignoring case map to paths that are.
+        let mut folded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let declared = input
+            .declared
+            .iter()
+            .filter_map(|d| mirrored(self.layout, &d.yaml));
+        for rel in declared.chain(input.ids.keys().cloned()) {
+            let shown = self.shown(&rel);
+            folded
+                .entry(shown.to_lowercase())
+                .or_default()
+                .insert(shown);
+        }
+        for set in folded.values().filter(|s| s.len() > 1) {
+            let list: Vec<&str> = set.iter().map(String::as_str).collect();
+            self.add(
+                Code::CaseCollision,
+                list[0].to_owned(),
+                format!("{} differ only in case", list.join(" and ")),
+                "rename one",
+            );
         }
     }
 }
