@@ -1571,6 +1571,7 @@ pub(crate) fn diff_partial_rebuilding(
             declared_name,
             &renames.apply(base_table, base_name),
             &changes[mark..],
+            dialect,
             &mut errs,
         );
         diff_constraints(
@@ -6630,6 +6631,7 @@ fn exclusion_hazards(
     name: &TableName,
     base: &Table,
     changes: &[Change],
+    dialect: &(impl Dialect + ?Sized),
     errs: &mut Vec<DiffError>,
 ) {
     if base.exclude.is_empty() {
@@ -6647,7 +6649,7 @@ fn exclusion_hazards(
             _ => continue,
         };
         for (key, x) in &base.exclude {
-            if exclusion_names(x, &column.name) {
+            if exclusion_names(x, &column.name, dialect) {
                 errs.push(DiffError::ExclusionRefused {
                     table: name.clone(),
                     name: key.clone(),
@@ -6665,16 +6667,25 @@ fn exclusion_hazards(
 }
 
 /// Whether an exclusion constraint's keys, payload or predicate hold `column`.
-fn exclusion_names(x: &pbps_model::ExclusionConstraint, column: &ColumnName) -> bool {
-    let word = |text: &str| {
-        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|token| token == column.raw())
-    };
+///
+/// A key's expression and the predicate are asked of the dialect's own column
+/// scan, the one an index key's input columns are asked of
+/// ([`Dialect::generation_may_read_column`]): it reads quoted identifiers by
+/// the engine's rules (a hyphen, a space, a doubled quote, a mixed case), and
+/// leaves string literals and comments out, so the name inside a literal is not
+/// a reference. It over-approximates (a function or a field of the same name
+/// counts), which is the safe side of a guard.
+fn exclusion_names(
+    x: &pbps_model::ExclusionConstraint,
+    column: &ColumnName,
+    dialect: &(impl Dialect + ?Sized),
+) -> bool {
+    let reads = |text: &str| dialect.generation_may_read_column(text, column);
     x.keys.iter().any(|k| match &k.key.key {
         pbps_model::IndexKey::Column(c) => c == column,
-        pbps_model::IndexKey::Expression(text) => word(text),
+        pbps_model::IndexKey::Expression(text) => reads(text),
     }) || x.include.contains(column)
-        || x.filter.as_deref().is_some_and(word)
+        || x.filter.as_deref().is_some_and(reads)
 }
 
 /// [`diff_constraints`] under a given policy table, so that a verdict no
@@ -10867,7 +10878,13 @@ mod tests {
         let changes: [(Edit<'_>, &str, &str); 2] = [(&drop, "a", "id"), (&retype, "b", "id")];
         for (change, held_column, free_column) in changes {
             let mut errs = Vec::new();
-            exclusion_hazards(&table, &with_filter, &[change(held_column)], &mut errs);
+            exclusion_hazards(
+                &table,
+                &with_filter,
+                &[change(held_column)],
+                &MinimalDialect,
+                &mut errs,
+            );
             assert_eq!(errs.len(), 1, "{held_column}: {errs:?}");
             assert!(
                 errs[0]
@@ -10876,15 +10893,33 @@ mod tests {
                 "{errs:?}"
             );
             let mut errs = Vec::new();
-            exclusion_hazards(&table, &with_filter, &[change("c")], &mut errs);
+            exclusion_hazards(
+                &table,
+                &with_filter,
+                &[change("c")],
+                &MinimalDialect,
+                &mut errs,
+            );
             assert_eq!(errs.len(), 1, "the predicate holds `c`: {errs:?}");
             let mut errs = Vec::new();
-            exclusion_hazards(&table, &with_filter, &[change(free_column)], &mut errs);
+            exclusion_hazards(
+                &table,
+                &with_filter,
+                &[change(free_column)],
+                &MinimalDialect,
+                &mut errs,
+            );
             assert!(errs.is_empty(), "{free_column}: {errs:?}");
         }
         // And a table with no exclusion has no hazard at all.
         let mut errs = Vec::new();
-        exclusion_hazards(&table, &Table::default(), &[drop("a")], &mut errs);
+        exclusion_hazards(
+            &table,
+            &Table::default(),
+            &[drop("a")],
+            &MinimalDialect,
+            &mut errs,
+        );
         assert!(errs.is_empty());
     }
 

@@ -291,3 +291,54 @@ fn a_standing_exclusion_is_not_dropped_replaced_or_stripped_of_a_column_by_a_pla
         assert!(!said(&out).contains("exclusion"), "{}", said(&out));
     });
 }
+
+/// A retype of a column an exclusion's expression holds is refused by name
+/// whatever the column is called: the guard reads the expression with the
+/// engine's identifier scan, so a quoted name with a hyphen, a space or a mixed
+/// case is found (DEC-2448.3).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_retype_of_a_quoted_key_column_in_an_expression_is_refused_by_name() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "exclude-quoted");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.q (id integer PRIMARY KEY, \"Start-Time\" integer NOT NULL, \
+               \"end time\" integer NOT NULL, free integer); \
+             ALTER TABLE app.q ADD CONSTRAINT x EXCLUDE USING gist \
+               (int4range(\"Start-Time\", \"end time\") WITH &&)",
+        );
+        let d = Demo::new("exclude-quoted");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.q.yml");
+        let held = std::fs::read_to_string(&path).unwrap();
+        let retyped = |column: &str| {
+            let text = held.replacen(
+                &format!("{column}:\n    type: integer"),
+                &format!("{column}:\n    type: bigint"),
+                1,
+            );
+            assert_ne!(text, held, "{column}:\n{held}");
+            std::fs::write(&path, text).unwrap();
+            d.commit();
+            d.run(&["plan", "--db", connection])
+        };
+        for column in ["Start-Time", "end time"] {
+            let out = retyped(column);
+            assert_ne!(code(&out), 0, "{column}: {}", said(&out));
+            assert!(
+                said(&out).contains("while the constraint holds it"),
+                "{column}: {}",
+                said(&out)
+            );
+        }
+        // Control: a column the expression does not mention retypes freely.
+        succeeds(retyped("free"));
+        assert_eq!(constraints(connection, "x"), 1);
+    });
+}

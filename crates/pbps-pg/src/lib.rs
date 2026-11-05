@@ -8519,6 +8519,120 @@ mod enum_partition_key_tests {
             .collect()
     }
 
+    /// A retype or drop of a column a standing exclusion holds is refused by name
+    /// whatever the column is called: the guard reads an expression and a
+    /// predicate with the engine's identifier scan, so a quoted name with a
+    /// hyphen, a space, a doubled quote or a mixed case is found, a bare
+    /// lowercase one still is, and the name inside a string literal or a comment
+    /// is not a reference (DEC-2448.3).
+    #[test]
+    fn a_column_an_exclusion_holds_is_found_by_its_quoted_name_and_not_in_a_literal() {
+        let columns = ["start-time", "my col", "a\"b", "MixedCase", "plain", "free"];
+        let base = |expression: &str, filter: Option<&str>| {
+            let mut table = Table::default();
+            for name in columns {
+                table.columns.insert(
+                    name.into(),
+                    pbps_model::Column::new("integer".parse().unwrap()),
+                );
+            }
+            table.exclude.insert(
+                "x".into(),
+                pbps_model::ExclusionConstraint {
+                    method: pbps_model::IndexMethod::Gist,
+                    keys: vec![pbps_model::ExclusionKey {
+                        key: pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Expression(expression.to_owned()),
+                            descending: false,
+                            opclass: None,
+                            collation: None,
+                        },
+                        operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                    }],
+                    include: Vec::new(),
+                    filter: filter.map(str::to_owned),
+                    storage_parameters: Default::default(),
+                    timing: pbps_model::ExclusionTiming::Immediate,
+                },
+            );
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert("app.t".parse::<TableName>().unwrap(), table);
+            schema
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-11-06".into(),
+        };
+        // The refusals of retyping `column` to bigint, where `base` is the
+        // declared schema with the exclusion and `declared` retypes it.
+        let refusals = |schema: &Schema, column: &str| -> Vec<String> {
+            let mut declared = schema.clone();
+            declared
+                .tables
+                .values_mut()
+                .next()
+                .unwrap()
+                .columns
+                .get_mut(column)
+                .unwrap()
+                .ty = "bigint".parse().unwrap();
+            let base_ids =
+                pbps_diff::resolve(schema, &pbps_model::IdsFile::default(), &[], &context)
+                    .unwrap()
+                    .ids;
+            let ids = pbps_diff::resolve(&declared, &base_ids, &[], &context)
+                .unwrap()
+                .ids;
+            let outcome = pbps_diff::diff(
+                pbps_diff::Side {
+                    schema,
+                    ids: &base_ids,
+                },
+                pbps_diff::Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &pbps_model::Hints::default(),
+            );
+            match outcome {
+                Ok(_) => Vec::new(),
+                Err(errors) => errors.iter().map(ToString::to_string).collect(),
+            }
+        };
+        let held = base(
+            "int4range(\"start-time\", \"my col\") || int4range(\"a\"\"b\", \"MixedCase\") \
+             || int4range(plain, plain)",
+            Some("\"start-time\" > 0"),
+        );
+        for column in columns {
+            let said = refusals(&held, column);
+            if column == "free" {
+                // Negative: a column nothing mentions retypes freely.
+                assert!(said.is_empty(), "{said:?}");
+            } else {
+                assert!(
+                    said.iter()
+                        .any(|m| m.contains("while the constraint holds it")),
+                    "{column}: {said:?}"
+                );
+            }
+        }
+        // Negative: the name in a string literal or a comment is no reference, and
+        // an unquoted `StartTime` folds to `starttime`, which is another column.
+        let literal = base(
+            "int4range(1, 2) /* \"start-time\" */ || int4range(plain, plain)",
+            Some("'start-time' = 'my col'"),
+        );
+        assert!(refusals(&literal, "start-time").is_empty());
+        assert!(refusals(&literal, "my col").is_empty());
+        assert!(!refusals(&literal, "plain").is_empty());
+        let folded = base("int4range(MixedCase, 1)", None);
+        assert!(refusals(&folded, "MixedCase").is_empty());
+    }
+
     /// An exclusion constraint whose expression or predicate may call a routine
     /// this project declares is refused by name, since the plan's order against
     /// that routine is the index machinery's and an exclusion is not on it yet;
