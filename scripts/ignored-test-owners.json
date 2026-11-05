@@ -2963,7 +2963,8 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "engine::mssql_live_tests::creation2469::checked_generation_edges_use_complete_catalog_collation_facts",
-        "engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused"
+        "engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused",
+        "engine::mssql_live_tests::the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ordered_it"
       ]
     },
     {
