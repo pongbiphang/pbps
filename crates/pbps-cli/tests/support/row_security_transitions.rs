@@ -185,7 +185,7 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
         let connection = own.connection();
         on_server(
             connection,
-            "CREATE SCHEMA app; CREATE FUNCTION app.visible(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; CREATE TABLE app.t(id integer,n integer); CREATE POLICY kept ON app.t USING(id>=0); CREATE POLICY gate ON app.t USING(app.visible(n)>0)",
+            "CREATE SCHEMA app; CREATE FUNCTION app.visible(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; CREATE TABLE app.t(id integer,n integer); CREATE POLICY kept ON app.t USING(id>=0); CREATE POLICY gate ON app.t USING(app.visible(n)>0)",
         );
         let d = adopted(connection, "rls-c-dependents");
         let original = std::fs::read_to_string(d.dir.join("schema/app.t.yml")).unwrap();

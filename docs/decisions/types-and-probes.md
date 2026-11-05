@@ -5141,3 +5141,54 @@ destination is a refusal, and a collision of a member class the destination quer
 does not list (a text search object, a statistics object) is the engine's rollback;
 declarations that spell a member with the old schema are the next plan's drift,
 not rewritten.
+
+<a id="dec-2563-4"></a>
+
+**DEC-2563.4. The CHECK, DEFAULT and generated expressions a plan gives a table are judged by the one predicate (PostgreSQL).**
+
+(#2563, slice 2b-1.) DEC-2563.2 judged every site that already had a vet; the
+expressions of a table were still only change-detected (DEC-319.1), so a function
+any role owned ran as the deployer at apply (measured, #2563 survey finding 2).
+Each change that introduces one now binds it, in a transaction that is rolled
+back, in a temporary table built from the table's own columns plus the one
+expression (`CREATE TEMPORARY TABLE ... (LIKE t EXCLUDING ALL, ...)` for a table
+that exists, the declared columns for one the plan creates), and reads the stored
+trees from `pg_constraint.conbin` and `pg_attrdef.adbin`. The routines they call
+are judged by `judge_trees`, the function `vet_in_transaction` now shares, so the
+predicate, its causes, its remedies and the review are DEC-2563.2's. Two
+differences from a conversion: a table expression is not held to built-in types
+(the types of a column have their own input path, DEC-2181.1), and the extended
+protocol refuses a text that closes its clause and adds a command, so nothing is
+run before it is judged. The changes are `CreateTable` (checks, defaults and
+generated columns; a partition is left to the next slice), `AddColumn`,
+`AddCheck`, `AlterColumnDefault` and `AlterColumnExpression`. Indexes, policies
+and partition keys are the next slice; `Change::AddComputedColumn` is SQL Server's.
+
+When it is judged. (1) `plan` binds each change against the target to learn which
+routines the review admits, so the plan shows and pins them (rule 4 roots join
+`type_routines`; no plan format changes); a refusal there is not raised, because a
+plan that replaces the routine it uses would be refused for the routine it is
+about to fix, and the same predicate decides at apply. (2) Apply binds them again
+before the pre-flight probes, which evaluate these expressions over the stored
+rows; if any is not admitted yet, the probes are skipped with the notice, not run.
+(3) Apply binds each change's expressions just before the statement that
+introduces them (`Statement::introduces`, set on the change's first statement),
+in the apply's own transaction, when everything the plan created earlier exists.
+That last binding is the authority: an expression that does not bind there is
+refused, never run unjudged.
+
+The limitation accepted with Q3. An expression that uses a type, a routine or a
+column the same plan creates cannot be bound at plan time or before the probes.
+`plan` says so as a warning (`plan.table-expression-unbound`: the expression, and
+that it is judged at apply only) and (3) judges it by rules 2 and 3, never by a
+pin, since a routine that does not exist cannot be shown. Plan time evaluates
+nothing the review alone admits (DEC-2563.2).
+
+Compatibility change (a behaviour change). A routine called from one of these
+expressions that was admitted at any owner is now refused unless it is built in or
+tier 1, or its owner is trusted and it sets a fixed `search_path`, or
+`pin_type_routines` admits it after review. An untrusted owner's helper, a trusted
+owner's helper without a `search_path`, and an expression with a node the proof
+has not audited (`bound_objects` refuses it) are refused at apply, before the
+statement, with the exact `ALTER FUNCTION` line or the three remedies. Existing
+expressions on tables the plan only writes rows to are the next slice.

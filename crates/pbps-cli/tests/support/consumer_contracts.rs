@@ -457,8 +457,8 @@ pub(super) fn live(server: &str, pg: bool) {
     let (name, body, changed) = if pg {
         (
             "app.f(integer)",
-            "(i integer) RETURNS integer LANGUAGE sql AS $$ SELECT i $$",
-            "(i integer) RETURNS integer LANGUAGE sql AS $$ SELECT i + 1 $$",
+            "(i integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT i $$",
+            "(i integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT i + 1 $$",
         )
     } else {
         (
@@ -503,7 +503,7 @@ pub(super) fn live(server: &str, pg: bool) {
         "{json}"
     );
     if pg {
-        std::fs::write(&routine, "function: app.f(text)\ndefinition: (i text) RETURNS text LANGUAGE sql AS $$ SELECT i $$\n").unwrap();
+        std::fs::write(&routine, "function: app.f(text)\ndefinition: (i text) RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT i $$\n").unwrap();
         refused(&d, "consumer.breaking", &["plan", "--db", connection]);
     }
 }
@@ -522,7 +522,7 @@ fn defaults_live(server: &str, pg: bool) {
         if pg {
             on_server(
                 connection,
-                "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+                "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$",
             );
         } else {
             on_server(connection, "CREATE TABLE app.source (old int NULL)");
@@ -565,7 +565,7 @@ fn defaults_live(server: &str, pg: bool) {
                         .contains("function: app.f(")
                 })
                 .unwrap();
-            std::fs::write(routine, "function: app.f()\ndefinition: () RETURNS bigint LANGUAGE sql AS $$ SELECT 2::bigint $$\n").unwrap();
+            std::fs::write(routine, "function: app.f()\ndefinition: () RETURNS bigint LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 2::bigint $$\n").unwrap();
         } else {
             // This engine also releases a DEFAULT for a caller-column retype.
             let caller = files

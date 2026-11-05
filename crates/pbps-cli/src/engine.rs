@@ -115,6 +115,17 @@ pub async fn vet_conversions(
     Ok(immutable)
 }
 
+/// Judges the table expressions a change introduces (DEC-2563.4).
+pub async fn vet_table_expressions(
+    conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
+    within: pbps_pg::pins::Within,
+    moment: pbps_pg::table_expressions::Moment,
+    change: &pbps_model::Change,
+) -> Result<Vec<String>, String> {
+    pbps_pg::table_expressions::vet_change(conn, admission, within, moment, change).await
+}
+
 pub async fn vet_drop_requirements(
     conn: &mut Conn,
     admission: &pbps_pg::admission::Admission,

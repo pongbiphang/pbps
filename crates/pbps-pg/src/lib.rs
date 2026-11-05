@@ -87,6 +87,7 @@ pub mod rows;
 pub mod staged;
 pub mod state;
 pub mod statement;
+pub mod table_expressions;
 pub mod type_rebuild;
 pub mod type_refs;
 mod types;

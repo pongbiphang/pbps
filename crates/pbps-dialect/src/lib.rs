@@ -309,6 +309,10 @@ pub struct Statement {
     /// The package this statement installs, vetted before its transaction commits.
     pub extension: Option<ExtensionStatement>,
 
+    /// The change whose table expressions (CHECK, DEFAULT, generated) this
+    /// statement is the first to introduce, judged before it runs (DEC-2563.4).
+    pub introduces: Option<Box<pbps_model::Change>>,
+
     /// Reference-data writes that need an engine-specific execution guard.
     /// Derived by the emitter, never inferred by parsing the SQL.
     pub row_write: Option<RowWrite>,
@@ -473,6 +477,7 @@ impl Statement {
             execution: None,
             declared_type: None,
             extension: None,
+            introduces: None,
             row_write: None,
             index_build: None,
             own_batch: false,

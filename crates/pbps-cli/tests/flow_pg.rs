@@ -61,6 +61,9 @@ mod rebuild_members;
 #[path = "support/conversions2331.rs"]
 mod conversions2331;
 
+#[path = "support/table_expressions2563.rs"]
+mod table_expressions2563;
+
 #[path = "support/drop_requirements2400.rs"]
 mod drop_requirements2400;
 
@@ -3048,7 +3051,7 @@ fn a_check_calling_a_new_function_follows_it_beside_a_function_turned_procedure(
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY)",
     );
     let d = Demo::new("function-to-procedure");
@@ -3059,13 +3062,13 @@ fn a_check_calling_a_new_function_follows_it_beside_a_function_turned_procedure(
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.procedure.yml"),
         "procedure: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (IN x integer) LANGUAGE sql AS $$ SELECT 1 $$\n",
+         (IN x integer) LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$\n",
     )
     .unwrap();
     std::fs::write(
         d.dir.join("schema/app.g%28integer%29.function.yml"),
         "function: app.g(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$\n",
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$\n",
     )
     .unwrap();
     let table = d.dir.join("schema/app.t.yml");
@@ -3122,7 +3125,7 @@ fn a_check_calling_a_procedure_turned_function_follows_its_create() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE PROCEDURE app.f(x integer) LANGUAGE sql AS $$ SELECT 1 $$; \
+         CREATE PROCEDURE app.f(x integer) LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY)",
     );
     let d = Demo::new("procedure-to-function");
@@ -3133,7 +3136,7 @@ fn a_check_calling_a_procedure_turned_function_follows_its_create() {
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$\n",
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$\n",
     )
     .unwrap();
     let table = d.dir.join("schema/app.t.yml");
@@ -3193,7 +3196,7 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$",
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$",
     );
     let d = Demo::new("new-table-after-rebuild");
     succeeds(d.run(&["pull", "--db", connection]));
@@ -3302,7 +3305,7 @@ fn what_calls_a_new_function_follows_its_create() {
     std::fs::write(
         d.dir.join("schema/app.h%28integer%29.function.yml"),
         "function: app.h(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 10 $$\n",
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 10 $$\n",
     )
     .unwrap();
     std::fs::write(
@@ -3381,7 +3384,7 @@ fn declare_function(d: &Demo, name: &str, body: &str) {
             .join(format!("schema/app.{name}%28integer%29.function.yml")),
         format!(
             "function: app.{name}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$\n"
+             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ {body} $$\n"
         ),
     )
     .unwrap();
@@ -3405,7 +3408,7 @@ fn adopted_table(name: &str) -> (OwnDatabase, Demo) {
     on_server(
         own.connection(),
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY, a integer); \
          INSERT INTO app.t VALUES (1, 5), (2, 7)",
     );
@@ -6124,7 +6127,7 @@ fn a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.u (id integer PRIMARY KEY, n integer, other integer); \
          INSERT INTO app.u VALUES (1, 7, 5)",
     );
@@ -6191,7 +6194,7 @@ fn a_view_over_a_view_edited_off_a_dropped_function_is_rebuilt() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE VIEW app.v1 AS SELECT app.f(1) AS one; \
          CREATE VIEW app.v2 AS SELECT one FROM app.v1",
     );
@@ -6233,8 +6236,8 @@ fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
-         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE VIEW app.v AS SELECT app.f(1) AS one, app.g(1) AS two",
     );
     let d = Demo::new("view-on-dropped-function");
@@ -6521,7 +6524,7 @@ fn additions_calling_a_rebuilt_function_are_created_after_it() {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY, n integer); \
          CREATE TABLE app.u (id integer PRIMARY KEY, n integer)",
     );
@@ -6634,7 +6637,7 @@ fn a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY); \
          CREATE INDEX ix_f ON app.t (app.f(id)); \
          INSERT INTO app.t (id) VALUES (1), (2)",
@@ -6744,7 +6747,7 @@ fn a_woven_rebuild_keeps_everything_else_on(server: &str, k: usize) {
         connection,
         &format!(
             "CREATE SCHEMA app; \
-             CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+             CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog \
                  AS $$ SELECT x $$; \
              CREATE TABLE app.t (id integer PRIMARY KEY CONSTRAINT ck CHECK (app.f(id) >= 0), \
                                  n text); \
@@ -6866,7 +6869,7 @@ fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_n
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY CONSTRAINT ck CHECK (app.f(id) >= 0), \
                              n integer DEFAULT app.f(1)); \
          CREATE VIEW app.v0 AS SELECT id FROM app.t; \
@@ -7074,7 +7077,7 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
         connection,
         "CREATE TABLE app.x (id integer PRIMARY KEY); \
          CREATE VIEW app.v AS SELECT 1 AS n; \
-         CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$; \
+         CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT $1 $$; \
          CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST ((id + 1))",
     );
     let table = |name: &str| {
@@ -7097,7 +7100,7 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
     .unwrap();
     std::fs::write(
         d.dir.join("schema/app.g.function.yml"),
-        "function: app.g(integer)\ndefinition: |-\n  (integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$\n",
+        "function: app.g(integer)\ndefinition: |-\n  (integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT $1 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -7327,7 +7330,7 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     // where a project says otherwise.
     std::fs::write(
         d.dir.join("schema/plain.yml"),
-        "function: app.plain()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
+        "function: app.plain()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 7 $$\n",
     )
     .unwrap();
     // A *procedure*, and it is here for the statement rather than the policy:
@@ -7344,7 +7347,7 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     // The one line that says otherwise.
     std::fs::write(
         d.dir.join("schema/open.yml"),
-        "function: app.open()\npublic_execute: true\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 8 $$\n",
+        "function: app.open()\npublic_execute: true\ndefinition: |-\n  () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 8 $$\n",
     )
     .unwrap();
     // The same line, on a signature the loader and the engine spell
@@ -7355,14 +7358,14 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     // opposite.
     std::fs::write(
         d.dir.join("schema/alias.yml"),
-        "function: app.alias(int)\npublic_execute: true\ndefinition: |-\n  (int) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$\n",
+        "function: app.alias(int)\npublic_execute: true\ndefinition: |-\n  (int) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT $1 $$\n",
     )
     .unwrap();
     // The positive control: access granted the ordinary way, to a role the
     // declarations name. Closing `PUBLIC` must not close this.
     std::fs::write(
         d.dir.join("schema/granted.yml"),
-        "function: app.granted()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 9 $$\n",
+        "function: app.granted()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 9 $$\n",
     )
     .unwrap();
     std::fs::write(
@@ -7538,7 +7541,7 @@ fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
     let file = d.dir.join("schema/reopen.yml");
     let declaration = |value: u8, open: bool| {
         format!(
-            "function: app.reopen()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT {value} $$\n{}",
+            "function: app.reopen()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT {value} $$\n{}",
             if open { "public_execute: true\n" } else { "" }
         )
     };
@@ -7603,7 +7606,7 @@ fn closing_a_routine_a_third_role_opened_to_public_is_refused_before_it_runs() {
     let file = d.dir.join("schema/shut.yml");
     let declaration = |value: u8, open: bool| {
         format!(
-            "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT {value} $$\n{}",
+            "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT {value} $$\n{}",
             if open { "public_execute: true\n" } else { "" }
         )
     };
@@ -7677,7 +7680,7 @@ fn a_staged_revision_may_still_create_one_routine() {
     let open = d.dir.join("schema/open.yml");
     std::fs::write(
         &open,
-        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -7699,7 +7702,7 @@ fn a_staged_revision_may_still_create_one_routine() {
     // it: the window between the `CREATE` and the revoke, not the count.
     std::fs::write(
         d.dir.join("schema/shut.yml"),
-        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 2 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -10221,7 +10224,7 @@ fn a_routine_reopened_or_closed_behind_the_plan_refuses_to_close_the_run() {
 
     std::fs::write(
         d.dir.join("schema/open.yml"),
-        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\n",
+        "function: app.open()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -10319,12 +10322,12 @@ fn a_declaration_opens_a_routine_even_where_default_privileges_close_it() {
     let d = Demo::new("routine-default-acl");
     std::fs::write(
         d.dir.join("schema/open.yml"),
-        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$\npublic_execute: true\n",
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 1 $$\npublic_execute: true\n",
     )
     .unwrap();
     std::fs::write(
         d.dir.join("schema/shut.yml"),
-        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$\n",
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 2 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -10346,7 +10349,7 @@ fn a_declaration_opens_a_routine_even_where_default_privileges_close_it() {
     // privileges would hand the replacement.
     std::fs::write(
         d.dir.join("schema/open.yml"),
-        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT 3 $$\npublic_execute: true\n",
+        "function: app.open()\ndefinition: () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 3 $$\npublic_execute: true\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -13386,7 +13389,7 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     tree(&format!("{p2025}{p2026}{rest}"));
     std::fs::write(
         d.dir.join("schema/app.seven.function.yml"),
-        "function: app.seven()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n",
+        "function: app.seven()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 7 $$\n",
     )
     .unwrap();
     // The partition beside the DEFAULT moves rows (none here), so it is not
@@ -13524,7 +13527,7 @@ fn partitions_are_added_and_dropped_through_the_cli() {
     on_server(&connection, "INSERT INTO app.ev VALUES (4, '2031-06-01')");
     std::fs::write(
         d.dir.join("schema/app.eight.function.yml"),
-        "function: app.eight()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql AS $$ SELECT 8 $$\n",
+        "function: app.eight()\ndefinition: |-\n  () RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 8 $$\n",
     )
     .unwrap();
     std::fs::write(
@@ -15607,7 +15610,7 @@ fn dropped_functions_keep_their_order_after_their_releases() {
     on_server(
         &connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
            BEGIN ATOMIC SELECT app.f(x); END; \
          CREATE TABLE app.a (id integer PRIMARY KEY, v integer, \
@@ -15703,8 +15706,8 @@ fn a_dropped_function_follows_what_releases_its_generated_columns() {
     on_server(
         &connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f1(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
-         CREATE FUNCTION app.f2(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f1(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f2(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t1 (id integer PRIMARY KEY, a integer, \
                               g1 integer GENERATED ALWAYS AS (app.f1(a)) STORED); \
          CREATE TABLE app.t2 (id integer PRIMARY KEY, a integer, \
@@ -15826,7 +15829,7 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
     on_server(
         &connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 2 $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
                              g integer NOT NULL GENERATED ALWAYS AS (app.f(a)) STORED); \
          INSERT INTO app.t (id, a) VALUES (1, 5)",
@@ -15955,7 +15958,7 @@ fn a_released_input_dropped_past_an_inserted_row_carries_its_consumers() {
                 .join(format!("schema/app.{function}%28integer%29.function.yml")),
             format!(
                 "function: app.{function}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n"
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 3 $$\n"
             ),
         )
         .unwrap();
@@ -16154,7 +16157,7 @@ fn a_defaulted_generated_input_is_released_before_its_insert() {
         std::fs::write(
             d.dir.join("schema/app.f%28integer%29.function.yml"),
             "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n",
+             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 3 $$\n",
         )
         .unwrap();
         succeeds(d.run(&["drop", "app.t.a", "--reason", "release generated input"]));
@@ -16218,7 +16221,7 @@ fn a_defaulted_generated_input_is_released_before_its_insert() {
             // AlterColumnExpression that the server cannot execute.
             on_server(
                 connection,
-                "CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+                "CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog \
                  AS $$ SELECT x * 3 $$; \
                  ALTER TABLE app.t DROP COLUMN g; \
                  ALTER TABLE app.t ADD COLUMN g integer GENERATED ALWAYS AS (app.f(b)) STORED; \
@@ -16281,7 +16284,7 @@ fn a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger(
                 .join(format!("schema/app.{function}%28integer%29.function.yml")),
             format!(
                 "function: app.{function}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n"
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 3 $$\n"
             ),
         )
         .unwrap();
@@ -17679,7 +17682,7 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new("overload-rebind");
     std::fs::write(d.dir.join("schema/f-bigint.yml"),
-        "function: app.f(bigint)\ndefinition: (n bigint) RETURNS text LANGUAGE sql AS $$ SELECT 'old' $$\n").unwrap();
+        "function: app.f(bigint)\ndefinition: (n bigint) RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 'old' $$\n").unwrap();
     std::fs::write(d.dir.join("schema/caller.yml"),
         "function: app.caller()\ndefinition: () RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT f(1); END\n").unwrap();
     succeeds(d.run(&["plan"]));
@@ -17691,7 +17694,7 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     );
 
     std::fs::write(d.dir.join("schema/f-integer.yml"),
-        "function: app.f(integer)\ndefinition: (n integer) RETURNS text LANGUAGE sql AS $$ SELECT 'new' $$\n").unwrap();
+        "function: app.f(integer)\ndefinition: (n integer) RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 'new' $$\n").unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
@@ -17736,7 +17739,7 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
     // A second new signature still reaches the ordinary carried-state guard.
     // The scanner is intentionally conservative about overload applicability.
     std::fs::write(d.dir.join("schema/f-smallint.yml"),
-        "function: app.f(smallint)\ndefinition: (n smallint) RETURNS text LANGUAGE sql AS $$ SELECT 'small' $$\n").unwrap();
+        "function: app.f(smallint)\ndefinition: (n smallint) RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 'small' $$\n").unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     on_server(connection, "COMMENT ON FUNCTION app.caller() IS 'keep me'");
@@ -17894,7 +17897,7 @@ fn managed_omission_reports_each_catalog_fact_once_and_keeps_recording_refusals(
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new("omission-facts");
     d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT n $$\n").unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -17916,7 +17919,7 @@ fn managed_omission_reports_each_catalog_fact_once_and_keeps_recording_refusals(
     omitted_state_cannot_be_recorded(&d, connection);
     on_server(
         connection,
-        "DROP AGGREGATE app.f(integer); CREATE FUNCTION app.f(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$",
+        "DROP AGGREGATE app.f(integer); CREATE FUNCTION app.f(n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT n $$",
     );
     succeeds(d.run(&["verify", "--db", connection]));
 }
@@ -18004,7 +18007,7 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
     std::fs::write(
         d.dir.join("schema/scalar-bigint.yml"),
         "function: app.json_scalar(bigint)\n\
-         definition: (n bigint) RETURNS integer LANGUAGE sql AS $$ SELECT 42 $$\n",
+         definition: (n bigint) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 42 $$\n",
     )
     .unwrap();
     std::fs::write(
@@ -18024,7 +18027,7 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
     std::fs::write(
         d.dir.join("schema/scalar-integer.yml"),
         "function: app.json_scalar(integer)\n\
-         definition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT 99 $$\n",
+         definition: (n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 99 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -18209,7 +18212,7 @@ fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new("limitation-scope");
     d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT n $$\n").unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -18285,7 +18288,7 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new("unmanaged-modules");
     d.table(ONE_COLUMN);
-    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$\n").unwrap();
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.t(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT n $$\n").unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -21278,7 +21281,7 @@ fn modules_apply_then_pull_round_trip_and_changed_bodies_are_drift() {
         "view: app.v\ndefinition: SELECT id FROM app.t WHERE id > 0\n",
     )
     .unwrap();
-    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n + 1 $$\n").unwrap();
+    std::fs::write(d.dir.join("schema/f.yml"), "function: app.f(integer)\ndefinition: (n integer) RETURNS integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT n + 1 $$\n").unwrap();
     let plan = connected_artifact(&d, connection, false);
     succeeds(approved_apply(&d, connection, &plan, &[]));
     succeeds(d.run(&["verify", "--db", connection]));
@@ -28035,7 +28038,7 @@ fn a_routine_with_a_continued_escape_string_default_plans_and_applies() {
     let d = bootstrapped_demo(connection, "continueddefault539", ONE_COLUMN);
     std::fs::write(
         d.dir.join("schema/app.f.function.yml"),
-        "function: app.f(text, integer)\ndefinition: |-\n  (a text DEFAULT E'x'\n  'y\\'z', b integer DEFAULT 1) RETURNS text LANGUAGE sql AS $$ SELECT a $$\n",
+        "function: app.f(text, integer)\ndefinition: |-\n  (a text DEFAULT E'x'\n  'y\\'z', b integer DEFAULT 1) RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT a $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -28604,7 +28607,7 @@ fn a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone() {
 
     std::fs::write(
         d.dir.join("schema/app.orders.function.yml"),
-        "function: app.orders()\ndefinition: |-\n  () RETURNS SETOF integer LANGUAGE sql AS $$ SELECT 42 $$\n",
+        "function: app.orders()\ndefinition: |-\n  () RETURNS SETOF integer LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 42 $$\n",
     )
     .unwrap();
     let planned = apply(&d);
@@ -29560,13 +29563,13 @@ fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     let schema = d.dir.join("schema");
     std::fs::write(
         schema.join("app.zz%28%29.function.yml"),
-        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$\n",
+        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT 'x' $$\n",
     )
     .unwrap();
     std::fs::write(
         schema.join("app.zz_double%28integer%29.function.yml"),
         "function: app.zz_double(integer)\ndefinition: |-\n  (i integer) RETURNS integer \
-         LANGUAGE sql IMMUTABLE AS $$ SELECT i * 2 $$\n",
+         LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT i * 2 $$\n",
     )
     .unwrap();
     std::fs::write(
@@ -29629,7 +29632,7 @@ fn an_offline_plan_names_the_catalog_fact_it_could_not_read_in_json_too() {
     let function = d.dir.join("schema/app.zz%28%29.function.yml");
     std::fs::write(
         &function,
-        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$\n",
+        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT 'x' $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -30032,7 +30035,7 @@ fn partition_inheritance_flow(server: &str, slug: &str) {
             &function,
             format!(
                 "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$\n"
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ {body} $$\n"
             ),
         )
         .unwrap();
@@ -30197,7 +30200,7 @@ fn parent_keys_flow(server: &str, slug: &str) {
     on_server(
         &conn,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog \
              AS $$ SELECT x $$; \
          CREATE TABLE app.ref (id integer PRIMARY KEY); \
          INSERT INTO app.ref VALUES (1), (2), (500); \
@@ -30331,7 +30334,7 @@ fn parent_keys_flow(server: &str, slug: &str) {
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x + 0 $$\n",
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x + 0 $$\n",
     )
     .unwrap();
     edit(
@@ -30371,7 +30374,7 @@ fn parent_keys_flow(server: &str, slug: &str) {
     std::fs::write(
         d.dir.join("schema/app.f%28integer%29.function.yml"),
         "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
-         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x + 1 $$\n",
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x + 1 $$\n",
     )
     .unwrap();
     applied("unbacked.json");
@@ -31278,7 +31281,7 @@ fn parent_indexes_flow(server: &str, slug: &str) {
 }
 
 const SETUP_1699: &str = "CREATE SCHEMA app; \
-     CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+     CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
      CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, k integer, n integer, \
          m integer, z integer, g integer DEFAULT app.f(1)) PARTITION BY RANGE (ts); \
      CREATE TABLE app.ev_2024 PARTITION OF app.ev \
@@ -31699,8 +31702,8 @@ fn a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own() {
     let own = OwnDatabase::new(&server, "parts-1588");
     let conn = own.connection().to_owned();
     let tree = "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
-         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT app.f(1)) \
              PARTITION BY RANGE (k); \
          CREATE TABLE app.ev_inh PARTITION OF app.ev FOR VALUES FROM (0) TO (10); \
@@ -31822,8 +31825,8 @@ fn a_partitions_default_taken_back_resolves_under_its_parents_schema() {
     on_server(
         db.connection(),
         "CREATE SCHEMA app; CREATE SCHEMA arch; \
-         CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT 1 $$; \
-         CREATE FUNCTION arch.f() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT 2 $$; \
+         CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT 1 $$; \
+         CREATE FUNCTION arch.f() RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT 2 $$; \
          SET search_path = app; \
          CREATE TABLE app.ev (k integer NOT NULL, v integer DEFAULT f()) \
              PARTITION BY RANGE (k); \
@@ -33124,7 +33127,7 @@ fn renamed_parent_generated_flow(server: &str, slug: &str) {
     on_server(
         &conn,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog \
              AS $$ SELECT x $$; \
          CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL, \
              g integer GENERATED ALWAYS AS (app.f(id)) STORED) PARTITION BY RANGE (ts); \
@@ -34973,7 +34976,7 @@ fn policy_rename_project(base: &str, slug: &str, policy: &str) -> (OwnDatabase, 
     on_server(own.connection(),&format!("CREATE SCHEMA app; CREATE SCHEMA archive;
         CREATE TABLE app.t(id integer, checked integer, unused integer);
         CREATE TABLE app.owner(id integer);
-        CREATE FUNCTION app.visible(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$;
+        CREATE FUNCTION app.visible(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$;
         {policy}"));
     let d = Demo::new(slug);
     succeeds(d.run(&["pull", "--db", own.connection()]));
