@@ -5965,3 +5965,49 @@ and on the engine by `mssql_a_changed_schema_bound_callee_is_rebuilt_around_by_i
 the engine: the scratch bootstrap creates the declared modules in an order the
 lexical match chose, before any capture exists, and it fails the same on a tree
 without this change. That ordering is c3b of #2143.
+
+<a id="dec-2674-1"></a>
+
+**DEC-2674.1. Recovery waits out a stop the runtime is finishing, and judges a stopped process as dead.**
+`a_docker_run_killed_during_use_is_confirmed_while_another_remover_runs` kept a
+container with `was not removed: it is stopping`: the sweep read the container
+in the middle of the other remover's stop and took the runtime's name for a
+state no one could judge. `stopping` is Podman's. Measured on Podman 5.7.0,
+`rm --force` holds a container there for its whole stop timeout (about 100 ms
+for an idle PostgreSQL server, 400 ms or more once the shutdown checkpoint has
+dirty buffers to write, 2.1 s under `--stop-timeout 2`, 10.1 s for a PID 1 that
+ignores SIGTERM), then through `stopped` (the process has exited, the container
+is not yet cleaned up) to `exited` or to gone. Docker has none of these: its
+`rm --force` kills at once, and the race it has is the `running` server that is
+unreadable because a remover killed it (DEC-2513.1). A scan of the sweep
+against a remover started 25 ms to 400 ms earlier, on a server holding a
+3,000,000-row table, kept the container as `it is stopping` at 12 of 17 offsets
+before this change and at none of 51 after.
+
+A status the runtime itself moves a container out of is not a verdict on its
+owner. `removing` already waited (DEC-2513.1); `stopping` is now waited out the
+same way, in the same two places a sweep reads the runtime (the first
+observation, and the re-read after an unreadable keeper probe), and the status
+it ends in is judged like any other: gone is dead, `exited`, `dead` and
+`stopped` are dead (a server that is not running serves no run), `removing`
+waits again, `running` goes to the keeper probe. The wait is a read of the
+container's own status every 100 ms, bounded at fifteen seconds: Docker and
+Podman give a server ten seconds to stop by default before they kill it, and a
+removal then gets the five seconds DEC-2513.1 allows. One stalled call is
+inside the bound. Only the runtime's missing-container answer is absence: a
+failed read, a container that is another's by now, and a stop that outlasts the
+bound keep the container, named `its stop did not finish within 15000ms` with
+the command that removes it. `remove_with_volumes` confirms absence the same
+way: after its own `kill`, `stopping` is a status to wait on, not a container
+that was left. `paused`, `configured`, `unknown` and any status not named here
+stay unprovable.
+
+The decisions are tested without a runtime (the wait against an answering
+runtime's every ending, `stopped` as dead, `stopping` as pending in
+`container_absent`), and on Podman against a container the runtime holds
+`stopping`: a sweep that begins inside the other remover's stop confirms the
+removal once the stop ends, from both reads; one that cannot outlast a stop of a
+minute inside a one-second wait keeps the container with that reason.
+Docker has no `stopping` to observe, so those tests say so and return there.
+#2689 is not this: a `running` container whose server read failed with a
+transport error has no status in transit to wait for.

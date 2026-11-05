@@ -13,7 +13,9 @@ use super::super::{Error, ProduceError, engine};
 
 mod recovery;
 #[cfg(test)]
-pub(super) use recovery::{Keeper, seen, swept, swept_alone, swept_with_observation};
+pub(super) use recovery::{
+    Keeper, seen, swept, swept_alone, swept_with_observation, swept_with_observation_within,
+};
 mod startup;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};
@@ -418,12 +420,14 @@ impl Container {
 }
 
 // One status read decides whether to wait: a second inspect can race the
-// transition from removing to absent (DEC-2513.1).
+// transition from removing to absent (DEC-2513.1). Podman's `stopping` is the
+// same kind of status: the stop `rm --force` begins, which this run's `kill`
+// has just cut short (DEC-2674.1).
 fn container_absent(id: &str, observed: Result<String, String>) -> Result<bool, String> {
     match observed {
         Err(why) if no_such_container(&why) => Ok(true),
         Err(why) => Err(why),
-        Ok(status) if status.trim() == "removing" => Ok(false),
+        Ok(status) if matches!(status.trim(), "removing" | "stopping") => Ok(false),
         Ok(status) => Err(format!(
             "the docker container {id} is still {}",
             status.trim()
@@ -431,34 +435,42 @@ fn container_absent(id: &str, observed: Result<String, String>) -> Result<bool, 
     }
 }
 
-async fn wait_absent<F: std::future::Future<Output = Result<bool, String>>>(
+/// Reads `observe` until it yields a value, says why it cannot, or `within`
+/// ends. The bound includes a stalled call, and `unfinished` opens the
+/// message for the time running out.
+async fn wait_until<T, F: std::future::Future<Output = Result<Option<T>, String>>>(
     within: Duration,
+    unfinished: &str,
     mut observe: impl FnMut() -> F,
-) -> Result<(), String> {
+) -> Result<T, String> {
     let deadline = tokio::time::Instant::now() + within;
+    let late = || format!("{unfinished} within {}ms", within.as_millis());
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "removal was not confirmed within {}ms",
-                within.as_millis()
-            ));
+            return Err(late());
         }
         match tokio::time::timeout_at(deadline, observe()).await {
-            Ok(Ok(true)) => return Ok(()),
-            Ok(Ok(false)) => {}
+            Ok(Ok(Some(done))) => return Ok(done),
+            Ok(Ok(None)) => {}
             Ok(Err(why)) => return Err(why),
-            Err(_) => {
-                return Err(format!(
-                    "removal was not confirmed within {}ms",
-                    within.as_millis()
-                ));
-            }
+            Err(_) => return Err(late()),
         }
         tokio::time::sleep_until(
             (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
         )
         .await;
     }
+}
+
+async fn wait_absent<F: std::future::Future<Output = Result<bool, String>>>(
+    within: Duration,
+    mut observe: impl FnMut() -> F,
+) -> Result<(), String> {
+    wait_until(within, "removal was not confirmed", || {
+        let seen = observe();
+        async move { seen.await.map(|absent| absent.then_some(())) }
+    })
+    .await
 }
 
 async fn wait_removed(id: &str) -> Result<(), String> {
@@ -734,8 +746,14 @@ mod tests {
             container_absent("owned", Ok("removing\n".into())),
             Ok(false)
         );
+        // Podman's stop in progress, which this run's own kill cuts short.
+        assert_eq!(
+            container_absent("owned", Ok("stopping\n".into())),
+            Ok(false)
+        );
         for response in [
             Ok("running".into()),
+            Ok("exited".into()),
             Ok("".into()),
             Err("permission denied".into()),
             Err("daemon unavailable".into()),

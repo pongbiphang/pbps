@@ -1902,6 +1902,11 @@ the PostgreSQL crate, the connection seam or anything it depends on.
   name`, which the runner reports as unchecked and the apply proceeds past. The
   unit suite could only ever check that the SQL said what its author thought it
   said — and it did.
+- A container the runtime calls `stopping`, then `stopped`: Podman's names for
+  the middle of a stop, which crash recovery read as a verdict and kept the
+  container for. Docker has neither, so CI could not see it; only a gate on
+  Podman, with a server busy enough to hold the stop open, did (DEC-2674.1). A
+  status a runtime moves on from by itself is something to wait on.
 
 **A reasoned worry in an ADR's Limits was a shipped bug.** ADR-0013 §4 found,
 on PostgreSQL, that comparing a declared expression against the engine's
