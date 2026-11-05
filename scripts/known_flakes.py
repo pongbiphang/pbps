@@ -2,8 +2,8 @@
 """The register of known flaky live tests (DEC-2553.2).
 
 `scripts/known-flakes.json` names each flake by its exact libtest name and the
-cargo invocation prefix that runs it, the open issue that records it and an
-expiry. `scripts/live-shards.py --resume` may complete a gate that failed only
+cargo invocation prefix that runs it, or a whole Python check (DEC-2651.1),
+the open issue that records it and an expiry. `scripts/live-shards.py --resume` may complete a gate that failed only
 on registered, unexpired entries (DEC-2553.1); the register never skips or
 selects a test.
 
@@ -49,10 +49,18 @@ def expiry(entry):
     return datetime.date.fromisoformat(entry["expires"])
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, f"{REGISTER} repeats field: {key}")
+        result[key] = value
+    return result
+
+
 def load(text):
     """Validate the register's schema and return its entries."""
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=unique_object)
     except ValueError as error:
         raise RegisterError(f"{REGISTER} is not valid JSON: {error}") from error
     require(isinstance(data, dict) and set(data) == {"version", "flakes"} and data["version"] == 1
@@ -68,8 +76,10 @@ def load(text):
         require(isinstance(entry["test"], str) and entry["test"], f"{label} has no test name")
         cargo = entry["cargo"]
         require(isinstance(cargo, list) and all(isinstance(a, str) and a for a in cargo)
-                and cargo[:1] == ["test"] and cargo[-1:] == ["--"],
-                f"{label}: cargo must be the invocation prefix from `test` to `--`")
+                and (cargo[:1] == ["test"] and cargo[-1:] == ["--"]
+                     or cargo == ["python", entry["test"]] and re.fullmatch(
+                         r"scripts/[A-Za-z0-9_-]+\.py", entry["test"])),
+                f"{label}: cargo must be the invocation prefix from `test` to `--`, or a whole Python check")
         require(isinstance(entry["expires"], str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", entry["expires"]),
                 f"{label}: expires must be YYYY-MM-DD")
         try:
@@ -87,7 +97,7 @@ def active(entries, today):
     return {(tuple(e["cargo"]), e["test"]): e for e in entries if expiry(e) >= today}
 
 
-def check(entries, today, targets, strict):
+def check(entries, today, targets, strict, *, python_checks=None):
     """Raise RegisterError unless every entry is valid against the compiled inventory."""
     import ignored_test_inventory as inventory  # the resume path needs only load and active
     for entry in entries:
@@ -96,6 +106,12 @@ def check(entries, today, targets, strict):
                 f"{label} expires {entry['expires']}, more than {MAX_DAYS} days out")
         require(not strict or expiry(entry) >= today,
                 f"{label} expired {entry['expires']}: remove it or renew it with a new date")
+        if entry["cargo"][:1] == ["python"]:
+            if python_checks is None:
+                import gate_rerun
+                python_checks = gate_rerun.python_checks(Path(__file__).resolve().parents[1])
+            require(entry["test"] in python_checks, f"{label}: no longer exists in CI's Python gate")
+            continue
         try:
             selection = inventory.cargo_selection(["cargo", *entry["cargo"]])
         except inventory.InventoryError as error:

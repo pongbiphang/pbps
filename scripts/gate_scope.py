@@ -39,7 +39,7 @@ BLOCKED = tuple(re.compile(p) for p in (
     r"^scripts/check-live-fixture",
     r"^scripts/resolver-mssql-fixtures\.sh$",
     r"^scripts/fixtures/",
-    r"^scripts/(gate_scope|known_flakes|known-flakes)",
+    r"^scripts/(gate_scope|gate_rerun|known_flakes|known-flakes)",
 ))
 # Header lines that belong to the change; `index`, `---`, `+++` and `@@` move.
 HEADER = (b"old mode ", b"new mode ", b"new file mode ", b"deleted file mode ")
