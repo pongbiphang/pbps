@@ -59,11 +59,11 @@ REGISTER = "scripts/known-flakes.json"
 # A registered flake that fails a third time on one head is not flaky (DEC-2553.1).
 MAX_FLAKE_FAILURES = 2
 # Default-include: any variable with these spellings may change a verdict.
-INPUT_PREFIXES = ("PBPS_", "INSTA_", "CARGO_PROFILE_")
+INPUT_PREFIXES = ("PBPS_", "INSTA_", "CARGO_", "RUST", "PYTHON", "NODE_", "GIT_CONFIG_", "LC_")
+SCHEDULING_VARIABLES = {"CARGO_BUILD_JOBS", "CARGO_TARGET_DIR"}
 # Python checks read CI expiry scope and the LocalDB install root. Windows
 # uppercases environment keys, so compare their normalized spelling below.
-INPUT_NAMES = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS",
-               "EVENT", "BASE_SHA", "PROGRAMFILES"}
+INPUT_NAMES = {"EVENT", "BASE_SHA", "PROGRAMFILES", "PATH", "HOME", "LANG", "LANGUAGE", "TZ"}
 FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
@@ -397,10 +397,14 @@ def inputs_digest(env):
         require(result.returncode == 0, f"{command[0]} failed: {result.stderr.strip()}")
         return result.stdout
     names = sorted(name for name in env
-                   if name not in FIXTURE_VARIABLES and not name.startswith("PBPS_LIVE_")
-                   and (name.upper() in INPUT_NAMES or name.startswith(INPUT_PREFIXES)))
+                   if name.upper() not in FIXTURE_VARIABLES | SCHEDULING_VARIABLES
+                   and not name.upper().startswith("PBPS_LIVE_")
+                   and (name.upper() in INPUT_NAMES or name.upper().startswith(INPUT_PREFIXES)))
+    # Startup flags can disable Python assertions without changing sys.version.
+    # Expiry depends on the UTC day even when EVENT and BASE_SHA stay unchanged.
     # rustc's commit and host identify the toolchain; cargo ships with it.
-    body = {"version": 1, "rustc": tool(["rustc", "-vV"]), "python": sys.version,
+    body = {"version": 1, "rustc": tool(["rustc", "-vV"]), "python": sys.version, "python_executable": sys.executable,
+            "python_flags": list(sys.flags), "expiry_day": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
             "env": {name: env[name] for name in names}}
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest(), names
 
@@ -414,7 +418,7 @@ def write_atomic(path, text):
 
 def read_json(path, what):
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(), object_pairs_hook=RERUN.unique_object)
     except (OSError, ValueError) as error:
         raise ValueError(f"unreadable {what} {path}: {error}") from error
 

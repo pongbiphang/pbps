@@ -49,10 +49,18 @@ def expiry(entry):
     return datetime.date.fromisoformat(entry["expires"])
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, f"{REGISTER} repeats field: {key}")
+        result[key] = value
+    return result
+
+
 def load(text):
     """Validate the register's schema and return its entries."""
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=unique_object)
     except ValueError as error:
         raise RegisterError(f"{REGISTER} is not valid JSON: {error}") from error
     require(isinstance(data, dict) and set(data) == {"version", "flakes"} and data["version"] == 1

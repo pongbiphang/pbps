@@ -33,6 +33,13 @@ class Load(unittest.TestCase):
         self.assertEqual(kf.load(register(entry()))[0]["issue"], 2513)
         self.assertEqual(kf.load(register()), [])
 
+    def test_duplicate_fields_are_ambiguous_even_if_the_last_value_is_valid(self):
+        for field, text in (("version", register(entry()).replace('"version": 1', '"version": 2, "version": 1')),
+                            ("expires", register(entry()).replace('"expires": ', '"expires": "2000-01-01", "expires": '))):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(kf.RegisterError, "repeats field: " + field):
+                    kf.load(text)
+
     def test_schema_violations_are_refused(self):
         for name, text, fragment in (
                 ("invalid json", "{", "not valid JSON"),

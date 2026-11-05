@@ -50,7 +50,10 @@ scope review in the PR, then write a JSON evidence file:
 
 Proof paths are relative to the evidence file or absolute. `paths` contains
 tracked repository paths, including the defining file and every external
-module/fixture it uses; directory paths cover their descendants. The driver
+module/fixture it uses; directory paths cover their descendants. Scope paths must be literal,
+repo-relative POSIX spellings from the tracked tree: no root `.`, dot or parent
+components, absolute paths, empty strings, trailing `/` or glob characters.
+Duplicate JSON fields are refused. The driver
 also protects a Rust file's same-named module directory (`mod.rs` protects its
 parent directory) and shared gate/build inputs. It checks the defining Rust
 function exists. Macro-generated names with no verifiable defining function
@@ -78,3 +81,8 @@ The allowance is stored under the common Git directory's
 Follow up with an ordinary register PR so recurring failures stay visible.
 Python register entries use the same whole-check `cargo`/`test` selector as
 the evidence file, with the ordinary issue and expiry fields.
+
+Resume inputs also pin Python startup flags, the executable/search path,
+Cargo/Rust/Python/Node and Git configuration environment, locale, and the UTC
+expiry day. Build jobs and the target directory are scheduling/storage settings. Keep that context identical for isolated proofs
+and resumption; a different expiry day requires fresh evidence.

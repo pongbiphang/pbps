@@ -8,9 +8,10 @@ from a successful neighbour or a register edit. See docs/GATE-RERUN.md.
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
+import stat
 
 
 def require(condition, message):
@@ -18,9 +19,17 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, f"duplicate rerun evidence field: {key}")
+        result[key] = value
+    return result
+
+
 def read(path):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_text(), object_pairs_hook=unique_object)
     except (OSError, ValueError) as error:
         raise ValueError(f"unreadable rerun evidence {path}: {error}") from error
 
@@ -28,22 +37,36 @@ def read(path):
 def git(root, *args):
     result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True)
     require(result.returncode == 0, f"cannot read rerun Git evidence: {result.stderr.strip()}")
-    return result.stdout if args[0] == "diff" else result.stdout.strip()
+    return result.stdout if args[0] == "diff" or "-z" in args else result.stdout.strip()
 
 
 def identity(cargo, name):
     return json.dumps([list(cargo), name], separators=(",", ":"))
 
 
-def path_name(value):
-    require(isinstance(value, str) and value and not PurePosixPath(value).is_absolute()
-            and ".." not in PurePosixPath(value).parts and "\\" not in value
-            and str(PurePosixPath(value)) == value, f"invalid evidence scope path: {value!r}")
-    return value
+class ScopePathError(ValueError):
+    """A scope must be one canonical, literal entry in the tracked Git tree."""
+
+
+def path_name(value, tracked):
+    # Validate the spelling before normalization can erase a component. Compare
+    # against literal Git inventory, never Git pathspecs or filesystem targets.
+    if (not isinstance(value, str) or not value or value == "."
+            or PurePosixPath(value).is_absolute() or PureWindowsPath(value).drive
+            or ".." in PurePosixPath(value).parts or "\\" in value
+            or any(c in value for c in "*?[]{}\0")
+            or str(PurePosixPath(value)) != value):
+        raise ScopePathError(f"invalid evidence scope path: {value!r}; use a literal normalized repo-relative path")
+    path = PurePosixPath(value)
+    if not any(overlaps(entry, path) for entry in tracked):
+        raise ScopePathError(f"untracked evidence scope path: {value!r}")
+    return path
 
 
 def overlaps(changed, scope):
-    return changed == scope or changed.startswith(scope + "/")
+    # Components enforce '/' boundaries. The inferred parent of a root mod.rs
+    # has no components and correctly protects the entire repository.
+    return changed.parts[:len(scope.parts)] == scope.parts
 
 
 def python_checks(root):
@@ -94,7 +117,8 @@ def load(path, root, tree, inputs):
     master = git(root, "rev-parse", "--verify", "origin/master^{commit}")
     head = git(root, "rev-parse", "--verify", "HEAD^{commit}")
     base = git(root, "merge-base", master, head)
-    changed = git(root, "diff", "--no-renames", "--name-only", "-z", base, head).split("\0")
+    changed = [PurePosixPath(p) for p in git(root, "diff", "--no-renames", "--name-only", "-z", base, head).split("\0") if p]
+    tracked = {PurePosixPath(p) for p in git(root, "ls-tree", "-r", "--full-tree", "--name-only", "-z", "HEAD").split("\0") if p}
     entries = {}
     for entry in data["names"]:
         require(isinstance(entry, dict) and set(entry) == {
@@ -107,28 +131,26 @@ def load(path, root, tree, inputs):
                 "each rerun name needs a tracking issue")
         require(isinstance(entry["scope_review"], str) and entry["scope_review"].strip(),
                 "record the review of the complete module and fixture scope")
-        source = path_name(entry["source"])
+        source = path_name(entry["source"], tracked)
         require(isinstance(entry["paths"], list) and entry["paths"], "missing module/fixture scope")
-        paths = [path_name(p) for p in entry["paths"]]
+        paths = [path_name(p, tracked) for p in entry["paths"]]
         require(source in paths, "scope must include the test source file")
-        for p in paths:
-            require(git(root, "ls-tree", "HEAD", "--", p), f"scope is not tracked: {p}")
-        text = git(root, "show", "HEAD:" + source)
+        require(source in tracked, f"test source is not a tracked file: {source}")
+        text = git(root, "show", "HEAD:" + str(source))
         if cargo[:1] == ["python"]:
-            require(cargo == ["python", name] and name == source and source.endswith(".py"),
+            require(cargo == ["python", name] and name == str(source) and source.suffix == ".py",
                     "Python reruns are whole checks identified by their script path")
         else:
-            require(cargo[:1] == ["test"] and cargo[-1:] == ["--"] and source.endswith(".rs")
+            require(cargo[:1] == ["test"] and cargo[-1:] == ["--"] and source.suffix == ".rs"
                     and re.search(r"\bfn\s+" + re.escape(name.split("::")[-1]) + r"\s*\(", text),
                     "cannot verify the Rust test source; provide its defining file")
         # A Rust file is a module together with its same-named directory. A
         # mod.rs owns its directory; the operator adds every external fixture.
-        module = str(PurePosixPath(source).parent if source.endswith("/mod.rs")
-                     else PurePosixPath(source).with_suffix(""))
-        scope = [*paths, module, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
-                 ".cargo", ".github/workflows/ci.yml", "scripts/live-shards.py",
-                 "scripts/gate_rerun.py"]
-        hits = [p for p in changed if p and any(overlaps(p, s) for s in scope)]
+        module = source.parent if source.name == "mod.rs" else source.with_suffix("")
+        scope = [*paths, module, *(PurePosixPath(p) for p in (
+                 "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo",
+                 ".github/workflows/ci.yml", "scripts/live-shards.py", "scripts/gate_rerun.py"))]
+        hits = [str(p) for p in changed if any(overlaps(p, s) for s in scope)]
         require(not hits, f"PR diff touches the test file, module, fixture or gate inputs: {hits}")
         evidence_dir = Path(path).resolve().parent
         require(all(isinstance(entry[p], str) and entry[p] for p in ("master_pass", "head_pass")),
@@ -143,9 +165,16 @@ def load(path, root, tree, inputs):
 
 
 def claim_path(root, tree, cargo, name):
-    directory = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    directory = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve(strict=True)
+    ledger = directory / "pbps-targeted-reruns"
+    for parent in (ledger, ledger / tree):
+        try:
+            mode = parent.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        require(stat.S_ISDIR(mode), f"unreadable targeted-rerun ledger directory: {parent}")
     key = hashlib.sha256(identity(cargo, name).encode()).hexdigest()
-    return directory / "pbps-targeted-reruns" / tree / (key + ".json")
+    return ledger / tree / (key + ".json")
 
 
 def claimed(root, tree, cargo, name):

@@ -13,7 +13,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import signal
 import subprocess
@@ -21,6 +21,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ("live-shards.py", "live-transport.py", "gate_rerun.py", "known_flakes.py", "ignored_test_inventory.py",
@@ -166,7 +167,7 @@ class Harness(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def drive(self, *options, fail=(), die=None, shards=2, output=None, check=None, env=None, a_names=A_NAMES, suite="pg"):
+    def drive(self, *options, fail=(), die=None, shards=2, output=None, check=None, env=None, a_names=A_NAMES, suite="pg", python_flags=()):
         """Run the driver; returns (CompletedProcess, output directory)."""
         type(self).counter += 1
         output = output or self.runs / f"run{self.counter}"
@@ -183,7 +184,7 @@ class Harness(unittest.TestCase):
         if die:
             env["FAKE_DIE"] = die
         result = subprocess.run(
-            [sys.executable, "scripts/live-shards.py", "--suite", suite, "--pg-shards", str(shards), "--mssql-shards", str(shards),
+            [sys.executable, *python_flags, "scripts/live-shards.py", "--suite", suite, "--pg-shards", str(shards), "--mssql-shards", str(shards),
              "--prefix", "s2553", "--output", str(output), "--flakes-ref", "HEAD", *options],
             cwd=self.repo, env=env, text=True, capture_output=True, timeout=120)
         if check is not None:
@@ -366,12 +367,13 @@ class IndependentFailures(Harness):
         self.assertIn("already attempted", result.stderr)
 
     def test_a_later_register_cannot_bypass_a_targeted_attempt_in_the_shared_ledger(self):
-        for suite, lost in (("pg", False), ("pg", True), ("python", False)):
-            with self.subTest(suite=suite, lost=lost):
+        for suite, lost, broken_ledger in (("pg", False, False), ("pg", True, False),
+                                          ("python", False, False), ("pg", False, True)):
+            with self.subTest(suite=suite, lost=lost, broken_ledger=broken_ledger):
                 # Each case owns a distinct tree and starts with no registration.
                 self.setUp()
                 with (self.repo / "notes.md").open("a") as out:
-                    out.write(f"{suite} {lost}\n")
+                    out.write(f"{suite} {lost} {broken_ledger}\n")
                 git(self.repo, "commit", "-q", "-am", "distinct attempted head")
                 head = git(self.repo, "rev-parse", "HEAD")
                 name = "scripts/check_demo.py" if suite == "python" else "a05"
@@ -390,13 +392,22 @@ class IndependentFailures(Harness):
                 register = git(self.repo, "rev-parse", "HEAD")
                 git(self.repo, "reset", "--hard", head)
                 git(self.repo, "update-ref", "refs/remotes/origin/master", register)
+                ledger = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+                ledger = (self.repo / ledger / "pbps-targeted-reruns").resolve()
+                saved = ledger.with_name(ledger.name + "-saved")
+                if broken_ledger:
+                    ledger.rename(saved)
+                    ledger.symlink_to(ledger.with_name("missing-ledger"), target_is_directory=True)
                 try:
                     result, refused = self.drive("--resume", str(before), "--flakes-ref", "origin/master",
                                                  suite=suite, shards=1, check=1)
-                    self.assertIn("targeted rerun already attempted", result.stderr)
+                    self.assertIn("unreadable targeted-rerun ledger" if broken_ledger
+                                  else "targeted rerun already attempted", result.stderr)
                     self.assertFalse(refused.exists())
                     self.assertFalse(self.trace.exists(), "a refused waiver must execute no tests")
                 finally:
+                    if broken_ledger:
+                        ledger.unlink(); saved.rename(ledger)
                     git(self.repo, "update-ref", "refs/remotes/origin/master", self.master)
 
     def test_a_lost_targeted_rerun_cannot_get_another_attempt(self):
@@ -406,6 +417,181 @@ class IndependentFailures(Harness):
                               die="a05", shards=1, check=1)
         result, _ = self.drive("--resume", str(after), shards=1, check=1)
         self.assertIn("targeted rerun has no passing receipt", result.stderr)
+
+    def refuse_scope_path(self, value):
+        rerun = self.shards.RERUN
+        tracked = {PurePosixPath("src/cases.rs"), PurePosixPath("fixtures/data.sql")}
+        with self.assertRaisesRegex(rerun.ScopePathError, "invalid evidence scope path"):
+            rerun.path_name(value, tracked)
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        for field in ("source", "paths"):
+            with self.subTest(field=field):
+                evidence = self.evidence(before)
+                data = json.loads(evidence.read_text())
+                if field == "source":
+                    data["names"][0][field] = value
+                else:
+                    data["names"][0][field].append(value)
+                evidence.write_text(json.dumps(data))
+                result, output = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence),
+                                             shards=1, check=1)
+                self.assertIn("invalid evidence scope path", result.stderr)
+                self.assertFalse(output.exists())
+                self.assertFalse(self.trace.exists())
+
+    def test_root_scope_is_refused_at_parse_time(self):
+        self.refuse_scope_path(".")
+
+    def test_dot_prefixed_scope_is_refused_at_parse_time(self):
+        self.refuse_scope_path("./src/cases.rs")
+
+    def test_parent_scope_is_refused_at_parse_time(self):
+        self.refuse_scope_path("../src/cases.rs")
+
+    def test_absolute_scope_is_refused_at_parse_time(self):
+        for value in ("/src/cases.rs", "C:/src/cases.rs"):
+            with self.subTest(value=value):
+                self.refuse_scope_path(value)
+
+    def test_empty_scope_is_refused_at_parse_time(self):
+        self.refuse_scope_path("")
+
+    def test_glob_scope_is_refused_at_parse_time(self):
+        for value in ("fixtures/*", "fixtures/?", "fixtures/[x]", "fixtures/{x,y}"):
+            with self.subTest(value=value):
+                self.refuse_scope_path(value)
+
+    def test_trailing_slash_scope_is_refused_at_parse_time(self):
+        self.refuse_scope_path("fixtures/")
+
+    def test_noncanonical_components_are_refused_at_parse_time(self):
+        for value in ("src//cases.rs", "src/./cases.rs", "src/../src/cases.rs", "src\\cases.rs"):
+            with self.subTest(value=value):
+                self.refuse_scope_path(value)
+
+    def test_scope_must_be_a_literal_tracked_file_or_directory_prefix(self):
+        rerun = self.shards.RERUN
+        tracked = {PurePosixPath("src/cases.rs")}
+        self.assertEqual(rerun.path_name("src", tracked), PurePosixPath("src"))
+        self.assertEqual(rerun.path_name("src/cases.rs", tracked), PurePosixPath("src/cases.rs"))
+        for value in ("missing", ":(top)src/cases.rs", ":(exclude)notes.md"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(rerun.ScopePathError, "untracked evidence scope path"):
+                    rerun.path_name(value, tracked)
+
+    def test_directory_scope_never_matches_a_sibling_prefix(self):
+        rerun = self.shards.RERUN
+        self.assertTrue(rerun.overlaps(PurePosixPath("scripts/check.py"), PurePosixPath("scripts")))
+        self.assertFalse(rerun.overlaps(PurePosixPath("scripts2/check.py"), PurePosixPath("scripts")))
+        (self.repo / "scripts2").mkdir()
+        (self.repo / "scripts2/check.py").write_text("# changed sibling, outside scripts scope\n")
+        git(self.repo, "add", "scripts2")
+        git(self.repo, "commit", "-q", "-m", "unrelated sibling")
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        data = json.loads(evidence.read_text()); data["names"][0]["paths"].append("scripts")
+        evidence.write_text(json.dumps(data))
+        _, after = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=0)
+        self.assertEqual(self.summary(after)["pg"]["union"], "exact")
+
+    def test_root_scope_cannot_waive_the_reviewers_notes_change(self):
+        self.assertIn("notes.md", git(self.repo, "diff", "--name-only", self.master, "HEAD"))
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        data = json.loads(evidence.read_text()); data["names"][0]["paths"].append(".")
+        evidence.write_text(json.dumps(data))
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
+        self.assertIn("invalid evidence scope path", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_a_root_mod_rs_protects_every_changed_path(self):
+        original = self.master
+        git(self.repo, "reset", "--hard", original)
+        (self.repo / "mod.rs").write_text("fn a05() {}\n")
+        git(self.repo, "add", "mod.rs"); git(self.repo, "commit", "-q", "-m", "root module")
+        self.master = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/master", self.master)
+        try:
+            self.setUp()
+            _, before = self.drive(fail=["a05"], shards=1, check=1)
+            evidence = self.evidence(before)
+            data = json.loads(evidence.read_text())
+            data["names"][0].update(source="mod.rs", paths=["mod.rs"])
+            evidence.write_text(json.dumps(data))
+            result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
+            self.assertIn("PR diff touches", result.stderr)
+            self.assertIn("notes.md", result.stderr)
+            self.assertFalse(refused.exists())
+        finally:
+            self.master = original
+            git(self.repo, "update-ref", "refs/remotes/origin/master", original)
+
+    def test_duplicate_evidence_scope_fields_are_refused(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        evidence.write_text(evidence.read_text().replace('"paths": [', '"paths": ["notes.md"], "paths": [', 1))
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
+        self.assertIn("duplicate rerun evidence field: paths", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_duplicate_manifest_identity_is_refused_before_a_waiver(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        manifest = before / "manifest.json"
+        manifest.write_text(manifest.read_text().replace('"tree": ', '"tree": "other", "tree": ', 1))
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
+        self.assertIn("duplicate rerun evidence field: tree", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_duplicate_register_fields_cannot_grant_an_ambiguous_waiver(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        head = git(self.repo, "rev-parse", "HEAD")
+        entry = {"test": "a05", "cargo": CARGO, "issue": 1, "expires": Resume.soon(self)}
+        text = json.dumps({"version": 1, "flakes": [entry]})
+        (self.repo / "scripts/known-flakes.json").write_text(text.replace('"expires": ', '"expires": "2000-01-01", "expires": ', 1))
+        git(self.repo, "commit", "-q", "-am", "ambiguous later register")
+        register = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "reset", "--hard", head)
+        git(self.repo, "update-ref", "refs/remotes/origin/master", register)
+        try:
+            result, refused = self.drive("--resume", str(before), "--flakes-ref", "origin/master", shards=1, check=1)
+            self.assertIn("repeats field: expires", result.stderr)
+            self.assertFalse(refused.exists())
+        finally:
+            git(self.repo, "update-ref", "refs/remotes/origin/master", self.master)
+
+    def test_duplicate_pass_proof_status_is_refused(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        proof = Path(json.loads(evidence.read_text())["names"][0]["head_pass"])
+        proof.write_text(proof.read_text().replace('"status": "ok"', '"status": "FAILED", "status": "ok"'))
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=1)
+        self.assertIn("duplicate rerun evidence field: status", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_a_python_resume_cannot_carry_an_optimized_away_assertion_into_strict_checks(self):
+        (self.repo / "scripts/check_demo.py").write_text("assert False, 'strict check must run'\n")
+        git(self.repo, "commit", "-q", "-am", "Python optimization affects the verdict")
+        _, before = self.drive(suite="python", env={"PYTHONOPTIMIZE": "1"}, check=0)
+        result, refused = self.drive("--resume", str(before), suite="python", env={"PYTHONOPTIMIZE": "0"}, check=1)
+        self.assertIn("previous inputs", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_a_python_resume_refuses_changed_interpreter_flags(self):
+        _, before = self.drive(suite="python", python_flags=("-O",), check=0)
+        result, refused = self.drive("--resume", str(before), suite="python", env={"FAKE_PY_FAIL": "1"}, check=1)
+        self.assertIn("previous inputs", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_unreadable_register_never_becomes_unregistered_permission(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        evidence = self.evidence(before)
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence),
+            "--flakes-ref", "refs/does-not-exist", shards=1, check=1)
+        self.assertIn("git show failed", result.stderr)
+        self.assertFalse(refused.exists())
+        # A register read failure must neither grant permission nor consume it.
+        self.drive("--resume", str(before), "--rerun-unregistered", str(evidence), shards=1, check=0)
 
     def test_a_changed_test_file_module_or_fixture_is_never_eligible(self):
         for path in ("src/cases.rs", "src/cases/helper.rs", "fixtures/data.sql"):
@@ -1475,14 +1661,28 @@ class Identity(unittest.TestCase):
         self.assertEqual(self.digest(), reference)
         for name in ("PBPS_TEST_DEV_IMAGE", "PBPS_TEST_PG_SCRATCH_IMAGE", "RUSTFLAGS", "INSTA_UPDATE",
                      "CARGO_PROFILE_DEV_DEBUG", "PBPS_SOMETHING_NEW", "EVENT", "BASE_SHA",
-                     "ProgramFiles", "PROGRAMFILES"):
+                     "ProgramFiles", "PROGRAMFILES", "CARGO_BUILD_RUSTFLAGS", "RUSTC_WRAPPER", "NODE_OPTIONS",
+                     "GIT_CONFIG_NOSYSTEM", "LC_ALL", "TZ"):
             with self.subTest(name):
                 self.assertNotEqual(self.digest(**{name: "x"}), reference)
+
+    def test_expiry_day_and_python_startup_flags_change_the_digest(self):
+        real_datetime = datetime.datetime
+        with mock.patch.object(self.shards.datetime, "datetime", wraps=real_datetime) as clock:
+            clock.now.return_value = real_datetime(2026, 11, 5, tzinfo=datetime.timezone.utc)
+            before = self.digest()
+            clock.now.return_value = real_datetime(2026, 11, 6, tzinfo=datetime.timezone.utc)
+            self.assertNotEqual(before, self.digest())
+        self.assertNotEqual(self.digest(PYTHONOPTIMIZE="1"), self.digest(PYTHONOPTIMIZE="0"))
+        self.assertNotEqual(self.digest(PYTHONPATH="first"), self.digest(PYTHONPATH="second"))
+
+    def test_search_path_is_an_input_even_when_rustc_version_matches(self):
+        self.assertNotEqual(self.digest(), self.digest(PATH=os.environ["PATH"] + os.pathsep + "/nonexistent"))
 
     def test_the_inputs_digest_ignores_scheduling_and_fixture_identity(self):
         reference = self.digest()
         for name in ("PBPS_LIVE_PREFIX", "PBPS_LIVE_WEIGHTS", "PBPS_LIVE_SHARD", "PBPS_TEST_PG_NAME",
-                     "PBPS_TEST_PG_PORT", "PBPS_TEST_MSSQL_SCRATCH_NAME", "CARGO_BUILD_JOBS", "TMPDIR"):
+                     "PBPS_TEST_PG_PORT", "PBPS_TEST_MSSQL_SCRATCH_NAME", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR", "TMPDIR"):
             with self.subTest(name):
                 self.assertEqual(self.digest(**{name: "x"}), reference)
 
