@@ -216,6 +216,11 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                         &mut pulled.schema,
                         &Default::default(),
                     )?);
+                // `init` selects no extension (it has no `--extension`), so
+                // every package is unmanaged here: a table of a type one
+                // provides is left out and named, as `pull` does, instead of
+                // being written for `plan` to refuse (DEC-2447.12).
+                crate::adopt::leave_out_unmanaged_providers(&mut pulled);
                 let ids = mint_ids(&pulled.schema, &root)?;
                 (
                     pulled.schema,

@@ -452,3 +452,41 @@ fn a_retype_to_or_from_a_provided_type_is_refused_by_name() {
         );
     });
 }
+
+/// `init --from` selects no package (it has no `--extension`), so a table of a
+/// type a package provides is left out with the command that opts the package
+/// in, exactly as a pull without the package does, and a table of plain types
+/// beside it is kept. Writing it would hand `plan` a type nobody opted in.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn init_from_leaves_a_table_of_an_unmanaged_packages_type_out_with_the_command() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("types2447-init-{slug}"));
+        on_server(
+            f.target(),
+            &format!("{WANTS}; CREATE TABLE app.plain (id integer PRIMARY KEY, n text)"),
+        );
+        let dir =
+            std::env::temp_dir().join(format!("pbps-init-2447-{slug}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let var = format!("PBPS_INIT_2447_{slug}");
+        let out = std::process::Command::new(super::BIN)
+            .env(&var, f.target())
+            .arg("--project")
+            .arg(&dir)
+            .args(["init", "--from", "source", "--url-env", &var])
+            .args(["--dialect", "postgres"])
+            .output()
+            .unwrap();
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let said = said(&out);
+        assert!(
+            said.contains("`app.wants` was left out")
+                && said.contains("pbps pull --extension citext"),
+            "{said}"
+        );
+        assert!(!dir.join("schema/app.wants.yml").exists(), "{said}");
+        assert!(dir.join("schema/app.plain.yml").exists(), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

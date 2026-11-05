@@ -753,6 +753,7 @@
         "extensions2447_types::a_move_the_confined_scratch_cannot_perform_is_refused_by_the_rehearsal",
         "extensions2447_types::a_package_and_its_consumer_are_planned_together_and_the_type_is_proved_after_the_rehearsal",
         "extensions2447_types::a_retype_to_or_from_a_provided_type_is_refused_by_name",
+        "extensions2447_types::init_from_leaves_a_table_of_an_unmanaged_packages_type_out_with_the_command",
         "extensions2447_update::an_update_is_rehearsed_sealed_gated_applied_and_the_next_plan_waits_for_the_externals_file",
         "extensions2447_update::an_update_offline_or_without_a_rehearsal_is_refused_by_name_and_writes_nothing",
         "extensions2447_update::an_update_with_no_path_or_to_an_unlisted_version_is_refused_by_name_before_a_plan_exists",
