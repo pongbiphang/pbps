@@ -251,6 +251,14 @@ fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
             return;
         }
         let f = fixture_on(server, &format!("types2447-move-{slug}"), Kind::Server);
+        // A managed domain over the package's type, and a table column of it:
+        // the base moves with the package as the columns do (the apply's
+        // read-back carries it by the same rule).
+        on_server(
+            f.target(),
+            "CREATE DOMAIN app.cdom AS ext.citext; \
+             CREATE TABLE app.dom_wants (id integer PRIMARY KEY, d app.cdom)",
+        );
         adopted(&f, &["citext", "hstore", "ltree"]);
         let before = scalar(
             f.target(),
@@ -259,8 +267,18 @@ fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
         on_server(f.target(), "CREATE SCHEMA moved");
         // The package, and every declaration that spells its schema.
         let spelled = |text: String| text.replace("ext.citext", "moved.citext");
-        let path = f.d.dir.join("schema/app.wants.yml");
-        std::fs::write(&path, spelled(std::fs::read_to_string(&path).unwrap())).unwrap();
+        let mut spelling = 0;
+        for entry in std::fs::read_dir(f.d.dir.join("schema")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "yml") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if text.contains("ext.citext") {
+                    std::fs::write(&path, spelled(text)).unwrap();
+                    spelling += 1;
+                }
+            }
+        }
+        assert!(spelling >= 2, "the table and the domain spell the type");
         let declaration = f.d.dir.join("schema/extensions/citext.yml");
         let text = std::fs::read_to_string(&declaration).unwrap();
         std::fs::write(&declaration, text.replace("schema: ext", "schema: moved")).unwrap();
@@ -279,8 +297,10 @@ fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
             "{kinds:#?}"
         );
         assert!(
-            !kinds.iter().any(|k| k.starts_with("AlterColumnType")),
-            "the column is carried, never retyped: {kinds:#?}"
+            !kinds
+                .iter()
+                .any(|k| k.starts_with("AlterColumnType") || k.starts_with("AlterDomain")),
+            "the column and the domain base are carried, never retyped: {kinds:#?}"
         );
         succeeds(f.apply("rename,extension-code,destructive"));
         assert_eq!(

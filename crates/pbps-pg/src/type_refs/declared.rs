@@ -390,9 +390,13 @@ fn check_definitions(
                     latest.and_then(|s| s.definition.as_ref()),
                 );
             }
+            // A domain over a type a moved package provides: its base reads
+            // back in the new schema, the same type (DEC-2447.12).
+            let moves = pbps_diff::package_moves(changes);
             if label_moved && let Some(was) = &pin.before {
                 let mut was = was.definition.clone();
                 renames.definition(&mut was);
+                pbps_diff::forward_domain_base(&mut was, actual, &moves);
                 if !matches_declaration(&was, actual) {
                     return Err(failed(format!(
                         "declared type `{}` changed since planning; plan again",
@@ -411,6 +415,7 @@ fn check_definitions(
             }
             // After the remap, which resolves a base by uid to where it stands.
             over_the_final_name(&mut expected, &rebuilt_tmp);
+            pbps_diff::forward_domain_base(&mut expected, actual, &moves);
             let mut comparable = actual.clone();
             super::renames::TypeRenames::default().definition(&mut comparable);
             if (before && comparable != expected)

@@ -5469,9 +5469,15 @@ fn refuse_pinned_movement(
             _ => {}
         }
     }
-    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
+    // A managed domain over a type a moved package provides reads back with
+    // its base in the new schema and no change of the plan on it: the same
+    // carrying as for a column of the table (DEC-2447.12).
+    let package_moves = pbps_diff::package_moves(changes);
+    let mut types_before = before.types.clone();
+    pbps_diff::forward_domain_moves(&mut types_before, &after.types, &package_moves);
+    let types: BTreeSet<_> = types_before.keys().chain(after.types.keys()).collect();
     for name in types {
-        if before.types.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
+        if types_before.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
             bail!("type `{}` changed during {label}", name.shown());
         }
     }
@@ -5592,16 +5598,6 @@ fn refuse_pinned_movement(
     // its OID and its name, and only its schema follows the package, so a table
     // this plan does not touch reads back with the new schema in its column
     // types and no change of the plan on it (DEC-2447.12).
-    let package_moves: Vec<(&str, &str)> = changes
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            pbps_model::Change::SetExtensionSchema { from, to, .. } => {
-                Some((from.schema.as_str(), to.schema.as_str()))
-            }
-            _ => None,
-        })
-        .collect();
     let label_forwarded = |table: &pbps_model::Table, now: Option<&pbps_model::Table>| {
         let mut table = table.clone();
         if let Some(now) = now {

@@ -13,8 +13,8 @@ pub mod drop_requirements;
 pub mod enum_labels;
 mod extensions;
 pub use extensions::{
-    bootstrap_base, differences as extension_differences, forward_schema_moves,
-    prerequisite_differences,
+    bootstrap_base, differences as extension_differences, forward_domain_base,
+    forward_domain_moves, forward_schema_moves, package_moves, prerequisite_differences,
 };
 pub mod foreign_keys;
 pub mod identity;

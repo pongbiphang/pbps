@@ -394,16 +394,8 @@ pub fn forward_moved_types<'a>(
         return comparison;
     }
     let forward = |ty: &mut ColumnType| {
-        // An array is looked up by its element.
-        if let Some(reference) = ty.element().type_ref()
-            && let Some(new) = moved.get(reference)
-        {
-            let carried = ColumnType::reference(new.clone());
-            *ty = if ty.is_array() {
-                carried.into_array()
-            } else {
-                carried
-            };
+        if let Some(carried) = carry_reference(ty, |reference| moved.get(reference).cloned()) {
+            *ty = carried;
         }
     };
     let mut schema = comparison.into_owned();
@@ -418,46 +410,118 @@ pub fn forward_moved_types<'a>(
     std::borrow::Cow::Owned(schema)
 }
 
+/// The one rule for "the same type, now in the schema its package moved to",
+/// shared by every read-back comparison: `was` is the recorded type, `is` what
+/// the database reads now. A typed reference is carried, an array by its
+/// element, and only where `is` shows the name kept and the schema moved along
+/// one of `moves`, so a type that stayed behind stays as it is (DEC-2447.12).
+fn carried_through(
+    was: &pbps_model::ColumnType,
+    is: &pbps_model::ColumnType,
+    moves: &[(&str, &str)],
+) -> Option<pbps_model::ColumnType> {
+    let element = is.element();
+    let is_ref = element.type_ref()?;
+    if was.is_array() != is.is_array() {
+        return None;
+    }
+    carry_reference(was, |was_ref| {
+        (was_ref.name() == is_ref.name()
+            && moves
+                .iter()
+                .any(|(from, to)| *from == was_ref.schema() && *to == is_ref.schema()))
+        .then(|| is_ref.clone())
+    })
+}
+
+/// Where a moved type is found in a column type: a typed reference, an array
+/// by its element. The one place that knows the positions (a column, an array
+/// column, a domain's base all hold a [`ColumnType`]); the differ's forwarding
+/// by the package's member list and the read-back comparisons both go through
+/// it, each supplying only how a name is mapped.
+fn carry_reference(
+    ty: &pbps_model::ColumnType,
+    to: impl Fn(&pbps_model::TypeRef) -> Option<pbps_model::TypeRef>,
+) -> Option<pbps_model::ColumnType> {
+    let new = to(ty.element().type_ref()?)?;
+    let carried = pbps_model::ColumnType::reference(new);
+    Some(if ty.is_array() {
+        carried.into_array()
+    } else {
+        carried
+    })
+}
+
 /// A table's column types carried through the moves of the plan, where the
-/// read-back shows them carried: a column that was a reference into a schema a
-/// package leaves and is now the same name in the one it goes to is the same
-/// column. Only a typed column reference is carried, an array by its element,
-/// and only what `now` shows moved, so a type that stayed behind in the schema
-/// stays as it is. Used by the apply's read-back comparison of a table the plan
-/// does not touch, where the plan's own move is the one explanation for a type
-/// changing schema (DEC-2447.12).
+/// read-back shows them carried (see [`carried_through`]). Used by the apply's
+/// read-back comparison of a table the plan does not touch, where the plan's
+/// own move is the one explanation for a type changing schema.
 pub fn forward_schema_moves(
     table: &mut pbps_model::Table,
     now: &pbps_model::Table,
     moves: &[(&str, &str)],
 ) {
-    use pbps_model::{ColumnType, TypeRef};
     if moves.is_empty() {
         return;
     }
     for (name, column) in &mut table.columns {
-        let Some(read) = now.columns.get(name) else {
-            continue;
-        };
-        let (was, is) = (column.ty.element(), read.ty.element());
-        let (Some(was), Some(is)) = (was.type_ref(), is.type_ref()) else {
-            continue;
-        };
-        let carried = was.name() == is.name()
-            && moves
-                .iter()
-                .any(|(from, to)| *from == was.schema() && *to == is.schema());
-        if carried && column.ty.is_array() == read.ty.is_array() {
-            let reference = ColumnType::reference(
-                TypeRef::new(is.schema(), is.name()).unwrap_or_else(|_| is.clone()),
-            );
-            column.ty = if read.ty.is_array() {
-                reference.into_array()
-            } else {
-                reference
-            };
+        if let Some(read) = now.columns.get(name)
+            && let Some(ty) = carried_through(&column.ty, &read.ty, moves)
+        {
+            column.ty = ty;
         }
     }
+}
+
+/// The same for the base of a managed domain: the domain keeps its name and
+/// its base type keeps its OID, so the read-back shows the base in the new
+/// schema with no change of the plan on the domain. `expected` is the
+/// definition held from before the move, `now` the one the database reads.
+pub fn forward_domain_base(
+    expected: &mut pbps_model::ManagedType,
+    now: &pbps_model::ManagedType,
+    moves: &[(&str, &str)],
+) {
+    if let (
+        pbps_model::ManagedType::Domain { base, .. },
+        pbps_model::ManagedType::Domain { base: read, .. },
+    ) = (expected, now)
+        && let Some(carried) = carried_through(base, read, moves)
+    {
+        *base = carried;
+    }
+}
+
+/// [`forward_domain_base`] for every domain of a set of definitions.
+pub fn forward_domain_moves<K: Ord>(
+    types: &mut std::collections::BTreeMap<K, pbps_model::ManagedType>,
+    now: &std::collections::BTreeMap<K, pbps_model::ManagedType>,
+    moves: &[(&str, &str)],
+) {
+    if moves.is_empty() {
+        return;
+    }
+    for (key, ty) in types.iter_mut() {
+        if let Some(read) = now.get(key) {
+            forward_domain_base(ty, read, moves);
+        }
+    }
+}
+
+/// The schema moves a plan carries, as (from, to) pairs: what every read-back
+/// comparison needs to tell a type that moved with its package from one that
+/// changed.
+pub fn package_moves(changes: &pbps_model::ChangeSet) -> Vec<(&str, &str)> {
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            let pbps_model::Change::SetExtensionSchema { from, to, .. } = &p.change else {
+                return None;
+            };
+            Some((from.schema.as_str(), to.schema.as_str()))
+        })
+        .collect()
 }
 
 /// How many packages of the plan each create waits behind, so that the differ's
@@ -1599,6 +1663,80 @@ mod tests {
         assert_eq!(same, before);
     }
 
+    /// The base of a managed domain follows a move by the same rule as a column
+    /// (DEC-2447.12): a scalar and an array base are carried where the read-back
+    /// shows the base moved; a base that stayed, another name, another kind of
+    /// domain, an enum and a domain the read-back lacks are not, and with no
+    /// move nothing is. The differ forwards the same positions by the package's
+    /// member list.
+    #[test]
+    fn a_domains_base_is_carried_by_the_same_rule_as_a_column() {
+        use pbps_model::{ColumnType, ManagedType, TypeRef};
+        let reference = |name: &str| ColumnType::reference(name.parse::<TypeRef>().unwrap());
+        let domain = |base: ColumnType| ManagedType::Domain {
+            base,
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        let key = |name: &str| name.parse::<TypeRef>().unwrap();
+        let before: std::collections::BTreeMap<TypeRef, ManagedType> = [
+            (key("app.d"), domain(reference("ext.citext"))),
+            (key("app.da"), domain(reference("ext.citext").into_array())),
+            (key("app.stayed"), domain(reference("ext.hstore"))),
+            (key("app.renamed"), domain(reference("ext.citext"))),
+            (key("app.plain"), domain("text".parse().unwrap())),
+            (key("app.gone"), domain(reference("ext.citext"))),
+            (
+                key("app.e"),
+                ManagedType::Enum {
+                    values: vec!["a".into()],
+                },
+            ),
+        ]
+        .into();
+        let now: std::collections::BTreeMap<TypeRef, ManagedType> = [
+            (key("app.d"), domain(reference("moved.citext"))),
+            (
+                key("app.da"),
+                domain(reference("moved.citext").into_array()),
+            ),
+            (key("app.stayed"), domain(reference("ext.hstore"))),
+            (key("app.renamed"), domain(reference("moved.other"))),
+            (key("app.plain"), domain("text".parse().unwrap())),
+            (
+                key("app.e"),
+                ManagedType::Enum {
+                    values: vec!["a".into()],
+                },
+            ),
+        ]
+        .into();
+        let base_of =
+            |types: &std::collections::BTreeMap<TypeRef, ManagedType>, name: &str| match &types
+                [&key(name)]
+            {
+                ManagedType::Domain { base, .. } => base.raw().to_string(),
+                ManagedType::Enum { .. } => String::new(),
+            };
+        let mut carried = before.clone();
+        forward_domain_moves(&mut carried, &now, &[("ext", "moved")]);
+        assert_eq!(base_of(&carried, "app.d"), "moved.citext");
+        assert_eq!(base_of(&carried, "app.da"), "moved.citext[]");
+        // Negative: it stayed, another name, not a reference, absent, an enum.
+        assert_eq!(base_of(&carried, "app.stayed"), "ext.hstore");
+        assert_eq!(base_of(&carried, "app.renamed"), "ext.citext");
+        assert_eq!(base_of(&carried, "app.plain"), "text");
+        assert_eq!(base_of(&carried, "app.gone"), "ext.citext");
+        assert_eq!(carried[&key("app.e")], before[&key("app.e")]);
+        // Negative: no move, or a move of other schemas, carries nothing.
+        let mut same = before.clone();
+        forward_domain_moves(&mut same, &now, &[]);
+        forward_domain_moves(&mut same, &now, &[("a", "b")]);
+        assert_eq!(same, before);
+    }
+
     /// A moved package's columns are carried to its new schema before they are
     /// compared, so that the move does not retype them (DEC-2447.12): a scalar
     /// and an array of a member type follow it, a type that is not a member and
@@ -1624,9 +1762,25 @@ mod tests {
             table.columns.insert(name.into(), column(ty));
         }
         let name = pbps_model::TableName::new("app", "wants");
+        let domain = |base: ColumnType| pbps_model::ManagedType::Domain {
+            base,
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
         let base = Schema {
             extensions: [("citext".into(), at("ext"))].into(),
             tables: [(name.clone(), table)].into(),
+            types: [
+                ("app.d".parse().unwrap(), domain(reference("ext.citext"))),
+                (
+                    "app.da".parse().unwrap(),
+                    domain(reference("ext.citext").into_array()),
+                ),
+                ("app.other".parse().unwrap(), domain(reference("ext.other"))),
+            ]
+            .into(),
             ..Default::default()
         };
         let desired = Schema {
@@ -1668,6 +1822,14 @@ mod tests {
         };
         assert_eq!(ty(&carried, "c"), "moved.citext");
         assert_eq!(ty(&carried, "ca"), "moved.citext[]");
+        let base_of = |schema: &Schema, name: &str| match &schema.types[&name.parse().unwrap()] {
+            pbps_model::ManagedType::Domain { base, .. } => base.raw().to_string(),
+            pbps_model::ManagedType::Enum { .. } => String::new(),
+        };
+        // A domain's base and an array base are carried the same way.
+        assert_eq!(base_of(&carried, "app.d"), "moved.citext");
+        assert_eq!(base_of(&carried, "app.da"), "moved.citext[]");
+        assert_eq!(base_of(&carried, "app.other"), "ext.other");
         // Negative: not a member, another schema, not a reference.
         assert_eq!(ty(&carried, "other"), "ext.other");
         assert_eq!(ty(&carried, "elsewhere"), "app.citext");
