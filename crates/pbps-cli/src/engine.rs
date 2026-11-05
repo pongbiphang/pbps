@@ -122,7 +122,7 @@ pub async fn vet_table_expressions(
     within: pbps_pg::pins::Within,
     moment: pbps_pg::table_expressions::Moment,
     change: &pbps_model::Change,
-) -> Result<Vec<String>, String> {
+) -> Result<pbps_pg::table_expressions::Vetted, String> {
     pbps_pg::table_expressions::vet_change(conn, admission, within, moment, change).await
 }
 

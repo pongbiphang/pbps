@@ -505,3 +505,62 @@ fn a_column_named_like_a_binder_helper_does_not_refuse_an_unrelated_expression_c
         }
     }
 }
+
+/// A pre-flight probe evaluates the new CHECK over the stored rows, so the
+/// routine it calls must have been judged first. When the expression cannot be
+/// bound before its statement (here an event trigger refuses the binding
+/// table, as a role without TEMP would be refused), "no refusal" is not
+/// "admitted": the probe must not run it (review of #2686, round 3).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe() {
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let slug = format!("tx2563-unbound-{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection().to_owned();
+        let d = bootstrapped_demo(&connection, &slug, BASE);
+        d.keyed(&connection);
+        // The probes run in a read-only transaction that is rolled back, so
+        // the only trace of a run is the error the routine raises, which the
+        // pre-flight reports as why it could not check the rows.
+        on_server(
+            &connection,
+            "CREATE FUNCTION app.ok(x text) RETURNS boolean LANGUAGE plpgsql \
+               SET search_path = pg_catalog AS $$ BEGIN \
+               RAISE EXCEPTION 'the probe ran the routine'; END $$; \
+             INSERT INTO app.t VALUES (1, 'a')",
+        );
+        Kind::Check.declare(&d);
+        on_server(
+            &connection,
+            "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
+               SET search_path = pg_catalog AS $$ BEGIN \
+               IF pg_catalog.current_query() LIKE '%pbps_table_expressions%' THEN \
+                 RAISE EXCEPTION 'the binding table is refused'; END IF; END $$; \
+             CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
+               WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.refuse_binding()",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("unbound-plan.json");
+        let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        let applied = approved_apply(
+            &d,
+            &connection,
+            &plan,
+            &["--allow", "destructive,narrowing,constraint"],
+        );
+        // The statement-time check cannot bind it either, so the apply stops.
+        assert_ne!(code(&applied), 0, "PG{version}: {}", text(&applied));
+        let shown = text(&applied);
+        assert!(
+            !shown.contains("the probe ran the routine"),
+            "PG{version}: the probe ran the routine: {shown}"
+        );
+        assert!(
+            shown.contains("unchecked until source review"),
+            "PG{version}: {shown}"
+        );
+    }
+}

@@ -9027,14 +9027,15 @@ async fn plan_db_selected(
         // cannot be bound yet and is said so, then judged at apply (DEC-2563.4).
         if conn.driver() == pbps_db::Driver::Postgres {
             for planned in requirement_names.changes() {
-                let Ok(notes) = crate::engine::vet_table_expressions(
-                    &mut conn,
-                    &site_admission,
-                    pbps_pg::pins::Within::OwnTransaction,
-                    pbps_pg::table_expressions::Moment::Early,
-                    &planned.change,
-                )
-                .await
+                let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) =
+                    crate::engine::vet_table_expressions(
+                        &mut conn,
+                        &site_admission,
+                        pbps_pg::pins::Within::OwnTransaction,
+                        pbps_pg::table_expressions::Moment::Early,
+                        &planned.change,
+                    )
+                    .await
                 else {
                     continue;
                 };
@@ -11007,6 +11008,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                         change,
                     )
                     .await
+                    .and_then(pbps_pg::table_expressions::Vetted::admitted)
                     .map_err(anyhow::Error::msg)?;
                 }
                 conn.execute(&stmt.sql).await?;
@@ -12011,8 +12013,11 @@ async fn run_probes_observed(
             )
             .await
             {
-                Ok(_) => {}
-                Err(_) => table_unjudged = true,
+                Ok(pbps_pg::table_expressions::Vetted::Admitted) => {}
+                // Not judged, however it came about: refused, or unbound here.
+                Ok(pbps_pg::table_expressions::Vetted::Unjudged(_)) | Err(_) => {
+                    table_unjudged = true;
+                }
             }
         }
     }
@@ -12321,6 +12326,7 @@ async fn execute_statement(
             change,
         )
         .await
+        .and_then(pbps_pg::table_expressions::Vetted::admitted)
         .map_err(anyhow::Error::msg)?;
     }
     // A drop is vetted before it runs: what it would delete is judged while

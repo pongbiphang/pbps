@@ -94,18 +94,46 @@ fn has_value(source: &ValueSource) -> bool {
     matches!(source, ValueSource::Default(_) | ValueSource::Generated(_))
 }
 
-/// Judges the expressions `change` introduces. `Ok` carries the notes of the
-/// expressions that cannot be bound yet and are judged at apply; `Err` is a
-/// refusal, with the fix.
+/// What judging a change's expressions came to. Two cases that must not be
+/// read alike: only `Admitted` means the routines were judged and admitted, so
+/// nothing may evaluate the expressions on any other reading (a pre-flight
+/// probe runs them over stored rows).
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Vetted {
+    /// Every expression was bound and judged, or the change carries none.
+    Admitted,
+    /// Some could not be bound yet (before the plan creates what they use, or
+    /// where the role cannot build the binding table); the notes say which.
+    /// They are judged at the statement that introduces them.
+    Unjudged(Vec<String>),
+}
+
+impl Vetted {
+    /// For the moment that cannot leave anything unjudged: the statement
+    /// itself, where an expression that does not bind is already a refusal.
+    ///
+    /// # Errors
+    /// Anything but `Admitted`.
+    pub fn admitted(self) -> Result<(), String> {
+        match self {
+            Self::Admitted => Ok(()),
+            Self::Unjudged(notes) => Err(notes.join("; ")),
+        }
+    }
+}
+
+/// Judges the expressions `change` introduces. `Err` is a refusal, with the
+/// fix; `Unjudged` is returned only before the statement.
 pub async fn vet_change(
     conn: &mut Conn,
     admission: &Admission,
     within: Within,
     moment: Moment,
     change: &Change,
-) -> Result<Vec<String>, String> {
+) -> Result<Vetted, String> {
     if !carries(change) {
-        return Ok(Vec::new());
+        return Ok(Vetted::Admitted);
     }
     if within == Within::CallersTransaction {
         return vet_in_callers_transaction(conn, admission, moment, change).await;
@@ -135,7 +163,7 @@ async fn vet_in_callers_transaction(
     admission: &Admission,
     moment: Moment,
     change: &Change,
-) -> Result<Vec<String>, String> {
+) -> Result<Vetted, String> {
     let unclean = || {
         "the expressions of a table could not be vetted: its binding table could not be removed"
             .to_owned()
@@ -167,7 +195,7 @@ async fn vet_bound(
     admission: &Admission,
     moment: Moment,
     change: &Change,
-) -> Result<Vec<String>, String> {
+) -> Result<Vetted, String> {
     let zone = conn
         .session_zone()
         .cloned()
@@ -178,7 +206,7 @@ async fn vet_bound(
     })?;
     // A failure to bind is a note before the statement and a refusal at it.
     let unbound = |what: &str, why: &str| match moment {
-        Moment::Early => Ok(vec![note(what, why)]),
+        Moment::Early => Ok(Vetted::Unjudged(vec![note(what, why)])),
         Moment::Statement => Err(format!(
             "{what} could not be bound just before they run (SQLSTATE {why}), so they cannot be \
              judged; nothing has been changed"
@@ -186,7 +214,7 @@ async fn vet_bound(
     };
     let mut spec = match spec(conn, change).await {
         Ok(Some(spec)) => spec,
-        Ok(None) => return Ok(Vec::new()),
+        Ok(None) => return Ok(Vetted::Admitted),
         Err(why) => return unbound(&describe(change), &why),
     };
     if let Some(table) = &spec.like {
@@ -314,7 +342,7 @@ async fn vet_bound(
         format!("{what} {why}")
     })
     .await?;
-    Ok(Vec::new())
+    Ok(Vetted::Admitted)
 }
 
 fn count(n: usize) -> i32 {
