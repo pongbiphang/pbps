@@ -429,10 +429,22 @@ pub fn required(server: &str, dialect: &str) {
         report(output)
     };
     // Both engines require the key before acquiring a scratch resource.
-    let value = refused(&["--db", connection], 2);
-    assert_eq!(value["findings"][0]["id"], "resolver.key", "{value}");
-    let value = refused(&["--env", "prod"], 2);
-    assert_eq!(value["findings"][0]["id"], "resolver.key", "{value}");
+    // Catalog warnings share the report, so locate the missing-key error by ID.
+    for target in [["--db", connection], ["--env", "prod"]] {
+        let value = refused(&target, 2);
+        assert_eq!(
+            value["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| {
+                    finding["id"] == "resolver.key" && finding["severity"] == "error"
+                })
+                .count(),
+            1,
+            "{value}"
+        );
+    }
     // With the key present the run starts, and finds no scratch server to
     // reach: an operational failure, not a finding (SPEC 9.8).
     successful(run(
