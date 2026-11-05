@@ -91,6 +91,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                     key: IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: true,

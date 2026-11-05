@@ -3530,6 +3530,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column((*c).into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     })
                     .collect(),
                 include: vec!["note".into()],

@@ -484,6 +484,7 @@ fn cycling_expression_notes_show_column_identities_once_in_every_format() {
                             key: IndexKey::Expression(format!("(\"{NAME}\" + 0)")),
                             descending: false,
                             opclass: None,
+                            collation: None,
                         }],
                         unique: true,
                         include: Vec::new(),

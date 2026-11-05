@@ -448,6 +448,7 @@ async fn mssql_a_filtered_index_is_no_resolver_surface() {
                                 key: pbps_model::IndexKey::Column("id".into()),
                                 descending: false,
                                 opclass: None,
+                                collation: None,
                             }],
                             include: vec![],
                             unique: false,

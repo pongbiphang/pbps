@@ -9420,3 +9420,56 @@ published-schema version moves, because nothing new is stored: the field
 it always was. The key collation's model field, its read from
 `pg_index.indcollation` and its three format numbers arrive with the part that
 admits it.
+
+
+<a id="dec-2448-2"></a>
+
+**DEC-2448.2. GiST indexes and a column key's collation (#2448 PR B).**
+`method: gist` is one more row in the policy table (DEC-2448.1) and goes through
+`AddIndex`, `DropIndex` and `SetIndexStorageParameters`: no new change kind, no
+ordering class, no identity (an index has no uid; a rename is a drop and an add),
+and no retirement record, because dropping any index needs only
+`--allow destructive`. Measured on 16.15 and 18.6, identical: GiST is not unique,
+has no order, takes `INCLUDE` of columns only, and its two parameters,
+`buffering` (`on`, `off`, `auto`, in any case and nothing around it) and
+`fillfactor`, change in place and keep the relation file. **The locks differ by
+parameter**: `fillfactor` takes `ShareUpdateExclusive` and `buffering`
+`AccessExclusive`, so a parameter may carry its own lock beside its method's
+(`MethodPolicy::lock_of`). `CREATE INDEX` takes `ShareLock` on the table.
+`buffering` only matters at build, so a `SET` records it without effect, as a
+B-tree's `fillfactor` does for built pages (DEC-1442.1); it is `Alter`, not a
+rebuild. An explicit `buffering = auto` is stored and is not the same as no
+parameter.
+
+Which keys are held. Of the column types the model declares only `tsvector` and
+`tsquery` have a GiST default class, and `inet`/`cidr` need `inet_ops` (the one
+non-default class the engine's own provides); every other type has none
+(`42704`), so it is indexed through an expression such as `int4range(a, b)`.
+Validation refuses the others by name with that advice; it does not type an
+expression, which the engine and the rehearsal answer for, as for a B-tree
+expression (DEC-1169.2). The catalog prints a class only when it is not the
+default, so spelling a default class is refused (one index, one spelling). The
+existing `key_classes` read already resolves every GiST default; the pull needed
+only the method admitted.
+
+Key collation. `collation:` is held for a column key as the bare name of a
+`pg_catalog` collation (`IndexColumn.collation: Option<String>`), and written
+`COLLATE "pg_catalog"."name"` before the class. It is held for a column the
+engine can collate (`text`, `varchar`, `char`; a user type is left to the
+engine) and refused on a key with none (`42804`), on an expression key, on GIN,
+as `default` (stored as no collation, so one spelling), and as a collation of
+another schema (an object this tool does not manage, which a scratch could lack;
+a non-deterministic collation changes what `UNIQUE` means). The pull reads
+`indcollation` per key, since the per-key text the catalog renders omits
+`COLLATE`; an expression key cannot be told from the same expression over a
+column whose own collation is the same, so an expression under a non-default
+collation is left out and named, as it was. No core GiST class is collatable, so
+a GiST key collation becomes usable with `btree_gist` (#2447 PR F).
+
+Formats: plan 66 (an older build would read `gist` as an unknown value and drop
+the collation), state 38, published schema set 91 (the declaration schema gains
+the `gist` method and a key's `collation`; the envelope schema's content does
+not change). Every addition is skipped when empty, so a btree or GIN index
+without a collation keeps its bytes. The model holds the collation as a string
+and not as a reference type because only `pg_catalog` is admitted; admitting
+another schema is a format change of its own.

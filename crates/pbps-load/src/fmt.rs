@@ -834,9 +834,11 @@ fn render_indexes(
             // written before expressions; `keys:`, one mapping each, once any
             // is an expression (DEC-1169.2).
             // A class whose name holds a space cannot be one word of the
-            // `columns:` text, so it takes `keys:` too (DEC-2448.1).
+            // `columns:` text, so it takes `keys:` too (DEC-2448.1), as does a
+            // collation, which `columns:` has no word for (DEC-2448.2).
             let inline = |c: &pbps_model::IndexColumn| {
                 c.key.column().is_some()
+                    && c.collation.is_none()
                     && c.opclass
                         .as_ref()
                         .is_none_or(|o| !o.raw().to_string().contains(char::is_whitespace))
@@ -871,6 +873,9 @@ fn render_indexes(
                             "\n{pad}        opclass: {}",
                             scalar(&class.raw().to_string())
                         );
+                    }
+                    if let Some(collation) = &c.collation {
+                        let _ = write!(s, "\n{pad}        collation: {}", scalar(collation));
                     }
                     if c.descending {
                         let _ = write!(s, "\n{pad}        order: desc");

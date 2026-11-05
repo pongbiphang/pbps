@@ -4219,6 +4219,7 @@ mod tests {
                     key: crate::IndexKey::Column("email".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique,

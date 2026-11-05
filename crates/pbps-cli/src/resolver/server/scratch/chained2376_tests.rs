@@ -601,6 +601,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                         key: IndexKey::Column("d".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique,

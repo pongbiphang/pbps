@@ -31,6 +31,7 @@ fn keyed(column: &str, unique: bool, filter: Option<&str>) -> Index {
             key: IndexKey::Column(column.into()),
             descending: false,
             opclass: None,
+            collation: None,
         }],
         include: Vec::new(),
         unique,

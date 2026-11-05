@@ -1433,11 +1433,9 @@ pub struct IndexKeyDto {
     /// The operator class, where it is not the key's default.
     #[serde(default)]
     pub opclass: Option<String>,
-    /// A PostgreSQL key collation. Read so that it can be refused by name
-    /// (DEC-2448.1); the model holds none yet, so it is not in the published
-    /// schema until it is declarable.
+    /// A PostgreSQL key collation of a column key: the name of a `pg_catalog`
+    /// collation (`C`), where it is not the column's own (DEC-2448.2).
     #[serde(default)]
-    #[schemars(skip)]
     pub collation: Option<String>,
     /// `asc`, the default, or `desc`.
     #[serde(default)]

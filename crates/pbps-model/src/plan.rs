@@ -285,7 +285,9 @@ use crate::zone::SessionZone;
 // (DEC-2447.10); 62 belongs to another change.
 // 64 adds the pinned `ALTER EXTENSION ... SET SCHEMA`, which an older build would refuse as an
 // unknown change (DEC-2447.11).
-pub const CURRENT_VERSION: u32 = 64;
+// 66 adds the GiST index method and a column key's collation (DEC-2448.2): an older build
+// would read `gist` as an unknown value and drop the collation; 65 belongs to another change.
+pub const CURRENT_VERSION: u32 = 66;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1350,7 +1352,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 64);
+        assert_eq!(plan.version, 66);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

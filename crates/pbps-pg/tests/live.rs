@@ -94,6 +94,8 @@ mod literal_inputs2378;
 #[path = "support/drop_requirements2400.rs"]
 mod drop_requirements2400;
 
+#[path = "support/index_gist2448.rs"]
+mod index_gist2448;
 #[path = "support/index_policy2448.rs"]
 mod index_policy2448;
 
@@ -3033,6 +3035,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
                 key: pbps_model::IndexKey::Column("body".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -5119,21 +5122,22 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
     let drifted = ours_only(&pull(&mut target).await, &s);
     assert!(!plan(&drifted, &ids, &redefined, &ids).is_empty());
 
-    // Every parameter of a B-tree and a GIN index is declarable; an index of
-    // a method the model does not hold, parameters and all, is named.
+    // Every parameter of a B-tree, a GIN and a GiST index is declarable; an
+    // index of a method the model does not hold, parameters and all, is named
+    // (BRIN, #2449).
     target
         .execute(&format!(
-            "CREATE TABLE {s}.g (id integer PRIMARY KEY, p point);
-             CREATE INDEX g_gist ON {s}.g USING gist (p) WITH (buffering = on);"
+            "CREATE TABLE {s}.g (id integer PRIMARY KEY);
+             CREATE INDEX g_brin ON {s}.g USING brin (id) WITH (pages_per_range = 8);"
         ))
         .await
-        .expect("a GiST index");
+        .expect("a BRIN index");
     let read = pull(&mut target).await;
     let limitations = ours_limitations(&read, &s);
     assert!(
         limitations
             .iter()
-            .any(|l| format!("{l:?}").contains("g_gist")),
+            .any(|l| format!("{l:?}").contains("g_brin")),
         "{limitations:?}"
     );
     drop_schema(&mut target, &s).await;
@@ -9058,11 +9062,13 @@ fn rich_schema(s: &str) -> Schema {
                     key: pbps_model::IndexKey::Column("region_id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 },
                 IndexColumn {
                     key: pbps_model::IndexKey::Column("created_at".into()),
                     descending: true,
                     opclass: None,
+                    collation: None,
                 },
             ],
             include: vec!["status".into()],
@@ -9235,6 +9241,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
                     key: pbps_model::IndexKey::Column("parent_code".into()),
                     descending: true,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -9418,6 +9425,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -9544,6 +9552,7 @@ async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
                 key: pbps_model::IndexKey::Column("n".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -9730,6 +9739,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
             key: pbps_model::IndexKey::Column("id".into()),
             descending: false,
             opclass: None,
+            collation: None,
         }],
         include: vec![],
         unique: false,
@@ -10377,6 +10387,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                                     key: pbps_model::IndexKey::Column(name),
                                     descending: false,
                                     opclass: None,
+                                    collation: None,
                                 })
                                 .collect(),
                             include: vec![],
@@ -10461,6 +10472,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     key: pbps_model::IndexKey::Column("a".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: include
                     .into_iter()
@@ -10506,6 +10518,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                             key: pbps_model::IndexKey::Column("a".into()),
                             descending: false,
                             opclass: None,
+                            collation: None,
                         }],
                         include: vec![],
                         unique: false,
@@ -10571,6 +10584,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                                     key: pbps_model::IndexKey::Column(name),
                                     descending: false,
                                     opclass: None,
+                                    collation: None,
                                 })
                                 .collect(),
                             include,
@@ -10641,6 +10655,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     key: pbps_model::IndexKey::Column("a".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -10749,6 +10764,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
                 key: pbps_model::IndexKey::Column("j".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -10941,6 +10957,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
                 key: pbps_model::IndexKey::Column("n".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -23538,6 +23555,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique: true,
@@ -32839,6 +32857,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -32863,6 +32882,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -35426,6 +35446,7 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -35624,6 +35645,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
                             key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
+                            collation: None,
                         }],
                         include: vec![],
                         unique,

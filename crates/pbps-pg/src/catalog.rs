@@ -973,8 +973,10 @@ fn constraints_query() -> String {
 ///
 /// `key_classes` holds one entry per key, `''` for the default and
 /// `schema.name` otherwise, so the reader can accept exactly the classes the
-/// model holds and name every other one (DEC-1169.1). A collation that is not the
-/// column's own is its own flag: no class makes up for it.
+/// model holds and name every other one (DEC-1169.1). `key_collations` holds
+/// one entry per key, `''` for the column's own and `schema.name` otherwise
+/// (DEC-2448.2); the per-key text carries no collation, so only `indcollation`
+/// says it.
 ///
 /// `indkey` and `indoption` are `int2vector`s, which no driver here reads.
 /// Rendered as text they are space-separated, so they arrive as a list this
@@ -1053,19 +1055,21 @@ fn indexes_query() -> String {
                       ORDER BY k.n), '[]'::pg_catalog.json)
                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
             ) AS key_texts,
-            EXISTS (
-              SELECT 1
-                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
-                JOIN pg_catalog.pg_attribute a
-                  ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]
-               WHERE i.indcollation[k.n - 1] <> 0
-                 AND i.indcollation[k.n - 1] <> a.attcollation
-            ) OR EXISTS (
-              SELECT 1
-                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
-               WHERE i.indkey[k.n - 1] = 0
-                 AND i.indcollation[k.n - 1] NOT IN (0, 100)
-            ) AS nondefault_collation
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      CASE WHEN i.indcollation[k.n - 1] = 0 THEN ''
+                           WHEN i.indkey[k.n - 1] = 0
+                             THEN CASE WHEN i.indcollation[k.n - 1] = 100 THEN ''
+                                       ELSE cn.nspname || '.' || cc.collname END
+                           WHEN i.indcollation[k.n - 1] IS NOT DISTINCT FROM
+                                (SELECT a.attcollation FROM pg_catalog.pg_attribute a
+                                  WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1])
+                             THEN ''
+                           ELSE cn.nspname || '.' || cc.collname END
+                      ORDER BY k.n), '[]'::pg_catalog.json)
+               FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+               LEFT JOIN pg_catalog.pg_collation cc ON cc.oid = i.indcollation[k.n - 1]
+               LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.collnamespace
+            ) AS key_collations
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -1797,7 +1801,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             method: text(row, "method")?,
             key_classes: strings(row, "key_classes")?,
             key_texts: strings(row, "key_texts")?,
-            nondefault_collation: flag(row, "nondefault_collation")?,
+            key_collations: strings(row, "key_collations")?,
             attached: flag(row, "attached")?,
             reloptions: strings(row, "reloptions")?,
         });

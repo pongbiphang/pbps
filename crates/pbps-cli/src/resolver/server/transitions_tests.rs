@@ -156,6 +156,7 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
                 key: IndexKey::Column("n".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,

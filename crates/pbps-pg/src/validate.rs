@@ -17,6 +17,7 @@
 //! where the user has the file open, with the line to add.
 
 use pbps_model::ColumnName;
+use pbps_model::storage::MethodPolicy;
 use std::collections::BTreeSet;
 
 use pbps_dialect::{DialectError, Expression};
@@ -259,6 +260,10 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                 )));
             }
         }
+        found.extend(key_collation(what, policy, &method, key, table));
+        if let (Some(column), false) = (column, policy.typed_columns.is_empty()) {
+            found.extend(typed_column(what, policy, &method, key, column, table));
+        }
         let Some(class) = &key.opclass else { continue };
         let at = format!("`{shown}`");
         let named = class.shown();
@@ -296,6 +301,118 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
         }));
     }
     found
+}
+
+/// What a key's collation may be (DEC-2448.2): held for a column key of a
+/// method that collates, over a column the engine can collate, and never the
+/// collation a key already has. Measured on 16.15 and 18.6: `COLLATE` on an
+/// `integer`, `inet` or `int4range` key is "collations are not supported by
+/// type ...", and `COLLATE "default"` on a default-collation column is stored
+/// as no collation at all.
+fn key_collation(
+    what: &str,
+    policy: &MethodPolicy,
+    method: &str,
+    key: &pbps_model::IndexColumn,
+    table: &Table,
+) -> Option<DialectError> {
+    let collation = key.collation.as_deref()?;
+    let shown = pbps_model::escape::Escaped(key.key.text());
+    let named = pbps_model::escape::Escaped(collation);
+    if !policy.collation {
+        return Some(invalid(format!(
+            "{what} collates `{shown}` by `{named}`, and a {method} index has no collation"
+        )));
+    }
+    let Some(column) = key.key.column() else {
+        return Some(invalid(format!(
+            "{what} collates the expression `{shown}` by `{named}`; this model holds a collation \
+             for a column key only, because the catalog does not tell an expression's own \
+             collation from one written beside it"
+        )));
+    };
+    if collation == "default" {
+        return Some(invalid(format!(
+            "{what} collates `{shown}` by `default`, which is what a key already has; leave the \
+             collation out"
+        )));
+    }
+    if collation.is_empty() || collation.contains(['.', '"', '\0']) {
+        return Some(invalid(format!(
+            "{what} collates `{shown}` by `{named}`, which is not the name of a `pg_catalog` \
+             collation; a collation of another schema is not supported"
+        )));
+    }
+    let ty = table
+        .columns
+        .get(column)
+        .and_then(|c| crate::types::normalize(&c.ty).ok())?;
+    // A type of the user's (a domain over `text`, an enum) is for the engine to
+    // answer; a built-in one is collatable only if it is a string.
+    let collatable = ty.type_ref().is_some()
+        || (!ty.is_array()
+            && matches!(ty.base.as_str(), "text" | "character varying" | "character"));
+    (!collatable).then(|| {
+        invalid(format!(
+            "{what} collates `{shown}` by `{named}`, and column `{column}` is of type `{}`, which \
+             has no collation",
+            pbps_model::escape::Escaped(&ty.base),
+            column = column.shown(),
+        ))
+    })
+}
+
+/// A method held over a few column types only (GiST, DEC-2448.2): a column key
+/// must be of one of them, and name the class the table says (`inet_ops` for
+/// `inet`), or none where the type has a default. Every other type is indexed
+/// through an expression.
+fn typed_column(
+    what: &str,
+    policy: &MethodPolicy,
+    method: &str,
+    key: &pbps_model::IndexColumn,
+    column: &ColumnName,
+    table: &Table,
+) -> Option<DialectError> {
+    let ty = crate::types::normalize(&table.columns.get(column)?.ty).ok()?;
+    let shown = pbps_model::escape::Escaped(key.key.text());
+    let admitted = (!ty.is_array() && ty.type_ref().is_none())
+        .then(|| {
+            policy
+                .typed_columns
+                .iter()
+                .find(|(base, _)| *base == ty.base)
+        })
+        .flatten();
+    let Some((_, required)) = admitted else {
+        return Some(invalid(format!(
+            "{what} is a {method} index over `{shown}` of type `{}`, which has no {method} \
+             operator class here; index an expression over it, such as `int4range(a, b)` \
+             (this model holds {method} over a column of the types {} only)",
+            pbps_model::escape::Escaped(&ty.base),
+            policy
+                .typed_columns
+                .iter()
+                .map(|(base, _)| format!("`{base}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    };
+    let named = key.opclass.as_ref().and_then(|c| c.as_bare());
+    match (required, named) {
+        (Some(class), Some(n)) if *class == n => None,
+        (Some(class), _) => Some(invalid(format!(
+            "{what} indexes `{shown}` of type `{}` under {method}, which needs the class \
+             `{class}`: name it with `opclass: {class}`",
+            pbps_model::escape::Escaped(&ty.base),
+        ))),
+        (None, Some(_)) => Some(invalid(format!(
+            "{what} names a class for `{shown}` of type `{}`, which takes its default under \
+             {method}; leave the class out",
+            pbps_model::escape::Escaped(&ty.base),
+        ))),
+        (None, None) => None,
+    }
 }
 
 fn key_columns(
@@ -947,6 +1064,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column((*name).into()),
                         descending: *descending,
                         opclass: class.map(|c| c.parse().unwrap()),
+                        collation: None,
                     })
                     .collect(),
                 include: Vec::new(),
@@ -964,6 +1082,134 @@ mod tests {
             .into_iter()
             .map(|e| e.to_string())
             .collect()
+    }
+
+    /// A table with one column of each type the GiST and collation rules look
+    /// at, and one index of `method` over `keys`, each `(column or expression,
+    /// opclass, collation)`.
+    fn gist_table(method: IndexMethod, keys: &[(&str, Option<&str>, Option<&str>)]) -> Table {
+        let mut table = Table::default();
+        for (name, ty) in [
+            ("ip", "inet"),
+            ("net", "cidr"),
+            ("doc", "tsvector"),
+            ("q", "tsquery"),
+            ("n", "integer"),
+            ("body", "text"),
+            ("tags", "text[]"),
+        ] {
+            table
+                .columns
+                .insert(name.into(), pbps_model::Column::new(ty.parse().unwrap()));
+        }
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: keys
+                    .iter()
+                    .map(|(key, class, collation)| pbps_model::IndexColumn {
+                        key: if table.columns.contains_key(*key) {
+                            pbps_model::IndexKey::Column((*key).into())
+                        } else {
+                            pbps_model::IndexKey::Expression((*key).to_owned())
+                        },
+                        descending: false,
+                        opclass: class.map(|c| c.parse().unwrap()),
+                        collation: collation.map(str::to_owned),
+                    })
+                    .collect(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method,
+                storage_parameters: Default::default(),
+            },
+        );
+        table
+    }
+
+    /// GiST over the column types it is held over, each under the class the
+    /// engine needs, and over any expression (DEC-2448.2; measured: `inet` and
+    /// `cidr` have no default class, `tsvector` and `tsquery` do).
+    #[test]
+    fn a_gist_key_is_a_held_column_type_under_its_class_or_an_expression() {
+        use IndexMethod::Gist;
+        for keys in [
+            vec![("doc", None, None)],
+            vec![("q", None, None)],
+            vec![("ip", Some("inet_ops"), None)],
+            vec![("net", Some("pg_catalog.inet_ops"), None)],
+            vec![("int4range(n, n + 1)", None, None)],
+            vec![("int4range(n, n + 1)", None, None), ("doc", None, None)],
+        ] {
+            assert!(structure(&gist_table(Gist, &keys)).is_empty(), "{keys:?}");
+        }
+    }
+
+    /// Negative: a column of any other type, `inet` without its class, a class
+    /// on a type with a default, the default spelled out, and a class of
+    /// another schema are each refused by name, the first with the advice to
+    /// index an expression.
+    #[test]
+    fn a_gist_key_the_engine_has_no_class_for_is_refused_by_name() {
+        use IndexMethod::Gist;
+        let said = |keys: &[(&str, Option<&str>, Option<&str>)]| {
+            structure(&gist_table(Gist, keys)).join("\n")
+        };
+        let int = said(&[("n", None, None)]);
+        assert!(
+            int.contains("`integer`") && int.contains("index an expression"),
+            "{int}"
+        );
+        assert!(said(&[("tags", None, None)]).contains("index an expression"));
+        let bare = said(&[("ip", None, None)]);
+        assert!(bare.contains("needs the class `inet_ops`"), "{bare}");
+        let on_default = said(&[("doc", Some("inet_ops"), None)]);
+        assert!(on_default.contains("leave the class out"), "{on_default}");
+        let spelled = said(&[("int4range(n, n)", Some("range_ops"), None)]);
+        assert!(spelled.contains("`range_ops`"), "{spelled}");
+        let outside = said(&[("ip", Some("ext.inet_ops"), None)]);
+        assert!(outside.contains("a schema owns"), "{outside}");
+        // GiST is never unique, ordered, or INCLUDEs an expression's payload.
+        let mut unique = gist_table(Gist, &[("doc", None, None)]);
+        unique.indexes.get_mut("ix").unwrap().unique = true;
+        assert!(structure(&unique).join("\n").contains("cannot be unique"));
+        let mut desc = gist_table(Gist, &[("doc", None, None)]);
+        desc.indexes.get_mut("ix").unwrap().columns[0].descending = true;
+        assert!(structure(&desc).join("\n").contains("has no order"));
+    }
+
+    /// A column key may be collated by a `pg_catalog` collation on a column the
+    /// engine can collate; every other case is refused by name (DEC-2448.2;
+    /// measured on 16.15 and 18.6: `COLLATE` on `integer`, `inet`, `int4range`
+    /// is "collations are not supported by type ...").
+    #[test]
+    fn a_key_collation_is_held_for_a_collatable_column_key_only() {
+        use IndexMethod::{Btree, Gin, Gist};
+        let said = |m, keys: &[(&str, Option<&str>, Option<&str>)]| {
+            structure(&gist_table(m, keys)).join("\n")
+        };
+        assert!(said(Btree, &[("body", None, Some("C"))]).is_empty());
+        let int = said(Btree, &[("n", None, Some("C"))]);
+        assert!(int.contains("has no collation"), "{int}");
+        let ip = said(Gist, &[("ip", Some("inet_ops"), Some("C"))]);
+        assert!(
+            ip.contains("`inet`") && ip.contains("has no collation"),
+            "{ip}"
+        );
+        let array = said(Btree, &[("tags", None, Some("C"))]);
+        assert!(array.contains("has no collation"), "{array}");
+        let expression = said(Btree, &[("lower(body)", None, Some("C"))]);
+        assert!(expression.contains("column key only"), "{expression}");
+        let default = said(Btree, &[("body", None, Some("default"))]);
+        assert!(default.contains("leave the collation out"), "{default}");
+        let schema = said(Btree, &[("body", None, Some("other.mine"))]);
+        assert!(
+            schema.contains("not the name of a `pg_catalog`"),
+            "{schema}"
+        );
+        let gin = said(Gin, &[("body", None, Some("C"))]);
+        assert!(gin.contains("has no collation"), "{gin}");
     }
 
     /// GIN over `jsonb` is accepted with its default class or
@@ -1015,6 +1261,7 @@ mod tests {
                 key: pbps_model::IndexKey::Expression(text.into()),
                 descending: false,
                 opclass: class.map(|c| c.parse().unwrap()),
+                collation: None,
             }];
             structure(&table)
         };

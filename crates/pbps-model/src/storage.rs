@@ -29,6 +29,10 @@ pub enum Kind {
     Real,
     /// `vacuum_index_cleanup`: `auto`, or a whole boolean word.
     IndexCleanup,
+    /// A GiST `buffering`: `on`, `off` or `auto`, in any case and with nothing
+    /// around it (measured on 16.15 and 18.6: `ON` is stored as `on`; `true`
+    /// and ` on` are refused by the engine).
+    Buffering,
 }
 
 /// Every heap parameter a table may declare, by name. Two are 18's
@@ -97,7 +101,7 @@ pub enum ParameterChange {
 }
 
 /// The table lock an in-place parameter change takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IndexLock {
     ShareUpdateExclusive,
     AccessExclusive,
@@ -109,6 +113,10 @@ pub struct IndexParameter {
     pub name: &'static str,
     pub kind: Kind,
     pub change: ParameterChange,
+    /// The lock this parameter's change takes where it is not the method's:
+    /// GiST's `buffering` takes `AccessExclusive` and its `fillfactor` the
+    /// lighter one (measured on 16.15 and 18.6, DEC-2448.2).
+    pub lock: Option<IndexLock>,
 }
 
 /// What this model holds of one index access method: the capabilities the
@@ -133,6 +141,14 @@ pub struct MethodPolicy {
     /// The method's default class for `key_type`, which a declaration leaves
     /// out and never spells; `None` where it depends on the key's type.
     pub default_class: Option<&'static str>,
+    /// Whether a column key may be compared under a collation of its own
+    /// (`COLLATE` on a key). GIN's `jsonb` has none.
+    pub collation: bool,
+    /// For a method held over a few column types only: each admitted base type
+    /// and the engine class its key must name (`None`: the type's default
+    /// class, so none is written). Empty where the method is not held by type
+    /// (DEC-2448.2).
+    pub typed_columns: &'static [(&'static str, Option<&'static str>)],
     /// The lock an in-place change of one of its parameters takes.
     pub lock: IndexLock,
     pub parameters: &'static [IndexParameter],
@@ -142,6 +158,20 @@ impl MethodPolicy {
     /// The parameter `name`, if this method declares it.
     pub fn parameter(&self, name: &str) -> Option<&'static IndexParameter> {
         self.parameters.iter().find(|p| p.name == name)
+    }
+
+    /// The strongest lock an in-place change of `names` takes: each
+    /// parameter's own, or the method's.
+    pub fn lock_of<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> IndexLock {
+        names
+            .into_iter()
+            .map(|name| {
+                self.parameter(name)
+                    .and_then(|p| p.lock)
+                    .unwrap_or(self.lock)
+            })
+            .max()
+            .unwrap_or(self.lock)
     }
 
     /// The most severe verdict among `names` and the first name that has it.
@@ -172,6 +202,17 @@ const fn param(name: &'static str, kind: Kind) -> IndexParameter {
         name,
         kind,
         change: ParameterChange::Alter,
+        lock: None,
+    }
+}
+
+/// [`param`] whose change takes `lock`, not the method's.
+const fn param_locked(name: &'static str, kind: Kind, lock: IndexLock) -> IndexParameter {
+    IndexParameter {
+        name,
+        kind,
+        change: ParameterChange::Alter,
+        lock: Some(lock),
     }
 }
 
@@ -184,6 +225,8 @@ static BTREE: MethodPolicy = MethodPolicy {
     key_type: None,
     classes: &[],
     default_class: None,
+    collation: true,
+    typed_columns: &[],
     lock: IndexLock::ShareUpdateExclusive,
     parameters: &[
         param("deduplicate_items", Kind::Bool),
@@ -200,6 +243,8 @@ static GIN: MethodPolicy = MethodPolicy {
     key_type: Some("jsonb"),
     classes: &["jsonb_path_ops"],
     default_class: Some("jsonb_ops"),
+    collation: false,
+    typed_columns: &[],
     lock: IndexLock::AccessExclusive,
     parameters: &[
         param("fastupdate", Kind::Bool),
@@ -207,8 +252,42 @@ static GIN: MethodPolicy = MethodPolicy {
     ],
 };
 
+/// GiST (DEC-2448.2), measured on 16.15 and 18.6. No unique, no order, `INCLUDE`
+/// of columns only. Of the column types this model declares only `tsvector`
+/// and `tsquery` have a GiST default class and `inet`/`cidr` take `inet_ops`
+/// (`inet_ops` is the one non-default class of the engine's own); every other
+/// type is indexed through an expression such as `int4range(a, b)`. Both
+/// parameters change in place and keep the relation file; `buffering` only
+/// matters at build, which `SET` records without effect, as a B-tree's
+/// `fillfactor` does for the pages already built (DEC-1442.1). The locks
+/// differ by parameter: `fillfactor` takes `ShareUpdateExclusive` and
+/// `buffering` `AccessExclusive` (measured on both servers).
+static GIST: MethodPolicy = MethodPolicy {
+    method: IndexMethod::Gist,
+    unique: false,
+    include: true,
+    ordered: false,
+    expression_keys: true,
+    key_type: None,
+    classes: &["inet_ops"],
+    default_class: None,
+    collation: true,
+    typed_columns: &[
+        ("tsvector", None),
+        ("tsquery", None),
+        ("inet", Some("inet_ops")),
+        ("cidr", Some("inet_ops")),
+    ],
+    lock: IndexLock::ShareUpdateExclusive,
+    parameters: &[
+        param_locked("buffering", Kind::Buffering, IndexLock::AccessExclusive),
+        param("fillfactor", Kind::Int),
+    ],
+};
+
 pub(crate) fn policy_of(method: IndexMethod) -> &'static MethodPolicy {
     match method {
+        IndexMethod::Gist => &GIST,
         IndexMethod::Btree => &BTREE,
         IndexMethod::Gin => &GIN,
     }
@@ -239,6 +318,12 @@ fn spelled(kind: Kind, name: &str, value: &str) -> Result<String, String> {
         // `+ 0.0` turns a negative zero into zero, which `to_string` would
         // otherwise spell `-0` (#1477 review).
         Kind::Real => parse_real(value).map(|r| (r + 0.0).to_string()),
+        Kind::Buffering => {
+            let word = value.to_lowercase();
+            ["on", "off", "auto"]
+                .contains(&word.as_str())
+                .then_some(word)
+        }
         Kind::IndexCleanup => {
             let word = value.trim().to_lowercase();
             if word == "auto" {
@@ -401,6 +486,66 @@ mod tests {
         }
     }
 
+    /// GiST's row, measured on 16.15 and 18.6 (DEC-2448.2): what the engine
+    /// reports for the method, its two parameters both altered in place, and
+    /// the column types it is held over with the class each needs.
+    #[test]
+    fn the_gist_policy_row_is_what_the_engine_reports() {
+        let g = IndexMethod::Gist.policy();
+        assert_eq!(g.method, IndexMethod::Gist);
+        assert!(!g.unique && g.include && !g.ordered && g.expression_keys && g.collation);
+        assert_eq!(g.lock, IndexLock::ShareUpdateExclusive);
+        // `buffering` takes the heavier lock; the strongest of a change wins.
+        assert_eq!(g.lock_of(["fillfactor"]), IndexLock::ShareUpdateExclusive);
+        assert_eq!(g.lock_of(["buffering"]), IndexLock::AccessExclusive);
+        assert_eq!(
+            g.lock_of(["fillfactor", "buffering"]),
+            IndexLock::AccessExclusive
+        );
+        assert_eq!(g.lock_of([]), g.lock);
+        assert_eq!(g.classes, &["inet_ops"]);
+        assert_eq!(g.default_class, None);
+        assert_eq!(
+            g.typed_columns,
+            &[
+                ("tsvector", None),
+                ("tsquery", None),
+                ("inet", Some("inet_ops")),
+                ("cidr", Some("inet_ops")),
+            ]
+        );
+        assert!(
+            g.parameters
+                .iter()
+                .all(|p| p.change == ParameterChange::Alter)
+        );
+        // Negative: btree and GIN are not held by type, and GIN has no collation.
+        assert!(IndexMethod::Btree.policy().typed_columns.is_empty());
+        assert!(!IndexMethod::Gin.policy().collation);
+    }
+
+    /// `buffering` is `on`, `off` or `auto` in any case, and nothing else:
+    /// the engine stores `ON` as `on` and refuses `true` and ` on`.
+    #[test]
+    fn a_gist_buffering_has_three_spellings_and_no_others() {
+        for (given, canonical) in [("on", "on"), ("OFF", "off"), ("Auto", "auto")] {
+            assert_eq!(
+                canonical_index(IndexMethod::Gist, "buffering", given).unwrap(),
+                canonical
+            );
+        }
+        for bad in ["true", "1", " on", "maybe", ""] {
+            assert!(
+                canonical_index(IndexMethod::Gist, "buffering", bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            canonical_index(IndexMethod::Gist, "fillfactor", "070").unwrap(),
+            "56"
+        );
+    }
+
     /// Negative: another method's parameter, and a method the model does not
     /// hold, are not this method's.
     #[test]
@@ -410,8 +555,10 @@ mod tests {
         assert!(b.parameter("fastupdate").is_none());
         assert!(IndexMethod::Gin.policy().parameter("fillfactor").is_none());
         assert!(canonical_index(IndexMethod::Gin, "fillfactor", "70").is_err());
-        assert_eq!(IndexMethod::from_am_name("gist"), None);
+        assert_eq!(IndexMethod::from_am_name("gist"), Some(IndexMethod::Gist));
         assert_eq!(IndexMethod::from_am_name("brin"), None);
+        assert!(IndexMethod::Gist.policy().parameter("fastupdate").is_none());
+        assert!(canonical_index(IndexMethod::Gist, "fastupdate", "on").is_err());
         assert_eq!(IndexMethod::from_am_name("BTREE"), None);
     }
 
@@ -424,16 +571,19 @@ mod tests {
                 name: "a",
                 kind: Kind::Int,
                 change: ParameterChange::Alter,
+                lock: None,
             },
             IndexParameter {
                 name: "r",
                 kind: Kind::Int,
                 change: ParameterChange::Rebuild,
+                lock: None,
             },
             IndexParameter {
                 name: "x",
                 kind: Kind::Int,
                 change: ParameterChange::Refuse,
+                lock: None,
             },
         ];
         let policy = MethodPolicy {

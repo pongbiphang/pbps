@@ -147,7 +147,9 @@ use schemars::JsonSchema;
 /// Version 35 keeps per-link rebuild conversion history (DEC-2298.13).
 /// Version 36 records exact installed PostgreSQL extensions (DEC-2447.1).
 /// Version 37 keeps the target assertions the applied plan recorded (DEC-2401.4).
-pub const CURRENT_VERSION: u32 = 37;
+/// Version 38 records the GiST index method and a column key's collation (DEC-2448.2);
+/// every older snapshot truthfully holds neither.
+pub const CURRENT_VERSION: u32 = 38;
 
 /// The oldest snapshot version this build reads as its own.
 ///

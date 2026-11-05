@@ -34,6 +34,7 @@ pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIn
                         key: pbps_model::IndexKey::Column(name.clone()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     })
                     .collect(),
                 include: Vec::new(),

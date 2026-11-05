@@ -4903,6 +4903,7 @@ fn attached(
                 key: pbps_model::IndexKey::Column(c.clone()),
                 descending: false,
                 opclass: None,
+                collation: None,
             })
             .collect(),
         include: Vec::new(),
@@ -9734,6 +9735,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("c".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -10044,6 +10046,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -10238,6 +10241,7 @@ mod tests {
                 name,
                 kind: Kind::Int,
                 change,
+                lock: None,
             }
         }
         pbps_model::storage::MethodPolicy {
@@ -10249,6 +10253,8 @@ mod tests {
             key_type: None,
             classes: &[],
             default_class: None,
+            collation: true,
+            typed_columns: &[],
             lock: IndexLock::AccessExclusive,
             parameters: &[
                 p("altered", ParameterChange::Alter),
@@ -10319,6 +10325,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A GiST index and a key's collation go through the ordinary index
+    /// route, with no new change kind (DEC-2448.2): a parameter-only change is
+    /// the `ALTER INDEX` carrying the method, and a collation change or a method
+    /// change is the drop and the add.
+    #[test]
+    fn a_gist_parameter_alters_and_a_collation_or_method_change_replaces_the_index() {
+        let table_with =
+            |method: IndexMethod, collation: Option<&str>, parameters: &[(&str, &str)]| {
+                let mut t = Table::default();
+                t.columns
+                    .insert("body".into(), Column::new("text".parse().unwrap()));
+                t.indexes.insert(
+                    "ix".into(),
+                    Index {
+                        columns: vec![pbps_model::IndexColumn {
+                            collation: collation.map(str::to_owned),
+                            ..pbps_model::IndexColumn::column("body")
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method,
+                        storage_parameters: parameters_of(parameters),
+                    },
+                );
+                t
+            };
+        let run = |was: &Table, now: &Table| {
+            let mut changes = Vec::new();
+            let mut errs = Vec::new();
+            diff_constraints(&"dbo.t".parse().unwrap(), was, now, &mut changes, &mut errs);
+            assert!(errs.is_empty(), "{errs:?}");
+            changes
+        };
+        let base = table_with(IndexMethod::Gist, None, &[("fillfactor", "70")]);
+        let tuned = table_with(
+            IndexMethod::Gist,
+            None,
+            &[("fillfactor", "80"), ("buffering", "off")],
+        );
+        assert!(matches!(
+            run(&base, &tuned).as_slice(),
+            [Change::SetIndexStorageParameters {
+                method: IndexMethod::Gist,
+                ..
+            }]
+        ));
+        assert!(run(&base, &base).is_empty());
+        let collated = table_with(IndexMethod::Gist, Some("C"), &[("fillfactor", "70")]);
+        assert!(matches!(
+            run(&base, &collated).as_slice(),
+            [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+                if index.columns[0].collation.as_deref() == Some("C")
+        ));
+        // Negative: the same collation on both sides changes nothing, and a
+        // method change is a replacement, never an `ALTER`.
+        assert!(run(&collated, &collated).is_empty());
+        let btree = table_with(IndexMethod::Btree, None, &[]);
+        assert!(matches!(
+            run(&base, &btree).as_slice(),
+            [Change::DropIndex { .. }, Change::AddIndex { .. }]
+        ));
     }
 
     /// Through the differ itself, under a policy that holds one parameter of
@@ -10441,6 +10511,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -12388,6 +12459,7 @@ mod tests {
                             key: pbps_model::IndexKey::Column(column.into()),
                             descending: false,
                             opclass: None,
+                            collation: None,
                         }],
                         include: Vec::new(),
                         unique: false,
@@ -13410,6 +13482,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -13828,6 +13901,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column((*c).into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 })
                 .collect(),
             unique: true,
@@ -14507,6 +14581,7 @@ mod tests {
                         key: pbps_model::IndexKey::Expression("f(n)".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     ..index_on("n")
                 },
@@ -14574,6 +14649,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -15522,6 +15598,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -16641,6 +16718,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: true,
@@ -16778,6 +16856,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("v".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -17759,6 +17838,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("n".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -21485,6 +21565,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(c.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -21558,6 +21639,7 @@ mod tests {
                             key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
+                            collation: None,
                         }],
                         include: vec![],
                         unique: true,
@@ -21666,6 +21748,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique,
@@ -21874,6 +21957,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("sku".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: true,
@@ -22023,6 +22107,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("old".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec!["note".into()],
                 unique: false,
@@ -22045,6 +22130,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("new".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec!["note".into()],
                 unique: false,
@@ -22231,6 +22317,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -22493,6 +22580,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -22593,6 +22681,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -23005,6 +23094,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -23055,6 +23145,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -23099,6 +23190,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -23322,6 +23414,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("doomed".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,
@@ -26588,6 +26681,7 @@ mod tests {
             key: IndexKey::Column("old".into()),
             descending: false,
             opclass: None,
+            collation: None,
         };
         for kind in [
             Part::Computed,

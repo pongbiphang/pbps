@@ -140,6 +140,8 @@ mod extensions2447_drop;
 mod extensions2447_move;
 #[path = "support/extensions2447_update.rs"]
 mod extensions2447_update;
+#[path = "support/index_gist2448.rs"]
+mod index_gist2448;
 
 #[path = "support/grant_advisories2446.rs"]
 mod grant_advisories2446;

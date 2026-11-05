@@ -220,6 +220,7 @@ fn schema() -> Schema {
                     key,
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,

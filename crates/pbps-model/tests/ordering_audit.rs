@@ -127,6 +127,7 @@ mod effects_of_each_kind {
                 key: IndexKey::Column("x".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,

@@ -82,6 +82,7 @@ pub(crate) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
                 key: IndexKey::Column("c".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,

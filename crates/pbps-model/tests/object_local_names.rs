@@ -51,6 +51,7 @@ fn shape() -> Table {
                     key: IndexKey::Expression("id + 1".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,

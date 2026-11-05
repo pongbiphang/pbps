@@ -268,6 +268,16 @@ where
             }
         }
     }
+    // #2448 adds a key's `collation:` and the `gist` method (schema set 91);
+    // the captured index branches predate both.
+    declaration_schema["$defs"]["IndexKeyDto"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("collation");
+    declaration_schema["$defs"]["IndexMethod"]["oneOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| variant["const"] != "gist");
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
