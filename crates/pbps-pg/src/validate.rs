@@ -348,10 +348,16 @@ fn key_collation(
         .get(column)
         .and_then(|c| crate::types::normalize(&c.ty).ok())?;
     // A type of the user's (a domain over `text`, an enum) is for the engine to
-    // answer; a built-in one is collatable only if it is a string.
-    let collatable = ty.type_ref().is_some()
-        || (!ty.is_array()
-            && matches!(ty.base.as_str(), "text" | "character varying" | "character"));
+    // answer; a built-in one is collatable only if it is a string. An array is
+    // collatable exactly when its element is: `text[]`, `varchar[]` and
+    // `char[]` take a key collation, `int[]` is `42804` (measured on 16.15 and
+    // 18.6).
+    let element = ty.element();
+    let collatable = element.type_ref().is_some()
+        || matches!(
+            element.base.as_str(),
+            "text" | "character varying" | "character"
+        );
     (!collatable).then(|| {
         invalid(format!(
             "{what} collates `{shown}` by `{named}`, and column `{column}` is of type `{}`, which \
@@ -1097,6 +1103,9 @@ mod tests {
             ("n", "integer"),
             ("body", "text"),
             ("tags", "text[]"),
+            ("vtags", "varchar(5)[]"),
+            ("ctags", "char(3)[]"),
+            ("nums", "integer[]"),
         ] {
             table
                 .columns
@@ -1197,8 +1206,23 @@ mod tests {
             ip.contains("`inet`") && ip.contains("has no collation"),
             "{ip}"
         );
-        let array = said(Btree, &[("tags", None, Some("C"))]);
-        assert!(array.contains("has no collation"), "{array}");
+        // An array is collatable by its element (measured: `text[]`,
+        // `varchar[]` and `char[]` build under `COLLATE "C"`, `int[]` is 42804).
+        for column in ["tags", "vtags", "ctags"] {
+            assert!(
+                said(Btree, &[(column, None, Some("C"))]).is_empty(),
+                "{column}"
+            );
+        }
+        // Still refused for GiST: `text[]` has no GiST class, whatever its
+        // collation, and the advice is the existing one.
+        let gist = said(Gist, &[("tags", None, Some("C"))]);
+        assert!(gist.contains("index an expression"), "{gist}");
+        let array = said(Btree, &[("nums", None, Some("C"))]);
+        assert!(
+            array.contains("has no collation") && array.contains("`integer`"),
+            "{array}"
+        );
         let expression = said(Btree, &[("lower(body)", None, Some("C"))]);
         assert!(expression.contains("column key only"), "{expression}");
         let default = said(Btree, &[("body", None, Some("default"))]);

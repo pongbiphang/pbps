@@ -440,3 +440,57 @@ async fn a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else() {
         db.finish().await;
     }
 }
+
+/// An array of a collatable element takes a key collation, and the round trip
+/// is exact (declare, apply, pull, equal): a `text[]`, `varchar[]` and `char[]`
+/// key under `COLLATE "C"` builds and is read as `collation: C`; an `integer[]`
+/// key is the engine's `42804`, and a GiST over `text[]` has no class at all
+/// (`42704`), so both stay refused (review round 1).
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_array_of_a_collatable_element_takes_a_key_collation_and_reads_back() {
+    let _live = super::live_ledger().await;
+    for variable in SERVERS {
+        let mut db = Private::on(variable, "array").await;
+        db.run(
+            "CREATE TABLE booking (id int PRIMARY KEY, tags text[], vtags varchar(5)[], \
+             ctags char(3)[], nums int[])",
+        )
+        .await;
+        let collated = |column: &str| {
+            index(
+                IndexMethod::Btree,
+                vec![key(IndexKey::Column(column.into()), None, Some("C"))],
+            )
+        };
+        let declared = [
+            ("ix_tags", "tags"),
+            ("ix_vtags", "vtags"),
+            ("ix_ctags", "ctags"),
+        ];
+        for (name, column) in declared {
+            db.apply(&add(name, collated(column))).await;
+        }
+        let read = pull_indexes(db.conn()).await;
+        for (name, column) in declared {
+            assert_eq!(
+                read[&ObjectLocalName::from(name)],
+                collated(column),
+                "{name}: what was declared is what is read"
+            );
+        }
+        // Negative: an array of a type with no collation, and a GiST over a
+        // collatable array, are the engine's refusals.
+        assert_eq!(
+            db.refused("CREATE INDEX z ON app.booking (nums COLLATE \"C\")")
+                .await,
+            "42804"
+        );
+        assert_eq!(
+            db.refused("CREATE INDEX z ON app.booking USING gist (tags)")
+                .await,
+            "42704"
+        );
+        db.finish().await;
+    }
+}

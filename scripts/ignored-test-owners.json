@@ -2491,6 +2491,7 @@
         "index_gist2448::a_gist_index_and_a_key_collation_read_back_as_declared",
         "index_gist2448::the_gist_column_types_are_the_ones_the_engine_has_a_class_for",
         "index_gist2448::a_key_collation_is_the_engines_where_the_model_holds_it",
+        "index_gist2448::an_array_of_a_collatable_element_takes_a_key_collation_and_reads_back",
         "index_gist2448::a_gist_option_change_alters_in_place_and_a_drop_needs_nothing_else",
         "index_policy2448::the_policy_capabilities_are_the_engines_own",
         "index_policy2448::every_parameter_verdict_and_lock_is_what_the_engine_does",
