@@ -447,3 +447,61 @@ fn a_routine_the_same_plan_creates_is_noted_at_plan_and_judged_at_apply() {
         }
     });
 }
+
+/// The binding table copies the table's own columns, so a column that already
+/// has the name a helper would take must not make a valid change fail to bind
+/// (review of #2686). Columns named for the placeholder and for the names the
+/// search falls back to are in the table; an unrelated DEFAULT and generated
+/// expression change on it, and the plan applies.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_column_named_like_a_binder_helper_does_not_refuse_an_unrelated_expression_change() {
+    const T: &str = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  pbps_bound: {type: integer}\n  pbps_bound_1: {type: integer}\n  a: {type: integer, default: '1'}\nGENprimary_key: {name: pk_t, columns: [id]}\n";
+    const G: &str = "  g: {type: integer, generated: {expression: 'a + 1', stored: true}}\n";
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let slug = format!("tx2563-helper-{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection().to_owned();
+        // Before 17 a generated expression cannot be changed in place, so the
+        // generated column is only here where it can be.
+        let generated = version >= 17;
+        let from = T.replace("GEN", if generated { G } else { "" });
+        let d = bootstrapped_demo(&connection, &slug, &from);
+        d.keyed(&connection);
+        on_server(&connection, "INSERT INTO app.t (id, a) VALUES (1, 5)");
+        d.table(
+            &from
+                .replace("default: '1'", "default: '2'")
+                .replace("a + 1", "a + 2"),
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("helper-plan.json");
+        let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        let applied = approved_apply(
+            &d,
+            &connection,
+            &plan,
+            &["--allow", "destructive,narrowing,constraint"],
+        );
+        assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
+        assert_eq!(
+            text_of(
+                &connection,
+                "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d JOIN pg_attribute a \
+                 ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+                 WHERE d.adrelid = 'app.t'::regclass AND a.attname = 'a'"
+            ),
+            "2",
+            "PG{version}"
+        );
+        if generated {
+            assert_eq!(
+                text_of(&connection, "SELECT g::text FROM app.t WHERE id = 1"),
+                "7",
+                "PG{version}"
+            );
+        }
+    }
+}

@@ -26,6 +26,10 @@ use crate::pins::Within;
 
 const TEMP: &str = "pbps_table_expressions";
 
+/// The placeholder name of the column an existing column's new expression is
+/// bound as; [`name_bound_columns`] replaces it before anything runs.
+const BIND: &str = "pbps_bound";
+
 /// When the expressions are judged, which decides what an unbindable one means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Moment {
@@ -180,11 +184,17 @@ async fn vet_bound(
              judged; nothing has been changed"
         )),
     };
-    let spec = match spec(conn, change).await {
+    let mut spec = match spec(conn, change).await {
         Ok(Some(spec)) => spec,
         Ok(None) => return Ok(Vec::new()),
         Err(why) => return unbound(&describe(change), &why),
     };
+    if let Some(table) = &spec.like {
+        match column_names(conn, table).await {
+            Ok(taken) => name_bound_columns(&mut spec, taken),
+            Err(why) => return unbound(&spec.what, &why),
+        }
+    }
     // Bound on the path the real statement runs on, or an unqualified name
     // would resolve differently here than where it is created (`SET LOCAL`
     // ends with the transaction or savepoint that is rolled back).
@@ -386,6 +396,55 @@ fn create_statement(spec: &Spec) -> Result<String, String> {
     ))
 }
 
+/// The names of the columns `table` has today, dropped ones excluded.
+async fn column_names(
+    conn: &mut Conn,
+    table: &TableName,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let qualified = crate::emit::qualified(table).map_err(|e| e.to_string())?;
+    let rows = conn
+        .query_with(
+            "SELECT a.attname::pg_catalog.text AS name
+               FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid OPERATOR(pg_catalog.=) $1::pg_catalog.text::pg_catalog.regclass
+                AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped",
+            &[Param::Str(&qualified)],
+        )
+        .await
+        .map_err(|e| {
+            e.server_error_code()
+                .unwrap_or_else(|| "unknown".to_owned())
+        })?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<&str>("name").ok().flatten().map(str::to_owned))
+        .collect())
+}
+
+/// Gives every bound column a name the copied columns do not have. The copy
+/// (`LIKE`) brings the table's own columns, so a fixed helper name, or the
+/// name of a column the plan drops and adds back, would make the temporary
+/// table fail to build and refuse a valid plan. The name is derived from the
+/// column set itself (`pbps_bound`, then `pbps_bound_1`, ...), so it cannot
+/// collide: no declared column can have a name this search skipped. The other
+/// helpers cannot collide by construction: the temporary table lives in the
+/// session's own `pg_temp`, `LIKE ... EXCLUDING ALL` copies no constraint or
+/// default, and no alias is used.
+fn name_bound_columns(spec: &mut Spec, mut taken: std::collections::BTreeSet<String>) {
+    for column in &mut spec.columns {
+        if column.bound == BIND || taken.contains(&column.bound) {
+            let mut n = 0_usize;
+            let mut name = BIND.to_owned();
+            while taken.contains(&name) {
+                n += 1;
+                name = format!("{BIND}_{n}");
+            }
+            column.bound = name;
+        }
+        taken.insert(column.bound.clone());
+    }
+}
+
 /// The type the table has for `column` today, for an expression that changes
 /// an existing column's default or generation.
 async fn column_type(conn: &mut Conn, column: &pbps_model::ColumnRef) -> Result<String, String> {
@@ -504,7 +563,7 @@ async fn existing(
         schema: column.table.schema.clone(),
         like: Some(column.table.clone()),
         columns: vec![Column {
-            bound: "pbps_bound".to_owned(),
+            bound: BIND.to_owned(),
             shown: column.name.raw().to_owned(),
             ty: column_type(conn, column).await?,
             value: Some(value),
