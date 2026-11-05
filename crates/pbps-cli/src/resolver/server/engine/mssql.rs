@@ -1160,6 +1160,7 @@ pub(super) fn compile_failed(error: ReconstructError) -> Error {
         ReconstructError::Unsupported(_)
         | ReconstructError::Emit { .. }
         | ReconstructError::Compile { .. }
+        | ReconstructError::Stalled(_)
         | ReconstructError::Cycle(_) => Error::Binding(error.to_string()),
     }
 }
@@ -1256,20 +1257,28 @@ impl Binding {
     /// Compiles `steps` as the reproduced deployer, each statement in its own
     /// batch and autocommit (measured on 17.0, `reconstruct.rs`).
     pub(super) async fn compile(
-        &self,
+        &mut self,
         prepared: &mut Prepared,
         target: &mut Conn,
         steps: std::ops::Range<usize>,
     ) -> Result<(), Error> {
-        for at in steps {
+        let mut at = steps.start;
+        while at < steps.end {
             if self.reconstruction.auxiliary(at).is_some() {
                 chained::execute(self, prepared, target, at).await?;
-            } else {
-                self.reconstruction
-                    .compile_steps(&mut prepared.compile, at..at + 1)
-                    .await
-                    .map_err(compile_failed)?;
+                at += 1;
+                continue;
             }
+            // The steps up to the next auxiliary one are one trial range
+            // (DEC-2143.9): the engine, not the text, orders what is in it.
+            let run = (at..steps.end)
+                .take_while(|&step| self.reconstruction.auxiliary(step).is_none())
+                .count();
+            self.reconstruction
+                .compile_steps(&mut prepared.compile, at..at + run)
+                .await
+                .map_err(compile_failed)?;
+            at += run;
         }
         Ok(())
     }

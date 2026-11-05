@@ -65,9 +65,10 @@ fn consumer(schema: &Schema) -> Reconstruction {
 }
 
 async fn install(target: &str, schema: &Schema) {
-    let compiled = consumer(schema);
+    let mut compiled = consumer(schema);
+    let len = compiled.len();
     compiled
-        .compile_steps(&mut connection(target).await, 0..compiled.len())
+        .compile_steps(&mut connection(target).await, 0..len)
         .await
         .unwrap();
 }
@@ -432,7 +433,8 @@ async fn noexec(conn: &mut Conn, consumer: &Reconstruction) -> bool {
         "the oracle compiles exactly one consumer"
     );
     conn.execute("SET NOEXEC ON;").await.unwrap();
-    let result = consumer.compile_steps(conn, 0..1).await;
+    // A probe: nothing is created, so each ask starts a fresh cursor.
+    let result = consumer.clone().compile_steps(conn, 0..1).await;
     conn.execute("SET NOEXEC OFF;").await.unwrap();
     if let Err(error) = &result {
         let text = error.to_string();

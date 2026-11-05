@@ -680,7 +680,7 @@ async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
                 .await
                 .unwrap();
                 let external_prerequisites = inputs.external_prerequisites();
-                let reconstruction =
+                let mut reconstruction =
                     pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
                         &pbps_mssql::Mssql,
                         &plan,

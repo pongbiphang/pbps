@@ -115,9 +115,9 @@ contract is not saved-plan data (DEC-2469.3).
 ## New-engine ordering contract
 
 An engine supplies ordering facts and lowering semantics to the shared
-compiler; it supplies no deployment reorder pass. PG scratch uses order's
+compiler; it supplies no deployment reorder pass. PG and SQL Server scratch use order's
 branded trial program to choose immutable whole groups after engine refusals,
-within fixed ranges and hard readiness (DEC-2465.1). Metadata is published only
+within fixed ranges and hard readiness (DEC-2465.1, DEC-2143.9). Metadata is published only
 on acknowledged commit, and completed observations gate assessment. The contract and pipeline are
 in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
 

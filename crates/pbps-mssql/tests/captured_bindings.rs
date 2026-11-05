@@ -227,3 +227,59 @@ fn the_passes_after_the_resolver_read_the_bindings_that_ordered_the_plan() {
     // every pass, as it always did.
     assert!(ordered(&Captured::default()).is_err());
 }
+
+/// The plan a resolver's scratch compiles is built from nothing, and the
+/// alias pair is in it: the function's text spells the view's name, the view's
+/// text calls the function. Nothing runs that order, since scratch settles its
+/// own with the text edges as guesses (DEC-2143.9), so it is not judged as one.
+#[test]
+#[allow(clippy::wildcard_enum_match_arm)]
+fn a_bootstrap_of_modules_whose_texts_name_each_other_is_not_judged_as_an_order() {
+    let (_, desired) = alias_column();
+    let ids = IdsFile::default();
+    let plan = pbps_diff::bootstrap(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &Mssql,
+        &Default::default(),
+    )
+    .expect("the declarations have a bootstrap plan");
+    let created: BTreeSet<_> = plan
+        .changes()
+        .changes
+        .iter()
+        .filter_map(|planned| match &planned.change {
+            Change::CreateModule { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(created, BTreeSet::from([id("f"), id("v")]));
+}
+
+/// Negative: an ordinary plan from nothing is still judged by the debug
+/// observer, so the exemption is the bootstrap's alone.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "effects contradict this order")]
+fn an_ordinary_plan_of_the_same_pair_is_still_judged_as_an_order() {
+    let (_, desired) = alias_column();
+    let ids = IdsFile::default();
+    let _ = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &Mssql,
+        &Default::default(),
+    );
+}

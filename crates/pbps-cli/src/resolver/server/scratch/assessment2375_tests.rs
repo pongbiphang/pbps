@@ -173,7 +173,7 @@ async fn mssql_assessment_distinguishes_bindings_creation_and_unreconstructed_ca
             let ids = pbps_diff::resolve(&schema, &IdsFile::default(), &[], &pbps_diff::Context { operator:"assessment-test".into(), today:"2026-10-27".into() }).unwrap().ids;
             let empty = Schema::default(); let empty_ids = IdsFile::default();
             let plan = pbps_diff::resolver::ordinary(pbps_diff::Side { schema:&empty, ids:&empty_ids }, pbps_diff::Side { schema:&schema, ids:&ids }, &pbps_mssql::Mssql, &Hints::default()).unwrap();
-            let order = Reconstruction::new(&pbps_mssql::Mssql, &plan, &ids, &Default::default()).unwrap();
+            let mut order = Reconstruction::new(&pbps_mssql::Mssql, &plan, &ids, &Default::default()).unwrap();
             {
                 let namespaces = BTreeSet::new();
                 let recorded = capture::RecordedOwnership { schema:&schema, ids:&ids, namespaces:&namespaces };

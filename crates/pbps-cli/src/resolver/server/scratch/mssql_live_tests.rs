@@ -271,7 +271,7 @@ async fn begin(target: &str, declared: &Declared) -> Begun {
     // As the planner forms it: the differ's plan from nothing to the
     // declarations, which may name a function a computed column calls
     // before it exists (`ordinary` refuses that, and is not the bootstrap).
-    let bootstrap = pbps_diff::diff(
+    let bootstrap = pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &nothing.0,
             ids: &nothing.1,

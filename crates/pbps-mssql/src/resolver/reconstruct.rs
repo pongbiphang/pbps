@@ -30,6 +30,7 @@ use pbps_model::{Change, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod chained;
+mod trial;
 pub use chained::AuxiliaryStep;
 
 /// Why the desired namespace could not be built on scratch. A named limit,
@@ -47,14 +48,18 @@ pub enum ReconstructError {
     /// the declaration either (SPEC 9.8, #1597).
     #[error("scratch compilation of {declaration} was interrupted: {reason}")]
     Interrupted { declaration: String, reason: String },
+    /// No group left could be created, though each waited for everything it
+    /// could: each is named with the last verdict of the engine (DEC-2143.9).
     #[error(
-        "scratch cannot order {0}. Either a computed column and a declared function each need \
-         the other, or a column that calls a function reads a column declared after it: \
-         columns are added in the order they are declared, which fixes their positions, and \
-         SQL Server cannot reorder them, so declare the column the function reads first. A \
-         function is read as needing a column wherever it names the column, so one that only \
-         shares a column's name (an alias, another table's column, a table of the same name in \
-         another schema) needs it too: rename the alias or the column"
+        "scratch could not create these declarations, each one failing for an object it names \
+         that does not exist or waiting on one that did: {0}. Declare the missing object, or \
+         state the order with `depends_on:` where one declaration needs another"
+    )]
+    Stalled(String),
+    #[error(
+        "scratch cannot order {0}. The order the declarations state makes them wait on one \
+         another: a loop of `depends_on:` edges, or columns, which are added in the order \
+         they are declared, so their positions are fixed and SQL Server cannot reorder them"
     )]
     Cycle(String),
 }
@@ -79,6 +84,11 @@ impl pbps_diff::order::scratch::Engine for Mssql {
     fn blueprint(&self, input: Self::Input) -> Input<Metadata> {
         input.0
     }
+    /// The text of a module is a guess at what it needs (DEC-2143.9), so the
+    /// engine's refusal, not the lexer, has the last word on its order.
+    fn trial_order(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +111,12 @@ pub struct Reconstruction {
     steps: Vec<Metadata>,
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
     execution: Vec<pbps_diff::order::scratch::Step<Metadata>>,
+    /// The step of each part, by the part's position in the lowered groups.
+    step_of_part: Vec<usize>,
     external: BTreeMap<ObjectIdentity, Result<Vec<String>, String>>,
+    trial: pbps_diff::order::scratch::TrialProgram<Mssql>,
+    /// The parts already created: the next range must start where it ends.
+    progress: pbps_diff::order::scratch::Progress<Mssql>,
 }
 
 type Draft = Part<Metadata>;
@@ -253,6 +268,16 @@ impl Reconstruction {
         let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter)
             .expect("the identical private probes already validated these lowering parts");
         let execution = ordered.steps().to_vec();
+        let step_of_part = execution
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| matches!(step, pbps_diff::order::scratch::Step::Managed { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        let trial = ordered
+            .trial()
+            .expect("SQL Server scratch issues trial authority")
+            .clone();
         let steps = execution
             .iter()
             .map(|step| match step {
@@ -285,7 +310,10 @@ impl Reconstruction {
             steps,
             lowered,
             execution,
+            step_of_part,
             external,
+            progress: trial.begin(),
+            trial,
         })
     }
 
@@ -354,41 +382,46 @@ impl Reconstruction {
             .collect()
     }
 
+    /// The declaration the part at `part` creates.
+    fn part_declaration(&self, part: usize) -> &str {
+        &self.steps[self.step_of_part[part]].declaration
+    }
+
     /// Runs the `range` of steps, one `Statement` per batch and each in
     /// autocommit, as whatever principal the session currently is: the
     /// reproduced deployer, which the caller has entered. Measured on 17.0:
     /// a failed statement leaves nothing behind and the session usable, so
     /// no transaction is needed and a later reader sees each step at once.
+    ///
+    /// The steps between two auxiliary ones are a trial range: order's cursor
+    /// picks the group to try and the engine says whether it was created, so a
+    /// group that fails for a missing object waits for another's success
+    /// instead of an order the text only guessed (DEC-2143.9). An auxiliary
+    /// step is a hard boundary and is never run here. Ranges must follow one
+    /// another from the first step, as the cursor's receipt requires.
     pub async fn compile_steps(
-        &self,
+        &mut self,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
         range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
-        for at in range {
-            let pbps_diff::order::scratch::Step::Managed { part } = self.execution[at] else {
+        let mut at = range.start;
+        while at < range.end {
+            let pbps_diff::order::scratch::Step::Managed { part: first } = self.execution[at]
+            else {
                 return Err(ReconstructError::Unsupported(
                     "an auxiliary step requires its setup executor".into(),
                 ));
             };
-            let step = &self.steps[at];
-            let group = &self.lowered.groups()[part];
-            for statement in group.statements() {
-                conn.execute(&statement.sql).await.map_err(|error| {
-                    let declaration = step.declaration.clone();
-                    let reason = error.to_string();
-                    if judged_the_statement(&error) {
-                        ReconstructError::Compile {
-                            declaration,
-                            reason,
-                        }
-                    } else {
-                        ReconstructError::Interrupted {
-                            declaration,
-                            reason,
-                        }
-                    }
-                })?;
-            }
+            let run = self.execution[at..range.end]
+                .iter()
+                .take_while(|step| matches!(step, pbps_diff::order::scratch::Step::Managed { .. }))
+                .count();
+            let trials = self
+                .trial
+                .start(first..first + run, &self.progress)
+                .map_err(ReconstructError::Cycle)?;
+            self.progress = self.trial_range(conn, trials).await?;
+            at += run;
         }
         Ok(())
     }

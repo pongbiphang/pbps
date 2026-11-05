@@ -236,9 +236,11 @@ for a moment keeps that type.
   part. `generated::constraints` orders them: the function before each part
   that calls it, the late columns after the bare table and in order, a module
   after the columns it reads. Table, then function, then `ALTER TABLE .. ADD
-  c AS f(..)` compiles even where `f` is schema-bound and reads the table. A
-  declaration whose order cannot both compile and keep the declared positions
-  refuses by name, with the remedy. Each `Statement` is its own batch, in
+  c AS f(..)` compiles even where `f` is schema-bound and reads the table. An
+  edge that rests on a name matched in a text is a guess, and the engine
+  corrects it: a group refused with 208, 4121 or 4513 waits for another's
+  success, and a pass that makes none refuses by name with the engine's
+  sentence (DEC-2143.9). Each `Statement` is its own batch, in
   autocommit, on the deployer's connection: a failed statement leaves nothing
   behind and the connection usable, so no transaction frames the run. A
   failure naming a deadlock, a lock or a resource limit answers nothing about
