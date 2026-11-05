@@ -819,18 +819,18 @@ jobs:
                   --ignored --test-threads=1 plan_test::session::mssql_tests \
                   test_scratch::tests::live_mssql 2>&1)
           echo "$out"
-          echo "$out" | grep -qE '^test result: ok\. 5 passed' || {
-            echo "expected the five owned SQL Server tests to run and pass" >&2
+          echo "$out" | grep -qE '^test result: ok\. 7 passed' || {
+            echo "expected the seven owned SQL Server tests to run and pass" >&2
             exit 1
           }
-      # The public command on the same owned SQL Server (#1165 F2), asserted too.
+      # The public command on the same owned SQL Server (#1165 F2, F3), asserted too.
       - name: pbps test command on an owned SQL Server
         run: |
           out=$(cargo test -p pbps-cli --test flow -- \
                   --ignored --test-threads=1 plan_test1165_mssql:: 2>&1)
           echo "$out"
-          echo "$out" | grep -qE '^test result: ok\. 5 passed' || {
-            echo "expected the five SQL Server pbps test command tests to run and pass" >&2
+          echo "$out" | grep -qE '^test result: ok\. 9 passed' || {
+            echo "expected the nine SQL Server pbps test command tests to run and pass" >&2
             exit 1
           }
 
