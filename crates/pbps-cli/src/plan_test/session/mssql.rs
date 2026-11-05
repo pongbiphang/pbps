@@ -2,6 +2,7 @@
 //! connection strings; the SQL is `pbps_mssql::test_scratch`'s.
 use super::{Conn, Driver, Session, TestScratch};
 use anyhow::{Context as _, ensure};
+use pbps_db::query::AssertionResult;
 use pbps_model::Schema;
 use pbps_mssql::test_scratch as sql;
 
@@ -110,4 +111,23 @@ pub(super) async fn fixture(conn: &mut Conn, text: &str) -> anyhow::Result<()> {
                 anyhow::anyhow!("{other}")
             }
         })
+}
+
+/// Switches the owned database read-only from the administrator's connection to
+/// `master`; the caller's deadline bounds it (the statement itself has none).
+pub(super) async fn seal(session: &Session<'_>) -> anyhow::Result<()> {
+    let mut conn = Conn::connect(Driver::Mssql, session.scratch.connection()).await?;
+    sql::seal(&mut conn).await?;
+    Ok(())
+}
+
+/// A failed setup read is not an assertion result: it is unanswerable.
+pub(super) async fn assertion(
+    session: &Session<'_>,
+    text: &str,
+    timeout: std::time::Duration,
+) -> AssertionResult {
+    sql::run_assertion(&session.assertion, text, timeout)
+        .await
+        .unwrap_or_else(AssertionResult::Unanswerable)
 }

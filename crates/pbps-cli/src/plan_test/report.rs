@@ -36,14 +36,35 @@ pub(crate) struct Phase {
     pub entry: Option<i64>,
     pub risks: Vec<String>,
     pub unavailable: BTreeMap<String, String>,
+    /// The engine whose error numbers `record` reads. Not part of the report.
+    #[serde(skip)]
+    #[schemars(skip)]
+    engine: Option<pbps_db::Driver>,
 }
 impl Phase {
-    pub fn new(phase: &str, identity: impl Into<String>) -> Self {
+    /// A phase that works against `engine`'s database. The engine is required
+    /// because a server error code means different things on each: a SQLSTATE
+    /// prefix on PostgreSQL, a plain number on SQL Server (`unanswerable`).
+    /// Nothing defaults to an engine, so a caller that has none does not compile.
+    pub fn on(engine: pbps_db::Driver, phase: &str, identity: impl Into<String>) -> Self {
+        Self {
+            engine: Some(engine),
+            ..Self::offline(phase, identity)
+        }
+    }
+    /// A phase that never holds a database error (the input check, cleanup, a
+    /// manifest write). A coded error recorded here is a finding, never a guess.
+    pub fn offline(phase: &str, identity: impl Into<String>) -> Self {
         Self {
             phase: phase.into(),
             identity: identity.into(),
             ..Self::default()
         }
+    }
+    /// Tests that do not exercise classification need no engine.
+    #[cfg(test)]
+    pub fn new(phase: &str, identity: impl Into<String>) -> Self {
+        Self::offline(phase, identity)
     }
     /// Refreshing grants may add time and findings to an already completed
     /// phase; it must not erase that phase's measured cost or stronger outcome.
@@ -60,7 +81,7 @@ impl Phase {
             Ok(_) if matches!(self.outcome, Status::Skipped) => self.outcome = Status::Passed,
             Ok(_) => {}
             Err(error) => {
-                let unknown = id == "test.infrastructure" || unanswerable(error);
+                let unknown = id == "test.infrastructure" || unanswerable(self.engine, error);
                 self.outcome = if unknown || matches!(self.outcome, Status::Unanswerable) {
                     Status::Unanswerable
                 } else {
@@ -71,15 +92,38 @@ impl Phase {
         }
     }
 }
-fn unanswerable(error: &anyhow::Error) -> bool {
+/// Whether a failure says the run could not look, rather than what it found.
+/// A database error without a server code (transport, deadline, refusal) never
+/// answered. With a code, the engine decides: PostgreSQL SQLSTATE classes 08,
+/// 53, 58 and XX and a cancelled statement are the server or its host failing;
+/// on SQL Server only the listed engine faults are. An error whose engine is
+/// unknown (a phase with no database) is never read as a fault by its number.
+pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Error) -> bool {
     if let Some(db) = error.downcast_ref::<pbps_db::DbError>() {
-        return db.server_error_code().is_none_or(|c| {
-            ["08", "53", "58", "XX"].iter().any(|p| c.starts_with(p)) || c == "57014"
+        return db.server_error_code().is_none_or(|c| match engine {
+            Some(driver) => fault_code(driver, &c),
+            None => false,
         });
     }
     error
         .chain()
         .any(|e| e.is::<tokio::time::error::Elapsed>() || e.is::<std::io::Error>())
+}
+/// Whether a server-coded error is the engine or its host failing, by the
+/// engine's own numbering.
+fn fault_code(driver: pbps_db::Driver, code: &str) -> bool {
+    match driver {
+        pbps_db::Driver::Postgres => {
+            ["08", "53", "58", "XX"].iter().any(|p| code.starts_with(p)) || code == "57014"
+        }
+        pbps_db::Driver::Mssql => pbps_mssql::test_scratch::infrastructure_fault(code),
+    }
+}
+/// [`fault_code`] for a database error an assertion returned.
+pub(super) fn engine_fault(driver: pbps_db::Driver, error: &pbps_db::DbError) -> bool {
+    error
+        .server_error_code()
+        .is_some_and(|code| fault_code(driver, &code))
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct Column {
@@ -383,7 +427,7 @@ impl TestData {
             // An earlier scratch's confirmation says nothing about this one.
             self.cleanup_confirmed = false;
             self.run_id = Some(cleanup.run_id.clone());
-            let mut p = Phase::new("cleanup", &cleanup.run_id);
+            let mut p = Phase::offline("cleanup", &cleanup.run_id);
             p.outcome = Status::Unanswerable;
             p.findings
                 .push(Finding::error("test.cleanup", cleanup.to_string()).remedy(&cleanup.remedy));
@@ -392,7 +436,7 @@ impl TestData {
         self.failure(phase, "test.infrastructure", error.to_string(), true);
     }
     pub(crate) fn reverify(&mut self, inputs: &super::Inputs) {
-        let mut phase = Phase::new("input", "final input verification");
+        let mut phase = Phase::offline("input", "final input verification");
         let started = std::time::Instant::now();
         match inputs.reverify() {
             Ok(()) => {
@@ -419,7 +463,7 @@ impl TestData {
                 .iter()
                 .any(|p| matches!(p.outcome, Status::Failed | Status::Unanswerable))
         {
-            let mut phase = Phase::new("input", "final input verification");
+            let mut phase = Phase::offline("input", "final input verification");
             phase.outcome = Status::Unanswerable;
             phase.findings.push(Finding::error(
                 "test.input",
@@ -428,7 +472,7 @@ impl TestData {
             self.phases.push(phase);
         }
         if self.run_id.is_some() && !self.cleanup_confirmed {
-            let mut cleanup = Phase::new("cleanup", "owned resource confirmation");
+            let mut cleanup = Phase::offline("cleanup", "owned resource confirmation");
             cleanup.outcome = Status::Unanswerable;
             cleanup.findings.push(Finding::error(
                 "test.cleanup",

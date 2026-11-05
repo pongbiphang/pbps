@@ -353,7 +353,7 @@ pub(crate) fn command(
 ) -> anyhow::Result<()> {
     let mut data = TestData::for_repin();
     data.phases
-        .push(Phase::new("input", "manifest, pins and edited fixture"));
+        .push(Phase::offline("input", "manifest, pins and edited fixture"));
     let started = Instant::now();
     // A relative walk stops at the working directory, missing a project above it.
     let start = match std::path::absolute(start) {
@@ -421,7 +421,9 @@ async fn side(
             (f.name.as_str(), text)
         })
         .collect();
+    let driver = crate::db::driver_for(plan.inputs.identity.dialect);
     let replay = Replay {
+        driver,
         chain: if original {
             &plan.original
         } else {
@@ -433,13 +435,13 @@ async fn side(
         timeouts,
     };
     let provision = data.phases.len();
-    let mut p = Phase::new("provision", "owned PostgreSQL scratch");
+    let mut p = Phase::on(driver, "provision", "owned PostgreSQL scratch");
     p.side = Some(label.to_owned());
     data.phases.push(p);
     let first = data.phases.len();
     replay_phases(&replay, &mut data.phases);
     let read = data.phases.len();
-    let mut p = Phase::new("snapshot", "rows and allocators");
+    let mut p = Phase::on(driver, "snapshot", "rows and allocators");
     p.side = Some(label.to_owned());
     data.phases.push(p);
     if !run {
@@ -549,10 +551,10 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     }
     let rows = data.phases.len();
     data.phases
-        .push(Phase::new("compare_rows", "all managed tables"));
+        .push(Phase::offline("compare_rows", "all managed tables"));
     data.phases
-        .push(Phase::new("compare_allocators", "every sequence"));
-    data.phases.push(Phase::new(
+        .push(Phase::offline("compare_allocators", "every sequence"));
+    data.phases.push(Phase::offline(
         "manifest_write",
         plan.inputs.frozen.manifest_file.path.clone(),
     ));

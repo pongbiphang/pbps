@@ -7,6 +7,7 @@ use crate::plan_test::{
     execution::Control,
     report::{Phase, TestData},
 };
+use pbps_db::query::AssertionResult;
 use pbps_model::{IdsFile, Intent, TableName};
 use std::time::Duration;
 
@@ -432,7 +433,7 @@ async fn exercise(scratch: &TestScratch<'_>, session: &Session<'_>) -> anyhow::R
     Ok(())
 }
 
-async fn lifecycle(image: &str) -> anyhow::Result<()> {
+async fn lifecycle(image: &str, sealed: bool) -> anyhow::Result<()> {
     let dir = crate::adopt::Stage::new("m1165-registry")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let timeouts = pbps_config::test_manifest::Timeouts {
@@ -468,7 +469,13 @@ async fn lifecycle(image: &str) -> anyhow::Result<()> {
         );
         tokio::time::timeout(
             Duration::from_secs(300),
-            crate::deploy::test_run::boxed_future(|| exercise(&scratch, &session)),
+            crate::deploy::test_run::boxed_future(|| async {
+                if sealed {
+                    exercise_sealed(&session).await
+                } else {
+                    exercise(&scratch, &session).await
+                }
+            }),
         )
         .await
         .context("lifecycle deadline")?
@@ -486,7 +493,184 @@ async fn lifecycle(image: &str) -> anyhow::Result<()> {
 async fn m1165_mssql_session_owns_least_privilege_identities_and_executes_only_accepted_sealed_plans()
  {
     let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
-    Box::pin(lifecycle(&image)).await.unwrap();
+    Box::pin(lifecycle(&image, false)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and the pinned SQL Server scratch image"]
+async fn m1165_mssql_sealed_database_bounds_every_assertion_and_refuses_a_held_session() {
+    let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
+    Box::pin(lifecycle(&image, true)).await.unwrap();
+}
+
+fn kind(result: &AssertionResult) -> &'static str {
+    match result {
+        AssertionResult::Pass(_) => "pass",
+        AssertionResult::Violation(_) => "violation",
+        AssertionResult::InvalidResult { .. } => "invalid",
+        AssertionResult::SqlError(_) => "sql_error",
+        AssertionResult::BoundaryViolation => "boundary",
+        AssertionResult::Unanswerable(_) => "unanswerable",
+    }
+}
+
+async fn assert_kind(session: &Session<'_>, sql: &str, want: &str) -> anyhow::Result<()> {
+    let result = session.run_assertion(sql, Duration::from_secs(10)).await;
+    ensure!(kind(&result) == want, "{sql}: {result:?}");
+    Ok(())
+}
+
+async fn assert_error_code(session: &Session<'_>, sql: &str, want: &str) -> anyhow::Result<()> {
+    match session.run_assertion(sql, Duration::from_secs(10)).await {
+        AssertionResult::SqlError(e) => {
+            ensure!(e.server_error_code().as_deref() == Some(want), "{sql}: {e}");
+            Ok(())
+        }
+        other @ (AssertionResult::Pass(_)
+        | AssertionResult::Violation(_)
+        | AssertionResult::InvalidResult { .. }
+        | AssertionResult::BoundaryViolation
+        | AssertionResult::Unanswerable(_)) => {
+            anyhow::bail!("{sql}: expected error {want}, got {other:?}")
+        }
+    }
+}
+
+async fn mode(conn: &mut Conn) -> anyhow::Result<String> {
+    Ok(conn
+        .query("SELECT CONVERT(nvarchar(60), DATABASEPROPERTYEX(N'pbps_test', N'Updateability')) AS mode")
+        .await?[0]
+        .try_get::<&str>("mode")?
+        .context("NULL mode")?
+        .to_owned())
+}
+
+async fn exercise_sealed(session: &Session<'_>) -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let base = fixture.input(&IdsFile::default(), false, false)?;
+    bootstrap(session, &base, &mut Phase::new("bootstrap", "base")).await?;
+    session.grants(&base.loaded.schema).await?;
+    let mut loader = session.fixtures().await?;
+    session.run_fixture(&mut loader, FIXTURE, 30_000).await?;
+    drop(loader);
+    // A writer the assertion login may execute: ownership chaining lets it
+    // write where the caller's own table rights cannot, so only the database
+    // mode stops it. `grants` would refuse this EXECUTE, so it is not re-run.
+    let login = session.roles[2].clone();
+    let mut admin = session.admin().await?;
+    admin
+        .execute(
+            "CREATE PROCEDURE app.writer AS INSERT INTO app.orders(code, amount) VALUES (N'w', 1)",
+        )
+        .await?;
+    admin
+        .execute(&format!("GRANT EXECUTE ON app.writer TO [{login}]"))
+        .await?;
+    // The setup connection is closed: any open session blocks the seal.
+    drop(admin);
+    // The observer stays in `master`, so it is no session of the owned database.
+    let mut admin = Conn::connect(Driver::Mssql, session.scratch.connection()).await?;
+    let orders = "SELECT COUNT(*) AS n FROM pbps_test.app.orders";
+    let before = count(&mut admin, orders).await?;
+
+    // Before the seal an assertion connection is refused outright: nothing of
+    // the file runs, so a write that the login could not make is not even tried.
+    let early = session
+        .run_assertion(
+            "INSERT INTO app.orders(code, amount) VALUES (N'early', 1); SELECT 1 AS a WHERE 1 = 0",
+            Duration::from_secs(10),
+        )
+        .await;
+    ensure!(kind(&early) == "unanswerable", "{early:?}");
+    ensure!(count(&mut admin, orders).await? == before);
+
+    // A held session is refused, never killed, and the mode does not change.
+    let mut held = session.fixtures().await?;
+    let started = std::time::Instant::now();
+    let refused = tokio::time::timeout(Duration::from_secs(20), session.seal())
+        .await
+        .context("the seal waited on a held session instead of refusing")?
+        .err()
+        .context("the seal succeeded over a held session")?;
+    ensure!(
+        started.elapsed() < Duration::from_secs(15)
+            && format!("{refused:#}").contains("open session"),
+        "{refused:#}"
+    );
+    ensure!(mode(&mut admin).await? == "READ_WRITE");
+    ensure!(
+        count(&mut held, "SELECT 1 AS n").await? == 1,
+        "the held session was ended"
+    );
+    drop(held);
+
+    session.seal().await?;
+    ensure!(mode(&mut admin).await? == "READ_ONLY");
+    // Sealing again is a no-op, not a failure.
+    session.seal().await?;
+
+    // Zero rows pass; any row, even of NULLs, is a violation.
+    assert_kind(
+        session,
+        "SELECT code FROM app.orders WHERE code = N'kept' AND amount <> 1164",
+        "pass",
+    )
+    .await?;
+    assert_kind(
+        session,
+        "SELECT code FROM app.orders WHERE code = N'kept'",
+        "violation",
+    )
+    .await?;
+    assert_kind(session, "SELECT NULL AS x", "violation").await?;
+    // Result shapes that are not one tabular result are invalid, not passes.
+    assert_kind(session, "DECLARE @x int = 1", "invalid").await?;
+    assert_kind(
+        session,
+        "SELECT 1 AS a WHERE 1 = 0; SELECT 2 AS b",
+        "invalid",
+    )
+    .await?;
+    // Temporary objects work in a read-only database; persistent writes do not.
+    assert_kind(
+        session,
+        "CREATE TABLE #t(a int); INSERT #t VALUES (1); SELECT a FROM #t WHERE a = 2",
+        "pass",
+    )
+    .await?;
+    assert_error_code(session, "SELECT 1 / 0 AS x", "8134").await?;
+    assert_error_code(
+        session,
+        "INSERT INTO app.orders(code, amount) VALUES (N'x', 1); SELECT 1 AS a WHERE 1 = 0",
+        "229",
+    )
+    .await?;
+    assert_error_code(
+        session,
+        "EXEC app.writer; SELECT 1 AS a WHERE 1 = 0",
+        "3906",
+    )
+    .await?;
+    // The batch separator is not interpreted; the engine refuses it.
+    assert_error_code(
+        session,
+        "SELECT 1 AS a WHERE 1 = 0\nGO\nSELECT 1 AS a",
+        "102",
+    )
+    .await?;
+    // A statement that outlives its deadline never answered.
+    let slow = session
+        .run_assertion(
+            "WAITFOR DELAY '00:00:05'; SELECT 1 AS a WHERE 1 = 0",
+            Duration::from_secs(1),
+        )
+        .await;
+    ensure!(kind(&slow) == "unanswerable", "{slow:?}");
+    ensure!(
+        count(&mut admin, orders).await? == before,
+        "an assertion persisted a row"
+    );
+    Ok(())
 }
 
 const ADMIN: &str =

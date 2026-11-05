@@ -337,7 +337,8 @@ fn relative_project_spellings_freeze_the_same_input_before_runtime() {
 }
 
 #[test]
-fn unsupported_engine_refuses_before_runtime_discovery() {
+#[ignore = "needs docker"]
+fn an_image_of_the_other_engine_is_unanswerable_and_leaves_nothing_running() {
     let p = Project::new();
     let base = p.commit();
     p.manifest(
@@ -367,14 +368,18 @@ fn unsupported_engine_refuses_before_runtime_discovery() {
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(manifest, text).unwrap();
-    let v = p.run(2);
+    // SQL Server runs now; a PostgreSQL image under it cannot serve it, so the
+    // scratch never starts. That is an infrastructure fault (exit 1), not a
+    // finding about the declarations, and nothing is left behind.
+    let v = p.run(1);
     assert!(v["findings"].as_array().unwrap().iter().any(|f| {
         f["message"]
             .as_str()
             .unwrap()
-            .contains("currently supports PostgreSQL")
+            .contains("the scratch could not be started")
     }));
-    assert!(!p.state().exists());
+    // A start that failed leaves no record behind it.
+    p.settled();
 }
 fn replay(old: bool) {
     let p = Project::new();

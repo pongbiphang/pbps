@@ -8,9 +8,10 @@ mod mssql;
 use super::revision::Assembled;
 use crate::{db::Target, test_scratch::TestScratch};
 use anyhow::{Context as _, ensure};
-use pbps_db::{Conn, Driver};
+use pbps_db::{Conn, Driver, query::AssertionResult};
 use pbps_dialect::Dialect as _;
 use pbps_model::{Schema, TableName};
+use std::time::Duration;
 
 pub(crate) struct Session<'a> {
     scratch: &'a TestScratch<'a>,
@@ -183,8 +184,27 @@ impl<'a> Session<'a> {
     pub fn target(&self) -> &Target {
         &self.target
     }
+    /// The assertion login's connection string, for the Linux lifecycle tests
+    /// that open it themselves; the command goes through [`Self::run_assertion`].
+    #[cfg(all(test, target_os = "linux"))]
     pub fn assertion(&self) -> &str {
         &self.assertion
+    }
+    /// The write boundary of the assertions, once the last grants are in.
+    /// PostgreSQL's is a READ ONLY transaction each assertion opens for itself,
+    /// so it has nothing to do here; SQL Server's is the database mode.
+    pub async fn seal(&self) -> anyhow::Result<()> {
+        match self.driver {
+            Driver::Postgres => Ok(()),
+            Driver::Mssql => Box::pin(mssql::seal(self)).await,
+        }
+    }
+    /// Runs one assertion file on its own connection as the assertion login.
+    pub async fn run_assertion(&self, sql: &str, timeout: Duration) -> AssertionResult {
+        match self.driver {
+            Driver::Postgres => pbps_pg::assertions::run(&self.assertion, sql, timeout).await,
+            Driver::Mssql => Box::pin(mssql::assertion(self, sql, timeout)).await,
+        }
     }
     pub fn project(&self, input: &Assembled) -> pbps_config::Project {
         let source = &input.config;

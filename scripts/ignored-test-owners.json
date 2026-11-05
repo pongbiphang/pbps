@@ -3315,9 +3315,29 @@
       ],
       "cases": [
         "plan_test::session::mssql_tests::m1165_mssql_session_owns_least_privilege_identities_and_executes_only_accepted_sealed_plans",
+        "plan_test::session::mssql_tests::m1165_mssql_sealed_database_bounds_every_assertion_and_refuses_a_held_session",
         "test_scratch::tests::live_mssql::a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record",
         "test_scratch::tests::live_mssql::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
         "test_scratch::tests::live_mssql::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "rehearsal",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux"
+      ],
+      "cases": [
+        "plan_test1165_mssql::plan_test1165_mssql_replays_a_pinned_fixture_and_the_sealed_candidate_decides_the_exit",
+        "plan_test1165_mssql::plan_test1165_mssql_every_assertion_outcome_other_than_zero_rows_fails_with_its_own_kind",
+        "plan_test1165_mssql::plan_test1165_mssql_a_fixture_that_leaves_a_transaction_open_fails_and_runs_nothing_after",
+        "plan_test1165_mssql::plan_test1165_mssql_fixture_repin_still_refuses_before_any_runtime_or_write",
+        "plan_test1165_mssql::plan_test1165_mssql_cancellation_and_changed_inputs_cannot_qualify_and_cleanup_is_confirmed"
       ]
     }
   ]
