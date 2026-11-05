@@ -140,11 +140,12 @@ pub async fn read_table(
 async fn identity_state(
     conn: &mut impl ExecuteConnection,
     relation: &str,
-) -> Result<(Option<String>, Option<String>), DbError> {
+) -> Result<IdentityState, DbError> {
     let rows = conn
         .query(&format!(
             "SELECT CONVERT(nvarchar(40), IDENT_CURRENT({lit})) AS current_value, \
-             CONVERT(nvarchar(40), c.last_value) AS last_value \
+             CONVERT(nvarchar(40), c.last_value) AS last_value, \
+             CONVERT(nvarchar(40), IDENT_INCR({lit})) AS increment \
              FROM sys.identity_columns c WHERE c.object_id = OBJECT_ID({lit})",
             lit = literal(relation)
         ))
@@ -153,7 +154,31 @@ async fn identity_state(
         return Err(refused(format!("{relation} has no single identity column")));
     };
     let text = |column: &str| Ok::<_, DbError>(row.try_get::<&str>(column)?.map(str::to_owned));
-    Ok((text("current_value")?, text("last_value")?))
+    Ok(IdentityState {
+        current: text("current_value")?,
+        last: text("last_value")?,
+        increment: text("increment")?,
+    })
+}
+
+#[derive(PartialEq)]
+struct IdentityState {
+    current: Option<String>,
+    last: Option<String>,
+    increment: Option<String>,
+}
+
+impl IdentityState {
+    /// The value one allocation from this state takes: the current value of a
+    /// column that never generated one, else the last plus the increment. This
+    /// only checks a probe; the answer is what the engine handed out.
+    fn one_step(&self) -> Option<i128> {
+        let number = |text: &Option<String>| text.as_deref().and_then(|t| t.parse::<i128>().ok());
+        match &self.last {
+            None => number(&self.current),
+            Some(_) => Some(number(&self.last)? + number(&self.increment)?),
+        }
+    }
 }
 
 /// Takes the next value of one identity column by really using it.
@@ -184,14 +209,23 @@ async fn identity_next(
         return Err(error);
     }
     let after = identity_state(conn, &relation).await?;
-    match after {
-        (Some(current), _) if after != before => Ok(current),
-        _ => Err(refused(format!(
+    let moved = (&after.current, &after.last) != (&before.current, &before.last);
+    let Some(current) = after.current.as_ref().filter(|_| moved) else {
+        return Err(refused(format!(
             "the next value of the identity column of {schema}.{table} cannot be established: \
              the probe insert did not take a value (an INSTEAD OF trigger, a column that cannot \
              take another value, or a failure before one was generated)"
-        ))),
+        )));
+    };
+    // One allocation moves the state by one step. A trigger that inserts into the
+    // same table takes more, and the first value taken is then not the last.
+    if current.parse::<i128>().ok() != before.one_step() {
+        return Err(refused(format!(
+            "the next value of the identity column of {schema}.{table} cannot be established: \
+             the probe took more than one value (a trigger that inserts into the same table)"
+        )));
     }
+    Ok(current.clone())
 }
 
 /// Every allocator in the database: each identity column and each sequence,

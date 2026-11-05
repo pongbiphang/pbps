@@ -1047,6 +1047,10 @@ in `TRY/CATCH` inside `BEGIN TRANSACTION … ROLLBACK`; the identity survives th
 rollback, the row and a trigger's writes do not, and the pair (`IDENT_CURRENT`,
 `last_value`) must have moved or the allocator is unestablishable and named (an
 `INSTEAD OF` trigger, an exhausted column, a failure before a value is taken).
+The value taken must also be the one a single allocation takes from the state read
+just before (the current value of a column that never generated one, else the last
+plus the increment), or the allocator is unestablishable: a trigger that inserts
+into the same table takes more than one, and `IDENT_CURRENT` would be the last.
 A sequence is read with `NEXT VALUE FOR`, and compared under the one column whose
 default names it, else by its own name. A trigger that writes to another table
 with an identity column advances that column once per probe (identity values

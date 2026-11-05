@@ -292,6 +292,25 @@ async fn allocators(conn: &mut Conn) -> anyhow::Result<()> {
     );
     run(conn, "DROP TRIGGER snap.swallow; DROP TABLE snap.hidden").await?;
 
+    // A trigger that inserts into its own table takes a second value after the
+    // probe's, so IDENT_CURRENT is not the first one taken: refused, not misread.
+    run(
+        conn,
+        "CREATE TABLE snap.twice (id int IDENTITY(1,1), x int NULL)",
+    )
+    .await?;
+    run(
+        conn,
+        "CREATE TRIGGER snap.again ON snap.twice AFTER INSERT AS INSERT snap.twice(x) VALUES (0)",
+    )
+    .await?;
+    let text = refused_allocators(conn).await?;
+    assert!(
+        text.contains("snap.twice") && text.contains("more than one value"),
+        "{text}"
+    );
+    run(conn, "DROP TRIGGER snap.again; DROP TABLE snap.twice").await?;
+
     // An exhausted identity column and an exhausted sequence name themselves.
     run(
         conn,
