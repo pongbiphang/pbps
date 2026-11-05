@@ -334,6 +334,29 @@ async fn allocators(conn: &mut Conn) -> anyhow::Result<()> {
     )
     .await?;
 
+    // A probe of one table can take the last value another has: the second is
+    // read from its state before any probe, and not refused as exhausted by a
+    // probe of its own.
+    run(
+        conn,
+        "CREATE TABLE snap.pa (id int IDENTITY(1,1), x int NULL); \
+         CREATE TABLE snap.pz (id tinyint IDENTITY(255,1), x int NULL)",
+    )
+    .await?;
+    run(
+        conn,
+        "CREATE TRIGGER snap.last ON snap.pa AFTER INSERT AS INSERT snap.pz DEFAULT VALUES",
+    )
+    .await?;
+    let last = read_allocators(conn).await?;
+    assert_eq!(next_of(&last, "snap.pa.id (identity)"), "1");
+    assert_eq!(next_of(&last, "snap.pz.id (identity)"), "255");
+    run(
+        conn,
+        "DROP TRIGGER snap.last; DROP TABLE snap.pa; DROP TABLE snap.pz",
+    )
+    .await?;
+
     // Sequences are read before identity columns: a probe evaluates the table's
     // defaults and takes a value of a sequence its column names.
     run(

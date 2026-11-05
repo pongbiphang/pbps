@@ -1057,7 +1057,9 @@ from a probe: every identity column's next value is taken from its state before
 any probe, and the probe only has to agree with the state it started from
 (draft review rounds 1 and 2 of #2690 each found a way a probe could otherwise let
 two different allocator states compare equal). A column a trigger moved earlier
-is confirmed against its state just before its own probe, so the shifted value
+is not probed again (a probe of a column whose last value another table's trigger
+took would exhaust it and refuse an equivalent re-pin): the move is checked
+against its state read first (onward, in whole increments), and the shifted value
 never reaches the report. Disabling the table's triggers during the probe was
 tried and rejected: the DDL discards the table's cached identity range and
 the next value jumps (measured: 1002 for a next value of 3). A sequence is read

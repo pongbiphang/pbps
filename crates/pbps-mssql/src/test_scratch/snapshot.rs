@@ -197,9 +197,36 @@ async fn identity_confirm(
     conn: &mut impl ExecuteConnection,
     schema: &str,
     table: &str,
+    initial: &IdentityState,
 ) -> Result<(), DbError> {
     let relation = qualified(schema, table)?;
     let before = identity_state(conn, &relation).await?;
+    if &before != initial {
+        // An earlier probe (a trigger inserting into this table) already took
+        // values here. That is the engine allocating from the state read first, so
+        // it is checked as such, and probing again could only exhaust a column
+        // that still has its value: a last value taken from a later probe would
+        // refuse an equivalent re-pin.
+        let number = |text: &Option<String>| text.as_deref().and_then(|t| t.parse::<i128>().ok());
+        let (Some(first), Some(now), Some(step)) = (
+            initial.one_step(),
+            number(&before.current),
+            number(&initial.increment),
+        ) else {
+            return Err(refused(format!(
+                "the next value of the identity column of {schema}.{table} cannot be \
+                 established: its state is unreadable"
+            )));
+        };
+        let onward = if step > 0 { now >= first } else { now <= first };
+        if onward && (now - first) % step == 0 {
+            return Ok(());
+        }
+        return Err(refused(format!(
+            "the next value of the identity column of {schema}.{table} cannot be established: \
+             a probe of another table moved it in a way its state does not explain"
+        )));
+    }
     let probe = format!(
         "BEGIN TRANSACTION; BEGIN TRY INSERT {relation} DEFAULT VALUES; END TRY \
          BEGIN CATCH END CATCH; IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;"
@@ -324,10 +351,10 @@ pub async fn read_allocators(
                  established: its state is unreadable"
             )));
         };
-        initial.push((schema, table, column, next));
+        initial.push((schema, table, column, state, next));
     }
-    for (schema, table, column, next) in initial {
-        identity_confirm(conn, schema, table).await?;
+    for (schema, table, column, state, next) in initial {
+        identity_confirm(conn, schema, table, &state).await?;
         let owner = format!("{schema}.{table}.{column}");
         found.push(AllocatorRead {
             name: format!("{owner} (identity)"),
