@@ -1365,7 +1365,7 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                         pbps_pg::type_refs::declared::check(
                             &mut conn,
                             &saved.declared_type_pins,
-                            &trusted,
+                            &pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
                             pbps_pg::pins::Within::OwnTransaction,
                             completed == statements.len(),
                             &saved.changes,
@@ -1379,7 +1379,9 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                             pbps_pg::type_refs::declared::vet(
                                 &mut conn,
                                 statement.declared_type.as_ref().unwrap(),
-                                &trusted,
+                                &pbps_pg::admission::Admission::without_review(
+                                    trusted.iter().cloned(),
+                                ),
                                 &saved.declared_type_pins,
                                 &saved.changes,
                                 &statements[..=completed],
@@ -1389,7 +1391,9 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                             pbps_pg::type_refs::declared::check(
                                 &mut conn,
                                 &saved.declared_type_pins,
-                                &trusted,
+                                &pbps_pg::admission::Admission::without_review(
+                                    trusted.iter().cloned(),
+                                ),
                                 pbps_pg::pins::Within::CallersTransaction,
                                 completed + 1 == statements.len(),
                                 &saved.changes,
@@ -1407,7 +1411,7 @@ fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
                         pbps_pg::type_refs::declared::check(
                             &mut conn,
                             &saved.declared_type_pins,
-                            &trusted,
+                            &pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
                             pbps_pg::pins::Within::OwnTransaction,
                             true,
                             &saved.changes,

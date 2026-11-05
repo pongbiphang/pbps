@@ -65,7 +65,7 @@ async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode) {
         )
         .unwrap()
     };
-    let trusted = ["postgres".into()].into();
+    let trusted: std::collections::BTreeSet<pbps_model::RoleName> = ["postgres".into()].into();
     let mut executed = Vec::new();
     for group in lowered.groups() {
         if mode == PlanMode::Staged {
@@ -81,7 +81,7 @@ async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode) {
                 pbps_pg::type_refs::declared::vet(
                     &mut db.conn,
                     metadata,
-                    &trusted,
+                    &pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
                     &[],
                     ordered.changes(),
                     &executed,

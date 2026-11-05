@@ -475,7 +475,7 @@ fn check_definitions(
 pub async fn check(
     conn: &mut Conn,
     pins: &[DeclaredTypePin],
-    trusted: &BTreeSet<pbps_model::RoleName>,
+    admission: &Admission,
     within: Within,
     complete: bool,
     changes: &pbps_model::ChangeSet,
@@ -495,8 +495,7 @@ pub async fn check(
             )));
         }
     }
-    let admission = Admission::without_review(trusted.iter().cloned());
-    input_routines(conn, within, &present, &admission).await?;
+    input_routines(conn, within, &present, admission).await?;
     Ok(())
 }
 
@@ -505,7 +504,7 @@ pub async fn check(
 pub async fn vet(
     conn: &mut Conn,
     statement: &pbps_dialect::DeclaredTypeStatement,
-    trusted: &BTreeSet<pbps_model::RoleName>,
+    admission: &Admission,
     pins: &[DeclaredTypePin],
     changes: &pbps_model::ChangeSet,
     executed: &[pbps_dialect::Statement],
@@ -532,12 +531,11 @@ pub async fn vet(
                     statement.name.shown()
                 )));
             }
-            let admission = Admission::without_review(trusted.iter().cloned());
             input_routines(
                 conn,
                 Within::CallersTransaction,
                 std::slice::from_ref(&statement.name),
-                &admission,
+                admission,
             )
             .await?;
             // A check added `NOT VALID` binds its expression and evaluates no

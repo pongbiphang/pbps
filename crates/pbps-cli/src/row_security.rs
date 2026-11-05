@@ -689,10 +689,14 @@ mod tests {
                 PlanMode::Transactional,
                 &pbps_mssql::Mssql,
             );
-            assert_eq!(
-                pg.emit(&pg_standing, 0).unwrap(),
-                pg.emit(&created_plan, 0).unwrap()
-            );
+            // The change a statement carries for its admission check names its
+            // origin (DEC-2563.5); everything the database is sent is the same.
+            let sent = |plan: &_| {
+                let mut statements = pg.emit(plan, 0).unwrap();
+                statements.iter_mut().for_each(|s| s.introduces = None);
+                statements
+            };
+            assert_eq!(sent(&pg_standing), sent(&created_plan));
             assert!(
                 pbps_mssql::Mssql
                     .emit(&mssql_standing, 0)

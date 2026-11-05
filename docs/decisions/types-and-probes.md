@@ -5263,3 +5263,49 @@ and 66 belong to other changes). State, ids and the published schema set do not
 move: a column of a provided type is an ordinary type reference (state 29), a
 provided type has no uid, and no published schema carries a type pin (checked by
 regenerating the set).
+
+<a id="dec-2563-5"></a>
+
+**DEC-2563.5. Index expressions, policies and created domains are judged by the same predicate at the same three moments (PostgreSQL).**
+
+(#2563, slice 2b-2.) DEC-2563.4 bound the expressions of a table in a temporary
+table; this adds three placements on that one binder and reads their stored
+trees. `AddIndex` whose keys or filter hold an expression (`CREATE INDEX` on the
+binding table, read from `pg_index.indexprs` and `indpred`); `CreatePolicy`
+(`CREATE POLICY` on it, `pg_policy.polqual` and `polwithcheck`); and the CHECK
+and DEFAULT code of a domain the plan creates (`CreateType`), rebuilds
+(`EnumRebuild` `Create`) or alters (the half of `AlterDomain` that adds it),
+bound as a domain of the session's own `pg_temp` and read from
+`pg_constraint.conbin` and `pg_type.typdefaultbin`. An index that is only
+columns calls nothing, and is also the one built `CONCURRENTLY`, outside any
+transaction; it is not bound. Every outcome is a `Vetted`, so a pre-flight or a
+statement can no more read "could not bind" as "admitted" than for a table.
+
+What changes. A created domain's code was vetted after its statement with no
+review (DEC-2563.2, DEC-1635.4): a routine that only `pin_type_routines` admits
+could not be shown, so it was refused. `plan` now binds the domain, so the
+routine joins `type_routines` like any rule 4 root, and apply's admission, which
+holds that set, is the one `declared::vet` and `declared::check` use; they take
+an `Admission` where they took the trusted roles. The limitation DEC-2563.2
+recorded for created domains is closed, except for a routine the same plan
+creates: a domain is created before the plan's routines (ORDERING.md, class 7),
+so it cannot call one, and `plan` notes it as judged at apply only, where the
+statement stops at it. A policy or an index over a routine the same plan creates
+is noted the same way and judged at its statement, by rules 2 and 3, never by a
+pin. The refusal for an untrusted owner now offers `pin_type_routines` at a
+domain, as it does at a table.
+
+Not a site. A partition key is only columns (`PartitionBy.columns`), so a
+declaration cannot hold an expression there, and no change carries one. A
+partition key expression a live table has is read, not written (2c). Existing
+indexes, policies and domains the plan only leaves alone, and the expressions a
+type change re-evaluates, stay change-detected (DEC-319.1) and are the next
+slice.
+
+Compatibility. The same as DEC-2563.4, now also for an index key or filter, a
+policy and a domain: a routine of an untrusted owner, or a trusted owner's
+without a fixed `search_path`, is refused at the statement with the exact
+`ALTER FUNCTION` line or the three remedies. A plan that creates a table and
+gives it a policy or an expression index now says so as a plan note, since the
+table does not exist to bind against; it is judged at apply. No plan format
+changes.
