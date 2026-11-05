@@ -93,12 +93,19 @@ fn run(n: char) -> String {
 /// that another test's thread forked while the lock was held: a lock belongs to
 /// the open file, so it is held until that child execs (a few milliseconds).
 fn released(dir: &StateDir, run_id: &str) -> bool {
+    released_with(|| dir.try_lock_existing(run_id).unwrap())
+}
+
+fn released_with(mut probe: impl FnMut() -> Option<std::fs::File>) -> bool {
     (0..500).any(|_| {
-        let free = dir.try_lock_existing(run_id).unwrap().is_some();
-        if !free {
+        let Some(lock) = probe() else {
             std::thread::sleep(Duration::from_millis(10));
-        }
-        free
+            return false;
+        };
+        // A concurrent fork can inherit this probe too. Explicit unlock releases
+        // the shared open file description even if its child has not exec'd yet.
+        lock.unlock().unwrap();
+        true
     })
 }
 
@@ -187,7 +194,18 @@ impl Runtime for Fake {
 }
 
 async fn reconciled(dir: &Dir, rt: &Fake) -> super::Reconciliation {
-    reconcile(&dir.dir, rt, &daemon(), soon()).await.unwrap()
+    let done = reconcile(&dir.dir, rt, &daemon(), soon()).await.unwrap();
+    recovery_locks_released(&done, |run_id| released(&dir.dir, run_id));
+    done
+}
+
+fn recovery_locks_released(done: &super::Reconciliation, mut release: impl FnMut(&str) -> bool) {
+    // Failed recovery keeps its record for another pass. Dropping its File does
+    // not end a sibling child's inherited lock; wait before exposing that pass.
+    // Intentionally live runs retain their locks and must not be waited on.
+    for failure in &done.failures {
+        assert!(release(&failure.run_id), "{done:?}");
+    }
 }
 
 fn kept(dir: &Dir, run_id: &str) -> bool {
@@ -692,6 +710,69 @@ mod recovery {
             FailureKind::Conflict
         );
         assert_eq!(d.dir.read(&run('c')).unwrap().unwrap().container.id, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_recovery_waits_for_inherited_locks_without_leaving_a_probe_lock() {
+        let d = Dir::new();
+        let run_id = run('a');
+        d.dir.write(&record(&run_id, State::Pending, None)).unwrap();
+        let refusing = Fake {
+            cannot_remove: Some(vec!["the docker volume vol1".into()]),
+            ..Fake::holding(&container(&run_id, &id('b')))
+        };
+        let failed = reconcile(&d.dir, &refusing, &daemon(), soon())
+            .await
+            .unwrap();
+        assert_eq!(failed.failures.len(), 1);
+        assert!(released(&d.dir, &run_id));
+
+        // File clones share the open file description just as forked descriptors
+        // do. Retain one after its parent's File drops, without spawn timing.
+        let parent = d.dir.try_lock_existing(&run_id).unwrap().unwrap();
+        let mut inherited = Some(parent.try_clone().unwrap());
+        drop(parent);
+        let absent = Fake {
+            orphans: vec!["vol1".into()],
+            ..Fake::default()
+        };
+        // Negative: the real reconciler must still leave a held lock alone.
+        let live = reconcile(&d.dir, &absent, &daemon(), soon()).await.unwrap();
+        assert_eq!(live.live, vec![run_id.clone()]);
+        assert!(live.removed.is_empty() && live.failures.is_empty());
+        assert!(absent.removed.borrow().is_empty());
+
+        let mut inherited_probe = None;
+        recovery_locks_released(&failed, |waiting_for| {
+            assert_eq!(waiting_for, run_id);
+            released_with(|| {
+                let lock = d.dir.try_lock_existing(waiting_for).unwrap();
+                if let Some(lock) = &lock {
+                    // Model a second fork during the successful release probe.
+                    inherited_probe = Some(lock.try_clone().unwrap());
+                } else {
+                    // Release the first inherited descriptor only after the
+                    // barrier has observed it, rather than after a timed sleep.
+                    drop(inherited.take());
+                }
+                lock
+            })
+        });
+        assert!(
+            inherited.is_none(),
+            "the inherited recovery lock was not observed"
+        );
+        assert!(
+            inherited_probe.is_some(),
+            "the release probe was not exercised"
+        );
+        // Keep the probe's duplicate open through the next real cleanup: merely
+        // dropping the probe File would still classify this run as live.
+        let cleaned = reconciled(&d, &absent).await;
+        assert_eq!(cleaned.removed, vec![run_id.clone()], "{cleaned:?}");
+        assert_eq!(*absent.removed.borrow(), vec!["vol1".to_owned()]);
+        assert!(!kept(&d, &run_id));
+        drop(inherited_probe);
     }
 
     #[tokio::test]
@@ -1299,8 +1380,6 @@ async fn d2a1165_the_private_key_survives_unconfirmed_cleanup_and_goes_with_its_
     assert_eq!(refused.failures.len(), 1, "{refused:?}");
     assert_eq!(std::fs::read(&key).unwrap(), b"private key sentinel");
     assert!(kept(&dir, &run_id));
-    // A sibling test's fork can retain the first recovery's file lock until exec.
-    assert!(released(&dir.dir, &run_id));
     let cleaned = reconciled(&dir, &Fake::holding(&held)).await;
     assert_eq!(cleaned.removed, vec![run_id], "{cleaned:?}");
     assert!(!key.exists());
