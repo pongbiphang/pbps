@@ -453,19 +453,27 @@ fn a_retype_to_or_from_a_provided_type_is_refused_by_name() {
     });
 }
 
-/// `init --from` selects no package (it has no `--extension`), so a table of a
-/// type a package provides is left out with the command that opts the package
-/// in, exactly as a pull without the package does, and a table of plain types
-/// beside it is kept. Writing it would hand `plan` a type nobody opted in.
+/// What hangs off a table of an unmanaged package's type: a trigger, a view
+/// and a foreign key from a table of plain types.
+const HANGERS: &str = "CREATE TABLE app.plain (id integer PRIMARY KEY, n text); \
+    CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS \
+    $$ BEGIN RETURN NEW; END $$; \
+    CREATE TRIGGER wants_touch BEFORE INSERT ON app.wants \
+    FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+    CREATE VIEW app.wants_view AS SELECT id FROM app.wants; \
+    CREATE TABLE app.refers (id integer PRIMARY KEY, \
+    wid integer REFERENCES app.wants (id))";
+
+/// `init --from` and `pull` select no package here, so a table of a type a
+/// package provides is left out with the command that opts the package in,
+/// and what hangs off it (a trigger) goes through the one cleanup of any
+/// left-out table, so the adoption succeeds. A table of plain types is kept.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn init_from_leaves_a_table_of_an_unmanaged_packages_type_out_with_the_command() {
+fn init_from_and_pull_leave_a_table_of_an_unmanaged_packages_type_out_with_its_dependents() {
     servers(|server, slug| {
         let f = fixture(server, &format!("types2447-init-{slug}"));
-        on_server(
-            f.target(),
-            &format!("{WANTS}; CREATE TABLE app.plain (id integer PRIMARY KEY, n text)"),
-        );
+        on_server(f.target(), &format!("{WANTS}; {HANGERS}"));
         let dir =
             std::env::temp_dir().join(format!("pbps-init-2447-{slug}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -478,15 +486,31 @@ fn init_from_leaves_a_table_of_an_unmanaged_packages_type_out_with_the_command()
             .args(["--dialect", "postgres"])
             .output()
             .unwrap();
-        assert_eq!(code(&out), 0, "{}", said(&out));
-        let said = said(&out);
-        assert!(
-            said.contains("`app.wants` was left out")
-                && said.contains("pbps pull --extension citext"),
-            "{said}"
-        );
-        assert!(!dir.join("schema/app.wants.yml").exists(), "{said}");
-        assert!(dir.join("schema/app.plain.yml").exists(), "{said}");
+        let init = said(&out);
+        assert_eq!(code(&out), 0, "{init}");
+        let pulled = succeeds(f.d.run(&["pull", "--force", "--db", f.target()]));
+        for (how, said) in [("init", init), ("pull", said(&pulled))] {
+            assert!(
+                said.contains("`app.wants` was left out")
+                    && said.contains("pbps pull --extension citext"),
+                "{how}: {said}"
+            );
+            assert!(
+                said.contains("wants_touch"),
+                "{how} names the trigger: {said}"
+            );
+        }
+        for root in [&dir, &f.d.dir] {
+            assert!(!root.join("schema/app.wants.yml").exists());
+            assert!(root.join("schema/app.plain.yml").exists());
+            let validate = std::process::Command::new(super::BIN)
+                .arg("--project")
+                .arg(root)
+                .arg("validate")
+                .output()
+                .unwrap();
+            assert_eq!(code(&validate), 0, "{}", said(&validate));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

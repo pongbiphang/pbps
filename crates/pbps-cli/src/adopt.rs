@@ -114,15 +114,23 @@ pub(crate) fn select_extensions(
 /// that package is not one the pull manages (DEC-2447.12). Reading it would
 /// hand a declaration to `plan` that names a type nobody opted in, and `plan`
 /// refuses it by name; the pull says the same thing earlier and names the
-/// command that opts the package in. Run after [`select_extensions`], which is
-/// what decides the managed packages.
-pub(crate) fn leave_out_unmanaged_providers(pulled: &mut Pulled) {
+/// command that opts the package in.
+///
+/// Run **before** [`leave_out_what_validate_refuses`], with the packages the
+/// run manages: a table left out here is then an ordinary left-out table, and
+/// that function's cleanup of what hung off it (its triggers, the grants of
+/// roles) runs afterwards for it as for any other. Run after it, the
+/// triggers stayed behind and the staged check refused the whole write.
+pub(crate) fn leave_out_unmanaged_providers(
+    pulled: &mut Pulled,
+    managed: &BTreeSet<pbps_model::ObjectLocalName>,
+) {
     let mut left: Vec<(pbps_model::TableName, String, String, String)> = Vec::new();
     for (name, table) in &pulled.schema.tables {
         for (column, spec) in &table.columns {
             if let Some(reference) = spec.ty.type_ref()
                 && let Some(extension) = pulled.provided_types.get(reference)
-                && !pulled.schema.extensions.contains_key(extension)
+                && !managed.contains(extension)
             {
                 left.push((
                     name.clone(),
@@ -864,7 +872,7 @@ mod tests {
             .provided_types
             .insert(citext.clone(), "citext".into());
         // The package is not managed: both tables of its type go.
-        leave_out_unmanaged_providers(&mut pulled);
+        leave_out_unmanaged_providers(&mut pulled, &BTreeSet::new());
         assert_eq!(pulled.schema.tables.len(), 1);
         assert!(
             pulled
@@ -895,7 +903,7 @@ mod tests {
                 version: "1.6".into(),
             },
         );
-        leave_out_unmanaged_providers(&mut managed);
+        leave_out_unmanaged_providers(&mut managed, &BTreeSet::from(["citext".into()]));
         assert_eq!(managed.schema.tables.len(), 1);
         assert!(managed.warnings.is_empty());
     }
