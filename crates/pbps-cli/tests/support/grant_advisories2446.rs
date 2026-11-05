@@ -147,11 +147,7 @@ pub fn check(admin: &str) {
         let reported = plan(&d, connection);
         let expected = check_named(&reported, &role, column, option);
         assert_eq!(reported["data"]["changes"], 0);
-        assert_eq!(
-            reported["findings"].as_array().unwrap(),
-            &expected,
-            "{reported}"
-        );
+        assert_eq!(advisories(&reported), expected, "{reported}");
         let mut after: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         // Independently created plans seal their own timestamps. Hold only
@@ -178,7 +174,7 @@ pub fn check(admin: &str) {
         succeeds(approved_apply(&d, connection, &path, &[]));
         let next = plan(&d, connection);
         assert_eq!(next["data"]["changes"], 0);
-        assert_eq!(next["findings"].as_array().unwrap(), &expected);
+        assert_eq!(advisories(&next), expected, "{next}");
         succeeds(d.run(&[
             "baseline",
             "--db",
@@ -196,7 +192,7 @@ pub fn check(admin: &str) {
         succeeds(d.run(&["verify", "--db", connection]));
         let next = plan(&d, connection);
         assert_eq!(next["data"]["changes"], 0);
-        assert_eq!(next["findings"].as_array().unwrap(), &expected);
+        assert_eq!(advisories(&next), expected, "{next}");
         assert_eq!(acl(connection), expected_acl);
         let state = text_of(
             connection,
