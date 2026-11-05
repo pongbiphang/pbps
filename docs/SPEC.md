@@ -1222,10 +1222,7 @@ refused by name and is planned in two steps, the package first (DEC-2447.6). A
 package whose members the declarations also manage as their own is
 refused after the rehearsal, and a collision with an unmanaged object of the
 target is the engine's own refusal inside the rolled-back transaction
-(DEC-2447.7). ALTER EXTENSION SET SCHEMA differences are named refusals and named
-drift, with no partial executable plan, and so is a version change together with
-a new schema (update the package in one plan and move it in the next).
-Provider-type admission and the use of a package's members by declarations
+(DEC-2447.7). Provider-type admission and the use of a package's members by declarations
 remain later slices.
 
 **Updating a package (DEC-2447.10).** A declaration at another version than the
@@ -1246,6 +1243,23 @@ transaction vets the manifest and the path before it and, after it, the pinned
 result and that every object outside the package that depended on it is still
 there (a script that drops a member `CASCADE` takes its dependents along, which
 the engine does not refuse); any difference rolls it back and records nothing.
+
+**Moving a package (DEC-2447.11).** A declaration in another schema than the
+target holds, under one identity, is one `ALTER EXTENSION name SET SCHEMA s`:
+`rename`, because the members keep their identity and only the schema they are
+spelled in changes, so a declaration that spells a member with the old schema is
+not rewritten and stops finding it. It is planned only with a rehearsal, on a
+scratch that holds the package where the target does, and sealed in plan format
+64 with the same pin as an update (the manifest before and after, no versions).
+A package that is not relocatable, a destination that is missing or where the
+role cannot create, a role that does not own the package and every member (a
+trusted install leaves its members to the superuser), and a destination name an
+object holds that the plan does not drop are refused by name before a plan exists;
+a managed module the plan drops that holds such a name is a handover, and the move
+waits for it. Beside a version change the update runs first and the move starts
+from the version it leaves; that needs the target version to be relocatable, or
+the plan is refused with the two-plan remedy. The apply checks as an update does,
+the intermediate step by its definition and the end by the pinned manifest.
 
 **Dropping a package (DEC-2447.8, DEC-2447.9).** Removing a declaration is not a
 drop: `plan` names the package and the command, and a human runs `pbps
@@ -2003,11 +2017,12 @@ two halves:
    Untouched policies keep their exact catalog predicates. Both RLS flags
    match the values the plan leaves, independently of whether any policy exists.
    Managed extensions retain their exact name, schema and version. A plan admits
-   only creates, updates and drops (DEC-2447.6, DEC-2447.8, DEC-2447.10), so every
+   only creates, updates, moves and drops (DEC-2447.6, DEC-2447.8, DEC-2447.10,
+   DEC-2447.11), so every
    package keeps these fields unchanged, except that each one the plan installs
    stands in exactly its pinned definition at the close and in none other before
-   it, each one it updates stands at the version it came from or the one it goes
-   to and at the close at the latter, and each one the plan drops stands as pinned
+   it, each one it updates or moves stands at a definition its chain passes
+   through and at the close at the last, and each one the plan drops stands as pinned
    until its statement and is absent from the close on; installed packages
    outside the declarations are not compared.
    A closing mismatch refuses success recording and rolls the transaction back;

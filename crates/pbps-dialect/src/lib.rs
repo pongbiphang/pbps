@@ -285,6 +285,10 @@ pub enum ExtensionPhase {
     /// everything remembered still stands). `from` is the definition the
     /// package must hold when the statement starts (DEC-2447.10).
     Update { from: pbps_model::Extension },
+    /// Vetted as an update is, without a version path: `from` is what the
+    /// package holds when the statement starts, which is the version an update
+    /// of the same plan leaves (DEC-2447.11).
+    SetSchema { from: pbps_model::Extension },
     /// Vetted before (the manifest and the objects outside it) and confirmed
     /// after (everything sealed is gone) (DEC-2447.8).
     Drop,

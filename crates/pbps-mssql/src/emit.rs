@@ -312,7 +312,8 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         }),
         Change::CreateExtension { name, .. }
         | Change::DropExtension { name, .. }
-        | Change::UpdateExtension { name, .. } => Err(DialectError::Unsupported {
+        | Change::UpdateExtension { name, .. }
+        | Change::SetExtensionSchema { name, .. } => Err(DialectError::Unsupported {
             dialect: crate::types::DIALECT,
             feature: format!("extension {}", name.shown()),
         }),
@@ -2410,7 +2411,7 @@ mod tests {
     /// SQL Server has no packages: neither the install nor the drop of one is
     /// ever emitted, whatever a plan carries (DEC-2447.6, DEC-2447.8).
     #[test]
-    fn a_package_install_update_or_drop_is_unsupported_on_sql_server() {
+    fn a_package_install_update_move_or_drop_is_unsupported_on_sql_server() {
         let definition = pbps_model::Extension {
             schema: "ext".into(),
             version: "1.0".into(),
@@ -2438,6 +2439,16 @@ mod tests {
                     ..definition.clone()
                 },
                 requires: Default::default(),
+                releases: Default::default(),
+            },
+            Change::SetExtensionSchema {
+                uid: "e_aaaaaa".parse().unwrap(),
+                name: "citext".into(),
+                from: definition.clone(),
+                to: pbps_model::Extension {
+                    schema: "elsewhere".into(),
+                    ..definition.clone()
+                },
                 releases: Default::default(),
             },
         ] {

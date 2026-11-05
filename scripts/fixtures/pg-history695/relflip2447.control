@@ -1,0 +1,4 @@
+comment = 'relocatable at 1.0, not at 1.1 (#2447)'
+default_version = '1.0'
+relocatable = true
+superuser = false

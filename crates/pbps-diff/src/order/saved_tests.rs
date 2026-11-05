@@ -637,3 +637,132 @@ fn admission_refuses_an_update_whose_pin_was_removed() {
     let checksum = whole.wire_fingerprint();
     assert!(admit(whole, &MinimalDialect, Path::new("plan.json"), &checksum).is_ok());
 }
+
+/// A plan that moves `earthdistance` from `ext` to `app` (and, when `with_update`
+/// is set, updates it from 1.1 to 1.3 first): the one pin covers the whole chain
+/// (DEC-2447.11).
+fn move_plan(with_update: bool) -> SavedPlan {
+    let at = |schema: &str, version: &str| pbps_model::Extension {
+        schema: schema.into(),
+        version: version.into(),
+    };
+    let manifest = |schema: &str, version: &str| pbps_model::ExtensionProvider {
+        definition: at(schema, version),
+        requires: Default::default(),
+        members: Default::default(),
+    };
+    let uid: pbps_model::Uid = "e_000002".parse().unwrap();
+    let (first, last) = if with_update {
+        ("1.1", "1.3")
+    } else {
+        ("1.3", "1.3")
+    };
+    let mut plan = wire();
+    plan.changes.changes = Vec::new();
+    if with_update {
+        plan.changes
+            .changes
+            .push(PlannedChange::new(Change::UpdateExtension {
+                uid: uid.clone(),
+                name: "earthdistance".into(),
+                from: at("ext", first),
+                to: at("ext", last),
+                requires: Default::default(),
+                releases: Default::default(),
+            }));
+    }
+    plan.changes
+        .changes
+        .push(PlannedChange::new(Change::SetExtensionSchema {
+            uid: uid.clone(),
+            name: "earthdistance".into(),
+            from: at("ext", last),
+            to: at("app", last),
+            releases: Default::default(),
+        }));
+    plan.ids.extensions = [(uid.clone(), "earthdistance".into())].into();
+    plan.extension_changes = vec![pbps_model::ExtensionChangePin {
+        uid,
+        name: "earthdistance".into(),
+        from: at("ext", first),
+        to: at("app", last),
+        path: if with_update {
+            ["1.1", "1.2", "1.3"].map(str::to_owned).to_vec()
+        } else {
+            Vec::new()
+        },
+        before: manifest("ext", first),
+        after: manifest("app", last),
+    }];
+    plan
+}
+
+/// A move is sealed with one pin whose path is empty, and one that follows an
+/// update is the same pin spanning both statements; every part that drifts from
+/// the chain is refused (DEC-2447.11).
+#[test]
+fn every_move_has_one_pin_over_its_whole_chain_and_each_drift_is_refused() {
+    let check = |plan: &SavedPlan| super::saved::package_pins_match_their_updates(plan);
+    assert!(check(&move_plan(false)).is_ok());
+    assert!(check(&move_plan(true)).is_ok());
+    type Edit = (&'static str, bool, fn(&mut SavedPlan));
+    let edits: [Edit; 11] = [
+        ("a move with no pin", false, |p| {
+            p.extension_changes.pop();
+        }),
+        ("a pin that goes to another schema", false, |p| {
+            p.extension_changes[0].to.schema = "other".into();
+            p.extension_changes[0].after.definition.schema = "other".into();
+        }),
+        ("a pin that starts in another schema", false, |p| {
+            p.extension_changes[0].from.schema = "other".into();
+            p.extension_changes[0].before.definition.schema = "other".into();
+        }),
+        ("a path on a move alone", false, |p| {
+            p.extension_changes[0].path = vec!["1.3".into()];
+        }),
+        ("a move that changes the version", false, |p| {
+            if let Change::SetExtensionSchema { to, .. } = &mut p.changes.changes[0].change {
+                to.version = "1.4".into();
+            }
+        }),
+        ("a move that stays in its schema", false, |p| {
+            if let Change::SetExtensionSchema { to, .. } = &mut p.changes.changes[0].change {
+                to.schema = "ext".into();
+            }
+        }),
+        ("a move twice", false, |p| {
+            let again = p.changes.changes[0].clone();
+            p.changes.changes.push(again);
+        }),
+        ("an update the pin path does not follow", true, |p| {
+            p.extension_changes[0].path.pop();
+        }),
+        (
+            "a move that starts elsewhere than the update ends",
+            true,
+            |p| {
+                if let Change::SetExtensionSchema { from, .. } = &mut p.changes.changes[1].change {
+                    from.version = "1.2".into();
+                }
+            },
+        ),
+        ("a pin that ignores the move", true, |p| {
+            p.extension_changes[0].to.schema = "ext".into();
+            p.extension_changes[0].after.definition.schema = "ext".into();
+        }),
+        ("a pin that ignores the update", true, |p| {
+            p.extension_changes[0].from.version = "1.3".into();
+            p.extension_changes[0].before.definition.version = "1.3".into();
+        }),
+    ];
+    for (what, with_update, edit) in edits {
+        let mut plan = move_plan(with_update);
+        edit(&mut plan);
+        let error = check(&plan).expect_err(what).to_string();
+        assert!(
+            error.contains("extension evidence disagrees"),
+            "{what}: {error}"
+        );
+    }
+}

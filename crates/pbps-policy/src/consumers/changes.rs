@@ -301,6 +301,7 @@ pub(super) fn classify(
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
         | Change::UpdateExtension { .. }
+        | Change::SetExtensionSchema { .. }
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetReplicaIdentity { .. }

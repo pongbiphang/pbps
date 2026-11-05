@@ -466,6 +466,7 @@ impl Reconstruction {
                 | Change::CreateExtension { .. }
                 | Change::DropExtension { .. }
                 | Change::UpdateExtension { .. }
+                | Change::SetExtensionSchema { .. }
                 | Change::Revoke { .. } => {
                     return Err(ReconstructError::Unsupported(
                         serde_json::to_value(change)

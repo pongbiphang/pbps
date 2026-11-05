@@ -5051,3 +5051,93 @@ managed object uses is refused by the rehearsal's own statement error, not a
 named finding; carrying a name collision through an edge needs a rehearsal before
 the order is decided; version strings are never ordered; relocation (SET SCHEMA)
 and the combined plan are the next slice.
+
+<a id="dec-2447-11"></a>
+
+**DEC-2447.11. A package is moved by an `ALTER EXTENSION SET SCHEMA` that is rehearsed where the target holds it, sealed before and after, and refused by name for everything the engine would refuse.**
+
+A declaration that holds an `e_` identity in another schema than the target, is
+`Change::SetExtensionSchema { uid, name, from, to, releases }`, emitted as
+`ALTER EXTENSION name SET SCHEMA s` and nothing else. It carries `rename` and not
+`extension-code`: no script runs, every member keeps its object number (measured
+on PostgreSQL 16.15 and 18.6: a table default, a GIN index and the members' own
+dependents stand afterwards, bound by number), and what changes is the schema a
+member is spelled in. A declaration, view body or routine text that spells a
+member with the old schema stops finding it, which pbps does not rewrite (the
+design forbids rewriting declarations), so the label is the honest one. Plan
+format is **64** (62 belongs to another change); state and ids are unchanged.
+
+Measured on both engines, identically. A package that is not relocatable
+(`plpgsql`, control `relocatable = false`) is refused by the engine
+("does not support SET SCHEMA"), the flag is read from the control file of the
+version the move runs at, and an update rewrites `extrelocatable` from the
+version it goes to. The engine renders a moved member with the new schema as a
+name part and as the front of a rendered type (`"My B".citext`, quoted when the
+schema needs it), which `ProviderMember::relocated` predicts exactly for every
+member of citext and of the fixture packages (a live test compares the prediction
+with the engine). `SET SCHEMA` needs `CREATE` on the destination (checked first,
+"permission denied for schema"), ownership of the package and ownership of
+**every member** ("must be owner of type a.hstore"): a trusted install leaves
+its members to the bootstrap superuser, so owning the package is not enough, and
+the rule `move_problems` states is what the engine does for a superuser, the
+owner, an inheriting member, a member that does not inherit and a stranger. A
+destination that holds an object of a member's name and signature is refused
+(42710 for a function) and passes once the same transaction has dropped the
+occupant, which is the handover.
+
+The plan is **rehearsed**, always, as an update is, on a scratch that holds the
+package where the target does (the externals file installs it; after the apply
+the file is raised to the new schema and until then every plan fails the exact
+scratch check by name). The rehearsal creates the destination schema on the
+scratch, runs the real move and reads the manifest after. The plan **seals** it
+in the update's pin, `ExtensionChangePin`, which now covers a package's whole
+chain: `from` is where the first statement starts and `to` where the last ends,
+the path is empty for a move alone, and admission demands that the chain agree
+(an update keeps its schema, a move keeps its version, the move starts where the
+update ends). A destination name that an object holds and that the plan does not
+drop is refused after the rehearsal, before the seal, from a catalog read of the
+destination (the scratch cannot see an unmanaged object): the members the
+rehearsal read, intersected with what the destination holds.
+
+Order. Beside a version change **the update runs first**, and the move starts
+from the version it leaves: the two rewrite one package, which the order settles
+by the plan's own sequence, and the differ's draft ranks the move one behind the
+update. That is admitted only when the target version is relocatable; a plan that
+would update to a version that is not is refused with the remedy "move the package
+in one plan and update it in the next" (a move first and then an update is a plan
+of its own, which the second plan states). A move waits for the managed modules
+the plan drops that hold a name a member takes in the destination (`releases`,
+`Absent(Module)`, by the members' relocated names and `ProviderMember::module`;
+measured live, a project with objects the resolver must answer for refuses that
+plan by name, as it does any plan that moves a package, so the drop is planned
+first and the move after it). It
+claims no name slot: the package's own name does not change, the members have no
+slot kind the order could use for operators, classes and casts, and an occupant
+the plan does not manage is a refusal above. A managed module the plan *creates* at
+a name the package vacates is the rehearsal's to catch, in order or not.
+
+Apply. Each statement is its own vet: **before** it the package stands as `from`
+(for a move after an update, the version the update leaves), the live manifest
+equals the sealed `before` while it is the package's first statement, and an
+update walks the sealed path; what depends on the package from outside is
+remembered; **after** it the definition is the one the statement leaves, and after
+the last statement the manifest equals the sealed `after` and every remembered
+object still stands. The step between an update and a move is held to its
+definition only, because the pin does not carry an intermediate manifest: a
+member added there is caught by the end's manifest, in the same transaction for a
+transactional run and after a committed update for a staged one, which the staged
+checkpoint then refuses to continue from. The opening asks the planner's sentences
+again. The closing guard allows the package at any definition its chain passes
+through while the plan runs and at the last at the close. `moves_bindings` stays
+`false` and a plan that also needs the resolver is refused by name before it runs
+(`resolution::package_changed`: "this plan also moves extension"), for the update's
+reason.
+
+All 41 `catalog_change!()` arms were read for a move and all join, as for an
+update: none reads a table, column, row or binding, and SQL Server never receives
+the change. Limits, stated: a retired member that a kept managed object uses is
+the rehearsal's statement error; a name an unmanaged object holds in the
+destination is a refusal, and a collision of a member class the destination query
+does not list (a text search object, a statistics object) is the engine's rollback;
+declarations that spell a member with the old schema are the next plan's drift,
+not rewritten.

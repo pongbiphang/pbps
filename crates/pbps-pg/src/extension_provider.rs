@@ -833,19 +833,222 @@ pub async fn update_problems(
     Ok(out)
 }
 
+/// The direct members of each package in `names` that the connected role does
+/// not own (and cannot act as an owner of), which `ALTER EXTENSION SET SCHEMA`
+/// refuses one by one with 42501: measured on 16.15 and 18.6, a trusted install
+/// leaves its members owned by the bootstrap superuser, so owning the package and
+/// holding `CREATE` on the destination is not enough (DEC-2447.11). Each is named
+/// by what the engine calls it.
+async fn foreign_members(
+    conn: &mut impl QueryConnection,
+    names: &BTreeSet<String>,
+) -> Result<Vec<(String, String, String)>, DbError> {
+    let list = names
+        .iter()
+        .map(|n| crate::emit::literal(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows = conn
+        .query(&format!(
+            "SELECT e.extname::text AS name, \
+                    pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS what, \
+                    pg_catalog.pg_get_userbyid(o.owner)::text AS owner \
+               FROM pg_catalog.pg_depend d \
+               JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+               JOIN LATERAL ( \
+                    SELECT proowner AS owner FROM pg_catalog.pg_proc WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND oid = d.objid \
+                    UNION ALL SELECT typowner FROM pg_catalog.pg_type WHERE d.classid = 'pg_catalog.pg_type'::regclass AND oid = d.objid \
+                    UNION ALL SELECT relowner FROM pg_catalog.pg_class WHERE d.classid = 'pg_catalog.pg_class'::regclass AND oid = d.objid \
+                    UNION ALL SELECT oprowner FROM pg_catalog.pg_operator WHERE d.classid = 'pg_catalog.pg_operator'::regclass AND oid = d.objid \
+                    UNION ALL SELECT opcowner FROM pg_catalog.pg_opclass WHERE d.classid = 'pg_catalog.pg_opclass'::regclass AND oid = d.objid \
+                    UNION ALL SELECT opfowner FROM pg_catalog.pg_opfamily WHERE d.classid = 'pg_catalog.pg_opfamily'::regclass AND oid = d.objid \
+                    UNION ALL SELECT collowner FROM pg_catalog.pg_collation WHERE d.classid = 'pg_catalog.pg_collation'::regclass AND oid = d.objid \
+                    UNION ALL SELECT conowner FROM pg_catalog.pg_conversion WHERE d.classid = 'pg_catalog.pg_conversion'::regclass AND oid = d.objid \
+                    UNION ALL SELECT lanowner FROM pg_catalog.pg_language WHERE d.classid = 'pg_catalog.pg_language'::regclass AND oid = d.objid \
+                    ) o ON true \
+               JOIN pg_catalog.pg_roles r ON r.rolname = current_user \
+              WHERE d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.deptype = 'e' \
+                AND e.extname IN ({list}) \
+                AND NOT (r.rolsuper OR pg_catalog.pg_has_role(current_user, o.owner, 'USAGE')) \
+              ORDER BY 1, 2"
+        ))
+        .await?;
+    rows.iter()
+        .map(|r| Ok((text(r, "name")?, text(r, "what")?, text(r, "owner")?)))
+        .collect()
+}
+
+/// Why each move in `moves` (name to the definition it starts from and the one it
+/// ends at) would fail on the target now, one sentence each (DEC-2447.11): the
+/// package stands in the schema the plan assumed and is relocatable (for a move
+/// that follows an update, at the version the update leaves), the destination
+/// exists and the connected role may create in it, and the role owns the package
+/// and every member. `updating` are the packages this plan also updates.
+pub async fn move_problems(
+    conn: &mut impl QueryConnection,
+    moves: &BTreeMap<String, (Extension, Extension)>,
+    updating: &BTreeSet<String>,
+) -> Result<Vec<String>, DbError> {
+    if moves.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = target(conn).await?;
+    let names: BTreeSet<String> = moves.keys().cloned().collect();
+    let mut out = ownership_problems(conn, &names, "move").await?;
+    for (name, member, owner) in foreign_members(conn, &names).await? {
+        out.push(format!(
+            "extension `{}`: {} is owned by `{}`, which the connected role is not and cannot act as, so the engine would refuse to move it (42501)",
+            Escaped(&name),
+            Escaped(&member),
+            Escaped(&owner)
+        ));
+    }
+    for (name, (from, to)) in moves {
+        let held = target.installed.get(name);
+        if held.is_some_and(|held| {
+            held.schema != from.schema || (!updating.contains(name) && held.version != from.version)
+        }) {
+            out.push(format!(
+                "extension `{}` is not installed as the plan assumed (it is in schema `{}`, not `{}`)",
+                Escaped(name),
+                Escaped(&held.map(|h| h.schema.clone()).unwrap_or_default()),
+                Escaped(&from.schema)
+            ));
+        }
+        // What decides it is the control of the version the move runs at: the
+        // installed one, or the version the plan's own update leaves (measured:
+        // the engine rewrites `extrelocatable` from the control it updates to).
+        match target.available.get(&(name.clone(), to.version.clone())) {
+            Some(control) if control.relocatable && control.schema.is_none() => {}
+            Some(_) if updating.contains(name) => out.push(format!(
+                "extension `{}` version `{}` is not relocatable, so it cannot be updated and moved in one plan; move the package in one plan and update it in the next",
+                Escaped(name),
+                Escaped(&to.version)
+            )),
+            Some(_) => out.push(format!(
+                "extension `{}` is not relocatable (its control file fixes the schema), so the engine would refuse SET SCHEMA",
+                Escaped(name)
+            )),
+            None => out.push(format!(
+                "extension `{}` version `{}` is not listed as installable, so its control file cannot say whether it moves",
+                Escaped(name),
+                Escaped(&to.version)
+            )),
+        }
+        if !target.schemas.contains(&to.schema) {
+            out.push(format!(
+                "extension `{}` would move to schema `{}`, which does not exist on the target",
+                Escaped(name),
+                Escaped(&to.schema)
+            ));
+        } else if !has_schema_create(conn, &to.schema).await? {
+            out.push(format!(
+                "extension `{}` would move to schema `{}`, where the connected role lacks CREATE (42501)",
+                Escaped(name),
+                Escaped(&to.schema)
+            ));
+        }
+    }
+    Ok(out)
+}
+
+async fn has_schema_create(conn: &mut impl QueryConnection, schema: &str) -> Result<bool, DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT pg_catalog.has_schema_privilege(current_user, {}, 'CREATE')::text AS allowed",
+            crate::emit::literal(schema)
+        ))
+        .await?;
+    rows.first()
+        .map(|r| flag(r, "allowed"))
+        .transpose()?
+        .ok_or_else(|| DbError::BadRow("the schema privilege read returned no row".into()))
+}
+
+/// The objects schema `schema` holds now, of the classes a package's members come
+/// in, named as a manifest names them (DEC-2447.11): what a member moved there
+/// would collide with. Read from the catalog so that an object nothing manages is
+/// seen too.
+pub async fn schema_occupants(
+    conn: &mut impl QueryConnection,
+    schema: &str,
+) -> Result<BTreeSet<ProviderMember>, DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT a.type AS one, pg_catalog.array_to_json(a.object_names)::text AS two, \
+                    pg_catalog.array_to_json(a.object_args)::text AS three \
+               FROM ( \
+                    SELECT 'pg_catalog.pg_proc'::regclass::oid AS classid, x.oid AS objid FROM pg_catalog.pg_proc x WHERE x.pronamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_type'::regclass::oid, x.oid FROM pg_catalog.pg_type x WHERE x.typnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_class'::regclass::oid, x.oid FROM pg_catalog.pg_class x WHERE x.relnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_operator'::regclass::oid, x.oid FROM pg_catalog.pg_operator x WHERE x.oprnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_opclass'::regclass::oid, x.oid FROM pg_catalog.pg_opclass x WHERE x.opcnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_opfamily'::regclass::oid, x.oid FROM pg_catalog.pg_opfamily x WHERE x.opfnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_collation'::regclass::oid, x.oid FROM pg_catalog.pg_collation x WHERE x.collnamespace = {n} \
+                    UNION ALL SELECT 'pg_catalog.pg_conversion'::regclass::oid, x.oid FROM pg_catalog.pg_conversion x WHERE x.connamespace = {n} \
+                    ) o \
+               LEFT JOIN LATERAL pg_catalog.pg_identify_object_as_address(o.classid, o.objid, 0) a ON true",
+            n = format!("(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = {})", crate::emit::literal(schema))
+        ))
+        .await?;
+    let mut out = BTreeSet::new();
+    for row in &rows {
+        let class = row.try_get::<&str>("one")?.ok_or_else(|| {
+            DbError::Refused(format!(
+                "the catalog changed while schema `{}` was read: an object was there and then gone",
+                Escaped(schema)
+            ))
+        })?;
+        out.insert(ProviderMember {
+            class: class.to_owned(),
+            names: names(row.try_get::<&str>("two")?, "an object's names")?,
+            args: names(row.try_get::<&str>("three")?, "an object's arguments")?,
+        });
+    }
+    Ok(out)
+}
+
+/// A package's members as the destination would name them, for the differ: each
+/// installed package in `moving`, its manifest's members moved from its schema
+/// to the one it is declared in (DEC-2447.11).
+pub fn relocated_members(
+    all: &BTreeMap<String, ExtensionProvider>,
+    moving: &BTreeMap<String, (Extension, Extension)>,
+) -> BTreeMap<String, BTreeSet<ProviderMember>> {
+    moving
+        .iter()
+        .filter_map(|(name, (from, to))| {
+            let provider = all.get(name)?;
+            Some((
+                name.clone(),
+                provider
+                    .members
+                    .iter()
+                    .map(|m| m.relocated(&from.schema, &to.schema))
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
 /// The check that runs in the statement's own transaction *before* an
-/// `ALTER EXTENSION ... UPDATE TO` (DEC-2447.10): the package stands as the
-/// plan assumed, its members are the ones the plan was approved over, and the
-/// engine would walk the pinned versions. What depends on the package from
+/// `ALTER EXTENSION ... UPDATE TO` or `... SET SCHEMA` (DEC-2447.10,
+/// DEC-2447.11): the package stands as the plan assumed (`from`, which is the
+/// version an update of the same plan leaves, for a move after it), its members
+/// are the ones the plan was approved over (while it is still the plan's first
+/// statement for the package, since nothing has run yet), and an update would
+/// walk the pinned versions. What depends on the package from
 /// outside it (a column default calling a member, a view, an object marked
 /// `DEPENDS ON EXTENSION`) is remembered in a temporary table that ends with the
-/// transaction, so that [`confirm_updated`] can prove each is still there: a
+/// transaction, so that [`confirm_changed`] can prove each is still there: a
 /// script that drops a member `CASCADE` takes its dependents with it, which the
 /// engine does not refuse.
-pub async fn vet_before_update(
+pub async fn vet_before_change(
     conn: &mut pbps_db::Conn,
     name: &str,
     pin: &pbps_model::ExtensionChangePin,
+    from: &Extension,
+    moving: bool,
 ) -> Result<(), DbError> {
     let all = providers(conn).await?;
     let Some(actual) = all.get(name) else {
@@ -854,17 +1057,24 @@ pub async fn vet_before_update(
             Escaped(name)
         )));
     };
-    if actual.definition != pin.from {
+    if actual.definition != *from {
         return Err(DbError::Refused(format!(
-            "extension `{}` is `{}` in schema `{}`, not the `{}` in schema `{}` the plan was approved to update",
+            "extension `{}` is `{}` in schema `{}`, not the `{}` in schema `{}` the plan was approved to change",
             Escaped(name),
             Escaped(&actual.definition.version),
             Escaped(&actual.definition.schema),
-            Escaped(&pin.from.version),
-            Escaped(&pin.from.schema)
+            Escaped(&from.version),
+            Escaped(&from.schema)
         )));
     }
-    let differences = pin.before.differences(actual);
+    // Only the package's first statement starts from what was sealed; after an
+    // update a move starts from the version the update left, held to its
+    // definition here and to the sealed manifest at the end (DEC-2447.11).
+    let differences = if *from == pin.from {
+        pin.before.differences(actual)
+    } else {
+        Vec::new()
+    };
     if !differences.is_empty() {
         return Err(DbError::Refused(format!(
             "extension `{}` is not what the plan was approved to update (its members changed since it was planned): {}",
@@ -872,10 +1082,11 @@ pub async fn vet_before_update(
             differences.join("; ")
         )));
     }
-    if update_path(conn, name, &pin.from.version, &pin.to.version)
-        .await?
-        .as_ref()
-        != Some(&pin.path)
+    if !moving
+        && update_path(conn, name, &pin.from.version, &pin.to.version)
+            .await?
+            .as_ref()
+            != Some(&pin.path)
     {
         return Err(DbError::Refused(format!(
             "extension `{}` no longer updates from `{}` to `{}` by the versions the plan was approved over ({})",
@@ -908,16 +1119,35 @@ pub async fn vet_before_update(
     Ok(())
 }
 
-/// The check right *after* the update, before its transaction commits: the
-/// package is at the target version with the members the rehearsal read, and
+/// The check right *after* the statement, before its transaction commits: the
+/// package is at the target definition with the members the rehearsal read, and
 /// every object that depended on it from outside is still there. Anything else
 /// rolls the update back with the rest.
-pub async fn confirm_updated(
+pub async fn confirm_changed(
     conn: &mut impl QueryConnection,
     name: &str,
     pin: &pbps_model::ExtensionChangePin,
+    moving: bool,
 ) -> Result<(), DbError> {
-    vet(conn, name, &pin.after).await?;
+    if moving || pin.from.schema == pin.to.schema {
+        vet(conn, name, &pin.after).await?;
+    } else {
+        // An update that a move follows leaves the package in the schema it
+        // started in: held to that definition, and the manifest waits for the
+        // move that ends the change.
+        let midway = Extension {
+            schema: pin.from.schema.clone(),
+            version: pin.to.version.clone(),
+        };
+        if installed(conn).await?.get(name) != Some(&midway) {
+            return Err(DbError::Refused(format!(
+                "extension `{}` is not at version `{}` in schema `{}` after its update",
+                Escaped(name),
+                Escaped(&midway.version),
+                Escaped(&midway.schema)
+            )));
+        }
+    }
     let gone = conn
         .query(&format!(
             "SELECT count(*)::text AS n FROM pg_temp.pbps_update_keep t WHERE t.ext = {} \
@@ -1522,6 +1752,170 @@ mod tests {
                 .any(|e| e.to_string().contains("only against a database")),
             "{offline:?}"
         );
+    }
+
+    /// A move is exactly `ALTER EXTENSION name SET SCHEMA schema` with the
+    /// boundary the executor vets, and through the real differ and orderer it
+    /// runs after the update of the same package and after the module its plan
+    /// drops that holds a name a member would take in the destination
+    /// (DEC-2447.11).
+    #[test]
+    fn a_move_is_exactly_the_schema_statement_and_follows_its_update_and_the_name_it_takes() {
+        use pbps_model::{Change, IdsFile, Schema};
+        let pg = crate::Postgres::new();
+        let move_to = Change::SetExtensionSchema {
+            uid: "e_000001".parse().unwrap(),
+            name: "odd \"name".into(),
+            from: wanted("ext", "1.0"),
+            to: wanted("new \"schema", "1.0"),
+            releases: Default::default(),
+        };
+        let statements = crate::emit::emit(&pg, &move_to, Default::default()).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "ALTER EXTENSION \"odd \"\"name\" SET SCHEMA \"new \"\"schema\";"
+        );
+        for forbidden in ["CASCADE", "UPDATE", "DROP", "VERSION"] {
+            assert!(!statements[0].sql.contains(forbidden));
+        }
+        assert_eq!(
+            statements[0].extension.as_ref().unwrap().phase,
+            pbps_dialect::ExtensionPhase::SetSchema {
+                from: wanted("ext", "1.0")
+            }
+        );
+
+        let function = |name: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: format!("() RETURNS int LANGUAGE sql RETURN {}", name.len()),
+            options: Default::default(),
+        };
+        let base = Schema {
+            extensions: [("aaa".into(), wanted("ext", "1.0"))].into(),
+            modules: [("app.taken()".parse().unwrap(), function("taken"))].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            extensions: [("aaa".into(), wanted("app", "1.1"))].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "aaa".into())].into(),
+            ..Default::default()
+        };
+        let hints = pbps_model::Hints {
+            extension_updates: [("aaa".into(), Default::default())].into(),
+            extension_moves: [(
+                "aaa".into(),
+                [ProviderMember {
+                    class: "function".into(),
+                    names: vec!["app".into(), "taken".into()],
+                    args: Vec::new(),
+                }]
+                .into(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        fn side<'a>(schema: &'a Schema, ids: &'a IdsFile) -> pbps_diff::Side<'a> {
+            pbps_diff::Side { schema, ids }
+        }
+        let side = |schema| side(schema, &ids);
+        let planned = pbps_diff::diff(side(&base), side(&desired), &pg, &hints).unwrap();
+        let order: Vec<String> = planned
+            .changes()
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::DropModule { id, .. } = &p.change {
+                    Some(format!("drop module {}", id.shown()))
+                } else if let Change::UpdateExtension { to, .. } = &p.change {
+                    Some(format!("update to {} in {}", to.version, to.schema))
+                } else if let Change::SetExtensionSchema { from, to, .. } = &p.change {
+                    Some(format!(
+                        "move {} {} to {}",
+                        from.version, from.schema, to.schema
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "drop module app.taken()",
+                "update to 1.1 in ext",
+                "move 1.1 ext to app"
+            ]
+        );
+
+        // Negative: a move planned offline is named, and the same schema plans
+        // no move.
+        let offline = pbps_diff::diff(
+            side(&base),
+            side(&desired),
+            &pg,
+            &pbps_model::Hints {
+                extension_updates: hints.extension_updates.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            offline
+                .iter()
+                .any(|e| e.to_string().contains("SET SCHEMA")
+                    && e.to_string().contains("only against")),
+            "{offline:?}"
+        );
+        let stays = Schema {
+            extensions: [("aaa".into(), wanted("ext", "1.1"))].into(),
+            ..Default::default()
+        };
+        let planned = pbps_diff::diff(side(&base), side(&stays), &pg, &hints).unwrap();
+        assert!(
+            !planned
+                .changes()
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::SetExtensionSchema { .. }))
+        );
+    }
+
+    /// A member keeps its identity through a move, and the engine renders it with
+    /// the new schema wherever the old one was a part or the front of a rendered
+    /// type, and nowhere else (measured on 16.15 and 18.6).
+    #[test]
+    fn a_member_is_relocated_by_schema_part_and_qualified_type_only() {
+        let member = ProviderMember {
+            class: "function".into(),
+            names: vec!["ext".into(), "citext_cmp".into()],
+            args: vec![
+                "ext.citext".into(),
+                "ext.citext".into(),
+                "pg_catalog.text".into(),
+            ],
+        };
+        let moved = member.relocated("ext", "My B");
+        assert_eq!(moved.names, ["My B", "citext_cmp"]);
+        assert_eq!(
+            moved.args,
+            ["\"My B\".citext", "\"My B\".citext", "pg_catalog.text"]
+        );
+        // A quoted source and a type in another schema keep their own.
+        let quoted = ProviderMember {
+            class: "cast".into(),
+            names: vec!["\"My B\".citext".into()],
+            args: vec!["character".into(), "extra.citext".into(), "ext_two".into()],
+        };
+        let back = quoted.relocated("My B", "ext");
+        assert_eq!(back.names, ["ext.citext"]);
+        assert_eq!(back.args, ["character", "extra.citext", "ext_two"]);
+        // Negative: moving from a schema the member is not in changes nothing.
+        assert_eq!(member.relocated("other", "x"), member);
     }
 
     /// What may update a package follows the control file of the version it
@@ -2376,8 +2770,10 @@ mod tests {
 
             // Before the statement the result is not there yet; after it, it is.
             conn.execute("BEGIN").await.unwrap();
-            vet_before_update(&mut conn, "upd2447", &pin).await.unwrap();
-            let error = confirm_updated(&mut conn, "upd2447", &pin)
+            vet_before_change(&mut conn, "upd2447", &pin, &pin.from, false)
+                .await
+                .unwrap();
+            let error = confirm_changed(&mut conn, "upd2447", &pin, false)
                 .await
                 .unwrap_err();
             assert!(
@@ -2387,20 +2783,22 @@ mod tests {
             conn.execute("ALTER EXTENSION upd2447 UPDATE TO '1.1'")
                 .await
                 .unwrap();
-            confirm_updated(&mut conn, "upd2447", &pin).await.unwrap();
+            confirm_changed(&mut conn, "upd2447", &pin, false)
+                .await
+                .unwrap();
             conn.execute("ROLLBACK").await.unwrap();
 
             // Not where the plan left it.
             let mut elsewhere = pin.clone();
             elsewhere.from.version = "0.9".into();
-            let error = vet_before_update(&mut conn, "upd2447", &elsewhere)
+            let error = vet_before_change(&mut conn, "upd2447", &elsewhere, &elsewhere.from, false)
                 .await
                 .unwrap_err();
             assert!(
                 error.to_string().contains("not the `0.9`"),
                 "{variable}: {error}"
             );
-            let error = vet_before_update(&mut conn, "nosuch", &pin)
+            let error = vet_before_change(&mut conn, "nosuch", &pin, &pin.from, false)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("no longer installed"), "{error}");
@@ -2408,7 +2806,7 @@ mod tests {
             // A path the engine no longer walks.
             let mut rerouted = pin.clone();
             rerouted.path = vec!["1.0".into(), "0.5".into(), "1.1".into()];
-            let error = vet_before_update(&mut conn, "upd2447", &rerouted)
+            let error = vet_before_change(&mut conn, "upd2447", &rerouted, &rerouted.from, false)
                 .await
                 .unwrap_err();
             assert!(
@@ -2423,7 +2821,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let error = vet_before_update(&mut conn, "upd2447", &pin)
+            let error = vet_before_change(&mut conn, "upd2447", &pin, &pin.from, false)
                 .await
                 .unwrap_err();
             assert!(
@@ -2442,13 +2840,13 @@ mod tests {
                 .await
                 .unwrap();
             conn.execute("BEGIN").await.unwrap();
-            vet_before_update(&mut conn, "updcascade2447", &cascade)
+            vet_before_change(&mut conn, "updcascade2447", &cascade, &cascade.from, false)
                 .await
                 .unwrap();
             conn.execute("ALTER EXTENSION updcascade2447 UPDATE TO '1.1'")
                 .await
                 .unwrap();
-            let error = confirm_updated(&mut conn, "updcascade2447", &cascade)
+            let error = confirm_changed(&mut conn, "updcascade2447", &cascade, false)
                 .await
                 .unwrap_err();
             assert!(
@@ -2462,13 +2860,13 @@ mod tests {
             // passes.
             conn.execute("DROP TABLE public.dep").await.unwrap();
             conn.execute("BEGIN").await.unwrap();
-            vet_before_update(&mut conn, "updcascade2447", &cascade)
+            vet_before_change(&mut conn, "updcascade2447", &cascade, &cascade.from, false)
                 .await
                 .unwrap();
             conn.execute("ALTER EXTENSION updcascade2447 UPDATE TO '1.1'")
                 .await
                 .unwrap();
-            confirm_updated(&mut conn, "updcascade2447", &cascade)
+            confirm_changed(&mut conn, "updcascade2447", &cascade, false)
                 .await
                 .unwrap();
             conn.execute("ROLLBACK").await.unwrap();
@@ -2640,6 +3038,327 @@ mod tests {
                 .execute(&format!("DROP ROLE {own}, {member}, {loose}, {stranger}"))
                 .await
                 .unwrap();
+        }
+    }
+
+    /// `ALTER EXTENSION SET SCHEMA` needs ownership of the package and of every
+    /// member, `CREATE` on the destination, and a relocatable package: the rule
+    /// `move_problems` states is what the engine does for a superuser, the owner,
+    /// a member that inherits, one that does not, a stranger, a destination the
+    /// role cannot create in, a package whose members the role does not own (a
+    /// trusted install leaves them to the superuser) and a package that is not
+    /// relocatable (measured on 16.15 and 18.6).
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_connected_role_may_move_what_it_owns_with_every_member_and_nothing_else() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (mut admin, db, mut conn) = fresh(variable, "moveown").await;
+            let tag = db.rsplit('_').next().unwrap().to_owned();
+            let [own, member, loose, stranger] =
+                ["own", "member", "loose", "stranger"].map(|r| format!("pbps_mov_{r}_{tag}"));
+            admin
+                .execute(&format!(
+                    "CREATE ROLE {own} NOLOGIN; CREATE ROLE {member} NOLOGIN; \
+                     CREATE ROLE {loose} NOLOGIN; CREATE ROLE {stranger} NOLOGIN; \
+                     GRANT {own} TO {member}; GRANT {own} TO {loose} WITH INHERIT FALSE"
+                ))
+                .await
+                .unwrap();
+            conn.execute(&format!(
+                "CREATE SCHEMA ext; CREATE SCHEMA dest; \
+                 GRANT ALL ON SCHEMA ext, dest TO {own}, {member}, {loose}, {stranger}; \
+                 GRANT CREATE ON DATABASE {db} TO {own}; \
+                 SET ROLE {own}; CREATE EXTENSION upd2447 SCHEMA ext VERSION '1.0'; \
+                 CREATE EXTENSION hstore SCHEMA ext VERSION '1.4'; RESET ROLE"
+            ))
+            .await
+            .unwrap();
+            let step = |name: &str, to: &str| -> BTreeMap<String, (Extension, Extension)> {
+                let version = if name == "hstore" { "1.4" } else { "1.0" };
+                [(
+                    name.to_owned(),
+                    (wanted("ext", version), wanted(to, version)),
+                )]
+                .into()
+            };
+            let none = BTreeSet::new();
+            // The engine and the rule, for one role and one package.
+            let both = |role: String, name: &'static str, to: &'static str| {
+                let step = step(name, to);
+                (role, name, to, step)
+            };
+            let mut conn = conn;
+            for (role, name, to, allowed) in [
+                (&own, "upd2447", "dest", true),
+                (&member, "upd2447", "dest", true),
+                (&loose, "upd2447", "dest", false),
+                (&stranger, "upd2447", "dest", false),
+                // A trusted package: its members belong to the superuser.
+                (&own, "hstore", "dest", false),
+            ] {
+                let (role, name, to, moves) = both(role.clone(), name, to);
+                conn.execute(&format!("SET ROLE {role}")).await.unwrap();
+                let problems = move_problems(&mut conn, &moves, &none).await.unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                let tried = conn
+                    .execute(&format!("ALTER EXTENSION {name} SET SCHEMA {to}"))
+                    .await;
+                conn.execute("ROLLBACK").await.unwrap();
+                conn.execute("RESET ROLE").await.unwrap();
+                assert_eq!(
+                    problems.is_empty(),
+                    allowed,
+                    "{variable} {role} {name}: {problems:?}"
+                );
+                assert_eq!(
+                    tried.is_ok(),
+                    allowed,
+                    "{variable} {role} {name}: the engine said {tried:?}"
+                );
+            }
+            // The refusals name what is wrong: the package owner, a member and
+            // its owner.
+            conn.execute(&format!("SET ROLE {stranger}")).await.unwrap();
+            let found = move_problems(&mut conn, &step("upd2447", "dest"), &none)
+                .await
+                .unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("42501") && p.contains(&own)),
+                "{found:?}"
+            );
+            conn.execute("RESET ROLE").await.unwrap();
+            conn.execute(&format!("SET ROLE {own}")).await.unwrap();
+            let found = move_problems(&mut conn, &step("hstore", "dest"), &none)
+                .await
+                .unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("is owned by `postgres`") || p.contains("cannot act as")),
+                "{found:?}"
+            );
+            // No CREATE on the destination, and a destination that is not there.
+            conn.execute("RESET ROLE").await.unwrap();
+            conn.execute(&format!("REVOKE CREATE ON SCHEMA dest FROM {own}"))
+                .await
+                .unwrap();
+            conn.execute(&format!("SET ROLE {own}")).await.unwrap();
+            let found = move_problems(&mut conn, &step("upd2447", "dest"), &none)
+                .await
+                .unwrap();
+            assert!(
+                found.iter().any(|p| p.contains("lacks CREATE")),
+                "{found:?}"
+            );
+            conn.execute("RESET ROLE").await.unwrap();
+            let found = move_problems(&mut conn, &step("upd2447", "nosuch"), &none)
+                .await
+                .unwrap();
+            assert!(
+                found.iter().any(|p| p.contains("does not exist")),
+                "{found:?}"
+            );
+            // Negatives: not where the plan assumed, and not relocatable.
+            let held: BTreeMap<String, (Extension, Extension)> = [(
+                "upd2447".to_owned(),
+                (wanted("elsewhere", "1.0"), wanted("dest", "1.0")),
+            )]
+            .into();
+            let found = move_problems(&mut conn, &held, &none).await.unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("not installed as the plan assumed")),
+                "{found:?}"
+            );
+            let fixed: BTreeMap<String, (Extension, Extension)> = [(
+                "plpgsql".to_owned(),
+                (wanted("pg_catalog", "1.0"), wanted("dest", "1.0")),
+            )]
+            .into();
+            let found = move_problems(&mut conn, &fixed, &none).await.unwrap();
+            assert!(
+                found.iter().any(|p| p.contains("not relocatable")),
+                "{variable}: {found:?}"
+            );
+            assert!(
+                move_problems(&mut conn, &BTreeMap::new(), &none)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            discard(admin, db, conn).await;
+        }
+    }
+
+    /// A move is vetted before it runs and confirmed after: the package stands as
+    /// the plan assumed with the members it sealed, the result is what the
+    /// rehearsal read, and a destination name an object already holds is seen
+    /// from the catalog (DEC-2447.11).
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_move_is_vetted_before_it_runs_and_confirmed_after_it_ran() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let (admin, db, mut conn) = fresh(variable, "movevet").await;
+            conn.execute(
+                "CREATE SCHEMA ext; CREATE SCHEMA \"De st\"; \
+                 CREATE EXTENSION upd2447 SCHEMA ext VERSION '1.1'",
+            )
+            .await
+            .unwrap();
+            let before = providers(&mut conn).await.unwrap()["upd2447"].clone();
+            // What the move leaves, read from the engine as the rehearsal does.
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("ALTER EXTENSION upd2447 SET SCHEMA \"De st\"")
+                .await
+                .unwrap();
+            let after = providers(&mut conn).await.unwrap()["upd2447"].clone();
+            conn.execute("ROLLBACK").await.unwrap();
+            assert_eq!(after.definition, wanted("De st", "1.1"));
+            let pin = pbps_model::ExtensionChangePin {
+                uid: "e_000001".parse().unwrap(),
+                name: "upd2447".into(),
+                from: before.definition.clone(),
+                to: after.definition.clone(),
+                path: Vec::new(),
+                before: before.clone(),
+                after: after.clone(),
+            };
+            // The relocated names are the ones the engine gives the members.
+            let predicted: BTreeSet<ProviderMember> = before
+                .members
+                .iter()
+                .map(|m| m.relocated("ext", "De st"))
+                .collect();
+            assert_eq!(predicted, after.members, "{variable}");
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_change(&mut conn, "upd2447", &pin, &pin.from, true)
+                .await
+                .unwrap();
+            conn.execute("ALTER EXTENSION upd2447 SET SCHEMA \"De st\"")
+                .await
+                .unwrap();
+            confirm_changed(&mut conn, "upd2447", &pin, true)
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+
+            // Negatives: a member the result does not have, the package not where
+            // the plan left it, a member added after the plan, the move not taken.
+            let mut forged = pin.clone();
+            forged.after.members.insert(ProviderMember {
+                class: "function".into(),
+                names: vec!["De st".into(), "forged".into()],
+                args: Vec::new(),
+            });
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("ALTER EXTENSION upd2447 SET SCHEMA \"De st\"")
+                .await
+                .unwrap();
+            let error = confirm_changed(&mut conn, "upd2447", &forged, true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("forged"), "{variable}: {error}");
+            conn.execute("ROLLBACK").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            let error = confirm_changed(&mut conn, "upd2447", &pin, true)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().is_empty(), "{variable}: not moved");
+            conn.execute("ROLLBACK").await.unwrap();
+            let mut elsewhere = pin.clone();
+            elsewhere.from.schema = "other".into();
+            let error = vet_before_change(&mut conn, "upd2447", &elsewhere, &elsewhere.from, true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not the"), "{error}");
+            conn.execute(
+                "CREATE FUNCTION ext.later2447() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+                 ALTER EXTENSION upd2447 ADD FUNCTION ext.later2447()",
+            )
+            .await
+            .unwrap();
+            let error = vet_before_change(&mut conn, "upd2447", &pin, &pin.from, true)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("later2447"),
+                "{variable}: {error}"
+            );
+            // After an update in the same plan the move is held to its
+            // definition, not the manifest sealed before the update.
+            let mut chained = pin.clone();
+            chained.before.members.clear();
+            chained.from.version = "1.0".into();
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_change(&mut conn, "upd2447", &chained, &pin.from, true)
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+            // An update that a move follows ends in the schema it started in, and
+            // is held to that definition: the version it should leave, there.
+            let mut chain = pin.clone();
+            chain.from = wanted("ext", "1.0");
+            chain.to = wanted("De st", "1.1");
+            conn.execute("BEGIN").await.unwrap();
+            vet_before_change(&mut conn, "upd2447", &chained, &pin.from, true)
+                .await
+                .unwrap();
+            confirm_changed(&mut conn, "upd2447", &chain, false)
+                .await
+                .unwrap();
+            chain.to.version = "1.2".into();
+            let error = confirm_changed(&mut conn, "upd2447", &chain, false)
+                .await
+                .unwrap_err();
+            conn.execute("ROLLBACK").await.unwrap();
+            assert!(
+                error.to_string().contains("not at version `1.2`"),
+                "{variable}: {error}"
+            );
+            conn.execute("DROP EXTENSION upd2447").await.unwrap();
+
+            // The prediction holds for a package of types, casts, operators and
+            // aggregates, where the schema is inside a rendered name.
+            conn.execute("CREATE EXTENSION citext SCHEMA ext")
+                .await
+                .unwrap();
+            let cit = providers(&mut conn).await.unwrap()["citext"].clone();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("ALTER EXTENSION citext SET SCHEMA \"De st\"")
+                .await
+                .unwrap();
+            let moved = providers(&mut conn).await.unwrap()["citext"].clone();
+            conn.execute("ROLLBACK").await.unwrap();
+            let predicted: BTreeSet<ProviderMember> = cit
+                .members
+                .iter()
+                .map(|m| m.relocated("ext", "De st"))
+                .collect();
+            assert_eq!(predicted, moved.members, "{variable}");
+            conn.execute("DROP EXTENSION citext").await.unwrap();
+
+            // The destination's occupants, of every class a package comes in.
+            conn.execute(
+                "CREATE FUNCTION \"De st\".taken2447() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+                 CREATE TYPE \"De st\".kind2447 AS ENUM ('a'); CREATE TABLE \"De st\".t2447 (i int)",
+            )
+            .await
+            .unwrap();
+            let held = schema_occupants(&mut conn, "De st").await.unwrap();
+            assert!(has(&held, "function", &["De st", "taken2447"]), "{held:?}");
+            assert!(has(&held, "table", &["De st", "t2447"]), "{held:?}");
+            assert!(held.iter().any(|m| m.class == "type"), "{held:?}");
+            assert!(!has(&held, "function", &["ext", "later2447"]));
+            assert!(
+                schema_occupants(&mut conn, "nosuch")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            discard(admin, db, conn).await;
         }
     }
 }

@@ -3185,6 +3185,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
+            | Change::SetExtensionSchema { .. }
     ) {
         return false;
     }

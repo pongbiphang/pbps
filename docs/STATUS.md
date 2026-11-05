@@ -12,13 +12,13 @@ on the resolver scratch, gated as `extension-code`, sealed with the package's
 member manifest and vetted in the transaction that installs it. A recorded
 package is dropped by `pbps drop-extension` and a gated, sealed `DROP EXTENSION
 RESTRICT` (#2447 PR C, DEC-2447.8, DEC-2447.9; plan format 61), and updated by a
-rehearsed, sealed `ALTER EXTENSION ... UPDATE TO` (#2447 PR D-update, DEC-2447.10; plan format 63). Exact quoted versions, explicit schemas, `e_` identities, pull,
+rehearsed, sealed `ALTER EXTENSION ... UPDATE TO` (#2447 PR D-update, DEC-2447.10; plan format 63) and moved by a rehearsed, sealed `ALTER EXTENSION ... SET SCHEMA`, alone or after the update (#2447 PR D-relocation, DEC-2447.11; plan format 64). Exact quoted versions, explicit schemas, `e_` identities, pull,
 baseline, verify and no-op plans. Pull selects new packages only through
 repeatable `--extension NAME`; existing declarations/identities stay selected.
 Unselected installed packages remain inventory with an opt-in hint (DEC-2447.3).
 Connected bootstrap adopts exact preinstalled
 package prerequisites without lifecycle DDL (DEC-2447.2); SQL replay checks
-exact package metadata before DDL. SET SCHEMA refuses by action name. Installed extension members remain excluded; unheld packages remain census
+exact package metadata before DDL. Installed extension members remain excluded; unheld packages remain census
 advisories. Declarations that use a package's members and extension-provided
 type/operator-class support remain later #2447 slices.
 

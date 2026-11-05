@@ -4873,6 +4873,27 @@ pub(crate) fn emit_in(
         // The version is named, never the default, and a path the engine
         // cannot walk is its own error: no downgrade guess, no drop and
         // recreate (DEC-2447.10).
+        // Only the schema is named: the package keeps its version and every
+        // member keeps its object number (DEC-2447.11).
+        Change::SetExtensionSchema {
+            uid,
+            name,
+            from,
+            to,
+            ..
+        } => {
+            let mut statement = Statement::new(format!(
+                "ALTER EXTENSION {} SET SCHEMA {};",
+                quote(name.raw())?,
+                quote(&to.schema)?
+            ));
+            statement.extension = Some(pbps_dialect::ExtensionStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                phase: pbps_dialect::ExtensionPhase::SetSchema { from: from.clone() },
+            });
+            Ok(vec![statement])
+        }
         Change::UpdateExtension {
             uid,
             name,

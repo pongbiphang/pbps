@@ -745,6 +745,22 @@
     }
   },
   {
+    "name": "SetExtensionSchema",
+    "change": {
+      "op": "set_extension_schema",
+      "uid": "e_aaaaaa",
+      "name": "part",
+      "from": {
+        "schema": "ext",
+        "version": "1.1"
+      },
+      "to": {
+        "schema": "app",
+        "version": "1.1"
+      }
+    }
+  },
+  {
     "name": "CreateRole",
     "change": {
       "op": "create_role",

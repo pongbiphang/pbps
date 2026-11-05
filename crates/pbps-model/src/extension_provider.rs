@@ -64,6 +64,43 @@ impl fmt::Display for ProviderMember {
 }
 
 impl ProviderMember {
+    /// This member as the engine names it once its package lives in schema `to`
+    /// instead of `from`: a schema part, and a type or argument rendered with
+    /// the schema in front (`ext.citext`), follow the move (DEC-2447.11). A
+    /// part that merely starts with the same letters does not.
+    pub fn relocated(&self, from: &str, to: &str) -> ProviderMember {
+        // As the engine renders a name inside a qualified one: quoted unless it
+        // is plain lower case.
+        let quoted = |s: &str| {
+            let plain = s
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if plain {
+                s.to_owned()
+            } else {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            }
+        };
+        let (old, new) = (quoted(from), quoted(to));
+        let moves = |part: &String| -> String {
+            if part == from || *part == old {
+                to.to_owned()
+            } else if let Some(rest) = part.strip_prefix(&format!("{old}.")) {
+                format!("{new}.{rest}")
+            } else {
+                part.clone()
+            }
+        };
+        ProviderMember {
+            class: self.class.clone(),
+            names: self.names.iter().map(moves).collect(),
+            args: self.args.iter().map(moves).collect(),
+        }
+    }
+
     /// The module of `ids` this object is, where it is one a plan manages: a
     /// routine by its full signature, a view or materialized view by name, a
     /// trigger by its table and name, and a view's rule as the view it makes

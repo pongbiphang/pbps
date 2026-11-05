@@ -311,19 +311,32 @@ fn package_created(request: &Request<'_>) -> Option<crate::output::Finding> {
             .map(|n| format!("`{}`", n.shown()))
             .collect();
         if dropped.is_empty() {
-            // An update: the scratch holds the version the target does, not the
-            // one the plan leaves (DEC-2447.10).
+            // An update or a move: the scratch holds the version and schema the
+            // target does, not the ones the plan leaves (DEC-2447.10,
+            // DEC-2447.11).
+            let changed = |f: &pbps_model::Extension, to: &pbps_model::Extension| {
+                (f.version != to.version, f.schema != to.schema)
+            };
             let updated: Vec<_> = (want.iter())
                 .filter(|(n, to)| {
                     base.ids.extension_uid(n).is_some()
-                        && base
-                            .schema
-                            .extensions
-                            .get(*n)
-                            .is_some_and(|f| f.version != to.version)
+                        && base.schema.extensions.get(*n).is_some_and(|f| {
+                            let (version, schema) = changed(f, to);
+                            version || schema
+                        })
                 })
                 .map(|(n, _)| format!("`{}`", n.shown()))
                 .collect();
+            let verb = if (want.iter()).any(|(n, to)| {
+                base.schema
+                    .extensions
+                    .get(n)
+                    .is_some_and(|f| changed(f, to).0)
+            }) {
+                "updates"
+            } else {
+                "moves"
+            };
             if updated.is_empty() {
                 return None;
             }
@@ -331,12 +344,12 @@ fn package_created(request: &Request<'_>) -> Option<crate::output::Finding> {
                 request.selection,
                 request.assessment,
                 &format!(
-                    "this plan also updates extension {}, and the resolver cannot describe a \
-                     package whose scratch holds another version than the plan leaves",
+                    "this plan also {verb} extension {}, and the resolver cannot describe a \
+                     package whose scratch holds another version or schema than the plan leaves",
                     updated.join(", ")
                 ),
-                "Plan the update alone first and apply it. Then raise the version in the \
-                 scratch's externals file (DEC-2447.2) and plan the rest.",
+                "Plan the update or move alone first and apply it. Then raise the version, or \
+                 the schema, in the scratch's externals file (DEC-2447.2) and plan the rest.",
             ));
         }
         return Some(gated(

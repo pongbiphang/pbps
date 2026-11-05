@@ -1062,7 +1062,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } | Change::CreateExtension { .. } | Change::DropExtension { .. } | Change::UpdateExtension { .. } | Change::SetExtensionSchema { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -2034,6 +2034,12 @@ pub fn describe(c: &Change) -> String {
             name.shown(),
             Escaped(&from.version),
             Escaped(&to.version)
+        ),
+        Change::SetExtensionSchema { name, from, to, .. } => format!(
+            "~ move extension {} from schema {} to {} (its members move with it; what spells one with the old schema stops finding it)",
+            name.shown(),
+            Escaped(&from.schema),
+            Escaped(&to.schema)
         ),
         Change::CreateExtension {
             name, definition, ..
