@@ -133,10 +133,29 @@ pub async fn read_table(
     })
 }
 
-/// What `IDENT_CURRENT` and the column's `last_value` say. `last_value` is
-/// `NULL` until a value has been generated, and `IDENT_CURRENT` alone cannot
-/// tell a column reseeded to 50 that never generated one (next 50) from one that
-/// did (next 51): the pair moves exactly when a value was taken.
+/// What `IDENT_CURRENT`, the column's `last_value` and its increment say.
+/// `last_value` is `NULL` until a value has been generated, and `IDENT_CURRENT`
+/// alone cannot tell a column reseeded to 50 that never generated one (next 50)
+/// from one that did (next 51): the pair moves exactly when a value was taken.
+#[derive(PartialEq)]
+struct IdentityState {
+    current: Option<String>,
+    last: Option<String>,
+    increment: Option<String>,
+}
+
+impl IdentityState {
+    /// The value one allocation from this state takes: the current value of a
+    /// column that never generated one, else the last plus the increment.
+    fn one_step(&self) -> Option<i128> {
+        let number = |text: &Option<String>| text.as_deref().and_then(|t| t.parse::<i128>().ok());
+        match &self.last {
+            None => number(&self.current),
+            Some(_) => Some(number(&self.last)? + number(&self.increment)?),
+        }
+    }
+}
+
 async fn identity_state(
     conn: &mut impl ExecuteConnection,
     relation: &str,
@@ -161,40 +180,24 @@ async fn identity_state(
     })
 }
 
-#[derive(PartialEq)]
-struct IdentityState {
-    current: Option<String>,
-    last: Option<String>,
-    increment: Option<String>,
-}
-
-impl IdentityState {
-    /// The value one allocation from this state takes: the current value of a
-    /// column that never generated one, else the last plus the increment. This
-    /// only checks a probe; the answer is what the engine handed out.
-    fn one_step(&self) -> Option<i128> {
-        let number = |text: &Option<String>| text.as_deref().and_then(|t| t.parse::<i128>().ok());
-        match &self.last {
-            None => number(&self.current),
-            Some(_) => Some(number(&self.last)? + number(&self.increment)?),
-        }
-    }
-}
-
-/// Takes the next value of one identity column by really using it.
+/// Confirms, by really using a value, that one identity column hands out what
+/// its state says it will.
 ///
 /// A failed `INSERT` still consumes an identity value, so `INSERT … DEFAULT
 /// VALUES` takes one even on a table with a column that cannot be defaulted, and
 /// `IDENT_CURRENT` then is the value the engine handed out. The insert runs in a
 /// transaction that is rolled back: the identity value survives a rollback, and
-/// the row and anything a trigger wrote do not. The probe is only believed when
-/// the state moved; an `INSTEAD OF` trigger, a column that cannot take another
-/// value, or a failure before the value is generated leave it where it was.
-async fn identity_next(
+/// the row and anything a trigger wrote do not. The probe must have moved the
+/// state, and the value it took must be what one allocation takes from the state
+/// read just before it; a column that cannot take another value, a failure
+/// before one is generated, an `INSTEAD OF` trigger that swallows the insert, or
+/// a trigger that inserts into the same table (so the last value taken is not the
+/// first) each fail one of those and are refused, naming the table.
+async fn identity_confirm(
     conn: &mut impl ExecuteConnection,
     schema: &str,
     table: &str,
-) -> Result<String, DbError> {
+) -> Result<(), DbError> {
     let relation = qualified(schema, table)?;
     let before = identity_state(conn, &relation).await?;
     let probe = format!(
@@ -210,59 +213,37 @@ async fn identity_next(
     }
     let after = identity_state(conn, &relation).await?;
     let moved = (&after.current, &after.last) != (&before.current, &before.last);
-    let Some(current) = after.current.as_ref().filter(|_| moved) else {
+    let took = after
+        .current
+        .as_deref()
+        .and_then(|c| c.parse::<i128>().ok());
+    if !moved || took != before.one_step() {
         return Err(refused(format!(
             "the next value of the identity column of {schema}.{table} cannot be established: \
-             the probe insert did not take a value (an INSTEAD OF trigger, a column that cannot \
-             take another value, or a failure before one was generated)"
-        )));
-    };
-    // One allocation moves the state by one step. A trigger that inserts into the
-    // same table takes more, and the first value taken is then not the last.
-    if current.parse::<i128>().ok() != before.one_step() {
-        return Err(refused(format!(
-            "the next value of the identity column of {schema}.{table} cannot be established: \
-             the probe took more than one value (a trigger that inserts into the same table)"
+             the probe insert did not take exactly one value (a column that cannot take another \
+             value, a failure before one was generated, an INSTEAD OF trigger, or a trigger that \
+             inserts into the same table)"
         )));
     }
-    Ok(current.clone())
+    Ok(())
 }
 
 /// Every allocator in the database: each identity column and each sequence,
 /// the ledger's own tables aside (their allocator differs between a replay and
 /// a bootstrap by construction). Run after every table's rows are read: a probe
-/// consumes a value and may run a trigger, and the database is discarded.
+/// consumes a value, and the database is discarded.
 ///
-/// A trigger that writes to another table with an identity column advances that
-/// column too, once per probe. The probes run in a fixed order over the same
-/// schema on both sides, so equal allocators stay equal and unequal ones stay
-/// unequal; the value shown for such a column is the one its own probe took.
+/// An identity column's next value is read from its state before any probe,
+/// then confirmed by a probe on the state just before it. A probe can move other
+/// allocators (a trigger inserting into another table, a default taking a value
+/// of a sequence), and a trigger can make that depend on their state, so a probe
+/// is never what an allocator is reported from; it only has to agree with the
+/// state it started from. Sequences are read before any probe for the same
+/// reason, and identity columns last.
 pub async fn read_allocators(
     conn: &mut impl ExecuteConnection,
 ) -> Result<Vec<AllocatorRead>, DbError> {
     let mut found = Vec::new();
-    let identities = rows_of(
-        conn.query(&format!(
-            "SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name \
-             FROM sys.identity_columns c JOIN sys.tables t ON t.object_id = c.object_id \
-             JOIN sys.schemas s ON s.schema_id = t.schema_id \
-             WHERE t.is_ms_shipped = 0 AND NOT (s.name = {ledger} AND t.name IN ({state}, {lock})) \
-             ORDER BY s.name, t.name, c.name",
-            ledger = literal(LEDGER_SCHEMA),
-            state = literal(pbps_db::ledger::STATE_TABLE_NAME),
-            lock = literal(pbps_db::ledger::LOCK_TABLE_NAME),
-        ))
-        .await?,
-        &["schema_name", "table_name", "column_name"],
-    )?;
-    for [schema, table, column] in identities.iter().map(|r| [&r[0], &r[1], &r[2]]) {
-        let owner = format!("{schema}.{table}.{column}");
-        found.push(AllocatorRead {
-            name: format!("{owner} (identity)"),
-            used_by: Some(owner),
-            next: identity_next(conn, schema, table).await?,
-        });
-    }
     let sequences = rows_of(
         conn.query(
             "SELECT s.name AS schema_name, q.name AS sequence_name \
@@ -316,6 +297,42 @@ pub async fn read_allocators(
             name: format!("{schema}.{sequence}"),
             used_by,
             next: next.clone(),
+        });
+    }
+    // Identity columns last: a probe also evaluates the table's column defaults,
+    // which can take a value of a sequence that is already read.
+    let identities = rows_of(
+        conn.query(&format!(
+            "SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name \
+             FROM sys.identity_columns c JOIN sys.tables t ON t.object_id = c.object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             WHERE t.is_ms_shipped = 0 AND NOT (s.name = {ledger} AND t.name IN ({state}, {lock})) \
+             ORDER BY s.name, t.name, c.name",
+            ledger = literal(LEDGER_SCHEMA),
+            state = literal(pbps_db::ledger::STATE_TABLE_NAME),
+            lock = literal(pbps_db::ledger::LOCK_TABLE_NAME),
+        ))
+        .await?,
+        &["schema_name", "table_name", "column_name"],
+    )?;
+    let mut initial = Vec::new();
+    for [schema, table, column] in identities.iter().map(|r| [&r[0], &r[1], &r[2]]) {
+        let state = identity_state(conn, &qualified(schema, table)?).await?;
+        let Some(next) = state.one_step() else {
+            return Err(refused(format!(
+                "the next value of the identity column of {schema}.{table} cannot be \
+                 established: its state is unreadable"
+            )));
+        };
+        initial.push((schema, table, column, next));
+    }
+    for (schema, table, column, next) in initial {
+        identity_confirm(conn, schema, table).await?;
+        let owner = format!("{schema}.{table}.{column}");
+        found.push(AllocatorRead {
+            name: format!("{owner} (identity)"),
+            used_by: Some(owner),
+            next: next.to_string(),
         });
     }
     Ok(found)

@@ -1044,19 +1044,25 @@ that never generated a value hands out 50, one that had hands out 51) and
 `last_value` is `NULL` after `TRUNCATE`; a failed `INSERT` still consumes a value
 (NOT NULL and UNIQUE violations both). So the probe is `INSERT … DEFAULT VALUES`
 in `TRY/CATCH` inside `BEGIN TRANSACTION … ROLLBACK`; the identity survives the
-rollback, the row and a trigger's writes do not, and the pair (`IDENT_CURRENT`,
-`last_value`) must have moved or the allocator is unestablishable and named (an
-`INSTEAD OF` trigger, an exhausted column, a failure before a value is taken).
-The value taken must also be the one a single allocation takes from the state read
-just before (the current value of a column that never generated one, else the last
-plus the increment), or the allocator is unestablishable: a trigger that inserts
-into the same table takes more than one, and `IDENT_CURRENT` would be the last.
-A sequence is read with `NEXT VALUE FOR`, and compared under the one column whose
-default names it, else by its own name. A trigger that writes to another table
-with an identity column advances that column once per probe (identity values
-survive the rollback): probes run in a fixed order over the same schema on both
-sides, so equal allocators stay equal and unequal ones stay unequal, and the
-value shown for such a column is the one its own probe took. Every table is read
+rollback and the row and a trigger's writes do not, and the pair (`IDENT_CURRENT`,
+`last_value`) must have moved, and by exactly what one allocation takes from the
+state just before (the current value of a column that never generated one, else
+the last plus the increment), or the allocator is unestablishable and named: an
+exhausted column, a failure before a value is taken, an `INSTEAD OF` trigger that
+swallows the insert, a trigger that inserts into the same table.
+A probe can also move other allocators (a trigger inserting into another table,
+possibly only while that table is in some state; a default taking a value of a
+sequence), and identity values survive the rollback. So no allocator is reported
+from a probe: every identity column's next value is taken from its state before
+any probe, and the probe only has to agree with the state it started from
+(draft review rounds 1 and 2 of #2690 each found a way a probe could otherwise let
+two different allocator states compare equal). A column a trigger moved earlier
+is confirmed against its state just before its own probe, so the shifted value
+never reaches the report. Disabling the table's triggers during the probe was
+tried and rejected: the DDL discards the table's cached identity range and
+the next value jumps (measured: 1002 for a next value of 3). A sequence is read
+with `NEXT VALUE FOR`, before any identity probe, and compared under the one
+column whose default names it, else by its own name. Every table's rows are read
 before any probe.
 
 Both reads run on the apply login, the owner of the objects, not on the

@@ -155,7 +155,8 @@ fn repin1165_mssql_moves_the_pin_when_rows_and_allocators_match_even_through_a_t
         "two fresh scratches"
     );
     // The trigger's rows are compared too, and its own allocator, which the
-    // probe of `app.t` advanced the same way on both sides.
+    // probe of `app.t` advances (identity values survive the rollback) the same
+    // way on both sides; the value reported is from before any probe.
     let tables = v["data"]["repin"]["tables"].as_array().unwrap();
     assert!(tables.iter().all(|t| t["equal"] == true), "{v}");
     assert!(tables.iter().any(|t| t["table"] == "app.audit"), "{v}");

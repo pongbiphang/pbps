@@ -244,9 +244,8 @@ async fn allocators(conn: &mut Conn) -> anyhow::Result<()> {
     assert_eq!(next_of(&all, "snap.never.id (identity)"), "50");
     assert_eq!(next_of(&all, "snap.once.id (identity)"), "51");
     assert_eq!(next_of(&all, "snap.watched.id (identity)"), "1");
-    // `audit` is probed before `watched` (name order), so the trigger's write to
-    // it shows only in the next read. The order is fixed, so both sides of a
-    // re-pin shift the same way.
+    // The trigger on `watched` writes to `audit` during `watched`'s probe, after
+    // `audit`'s own; the value reported is from the state before any probe.
     assert_eq!(next_of(&all, "snap.audit.n (identity)"), "1");
     assert_eq!(next_of(&all, "snap.codes"), "5");
     // A sequence one column fills is compared under it; two columns share one.
@@ -274,42 +273,78 @@ async fn allocators(conn: &mut Conn) -> anyhow::Result<()> {
     assert_eq!(next_of(&again, "snap.audit.n (identity)"), "3");
     assert_eq!(next_of(&again, "snap.codes"), "8");
 
-    // A probe that takes no value is not guessed at.
-    run(
-        conn,
-        "CREATE TABLE snap.hidden (id int IDENTITY(1,1), x int NULL)",
-    )
-    .await?;
-    run(
-        conn,
-        "CREATE TRIGGER snap.swallow ON snap.hidden INSTEAD OF INSERT AS SET NOCOUNT ON",
-    )
-    .await?;
-    let text = refused_allocators(conn).await?;
-    assert!(
-        text.contains("snap.hidden") && text.contains("cannot be established"),
-        "{text}"
-    );
-    run(conn, "DROP TRIGGER snap.swallow; DROP TABLE snap.hidden").await?;
+    // A probe that takes no value, or not exactly one, is not guessed at: an
+    // INSTEAD OF trigger that swallows the insert, and one that inserts into its
+    // own table again (so the last value taken is not the first).
+    for (table, trigger, word) in [
+        (
+            "hidden",
+            "CREATE TRIGGER snap.swallow ON snap.hidden INSTEAD OF INSERT AS SET NOCOUNT ON",
+            "snap.swallow",
+        ),
+        (
+            "twice",
+            "CREATE TRIGGER snap.again ON snap.twice AFTER INSERT AS INSERT snap.twice(x) VALUES (0)",
+            "snap.again",
+        ),
+    ] {
+        run(
+            conn,
+            &format!("CREATE TABLE snap.{table} (id int IDENTITY(1,1), x int NULL)"),
+        )
+        .await?;
+        run(conn, trigger).await?;
+        let text = refused_allocators(conn).await?;
+        assert!(
+            text.contains(&format!("snap.{table}")) && text.contains("exactly one value"),
+            "{text}"
+        );
+        run(
+            conn,
+            &format!("DROP TRIGGER {word}; DROP TABLE snap.{table}"),
+        )
+        .await?;
+    }
 
-    // A trigger that inserts into its own table takes a second value after the
-    // probe's, so IDENT_CURRENT is not the first one taken: refused, not misread.
+    // A trigger that inserts into another table only while that table's identity
+    // is below 10 moves it during a probe of the first. Its next value is read
+    // from before any probe, so the move is not mistaken for its state.
     run(
         conn,
-        "CREATE TABLE snap.twice (id int IDENTITY(1,1), x int NULL)",
+        "CREATE TABLE snap.ca (id int IDENTITY(1,1), x int NULL); \
+         CREATE TABLE snap.cb (id int IDENTITY(1,1), x int NULL); \
+         INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES; \
+         INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES; \
+         INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES; INSERT snap.cb DEFAULT VALUES",
     )
     .await?;
     run(
         conn,
-        "CREATE TRIGGER snap.again ON snap.twice AFTER INSERT AS INSERT snap.twice(x) VALUES (0)",
+        "CREATE TRIGGER snap.reach ON snap.ca AFTER INSERT AS \
+         IF IDENT_CURRENT(N'snap.cb') < 10 INSERT snap.cb DEFAULT VALUES",
     )
     .await?;
-    let text = refused_allocators(conn).await?;
-    assert!(
-        text.contains("snap.twice") && text.contains("more than one value"),
-        "{text}"
-    );
-    run(conn, "DROP TRIGGER snap.again; DROP TABLE snap.twice").await?;
+    let triggered = read_allocators(conn).await?;
+    assert_eq!(next_of(&triggered, "snap.ca.id (identity)"), "1");
+    // `cb` is 9 rows in: its next is 10, and `ca`'s trigger took it first.
+    assert_eq!(next_of(&triggered, "snap.cb.id (identity)"), "10");
+    run(
+        conn,
+        "DROP TRIGGER snap.reach; DROP TABLE snap.ca; DROP TABLE snap.cb",
+    )
+    .await?;
+
+    // Sequences are read before identity columns: a probe evaluates the table's
+    // defaults and takes a value of a sequence its column names.
+    run(
+        conn,
+        "CREATE SEQUENCE snap.mixseq START WITH 1; \
+         CREATE TABLE snap.mix (id int IDENTITY(1,1), c int NOT NULL DEFAULT (NEXT VALUE FOR snap.mixseq))",
+    )
+    .await?;
+    assert_eq!(next_of(&read_allocators(conn).await?, "snap.mixseq"), "1");
+    assert_eq!(next_of(&read_allocators(conn).await?, "snap.mixseq"), "3");
+    run(conn, "DROP TABLE snap.mix; DROP SEQUENCE snap.mixseq").await?;
 
     // An exhausted identity column and an exhausted sequence name themselves.
     run(
