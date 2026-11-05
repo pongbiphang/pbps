@@ -209,6 +209,20 @@ It previously had only a manual-run note. Its assertions remain unchanged; the
 checker also rejects removal of that scheduling command.
 
 
+## Merge-group result ownership
+
+The [ci-before-merge ruleset](https://github.com/pongbiphang/pbps/rules/22340053)
+uses `HEADGREEN`. Required checks decide admission on the combined group head;
+entries below it can merge with that green head without each level's own run
+being green (DEC-2700.1). Current-head PR checks and review requirements still
+apply before queue admission; read the ruleset for configurable queue limits.
+
+For an ejection, record the failing group ref/SHA, its queue level and entry,
+whether that entry was ours, and whether the failed tree included our head.
+A later entry's tree can include our changes. Read that level's failing job and
+attribute its cause before applying [the ejection rules](../AGENTS.md#ci-and-the-merge-queue)
+to our PR.
+
 ## Shipped viewer browser acceptance
 
 `tests/ui-browser` is a separate, locked Playwright/Chromium suite, not an

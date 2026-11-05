@@ -212,6 +212,10 @@ Read before changing things:
 - The PR run omits `live`, `live-pg`, `resolver` and `release-windows`; the
   merge group runs them with every other job (DEC-1835.1). `master` runs
   nightly, not per merge (DEC-1836.1).
+- The [ci-before-merge ruleset](https://github.com/pongbiphang/pbps/rules/22340053)
+  uses `HEADGREEN`: required checks must pass on the combined merge-group head;
+  entries below it can merge with that head without green runs at every level
+  (DEC-2700.1). Read the ruleset for current queue limits.
 - Wait for `ci-gate` by reading the run, not `check-runs`, which lists only the
   jobs created so far.
 - Retry a transient failure with `gh run rerun <run-id>` (`--failed` for the
@@ -238,10 +242,13 @@ Read before changing things:
 - Enqueue with `gh pr merge --merge`. Never pass `--delete-branch`: deleting
   the head before the merge closes the PR and drops it from the queue.
 - A queued PR is not a merged one. Wait for the merge before cleanup.
-- If the queue ejects the PR, **read the failing job before re-queueing** and
-  say which case it was:
-  - A failure that reproduces, or a test failing on its merits, is a real
-    interaction. Rebase and fix it (below); do not re-queue.
+- If the queue ejects the PR, first identify the failing group ref/SHA and
+  queue level/entry, whether that entry was ours, and whether its tested tree
+  included our head (DEC-2700.1). **Read the failing job before re-queueing**;
+  attribute the failure before calling it our PR's interaction, then say which
+  case it was:
+  - Once attributed to our PR, a reproducing failure or a test failing on
+    its merits is a real interaction. Rebase and fix it (below); do not re-queue.
   - An infrastructure fault (the engine startup crashes `ci.yml` and
     docs/PITFALLS.md record) is transient. Re-queue.
   - A conflict is a rebase case.

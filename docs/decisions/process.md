@@ -1836,3 +1836,25 @@ second failure. Python interpreter identity joins the inputs digest. This
 amends DEC-2553.1/.2 only for explicit, evidenced failures; registered-flake
 limits, the exact union audit and DEC-2584.1's missing-only automatic
 continuation stay in force. See `docs/GATE-RERUN.md` for the evidence schema.
+
+
+<a id="dec-2700-1"></a>
+
+**DEC-2700.1. Attribute a HEADGREEN ejection to its merge-group level before
+judging our PR's interaction.** The
+[ci-before-merge ruleset](https://github.com/pongbiphang/pbps/rules/22340053)
+uses `HEADGREEN`, superseding the `ALLGREEN` choice recorded in DECISIONS 502
+following leon's 2026-10-31 change. Required checks must pass on the combined
+group head, which includes every entry in that group; lower entries can merge
+with it without a green run at every individual level. The live ruleset owns
+configurable queue capacity and timeout limits.
+
+An ejection therefore requires the failing group ref/SHA, queue level and the
+entry defining that cumulative tree, whether that entry was ours, and whether
+our head was included. Read the failing job and attribute its cause before
+classifying an interaction with our PR or deciding to rebase, fix or re-queue.
+A later entry can include our changes, so identifying another entry does not
+alone establish independence either. This changes failure attribution, not
+current-head PR admission, required checks, or the existing infrastructure and
+conflict dispositions. AGENTS.md and TEST-EXECUTION.md apply the same rule;
+the earlier decision remains historical provenance.
