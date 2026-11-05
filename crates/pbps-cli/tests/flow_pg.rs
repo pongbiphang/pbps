@@ -141,6 +141,8 @@ mod extensions2447_create;
 mod extensions2447_drop;
 #[path = "support/extensions2447_move.rs"]
 mod extensions2447_move;
+#[path = "support/extensions2447_types.rs"]
+mod extensions2447_types;
 #[path = "support/extensions2447_update.rs"]
 mod extensions2447_update;
 #[path = "support/index_gist2448.rs"]

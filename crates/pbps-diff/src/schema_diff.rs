@@ -873,6 +873,8 @@ pub(crate) fn diff_partial_rebuilding(
     let (mut label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
     let comparison = crate::retained::comparison(base, declared, hints, &mut label_changes);
+    let comparison =
+        crate::extensions::forward_moved_types(comparison, base, declared, &hints.extension_moves);
     let base = Side {
         schema: &comparison,
         ids: base.ids,
@@ -2639,6 +2641,19 @@ pub(crate) fn diff_partial_rebuilding(
         // it (#1174).
         if matches!(c, Change::DropComputedColumn { .. }) {
             return (2, 4);
+        }
+        // A package's own objects are what a column, a domain or a module of
+        // the plan may use (DEC-2447.12), and its create, update and move share
+        // the type class with them, so they go first inside it: nothing else
+        // there is ordered against them, and a tie would be decided by a random
+        // uid.
+        if matches!(
+            c,
+            Change::CreateExtension { .. }
+                | Change::UpdateExtension { .. }
+                | Change::SetExtensionSchema { .. }
+        ) {
+            return (order_key(c), 0);
         }
         if matches!(c, Change::AddComputedColumn { .. }) {
             return (COLUMN_ALTERATIONS, 3);
@@ -9633,6 +9648,90 @@ mod tests {
         }
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
+        }
+    }
+
+    /// `MinimalDialect` under PostgreSQL's name, for the shapes only that
+    /// dialect plans: a package's lifecycle (DEC-2447.12).
+    struct Postgres;
+
+    impl Dialect for Postgres {
+        fn name(&self) -> &'static str {
+            "postgres"
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// A package's create, update and move come before a table of the plan in
+    /// their shared class, whatever the identities the run happened to mint: a
+    /// column of a type the package provides needs it first, and a tie left to
+    /// a random uid would put the table ahead of it half the time
+    /// (DEC-2447.12).
+    #[test]
+    fn a_packages_create_comes_before_a_table_of_the_same_class_every_time() {
+        let mut declared = schema_of("app.mail", table(&[("who", Column::new(ty("ext.citext")))]));
+        declared.extensions.insert(
+            "citext".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        );
+        for _ in 0..40 {
+            let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+            let position = |wanted: fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            let package = position(|c| matches!(c, Change::CreateExtension { .. }));
+            let table = position(|c| matches!(c, Change::CreateTable { .. }));
+            assert!(package < table, "{:#?}", plan.changes);
         }
     }
 

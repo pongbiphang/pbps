@@ -110,6 +110,44 @@ pub(crate) fn select_extensions(
     Ok(notices)
 }
 
+/// Leaves out a table whose column is of a base type a package provides when
+/// that package is not one the pull manages (DEC-2447.12). Reading it would
+/// hand a declaration to `plan` that names a type nobody opted in, and `plan`
+/// refuses it by name; the pull says the same thing earlier and names the
+/// command that opts the package in. Run after [`select_extensions`], which is
+/// what decides the managed packages.
+pub(crate) fn leave_out_unmanaged_providers(pulled: &mut Pulled) {
+    let mut left: Vec<(pbps_model::TableName, String, String, String)> = Vec::new();
+    for (name, table) in &pulled.schema.tables {
+        for (column, spec) in &table.columns {
+            if let Some(reference) = spec.ty.type_ref()
+                && let Some(extension) = pulled.provided_types.get(reference)
+                && !pulled.schema.extensions.contains_key(extension)
+            {
+                left.push((
+                    name.clone(),
+                    column.shown().to_string(),
+                    reference.shown().to_string(),
+                    extension.raw().to_owned(),
+                ));
+                break;
+            }
+        }
+    }
+    for (name, column, ty, extension) in left {
+        pulled.schema.tables.remove(&name);
+        let argument = crate::report::shell_arg(&extension)
+            .unwrap_or_else(|| crate::report::placeholder("extension name"));
+        pulled.warnings.push(format!(
+            "table `{table}` was left out: column `{column}` is of the type `{ty}`, which the \
+             extension `{extension}` provides and this project does not manage. To manage it: \
+             pbps pull --extension {argument}",
+            table = name.shown(),
+            extension = pbps_model::escape::Escaped(&extension),
+        ));
+    }
+}
+
 /// Declares `partitions: external` (#1533) on the parents another tool
 /// creates partitions of, and leaves those partitions out of what is written.
 ///
@@ -796,6 +834,72 @@ impl Drop for Stage {
 
 #[cfg(test)]
 mod tests {
+    /// A table whose column is of a type a package provides is left out when
+    /// the package is not one the pull manages, with the command that opts it in;
+    /// one whose package is managed, and one with no such column, stay
+    /// (DEC-2447.12).
+    #[test]
+    fn a_table_of_an_unmanaged_packages_type_is_left_out_with_the_command() {
+        use pbps_model::{Column, ColumnType, Extension, Table, TableName, TypeRef};
+        let table_with = |ty: ColumnType| {
+            let mut table = Table::default();
+            table.columns.insert("c".into(), Column::new(ty));
+            table
+        };
+        let citext: TypeRef = "ext.citext".parse().unwrap();
+        let mut pulled = Pulled::default();
+        pulled.schema.tables.insert(
+            TableName::new("app", "uses"),
+            table_with(ColumnType::reference(citext.clone())),
+        );
+        pulled.schema.tables.insert(
+            TableName::new("app", "array"),
+            table_with(ColumnType::reference(citext.clone()).into_array()),
+        );
+        pulled.schema.tables.insert(
+            TableName::new("app", "plain"),
+            table_with("text".parse().unwrap()),
+        );
+        pulled
+            .provided_types
+            .insert(citext.clone(), "citext".into());
+        // The package is not managed: both tables of its type go.
+        leave_out_unmanaged_providers(&mut pulled);
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("app", "plain"))
+        );
+        assert_eq!(pulled.warnings.len(), 2, "{:?}", pulled.warnings);
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .all(|w| w.contains("pbps pull --extension citext")),
+            "{:?}",
+            pulled.warnings
+        );
+        // Negative: with the package managed nothing is left out.
+        let mut managed = Pulled::default();
+        managed.schema.tables.insert(
+            TableName::new("app", "uses"),
+            table_with(ColumnType::reference(citext.clone())),
+        );
+        managed.provided_types.insert(citext, "citext".into());
+        managed.schema.extensions.insert(
+            "citext".into(),
+            Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        );
+        leave_out_unmanaged_providers(&mut managed);
+        assert_eq!(managed.schema.tables.len(), 1);
+        assert!(managed.warnings.is_empty());
+    }
+
     use super::*;
     use pbps_model::{Column, Identity, Module, Permission, PrimaryKey, Table, TableName};
 

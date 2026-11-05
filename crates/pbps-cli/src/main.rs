@@ -2063,6 +2063,7 @@ fn cmd_pull(
     })?;
 
     let extension_notices = adopt::select_extensions(&mut pulled.schema, &extension_scope)?;
+    adopt::leave_out_unmanaged_providers(&mut pulled);
     for notice in &pulled.onboarding_notices {
         eprintln!("warning: {}", notice);
     }

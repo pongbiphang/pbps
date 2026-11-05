@@ -5192,3 +5192,74 @@ owner's helper without a `search_path`, and an expression with a node the proof
 has not audited (`bound_objects` refuses it) are refused at apply, before the
 statement, with the exact `ALTER FUNCTION` line or the three remedies. Existing
 expressions on tables the plan only writes rows to are the next slice.
+<a id="dec-2447-12"></a>
+
+**DEC-2447.12. A column of a type a package provides is pinned against its managed provider.**
+A base type is admitted as a column type, an array of one, or the base of a managed
+domain exactly when a package owns **the type row itself** (its own `pg_depend`
+`e` edge to `pg_extension`), and never by schema, name or the support functions
+alone: measured on 16.15 and 18.6, a superuser's base type built out of ordinary
+support functions has no such edge. Every support function that is neither built
+in nor a member of the same package refuses the type by name. The array type of a
+member needs no case (it is the column's `[]`; it is an `i` dependency of the base
+type on 16 and also a package member on 18, and both are projected out the same
+way), and a composite attribute, a partition key, a range subtype and a `data:`
+cell of a provided type keep their existing refusals.
+
+The read is the pin of every other type (`Kind::Provided`): the package, its
+installed version, the type's input and output functions and everything `ALTER
+TYPE ... SET` can change. It **leaves the schema out**: the schema is the package's,
+and a move changes it with the type's OID unchanged (measured: column, default,
+CHECK, view and function trees follow, a text-bodied function's text does not).
+The pin holds the support functions' OIDs, so an update that changes what the type
+can do (`hstore` 1.4 to 1.8 adds its subscript handler) moves it; a plan therefore
+does not update a package beside a use of its type, and says so.
+
+**The provider must be managed** (DEC-2447.3): a column of a type whose package
+the project does not declare is refused at plan by name, with `pbps pull
+--extension NAME` and `pbps baseline`; the pull leaves such a table out with the
+same command, and never adopts. A version that differs from the declared one is
+refused.
+
+**A package the plan itself brings.** Members are known only after the rehearsal
+(DEC-2447.7), so the order cannot use them: a type the target lacks, in the schema
+of exactly one declared package, is a placeholder pin (`kind: planned`, nothing to
+read or digest), the package's create, update and move go first in their class,
+and after the rehearsal the sealed manifest (the create's, or the change's
+`after`) must list that exact type as a member, else the plan is refused. A type
+of the same spelling from anywhere else does not stand in. Apply reads nothing for
+a placeholder.
+
+**A move carries its columns.** The differ forwards a recorded column of a moved
+member (the connected read's members, spelled as the destination names them, read
+back through `relocated`) to the new schema before comparing, so the column is
+not retyped. Only a typed column reference is forwarded: a default, CHECK, index
+key or module body that spells the old schema is a declared text change and is
+planned as one, and the declarations are not rewritten (DEC-2447.11). A pin of
+such a type names the schema it will have (`moved_to`), so the checks that read it
+again, before each statement and at the end, find the type under either name; the
+apply's read-back comparison carries a table the plan does not touch through the
+plan's moves only where the read-back shows the type moved.
+
+**Refused by name, each tested:** a retype to or from a provided type (`citext`
+to `text` is binary-coercible and runs no package code, `boolean` to `citext`
+calls a package function; which is safe is a separate decision); an update of a
+package beside a use of its type; two declared packages in the schema of a type
+the target lacks; a type of a package the plan neither creates nor changes after
+the rehearsal. Calls to a package's functions in a default or CHECK are admitted
+by the one admission predicate (DEC-2563.2): a member is owned by the installing
+superuser and is a `c` or `internal` routine, so no new root category was needed;
+a function a role wrote keeps its own rules. **Resolver limit, stated, not
+chased:** with a resolver selected, a stored constant of a provided type (a
+default `'Ab'::ext.citext`) is not coverable by the resolver capture ("unqualified
+datum output"), so such a default is the resolver's named refusal; a column
+without one is unaffected. A move of a `trusted` package needs the role that owns
+its members, which a confined scratch role is not, so it is refused by the
+rehearsal by name there and rehearsed on a superuser scratch.
+
+Formats: saved plan **67** (`TypePin.provider`, with `moved_to`, skip-empty; an
+older build would reject the field as malformed rather than as a newer plan; 65
+and 66 belong to other changes). State, ids and the published schema set do not
+move: a column of a provided type is an ordinary type reference (state 29), a
+provided type has no uid, and no published schema carries a type pin (checked by
+regenerating the set).

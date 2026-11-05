@@ -145,22 +145,46 @@ fn exact_installed_packages_round_trip_and_native_changes_are_named_drift() {
         let first = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
         succeeds(d.run(&["pull", "--force", "--db", connection]));
         assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), first);
-        // Read-only package support must not relax the provider-type gate.
+        // The two pulls below mint identities for the tables they read and remove
+        // them again; the files go back as they were, so that the checks after
+        // them compare what they always compared.
+        let ids_file = d.dir.join("schema.ids.json");
+        let ids_before = std::fs::read(&ids_file).unwrap();
+        // A table of a type a managed package provides is read as a reference to
+        // it (DEC-2447.12); a base type no package owns still is not.
         on_server(connection, "CREATE TABLE ext.user_provider(c ext.citext)");
-        let provider = succeeds(d.run(&["pull", "--force", "--db", connection]));
-        assert!(
-            stderr(&provider).contains("citext"),
-            "{}",
-            stderr(&provider)
+        succeeds(d.run(&["pull", "--force", "--db", connection]));
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        let provided = &loaded.schema.tables[&"ext.user_provider".parse().unwrap()];
+        assert_eq!(provided.columns["c"].ty.raw().to_string(), "ext.citext");
+        on_server(connection, "DROP TABLE ext.user_provider");
+        on_server(
+            connection,
+            "CREATE TYPE public.mytxt; \
+             CREATE FUNCTION public.mytxt_in(cstring) RETURNS public.mytxt \
+               LANGUAGE internal IMMUTABLE STRICT AS 'textin'; \
+             CREATE FUNCTION public.mytxt_out(public.mytxt) RETURNS cstring \
+               LANGUAGE internal IMMUTABLE STRICT AS 'textout'; \
+             CREATE TYPE public.mytxt (INPUT = public.mytxt_in, OUTPUT = public.mytxt_out, LIKE = text); \
+             CREATE TABLE ext.user_base(c public.mytxt)",
         );
+        // The type'"'"'s own I/O functions cannot be declared either, so this pull
+        // reports things left out and its exit says so; the table is among them.
+        let base = d.run(&["pull", "--force", "--db", connection]);
+        assert!(stderr(&base).contains("mytxt"), "{}", stderr(&base));
         assert!(
             !pbps_load::load_schema_dir(&d.dir.join("schema"))
                 .unwrap()
                 .schema
                 .tables
-                .contains_key(&"ext.user_provider".parse().unwrap())
+                .contains_key(&"ext.user_base".parse().unwrap())
         );
-        on_server(connection, "DROP TABLE ext.user_provider");
+        on_server(connection, "DROP TABLE ext.user_base");
+        on_server(connection, "DROP TYPE public.mytxt CASCADE");
+        std::fs::write(&ids_file, ids_before).unwrap();
+        for name in ["ext.user_provider.yml", "ext.user_base.yml"] {
+            let _ = std::fs::remove_file(d.dir.join("schema").join(name));
+        }
         on_server(connection, "ALTER EXTENSION citext UPDATE TO '1.6'");
         let out = d.run(&["verify", "--db", connection, "--format", "json"]);
         assert_ne!(code(&out), 0);

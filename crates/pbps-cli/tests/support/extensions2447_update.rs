@@ -654,14 +654,16 @@ fn a_real_packages_update_retires_and_adds_members_and_leaves_what_depends_on_it
             &format!("update2447-hstore-{slug}"),
             "hstore",
             "1.4",
-            &Options {
-                target_only: Some(
-                    "CREATE TABLE public.h2447 (h ext.hstore); \
-                     CREATE INDEX h2447_i ON public.h2447 USING gin (h ext.gin_hstore_ops); \
-                     CREATE VIEW public.h2447_v AS SELECT ext.akeys(h) FROM public.h2447",
-                ),
-                ..Default::default()
-            },
+            &Options::default(),
+        );
+        // Created after the project adopted the package, so that the table is
+        // not the project's: a managed table of this type would hold its GIN
+        // index as a limitation of the managed set (DEC-2447.12).
+        on_server(
+            f.target(),
+            "CREATE TABLE public.h2447 (h ext.hstore); \
+             CREATE INDEX h2447_i ON public.h2447 USING gin (h ext.gin_hstore_ops); \
+             CREATE VIEW public.h2447_v AS SELECT ext.akeys(h) FROM public.h2447",
         );
         declare(&f, "hstore", "ext", "1.8");
         let out = f.plan(&[]);

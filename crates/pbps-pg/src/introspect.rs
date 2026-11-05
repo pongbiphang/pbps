@@ -199,6 +199,9 @@ pub struct RawUserType {
     pub kind: String,
     pub defined: bool,
     pub relkind: Option<String>,
+    /// The package the type row is a direct member of, for a base type one
+    /// provides (DEC-2447.12).
+    pub extension: Option<String>,
     pub array: bool,
 }
 
@@ -206,7 +209,8 @@ impl RawUserType {
     fn held(&self) -> Option<ColumnType> {
         if !self.defined
             || !(matches!(self.kind.as_str(), "e" | "d")
-                || self.kind == "c" && self.relkind.as_deref() == Some("c"))
+                || self.kind == "c" && self.relkind.as_deref() == Some("c")
+                || self.kind == "b" && self.extension.is_some())
         {
             return None;
         }
@@ -770,6 +774,20 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     };
     pulled.schema.types = raw.types.clone();
     pulled.schema.extensions = raw.extensions.clone();
+    // The package behind each held base-type reference, so that the caller
+    // that selects the managed packages can leave a table out when its
+    // provider is not one of them.
+    for column in &raw.columns {
+        if let Some(info) = &column.user_type
+            && info.held().is_some()
+            && let Some(extension) = &info.extension
+            && let Ok(reference) = pbps_model::TypeRef::new(&info.schema, &info.name)
+        {
+            pulled
+                .provided_types
+                .insert(reference, extension.as_str().into());
+        }
+    }
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
     let policies_by_table = group(&raw.row_policies, |p| p.table_oid);
@@ -8549,6 +8567,50 @@ mod tests {
         );
     }
 
+    /// A base type a package owns is held as a reference and its package is
+    /// recorded for the caller that selects the managed packages; a base type no
+    /// package owns, an undefined one and the array of one are treated as the
+    /// rest of the kinds are (DEC-2447.12).
+    #[test]
+    fn a_base_type_a_package_owns_is_held_and_names_its_package() {
+        let provided = |extension: Option<&str>, defined: bool, array: bool| {
+            let mut raw = col(1, 1, "v", "ext.citext");
+            raw.user_type = Some(RawUserType {
+                schema: "ext".into(),
+                name: "citext".into(),
+                kind: "b".into(),
+                defined,
+                relkind: None,
+                extension: extension.map(str::to_owned),
+                array,
+            });
+            raw
+        };
+        let held = column_type(&provided(Some("citext"), true, false)).unwrap();
+        assert_eq!(held.raw().to_string(), "ext.citext");
+        let array = column_type(&provided(Some("citext"), true, true)).unwrap();
+        assert_eq!(array.raw().to_string(), "ext.citext[]");
+        // Negative: no package owns it, or it is not defined.
+        assert!(column_type(&provided(None, true, false)).is_err());
+        assert!(column_type(&provided(Some("citext"), false, false)).is_err());
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![provided(Some("citext"), true, false)],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(
+            pulled.provided_types.get(&"ext.citext".parse().unwrap()),
+            Some(&"citext".into())
+        );
+        let none = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![provided(None, true, false)],
+            ..RawCatalog::default()
+        });
+        assert!(none.provided_types.is_empty());
+    }
+
     #[test]
     fn reference_identity_comes_from_catalog_parts_and_only_admitted_kinds_are_held() {
         let mut raw = col(1, 1, "v", "Mood[]");
@@ -8558,12 +8620,14 @@ mod tests {
             kind: "e".into(),
             defined: true,
             relkind: None,
+            extension: None,
             array: true,
         });
         assert_eq!(
             column_type(&raw).unwrap().raw().to_string(),
             "\"App\".\"Mood\"[]"
         );
+        // A base type no package owns is refused; one a package owns is held.
         for kind in ["b", "r", "m", "p"] {
             raw.user_type.as_mut().unwrap().kind = kind.into();
             assert!(column_type(&raw).is_err(), "{kind}");

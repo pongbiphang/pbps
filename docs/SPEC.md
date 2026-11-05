@@ -1266,6 +1266,19 @@ from the version it leaves; that needs the target version to be relocatable, or
 the plan is refused with the two-plan remedy. The apply checks as an update does,
 the intermediate step by its definition and the end by the pinned manifest.
 
+**Using a package's types (DEC-2447.12).** A column, an array or a managed
+domain's base may name a base type a managed package owns (`ext.citext`,
+`ext.hstore`, `ext.ltree`): pull holds it when the package is selected and
+otherwise leaves the table out with `pbps pull --extension NAME`; `plan` refuses
+a type of a package the project does not manage by name. The type is pinned with
+its provider, version and support functions (plan format 67), so a replaced
+support function or an update that changes the type stops the apply. The
+package's create, update and move come first, the type of a package the same plan
+creates is proved by its sealed manifest after the rehearsal, and a move carries
+its columns without retyping them; a default, CHECK or module that spells the old
+schema is re-planned as a text change. A retype to or from such a type, and an
+update of a package beside a use of its type, are refused by name.
+
 **Dropping a package (DEC-2447.8, DEC-2447.9).** Removing a declaration is not a
 drop: `plan` names the package and the command, and a human runs `pbps
 drop-extension NAME --reason WHY` (batch: `pbps intent --drop-extension NAME

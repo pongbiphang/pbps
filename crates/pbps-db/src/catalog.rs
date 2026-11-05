@@ -46,6 +46,12 @@ pub struct Pulled {
     pub catalog_notices: Vec<String>,
     /// Extension census objects, classified against managed ids by the caller.
     pub extension_notices: std::collections::BTreeMap<pbps_model::ObjectLocalName, String>,
+    /// The package each referenced base type belongs to, for the column types
+    /// the pull holds as references to a type a package provides. The caller
+    /// that selects which packages are managed leaves out a table whose type's
+    /// package is not one of them (DEC-2447.12).
+    pub provided_types:
+        std::collections::BTreeMap<pbps_model::TypeRef, pbps_model::ObjectLocalName>,
     /// Permissions the model cannot hold and a drift check must not call
     /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
     /// permission outside the closed set, a grant on an object the model does

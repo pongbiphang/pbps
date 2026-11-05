@@ -123,6 +123,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
                 oid: 40000 + i as i64,
                 kind: kind.into(),
                 digest: "ab".repeat(32),
+                provider: None,
             })
             .collect();
         plan.pin_type_routines = true;

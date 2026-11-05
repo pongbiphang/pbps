@@ -2528,6 +2528,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         onboarding_notices,
         catalog_notices: Vec::new(),
         extension_notices: BTreeMap::new(),
+        provided_types: BTreeMap::new(),
         warnings,
         unexpressible,
         limitations,

@@ -339,6 +339,127 @@ pub fn moves(
     (changes, errors)
 }
 
+/// The comparison schema with every column of a type a moved package provides
+/// spelled in the schema the package moves to (DEC-2447.12).
+///
+/// A column keeps its type through `ALTER EXTENSION ... SET SCHEMA`: the type
+/// keeps its OID and only its name changes (measured on 16.15 and 18.6). The
+/// recorded schema still spells `ext.citext` and the declaration spells the new
+/// schema, so compared as written the column would be retyped. Both sides name
+/// one type, so the base is carried through the move, by the members the
+/// connected read listed for the package (as the destination names them),
+/// before the columns are compared. Only
+/// a typed column reference is forwarded: a default, a CHECK or an index key
+/// that spells the old schema is a declared text change and is planned as one.
+pub fn forward_moved_types<'a>(
+    comparison: std::borrow::Cow<'a, pbps_model::Schema>,
+    base: Side<'_>,
+    desired: Side<'_>,
+    facts: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        std::collections::BTreeSet<pbps_model::ProviderMember>,
+    >,
+) -> std::borrow::Cow<'a, pbps_model::Schema> {
+    use pbps_model::{ColumnType, TypeRef};
+    let mut moved: std::collections::BTreeMap<TypeRef, TypeRef> = std::collections::BTreeMap::new();
+    for (name, to) in &desired.schema.extensions {
+        let (Some(from), Some(members)) = (base.schema.extensions.get(name), facts.get(name))
+        else {
+            continue;
+        };
+        let same = matches!(
+            (base.ids.extension_uid(name), desired.ids.extension_uid(name)),
+            (Some(a), Some(b)) if a == b
+        );
+        if !same || from.schema == to.schema {
+            continue;
+        }
+        // The facts are the members as the destination names them. The engine
+        // names a type as one qualified name (`moved.citext`, or `"My B".citext`),
+        // and `relocated` read the other way is how it reads where the package
+        // is now. The array type of a member is the column's own `[]` and has
+        // no entry: a name with a suffix does not parse as one.
+        for member in members.iter().filter(|m| m.class == "type") {
+            if let [name] = member.names.as_slice()
+                && let Ok(new) = name.parse::<TypeRef>()
+                && new.schema() == to.schema
+                && let [previous] = member.relocated(&to.schema, &from.schema).names.as_slice()
+                && let Ok(old) = previous.parse::<TypeRef>()
+            {
+                moved.insert(old, new);
+            }
+        }
+    }
+    if moved.is_empty() {
+        return comparison;
+    }
+    let forward = |ty: &mut ColumnType| {
+        // An array is looked up by its element.
+        if let Some(reference) = ty.element().type_ref()
+            && let Some(new) = moved.get(reference)
+        {
+            let carried = ColumnType::reference(new.clone());
+            *ty = if ty.is_array() {
+                carried.into_array()
+            } else {
+                carried
+            };
+        }
+    };
+    let mut schema = comparison.into_owned();
+    for table in schema.tables.values_mut() {
+        table.columns.values_mut().for_each(|c| forward(&mut c.ty));
+    }
+    for ty in schema.types.values_mut() {
+        if let pbps_model::ManagedType::Domain { base, .. } = ty {
+            forward(base);
+        }
+    }
+    std::borrow::Cow::Owned(schema)
+}
+
+/// A table's column types carried through the moves of the plan, where the
+/// read-back shows them carried: a column that was a reference into a schema a
+/// package leaves and is now the same name in the one it goes to is the same
+/// column. Only a typed column reference is carried, an array by its element,
+/// and only what `now` shows moved, so a type that stayed behind in the schema
+/// stays as it is. Used by the apply's read-back comparison of a table the plan
+/// does not touch, where the plan's own move is the one explanation for a type
+/// changing schema (DEC-2447.12).
+pub fn forward_schema_moves(
+    table: &mut pbps_model::Table,
+    now: &pbps_model::Table,
+    moves: &[(&str, &str)],
+) {
+    use pbps_model::{ColumnType, TypeRef};
+    if moves.is_empty() {
+        return;
+    }
+    for (name, column) in &mut table.columns {
+        let Some(read) = now.columns.get(name) else {
+            continue;
+        };
+        let (was, is) = (column.ty.element(), read.ty.element());
+        let (Some(was), Some(is)) = (was.type_ref(), is.type_ref()) else {
+            continue;
+        };
+        let carried = was.name() == is.name()
+            && moves
+                .iter()
+                .any(|(from, to)| *from == was.schema() && *to == is.schema());
+        if carried && column.ty.is_array() == read.ty.is_array() {
+            let reference = ColumnType::reference(
+                TypeRef::new(is.schema(), is.name()).unwrap_or_else(|_| is.clone()),
+            );
+            column.ty = if read.ty.is_array() {
+                reference.into_array()
+            } else {
+                reference
+            };
+        }
+    }
+}
+
 /// How many packages of the plan each create waits behind, so that the differ's
 /// own order has a prerequisite ahead of what requires it. It is the effects
 /// graph that decides the order the plan keeps; this rank only keeps the
@@ -1425,6 +1546,144 @@ mod tests {
         );
         assert_eq!(rank[&uid("citext")], 1);
         assert_eq!(rank[&uid("cube")], 0);
+    }
+
+    /// The read-back of a table the plan does not touch is carried through the
+    /// plan's moves only where it shows the type moved: a scalar and an array
+    /// follow, a type that stayed in the schema does not, a name that differs
+    /// does not, and with no move nothing does (DEC-2447.12).
+    #[test]
+    fn a_read_back_column_is_carried_only_where_it_shows_the_type_moved() {
+        use pbps_model::{Column, ColumnType, Table, TypeRef};
+        let reference = |name: &str| ColumnType::reference(name.parse::<TypeRef>().unwrap());
+        let table = |columns: &[(&str, ColumnType)]| {
+            let mut table = Table::default();
+            for (name, ty) in columns {
+                table
+                    .columns
+                    .insert((*name).into(), Column::new(ty.clone()));
+            }
+            table
+        };
+        let before = table(&[
+            ("c", reference("ext.citext")),
+            ("ca", reference("ext.citext").into_array()),
+            ("h", reference("ext.hstore")),
+            ("renamed", reference("ext.citext")),
+            ("shape", reference("ext.citext")),
+            ("t", "text".parse().unwrap()),
+        ]);
+        let after = table(&[
+            ("c", reference("moved.citext")),
+            ("ca", reference("moved.citext").into_array()),
+            ("h", reference("ext.hstore")),
+            ("renamed", reference("moved.other")),
+            ("shape", reference("moved.citext").into_array()),
+            ("t", "text".parse().unwrap()),
+        ]);
+        let mut carried = before.clone();
+        forward_schema_moves(&mut carried, &after, &[("ext", "moved")]);
+        let ty = |t: &Table, c: &str| t.columns[c].ty.raw().to_string();
+        assert_eq!(ty(&carried, "c"), "moved.citext");
+        assert_eq!(ty(&carried, "ca"), "moved.citext[]");
+        // Negative: it stayed, another name, scalar became an array, not a reference.
+        assert_eq!(ty(&carried, "h"), "ext.hstore");
+        assert_eq!(ty(&carried, "renamed"), "ext.citext");
+        assert_eq!(ty(&carried, "shape"), "ext.citext");
+        assert_eq!(ty(&carried, "t"), "text");
+        // Negative: no move, or a move of other schemas, carries nothing.
+        let mut same = before.clone();
+        forward_schema_moves(&mut same, &after, &[]);
+        assert_eq!(same, before);
+        forward_schema_moves(&mut same, &after, &[("a", "b")]);
+        assert_eq!(same, before);
+    }
+
+    /// A moved package's columns are carried to its new schema before they are
+    /// compared, so that the move does not retype them (DEC-2447.12): a scalar
+    /// and an array of a member type follow it, a type that is not a member and
+    /// a type in another schema do not, and a package that does not move, has no
+    /// facts or is another identity forwards nothing.
+    #[test]
+    fn a_moved_packages_columns_are_carried_and_nothing_else_is() {
+        use pbps_model::{Column, ColumnType, Table, TypeRef};
+        let at = |schema: &str| Extension {
+            schema: schema.into(),
+            version: "1.6".into(),
+        };
+        let column = |ty: ColumnType| Column::new(ty);
+        let reference = |name: &str| ColumnType::reference(name.parse::<TypeRef>().unwrap());
+        let mut table = Table::default();
+        for (name, ty) in [
+            ("c", reference("ext.citext")),
+            ("ca", reference("ext.citext").into_array()),
+            ("other", reference("ext.other")),
+            ("elsewhere", reference("app.citext")),
+            ("t", "text".parse().unwrap()),
+        ] {
+            table.columns.insert(name.into(), column(ty));
+        }
+        let name = pbps_model::TableName::new("app", "wants");
+        let base = Schema {
+            extensions: [("citext".into(), at("ext"))].into(),
+            tables: [(name.clone(), table)].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            extensions: [("citext".into(), at("moved"))].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [(uid("citext"), "citext".into())].into(),
+            ..Default::default()
+        };
+        let member = |name: &str| pbps_model::ProviderMember {
+            class: "type".into(),
+            names: vec![name.to_owned()],
+            args: Vec::new(),
+        };
+        let facts: std::collections::BTreeMap<_, _> = [(
+            "citext".into(),
+            [member("moved.citext"), member("moved.citext[]")].into(),
+        )]
+        .into();
+        let run = |base: &Schema, desired: &Schema, ids_desired: &IdsFile, facts: &_| {
+            forward_moved_types(
+                std::borrow::Cow::Borrowed(base),
+                Side {
+                    schema: base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: desired,
+                    ids: ids_desired,
+                },
+                facts,
+            )
+            .into_owned()
+        };
+        let carried = run(&base, &desired, &ids, &facts);
+        let ty = |schema: &Schema, column: &str| {
+            schema.tables[&name].columns[column].ty.raw().to_string()
+        };
+        assert_eq!(ty(&carried, "c"), "moved.citext");
+        assert_eq!(ty(&carried, "ca"), "moved.citext[]");
+        // Negative: not a member, another schema, not a reference.
+        assert_eq!(ty(&carried, "other"), "ext.other");
+        assert_eq!(ty(&carried, "elsewhere"), "app.citext");
+        assert_eq!(ty(&carried, "t"), "text");
+        // Negative: the package does not move, has no facts, or is another one.
+        let stays = Schema {
+            extensions: [("citext".into(), at("ext"))].into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&base, &stays, &ids, &facts), base);
+        assert_eq!(run(&base, &desired, &ids, &Default::default()), base);
+        let other = IdsFile {
+            extensions: [(uid("hstore"), "citext".into())].into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&base, &desired, &other, &facts), base);
     }
 
     /// A schema change under one recorded identity is a move that starts from the

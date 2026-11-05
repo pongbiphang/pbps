@@ -782,6 +782,14 @@ fn columns_query() -> String {
             ut.oid::int8 AS user_type_oid, un.nspname AS user_type_schema,
             ut.typname AS user_type_name, ut.typtype::text AS user_type_kind,
             ut.typisdefined AS user_type_defined, ur.relkind::text AS user_type_relkind,
+            (SELECT x.extname::text
+               FROM pg_catalog.pg_depend ud
+               JOIN pg_catalog.pg_extension x ON x.oid = ud.refobjid
+              WHERE ud.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                AND ud.objid = ut.oid
+                AND ud.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                AND ud.deptype = 'e'
+              LIMIT 1) AS user_type_extension,
             (el.oid IS NOT NULL) AS type_array,
             NOT a.attnotnull AS nullable,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr,
@@ -1718,6 +1726,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                     kind: text(row, "user_type_kind")?,
                     defined: flag(row, "user_type_defined")?,
                     relkind: optional_text(row, "user_type_relkind")?,
+                    extension: optional_text(row, "user_type_extension")?,
                     array: flag(row, "type_array")?,
                 })
             } else {
