@@ -1358,3 +1358,32 @@ exactly one table, as after a rename; the writer asks rather than guesses.
 record is always found beside the table it produced. (4) Records the caller
 gave no order for follow the ordered ones in uid order, and `next_order`
 carries the design's rule for new, retired and reordered columns.
+
+<a id="dec-2600-6"></a>
+
+**DEC-2600.6. The identity-tree validator reports every finding under a stable `ids.*` code.**
+`pbps-model::ids_check` takes the tree's text and the declarations it mirrors
+and returns all findings, sorted by path and code, not the first: a merge
+usually leaves several at once. It adds no second reader. Per-file refusals of
+`ids_tree::parse` map onto codes (`ids.conflict-markers`, `ids.malformed`,
+`ids.sentinel-missing`, `ids.format`, `ids.live-column-in-dropped`, and
+`ids.duplicate-uid` for a uid listed twice in one file); the checks that need
+two files or a declaration are new (`ids.duplicate-uid` across files,
+`ids.yaml-without-ids`, `ids.orphan`, `ids.name-mismatch`,
+`ids.dropped-but-declared`, `ids.path-collision`, `ids.case-collision`,
+`ids.not-canonical`, `ids.legacy-layout`, `ids.legacy-beside-tree`). The
+unchanged `IdsFile::validate` runs on the assembled mapping only when every
+file parsed and no uid repeats, since assembly would stop at the first fault
+otherwise; its `DuplicateName` becomes `ids.duplicate-name` naming both files,
+and any other refusal becomes `ids.invalid-mapping` (a code the design did not
+list, so a refusal never reads as clean). A declaration whose file moved is
+reported once, as the old file's `ids.orphan`, when exactly one unpaired live
+file of its kind carries its name or `renamed_from` (design 3.4 step 2);
+with several candidates it stays `ids.yaml-without-ids`. An orphan is reported
+by `validate` as well as `plan --check` (design question 6, recommendation
+taken). `ids.not-regular` needs the file system and belongs to the caller. A
+code's text never changes. The sync half (`plan` writing and relocating files)
+follows in a later change and is not decided here.
+
+Pinned by one positive and one negative test per code and by a test that
+splits generated models and checks them without a finding.

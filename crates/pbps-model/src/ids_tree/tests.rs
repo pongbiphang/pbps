@@ -19,7 +19,7 @@ fn tomb(was: &str) -> Tombstone {
 /// the middle, a partitioned table with a live and a retired child, a move,
 /// a conversion, a dropped table, a rebuild across files, and one live and
 /// one dropped object of each global kind.
-fn sample() -> (IdsFile, Placement) {
+pub(crate) fn sample() -> (IdsFile, Placement) {
     let mut f = IdsFile::default();
     let t = |s: &str| -> TableName { s.parse().unwrap() };
     let c = |s: &str| -> ColumnRef { s.parse().unwrap() };
@@ -132,7 +132,7 @@ fn sample() -> (IdsFile, Placement) {
     (f, p)
 }
 
-fn tree() -> BTreeMap<String, String> {
+pub(crate) fn tree() -> BTreeMap<String, String> {
     let (ids, p) = sample();
     split(&ids, &p).unwrap()
 }
