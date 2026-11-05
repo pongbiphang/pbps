@@ -62,6 +62,7 @@ pub mod extension_provider;
 pub mod finding;
 pub mod fingerprint;
 pub mod ids;
+pub mod ids_tree;
 pub mod intent;
 pub mod managed_type;
 pub mod module;

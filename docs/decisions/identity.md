@@ -1338,3 +1338,23 @@ version changes. Valid bounds and idempotent repeated intent are unchanged.
 Pinned by JSON intent refusal (the revert witness), historical identity
 loading with damaged-record controls, and an offline CLI regression for
 unchanged identity bytes on refusal, verbatim recording and repeated intent.
+
+<a id="dec-2600-1"></a>
+
+**DEC-2600.1. The identity tree layers on `IdsFile`; the code settles four points the design left open.**
+`pbps-model::ids_tree` converts between the unchanged `IdsFile` and one file
+per declaration file (design-2600). `format` is the layout version of a file;
+`IdsFile.version` stays the meaning of the mapping, so no plan or state
+format moves. The loader checks structure, not spacing: blank lines carry no
+meaning and a merge may leave one more or fewer, so only the canonical-bytes
+check will flag them. Where the design was silent: (1) a retired partition
+child is a tombstone record in its parent's `partitions` section, because it
+no longer has a file of its own; a dropped file refuses live partitions and
+columns but may hold such tombstones, as dropping a parent retires its
+children. (2) A column tombstone is placed by its `was` table name, and the
+caller names the owner (`Placement::owners`) when that name no longer finds
+exactly one table, as after a rename; the writer asks rather than guesses.
+(3) A file that holds `rebuilds` must be the replacement root's, so the
+record is always found beside the table it produced. (4) Records the caller
+gave no order for follow the ordered ones in uid order, and `next_order`
+carries the design's rule for new, retired and reordered columns.
