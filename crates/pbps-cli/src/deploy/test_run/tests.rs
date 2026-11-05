@@ -1314,6 +1314,7 @@ fn d2a1165_composed_service_futures_stay_below_256_kib() {
                 declarations(&input),
                 crate::dialect(&project).unwrap(),
                 "measure",
+                super::super::CatalogWarnings::Human,
             );
             let bootstrap_size = std::mem::size_of_val(&boot);
             drop(boot);

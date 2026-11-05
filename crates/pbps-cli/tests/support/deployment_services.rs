@@ -91,8 +91,8 @@ pub fn offline(pg: bool) {
     assert!(!applied.exists() && !attempt.exists());
 }
 
-// Exact baseline warnings: three capture reads during bootstrap, one during
-// planning and five during this transactional apply. Keep duplicate lines:
+// Exact human warnings: three capture reads during bootstrap and five during
+// this transactional apply. Keep duplicate lines:
 // dropping a capture must not silently make the extraction look equivalent.
 fn catalog_warnings(out: &Output, pg: bool, reads: usize) {
     let warning = concat!(
@@ -190,7 +190,17 @@ pub fn connected(server: &str, pg: bool) {
     assert_eq!(report["command"], "plan");
     assert_eq!(report["result"], "ok");
     assert_eq!(report["data"]["changes"], 1);
-    catalog_warnings(&planned, pg, 1);
+    assert_eq!(stderr(&planned), "");
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "catalog.warning")
+            .count(),
+        if pg { 2 } else { 0 },
+        "{report}"
+    );
     let raw = std::fs::read(&plan_path).unwrap();
     let plan: pbps_model::SavedPlan = serde_json::from_slice(&raw).unwrap();
     assert_eq!(
