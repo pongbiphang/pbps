@@ -68,6 +68,33 @@ pub fn analyse_with_catalog(
         None,
         false,
         &[],
+        &Default::default(),
+    )
+}
+
+/// Ordinary effects whose dialect hook also reads what a connected capture
+/// bound at creation, in place of its lexical guess (DEC-2143.8). An empty
+/// [`Captured`] is [`analyse_with_catalog`] exactly.
+pub fn analyse_captured(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    captured: &pbps_model::operation::Captured,
+) -> Shadowed {
+    analyse_scoped(
+        operations,
+        owners,
+        before,
+        after,
+        dialect,
+        catalog,
+        None,
+        false,
+        &[],
+        captured,
     )
 }
 
@@ -94,6 +121,7 @@ pub fn analyse_with_membership(
         stored,
         true,
         &[],
+        &Default::default(),
     )
 }
 
@@ -122,6 +150,7 @@ pub(super) fn analyse_planning<S>(
         stored,
         !plan.boundaries.is_empty(),
         annotations,
+        plan.captured(),
     )
 }
 
@@ -136,6 +165,7 @@ pub(super) fn analyse_scoped(
     stored: Option<&pbps_model::operation::MembershipCatalog>,
     membership: bool,
     annotations: &[super::Constraint],
+    captured: &pbps_model::operation::Captured,
 ) -> Shadowed {
     use pbps_model::operation::{End, Lineage, MembershipCatalog};
     let lineage = Lineage::of(before, after);
@@ -230,7 +260,7 @@ pub(super) fn analyse_scoped(
                 fx
             });
             let engine = dialect
-                .engine_effects(op, owners, before, after, catalog)
+                .engine_effects(op, owners, before, after, catalog, captured)
                 .and_then(|e| {
                     if !membership {
                         return Ok(e);
@@ -340,6 +370,7 @@ pub enum Stage {
 /// plan, whose last pass is still to come) and the order a connected plan
 /// finally runs (`Stage::Final`, where nothing is exempt).
 #[cfg(any(test, debug_assertions))]
+#[allow(clippy::too_many_arguments)]
 pub fn observe_scheduled(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
@@ -348,6 +379,7 @@ pub fn observe_scheduled(
     changes: &pbps_model::ChangeSet,
     stage: Stage,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
+    captured: &pbps_model::operation::Captured,
 ) {
     use pbps_model::operation::ModuleEdits;
     let modes = if dialect.rebuilds_modules() {
@@ -356,7 +388,7 @@ pub fn observe_scheduled(
         ModuleEdits::InPlace
     };
     let operations = Operations::of_plan(&changes.changes, modes);
-    observe(
+    observe_captured(
         base,
         desired,
         dialect,
@@ -365,6 +397,7 @@ pub fn observe_scheduled(
         &operations,
         stage,
         facts,
+        captured,
     );
 }
 
@@ -381,6 +414,35 @@ pub(crate) fn observe(
     operations: &Operations,
     stage: Stage,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
+) {
+    observe_captured(
+        base,
+        desired,
+        dialect,
+        declared,
+        logical,
+        operations,
+        stage,
+        facts,
+        &Default::default(),
+    );
+}
+
+/// [`observe`] on the effects the plan was ordered by: a plan ordered from a
+/// capture is judged by the same capture, not by the lexical guess it replaced
+/// (DEC-2143.8).
+#[cfg(any(test, debug_assertions))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_captured(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    declared: &ModuleDeps,
+    logical: &pbps_model::ChangeSet,
+    operations: &Operations,
+    stage: Stage,
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
+    captured: &pbps_model::operation::Captured,
 ) {
     use pbps_model::operation::PlanOwners;
     use pbps_model::plan_names::PlanNames;
@@ -404,7 +466,15 @@ pub(crate) fn observe(
         },
     );
     let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse_with_catalog(&operations, &owners, before, after, dialect, facts);
+    let shadowed = analyse_captured(
+        &operations,
+        &owners,
+        before,
+        after,
+        dialect,
+        facts,
+        captured,
+    );
     let report = shadowed.report(&operations, &baseline, declared);
     let mut lines: Vec<String> = report
         .unowned

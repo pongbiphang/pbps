@@ -8825,6 +8825,15 @@ async fn plan_db_selected(
             } else {
                 None
             };
+            // The plan carries what the resolver's run bound at creation, so
+            // every pass that orders it again reads the same bindings. Only the
+            // observer below judges the finished `ChangeSet`, which does not
+            // (DEC-2143.8).
+            #[cfg(debug_assertions)]
+            let captured = resolution
+                .as_ref()
+                .map(|(_, unsealed, _)| unsealed.captured().clone())
+                .unwrap_or_default();
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
@@ -8972,6 +8981,7 @@ async fn plan_db_selected(
                         .or_else(|| name_facts.as_ref().map(crate::engine::NameFacts::slots))
                         .unwrap_or_default(),
                 ),
+                &captured,
             ); }
             // The observer's own gate: a release test build has `cfg(test)`
             // but no observer, so the facts are spent here too (#2089).

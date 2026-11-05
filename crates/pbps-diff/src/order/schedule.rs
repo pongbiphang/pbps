@@ -376,6 +376,7 @@ impl Schedule {
         changes.allocator = plan.allocator;
         changes.boundaries = plan.boundaries;
         changes.annotations = plan.annotations;
+        changes.captured = plan.captured;
         #[cfg(any(test, debug_assertions))]
         if changes.annotations.is_some() {
             debug_assert!(

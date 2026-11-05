@@ -122,7 +122,29 @@ pub fn plan<D: Dialect + ?Sized>(
     resolution: &[SurfaceResolution],
     dialect: &D,
 ) -> Result<Ordered<crate::order::Canonical<D>>, Error> {
-    plan_operations(base, desired, hints, resolution, dialect).map(|planned| planned.ordered)
+    plan_captured(
+        base,
+        desired,
+        hints,
+        resolution,
+        dialect,
+        &Default::default(),
+    )
+}
+
+/// [`plan`] ordered by the bindings the run captured (DEC-2143.8): a caller
+/// the capture covers brings its own schema-bound callees, and the lexical
+/// guess is kept for the rest.
+pub fn plan_captured<D: Dialect + ?Sized>(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    hints: &pbps_model::Hints,
+    resolution: &[SurfaceResolution],
+    dialect: &D,
+    captured: &pbps_model::operation::Captured,
+) -> Result<Ordered<crate::order::Canonical<D>>, Error> {
+    plan_operations_captured(base, desired, hints, resolution, dialect, captured)
+        .map(|planned| planned.ordered)
 }
 
 /// [`plan`], with the operations its steps are (#1961) and the logical plan
@@ -146,6 +168,25 @@ pub fn plan_operations<D: Dialect + ?Sized>(
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
     dialect: &D,
+) -> Result<Planned<D>, Error> {
+    plan_operations_captured(
+        base,
+        desired,
+        hints,
+        resolution,
+        dialect,
+        &Default::default(),
+    )
+}
+
+/// [`plan_operations`] ordered by a capture; see [`plan_captured`].
+pub fn plan_operations_captured<D: Dialect + ?Sized>(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    hints: &pbps_model::Hints,
+    resolution: &[SurfaceResolution],
+    dialect: &D,
+    captured: &pbps_model::operation::Captured,
 ) -> Result<Planned<D>, Error> {
     let (logical, prepared) = prepare(base, desired, hints, resolution, dialect)?;
     let module_edits = if dialect.rebuilds_modules() {
@@ -178,6 +219,7 @@ pub fn plan_operations<D: Dialect + ?Sized>(
         base,
         desired,
         dialect,
+        captured,
     );
     let (ordered, sequence) = settle(prepared.changes, &schedule)?;
     let (ordered, operations) = crate::order::resolver_finish::finish(
@@ -189,8 +231,14 @@ pub fn plan_operations<D: Dialect + ?Sized>(
         dialect,
         module_edits,
     )?;
+    // The plan carries what ordered it, so every pass that reads its effects
+    // again (the rewrites, the dependents schedule) reads the same bindings.
+    let ordered = Ordered {
+        changes: ordered.changes.with_captured(captured),
+        ..ordered
+    };
     #[cfg(any(test, debug_assertions))]
-    crate::order::shadow::observe(
+    crate::order::shadow::observe_captured(
         base,
         desired,
         dialect,
@@ -199,6 +247,7 @@ pub fn plan_operations<D: Dialect + ?Sized>(
         &operations,
         crate::order::shadow::Stage::Differ,
         None,
+        captured,
     );
     Ok(Planned {
         ordered,
@@ -223,6 +272,7 @@ fn scheduled(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     dialect: &(impl Dialect + ?Sized),
+    captured: &pbps_model::operation::Captured,
 ) -> Schedule {
     let (before, after) = (
         Snapshot {
@@ -236,7 +286,7 @@ fn scheduled(
     );
     let baseline = Baseline::of(before, owners);
     let shadowed =
-        crate::order::analyse_with_catalog(operations, owners, before, after, dialect, None);
+        crate::order::analyse_captured(operations, owners, before, after, dialect, None, captured);
     let effect_graph = graph(
         operations.as_slice(),
         &shadowed.effects,
@@ -325,6 +375,7 @@ fn order_logical(
         base,
         desired,
         dialect,
+        &Default::default(),
     );
     settle(changes, &schedule).map(|(ordered, _)| ordered)
 }

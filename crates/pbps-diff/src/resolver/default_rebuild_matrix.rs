@@ -679,6 +679,7 @@ mod default_rebuild_matrix {
             before,
             after,
             &dialect,
+            &Default::default(),
         );
         let planned =
             crate::resolver::plan_operations(before, after, &hints, &resolution, &dialect)

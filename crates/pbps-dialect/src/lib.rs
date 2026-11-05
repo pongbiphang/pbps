@@ -3484,6 +3484,7 @@ pub trait Dialect {
         _before: pbps_model::operation::Snapshot<'_>,
         _after: pbps_model::operation::Snapshot<'_>,
         _catalog: Option<&slots::CatalogFacts>,
+        _captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         Ok(pbps_model::operation::Effects::default())
     }

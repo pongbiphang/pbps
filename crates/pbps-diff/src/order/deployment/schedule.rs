@@ -491,7 +491,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }
             }
-            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+            keep_handover_dependents(&cs, declared, dialect, cs.captured(), &mut handovers)?;
         }
         moved += after_the_rebuilds(
             &mut cs,
@@ -549,7 +549,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                     .map_err(Refusal::module_passes)?,
             )
             .map_err(Refusal)?;
-            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
+            keep_handover_dependents(&cs, declared, dialect, cs.captured(), &mut handovers)?;
             cs = handovers
                 .settle(cs.clone())
                 .map_err(|why| Refusal(why.describe(&cs)))?
@@ -642,6 +642,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         &cs,
         crate::order::shadow::Stage::Differ,
         None,
+        cs.captured(),
     );
     crate::order::boundaries::replay(
         &mut cs,
@@ -721,6 +722,7 @@ fn keep_handover_dependents(
     cs: &ChangeSet,
     declared: &Declarations<'_>,
     dialect: &dyn Dialect,
+    captured: &pbps_model::operation::Captured,
     handovers: &mut crate::order::Schedule,
 ) -> Result<(), Refusal> {
     use crate::order::{Schedule, edges, shadow};
@@ -757,7 +759,8 @@ fn keep_handover_dependents(
         schema: declared.schema,
         ids: declared.sources.after,
     };
-    let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
+    let effects =
+        shadow::analyse_captured(&operations, &owners, before, after, dialect, None, captured);
     if let Some((_, error)) = effects.unowned.first() {
         return Err(Refusal(error.to_string()));
     }

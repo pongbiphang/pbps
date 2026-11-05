@@ -91,6 +91,7 @@ pub(super) fn state<S, T>(plan: PlanningPlan<S>) -> PlanningPlan<T> {
     done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
     done.annotations = plan.annotations;
+    done.captured = plan.captured;
     done
 }
 
@@ -145,6 +146,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     done.allocator = plan.allocator;
     done.boundaries = plan.boundaries;
     done.annotations = plan.annotations;
+    done.captured = plan.captured;
     Ok(done)
 }
 impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
@@ -172,6 +174,11 @@ pub struct PlanningPlan<S = Draft> {
     pub(super) allocator: pbps_model::operation::IdAllocator,
     pub(super) boundaries: super::boundaries::Obligations,
     pub(super) annotations: Option<std::sync::Arc<super::annotations::Contract>>,
+    /// The bindings a connected capture read, which order this plan wherever
+    /// its effects are read again (DEC-2143.8). Carried like `annotations`:
+    /// a pass that rebuilds the plan copies it, so no later pass has to be
+    /// handed it separately and none can read the lexical guess it replaced.
+    pub(super) captured: Option<std::sync::Arc<pbps_model::operation::Captured>>,
 }
 
 impl<S> PlanningPlan<S> {
@@ -192,6 +199,7 @@ impl<S> PlanningPlan<S> {
             allocator: pbps_model::operation::IdAllocator::logical(logical),
             boundaries: Default::default(),
             annotations: None,
+            captured: None,
         }
     }
     pub(crate) fn pending_boundaries(
@@ -228,6 +236,23 @@ impl<S> PlanningPlan<S> {
             &self, before, after, base, goal, modules,
         )?));
         Ok(self)
+    }
+    /// Order this plan, wherever its effects are read, by what the run
+    /// captured. An empty capture is none.
+    pub fn with_captured(mut self, captured: &pbps_model::operation::Captured) -> Self {
+        self.captured = (!captured.is_empty()).then(|| std::sync::Arc::new(captured.clone()));
+        self
+    }
+    /// Whether a capture orders this plan.
+    pub fn has_captured(&self) -> bool {
+        self.captured.is_some()
+    }
+    pub(super) fn captured(&self) -> &pbps_model::operation::Captured {
+        static NONE: std::sync::OnceLock<pbps_model::operation::Captured> =
+            std::sync::OnceLock::new();
+        self.captured
+            .as_deref()
+            .unwrap_or_else(|| NONE.get_or_init(Default::default))
     }
     pub fn annotation_edges(&self) -> Result<Vec<super::Constraint>, String> {
         self.annotations

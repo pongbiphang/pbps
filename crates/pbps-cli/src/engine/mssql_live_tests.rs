@@ -174,6 +174,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
                     &reversed,
                     order::shadow::Stage::Final,
                     Some(&facts),
+                    &Default::default(),
                 )
             })
             .is_err();
@@ -225,3 +226,127 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
 
 #[path = "mssql_live_tests/creation2469_tests.rs"]
 mod creation2469;
+
+/// The connected pass that settles a resolver plan again (`catalog_requirements`
+/// through `order_created_object_names`) reads the bindings that ordered it.
+/// A schema-bound function whose text spells `dbo.v2143` as an alias column is
+/// no caller of the view of that name, and the capture says so; a pass that
+/// forgot the capture would read the lexical edge back and refuse the plan
+/// (the review of #2680).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+async fn the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ordered_it() {
+    use pbps_model::operation::Captured;
+    use pbps_model::resolver::{BoundSurface, ObjectIdentity, Surface, SurfaceResolution};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let mut conn = Conn::connect(Driver::Mssql, &server).await.unwrap();
+    let db = format!("pbps_captured2143_{}", std::process::id());
+    conn.execute(&format!("CREATE DATABASE [{db}]"))
+        .await
+        .unwrap();
+    conn.execute(&format!("USE [{db}]")).await.unwrap();
+    let id = |name: &str| ModuleId::Named(TableName::new("dbo", name));
+    let function = |body: &str| Module {
+        kind: ModuleKind::Function,
+        definition: format!("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {body} END"),
+        description: None,
+        options: Default::default(),
+    };
+    let view = |body: &str| Module {
+        kind: ModuleKind::View,
+        definition: body.into(),
+        description: None,
+        options: pbps_model::ModuleOptions {
+            schemabinding: true,
+            ..Default::default()
+        },
+    };
+    let alias = "(SELECT TOP 1 dbo.v2143 FROM dbo.t2143 AS dbo)";
+    let mut before = Schema::default();
+    before.modules.insert(id("f2143"), function(alias));
+    before.modules.insert(id("v2143"), view("SELECT 1 AS x"));
+    let mut after = before.clone();
+    after
+        .modules
+        .insert(id("f2143"), function(&format!("{alias} + 1")));
+    after
+        .modules
+        .insert(id("v2143"), view("SELECT dbo.f2143(1) AS x"));
+    let ids = IdsFile::default();
+    let observed: Vec<_> = before
+        .modules
+        .keys()
+        .map(|module| {
+            let bound = BoundSurface {
+                object: ObjectIdentity {
+                    class: "module".into(),
+                    name: vec![module.shown().to_string()],
+                    signature: vec![],
+                },
+                bindings: vec![],
+                managed_inputs: BTreeSet::new(),
+            };
+            SurfaceResolution {
+                surface: Surface::Module(module.clone()),
+                current: Some(bound.clone()),
+                desired: Some(bound),
+            }
+        })
+        .collect();
+    let captured = Captured {
+        before: BTreeMap::new(),
+        after: BTreeMap::from([
+            (id("f2143"), BTreeSet::new()),
+            (id("v2143"), BTreeSet::from([id("f2143")])),
+        ]),
+    };
+    let plan_with = |captured: &Captured| {
+        pbps_diff::resolver::plan_captured(
+            pbps_diff::Side {
+                schema: &before,
+                ids: &ids,
+            },
+            pbps_diff::Side {
+                schema: &after,
+                ids: &ids,
+            },
+            &Default::default(),
+            &observed,
+            &pbps_mssql::Mssql,
+            captured,
+        )
+    };
+    let dependencies = Default::default();
+    let declarations = crate::dependents::schedule::Declarations {
+        schema: &after,
+        sources: crate::dependents::Sources {
+            before: pbps_diff::Side {
+                schema: &before,
+                ids: &ids,
+            },
+            after: &ids,
+        },
+        module_deps: &dependencies,
+    };
+    let mut ordered = plan_with(&captured)
+        .expect("planned from the capture")
+        .changes;
+    order_created_object_names(&mut conn, &mut ordered, "test", &[], &declarations)
+        .await
+        .expect("the connected settlement keeps the capture's order");
+    let position = |wanted: &ModuleId| {
+        ordered.changes().changes.iter().position(|planned| {
+            matches!(&planned.change, Change::AlterModule { id, .. } | Change::CreateModule { id, .. } if id == wanted)
+        })
+    };
+    assert!(position(&id("f2143")) < position(&id("v2143")));
+    // The same plan without the capture reads the alias column as a call of
+    // the view, as it always did, and is refused before it gets here.
+    assert!(plan_with(&Captured::default()).is_err());
+    conn.execute("USE master").await.unwrap();
+    conn.execute(&format!("DROP DATABASE [{db}]"))
+        .await
+        .unwrap();
+}

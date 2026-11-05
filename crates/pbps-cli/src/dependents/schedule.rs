@@ -202,18 +202,23 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
         module_deps: declared.module_deps,
     };
     let read = facts.owned();
+    // The frozen oracle predates captured bindings and orders by the lexical
+    // guess alone, so it is compared only where no capture applies.
     #[cfg(test)]
-    let expected = oracle_schedule(
-        pbps_diff::order::propose(cs.changes().clone()),
-        declared,
-        facts,
-        dialect,
-    );
+    let expected = (!cs.has_captured()).then(|| {
+        oracle_schedule(
+            pbps_diff::order::propose(cs.changes().clone()),
+            declared,
+            facts,
+            dialect,
+        )
+    });
     let actual = owned::schedule::schedule(cs, &declarations, &read, dialect)
         .map_err(|why| Refusal(why.to_string()));
     #[cfg(test)]
-    match (&actual, &expected) {
-        (Ok(actual), Ok(expected)) => {
+    match (&actual, expected.as_ref()) {
+        (_, None) => {}
+        (Ok(actual), Some(Ok(expected))) => {
             assert_eq!(actual.changes.changes(), expected.changes.changes());
             assert_eq!(
                 (actual.added, actual.split, actual.moved),
@@ -232,7 +237,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
                     .collect::<Vec<_>>()
             );
         }
-        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        (Err(actual), Some(Err(expected))) => assert_eq!(actual, expected),
         _ => panic!("canonical route and frozen schedule disagree: {actual:?} / {expected:?}"),
     }
     actual
@@ -490,6 +495,7 @@ fn oracle_schedule(
         &cs,
         pbps_diff::order::shadow::Stage::Differ,
         None,
+        &Default::default(),
     );
     Ok(OracleScheduled {
         changes: cs,

@@ -5918,3 +5918,50 @@ name nothing uses, an unmanaged module refusing by name, a shadowed `dbo`
 fallback, the call path through a principal's default schema, a fixed principal
 whose default schema already holds the callee, a name that resolves earlier than
 the arrival, and a plan that creates nothing sealing despite the roots it keeps.
+
+<a id="dec-2143-8"></a>
+
+**DEC-2143.8. A resolver plan orders a schema-bound caller by the callees the
+engine bound, not by the lexer's guess at its text (#2143 c3, design item 5a).**
+`Mssql::engine_effects` builds a schema-bound module's requirements from its
+text (`schema_bound_callees`): a lexical match that over-approximates, so a
+false yes costs an edge. One of those false edges is a cycle: a schema-bound
+function that reads column `app.v` of a table aliased `app` is read as calling
+the view `app.v`, and an edit that makes that view call the function then waits
+on itself. The scratch capture already holds the truth, `is_schema_bound_reference`
+with the id the engine bound at creation (DEC-2141.1), and it is what a resolver
+plan exists to use.
+
+The capture records each schema-bound module and the objects it was bound to,
+including a module bound to none. The producer maps both sides to the declared
+modules by name: the target now (the opening capture) and the declarations as
+they compiled on scratch. That `pbps_model::operation::Captured` goes to the
+dialect through a new defaulted parameter of `engine_effects`, an input of the
+same kind as the catalog facts: typed data, no query, the dialect stays pure.
+A caller present in the map has exactly the listed callees and the lexer is not
+consulted for it; an absent caller, an offline plan, a plan with no resolver and
+a PostgreSQL plan keep the lexical match, so none of them changes.
+
+**It is plan-time data and is kept out of the evidence.** The order is decided
+when the plan is made and sealed in it; `apply`, `explain` and the evidence
+reader never order a saved plan again, so they need no map and the sealed
+format is unchanged (no schema-set, plan or state number). The map does have to
+reach every pass that orders the plan after the resolver. The plan carries it
+(`PlanningPlan::with_captured`, copied wherever the plan is rebuilt, like its
+annotations), so the rewrite settlements, `catalog_requirements` and the
+dependents schedule `plan --db` runs on the resolver's order read the same
+bindings without each being handed them. Only the debug observer judges a
+finished `ChangeSet`, so it is given them from the run. A pass that left them
+out would read the lexical edges back into a plan ordered without them, which
+the review of #2680 found in `catalog_requirements`. `rehearsal` orders a
+baseline with no resolver, and the frozen `dependents::schedule` oracle orders
+by the lexical match alone, so it is compared only where no capture applies.
+
+Pinned by `a_captured_caller_does_not_wait_for_the_view_its_alias_column_is_spelled_like`,
+`a_captured_callee_the_text_does_not_name_is_still_waited_for` and the negative
+`a_caller_without_a_capture_keeps_the_lexical_order` (`tests/captured_bindings.rs`),
+and on the engine by `mssql_a_changed_schema_bound_callee_is_rebuilt_around_by_its_bound_caller`
+(Case 24 through the resolver). The alias-column case does not reach planning on
+the engine: the scratch bootstrap creates the declared modules in an order the
+lexical match chose, before any capture exists, and it fails the same on a tree
+without this change. That ordering is c3b of #2143.

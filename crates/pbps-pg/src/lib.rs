@@ -2787,6 +2787,7 @@ impl Dialect for Postgres {
         before: pbps_model::operation::Snapshot<'_>,
         after: pbps_model::operation::Snapshot<'_>,
         _catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+        _captured: &pbps_model::operation::Captured,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{Incarnation, PartKey, Resource, base_table};

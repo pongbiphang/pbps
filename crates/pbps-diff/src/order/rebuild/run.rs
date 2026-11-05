@@ -95,6 +95,7 @@ impl Rule<'_> {
                         before,
                         after,
                         Some(&self.prepared.names),
+                        &Default::default(),
                     )?),
                 )
             })

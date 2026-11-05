@@ -194,6 +194,7 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
                     before,
                     after,
                     Some(prepared.names()),
+                    &Default::default(),
                 )
                 .unwrap(),
             )

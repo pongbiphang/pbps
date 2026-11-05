@@ -238,6 +238,12 @@ impl<D: super::PlanningDialect> Unsealed<D> {
         &self.ordered.changes
     }
 
+    /// The bindings the run captured, which ordered [`Self::changes`]. Later
+    /// passes that order the plan again take them too (DEC-2143.8).
+    pub fn captured(&self) -> &pbps_model::operation::Captured {
+        &self.sealing.producer.captured
+    }
+
     /// The fresh pre-publication recheck (#1516). The session must reach
     /// the cluster the planning read recorded (DEC-1685.1). The target's
     /// reported facts and its deployer's authorization are read again and

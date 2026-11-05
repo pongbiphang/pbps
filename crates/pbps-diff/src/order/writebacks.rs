@@ -117,7 +117,8 @@ impl PlanningInput {
     pub fn append_to<S>(&self, draft: super::PlanningPlan<S>) -> super::PlanningPlan {
         let plain = draft.boundaries.is_empty()
             && draft.identities.is_none()
-            && draft.annotations.is_none();
+            && draft.annotations.is_none()
+            && draft.captured.is_none();
         let mut draft: super::PlanningPlan = if plain {
             // Preserve the existing re-proposal route for untracked inputs.
             super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
