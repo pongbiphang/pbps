@@ -69,16 +69,17 @@ pub(super) fn replay_phases(r: &Replay<'_>, phases: &mut Vec<Phase>) {
     }
 }
 
+pub(super) fn scratch_label(driver: pbps_db::Driver) -> &'static str {
+    match driver {
+        pbps_db::Driver::Postgres => "owned PostgreSQL scratch",
+        pbps_db::Driver::Mssql => "owned SQL Server scratch",
+    }
+}
+
 fn prepare(data: &mut TestData, inputs: &Inputs) {
     let driver = crate::db::driver_for(inputs.identity.dialect);
-    data.phases.push(Phase::on(
-        driver,
-        "provision",
-        match driver {
-            pbps_db::Driver::Postgres => "owned PostgreSQL scratch",
-            pbps_db::Driver::Mssql => "owned SQL Server scratch",
-        },
-    ));
+    data.phases
+        .push(Phase::on(driver, "provision", scratch_label(driver)));
     replay_phases(&inputs.replay(), &mut data.phases);
     data.phases.push(Phase::on(
         driver,
@@ -173,7 +174,9 @@ pub(super) async fn run_replay(
                 }
                 phase += 1;
             }
-            // No fixture session survives into the next capture/apply.
+            // The fixture's client is closed before the next capture/apply, but the
+            // server ends its backend later: a session of its own can still be
+            // listed for a moment (#2681).
             drop(conn);
         }
     }

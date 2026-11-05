@@ -15,6 +15,8 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{Conn, DbError, Driver, Row};
 use pbps_model::Schema;
 
+pub mod snapshot;
+
 use crate::ident::quote;
 use crate::resolver::scratch::literal;
 

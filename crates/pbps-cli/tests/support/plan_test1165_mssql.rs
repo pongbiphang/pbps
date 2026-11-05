@@ -299,48 +299,8 @@ fn plan_test1165_mssql_a_fixture_that_leaves_a_transaction_open_fails_and_runs_n
     p.settled();
 }
 
-#[test]
-#[ignore = "needs docker and the pinned SQL Server image"]
-fn plan_test1165_mssql_fixture_repin_still_refuses_before_any_runtime_or_write() {
-    let p = Project::new();
-    let oldest = p.commit();
-    p.write("later.txt", "later");
-    let base = p.commit();
-    p.write(
-        "tests/f.sql",
-        "INSERT INTO app.t(id, amount) VALUES (1, 1);",
-    );
-    p.manifest(
-        &base,
-        &[("f", &oldest)],
-        "SELECT 1 AS x WHERE 1 = 0",
-        10_000,
-    );
-    // A re-pin reads the committed manifest and fixture, and a newer pin to move to.
-    p.commit();
-    let before = p.bytes();
-    let out = Command::new(BIN)
-        .arg("--project")
-        .arg(&p.0.dir)
-        .args([
-            "test", "fixtures", "repin", "f", "--at", &base, "--format", "json",
-        ])
-        .env("XDG_STATE_HOME", p.state())
-        .output()
-        .unwrap();
-    assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
-    assert!(
-        stdout(&out).contains("currently supports PostgreSQL"),
-        "{}{}",
-        stdout(&out),
-        stderr(&out)
-    );
-    assert_eq!(p.bytes(), before, "a refused re-pin wrote into the project");
-    assert!(
-        !p.state().join("pbps/test-runs").exists(),
-        "a refusal started a run"
-    );
-}
+#[path = "repin1165_mssql.rs"]
+mod repin1165_mssql;
 
 struct Running {
     child: Option<Child>,

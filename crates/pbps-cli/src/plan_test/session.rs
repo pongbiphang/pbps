@@ -181,6 +181,9 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
+    pub(super) fn driver(&self) -> Driver {
+        self.driver
+    }
     pub fn target(&self) -> &Target {
         &self.target
     }

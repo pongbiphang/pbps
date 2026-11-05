@@ -1018,5 +1018,45 @@ storage, a session the server ended). A SQL Server number is not a SQLSTATE: a
 user `THROW 53300` is the user's own, and a permission error (229) or a write to
 the sealed database (3906) is a finding. The same reading applies to the error
 an assertion itself returns: a coded engine fault there is unanswerable (exit 1),
-not a finding about the SQL, on either engine. `fixtures repin` still refuses SQL
-Server until F3.
+not a finding about the SQL, on either engine. `fixtures repin` followed in F3
+(DEC-1165.16).
+
+<a id="dec-1165-16"></a>
+
+**DEC-1165.16. A SQL Server re-pin reads typed rows and really-taken allocator values, as the apply login.**
+`fixtures repin` runs on SQL Server through the same two fresh scratches, replay
+and comparison as PostgreSQL; only the read of a comparison database is the
+engine's. Rows come back as one text cell per column, chosen by the column's
+base type (a float to 17 digits, a money value to 4 decimals, dates in a fixed
+style, binary and spatial values as hex), and are counted in Rust, not by a
+server `GROUP BY`: the default collation folds case and trailing spaces, and the
+comparison must not. `NULL` stays apart from the empty string and columns are
+compared sorted by name. A table that cannot be compared makes the re-pin
+unanswerable and names the table and column: a `rowversion`, a system-versioned
+period or ledger column differs between any two databases by construction, and a
+`sql_variant` or an unknown type has no faithful text. It is never skipped
+silently (ADR-0019 §5), so a table with a temporal or rowversion column cannot be
+re-pinned until that is declared another way.
+
+The next value of an identity column is the one the engine hands out. Measured:
+`IDENT_CURRENT` alone is ambiguous (after `DBCC CHECKIDENT … RESEED, 50` a column
+that never generated a value hands out 50, one that had hands out 51) and
+`last_value` is `NULL` after `TRUNCATE`; a failed `INSERT` still consumes a value
+(NOT NULL and UNIQUE violations both). So the probe is `INSERT … DEFAULT VALUES`
+in `TRY/CATCH` inside `BEGIN TRANSACTION … ROLLBACK`; the identity survives the
+rollback, the row and a trigger's writes do not, and the pair (`IDENT_CURRENT`,
+`last_value`) must have moved or the allocator is unestablishable and named (an
+`INSTEAD OF` trigger, an exhausted column, a failure before a value is taken).
+A sequence is read with `NEXT VALUE FOR`, and compared under the one column whose
+default names it, else by its own name. A trigger that writes to another table
+with an identity column advances that column once per probe (identity values
+survive the rollback): probes run in a fixed order over the same schema on both
+sides, so equal allocators stay equal and unequal ones stay unequal, and the
+value shown for such a column is the one its own probe took. Every table is read
+before any probe.
+
+Both reads run on the apply login, the owner of the objects, not on the
+administrator: a table can carry a computed column or a trigger, which is user
+code. PostgreSQL's re-pin keeps reading as the administrator. No report or
+manifest field is added and no format version changes. The cause of a failed
+scratch start is no longer lost in the lifecycle test (#2683).
