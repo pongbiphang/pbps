@@ -726,21 +726,13 @@ fn a_name_the_mapping_cannot_read_back_is_refused_wherever_the_file_stores_one()
     // A live column: empty, or holding the separator.
     assert_eq!(bad(customer, "\"full_name\"", "\"\""), "");
     assert_eq!(bad(customer, "\"full_name\"", "\"a.b\""), "a.b");
-    // A retired column or partition remembers a name of the same shape.
-    assert_eq!(
-        bad(
-            customer,
-            "\"dbo.customer.national_id\"",
-            "\"dbo.customer.a.b\""
-        ),
-        "dbo.customer.a.b"
-    );
+    // A live partition child is a table name.
     assert_eq!(
         bad("app/events.json", "\"app.events_2026_01\"", "\"app.a.b\""),
         "app.a.b"
     );
     assert_eq!(
-        bad("app/events.json", "\"app.events_2025_12\"", "\"events\""),
+        bad("app/events.json", "\"app.events_2026_01\"", "\"events\""),
         "events"
     );
     // The names of the other kinds.
@@ -750,32 +742,18 @@ fn a_name_the_mapping_cannot_read_back_is_refused_wherever_the_file_stores_one()
         bad("types/status.json", "\"dbo.status\"", "\"status\""),
         "status"
     );
-    // The `was` of a dropped object, and of a retired record, is stored too.
-    let was = |path: &str, from: &str, to: &str| bad_name(refuses(path, edit(&t[path], from, to)));
+    // A `was` is only required to say something.
+    let was =
+        |path: &str, from: &str| bad_name(refuses(path, edit(&t[path], from, "\"was\": \"\"")));
+    assert_eq!(was("dbo/legacy.json", "\"was\": \"dbo.legacy\""), "");
+    assert_eq!(was("roles/old_role.json", "\"was\": \"old_role\""), "");
     assert_eq!(
-        was(
-            "dbo/legacy.json",
-            "\"was\": \"dbo.legacy\"",
-            "\"was\": \"legacy\""
-        ),
-        "legacy"
-    );
-    assert_eq!(
-        was(
-            "roles/old_role.json",
-            "\"was\": \"old_role\"",
-            "\"was\": \"\""
-        ),
+        was("dbo/customer.json", "\"was\": \"dbo.customer.national_id\""),
         ""
     );
-    // A dropped table keeps its last name in the header, which must parse too.
     assert_eq!(
-        bad(
-            "dbo/legacy.json",
-            "\"table\": \"dbo.legacy\"",
-            "\"table\": \"legacy\""
-        ),
-        "legacy"
+        was("app/events.json", "\"was\": \"app.events_2025_12\""),
+        ""
     );
 }
 
@@ -877,5 +855,36 @@ fn a_table_tombstone_name_that_collides_with_a_live_one_needs_its_owner() {
         }
     );
     p.owners.insert(uid("c_ccccc1"), uid("t_cccccc"));
+    assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
+}
+
+#[test]
+fn dotted_role_and_extension_names_round_trip_live_and_dropped() {
+    // The loader allows a `.` in both; they serialize as standalone strings.
+    let (mut ids, p) = sample();
+    ids.roles
+        .insert(uid("r_aaaaaa"), RoleName::new("app.reader"));
+    ids.extensions
+        .insert(uid("e_aaaaaa"), ObjectLocalName::new("uuid.ossp"));
+    ids.tombstones.insert(uid("r_bbbbbb"), tomb("old.role"));
+    let mut p = p;
+    p.paths
+        .insert(uid("e_bbbbbb"), "extensions/gone.json".into());
+    ids.tombstones.insert(uid("e_bbbbbb"), tomb("gone.ext"));
+    let t = split(&ids, &p).unwrap();
+    assert!(t["roles/app_reader.json"].contains("\"role\": \"app.reader\""));
+    assert!(t["roles/old_role.json"].contains("\"role\": \"old.role\""));
+    assert!(t["extensions/gone.json"].contains("\"was\": \"gone.ext\""));
+    assert_eq!(assemble(&t).unwrap(), ids);
+}
+
+#[test]
+fn a_dropped_object_may_remember_a_name_nothing_parses() {
+    // `was` is compared as text, never parsed, so a dropped table, type or
+    // column that remembers an odd spelling still round-trips.
+    let (mut ids, p) = sample();
+    ids.tombstones.get_mut(&uid("c_aaaaa3")).unwrap().was = "dbo.customer.a.b".into();
+    let mut p = p;
+    p.owners.insert(uid("c_aaaaa3"), uid("t_aaaaaa"));
     assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
 }

@@ -492,60 +492,62 @@ fn check(path: &str, file: &TreeFile) -> Result<(), TreeError> {
 }
 
 /// Every name the file stores must read back through the unchanged
-/// `IdsFile` JSON, which joins a column as `schema.table.column` and splits it
-/// on `.`. A local column name that is empty or holds a `.` serializes into a
-/// string `ColumnRef::from_str` refuses, so the mapping would validate here and
-/// then fail in a plan or snapshot that embeds it. The writer runs this too:
-/// `IdsFile` does not stop `ColumnRef::new` from building such a name.
+/// `IdsFile` JSON, so each live one is held to the parser that JSON uses for
+/// its kind. A column joins as `schema.table.column` and splits on `.`, so a
+/// local column name that is empty or holds a `.` would validate here and then
+/// fail in a plan or snapshot that embeds it; tables and types parse as
+/// qualified names. Roles and extensions are standalone strings, and the
+/// loader allows a `.` in them, so only the empty name is refused. A `was` is
+/// never parsed anywhere (it is compared as text), so it is only required to
+/// say something. `IdsFile` does not stop `ColumnRef::new` from building a
+/// bad column name, so the writer runs this too.
 fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
     let bad = |name: &str, why: &dyn std::fmt::Display| TreeError::BadName {
         path: path.to_owned(),
         name: name.to_owned(),
         why: why.to_string(),
     };
+    let nonempty = |name: &str| {
+        if name.is_empty() {
+            Err(bad(name, &"a name cannot be empty"))
+        } else {
+            Ok(())
+        }
+    };
     let table = |name: &str| {
         name.parse::<TableName>()
             .map(drop)
             .map_err(|e| bad(name, &e))
     };
-    let local = |name: &str| {
-        if name.is_empty() {
-            return Err(bad(name, &"a name cannot be empty"));
-        }
+    let column = |name: &str| {
+        nonempty(name)?;
         crate::name::check_segment(name).map_err(|e| bad(name, &e))
     };
-    // The `was` of a dropped object is read back as the same kind of name.
     if let Some(tomb) = &file.dropped {
-        match &file.body {
-            Body::Table(_) => table(&tomb.was)?,
-            Body::Type(_) => tomb
-                .was
-                .parse::<TypeRef>()
-                .map(drop)
-                .map_err(|e| bad(&tomb.was, &e))?,
-            Body::Role(_) | Body::Extension(_) => local(&tomb.was)?,
-        }
+        nonempty(&tomb.was)?;
     }
+    // A dropped file's name line only repeats `was`, so it is not parsed.
+    let live = file.dropped.is_none();
     match &file.body {
-        Body::Role(n) | Body::Extension(n) => local(n)?,
-        Body::Type(n) => n.parse::<TypeRef>().map(drop).map_err(|e| bad(n, &e))?,
+        Body::Role(n) | Body::Extension(n) => nonempty(n)?,
+        Body::Type(n) if live => n.parse::<TypeRef>().map(drop).map_err(|e| bad(n, &e))?,
+        Body::Type(n) => nonempty(n)?,
         Body::Table(t) => {
-            table(&t.table)?;
+            if live {
+                table(&t.table)?;
+            } else {
+                nonempty(&t.table)?;
+            }
             for (_, rec) in &t.columns {
                 match rec {
-                    Rec::Live(name) => local(name)?,
-                    Rec::Dead(tomb) => {
-                        tomb.was
-                            .parse::<ColumnRef>()
-                            .map(drop)
-                            .map_err(|e| bad(&tomb.was, &e))?;
-                    }
+                    Rec::Live(name) => column(name)?,
+                    Rec::Dead(tomb) => nonempty(&tomb.was)?,
                 }
             }
             for (_, rec) in &t.partitions {
                 match rec {
                     Rec::Live(name) => table(name)?,
-                    Rec::Dead(tomb) => table(&tomb.was)?,
+                    Rec::Dead(tomb) => nonempty(&tomb.was)?,
                 }
             }
         }
@@ -588,7 +590,12 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                     .insert(file.uid.clone(), ObjectLocalName::new(n.as_str()));
             }
             Body::Table(t) => {
-                let table: TableName = t.table.parse().map_err(|e| bad_name(&e))?;
+                // A dropped file has no live column to name a table for.
+                let table: TableName = if file.dropped.is_none() {
+                    t.table.parse().map_err(|e| bad_name(&e))?
+                } else {
+                    TableName::new("", "")
+                };
                 if file.dropped.is_none() {
                     ids.tables.insert(file.uid.clone(), table.clone());
                 }
