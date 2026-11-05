@@ -3858,6 +3858,24 @@ pub(crate) fn emit_in(
     strategy: Strategy,
     row_defaults: &RowDefaults<'_>,
 ) -> Sql {
+    let mut statements = emit_statements(pg, change, strategy, row_defaults)?;
+    // The first statement of a change that introduces an expression carries the
+    // change, so the executor judges the routines it calls before it runs
+    // (DEC-2563.4).
+    if crate::table_expressions::carries(change)
+        && let Some(first) = statements.first_mut()
+    {
+        first.introduces = Some(Box::new(change.clone()));
+    }
+    Ok(statements)
+}
+
+fn emit_statements(
+    pg: &Postgres,
+    change: &Change,
+    strategy: Strategy,
+    row_defaults: &RowDefaults<'_>,
+) -> Sql {
     // DEC-2400.1: legacy recordings must stay inside every conversion wrapper.
     pbps_diff::conversion::check_change(change, pg).map_err(|error| invalid(error.to_string()))?;
     match change {

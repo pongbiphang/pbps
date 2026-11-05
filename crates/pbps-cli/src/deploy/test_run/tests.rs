@@ -422,12 +422,17 @@ enum Admission {
 }
 fn write_default_routines(fixture: &Fixture) -> anyhow::Result<()> {
     for (name, dependencies, language, body) in [
-        ("fixture_leaf()", "", "sql", "RETURN 41"),
+        (
+            "fixture_leaf()",
+            "",
+            "sql",
+            "SET search_path = pg_catalog RETURN 41",
+        ),
         (
             "fixture_default()",
             "depends_on: [app.fixture_leaf(), app.fixture_definer()]\n",
             "sql",
-            "RETURN app.fixture_leaf() + app.fixture_definer()",
+            "SET search_path = pg_catalog RETURN app.fixture_leaf() + app.fixture_definer()",
         ),
         (
             "fixture_definer()",
@@ -444,13 +449,13 @@ fn write_default_routines(fixture: &Fixture) -> anyhow::Result<()> {
             "string_default()",
             "depends_on: [app.fixture_leaf()]\n",
             "sql",
-            "AS $$ SELECT app.fixture_leaf() + 1 $$",
+            "SET search_path = pg_catalog AS $$ SELECT app.fixture_leaf() + 1 $$",
         ),
         (
             "plpgsql_default()",
             "depends_on: [app.fixture_leaf()]\n",
             "plpgsql",
-            "AS $$ BEGIN RETURN app.fixture_leaf() + 1; END $$",
+            "SET search_path = pg_catalog AS $$ BEGIN RETURN app.fixture_leaf() + 1; END $$",
         ),
     ] {
         std::fs::write(

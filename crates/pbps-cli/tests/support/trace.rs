@@ -280,7 +280,7 @@ fn a_missing_sink_and_an_unreadable_artifact_cannot_pass_as_empty() {
 const EXTERNALS: &str = "CREATE SCHEMA IF NOT EXISTS ext;\n\
     CREATE TABLE ext.t (id integer);\n\
     CREATE VIEW ext.v AS SELECT NULL::integer AS id, NULL::text AS label WHERE false;\n\
-    CREATE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';\n";
+    CREATE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS 'SELECT 1';\n";
 
 struct Fixture {
     slug: String,
@@ -303,7 +303,7 @@ impl Fixture {
                  CREATE TABLE ext.t (id integer DEFAULT length('{}'), \
                    CONSTRAINT private_check CHECK (id <> length('{}')));\n\
                  CREATE VIEW ext.v AS SELECT id, '{}'::text || '{}'::text AS label FROM ext.t;\n\
-                 CREATE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE \
+                 CREATE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog \
                    AS $$SELECT length('{}')$$;\n\
                  CREATE FUNCTION ext.fire() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS \
                    $$BEGIN PERFORM '{}'; RETURN NEW; END$$;\n\
@@ -369,7 +369,7 @@ impl Fixture {
         std::fs::write(
             fixture.d.dir.join("schema/ext.f%28integer%29.function.yml"),
             "function: ext.f(integer)\npublic_execute: true\ndefinition: |-\n  \
-             (integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1\n",
+             (integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog RETURN 1\n",
         )
         .unwrap();
         fixture.ok(&["plan", "--no-dev"]);
@@ -765,7 +765,7 @@ impl Fixture {
         );
         on_server(
             self.own.connection(),
-            "CREATE OR REPLACE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 2'",
+            "CREATE OR REPLACE FUNCTION ext.f(numeric) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS 'SELECT 2'",
         );
         self.apply("second.json", false);
         on_server(self.own.connection(), &original);

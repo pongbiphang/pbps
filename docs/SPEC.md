@@ -171,7 +171,9 @@ admitted when its owner is trusted and it sets a fixed `search_path`; it is
 never admitted as `SECURITY DEFINER` of an untrusted owner (DEC-2563.2).
 `pin_type_routines: true` admits an untrusted owner's routine through a saved
 plan showing its complete source and pinning it; apply refuses a changed
-setting (DEC-2181.2).
+setting (DEC-2181.2). The same predicate judges the CHECK, DEFAULT and
+generated expressions a plan gives a table, just before the statement that
+introduces them (DEC-2563.4).
 `bootstrap --sql` refuses declarations with type references; use connected
 bootstrap or plan/apply against the target.
 

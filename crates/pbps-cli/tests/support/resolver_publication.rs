@@ -2005,7 +2005,7 @@ pub fn in_place_default_edits(server: &str, drop_function: bool) {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
          CREATE TABLE app.t(n integer DEFAULT app.f(1)); \
          CREATE TABLE app.tree(k integer NOT NULL,d integer DEFAULT 4) PARTITION BY RANGE(k); \
          CREATE TABLE app.p PARTITION OF app.tree FOR VALUES FROM (0) TO (10); \

@@ -12,7 +12,7 @@ fn scenario(server: &str, unrelated: bool) {
     on_server(
         connection,
         "CREATE SCHEMA app; \
-        CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+        CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x $$; \
         CREATE TABLE app.t(k integer NOT NULL,d integer DEFAULT app.f(1)) PARTITION BY RANGE(k); \
         CREATE TABLE app.p PARTITION OF app.t FOR VALUES FROM (0) TO (10); \
         ALTER TABLE app.p ALTER COLUMN d SET DEFAULT app.f(2); \
@@ -44,7 +44,7 @@ fn scenario(server: &str, unrelated: bool) {
         p:\n    from: [0]\n    to: [10]\n    columns:\n      e: {default: app.f(2)}\n  \
         a:\n    from: [10]\n    to: [20]\n    columns:\n      e: {default: app.f(3)}\n";
     let function = "function: app.f(integer)\npublic_execute: true\ndefinition: |-\n  \
-        (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 10 $$\n";
+        (x integer) RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT x * 10 $$\n";
     println!("AFTER app.t.yml:\n{table}\nAFTER function:\n{function}");
     std::fs::write(d.dir.join("schema/app.t.yml"), table).unwrap();
     std::fs::write(

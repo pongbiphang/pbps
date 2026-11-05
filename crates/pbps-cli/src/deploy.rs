@@ -9032,6 +9032,34 @@ async fn plan_db_selected(
         // judges it again, and a routine missed here fails closed there.
         let _ = crate::engine::vet_conversions(&mut conn, &site_admission, requirement_names.changes())
             .await;
+        // The expressions a table gains are bound the same way, to learn which
+        // routines the review admits; one that uses an object this plan creates
+        // cannot be bound yet and is said so, then judged at apply (DEC-2563.4).
+        if conn.driver() == pbps_db::Driver::Postgres {
+            for planned in requirement_names.changes() {
+                let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) =
+                    crate::engine::vet_table_expressions(
+                        &mut conn,
+                        &site_admission,
+                        pbps_pg::pins::Within::OwnTransaction,
+                        pbps_pg::table_expressions::Moment::Early,
+                        &planned.change,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                for note in notes {
+                    if !json {
+                        eprintln!("warning: {note}");
+                    }
+                    findings.push(crate::output::Finding::warning(
+                        "plan.table-expression-unbound",
+                        &note,
+                    ));
+                }
+            }
+        }
         // Rows that hold a label an enum rebuild removes, or that a domain's
         // narrower base cannot hold, are counted now, by the same probes the
         // apply runs, so the plan is refused by name and with a count before
@@ -10952,6 +10980,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             finish_transaction(conn, dialect, result).await
         } else if stmt.transactional
             && (stmt.declared_type.is_some()
+                || stmt.introduces.is_some()
                 || stmt.extension.is_some()
                 || !written_routines.is_empty()
                 || !plan.type_pins.is_empty()
@@ -10972,6 +11001,25 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 .await?;
                 if let Some(extension) = &stmt.extension {
                     vet_before_extension(conn, extension, Some(plan)).await?;
+                }
+                if let Some(change) = &stmt.introduces {
+                    // Judged by the plan's own admission before the statement
+                    // runs, with what the earlier steps created in place.
+                    let admission = pbps_pg::admission::Admission::new(
+                        project.config.trusted_roles.iter().cloned(),
+                        plan.pin_type_routines,
+                    )
+                    .approving(plan.type_routines.iter().map(|r| r.oid));
+                    pbps_pg::table_expressions::vet_change(
+                        conn,
+                        &admission,
+                        pbps_pg::pins::Within::CallersTransaction,
+                        pbps_pg::table_expressions::Moment::Statement,
+                        change,
+                    )
+                    .await
+                    .and_then(pbps_pg::table_expressions::Vetted::admitted)
+                    .map_err(anyhow::Error::msg)?;
                 }
                 conn.execute(&stmt.sql).await?;
                 retained_verified =
@@ -11959,14 +12007,38 @@ async fn run_probes_observed(
     let mark = admission.mark();
     let immutable = crate::engine::vet_conversions(conn, admission, names.changes()).await?;
     crate::engine::vet_drop_requirements(conn, admission, names).await?;
-    if admission.relied_since(mark) {
+    // The expressions the plan gives a table are evaluated by the probes too, so
+    // they are judged first. One that is not admitted yet, or cannot be bound
+    // before the plan creates what it uses, is left to the check just before its
+    // statement; the probes that would run it are skipped, not run unjudged.
+    let mut table_unjudged = false;
+    if conn.driver() == pbps_db::Driver::Postgres {
+        for planned in names.changes() {
+            match crate::engine::vet_table_expressions(
+                conn,
+                admission,
+                pbps_pg::pins::Within::OwnTransaction,
+                pbps_pg::table_expressions::Moment::Early,
+                &planned.change,
+            )
+            .await
+            {
+                Ok(pbps_pg::table_expressions::Vetted::Admitted) => {}
+                // Not judged, however it came about: refused, or unbound here.
+                Ok(pbps_pg::table_expressions::Vetted::Unjudged(_)) | Err(_) => {
+                    table_unjudged = true;
+                }
+            }
+        }
+    }
+    if table_unjudged || admission.relied_since(mark) {
         // Plan time, and a conversion or requirement is admitted only by the
         // review: no probe evaluates it before the human has read the source.
         // Apply runs every probe after the approval (DEC-2563.2).
         services::notice(
             progress,
             "apply.preflight",
-            "Pre-flight: the probes are unchecked until source review, because a conversion or requirement calls a routine admitted only by `pin_type_routines`; apply checks them."
+            "Pre-flight: the probes are unchecked until source review, because an expression calls a routine that only `pin_type_routines` admits, or that is not admitted yet; apply judges it before its statement and checks them."
                 .to_owned(),
         );
         return Ok(());
@@ -12253,6 +12325,20 @@ async fn execute_statement(
         crate::pins::Approved::admission,
     );
     crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
+    // The routines a table expression calls are judged just before the statement
+    // that introduces it, with what the plan created earlier in place (DEC-2563.4).
+    if let Some(change) = &stmt.introduces {
+        pbps_pg::table_expressions::vet_change(
+            conn,
+            &admission,
+            pbps_pg::pins::Within::CallersTransaction,
+            pbps_pg::table_expressions::Moment::Statement,
+            change,
+        )
+        .await
+        .and_then(pbps_pg::table_expressions::Vetted::admitted)
+        .map_err(anyhow::Error::msg)?;
+    }
     // A drop is vetted before it runs: what it would delete is judged while
     // it can still be refused, not after (DEC-2447.8).
     if let Some(extension) = &stmt.extension {

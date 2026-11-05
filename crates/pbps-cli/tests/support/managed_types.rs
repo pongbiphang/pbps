@@ -3157,7 +3157,7 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
             ("view", "SELECT 'new'::app.e AS m"),
             (
                 "function",
-                "() RETURNS app.e LANGUAGE sql AS $$ SELECT 'new'::app.e $$",
+                "() RETURNS app.e LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT 'new'::app.e $$",
             ),
             (
                 "function",
@@ -3881,7 +3881,7 @@ fn enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns() {
             CREATE VIEW app.moods2 AS SELECT m FROM app.moods;
             CREATE FUNCTION app.n() RETURNS int LANGUAGE sql
               BEGIN ATOMIC SELECT count(*)::int FROM app.t WHERE m = 'ok'; END;
-            CREATE FUNCTION app.s() RETURNS bigint LANGUAGE sql AS $$ SELECT count(*) FROM app.t $$;
+            CREATE FUNCTION app.s() RETURNS bigint LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT count(*) FROM app.t $$;
             CREATE FUNCTION app.tf() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$;
             CREATE TRIGGER tr BEFORE UPDATE OF m ON app.t FOR EACH ROW EXECUTE FUNCTION app.tf();";
         let (own, d) = adopted(&server, "rebuild_modules1635", sql);
@@ -8429,8 +8429,8 @@ fn a_domain_bounded_string_change_counts_assignment_refusals_before_rebuilding()
 // argument itself is built-in. Keep overloads distinct by identity arguments.
 fn signature_rebuild_dependents(ty: &str) -> String {
     format!(
-        "CREATE FUNCTION app.accepts(x {ty}) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN x::text <> '';
-         CREATE FUNCTION app.arr() RETURNS {ty}[] LANGUAGE SQL AS $$ SELECT ARRAY['ok'::{ty}] $$;
+        "CREATE FUNCTION app.accepts(x {ty}) RETURNS boolean LANGUAGE SQL IMMUTABLE SET search_path = pg_catalog RETURN x::text <> '';
+         CREATE FUNCTION app.arr() RETURNS {ty}[] LANGUAGE SQL SET search_path = pg_catalog AS $$ SELECT ARRAY['ok'::{ty}] $$;
          CREATE FUNCTION app.overload(x {ty}) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
          CREATE FUNCTION app.overload(x {ty}[]) RETURNS int LANGUAGE SQL AS $$ SELECT 2 $$;
          CREATE FUNCTION app.outarg(OUT x {ty}) LANGUAGE SQL AS $$ SELECT 'ok'::{ty} $$;

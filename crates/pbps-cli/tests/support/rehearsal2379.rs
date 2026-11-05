@@ -141,7 +141,7 @@ const VIEW: &str = "view: app.v\ndefinition: SELECT id, app.f(id) AS next, amoun
 /// seconds a call. An external, because a table default that names a managed
 /// function is not ordered after it.
 const SLOW_EXTERNAL: &str = "CREATE SCHEMA ext; CREATE FUNCTION ext.slow() RETURNS integer \
-    LANGUAGE sql VOLATILE RETURN (SELECT 1 FROM pg_sleep(8))";
+    LANGUAGE sql VOLATILE SET search_path = pg_catalog RETURN (SELECT 1 FROM pg_sleep(8))";
 
 fn table_with_policy(role: &str, using: &str) -> String {
     format!(

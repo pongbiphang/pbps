@@ -272,6 +272,9 @@ pub enum Part {
     /// The expression a recorded conversion retypes a column with (#2331).
     Conversion,
     RowRequirement,
+    /// An expression of a table the plan introduces (DEC-2563.4); the use's
+    /// `ty` is the whole phrase, `the CHECK `x` of app.t`.
+    TableExpression,
 }
 
 /// The type and the part of it an expression is in.
@@ -296,6 +299,7 @@ impl fmt::Display for Use {
             Part::Default => write!(f, "the DEFAULT of `{}`", self.ty),
             Part::Conversion => write!(f, "the conversion of {}", self.ty),
             Part::RowRequirement => write!(f, "the row requirement of {}", self.ty),
+            Part::TableExpression => write!(f, "{}", self.ty),
         }
     }
 }
@@ -1170,6 +1174,193 @@ struct VettedExpression {
     immutable: bool,
 }
 
+/// The framing a bind runs in: its own transaction, or a savepoint inside the
+/// caller's, rolled back either way.
+pub(crate) fn framing(within: Within, savepoint: &str) -> pbps_dialect::TransactionFraming {
+    match within {
+        Within::OwnTransaction => pbps_dialect::TransactionFraming {
+            begin: "BEGIN ISOLATION LEVEL READ COMMITTED;".into(),
+            commit: "COMMIT;".into(),
+            rollback: "ROLLBACK;".into(),
+        },
+        Within::CallersTransaction => pbps_dialect::TransactionFraming {
+            begin: format!("SAVEPOINT {savepoint};").into(),
+            commit: format!("RELEASE SAVEPOINT {savepoint};").into(),
+            rollback: format!("ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};")
+                .into(),
+        },
+    }
+}
+
+/// How many columns `table` has now.
+pub(crate) async fn column_count(
+    conn: &mut Conn,
+    table: &pbps_model::TableName,
+) -> Result<i32, String> {
+    let qualified = crate::emit::qualified(table).map_err(|e| e.to_string())?;
+    let rows = conn
+        .query_with(
+            "SELECT count(*)::pg_catalog.int4 AS columns FROM pg_catalog.pg_attribute WHERE attrelid OPERATOR(pg_catalog.=) $1::pg_catalog.text::pg_catalog.regclass AND attnum OPERATOR(pg_catalog.>) 0 AND NOT attisdropped",
+            &[pbps_db::Param::Str(&qualified)],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    rows.first()
+        .and_then(|r| r.try_get("columns").ok().flatten())
+        .ok_or_else(|| "the columns are unreadable".to_owned())
+}
+
+/// What judging a set of stored trees leaves for the caller.
+pub(crate) struct Judged {
+    pub(crate) functions: BTreeMap<Oid, Vec<Use>>,
+    pub(crate) non_immutable: bool,
+    pub(crate) bounds: Vec<(Use, Bound)>,
+}
+
+/// Judges every routine the stored `trees` call by the one predicate, or says
+/// why not. `builtin_types_only` is the v1 scope of a recorded conversion and a
+/// row requirement; a table expression is not held to it, since the types of its
+/// columns have their own input path (DEC-2181.1).
+pub(crate) async fn judge_trees(
+    conn: &mut Conn,
+    admission: &Admission,
+    trees: Vec<(Use, String)>,
+    builtin_types_only: bool,
+    refuse: &dyn Fn(&str) -> String,
+) -> Result<Judged, String> {
+    let major = server_major(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the server version is unreadable"))?;
+    let denied = runs_sql_oids(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the audited list could not be read"))?
+        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
+    let mut bounds = Vec::new();
+    for (used_by, text) in &trees {
+        let bound = bound_objects(text, major)
+            .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
+        bounds.push((used_by.clone(), bound));
+    }
+    // A user function whose body is proven built-in-only adds its body's trees
+    // under this use (#2563), so everything below judges them as the expression.
+    let mut proven = body::Proven::default();
+    body::expand(conn, major, &mut bounds, &mut proven)
+        .await
+        .map_err(|failure| match failure {
+            Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
+            Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
+        })?;
+    // Built-in types only: a user-defined or domain type in the tree runs its
+    // own input path (v1 scope).
+    if builtin_types_only
+        && bounds.iter().any(|(_, bound)| {
+            bound.domain_coercions.iter().any(|_| true)
+                || bound
+                    .types
+                    .iter()
+                    .chain(&bound.input_coercions)
+                    .any(|oid| !is_builtin(Oid::from(*oid)))
+        })
+    {
+        return Err(refuse(
+            "names a type that is not built into PostgreSQL, or coerces to a domain, which \
+             runs code of its own",
+        ));
+    }
+    let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
+    let mut operators: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
+    let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
+    for (used_by, bound) in &bounds {
+        for f in &bound.routines {
+            functions.insert(Oid::from(*f), vec![used_by.clone()]);
+        }
+        for o in &bound.operators {
+            operators.insert(Oid::from(*o), vec![used_by.clone()]);
+        }
+        for (o, f) in &bound.row_compares {
+            row_compares.insert((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]);
+        }
+    }
+    let found = unadmitted_routines(
+        conn,
+        &denied,
+        &functions,
+        &operators,
+        &row_compares,
+        &proven,
+    )
+    .await
+    .map_err(|failure| match failure {
+        Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
+        Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
+    })?;
+    let non_immutable = found.non_immutable;
+    let mut reasons: Vec<Reason> = found.runs_sql.into_iter().map(Reason::Routine).collect();
+    // The engine made every built-in, so only a routine a role wrote has an owner
+    // to trust. Whoever can act as it can replace its body after this read, so
+    // the owner rule of the module docs applies here as it does to a type.
+    let owners: Vec<_> = found
+        .owners
+        .into_iter()
+        .filter(|o| !is_builtin(o.oid))
+        .collect();
+    if !owners.is_empty() || !found.user.is_empty() {
+        let wanted: BTreeSet<Oid> = owners
+            .iter()
+            .map(|o| o.owner_oid)
+            .chain(found.user.iter().map(|u| u.function_owner_oid))
+            .collect();
+        let actors = untrusted_actors(conn, admission.trusted(), &wanted)
+            .await
+            .map_err(|_| {
+                refuse("could not be vetted: the owners of the routines it calls could not be read")
+            })?;
+        for routine in owners {
+            for actor in actors.get(&routine.owner_oid).into_iter().flatten() {
+                reasons.push(Reason::RoutineOwner(RoutineOwnerReason {
+                    kind: routine.kind,
+                    identity: routine.identity.clone(),
+                    owner: routine.owner.clone(),
+                    actor: actor.clone(),
+                }));
+            }
+        }
+        let reviewed = judge_routines(found.user, &actors, admission.pin(), &mut reasons);
+        // At apply, review admits only what the plan showed and pinned; the
+        // refusal is here, before the caller evaluates the expression.
+        if reasons.is_empty()
+            && let Some(oid) = admission.unapproved(&reviewed)
+        {
+            return Err(refuse(&format!(
+                "reaches the routine with OID {oid}, which `pin_type_routines` admits but \
+                 the plan did not show and pin (the catalog changed since planning); \
+                 plan again against the database; nothing has been changed"
+            )));
+        }
+        if reasons.is_empty() {
+            admission.review(reviewed);
+        }
+    }
+    if !reasons.is_empty() {
+        reasons.sort();
+        reasons.dedup();
+        return Err(format!(
+            "{}; nothing has been changed{}",
+            reasons
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+            remedies_for(&reasons, admission).map_or_else(String::new, |r| format!(". {r}"))
+        ));
+    }
+    Ok(Judged {
+        functions,
+        non_immutable,
+        bounds,
+    })
+}
+
 // One argument per fact of the binding table; a struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 async fn vet_in_transaction(
@@ -1289,135 +1480,28 @@ async fn vet_in_transaction(
         .and_then(|row| row.try_get::<&str>("expr").ok().flatten())
         .ok_or_else(|| refuse("could not be vetted: its bound form was not stored"))?
         .to_owned();
-    let major = server_major(conn)
-        .await
-        .map_err(|_| refuse("could not be vetted: the server version is unreadable"))?;
-    let denied = runs_sql_oids(conn)
-        .await
-        .map_err(|_| refuse("could not be vetted: the audited list could not be read"))?
-        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
-    let bound = bound_objects(&text, major)
-        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
-    let used_by = Use {
-        ty: shown.to_owned(),
-        part: if predicate {
-            Part::RowRequirement
-        } else {
-            Part::Conversion
-        },
-    };
-    // A user function whose body is proven built-in-only adds its body's trees
-    // under this use (#2563), so everything below judges them as the expression.
-    let mut bounds = vec![(used_by.clone(), bound)];
-    let mut proven = body::Proven::default();
-    body::expand(conn, major, &mut bounds, &mut proven)
-        .await
-        .map_err(|failure| match failure {
-            Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
-            Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
-        })?;
-    // Built-in types only: a user-defined or domain type in the tree runs its
-    // own input path (v1 scope).
-    if bounds.iter().any(|(_, bound)| {
-        bound.domain_coercions.iter().any(|_| true)
-            || bound
-                .types
-                .iter()
-                .chain(&bound.input_coercions)
-                .any(|oid| !is_builtin(Oid::from(*oid)))
-    }) {
-        return Err(refuse(
-            "names a type that is not built into PostgreSQL, or coerces to a domain, which \
-             runs code of its own",
-        ));
-    }
-    let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
-    let mut operators: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
-    let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
-    for (used_by, bound) in &bounds {
-        for f in &bound.routines {
-            functions.insert(Oid::from(*f), vec![used_by.clone()]);
-        }
-        for o in &bound.operators {
-            operators.insert(Oid::from(*o), vec![used_by.clone()]);
-        }
-        for (o, f) in &bound.row_compares {
-            row_compares.insert((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]);
-        }
-    }
-    let found = unadmitted_routines(
+    let Judged {
+        functions,
+        non_immutable,
+        bounds,
+    } = judge_trees(
         conn,
-        &denied,
-        &functions,
-        &operators,
-        &row_compares,
-        &proven,
+        admission,
+        vec![(
+            Use {
+                ty: shown.to_owned(),
+                part: if predicate {
+                    Part::RowRequirement
+                } else {
+                    Part::Conversion
+                },
+            },
+            text,
+        )],
+        true,
+        &refuse,
     )
-    .await
-    .map_err(|failure| match failure {
-        Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
-        Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
-    })?;
-    let non_immutable = found.non_immutable;
-    let mut reasons: Vec<Reason> = found.runs_sql.into_iter().map(Reason::Routine).collect();
-    // The engine made every built-in, so only a routine a role wrote has an owner
-    // to trust. Whoever can act as it can replace its body after this read, so
-    // the owner rule of the module docs applies here as it does to a type.
-    let owners: Vec<_> = found
-        .owners
-        .into_iter()
-        .filter(|o| !is_builtin(o.oid))
-        .collect();
-    if !owners.is_empty() || !found.user.is_empty() {
-        let wanted: BTreeSet<Oid> = owners
-            .iter()
-            .map(|o| o.owner_oid)
-            .chain(found.user.iter().map(|u| u.function_owner_oid))
-            .collect();
-        let actors = untrusted_actors(conn, admission.trusted(), &wanted)
-            .await
-            .map_err(|_| {
-                refuse("could not be vetted: the owners of the routines it calls could not be read")
-            })?;
-        for routine in owners {
-            for actor in actors.get(&routine.owner_oid).into_iter().flatten() {
-                reasons.push(Reason::RoutineOwner(RoutineOwnerReason {
-                    kind: routine.kind,
-                    identity: routine.identity.clone(),
-                    owner: routine.owner.clone(),
-                    actor: actor.clone(),
-                }));
-            }
-        }
-        let reviewed = judge_routines(found.user, &actors, admission.pin(), &mut reasons);
-        // At apply, review admits only what the plan showed and pinned; the
-        // refusal is here, before the caller evaluates the expression.
-        if reasons.is_empty()
-            && let Some(oid) = admission.unapproved(&reviewed)
-        {
-            return Err(refuse(&format!(
-                "reaches the routine with OID {oid}, which `pin_type_routines` admits but \
-                 the plan did not show and pin (the catalog changed since planning); \
-                 plan again against the database; nothing has been changed"
-            )));
-        }
-        if reasons.is_empty() {
-            admission.review(reviewed);
-        }
-    }
-    if !reasons.is_empty() {
-        reasons.sort();
-        reasons.dedup();
-        return Err(format!(
-            "{}; nothing has been changed{}",
-            reasons
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; "),
-            remedies_for(&reasons, admission).map_or_else(String::new, |r| format!(". {r}"))
-        ));
-    }
+    .await?;
     if !predicate {
         let mut immutable = !non_immutable && !bounds.iter().any(|(_, b)| b.reads_session);
         if immutable {
