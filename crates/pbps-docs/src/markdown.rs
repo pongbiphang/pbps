@@ -393,16 +393,31 @@ fn code_cell(text: &str) -> String {
 }
 
 fn cell(v: Option<&str>) -> String {
-    match v {
-        // Line endings and pipes delimit rows and cells before inline Markdown
-        // is parsed. Inline HTML can close the table even without either.
-        Some(d) => d
-            .replace("\r\n", " ")
-            .replace(['\r', '\n'], " ")
-            .replace('|', "\\|")
-            .replace('<', "&lt;"),
-        None => "—".into(),
+    let Some(d) = v else {
+        return "—".into();
+    };
+    // GFM splits rows and cells before parsing spans, so these transformations
+    // apply inside authored code too (DEC-2676.1).
+    let text = d
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .replace('|', "\\|");
+    let mut chars = text.chars().peekable();
+    let mut out = String::with_capacity(text.len());
+    while let Some(c) = chars.next() {
+        // Comparisons cannot open HTML. Escape every potential HTML opener
+        // without depending on how Markdown parses backticks or link URLs.
+        if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, '/' | '!' | '?'))
+        {
+            out.push_str("&lt;");
+        } else {
+            out.push(c);
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -412,6 +427,108 @@ mod tests {
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn comparisons_keep_less_than_signs_in_code_and_prose() {
+        for text in [
+            "Use `amount < 10`",
+            "a < b",
+            "amount<10",
+            "amount <= 10",
+            "<",
+            "trailing <",
+            "<9 <= <> <_x <名 <é",
+            "``amount < `limit` ``",
+            "```amount < ``limit`` ```",
+            "`a < b` / ``c < d``",
+            "`名 < 字`",
+        ] {
+            assert_eq!(cell(Some(text)), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn potential_html_openers_are_escaped_even_without_complete_tags() {
+        for (text, expected) in [
+            ("<tag>", "&lt;tag>"),
+            ("<Tag>", "&lt;Tag>"),
+            ("<x", "&lt;x"),
+            ("</td></tr><tr><td>", "&lt;/td>&lt;/tr>&lt;tr>&lt;td>"),
+            ("<!-- note -->", "&lt;!-- note -->"),
+            ("<!DOCTYPE html>", "&lt;!DOCTYPE html>"),
+            ("<![CDATA[x]]>", "&lt;![CDATA[x]]>"),
+            ("<?target?>", "&lt;?target?>"),
+            ("</ <! <?", "&lt;/ &lt;! &lt;?"),
+            ("<<tag>", "<&lt;tag>"),
+        ] {
+            assert_eq!(cell(Some(text)), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn backticks_and_backslashes_do_not_change_less_than_classification() {
+        for (before, after) in [
+            ("`", "`"),
+            ("``", "``"),
+            ("`", "``"),
+            ("``", "`"),
+            ("`", ""),
+            (r"\`", "`"),
+            (r"\\`", "`"),
+            ("`", r"\`"),
+        ] {
+            let text = format!("{before}a < b; <x{after}");
+            let expected = format!("{before}a < b; &lt;x{after}");
+            assert_eq!(cell(Some(&text)), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn pipes_in_authored_code_spans_still_cannot_split_cells() {
+        for (text, expected) in [
+            ("`a|b < 10` | outside", r"`a\|b < 10` \| outside"),
+            (r"``a\|b < `limit` ``", r"``a\\|b < `limit` ``"),
+        ] {
+            assert_eq!(cell(Some(text)), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn link_destination_backticks_cannot_hide_raw_html_openers() {
+        assert_eq!(
+            cell(Some("[link](url`) </td></tr><tr><td>tail `")),
+            "[link](url`) &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail `"
+        );
+    }
+
+    #[test]
+    fn line_folding_and_pipe_escaping_keep_safe_less_than_signs() {
+        for (text, expected) in [
+            ("`amount <\r\n10`", "`amount < 10`"),
+            ("<\ntag> <\r/tag> <\r\n?", "< tag> < /tag> < ?"),
+            ("<|", r"<\|"),
+        ] {
+            assert_eq!(cell(Some(text)), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn tag_like_code_keeps_the_documented_entity_spelling() {
+        assert_eq!(
+            cell(Some(
+                "</td></tr><tr><td> `amount < 10` </td> ``<i>`` <tail>"
+            )),
+            "&lt;/td>&lt;/tr>&lt;tr>&lt;td> `amount < 10` &lt;/td> ``&lt;i>`` &lt;tail>"
+        );
+        assert_eq!(cell(Some("`<x`")), "`&lt;x`");
+    }
+
+    #[test]
+    fn missing_empty_and_literal_entity_prose_keep_their_meanings() {
+        assert_eq!(cell(None), "—");
+        assert_eq!(cell(Some("")), "");
+        assert_eq!(cell(Some("&lt; `&lt;`")), "&lt; `&lt;`");
     }
 
     fn documented() -> Schema {
