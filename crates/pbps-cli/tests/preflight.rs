@@ -10,6 +10,7 @@ fn index(unique: bool, filtered: bool) -> Change {
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique,

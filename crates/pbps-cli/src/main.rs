@@ -2684,6 +2684,7 @@ mod consumer_contract_tests {
             key: IndexKey::Column("old".into()),
             descending: false,
             opclass: None,
+            collation: None,
         };
         let ctx = pbps_policy::Context {
             now: 0,

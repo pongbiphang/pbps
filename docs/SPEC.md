@@ -516,8 +516,11 @@ indexes:
   qualified by its schema; a qualified class parses and is refused by name
   until a pinned provider vouches for it. What each method may do and what
   changing one of its parameters costs is one table per method, not a rule per
-  dialect, and a key `collation:`, `method: gist`/`brin` and `exclude:` are
-  refused by name until the later parts of #2448 (DEC-2448.1).
+  dialect (DEC-2448.1). `method: gist` is held over `tsvector`/`tsquery`
+  columns, over `inet`/`cidr` with `opclass: inet_ops`, and over any expression
+  (`int4range(a, b)`); a column key may carry `collation:`, the name of a
+  `pg_catalog` collation, for a column the engine can collate (DEC-2448.2).
+  `method: brin` and `exclude:` are refused by name until their own parts.
 - **A stored generated column is `generated: {expression: "a * 2", stored:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and

@@ -392,20 +392,30 @@ pub const FIXED_ROLES: [&str; 10] = [
 /// database for good and every plan would rebuild the index (DEC-1169.1).
 /// One check for the indexes of a table and of an indexed view alike, so the
 /// two cannot disagree about what the emitter drops.
+///
+/// A key collation (`collation:`) is PostgreSQL's too and refused the same way
+/// (DEC-2448.2): SQL Server's collation is a column's, and a declaration that
+/// the emitter silently drops would differ from the database for good.
 fn operator_classes(what: &str, index: &pbps_model::Index) -> Vec<DialectError> {
-    index
-        .columns
-        .iter()
-        .filter_map(|key| {
-            let class = key.opclass.as_ref()?;
-            Some(invalid(format!(
-                "{what} indexes `{}` with `{class}`, and SQL Server has no operator classes \
+    let mut found = Vec::new();
+    for key in &index.columns {
+        let shown = pbps_model::escape::Escaped(key.key.text());
+        if let Some(class) = &key.opclass {
+            found.push(invalid(format!(
+                "{what} indexes `{shown}` with `{class}`, and SQL Server has no operator classes \
                  (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                pbps_model::escape::Escaped(key.key.text()),
                 class = class.shown(),
-            )))
-        })
-        .collect()
+            )));
+        }
+        if let Some(collation) = &key.collation {
+            found.push(invalid(format!(
+                "{what} collates `{shown}` by `{}`, and a SQL Server index key takes its column's \
+                 collation (declare the collation on the column)",
+                pbps_model::escape::Escaped(collation),
+            )));
+        }
+    }
+    found
 }
 
 /// What an indexed view must satisfy before the engine is asked
@@ -1791,6 +1801,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("c".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: true,
@@ -2023,6 +2034,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("a".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -2221,6 +2233,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column("a".into()),
                 descending: false,
                 opclass: opclass.map(|c| c.parse().unwrap()),
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -2256,6 +2269,16 @@ mod tests {
                 .any(|m| m.contains("`ext.int4_ops`") && m.contains("no operator classes")),
             "{qualified:?}"
         );
+        // A key collation is PostgreSQL's, refused by name; Gist likewise.
+        let mut collated = index(IndexMethod::Btree, None);
+        collated.columns[0].collation = Some("C".to_owned());
+        let collated = messages(collated);
+        assert!(
+            collated.iter().any(|m| m.contains("collates `a` by `C`")),
+            "{collated:?}"
+        );
+        let gist = messages(index(IndexMethod::Gist, None));
+        assert!(gist.iter().any(|m| m.contains("`gist` method")), "{gist:?}");
         let class = messages(index(IndexMethod::Btree, Some("dsc")));
         assert!(
             class
@@ -2277,6 +2300,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include,
             unique: false,
@@ -2946,6 +2970,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("email".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec!["email".into()],
                 unique: false,
@@ -3525,6 +3550,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,

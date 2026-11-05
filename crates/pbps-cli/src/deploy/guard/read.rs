@@ -168,6 +168,7 @@ mod tests {
                 key: IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,

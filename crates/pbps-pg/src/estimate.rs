@@ -510,15 +510,18 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         ),
 
         // In place, on the index alone (measured on 16 and 18): nothing is
-        // rebuilt or read, and the lock is the method's. A B-tree's
-        // parameters take `ShareUpdateExclusiveLock`; a GIN index's take
-        // `AccessExclusiveLock`, which holds every write to the table, since
-        // each writes the index, until it commits (#1442).
+        // rebuilt or read, and the lock is the method's, or the strongest of
+        // the parameters' own. A B-tree's parameters take
+        // `ShareUpdateExclusiveLock`; a GIN index's take `AccessExclusiveLock`,
+        // which holds every write to the table, since each writes the index,
+        // until it commits (#1442). GiST's `buffering` takes it and its
+        // `fillfactor` does not (DEC-2448.2).
         Change::SetIndexStorageParameters {
             table,
             target,
             method,
-            ..
+            set,
+            reset,
         } => {
             let of = match target {
                 pbps_model::IndexPart::PrimaryKey => "the primary key's index".to_owned(),
@@ -534,7 +537,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 table,
                 Rewrite::No,
                 Reads::Nothing,
-                match method.policy().lock {
+                match method
+                    .policy()
+                    .lock_of(set.keys().chain(reset.iter()).map(String::as_str))
+                {
                     pbps_model::storage::IndexLock::ShareUpdateExclusive => {
                         Lock::ShareUpdateExclusive
                     }
@@ -1455,6 +1461,16 @@ mod tests {
         assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
         let e = estimate(&change(pbps_model::IndexMethod::Gin), Strategy::default()).unwrap();
         assert!(matches!(e.lock, Lock::AccessExclusive));
+        // GiST's lock is the strongest of its parameters': `fillfactor` alone
+        // is the light one, `buffering` beside it is not (DEC-2448.2).
+        let e = estimate(&change(pbps_model::IndexMethod::Gist), Strategy::default()).unwrap();
+        assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
+        let mut both = change(pbps_model::IndexMethod::Gist);
+        if let Change::SetIndexStorageParameters { set, .. } = &mut both {
+            set.insert("buffering".to_owned(), "off".to_owned());
+        }
+        let e = estimate(&both, Strategy::default()).unwrap();
+        assert!(matches!(e.lock, Lock::AccessExclusive));
     }
 
     /// A storage parameter change rebuilds and reads nothing, and takes the
@@ -1530,6 +1546,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -1791,6 +1808,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique: false,
@@ -2287,6 +2305,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("v".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,

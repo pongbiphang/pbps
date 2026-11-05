@@ -1201,6 +1201,7 @@ mod tests {
                     key: crate::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -1216,6 +1217,7 @@ mod tests {
                     key: crate::IndexKey::Column("m".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -1262,6 +1264,7 @@ mod tests {
             key: k,
             descending: false,
             opclass: None,
+            collation: None,
         };
         let expression_index = |text: &str| Index {
             columns: vec![
@@ -1366,6 +1369,7 @@ mod tests {
                 key: IndexKey::Expression("n+m".to_owned()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,

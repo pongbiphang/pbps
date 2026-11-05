@@ -102,7 +102,7 @@ async fn the_policy_capabilities_are_the_engines_own() {
                     "SELECT pg_indexam_has_property(oid, '{p}') FROM pg_am WHERE amname = '{am}'"
                 )
             };
-            let column = policy.key_type.map_or("n", |_| "body");
+            let column = key_of(policy);
             for (what, claimed, property_name, clause) in [
                 ("unique", policy.unique, "can_unique", String::new()),
                 (
@@ -137,7 +137,7 @@ async fn the_policy_capabilities_are_the_engines_own() {
         }
         // Negative: a method the table does not hold has no row, and the
         // engine's own list has it (so the absence is the model's choice).
-        for other in ["gist", "brin", "spgist", "hash"] {
+        for other in ["brin", "spgist", "hash"] {
             assert_eq!(IndexMethod::from_am_name(other), None);
             assert!(
                 truth(
@@ -176,7 +176,7 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
             let am = method.as_str();
             db.run(&format!(
                 "CREATE INDEX ix ON t USING {am} ({})",
-                policy.key_type.map_or("n", |_| "body")
+                key_of(policy)
             ))
             .await;
             for parameter in policy.parameters {
@@ -194,7 +194,7 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
                 )
                 .await;
                 db.run("COMMIT").await;
-                let expected = match policy.lock {
+                let expected = match policy.lock_of([parameter.name]) {
                     IndexLock::ShareUpdateExclusive => "ShareUpdateExclusiveLock",
                     IndexLock::AccessExclusive => "AccessExclusiveLock",
                 };
@@ -228,6 +228,18 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
             db.run("DROP INDEX ix").await;
         }
         db.finish().await;
+    }
+}
+
+/// A key every method can be built over: `n` for a B-tree, `body` for GIN, and
+/// an expression for GiST, which has no default class for an integer.
+fn key_of(policy: &pbps_model::storage::MethodPolicy) -> &'static str {
+    if policy.key_type.is_some() {
+        "body"
+    } else if policy.typed_columns.is_empty() {
+        "n"
+    } else {
+        "(int4range(n, n))"
     }
 }
 
@@ -267,6 +279,7 @@ fn add_index(
                 key: pbps_model::IndexKey::Column(key.into()),
                 descending: false,
                 opclass: class,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,
@@ -331,9 +344,9 @@ async fn a_qualified_class_is_spelled_by_its_own_schema_and_a_bare_one_by_pg_cat
     }
 }
 
-/// What the pull says today about each index shape that arrives with a later
-/// part of #2448 or of #2447: the baseline the named refusals are measured
-/// against (M8). Each is left out with a note, nothing else is noted, and the
+/// What the pull says about each index shape that still arrives with a later
+/// part of #2448, #2449 or #2447 (B holds GiST and a `pg_catalog` key
+/// collation): each is left out with a note, nothing else is noted, and the
 /// ordinary index beside them is read as it always was.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
@@ -349,6 +362,8 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
              CREATE TABLE t (id int PRIMARY KEY, c text, r inet, e text, body jsonb);
              CREATE INDEX ix_ok ON t (c);
              CREATE INDEX ix_collated ON t (c COLLATE \"C\");
+             CREATE COLLATION ext.mine (provider = libc, locale = 'C');
+             CREATE INDEX ix_user_collation ON t (c COLLATE ext.mine);
              CREATE INDEX ix_gist ON t USING gist (r inet_ops);
              CREATE INDEX ix_brin ON t USING brin (id);
              CREATE INDEX ix_pattern ON t (e text_pattern_ops);
@@ -362,19 +377,26 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
         let held: Vec<&str> = table.indexes.keys().map(|n| n.raw()).collect();
         assert_eq!(
             held,
-            ["ix_ext_gin", "ix_ok"],
+            ["ix_collated", "ix_ext_gin", "ix_gist", "ix_ok"],
             "only the held shapes are read: {:?}",
             pulled.warnings
         );
+        // Part B holds these two: a `pg_catalog` key collation and GiST.
+        assert_eq!(
+            table.indexes[&pbps_model::ObjectLocalName::from("ix_collated")].columns[0]
+                .collation
+                .as_deref(),
+            Some("C")
+        );
+        assert_eq!(
+            table.indexes[&pbps_model::ObjectLocalName::from("ix_gist")].method,
+            IndexMethod::Gist
+        );
         for (what, expected) in [
-            ("ix_collated", "a later part of #2448"),
-            (
-                "ix_gist",
-                "`gist` method, and this model holds only `btree` and `gin`",
-            ),
+            ("ix_user_collation", "collation this model does not hold"),
             (
                 "ix_brin",
-                "`brin` method, and this model holds only `btree` and `gin`",
+                "`brin` method, and this model holds only `btree`, `gin` and `gist`",
             ),
             ("ix_pattern", "B-tree key's default class"),
             ("ix_ext", "#2447 PR F"),
@@ -387,14 +409,14 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
                 .unwrap_or_else(|| panic!("{what} is named: {:?}", pulled.warnings));
             assert!(note.contains(expected), "{what}: {note}");
         }
-        // The notes about this table are these six and no other; the two about
+        // The notes about this table are these five and no other; the two about
         // the fixture's superuser and `PUBLIC` are the cluster's, not the table's.
         let own = pulled
             .warnings
             .iter()
             .filter(|w| w.contains("`app.t`"))
             .count();
-        assert_eq!(own, 6, "{:#?}", pulled.warnings);
+        assert_eq!(own, 5, "{:#?}", pulled.warnings);
         db.finish().await;
     }
 }

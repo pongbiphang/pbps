@@ -1100,33 +1100,67 @@ indexes:
         }
     }
 
-    /// A key `collation:` is read so that it can be refused by name, and the
-    /// refusal says it arrives with a later part of #2448 and where a
-    /// collation can be written today (DEC-2448.1). Without it the same
-    /// index loads: the refusal is the field's, not the index's.
+    /// A column key's `pg_catalog` collation is held bare, `pg_catalog.` is the
+    /// same collation, and it writes back under `keys:` (DEC-2448.2).
     #[test]
-    fn a_key_collation_is_refused_by_name_until_it_is_held() {
-        let with = errors(
+    fn a_key_collation_is_held_bare_and_written_back() {
+        for spelled in ["C", "pg_catalog.C", "\"pg_catalog.C\""] {
+            let t = load(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n    keys:\n\
+                 \x20     - {{column: a, collation: {spelled}}}\n"
+            ));
+            assert_eq!(
+                t.table.indexes["ix"].columns[0].collation.as_deref(),
+                Some("C"),
+                "{spelled}"
+            );
+        }
+        let t = load(
             "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    keys:\n\
-             \x20     - {column: a, collation: \"C\"}\n",
+             \x20     - {column: a, collation: C}\n",
         );
-        let text = render(&with);
-        assert!(
-            text.contains("`collation: C` is not supported yet") && text.contains("#2448"),
-            "{text}"
+        let written = fmt::render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(written.contains("collation: C"), "{written}");
+        assert_eq!(
+            load(&written).table.indexes["ix"].columns[0]
+                .collation
+                .as_deref(),
+            Some("C")
         );
         let without = load(
             "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    keys:\n\
              \x20     - {column: a}\n",
         );
-        assert_eq!(without.table.indexes["ix"].columns.len(), 1);
+        assert_eq!(without.table.indexes["ix"].columns[0].collation, None);
     }
 
-    /// The access methods and constraints that come with later parts of #2448
-    /// are refused at load today, naming what was written.
+    /// Negative: a collation of another schema, `default`, an empty or quoted
+    /// name are refused by name at load.
     #[test]
-    fn gist_brin_and_exclude_are_refused_by_name_until_their_parts_land() {
-        for method in ["gist", "brin", "spgist", "hash"] {
+    fn a_key_collation_the_model_cannot_hold_is_refused_by_name() {
+        for (spelled, expected) in [
+            ("other.mine", "another schema"),
+            ("default", "leave it out"),
+            ("pg_catalog.default", "leave it out"),
+            ("\"\"", "not the name"),
+        ] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n    keys:\n\
+                 \x20     - {{column: a, collation: {spelled}}}\n"
+            ));
+            assert!(render(&e).contains(expected), "{spelled}: {}", render(&e));
+        }
+    }
+
+    /// GiST loads as a method; the methods and constraints that belong to later
+    /// parts of #2448 and #2449 are still refused at load, naming what was written.
+    #[test]
+    fn gist_loads_and_brin_spgist_hash_and_exclude_are_refused_by_name() {
+        let t = load(
+            "table: app.t\ncolumns:\n  a: {type: tsvector}\nindexes:\n  ix:\n    method: gist\n    columns: [a]\n",
+        );
+        assert_eq!(t.table.indexes["ix"].method, pbps_model::IndexMethod::Gist);
+        for method in ["brin", "spgist", "hash"] {
             let e = errors(&format!(
                 "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n    method: {method}\n    columns: [a]\n"
             ));

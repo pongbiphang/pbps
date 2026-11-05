@@ -1559,11 +1559,14 @@ pub enum IndexMethod {
     Btree,
     /// PostgreSQL's generalized inverted index, over `jsonb` in this model.
     Gin,
+    /// PostgreSQL's generalized search tree: range, `tsvector`, `inet` and the
+    /// other geometric-style keys, mostly through an expression (DEC-2448.2).
+    Gist,
 }
 
 impl IndexMethod {
     /// Every method this model holds, in the order a message lists them.
-    pub const ALL: [IndexMethod; 2] = [IndexMethod::Btree, IndexMethod::Gin];
+    pub const ALL: [IndexMethod; 3] = [IndexMethod::Btree, IndexMethod::Gin, IndexMethod::Gist];
 
     pub fn is_btree(&self) -> bool {
         *self == IndexMethod::Btree
@@ -1574,6 +1577,7 @@ impl IndexMethod {
         match self {
             IndexMethod::Btree => "btree",
             IndexMethod::Gin => "gin",
+            IndexMethod::Gist => "gist",
         }
     }
 
@@ -1646,6 +1650,12 @@ pub struct IndexColumn {
     /// names are accepted is the dialect's question (DEC-1169.1). Bare for
     /// the engine's own, qualified for a schema's (DEC-2448.1).
     pub opclass: Option<crate::OpClassRef>,
+    /// The collation this key is compared under, where it is not the column's
+    /// own: the bare name of a `pg_catalog` collation (`C`), the only ones this
+    /// model holds (DEC-2448.2). Absent is the column's own collation. Only a
+    /// column key has one: an expression carries its own, which the catalog
+    /// does not tell apart.
+    pub collation: Option<String>,
 }
 
 /// What an index key orders by: a column of the table, or an expression over
@@ -1695,6 +1705,7 @@ impl IndexColumn {
             key: IndexKey::Column(name.into()),
             descending: false,
             opclass: None,
+            collation: None,
         }
     }
 }
@@ -1714,6 +1725,8 @@ struct RawIndexColumn {
     descending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     opclass: Option<crate::OpClassRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collation: Option<String>,
 }
 
 impl TryFrom<RawIndexColumn> for IndexColumn {
@@ -1734,6 +1747,7 @@ impl TryFrom<RawIndexColumn> for IndexColumn {
             key,
             descending: raw.descending,
             opclass: raw.opclass,
+            collation: raw.collation,
         })
     }
 }
@@ -1749,6 +1763,7 @@ impl From<IndexColumn> for RawIndexColumn {
             expression,
             descending: c.descending,
             opclass: c.opclass,
+            collation: c.collation,
         }
     }
 }
@@ -1782,6 +1797,29 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&own).unwrap(),
             r#"{"name":"c","descending":false,"opclass":"ext.gist_ops"}"#
+        );
+    }
+
+    /// A key's collation is written only when it is held, so every key from
+    /// before it reads and writes the same bytes; a held one round-trips and an
+    /// unknown field is still refused (DEC-2448.2).
+    #[test]
+    fn an_index_key_collation_is_written_only_when_held() {
+        let plain = r#"{"name":"body","descending":false}"#;
+        let key: IndexColumn = serde_json::from_str(plain).unwrap();
+        assert_eq!(key.collation, None);
+        assert_eq!(serde_json::to_string(&key).unwrap(), plain);
+        let held = r#"{"name":"body","descending":false,"collation":"C"}"#;
+        let key: IndexColumn = serde_json::from_str(held).unwrap();
+        assert_eq!(key.collation.as_deref(), Some("C"));
+        assert_eq!(serde_json::to_string(&key).unwrap(), held);
+        // Negative: a key that differs only by collation is another key.
+        assert_ne!(key, serde_json::from_str::<IndexColumn>(plain).unwrap());
+        assert!(
+            serde_json::from_str::<IndexColumn>(
+                r#"{"name":"b","descending":false,"colation":"C"}"#
+            )
+            .is_err()
         );
     }
 
@@ -2031,6 +2069,7 @@ mod tests {
                 key,
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique,
@@ -2144,6 +2183,7 @@ mod tests {
                 key: IndexKey::Column("email".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: Vec::new(),
             unique: false,

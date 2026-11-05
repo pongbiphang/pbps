@@ -372,9 +372,11 @@ pub struct RawIndex {
     /// Each expression key's text as the engine renders it
     /// (`pg_get_indexdef(oid, k, true)`), and `""` for a column key.
     pub key_texts: Vec<String>,
-    /// Whether any key column is indexed under a collation that is not the
-    /// column's own — `COLLATE "C"`.
-    pub nondefault_collation: bool,
+    /// Each key's collation: `""` where it is the column's own (or an
+    /// expression's inferred default), `schema.name` otherwise
+    /// (`pg_catalog.C`). Computed in the query from `indcollation`, because the
+    /// per-key text the catalog renders leaves the collation out.
+    pub key_collations: Vec<String>,
     /// The index's `reloptions`, each `name=value` as the engine keeps it
     /// (#1442).
     pub reloptions: Vec<String>,
@@ -3568,11 +3570,16 @@ fn unknown_match(
 /// key whether the uniqueness it is enforced against is there.
 fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) -> bool {
     let Some(method) = IndexMethod::from_am_name(&raw.method) else {
-        let held = IndexMethod::ALL
+        let mut words: Vec<String> = IndexMethod::ALL
             .iter()
             .map(|m| format!("`{}`", m.as_str()))
-            .collect::<Vec<_>>()
-            .join(" and ");
+            .collect();
+        let last = words.pop().unwrap_or_default();
+        let held = if words.is_empty() {
+            last
+        } else {
+            format!("{} and {last}", words.join(", "))
+        };
         note(
             pulled,
             &parts.name,
@@ -3615,21 +3622,6 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  planner does not use it, which is what a `CREATE INDEX CONCURRENTLY` that \
                  failed leaves behind. It is left out of the pull, so a declaration of the same \
                  shape reads as an index that is missing rather than one that is present.",
-                raw.name.shown(),
-                parts.name.shown()
-            ),
-        );
-        return false;
-    }
-    if raw.nondefault_collation {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "index `{}` on `{}` orders a column by a collation that is not the column's own \
-                 -- `COLLATE \"C\"` is the one that comes up -- and this model holds no key \
-                 collation yet (a later part of #2448 adds it). Read back it is an ordinary \
-                 index, which compares different values equal, so it is left out.",
                 raw.name.shown(),
                 parts.name.shown()
             ),
@@ -3738,10 +3730,14 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         let Some(opclass) = key_class(raw, parts, table, method, position, &name, pulled) else {
             return false;
         };
+        let Some(collation) = key_collation(raw, parts, &key, position, pulled) else {
+            return false;
+        };
         columns.push(IndexColumn {
             key,
             descending,
             opclass,
+            collation,
         });
     }
 
@@ -3758,6 +3754,70 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         },
     );
     true
+}
+
+/// A key's collation as the model holds it: the bare name of a `pg_catalog`
+/// collation of a column key, `Some(None)` where it is the column's own, or
+/// `None` after naming why the index is left out (DEC-2448.2).
+///
+/// An index under a collation the model cannot hold, read back as an ordinary
+/// one, compares different values equal, so it is left out and named, never
+/// read as the column's own. An expression key is left out too: its collation
+/// is inferred from the expression and the catalog does not say which was
+/// written.
+fn key_collation(
+    raw: &RawIndex,
+    parts: &Parts,
+    key: &pbps_model::IndexKey,
+    position: usize,
+    pulled: &mut Pulled,
+) -> Option<Option<String>> {
+    // An empty entry is the column's own; a missing one is a key the query did
+    // not describe, which is not the same thing.
+    let Some(collation) = raw.key_collations.get(position) else {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}`: the catalog did not say which collation orders `{}`, so the \
+                 index is left out rather than read as the column's own.",
+                raw.name.shown(),
+                parts.name.shown(),
+                pbps_model::escape::Escaped(key.text())
+            ),
+        );
+        return None;
+    };
+    if collation.is_empty() {
+        return Some(None);
+    }
+    let held = key
+        .column()
+        .and_then(|_| collation.strip_prefix("pg_catalog."))
+        .filter(|name| *name != "default");
+    let Some(name) = held else {
+        let why = if key.column().is_none() {
+            "an expression key under a collation other than the database default, which the \
+             catalog does not tell from the expression's own"
+        } else {
+            "a column key under a collation this model does not hold (only a `pg_catalog` \
+             collation other than `default`)"
+        };
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` orders `{}` by `{}`: {why}. Read back it is an ordinary \
+                 index, which compares different values equal, so it is left out.",
+                raw.name.shown(),
+                parts.name.shown(),
+                pbps_model::escape::Escaped(key.text()),
+                pbps_model::escape::Escaped(collation)
+            ),
+        );
+        return None;
+    };
+    Some(Some(name.to_owned()))
 }
 
 /// A key's operator class as the model holds it, or `None` after naming why
@@ -5901,7 +5961,7 @@ mod tests {
             method: "btree".to_owned(),
             key_classes: vec![String::new()],
             key_texts: vec![String::new()],
-            nondefault_collation: false,
+            key_collations: vec![String::new()],
             attached: false,
             reloptions: Vec::new(),
         }
@@ -6162,6 +6222,7 @@ mod tests {
         // One class per key column, as the query reports them; none for the
         // `INCLUDE` payload, which has no order.
         ix.key_classes = vec![String::new(), String::new()];
+        ix.key_collations = vec![String::new(), String::new()];
         ix.filter = Some("(c IS NOT NULL)".to_owned());
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
@@ -7689,6 +7750,7 @@ mod tests {
         ix.columns = vec![0, 1];
         ix.options = vec![3, 0];
         ix.key_classes = vec![String::new(), String::new()];
+        ix.key_collations = vec![String::new(), String::new()];
         ix.key_texts = vec!["(a + 1)".to_owned(), String::new()];
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
@@ -7713,93 +7775,84 @@ mod tests {
         assert_eq!(read.column_keys(), None);
     }
 
-    /// A collation that is not the column's own is left out on its own
-    /// account, whatever the class (DEC-1169.1).
+    /// A `pg_catalog` collation of a column key is read, as the bare name; the
+    /// column's own reads as none (DEC-2448.2).
     #[test]
-    fn an_index_under_another_collation_is_left_out() {
-        let mut ix = index(50, 1, "t_ix");
-        ix.nondefault_collation = true;
-        let raw = RawCatalog {
-            tables: vec![table(1, "t")],
-            columns: vec![col(1, 1, "a", "text")],
-            indexes: vec![ix],
-            ..RawCatalog::default()
-        };
-        let pulled = assemble(&raw);
-        assert!(only(&pulled).indexes.is_empty());
-        assert!(
-            pulled.warnings[0].contains("collation"),
-            "{:?}",
-            pulled.warnings
-        );
-    }
-
-    /// GIN over `jsonb` is read back with its method and, where it is not the
-    /// default, its class; every other class, a same-named class outside
-    /// `pg_catalog`, and a key the catalog did not describe are named and
-    /// left out rather than read as the default (DEC-1169.1).
-    #[test]
-    fn a_gin_index_over_jsonb_is_read_back_with_its_class() {
-        let gin = |classes: &[&str]| {
+    fn a_pg_catalog_key_collation_is_read_and_the_columns_own_is_not() {
+        let read = |collations: &[&str]| {
             let mut ix = index(50, 1, "t_ix");
-            ix.method = "gin".to_owned();
-            ix.key_count = classes.len();
-            ix.columns = (1..=classes.len() as i32).collect();
-            ix.options = vec![0; classes.len()];
-            ix.key_classes = classes.iter().map(|c| (*c).to_owned()).collect();
-            let raw = RawCatalog {
+            ix.key_collations = collations.iter().map(|c| (*c).to_owned()).collect();
+            assemble(&RawCatalog {
                 tables: vec![table(1, "t")],
-                columns: vec![col(1, 1, "body", "jsonb"), col(1, 2, "tags", "jsonb")],
+                columns: vec![col(1, 1, "a", "text")],
                 indexes: vec![ix],
                 ..RawCatalog::default()
-            };
-            assemble(&raw)
+            })
         };
-        let pulled = gin(&["", "pg_catalog.jsonb_path_ops"]);
-        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
-        let ix = &only(&pulled).indexes["t_ix"];
-        assert_eq!(ix.method, IndexMethod::Gin);
-        assert_eq!(ix.columns[0].opclass, None);
-        assert_eq!(
-            ix.columns[1].opclass,
-            Some(OpClassRef::bare("jsonb_path_ops"))
-        );
+        let held = read(&["pg_catalog.C"]);
+        let key = &held
+            .schema
+            .tables
+            .values()
+            .next()
+            .unwrap()
+            .indexes
+            .values()
+            .next()
+            .unwrap()
+            .columns[0];
+        assert_eq!(key.collation.as_deref(), Some("C"));
+        let own = read(&[""]);
+        let key = &own
+            .schema
+            .tables
+            .values()
+            .next()
+            .unwrap()
+            .indexes
+            .values()
+            .next()
+            .unwrap()
+            .columns[0];
+        assert_eq!(key.collation, None);
+    }
 
-        for (classes, expected) in [
-            (&["pg_catalog.jsonb_hash_ops"][..], "jsonb_hash_ops"),
-            (&["public.jsonb_path_ops"][..], "public.jsonb_path_ops"),
-            (&[][..], "did not say"),
+    /// Negative: a collation the model does not hold leaves the index out and
+    /// says why, whatever the class: one of another schema, `default` where the
+    /// column's own is not, an expression key's, and a key the query did not
+    /// describe (DEC-2448.2).
+    #[test]
+    fn an_index_under_a_collation_the_model_does_not_hold_is_left_out() {
+        for (collation, expression, expected) in [
+            ("public.mine", false, "does not hold"),
+            ("pg_catalog.default", false, "does not hold"),
+            ("pg_catalog.C", true, "expression key"),
         ] {
-            let pulled = gin(if classes.is_empty() { &[""] } else { classes });
-            let pulled = if classes.is_empty() {
-                // One key described by none.
-                let mut ix = index(50, 1, "t_ix");
-                ix.method = "gin".to_owned();
-                ix.key_classes = Vec::new();
-                assemble(&RawCatalog {
-                    tables: vec![table(1, "t")],
-                    columns: vec![col(1, 1, "body", "jsonb")],
-                    indexes: vec![ix],
-                    ..RawCatalog::default()
-                })
-            } else {
-                pulled
-            };
-            assert!(only(&pulled).indexes.is_empty(), "{expected}");
+            let mut ix = index(50, 1, "t_ix");
+            ix.key_collations = vec![collation.to_owned()];
+            if expression {
+                ix.columns = vec![0];
+                ix.has_expressions = true;
+                ix.key_texts = vec!["lower(a)".to_owned()];
+            }
+            let pulled = assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "text")],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            });
+            assert!(
+                pulled.schema.tables.values().all(|t| t.indexes.is_empty()),
+                "{collation}"
+            );
             assert!(
                 pulled.warnings.iter().any(|w| w.contains(expected)),
-                "{expected}: {:?}",
+                "{collation}: {:?}",
                 pulled.warnings
             );
         }
-    }
-
-    /// The collation note says the model will hold it in a later part of
-    /// #2448, so a reader knows the omission is a stage and not a decision.
-    #[test]
-    fn the_left_out_collation_names_the_part_that_will_hold_it() {
         let mut ix = index(50, 1, "t_ix");
-        ix.nondefault_collation = true;
+        ix.key_collations = Vec::new();
         let pulled = assemble(&RawCatalog {
             tables: vec![table(1, "t")],
             columns: vec![col(1, 1, "a", "text")],
@@ -7807,9 +7860,10 @@ mod tests {
             ..RawCatalog::default()
         });
         assert!(
-            pulled.warnings[0].contains("a later part of #2448"),
-            "{:?}",
-            pulled.warnings
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("did not say which collation"))
         );
     }
 
@@ -7846,7 +7900,7 @@ mod tests {
     /// the ones it does read from the policy table (DEC-2448.1).
     #[test]
     fn an_access_method_outside_the_policy_table_is_named_and_left_out() {
-        for method in ["gist", "brin", "spgist", "hash", "bloom"] {
+        for method in ["brin", "spgist", "hash", "bloom"] {
             let mut ix = index(50, 1, "t_ix");
             ix.method = method.to_owned();
             let pulled = assemble(&RawCatalog {
@@ -7859,7 +7913,7 @@ mod tests {
             let note = &pulled.warnings[0];
             assert!(
                 note.contains(&format!("`{method}` method"))
-                    && note.contains("only `btree` and `gin`"),
+                    && note.contains("only `btree`, `gin` and `gist`"),
                 "{method}: {note}"
             );
         }

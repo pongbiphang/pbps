@@ -474,6 +474,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
             key: pbps_model::IndexKey::Column(column.into()),
             descending: false,
             opclass: None,
+            collation: None,
         }],
         include: Vec::new(),
         unique: false,

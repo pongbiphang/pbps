@@ -1992,6 +1992,17 @@ fn create_index_on(
                 pbps_model::IndexKey::Column(name) => quote(name.raw())?,
                 pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
             };
+            // `COLLATE` comes before the class in the grammar. Qualified with
+            // `pg_catalog`, the only schema the model holds, so a collation of
+            // the same name earlier on the `search_path` cannot stand in
+            // (DEC-2448.2).
+            if let Some(collation) = &c.collation {
+                key = format!(
+                    "{key} COLLATE {}.{}",
+                    quote("pg_catalog")?,
+                    quote(collation)?
+                );
+            }
             // Qualified, so a class of the same name earlier on the
             // `search_path` cannot stand in for the one declared: a bare class
             // is the engine's own, `pg_catalog`'s, and a schema's carries its
@@ -7777,6 +7788,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("ts".into()),
                     descending: true,
                     opclass: None,
+                    collation: None,
                 }],
                 include: Vec::new(),
                 unique: false,
@@ -8365,6 +8377,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column("v".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -8624,6 +8637,7 @@ mod tests {
                     key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: true,
@@ -8682,6 +8696,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
@@ -10774,6 +10789,7 @@ mod tests {
                     key: pbps_model::IndexKey::Expression("lower(email) -- why".into()),
                     descending: true,
                     opclass: None,
+                    collation: None,
                 },
                 IndexColumn::column("id"),
             ],
@@ -10855,6 +10871,7 @@ mod tests {
             key: pbps_model::IndexKey::Column(name.into()),
             descending: false,
             opclass: opclass.map(|c| c.parse().unwrap()),
+            collation: None,
         };
         let change = Change::AddIndex {
             table: name("app", "doc"),
@@ -10894,6 +10911,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("tags".into()),
                         descending: false,
                         opclass: Some(class.parse().unwrap()),
+                        collation: None,
                     }],
                     include: Vec::new(),
                     unique: false,
@@ -10919,6 +10937,90 @@ mod tests {
         assert!(sql("jsonb_path_ops").contains("\"pg_catalog\".\"jsonb_path_ops\""));
     }
 
+    /// A GiST index is built `USING gist` with its expression, `INCLUDE`,
+    /// parameters and filter in the grammar's order, writes no direction, and
+    /// qualifies its non-default class (DEC-2448.2). The `COLLATE` of a key
+    /// comes before its class and names `pg_catalog`, so a collation of the
+    /// same name earlier on the `search_path` cannot stand in.
+    #[test]
+    fn a_gist_index_and_a_key_collation_are_emitted_in_the_grammars_order() {
+        let index = |keys: Vec<IndexColumn>, method| Index {
+            columns: keys,
+            include: vec!["note".into()],
+            unique: false,
+            filter: Some("active".into()),
+            method,
+            storage_parameters: if method == pbps_model::IndexMethod::Gist {
+                [
+                    ("buffering".to_owned(), "on".to_owned()),
+                    ("fillfactor".to_owned(), "70".to_owned()),
+                ]
+                .into()
+            } else {
+                Default::default()
+            },
+        };
+        let emit = |index: Index| {
+            let change = Change::AddIndex {
+                table: name("app", "booking"),
+                name: "ix".into(),
+                index: Box::new(index),
+                clustered: false,
+            };
+            sql_of(&Postgres::new(), &change).remove(0)
+        };
+        let key =
+            |key: pbps_model::IndexKey, class: Option<&str>, collation: Option<&str>| IndexColumn {
+                key,
+                descending: false,
+                opclass: class.map(|c| c.parse().unwrap()),
+                collation: collation.map(str::to_owned),
+            };
+        let gist = emit(index(
+            vec![
+                key(
+                    pbps_model::IndexKey::Expression("int4range(starts, ends, '[)')".into()),
+                    None,
+                    None,
+                ),
+                key(
+                    pbps_model::IndexKey::Column("ip".into()),
+                    Some("inet_ops"),
+                    None,
+                ),
+            ],
+            pbps_model::IndexMethod::Gist,
+        ));
+        assert!(
+            gist.contains(
+                "CREATE INDEX \"ix\" ON \"app\".\"booking\" USING gist \
+                 ((int4range(starts, ends, '[)')\n), \"ip\" \"pg_catalog\".\"inet_ops\") \
+                 INCLUDE (\"note\") WITH (buffering = 'on', fillfactor = '70') \
+                 WHERE (active\n);"
+            ),
+            "{gist}"
+        );
+        assert!(!gist.contains("ASC") && !gist.contains("DESC"), "{gist}");
+        let collated = emit(index(
+            vec![key(
+                pbps_model::IndexKey::Column("body".into()),
+                None,
+                Some("C"),
+            )],
+            pbps_model::IndexMethod::Btree,
+        ));
+        assert!(
+            collated.contains("(\"body\" COLLATE \"pg_catalog\".\"C\" ASC)"),
+            "{collated}"
+        );
+        // Negative: with no collation the key is as it was.
+        let plain = emit(index(
+            vec![key(pbps_model::IndexKey::Column("body".into()), None, None)],
+            pbps_model::IndexMethod::Btree,
+        ));
+        assert!(!plain.contains("COLLATE"), "{plain}");
+    }
+
     /// An index without a filter and without the hint is the ordinary case, and
     /// it is scoped like everything else; the concurrent one is the only
     /// statement here that is not, because it cannot be.
@@ -10929,6 +11031,7 @@ mod tests {
                 key: pbps_model::IndexKey::Column("n".into()),
                 descending: true,
                 opclass: None,
+                collation: None,
             }],
             include: vec!["m".into()],
             unique: true,
@@ -11056,6 +11159,7 @@ mod tests {
                         key: pbps_model::IndexKey::Column("n".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique: false,

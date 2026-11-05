@@ -44,6 +44,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                         key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
+                        collation: None,
                     }],
                     include: vec![],
                     unique: false,

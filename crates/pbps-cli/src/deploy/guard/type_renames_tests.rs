@@ -30,6 +30,7 @@ fn observed(ty: &str) -> Schema {
                     key: IndexKey::Expression(format!("v = {cast}")),
                     descending: false,
                     opclass: None,
+                    collation: None,
                 }],
                 include: vec![],
                 unique: false,

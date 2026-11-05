@@ -1132,6 +1132,7 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         key: pbps_model::IndexKey::Column(name.into()),
         descending,
         opclass,
+        collation: None,
     };
 
     match parts.as_slice() {
@@ -1235,7 +1236,7 @@ fn parse_index_key(
         )
         .with_help(
             "the format is `{column: <name>}` or `{expression: \"...\"}`, with optional \
-             `opclass:` and `order: asc|desc`",
+             `opclass:`, `collation:` and `order: asc|desc`",
         )
     };
     let e = &v.value;
@@ -1254,20 +1255,38 @@ fn parse_index_key(
         .map(opclass_ref)
         .transpose()
         .map_err(|why: String| bad(&why))?;
-    // The model holds no key collation yet (DEC-2448.1); say so rather than
-    // let a declaration read as if it were kept.
-    if let Some(collation) = &e.collation {
-        return Err(bad(&format!(
-            "`collation: {collation}` is not supported yet; a PostgreSQL index key collation \
-             arrives in a later part of #2448, and until then write `COLLATE` inside an \
-             `expression:` key"
-        )));
-    }
+    let collation = e
+        .collation
+        .as_deref()
+        .map(key_collation)
+        .transpose()
+        .map_err(|why: String| bad(&why))?;
     Ok(IndexColumn {
         key,
         descending: e.order == Some(crate::dto::IndexOrder::Desc),
         opclass,
+        collation,
     })
+}
+
+/// A key's collation as the model holds it: the bare name of a `pg_catalog`
+/// collation, with `pg_catalog.` accepted and dropped (DEC-2448.2). A
+/// collation of another schema is an object this tool does not manage, so a
+/// scratch could lack it, and `default` is what a key already has, so one
+/// index has one spelling. Whether the column can be collated at all is the
+/// dialect's question.
+fn key_collation(text: &str) -> Result<String, String> {
+    let name = text.strip_prefix("pg_catalog.").unwrap_or(text);
+    if name.is_empty() || name.contains(['.', '"', '\0']) {
+        return Err(format!(
+            "`collation: {text}` is not the name of a `pg_catalog` collation; a collation of \
+             another schema is not supported"
+        ));
+    }
+    if name == "default" {
+        return Err("`collation: default` is the collation a key already has; leave it out".into());
+    }
+    Ok(name.to_owned())
 }
 
 /// DTO to domain model for one module.

@@ -371,6 +371,7 @@ fn a_step_defines_only_what_its_own_payload_holds() {
                 key: IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,

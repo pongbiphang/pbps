@@ -541,6 +541,7 @@ fn indexed_view(
                 key: pbps_model::IndexKey::Column(i.column.clone().into()),
                 descending: i.is_descending,
                 opclass: None,
+                collation: None,
             });
         }
     }
@@ -1899,6 +1900,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 key: pbps_model::IndexKey::Column(i.column.clone().into()),
                 descending: i.is_descending,
                 opclass: None,
+                collation: None,
             });
         }
     }

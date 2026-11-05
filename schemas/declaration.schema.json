@@ -766,6 +766,14 @@
           ],
           "default": null
         },
+        "collation": {
+          "description": "A PostgreSQL key collation of a column key: the name of a `pg_catalog`\ncollation (`C`), where it is not the column's own (DEC-2448.2).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "order": {
           "description": "`asc`, the default, or `desc`.",
           "anyOf": [
@@ -799,6 +807,11 @@
           "description": "PostgreSQL's generalized inverted index, over `jsonb` in this model.",
           "type": "string",
           "const": "gin"
+        },
+        {
+          "description": "PostgreSQL's generalized search tree: range, `tsvector`, `inet` and the\nother geometric-style keys, mostly through an expression (DEC-2448.2).",
+          "type": "string",
+          "const": "gist"
         }
       ]
     },
@@ -1858,6 +1871,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 90,
+  "x-pbps-schema-version": 91,
   "x-pbps-tool-version": "0.0.0"
 }

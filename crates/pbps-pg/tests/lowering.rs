@@ -56,6 +56,7 @@ fn index(key: IndexKey, filter: Option<&str>) -> Change {
                 key,
                 descending: false,
                 opclass: None,
+                collation: None,
             }],
             include: vec![],
             unique: false,
