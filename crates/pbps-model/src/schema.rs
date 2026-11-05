@@ -211,7 +211,12 @@ impl Table {
             .map(|name| (name, "primary key"))
             .chain(self.unique.keys().map(|name| (name, "unique constraint")))
             .chain(self.foreign_keys.keys().map(|name| (name, "foreign key")))
-            .chain(self.checks.keys().map(|name| (name, "check constraint")));
+            .chain(self.checks.keys().map(|name| (name, "check constraint")))
+            .chain(
+                self.exclude
+                    .keys()
+                    .map(|name| (name, "exclusion constraint")),
+            );
         let mut seen = BTreeMap::new();
         let mut problems = Vec::new();
         for (name, kind) in names {
@@ -482,6 +487,13 @@ pub struct Table {
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub indexes: BTreeMap<ObjectLocalName, Index>,
+
+    /// PostgreSQL exclusion constraints (#2448, DEC-2448.3), by name. A
+    /// constraint and not an index: it owns its backing index, which is never
+    /// declared beside it. Empty is what every table recorded before the field
+    /// existed truthfully has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclude: BTreeMap<ObjectLocalName, ExclusionConstraint>,
 
     /// Which index holds the table's rows, where that is not the default
     /// (SQL Server's clustered index, #1178).
@@ -1536,6 +1548,71 @@ impl Index {
     }
 }
 
+/// An `EXCLUDE` constraint (DEC-2448.3): the keys and the operator each is
+/// compared with, the method the backing index is built with, the payload and
+/// predicate of that index, and when the constraint is checked.
+///
+/// Always enforced and validated: the engine has no `NOT VALID` and no
+/// `NOT ENFORCED` for it (measured on 16.15 and 18.6), so neither is a field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionConstraint {
+    /// Never defaulted: the engine's default method is a B-tree, and a
+    /// declaration that leaves it out must not read as a GiST one.
+    pub method: IndexMethod,
+    pub keys: Vec<ExclusionKey>,
+    /// Payload columns of the backing index; they have no operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<ColumnName>,
+    /// The predicate of the constraint, kept verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_parameters: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "ExclusionTiming::is_immediate")]
+    pub timing: ExclusionTiming,
+}
+
+/// One key of an exclusion constraint: an index key and the operator it is
+/// excluded with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionKey {
+    pub key: IndexColumn,
+    pub operator: crate::OperatorRef,
+}
+
+/// When an exclusion constraint is checked: the three states the engine has.
+/// An enum, so `NOT DEFERRABLE INITIALLY DEFERRED` cannot be written down.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionTiming {
+    #[default]
+    Immediate,
+    DeferrableImmediate,
+    DeferrableDeferred,
+}
+
+impl ExclusionTiming {
+    pub fn is_immediate(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+}
+
+impl ExclusionConstraint {
+    /// The columns this constraint's keys, payload and predicate name, where
+    /// every key is a column; an expression or a predicate is text the model
+    /// does not parse, so `None` there.
+    pub fn key_columns(&self) -> Option<Vec<ColumnName>> {
+        self.keys
+            .iter()
+            .map(|k| k.key.key.column().cloned())
+            .collect()
+    }
+}
+
 /// How an index is built. A closed list: a method this model does not name is
 /// left out of a pull and reported, never stood in for by one it does.
 #[derive(
@@ -2464,5 +2541,63 @@ mod tests {
             0,
             "a table with neither binds no expression"
         );
+    }
+
+    /// An exclusion constraint's bytes: a table without one writes exactly what
+    /// it wrote before the field existed, one with one reads back as written, and
+    /// the timing states are the engine's three and nothing else (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraint_adds_no_bytes_to_a_table_without_one() {
+        let bare = Table::default();
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("exclude").is_none(), "{json}");
+        let x = ExclusionConstraint {
+            method: IndexMethod::Gist,
+            keys: vec![ExclusionKey {
+                key: IndexColumn {
+                    key: IndexKey::Expression("int4range(a, b)".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                },
+                operator: crate::OperatorRef::symbol("&&").unwrap(),
+            }],
+            include: vec!["note".into()],
+            filter: Some("active".into()),
+            storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            timing: ExclusionTiming::DeferrableDeferred,
+        };
+        let mut table = Table::default();
+        table.exclude.insert("no_overlap".into(), x.clone());
+        let back: Table = serde_json::from_value(serde_json::to_value(&table).unwrap()).unwrap();
+        assert_eq!(back.exclude["no_overlap"], x);
+        // The default timing, and an empty payload, write nothing.
+        let plain = ExclusionConstraint {
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: ExclusionTiming::Immediate,
+            ..x
+        };
+        let written = serde_json::to_value(&plain).unwrap();
+        assert!(
+            written.get("timing").is_none() && written.get("include").is_none(),
+            "{written}"
+        );
+        // Negative: a state's unknown field, an unknown timing and a missing
+        // method are refused, never defaulted.
+        for bad in [
+            r#"{"method":"gist","keys":[],"not_valid":true}"#,
+            r#"{"method":"gist","keys":[],"timing":"never"}"#,
+            r#"{"keys":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ExclusionConstraint>(bad).is_err(),
+                "{bad}"
+            );
+        }
+        // The method's policy says which methods may back one.
+        assert!(IndexMethod::Btree.policy().exclusion && IndexMethod::Gist.policy().exclusion);
+        assert!(!IndexMethod::Gin.policy().exclusion);
     }
 }

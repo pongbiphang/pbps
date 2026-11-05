@@ -267,6 +267,8 @@ pub enum PartKey {
     Unique(ObjectLocalName),
     ForeignKey(ObjectLocalName),
     Check(ObjectLocalName),
+    /// An exclusion constraint; it owns an index of the same name (#2448).
+    Exclusion(ObjectLocalName),
     Policy(String),
     RowSecurity,
     Index(ObjectLocalName),
@@ -865,6 +867,14 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                     out.push(part(PartKey::PrimaryKey));
                 }
                 out.extend(table.unique.keys().cloned().map(PartKey::Unique).map(part));
+                out.extend(
+                    table
+                        .exclude
+                        .keys()
+                        .cloned()
+                        .map(PartKey::Exclusion)
+                        .map(part),
+                );
                 out.extend(
                     table
                         .foreign_keys

@@ -1029,6 +1029,7 @@ impl Cx<'_> {
                             PartKey::Index(n) => was.indexes.get(n) == will.indexes.get(n),
                             PartKey::ForeignKey(_)
                             | PartKey::Check(_)
+                            | PartKey::Exclusion(_)
                             | PartKey::Computed(_)
                             | PartKey::Policy(_)
                             | PartKey::RowSecurity => false,
@@ -1630,6 +1631,7 @@ impl Cx<'_> {
                 .unwrap_or_default(),
             PartKey::ForeignKey(_)
             | PartKey::Check(_)
+            | PartKey::Exclusion(_)
             | PartKey::Computed(_)
             | PartKey::Policy(_)
             | PartKey::RowSecurity => Vec::new(),
@@ -2547,6 +2549,7 @@ fn table_parts(table: &Table) -> Vec<PartKey> {
         out.push(PartKey::PrimaryKey);
     }
     out.extend(table.unique.keys().cloned().map(PartKey::Unique));
+    out.extend(table.exclude.keys().cloned().map(PartKey::Exclusion));
     out.extend(table.foreign_keys.keys().cloned().map(PartKey::ForeignKey));
     out.extend(table.checks.keys().cloned().map(PartKey::Check));
     out.extend(table.indexes.keys().cloned().map(PartKey::Index));

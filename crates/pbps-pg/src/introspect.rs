@@ -343,6 +343,14 @@ pub struct RawConstraint {
     /// defined locally at all. A partition's clone of its parent's CHECK, which
     /// is its parent's to declare (#1577).
     pub inherited: bool,
+    /// An exclusion constraint's operators, one per key in key order: the
+    /// operator's schema and its symbol, the catalog's own spelling (`conexclop`
+    /// joined to `pg_operator`). Empty for every other kind.
+    pub exclusion_op_schemas: Vec<String>,
+    pub exclusion_op_names: Vec<String>,
+    /// `array_length(conexclop)`, which the two lists above must match: a join
+    /// that dropped an operator would otherwise read as a weaker constraint.
+    pub exclusion_op_count: usize,
 }
 
 /// One row of `pg_index`, joined to what it needs from `pg_class` and `pg_am`.
@@ -744,6 +752,10 @@ struct Lookups<'a> {
     /// against a uniqueness that is there, and whether it is there is not known
     /// until the constraint and index arms have had their say.
     surviving_indexes: BTreeSet<i64>,
+    /// Every index by oid: an exclusion constraint's keys, payload and
+    /// predicate are those of its backing index, found by `conindid` and never
+    /// by name (DEC-2448.3).
+    indexes: HashMap<i64, &'a RawIndex>,
 }
 
 /// Everything a table's own assembly needs, gathered once.
@@ -855,6 +867,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map(|i| i.oid)
             .collect(),
         surviving_indexes: BTreeSet::new(),
+        indexes: raw.indexes.iter().map(|i| (i.oid, i)).collect(),
     };
     let constraints_by_table = group(&raw.constraints, |c| c.table_oid);
     let indexes_by_table = group(&raw.indexes, |i| i.table_oid);
@@ -1106,6 +1119,12 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         {
             let options = options_of(constraint.index_oid);
             let what = format!("constraint `{}`", constraint.name.shown());
+            if constraint.kind == 'x'
+                && let Some(x) = table.exclude.get_mut(&constraint.name)
+            {
+                x.storage_parameters = index_parameters(x.method, options, &what, &mut unread);
+                continue;
+            }
             let target = match constraint.kind {
                 'p' => table
                     .primary_key
@@ -3336,17 +3355,7 @@ fn add_constraint(
 
         'f' => add_foreign_key(raw, parts, lookups, table, pulled),
 
-        'x' => note_false(
-            pulled,
-            &parts.name,
-            format!(
-                "`{}` on `{}` is an exclusion constraint, which this model does not hold. It is \
-                 left out of the pull, so a plan cannot see it and `verify` cannot report a \
-                 change to it.",
-                raw.name.shown(),
-                parts.name.shown()
-            ),
-        ),
+        'x' => add_exclusion(raw, parts, lookups, table, pulled),
 
         other => note_false(
             pulled,
@@ -3360,6 +3369,114 @@ fn add_constraint(
             ),
         ),
     }
+}
+
+/// An exclusion constraint, from its constraint row and the index row its
+/// `conindid` names (DEC-2448.3). Every doubt leaves the constraint out and
+/// names it: a constraint read with an operator missing, a key left out or a
+/// timing it cannot say is a weaker guarantee than the one the database gives.
+fn add_exclusion(
+    raw: &RawConstraint,
+    parts: &Parts,
+    lookups: &Lookups,
+    table: &mut Table,
+    pulled: &mut Pulled,
+) -> bool {
+    let left_out = |pulled: &mut Pulled, why: String| {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "exclusion constraint `{}` on `{}` {why}. It is left out of the pull, so a plan \
+                 cannot see it and `verify` cannot report a change to it. Its definition is \
+                 `{}`.",
+                raw.name.shown(),
+                parts.name.shown(),
+                raw.definition
+            ),
+        );
+        false
+    };
+    let Some(index) = raw.index_oid.and_then(|oid| lookups.indexes.get(&oid)) else {
+        return left_out(pulled, "names no backing index this pull read".to_owned());
+    };
+    if !raw.validated || !index.exclusion {
+        return left_out(
+            pulled,
+            "is not a validated exclusion constraint of its index".to_owned(),
+        );
+    }
+    let Some(read) = read_index(index, parts, table, pulled) else {
+        // `read_index` has said why.
+        return false;
+    };
+    if !read.method.policy().exclusion {
+        return left_out(
+            pulled,
+            format!("is built with the `{}` method", read.method.as_str()),
+        );
+    }
+    // One operator per key, and none of the payload's.
+    let keys = read.columns.len();
+    if raw.exclusion_op_count != keys
+        || raw.exclusion_op_names.len() != keys
+        || raw.exclusion_op_schemas.len() != keys
+    {
+        return left_out(
+            pulled,
+            format!(
+                "has {} operator(s) for {keys} key(s); read back with one missing it would be a \
+                 weaker constraint",
+                raw.exclusion_op_count
+            ),
+        );
+    }
+    let mut excluded = Vec::with_capacity(keys);
+    for ((schema, name), key) in raw
+        .exclusion_op_schemas
+        .iter()
+        .zip(&raw.exclusion_op_names)
+        .zip(read.columns)
+    {
+        let held = (schema == "pg_catalog")
+            .then(|| pbps_model::OperatorRef::symbol(name))
+            .flatten();
+        let Some(operator) = held else {
+            return left_out(
+                pulled,
+                format!(
+                    "excludes with the operator `{}.{}`, and this model holds only the operators \
+                     of `pg_catalog` until a pinned provider vouches for another (#2447 PR F)",
+                    pbps_model::escape::Escaped(schema),
+                    pbps_model::escape::Escaped(name)
+                ),
+            );
+        };
+        excluded.push(pbps_model::ExclusionKey { key, operator });
+    }
+    let timing = match (raw.deferrable, raw.deferred) {
+        (false, false) => pbps_model::ExclusionTiming::Immediate,
+        (true, false) => pbps_model::ExclusionTiming::DeferrableImmediate,
+        (true, true) => pbps_model::ExclusionTiming::DeferrableDeferred,
+        (false, true) => {
+            return left_out(
+                pulled,
+                "is `INITIALLY DEFERRED` without being deferrable".to_owned(),
+            );
+        }
+    };
+    table.exclude.insert(
+        raw.name.clone(),
+        pbps_model::ExclusionConstraint {
+            method: read.method,
+            keys: excluded,
+            include: read.include,
+            filter: read.filter,
+            storage_parameters: Default::default(),
+            timing,
+        },
+    );
+    true
 }
 
 fn add_foreign_key(
@@ -3593,6 +3710,33 @@ fn unknown_match(
 /// Returns whether the index reached the pull, which is what tells a foreign
 /// key whether the uniqueness it is enforced against is there.
 fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) -> bool {
+    if raw.exclusion {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` enforces an exclusion constraint, which this model does not \
+                 hold.",
+                raw.name.shown(),
+                parts.name.shown()
+            ),
+        );
+        return false;
+    }
+    match read_index(raw, parts, table, pulled) {
+        Some(index) => {
+            table.indexes.insert(raw.name.clone(), index);
+            true
+        }
+        None => false,
+    }
+}
+
+/// An index row as the model holds it, or `None` after naming why it is left
+/// out. The reading an index and an exclusion constraint's backing index have
+/// in common: the method, each key with its class and collation, the payload
+/// and the predicate (DEC-2448.3).
+fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled) -> Option<Index> {
     let Some(method) = IndexMethod::from_am_name(&raw.method) else {
         let mut words: Vec<String> = IndexMethod::ALL
             .iter()
@@ -3615,7 +3759,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 raw.method,
             ),
         );
-        return false;
+        return None;
     };
     // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
     // `jsonb` columns (DEC-1169.1). Each method's policy says which.
@@ -3631,7 +3775,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 method.as_str().to_ascii_uppercase(),
             ),
         );
-        return false;
+        return None;
     }
     // A failed `CREATE INDEX CONCURRENTLY` leaves a row behind that the
     // planner will not use. Read back as an index, a declaration of the same
@@ -3650,7 +3794,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 parts.name.shown()
             ),
         );
-        return false;
+        return None;
     }
     if raw.nulls_not_distinct {
         note(
@@ -3665,22 +3809,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 parts.name.shown()
             ),
         );
-        return false;
+        return None;
     }
-    if raw.exclusion {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "index `{}` on `{}` enforces an exclusion constraint, which this model does not \
-                 hold.",
-                raw.name.shown(),
-                parts.name.shown()
-            ),
-        );
-        return false;
-    }
-
     let key_count = raw.key_count.min(raw.columns.len());
     let (key_attnums, included) = raw.columns.split_at(key_count);
     let Ok(include) = parts.names(included) else {
@@ -3691,7 +3821,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             &raw.name,
             *raw.columns.last().unwrap_or(&0),
         );
-        return false;
+        return None;
     };
     // A key is a column where `indkey` holds its attnum and an expression
     // where it holds `0`, whose text the catalog renders by position. An
@@ -3712,7 +3842,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                         position + 1
                     ),
                 );
-                return false;
+                return None;
             };
             keys.push(pbps_model::IndexKey::Expression(text.clone()));
         } else {
@@ -3720,7 +3850,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 Ok(mut name) => keys.push(pbps_model::IndexKey::Column(name.remove(0))),
                 Err(missing) => {
                     unresolved(pulled, parts, "index", &raw.name, missing);
-                    return false;
+                    return None;
                 }
             }
         }
@@ -3751,12 +3881,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 ),
             );
         }
-        let Some(opclass) = key_class(raw, parts, table, method, position, &name, pulled) else {
-            return false;
-        };
-        let Some(collation) = key_collation(raw, parts, &key, position, pulled) else {
-            return false;
-        };
+        let opclass = key_class(raw, parts, table, method, position, &name, pulled)?;
+        let collation = key_collation(raw, parts, &key, position, pulled)?;
         columns.push(IndexColumn {
             key,
             descending,
@@ -3765,19 +3891,15 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         });
     }
 
-    table.indexes.insert(
-        raw.name.clone(),
-        Index {
-            columns,
-            include,
-            unique: raw.unique,
-            // Verbatim: see this module's own documentation.
-            filter: raw.filter.clone(),
-            method,
-            storage_parameters: Default::default(),
-        },
-    );
-    true
+    Some(Index {
+        columns,
+        include,
+        unique: raw.unique,
+        // Verbatim: see this module's own documentation.
+        filter: raw.filter.clone(),
+        method,
+        storage_parameters: Default::default(),
+    })
 }
 
 /// A key's collation as the model holds it: the bare name of a `pg_catalog`
@@ -5964,6 +6086,9 @@ mod tests {
             no_inherit: false,
             triggers_not_ordinary: false,
             inherited: false,
+            exclusion_op_schemas: Vec::new(),
+            exclusion_op_names: Vec::new(),
+            exclusion_op_count: 0,
         }
     }
 
@@ -7889,6 +8014,113 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("did not say which collation"))
         );
+    }
+
+    /// An exclusion constraint is read from its constraint row and the index row
+    /// `conindid` names, one operator per key; every doubt leaves it out and names
+    /// it, never reads a weaker constraint (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraint_is_read_whole_or_left_out_by_name() {
+        let build = |tweak: &dyn Fn(&mut RawConstraint, &mut RawIndex)| {
+            let mut x = constraint(1, "t_x", 'x');
+            x.index_oid = Some(50);
+            x.exclusion_op_schemas = vec!["pg_catalog".into()];
+            x.exclusion_op_names = vec!["&&".into()];
+            x.exclusion_op_count = 1;
+            x.definition = "EXCLUDE USING gist (...)".into();
+            let mut ix = index(50, 1, "t_x");
+            ix.exclusion = true;
+            ix.method = "gist".to_owned();
+            ix.columns = vec![0, 2];
+            ix.key_count = 1;
+            ix.options = vec![0];
+            ix.has_expressions = true;
+            ix.key_texts = vec!["int4range(a, a)".to_owned()];
+            ix.filter = Some("(a > 0)".to_owned());
+            ix.reloptions = vec!["fillfactor=70".to_owned()];
+            tweak(&mut x, &mut ix);
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "integer"), col(1, 2, "note", "text")],
+                constraints: vec![x],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        // Held whole: the method, the operator, the payload, the predicate,
+        // the parameters and the timing, and not also as an index of its own.
+        let held = build(&|x, _| x.deferrable = true);
+        let table = only(&held);
+        assert!(table.indexes.is_empty(), "{:?}", held.warnings);
+        let x = &table.exclude["t_x"];
+        assert_eq!(x.method, IndexMethod::Gist);
+        assert_eq!(x.keys.len(), 1);
+        assert_eq!(x.keys[0].operator.raw().to_string(), "&&");
+        assert_eq!(x.include, vec![pbps_model::ColumnName::from("note")]);
+        assert_eq!(x.filter.as_deref(), Some("(a > 0)"));
+        assert_eq!(x.storage_parameters["fillfactor"], "70");
+        assert_eq!(x.timing, pbps_model::ExclusionTiming::DeferrableImmediate);
+        assert!(held.warnings.is_empty(), "{:?}", held.warnings);
+        // Negatives: each is left out with a note, and is not an index either.
+        type Tweak<'a> = &'a dyn Fn(&mut RawConstraint, &mut RawIndex);
+        let cases: [(&str, Tweak<'_>, &str); 7] = [
+            (
+                "one operator short",
+                &|x, _| x.exclusion_op_count = 0,
+                "operator(s) for 1 key",
+            ),
+            (
+                "a lost operator in the join",
+                &|x, _| x.exclusion_op_names.clear(),
+                "operator(s) for 1 key",
+            ),
+            (
+                "an operator of another schema",
+                &|x, _| x.exclusion_op_schemas = vec!["ext".into()],
+                "only the operators of `pg_catalog`",
+            ),
+            (
+                "not validated",
+                &|x, _| x.validated = false,
+                "not a validated",
+            ),
+            (
+                "deferred without being deferrable",
+                &|x, _| x.deferred = true,
+                "INITIALLY DEFERRED",
+            ),
+            (
+                "a method that cannot be read",
+                &|_, ix| ix.method = "hash".to_owned(),
+                "uses the `hash` method",
+            ),
+            (
+                "no backing index",
+                &|x, _| x.index_oid = Some(99),
+                "no backing index",
+            ),
+        ];
+        for (what, tweak, expected) in cases {
+            let pulled = build(tweak);
+            assert!(only(&pulled).exclude.is_empty(), "{what}");
+            assert!(only(&pulled).indexes.is_empty(), "{what}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{what}: {:?}",
+                pulled.warnings
+            );
+        }
+        // The timing words are the engine's three states.
+        for (deferrable, deferred, expected) in [
+            (false, false, pbps_model::ExclusionTiming::Immediate),
+            (true, true, pbps_model::ExclusionTiming::DeferrableDeferred),
+        ] {
+            let pulled = build(&|x, _| {
+                x.deferrable = deferrable;
+                x.deferred = deferred;
+            });
+            assert_eq!(only(&pulled).exclude["t_x"].timing, expected);
+        }
     }
 
     /// A key the method is not held over is named for what it is, from the

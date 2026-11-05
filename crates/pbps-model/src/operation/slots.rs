@@ -192,6 +192,9 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table, policies: bool
     for n in table.unique.keys() {
         out.push(part(NameKind::Key, PartKey::Unique(n.clone()), n.raw()));
     }
+    for n in table.exclude.keys() {
+        out.push(part(NameKind::Key, PartKey::Exclusion(n.clone()), n.raw()));
+    }
     for n in table.indexes.keys() {
         out.push(part(NameKind::Index, PartKey::Index(n.clone()), n.raw()));
     }

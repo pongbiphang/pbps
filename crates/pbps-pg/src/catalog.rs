@@ -939,7 +939,22 @@ fn constraints_query() -> String {
             NOT con.conislocal OR con.coninhcount > 0 AS inherited,
             EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
                      WHERE tg.tgconstraint = con.oid AND tg.tgenabled <> 'O')
-              AS triggers_not_ordinary
+              AS triggers_not_ordinary,
+            -- An exclusion constraint's operator of each key, in key order, as
+            -- the schema and the symbol (DEC-2448.3). `NULL` for every other
+            -- kind, so these are empty there.
+            (SELECT COALESCE(pg_catalog.json_agg(ns.nspname ORDER BY u.n),
+                             '[]'::pg_catalog.json)
+               FROM pg_catalog.unnest(con.conexclop) WITH ORDINALITY AS u(op, n)
+               JOIN pg_catalog.pg_operator o ON o.oid = u.op
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = o.oprnamespace
+            ) AS exclusion_op_schemas,
+            (SELECT COALESCE(pg_catalog.json_agg(o.oprname ORDER BY u.n),
+                             '[]'::pg_catalog.json)
+               FROM pg_catalog.unnest(con.conexclop) WITH ORDINALITY AS u(op, n)
+               JOIN pg_catalog.pg_operator o ON o.oid = u.op
+            ) AS exclusion_op_names,
+            COALESCE(pg_catalog.array_length(con.conexclop, 1), 0) AS exclusion_op_count
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1792,6 +1807,9 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             no_inherit: flag(row, "no_inherit")?,
             triggers_not_ordinary: flag(row, "triggers_not_ordinary")?,
             inherited: flag(row, "inherited")?,
+            exclusion_op_schemas: strings(row, "exclusion_op_schemas")?,
+            exclusion_op_names: strings(row, "exclusion_op_names")?,
+            exclusion_op_count: small(row, "exclusion_op_count")?.max(0) as usize,
         });
     }
     for row in batch.get("indexes").ok_or_else(|| missing("indexes"))? {

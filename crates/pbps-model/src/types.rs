@@ -687,6 +687,101 @@ impl<'de> serde::Deserialize<'de> for OpClassRef {
 // All three cross JSON as one string with a hand-written codec (DEC-2412.1).
 string_json_schema!(TypeRef, CollationName, OpClassRef);
 
+/// The operator of an exclusion key (DEC-2448.3): the symbol of an operator in
+/// `pg_catalog`, which is the only schema this model holds. `&&` and
+/// `pg_catalog.&&` are one operator and both read as the bare symbol; the
+/// emitter always writes `OPERATOR(pg_catalog.&&)`, so a symbol is never
+/// interpolated into SQL as text. A symbol is the engine's operator characters
+/// and nothing else, so no other token can ride in one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperatorRef(String);
+
+impl OperatorRef {
+    /// The characters PostgreSQL allows in an operator name.
+    const CHARS: &'static str = "+-*/<>=~!@#%^&|`?";
+
+    /// An operator of `pg_catalog` by its symbol; `None` if the text is not a
+    /// symbol of at most 63 bytes.
+    #[must_use]
+    pub fn symbol(text: &str) -> Option<Self> {
+        let ok = !text.is_empty()
+            && text.len() <= 63
+            && text.chars().all(|c| Self::CHARS.contains(c))
+            // The engine reads `--` and `/*` as comments, never as an operator.
+            && !text.contains("--")
+            && !text.contains("/*");
+        ok.then(|| Self(text.to_owned()))
+    }
+
+    /// The symbol, as the catalog's `oprname` keeps it.
+    #[must_use]
+    pub fn as_symbol(&self) -> &str {
+        &self.0
+    }
+
+    /// The canonical spelling for SQL, serialization and identity comparisons.
+    #[must_use]
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawOperator(self)
+    }
+
+    /// The canonical spelling for a person, escaped exactly once.
+    #[must_use]
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownOperator(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawOperator<'a>(&'a OperatorRef);
+
+#[derive(Clone, Copy)]
+struct ShownOperator<'a>(&'a OperatorRef);
+
+impl fmt::Display for RawOperator<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.0)
+    }
+}
+
+impl fmt::Display for ShownOperator<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", crate::escape::Escaped(&self.0.0))
+    }
+}
+
+impl FromStr for OperatorRef {
+    type Err = TypeParseError;
+
+    /// The bare symbol, or the same symbol qualified by `pg_catalog`. Any other
+    /// schema is an operator this model does not hold yet (#2447 PR F).
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        let bare = text.strip_prefix("pg_catalog.").unwrap_or(text);
+        Self::symbol(bare).ok_or_else(|| {
+            bad_reference(
+                text,
+                "expected an operator symbol such as `&&` or `=`; only operators of pg_catalog are held",
+            )
+        })
+    }
+}
+
+impl serde::Serialize for OperatorRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OperatorRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+string_json_schema!(OperatorRef);
+
 impl TypeRef {
     /// A reference from two parts exactly as the engine keeps them, with no
     /// folding: the catalog's own `nspname` and `typname`.
@@ -1558,5 +1653,45 @@ mod collation_name_tests {
         for text in ["unqualified", "app.c[]", "app.c.extra", "app.\"\""] {
             assert!(text.parse::<CollationName>().is_err(), "{text}");
         }
+    }
+
+    /// An exclusion operator is the symbol of an operator of `pg_catalog` and
+    /// nothing else: bare or qualified by `pg_catalog` it is one operator, and
+    /// no other text can ride in one (DEC-2448.3).
+    #[test]
+    fn an_exclusion_operator_is_a_pg_catalog_symbol_and_nothing_else() {
+        for text in ["&&", "=", "-|-", "~=", "<>", "pg_catalog.&&", " && "] {
+            let held: OperatorRef = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(
+                held.raw().to_string(),
+                text.trim().trim_start_matches("pg_catalog.")
+            );
+            // The wire form is the bare symbol, and reads back as itself.
+            let json = serde_json::to_string(&held).unwrap();
+            assert_eq!(serde_json::from_str::<OperatorRef>(&json).unwrap(), held);
+        }
+        assert_eq!(
+            "&&".parse::<OperatorRef>().unwrap(),
+            "pg_catalog.&&".parse().unwrap()
+        );
+        // Negative: another schema, empty, a comment opener, letters, a space,
+        // a statement, a quote, and more than the engine's 63 bytes.
+        let long = "+".repeat(64);
+        for text in [
+            "ext.&&",
+            "",
+            "--",
+            "/*",
+            "&&--",
+            "and",
+            "& &",
+            "&&; DROP TABLE t",
+            "\"&&\"",
+            "pg_catalog.",
+            long.as_str(),
+        ] {
+            assert!(text.parse::<OperatorRef>().is_err(), "{text:?}");
+        }
+        assert!(serde_json::from_str::<OperatorRef>("\"ext.&&\"").is_err());
     }
 }

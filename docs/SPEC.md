@@ -522,7 +522,15 @@ indexes:
   columns, over `inet`/`cidr` with `opclass: inet_ops`, and over any expression
   (`int4range(a, b)`); a column key may carry `collation:`, the name of a
   `pg_catalog` collation, for a column the engine can collate (DEC-2448.2).
-  `method: brin` and `exclude:` are refused by name until their own parts.
+  `method: brin` is refused by name until its own part.
+- **A PostgreSQL exclusion constraint is an `exclude:` entry** with a required
+  `method:` (`btree` or `gist`), `keys:` that each name a column or an expression and
+  the `operator:` (a `pg_catalog` symbol such as `&&` or `=`) it is excluded with,
+  and the optional `include:`, `where:`, `storage_parameters:`, `deferrable:` and
+  `initially:`. The pull reads one and the round trip is empty; there is no
+  `NOT VALID` or `NOT ENFORCED` for it. Adding, dropping, replacing or renaming one,
+  a change to a column it holds, and a partitioned table's are refused by name until
+  the parts that deliver them (DEC-2448.3). SQL Server has no such constraint.
 - **A stored generated column is `generated: {expression: "a * 2", stored:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and

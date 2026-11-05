@@ -806,6 +806,7 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
     }
 
     render_indexes(s, &table.indexes, pad, lead);
+    render_exclusions(s, &table.exclude, pad, lead);
 }
 
 /// An `indexes:` block, each line under `pad`: a table's, a partition's, or an
@@ -891,6 +892,76 @@ fn render_indexes(
             }
             if let Some(f) = &ix.filter {
                 let _ = writeln!(s, "{pad}    where: {}", scalar(f));
+            }
+        }
+    }
+}
+
+/// A table's `exclude:` block (DEC-2448.3): always `keys:` with the operator of
+/// each, since a key without an operator is not a key of one.
+fn render_exclusions(
+    s: &mut String,
+    exclusions: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        pbps_model::ExclusionConstraint,
+    >,
+    pad: &str,
+    lead: &str,
+) {
+    if exclusions.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "{lead}{pad}exclude:");
+    for (n, x) in exclusions {
+        let _ = writeln!(s, "{pad}  {}:", scalar(n.raw()));
+        let _ = writeln!(s, "{pad}    method: {}", x.method.as_str());
+        let _ = writeln!(s, "{pad}    keys:");
+        for k in &x.keys {
+            let (field, text) = match &k.key.key {
+                pbps_model::IndexKey::Column(name) => ("column", name.raw()),
+                pbps_model::IndexKey::Expression(text) => ("expression", text.as_str()),
+            };
+            let _ = write!(s, "{pad}      - {field}: {}", scalar(text));
+            if let Some(class) = &k.key.opclass {
+                let _ = write!(
+                    s,
+                    "\n{pad}        opclass: {}",
+                    scalar(&class.raw().to_string())
+                );
+            }
+            if let Some(collation) = &k.key.collation {
+                let _ = write!(s, "\n{pad}        collation: {}", scalar(collation));
+            }
+            if k.key.descending {
+                let _ = write!(s, "\n{pad}        order: desc");
+            }
+            let _ = writeln!(
+                s,
+                "\n{pad}        operator: {}",
+                scalar(&k.operator.raw().to_string())
+            );
+        }
+        if !x.include.is_empty() {
+            let _ = writeln!(s, "{pad}    include: {}", seq(&x.include));
+        }
+        if let Some(f) = &x.filter {
+            let _ = writeln!(s, "{pad}    where: {}", scalar(f));
+        }
+        if !x.storage_parameters.is_empty() {
+            let _ = writeln!(
+                s,
+                "{pad}    storage_parameters: {}",
+                flow(&x.storage_parameters)
+            );
+        }
+        match x.timing {
+            pbps_model::ExclusionTiming::Immediate => {}
+            pbps_model::ExclusionTiming::DeferrableImmediate => {
+                let _ = writeln!(s, "{pad}    deferrable: true");
+            }
+            pbps_model::ExclusionTiming::DeferrableDeferred => {
+                let _ = writeln!(s, "{pad}    deferrable: true");
+                let _ = writeln!(s, "{pad}    initially: deferred");
             }
         }
     }

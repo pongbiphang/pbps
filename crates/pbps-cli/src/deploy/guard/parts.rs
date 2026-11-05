@@ -5,7 +5,7 @@ use pbps_model::{
     plan_names::{At, Holder, PlanNames},
 };
 
-use super::super::{index_as_declared, primary_key_as_declared};
+use super::super::{exclusion_as_declared, index_as_declared, primary_key_as_declared};
 use super::Fields;
 
 /// The primary key has no map name; names in different part namespaces never
@@ -16,6 +16,7 @@ enum Slot<'a> {
     Unique(&'a str),
     ForeignKey(&'a str),
     Check(&'a str),
+    Exclusion(&'a str),
     Policy(&'a str),
     Index(&'a str),
     Computed(&'a str),
@@ -28,6 +29,7 @@ impl<'a> Slot<'a> {
             Part::Unique => Self::Unique(part.name.expect("named unique")),
             Part::ForeignKey => Self::ForeignKey(part.name.expect("named foreign key")),
             Part::Check => Self::Check(part.name.expect("named check")),
+            Part::Exclusion => Self::Exclusion(part.name.expect("named exclusion")),
             Part::Policy => Self::Policy(part.name.expect("named policy")),
             Part::Index => Self::Index(part.name.expect("named index")),
             Part::Computed => Self::Computed(part.name.expect("named computed column")),
@@ -49,6 +51,7 @@ impl<'a> Slot<'a> {
             | Self::ForeignKey(n)
             | Self::Policy(n)
             | Self::Check(n)
+            | Self::Exclusion(n)
             | Self::Index(n)
             | Self::Computed(n) => n,
         }
@@ -60,6 +63,7 @@ impl<'a> Slot<'a> {
             Self::Unique(_) => "unique",
             Self::ForeignKey(_) => "foreign key",
             Self::Check(_) => "check",
+            Self::Exclusion(_) => "exclusion constraint",
             Self::Policy(_) => "row policy",
             Self::Index(_) => "index",
             Self::Computed(_) => "computed column",
@@ -74,6 +78,7 @@ impl<'a> Slot<'a> {
             Self::Unique(n) => PartDefinition::Unique(table.unique.get(n)?, false),
             Self::ForeignKey(n) => PartDefinition::ForeignKey(table.foreign_keys.get(n)?),
             Self::Check(n) => PartDefinition::Check(table.checks.get(n)?),
+            Self::Exclusion(n) => PartDefinition::Exclusion(table.exclude.get(n)?),
             Self::Policy(n) => PartDefinition::Policy(table.row_policies.get(n)?),
             Self::Index(n) => PartDefinition::Index(table.indexes.get(n)?, false),
             Self::Computed(n) => PartDefinition::Computed(table.computed.get(n)?),
@@ -86,6 +91,7 @@ impl<'a> Slot<'a> {
             .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n.raw())))
             .chain(table.row_policies.keys().map(|n| Self::Policy(n)))
             .chain(table.checks.keys().map(|n| Self::Check(n.raw())))
+            .chain(table.exclude.keys().map(|n| Self::Exclusion(n.raw())))
             .chain(table.indexes.keys().map(|n| Self::Index(n.raw())))
             .chain(table.computed.keys().map(|n| Self::Computed(n.raw())))
             .collect()
@@ -141,6 +147,11 @@ impl<'a> Parameters<'a> {
                 self.apply(&mut value.storage_parameters);
                 check(PartDefinition::Index(&value, clustered))
             }
+            PartDefinition::Exclusion(value) => {
+                let mut value = value.clone();
+                self.apply(&mut value.storage_parameters);
+                check(PartDefinition::Exclusion(&value))
+            }
             PartDefinition::ForeignKey(_)
             | PartDefinition::Policy(_)
             | PartDefinition::Check(_)
@@ -190,7 +201,13 @@ impl<'a> PartChanges<'a> {
             Some(Slot::Unique(n)) => Some(pbps_model::Clustered::Unique(n.to_owned().into())),
             Some(Slot::Index(n)) => Some(pbps_model::Clustered::Index(n.to_owned().into())),
             None => Some(pbps_model::Clustered::Heap),
-            Some(Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) | Slot::Policy(_)) => {
+            Some(
+                Slot::ForeignKey(_)
+                | Slot::Check(_)
+                | Slot::Exclusion(_)
+                | Slot::Computed(_)
+                | Slot::Policy(_),
+            ) => {
                 unreachable!("only index-backed parts hold rows")
             }
         };
@@ -218,6 +235,9 @@ impl<'a> PartChanges<'a> {
                             PartDefinition::Index(value, _) => {
                                 table.indexes.insert(name.into(), value.clone());
                             }
+                            PartDefinition::Exclusion(value) => {
+                                table.exclude.insert(name.into(), value.clone());
+                            }
                             PartDefinition::Computed(value) => {
                                 table.computed.insert(name.into(), value.clone());
                             }
@@ -240,6 +260,9 @@ impl<'a> PartChanges<'a> {
                         Slot::Index(n) => {
                             table.indexes.remove(*n);
                         }
+                        Slot::Exclusion(n) => {
+                            table.exclude.remove(*n);
+                        }
                         Slot::Computed(n) => {
                             table.computed.remove(*n);
                         }
@@ -253,6 +276,7 @@ impl<'a> PartChanges<'a> {
                     .map(|p| &mut p.storage_parameters),
                 Slot::Unique(n) => table.unique.get_mut(*n).map(|p| &mut p.storage_parameters),
                 Slot::Index(n) => table.indexes.get_mut(*n).map(|p| &mut p.storage_parameters),
+                Slot::Exclusion(n) => table.exclude.get_mut(*n).map(|p| &mut p.storage_parameters),
                 Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) | Slot::Policy(_) => None,
             };
             if let Some(parameters) = parameters {
@@ -491,6 +515,7 @@ fn clustered(after: PartAfter<'_>) -> bool {
             PartDefinition::ForeignKey(_)
             | PartDefinition::Policy(_)
             | PartDefinition::Check(_)
+            | PartDefinition::Exclusion(_)
             | PartDefinition::Computed(_),
         )
         | PartAfter::Gone(_) => false,
@@ -529,6 +554,9 @@ fn part_as_planned(
         // and the two referential actions — so all of it is comparable (182).
         PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
         PartDefinition::Check(_) => return None,
+        // Structure, as an index's: the text of its expressions and predicate is
+        // the engine's to respell, its operators, method and timing are not.
+        PartDefinition::Exclusion(was) => exclusion_as_declared(was, table.exclude.get(name)?),
         PartDefinition::Policy(was) => was.agrees_when_written(table.row_policies.get(name)?),
         PartDefinition::Index(was, clustered) => {
             index_as_declared(was, table.indexes.get(name)?)

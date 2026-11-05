@@ -173,6 +173,9 @@ impl Inline {
                             constraint: c.clone(),
                             clustered: full.unique_is_clustered(key.raw()),
                         }),
+                        // An exclusion is its own change, never a creation part
+                        // (DEC-2448.3).
+                        PartKey::Exclusion(_) => None,
                         PartKey::ForeignKey(key) => {
                             full.foreign_keys.get(key).map(|c| Change::AddForeignKey {
                                 table: name.clone(),

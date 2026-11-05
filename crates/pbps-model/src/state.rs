@@ -149,7 +149,9 @@ use schemars::JsonSchema;
 /// Version 37 keeps the target assertions the applied plan recorded (DEC-2401.4).
 /// Version 38 records the GiST index method and a column key's collation (DEC-2448.2);
 /// every older snapshot truthfully holds neither.
-pub const CURRENT_VERSION: u32 = 38;
+/// Version 39 records exclusion constraints (DEC-2448.3); every older snapshot truthfully
+/// holds none.
+pub const CURRENT_VERSION: u32 = 39;
 
 /// The oldest snapshot version this build reads as its own.
 ///

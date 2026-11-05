@@ -181,6 +181,13 @@
             "$ref": "#/$defs/IndexDto"
           }
         },
+        "exclude": {
+          "description": "PostgreSQL exclusion constraints (#2448): each names its `method:`\n(`btree` or `gist`) and its `keys:`, every key with the `operator:` it\nis excluded with. Never `NOT VALID` or `NOT ENFORCED`: the engine has\nneither for one.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ExclusionDto"
+          }
+        },
         "clustered": {
           "description": "Which index holds the table's rows, on SQL Server: `heap`, `{unique:\n<constraint>}` or `{index: <index>}`. Absent means the primary key is\nthe clustered index, or the table is a heap if it has no primary key.",
           "anyOf": [
@@ -813,6 +820,125 @@
           "type": "string",
           "const": "gist"
         }
+      ]
+    },
+    "ExclusionDto": {
+      "description": "An `exclude:` entry (DEC-2448.3).",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "`btree` or `gist`. Required: the engine's default is a B-tree, and a\ndeclaration that leaves it out must not be read as a GiST one.",
+          "$ref": "#/$defs/IndexMethod"
+        },
+        "keys": {
+          "description": "The keys, one mapping each, in the constraint's order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExclusionKeyDto"
+          }
+        },
+        "include": {
+          "description": "Payload columns of the backing index; they have no operator.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "where": {
+          "description": "The predicate, kept verbatim.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "storage_parameters": {
+          "description": "The backing index's storage parameters, by its method.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        },
+        "deferrable": {
+          "description": "Whether the constraint may be deferred. Default `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "initially": {
+          "description": "When a deferrable constraint is checked: `immediate` (the default) or\n`deferred`. `deferred` needs `deferrable: true`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InitiallyDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "keys"
+      ]
+    },
+    "ExclusionKeyDto": {
+      "description": "One key of an `exclude:` entry: an index key (`column:` or `expression:`,\nwith the optional `opclass:`, `collation:` and `order:` of an index key) and\nthe `operator:` it is excluded with, a symbol of `pg_catalog` such as `&&`\nor `=`.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "expression": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "opclass": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "collation": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "order": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IndexOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operator"
+      ]
+    },
+    "InitiallyDto": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "deferred"
       ]
     },
     "ClusteredDto": {

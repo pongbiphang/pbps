@@ -1153,10 +1153,10 @@ indexes:
         }
     }
 
-    /// GiST loads as a method; the methods and constraints that belong to later
-    /// parts of #2448 and #2449 are still refused at load, naming what was written.
+    /// GiST loads as a method; the methods that belong to #2449 are still refused
+    /// at load, naming what was written.
     #[test]
-    fn gist_loads_and_brin_spgist_hash_and_exclude_are_refused_by_name() {
+    fn gist_loads_and_brin_spgist_and_hash_are_refused_by_name() {
         let t = load(
             "table: app.t\ncolumns:\n  a: {type: tsvector}\nindexes:\n  ix:\n    method: gist\n    columns: [a]\n",
         );
@@ -1167,9 +1167,105 @@ indexes:
             ));
             assert!(render(&e).contains(method), "{method}: {}", render(&e));
         }
-        let e =
-            errors("table: app.t\ncolumns:\n  a: {type: text}\nexclude:\n  ex: {using: gist}\n");
-        assert!(render(&e).contains("exclude"), "{}", render(&e));
+    }
+
+    const EXCLUDED: &str = "table: app.t\ncolumns:\n  a: {type: integer}\n  b: {type: integer}\n  \
+        ip: {type: inet}\n  note: {type: text}\nexclude:\n";
+
+    /// An `exclude:` entry loads into the model with its method, keys, operators,
+    /// payload, predicate, parameters and timing, and writes back as the same
+    /// constraint (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraint_loads_and_writes_back() {
+        let text = format!(
+            "{EXCLUDED}  no_overlap:\n    method: gist\n    keys:\n      \
+             - {{expression: \"int4range(a, b, '[)')\", operator: \"&&\"}}\n      \
+             - {{column: ip, opclass: inet_ops, operator: pg_catalog.&&}}\n    include: [note]\n    \
+             where: a > 0\n    storage_parameters: {{fillfactor: 70}}\n    deferrable: true\n    \
+             initially: deferred\n  one_per_a:\n    method: btree\n    keys:\n      - {{column: a, operator: \"=\"}}\n"
+        );
+        let t = load(&text);
+        let x = &t.table.exclude["no_overlap"];
+        assert_eq!(x.method, pbps_model::IndexMethod::Gist);
+        assert_eq!(x.keys.len(), 2);
+        assert_eq!(
+            x.keys[0].key.key.expression(),
+            Some("int4range(a, b, '[)')")
+        );
+        assert_eq!(
+            x.keys[1].key.opclass.as_ref().and_then(|c| c.as_bare()),
+            Some("inet_ops")
+        );
+        assert_eq!(x.keys[1].operator.raw().to_string(), "&&");
+        assert_eq!(x.include.len(), 1);
+        assert_eq!(x.filter.as_deref(), Some("a > 0"));
+        assert_eq!(x.storage_parameters["fillfactor"], "70");
+        assert_eq!(x.timing, pbps_model::ExclusionTiming::DeferrableDeferred);
+        assert_eq!(
+            t.table.exclude["one_per_a"].timing,
+            pbps_model::ExclusionTiming::Immediate
+        );
+        let written = fmt::render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(
+            written.contains("exclude:") && written.contains("operator: \"&&\"")
+                || written.contains("operator: '&&'")
+                || written.contains("operator: &&"),
+            "{written}"
+        );
+        assert_eq!(load(&written).table, t.table, "{written}");
+        // `deferrable` alone is immediate until said otherwise.
+        let t = load(&format!(
+            "{EXCLUDED}  x:\n    method: btree\n    keys:\n      - {{column: a, operator: \"=\"}}\n    \
+             deferrable: true\n"
+        ));
+        assert_eq!(
+            t.table.exclude["x"].timing,
+            pbps_model::ExclusionTiming::DeferrableImmediate
+        );
+    }
+
+    /// Negative: everything an exclusion declaration cannot say is refused at load
+    /// by name, never defaulted or ignored (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraint_that_cannot_be_held_is_refused_at_load() {
+        let key = "    keys:\n      - {column: a, operator: \"=\"}\n";
+        for (body, expected) in [
+            // No default method: the engine's default is not GiST.
+            (format!("  x:\n{key}"), "method"),
+            ("  x:\n    method: btree\n".to_owned(), "keys"),
+            (
+                "  x:\n    method: btree\n    keys:\n      - {column: a}\n".to_owned(),
+                "operator",
+            ),
+            (
+                "  x:\n    method: btree\n    keys:\n      - {column: a, operator: \"ext.=\"}\n"
+                    .to_owned(),
+                "pg_catalog",
+            ),
+            (
+                "  x:\n    method: btree\n    keys:\n      - {column: a, operator: \"= ; DROP\"}\n"
+                    .to_owned(),
+                "operator symbol",
+            ),
+            (
+                "  x:\n    method: btree\n    keys:\n      - {column: a, expression: \"b\", operator: \"=\"}\n"
+                    .to_owned(),
+                "not both",
+            ),
+            (format!("  x:\n    method: btree\n{key}    not_valid: true\n"), "not_valid"),
+            (format!("  x:\n    method: btree\n{key}    enforced: false\n"), "enforced"),
+            (
+                format!("  x:\n    method: btree\n{key}    initially: deferred\n"),
+                "not deferrable",
+            ),
+            (
+                format!("  x:\n    method: btree\n{key}    storage_parameters: {{buffering: on}}\n"),
+                "storage parameter",
+            ),
+        ] {
+            let e = errors(&format!("{EXCLUDED}{body}"));
+            assert!(render(&e).contains(expected), "{body}: {}", render(&e));
+        }
     }
 
     /// Report every problem at once, rather than fix-one-run-again.

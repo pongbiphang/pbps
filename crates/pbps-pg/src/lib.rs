@@ -2017,6 +2017,38 @@ impl Dialect for Postgres {
         if table.partition_of.is_none() {
             found.extend(validate::table_structure(table));
         }
+        // An exclusion constraint's expression or predicate that may call a
+        // function this project declares is refused for now: the plan's
+        // ordering of such a constraint against the function it calls is the
+        // index machinery's (DEC-1169.2), which an exclusion is not on yet
+        // (DEC-2448.3). The engine would refuse the constraint where the
+        // function does not exist yet, so this says so before any plan.
+        for (exclusion, x) in &table.exclude {
+            let texts = x
+                .filter
+                .iter()
+                .map(String::as_str)
+                .chain(x.keys.iter().filter_map(|k| k.key.key.expression()));
+            for text in texts {
+                for id in schema.modules.keys() {
+                    if matches!(id, pbps_model::ModuleId::Routine(_))
+                        && generated::may_call(text, id.name())
+                    {
+                        found.push(DialectError::Invalid {
+                            dialect: types::DIALECT,
+                            message: format!(
+                                "exclusion constraint `{}` on `{}` may call the routine `{}` of \
+                                 this project in an expression or predicate; that is not held yet \
+                                 (an exclusion over built-in functions and operators is)",
+                                exclusion.shown(),
+                                name.shown(),
+                                pbps_model::escape::Escaped(id.name()),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         if table.has_row_security() {
             let invalid = |message| DialectError::Invalid {
                 dialect: types::DIALECT,
@@ -8485,6 +8517,65 @@ mod enum_partition_key_tests {
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    /// An exclusion constraint whose expression or predicate may call a routine
+    /// this project declares is refused by name, since the plan's order against
+    /// that routine is the index machinery's and an exclusion is not on it yet;
+    /// one over built-in functions, or over a routine only by a lookalike
+    /// word, is held (DEC-2448.3).
+    #[test]
+    fn an_exclusion_that_may_call_a_projects_routine_is_refused_by_name() {
+        let exclusion = |expression: &str, filter: Option<&str>| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "a".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table.exclude.insert(
+                "x".into(),
+                pbps_model::ExclusionConstraint {
+                    method: pbps_model::IndexMethod::Gist,
+                    keys: vec![pbps_model::ExclusionKey {
+                        key: pbps_model::IndexColumn {
+                            key: pbps_model::IndexKey::Expression(expression.to_owned()),
+                            descending: false,
+                            opclass: None,
+                            collation: None,
+                        },
+                        operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                    }],
+                    include: Vec::new(),
+                    filter: filter.map(str::to_owned),
+                    storage_parameters: Default::default(),
+                    timing: pbps_model::ExclusionTiming::Immediate,
+                },
+            );
+            table
+        };
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            "app.span(integer)".parse().unwrap(),
+            pbps_model::Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "CREATE FUNCTION app.span(a integer) RETURNS int4range \
+                             AS 'SELECT int4range(a, a)' LANGUAGE sql IMMUTABLE;"
+                    .into(),
+                options: Default::default(),
+            },
+        );
+        let said = problems(&exclusion("app.span(a)", None), &schema).join("\n");
+        assert!(said.contains("may call the routine `span`"), "{said}");
+        let said = problems(
+            &exclusion("int4range(a, a)", Some("app.span(a) IS NOT NULL")),
+            &schema,
+        )
+        .join("\n");
+        assert!(said.contains("may call the routine `span`"), "{said}");
+        // Held: built-ins only, and the same table in a project with no routine.
+        assert!(problems(&exclusion("int4range(a, a)", Some("a > 0")), &schema).is_empty());
+        assert!(problems(&exclusion("app.span(a)", None), &Schema::default()).is_empty());
     }
 
     /// DEC-2346.1: a scalar reference to a declared enum keys a LIST or RANGE

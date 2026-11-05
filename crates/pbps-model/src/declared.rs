@@ -58,6 +58,15 @@ pub struct DeclaredExpressions {
     /// indexes with an expression key appear (DEC-1169.2).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, Vec<Option<String>>>>,
+    /// `ExclusionConstraint::filter`, by table and constraint name; only
+    /// constraints with a predicate appear (DEC-2448.3).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusion_filters: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, String>>,
+    /// An exclusion constraint's keys as `keys` records an index's: the declared
+    /// text of an expression key and `None` for a column key; only constraints
+    /// with an expression key appear.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusion_keys: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, Vec<Option<String>>>>,
     /// Both predicates independently, without manufacturing omitted clauses.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policies: BTreeMap<TableName, BTreeMap<String, DeclaredPolicyExpressions>>,
@@ -91,6 +100,8 @@ impl DeclaredExpressions {
             && self.checks.is_empty()
             && self.filters.is_empty()
             && self.keys.is_empty()
+            && self.exclusion_filters.is_empty()
+            && self.exclusion_keys.is_empty()
             && self.policies.is_empty()
     }
 }
@@ -98,17 +109,17 @@ impl DeclaredExpressions {
 /// An index's keys as `DeclaredExpressions::keys` records them, or `None`
 /// where every key is a column and there is nothing to record.
 fn declared_keys(index: &crate::schema::Index) -> Option<Vec<Option<String>>> {
-    index
-        .columns
-        .iter()
-        .any(|c| c.key.expression().is_some())
-        .then(|| {
-            index
-                .columns
-                .iter()
-                .map(|c| c.key.expression().map(str::to_owned))
-                .collect()
-        })
+    keys_text(index.columns.iter())
+}
+
+/// [`declared_keys`] for any run of index keys: an exclusion constraint's too.
+fn keys_text<'a>(
+    keys: impl Iterator<Item = &'a crate::schema::IndexColumn> + Clone,
+) -> Option<Vec<Option<String>>> {
+    keys.clone().any(|c| c.key.expression().is_some()).then(|| {
+        keys.map(|c| c.key.expression().map(str::to_owned))
+            .collect()
+    })
 }
 
 /// What one declaration's unqualified references resolved to when it was
@@ -343,8 +354,35 @@ impl Declared {
                         .insert(index.clone(), keys);
                 }
             }
+            for (exclusion, spec) in &table.exclude {
+                d.record_exclusion(name, exclusion, spec);
+            }
         }
         d
+    }
+
+    /// The declared text of an exclusion constraint's predicate and expression
+    /// keys, as an index's are recorded (DEC-2448.3).
+    fn record_exclusion(
+        &mut self,
+        table: &TableName,
+        name: &crate::ObjectLocalName,
+        spec: &crate::schema::ExclusionConstraint,
+    ) {
+        if let Some(filter) = &spec.filter {
+            self.expressions
+                .exclusion_filters
+                .entry(table.clone())
+                .or_default()
+                .insert(name.clone(), filter.clone());
+        }
+        if let Some(keys) = keys_text(spec.keys.iter().map(|k| &k.key)) {
+            self.expressions
+                .exclusion_keys
+                .entry(table.clone())
+                .or_default()
+                .insert(name.clone(), keys);
+        }
     }
 
     /// Carries the record forward over the changes a plan ran.
@@ -471,6 +509,12 @@ impl Declared {
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
+                    self.expressions
+                        .exclusion_filters
+                        .extend(fresh.expressions.exclusion_filters);
+                    self.expressions
+                        .exclusion_keys
+                        .extend(fresh.expressions.exclusion_keys);
                     self.expressions.policies.extend(fresh.expressions.policies);
                 }
                 Change::DropTable { name, .. } => self.forget_table(name),
@@ -500,6 +544,12 @@ impl Declared {
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
+                    self.expressions
+                        .exclusion_filters
+                        .extend(fresh.expressions.exclusion_filters);
+                    self.expressions
+                        .exclusion_keys
+                        .extend(fresh.expressions.exclusion_keys);
                     self.expressions.policies.extend(fresh.expressions.policies);
                     let renamed = |kind: crate::DetachedKind, of: &crate::ObjectLocalName| {
                         names
@@ -566,6 +616,12 @@ impl Declared {
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
+                    self.expressions
+                        .exclusion_filters
+                        .extend(fresh.expressions.exclusion_filters);
+                    self.expressions
+                        .exclusion_keys
+                        .extend(fresh.expressions.exclusion_keys);
                 }
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
@@ -574,6 +630,8 @@ impl Declared {
                     rekey_table(&mut self.expressions.checks, from, to);
                     rekey_table(&mut self.expressions.filters, from, to);
                     rekey_table(&mut self.expressions.keys, from, to);
+                    rekey_table(&mut self.expressions.exclusion_filters, from, to);
+                    rekey_table(&mut self.expressions.exclusion_keys, from, to);
                     rekey_table(&mut self.expressions.policies, from, to);
                     rekey_table(&mut self.bindings.defaults, from, to);
                     rekey_table(&mut self.bindings.checks, from, to);
@@ -789,6 +847,8 @@ impl Declared {
         self.expressions.checks.remove(name);
         self.expressions.filters.remove(name);
         self.expressions.keys.remove(name);
+        self.expressions.exclusion_filters.remove(name);
+        self.expressions.exclusion_keys.remove(name);
         self.expressions.policies.remove(name);
         self.bindings.defaults.remove(name);
         self.bindings.checks.remove(name);
@@ -933,6 +993,36 @@ impl Declared {
                         for (d, c) in declared.iter().zip(&mut spec.columns) {
                             if let Some(text) = d {
                                 c.key = crate::IndexKey::Expression(text.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(filters) = self.expressions.exclusion_filters.get(name) {
+                for (exclusion, spec) in &mut table.exclude {
+                    if let Some(declared) = filters.get(exclusion)
+                        && spec.filter.is_some()
+                    {
+                        spec.filter = Some(declared.clone());
+                    }
+                }
+            }
+            // The same rule as an index's keys: only where the read-back has the
+            // recorded shape (DEC-2448.3).
+            if let Some(keys) = self.expressions.exclusion_keys.get(name) {
+                for (exclusion, spec) in &mut table.exclude {
+                    let Some(declared) = keys.get(exclusion) else {
+                        continue;
+                    };
+                    let same_shape = declared.len() == spec.keys.len()
+                        && declared
+                            .iter()
+                            .zip(&spec.keys)
+                            .all(|(d, k)| d.is_some() == k.key.key.expression().is_some());
+                    if same_shape {
+                        for (d, k) in declared.iter().zip(&mut spec.keys) {
+                            if let Some(text) = d {
+                                k.key.key = crate::IndexKey::Expression(text.clone());
                             }
                         }
                     }
@@ -1714,5 +1804,82 @@ mod tests {
         );
         // With nothing recorded, the overlay is the identity.
         assert_eq!(Declared::default().overlay(&read_back), read_back);
+    }
+
+    fn excluded() -> crate::ExclusionConstraint {
+        crate::ExclusionConstraint {
+            method: crate::IndexMethod::Gist,
+            keys: vec![
+                crate::ExclusionKey {
+                    key: IndexColumn {
+                        key: crate::IndexKey::Expression("int4range(n, m, '[)')".to_owned()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    },
+                    operator: crate::OperatorRef::symbol("&&").unwrap(),
+                },
+                crate::ExclusionKey {
+                    key: IndexColumn::column("m"),
+                    operator: crate::OperatorRef::symbol("=").unwrap(),
+                },
+            ],
+            include: Vec::new(),
+            filter: Some("n > 0".to_owned()),
+            storage_parameters: Default::default(),
+            timing: crate::ExclusionTiming::Immediate,
+        }
+    }
+
+    /// An exclusion constraint's expression keys and predicate are recorded as
+    /// declared and put back over the engine's respelling, only where the
+    /// read-back has the shape the record has (DEC-2448.3).
+    #[test]
+    fn an_exclusions_declared_texts_are_recorded_and_overlaid() {
+        let mut declared_schema = schema();
+        declared_schema
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .exclude
+            .insert("no_overlap".into(), excluded());
+        let declared = Declared::from_schema(&declared_schema);
+        assert_eq!(
+            declared.expressions.exclusion_keys[&t()]["no_overlap"],
+            vec![Some("int4range(n, m, '[)')".to_owned()), None]
+        );
+        assert_eq!(
+            declared.expressions.exclusion_filters[&t()]["no_overlap"],
+            "n > 0"
+        );
+        // The engine respells both; the overlay puts the declared text back.
+        let mut read_back = declared_schema.clone();
+        let x = read_back
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap();
+        x.keys[0].key.key = crate::IndexKey::Expression("int4range(n, m, '[)'::text)".to_owned());
+        x.filter = Some("(n > 0)".to_owned());
+        let base = declared.overlay(&read_back);
+        assert_eq!(base.tables[&t()].exclude["no_overlap"], excluded());
+        // Negative: a key that is a column in the read-back is not given an
+        // expression, and an absent predicate is not made one.
+        let mut changed = declared_schema.clone();
+        let x = changed
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .exclude
+            .get_mut("no_overlap")
+            .unwrap();
+        x.keys[0].key.key = crate::IndexKey::Column("n".into());
+        x.filter = None;
+        let base = declared.overlay(&changed);
+        let x = &base.tables[&t()].exclude["no_overlap"];
+        assert_eq!(x.keys[0].key.key, crate::IndexKey::Column("n".into()));
+        assert_eq!(x.filter, None);
     }
 }

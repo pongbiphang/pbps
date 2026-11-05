@@ -9473,3 +9473,60 @@ not change). Every addition is skipped when empty, so a btree or GIN index
 without a collation keeps its bytes. The model holds the collation as a string
 and not as a reference type because only `pg_catalog` is admitted; admitting
 another schema is a format change of its own.
+
+
+<a id="dec-2448-3"></a>
+
+**DEC-2448.3. EXCLUDE constraints on ordinary tables: read and round trip (#2448 PR C1a).**
+A table gains `exclude:`, a map by name of `ExclusionConstraint`: a required
+`method` (`btree` or `gist`; never defaulted, because the engine's default is a
+B-tree and a declaration that leaves it out must not read as GiST), `keys`, each
+an index key (column or expression, optional `opclass`, `collation`, `order`)
+with the `operator` it is excluded with, `include`, a `where` predicate, storage
+parameters, and a timing that is one of the engine's three states
+(`ExclusionTiming`: immediate, deferrable and immediate, deferrable and
+deferred; `deferrable: false` with `initially: deferred` cannot be built). It
+is a constraint and owns its backing index, which is never declared beside it
+and is read by `conindid`, never by name. Measured on 16.15 and 18.6, identical:
+the engine has no `NOT VALID` and no `NOT ENFORCED` for it (16 does not even
+parse the latter), so neither is a field; the index is named like the constraint;
+`pg_get_constraintdef` omits `INITIALLY IMMEDIATE` and a default class, so a
+reader uses the structured rows (per-key text, `indclass`, `indcollation`, and
+`conexclop` joined to `pg_operator`), where an `INCLUDE` column has no operator.
+
+The operator is `OperatorRef`: the symbol of a `pg_catalog` operator, written
+bare or `pg_catalog.&&` (one operator), validated against the engine's operator
+characters. An operator of another schema is held by #2447 PR F. Whether an
+operator is commutative, a member of its key's operator family or boolean is the
+engine's to say, as which key types a method takes is, so validation does not
+whitelist operators.
+
+**This part reads and plans nothing.** The pull reads a constraint whole or
+leaves it out with a note: an operator count that differs from the key count (a
+join that lost one would read a weaker constraint), a backing index it cannot
+find, an unvalidated or non-enforced row, an `INITIALLY DEFERRED` without
+deferrable, a method outside the model (the engine accepts `hash` and `spgist`
+too). Pull, baseline, verify and the next plan round trip to no change. The
+authored text of an expression key and of the predicate is recorded beside the
+read-back and put over the engine's respelling (`DeclaredExpressions`
+`exclusion_keys`, `exclusion_filters`), as an index's are, so a plan does not
+re-plan on the deparser's casts. **Every difference in an exclusion is refused
+by name in the differ**: adding one arrives in the next part, and dropping,
+replacing or renaming one (a drop and an add) with the retirement record after
+it. So is a plan that drops or retypes a column a standing exclusion holds:
+measured, `DROP COLUMN` of a plain key column drops the constraint silently, one
+inside an expression is refused by a dependency, and `ALTER COLUMN TYPE`
+silently rebuilds it under an exclusive lock; a column a key's expression or
+the predicate mentions as a word counts as held.
+
+Refused at `validate` by name: a partitioned table or a partition (16 refuses a
+parent's and 18 requires the partition key), an expression or predicate that may
+call a routine of the project (its order against the routine is the index
+machinery's, which an exclusion is not on yet), a method that cannot back one
+(`gin`), a key class the method does not hold, a non-`pg_catalog` operator, and
+SQL Server as a whole.
+
+Formats: plan 68 (an older build would drop `exclude` from a table in a
+payload), state 39, published schema set 92 (the declaration schema gains
+`exclude:`). The ids file and its tree are untouched. A table with no exclusion
+serialises exactly as before.

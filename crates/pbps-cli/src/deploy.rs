@@ -5228,6 +5228,27 @@ fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> b
         && declared.storage_parameters == now.storage_parameters
 }
 
+/// Whether an exclusion constraint read back is the one declared (DEC-2448.3):
+/// the method, timing, payload, storage parameters, and each key's direction,
+/// class and operator, with an expression by being one, as an index key is, and
+/// the predicate by being there or not.
+fn exclusion_as_declared(
+    declared: &pbps_model::ExclusionConstraint,
+    now: &pbps_model::ExclusionConstraint,
+) -> bool {
+    declared.method == now.method
+        && declared.timing == now.timing
+        && declared.include == now.include
+        && declared.filter.is_some() == now.filter.is_some()
+        && declared.storage_parameters == now.storage_parameters
+        && declared.keys.len() == now.keys.len()
+        && declared.keys.iter().zip(&now.keys).all(|(d, n)| {
+            key_as_declared(&d.key, &n.key)
+                && d.key.collation == n.key.collation
+                && d.operator == n.operator
+        })
+}
+
 /// Whether an index key read back is the one declared: a column by its name,
 /// and an expression by being one — its text is the engine's to respell, as a
 /// filter's is (DEC-1169.2) — each with the same direction and class.

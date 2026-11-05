@@ -99,6 +99,16 @@ impl Renames {
             }
             ix.include = self.column_list(name, &ix.include);
         }
+        for x in t.exclude.values_mut() {
+            for k in &mut x.keys {
+                // An expression and the predicate are left as written, as an
+                // index's are.
+                if let crate::IndexKey::Column(column) = &mut k.key.key {
+                    *column = self.column(name, column);
+                }
+            }
+            x.include = self.column_list(name, &x.include);
+        }
         for f in t.foreign_keys.values_mut() {
             f.columns = self.column_list(name, &f.columns);
             // The referenced columns belong to the referenced table, so they

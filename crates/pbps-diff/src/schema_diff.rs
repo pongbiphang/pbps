@@ -46,6 +46,12 @@ pub enum DiffError {
         method: &'static str,
         parameter: String,
     },
+    #[error("exclusion constraint `{}` on `{}`: {reason} (DEC-2448.3)", .name.shown(), .table.shown())]
+    ExclusionRefused {
+        table: TableName,
+        name: pbps_model::ObjectLocalName,
+        reason: String,
+    },
     #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
     ExtensionLifecycleUnsupported {
         name: pbps_model::ObjectLocalName,
@@ -1223,6 +1229,16 @@ pub(crate) fn diff_partial_rebuilding(
                     origin: pbps_model::RowSecurityOrigin::Created,
                 });
             }
+            // An exclusion on a new table is added by a change of the next part
+            // (DEC-2448.3); until then it is refused by name, never dropped from
+            // the payload, so no plan creates the table without it.
+            for exclusion in table.exclude.keys() {
+                errs.push(DiffError::ExclusionRefused {
+                    table: name.clone(),
+                    name: exclusion.clone(),
+                    reason: "adding one arrives in the next PR".to_owned(),
+                });
+            }
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -1538,6 +1554,7 @@ pub(crate) fn diff_partial_rebuilding(
             continue;
         }
 
+        let mark = changes.len();
         diff_columns(
             &index,
             &types,
@@ -1550,11 +1567,23 @@ pub(crate) fn diff_partial_rebuilding(
             &mut changes,
             &mut errs,
         );
+        exclusion_hazards(
+            declared_name,
+            &renames.apply(base_table, base_name),
+            &changes[mark..],
+            &mut errs,
+        );
         diff_constraints(
             declared_name,
             &renames.apply(base_table, base_name),
             declared_table,
             &mut changes,
+            &mut errs,
+        );
+        diff_exclusions(
+            declared_name,
+            &renames.apply(base_table, base_name),
+            declared_table,
             &mut errs,
         );
         diff_computed(declared_name, base_table, declared_table, &mut changes);
@@ -6555,6 +6584,99 @@ fn diff_constraints(
     diff_constraints_by(name, base, declared, changes, errs, &IndexMethod::policy);
 }
 
+/// A table's exclusion constraints, by name (DEC-2448.3). **Every difference is
+/// refused here, by name**: this part reads one and plans nothing for it. Adding
+/// one arrives in the next PR, and dropping, replacing or renaming one with the
+/// retirement record after it, so a plan that would give a guarantee up, or take
+/// one on, without the change that says so is refused rather than planned.
+fn diff_exclusions(name: &TableName, base: &Table, declared: &Table, errs: &mut Vec<DiffError>) {
+    let refuse = |key: &pbps_model::ObjectLocalName, reason: &str| DiffError::ExclusionRefused {
+        table: name.clone(),
+        name: key.clone(),
+        reason: reason.to_owned(),
+    };
+    for (key, was) in &base.exclude {
+        match declared.exclude.get(key) {
+            Some(now) if now == was => {}
+            Some(_) => errs.push(refuse(
+                key,
+                "replacing one arrives with the retirement record in a later PR; for now it \
+                 stands as it is read",
+            )),
+            None => errs.push(refuse(
+                key,
+                "dropping one (and renaming one, which is a drop and an add) arrives with the \
+                 retirement record in a later PR; for now it stands",
+            )),
+        }
+    }
+    for key in declared.exclude.keys() {
+        if !base.exclude.contains_key(key) {
+            errs.push(refuse(key, "adding one arrives in the next PR"));
+        }
+    }
+}
+
+/// A column change under a standing exclusion constraint, refused by name
+/// (DEC-2448.3). The engine drops an exclusion silently when a plain key column
+/// is dropped, and silently rebuilds it, under an exclusive lock, when one is
+/// retyped (measured on 16.15 and 18.6): a guarantee given up, or a rebuild,
+/// that no plan states. The first needs the retirement record, the second the
+/// teardown and restoration of PR D, so both arrive there. A key that is an
+/// expression, or a predicate, names its columns in text this model does not
+/// parse, so a column its text mentions counts as one it holds.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn exclusion_hazards(
+    name: &TableName,
+    base: &Table,
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    if base.exclude.is_empty() {
+        return;
+    }
+    for change in changes {
+        let (column, what) = match change {
+            Change::DropColumn { column, .. } => (column, "dropped"),
+            Change::AlterColumnType { column, .. }
+            | Change::AlterColumnExpression { column, .. } => (column, "retyped"),
+            Change::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Retype { column, .. },
+                ..
+            } => (column, "retyped"),
+            _ => continue,
+        };
+        for (key, x) in &base.exclude {
+            if exclusion_names(x, &column.name) {
+                errs.push(DiffError::ExclusionRefused {
+                    table: name.clone(),
+                    name: key.clone(),
+                    reason: format!(
+                        "column `{}` is {what} while the constraint holds it; that arrives \
+                         with the retirement record and the rebuild of the next PRs, and the \
+                         engine would otherwise drop or rebuild the constraint without a plan \
+                         saying so",
+                        column.name.shown()
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Whether an exclusion constraint's keys, payload or predicate hold `column`.
+fn exclusion_names(x: &pbps_model::ExclusionConstraint, column: &ColumnName) -> bool {
+    let word = |text: &str| {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == column.raw())
+    };
+    x.keys.iter().any(|k| match &k.key.key {
+        pbps_model::IndexKey::Column(c) => c == column,
+        pbps_model::IndexKey::Expression(text) => word(text),
+    }) || x.include.contains(column)
+        || x.filter.as_deref().is_some_and(word)
+}
+
 /// [`diff_constraints`] under a given policy table, so that a verdict no
 /// method holds yet can be exercised end to end.
 fn diff_constraints_by(
@@ -8089,6 +8211,7 @@ pub fn restoration_comparison<'a>(
                 part.name.is_some_and(|n| t.foreign_keys.contains_key(n))
             }
             pbps_model::Part::Index => part.name.is_some_and(|n| t.indexes.contains_key(n)),
+            pbps_model::Part::Exclusion => part.name.is_some_and(|n| t.exclude.contains_key(n)),
             // RLS policy changes have no consumer restoration exemption.
             pbps_model::Part::Policy => false,
         };
@@ -10593,6 +10716,7 @@ mod tests {
             classes: &[],
             default_class: None,
             collation: true,
+            exclusion: true,
             typed_columns: &[],
             lock: IndexLock::AccessExclusive,
             parameters: &[
@@ -10602,6 +10726,167 @@ mod tests {
             ],
         }
     };
+
+    fn exclusion(key: &str, operator: &str) -> pbps_model::ExclusionConstraint {
+        pbps_model::ExclusionConstraint {
+            method: IndexMethod::Gist,
+            keys: vec![pbps_model::ExclusionKey {
+                key: IndexColumn {
+                    key: pbps_model::IndexKey::Expression(key.to_owned()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                },
+                operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
+            }],
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: pbps_model::ExclusionTiming::Immediate,
+        }
+    }
+
+    fn booking(exclusions: &[(&str, pbps_model::ExclusionConstraint)]) -> Schema {
+        let int = || Column::new(ty("integer"));
+        let mut t = table(&[("id", int()), ("a", int()), ("b", int()), ("c", int())]);
+        for (name, x) in exclusions {
+            t.exclude.insert((*name).into(), x.clone());
+        }
+        schema_of("app.booking", t)
+    }
+
+    /// This part reads an exclusion constraint and plans nothing for it: one that
+    /// stands as declared is no difference, and adding one, to a standing table
+    /// or to a new one, is refused by name rather than planned or dropped from
+    /// the plan (DEC-2448.3).
+    #[test]
+    fn a_standing_exclusion_plans_nothing_and_adding_one_is_refused_by_name() {
+        let table: TableName = "app.booking".parse().unwrap();
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let none = booking(&[]);
+        let refusals = |base: &Schema, declared: &Schema| -> Vec<String> {
+            let mut errs = Vec::new();
+            diff_exclusions(
+                &table,
+                &base.tables[&table],
+                &declared.tables[&table],
+                &mut errs,
+            );
+            errs.iter().map(ToString::to_string).collect()
+        };
+        assert!(refusals(&held, &held).is_empty());
+        let said = refusals(&none, &held);
+        assert!(
+            said.len() == 1 && said[0].contains("adding one arrives"),
+            "{said:?}"
+        );
+        // A new table: the plan is refused, and no `CreateTable` carries on
+        // without it.
+        let base_ids = crate::resolve(&Schema::default(), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&held, &base_ids, &[], &ctx()).unwrap().ids;
+        let errs = diff(
+            Side {
+                schema: &Schema::default(),
+                ids: &base_ids,
+            },
+            Side {
+                schema: &held,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("adding one arrives")),
+            "{errs:?}"
+        );
+    }
+
+    /// Negative: dropping, replacing and renaming one is refused by name until the
+    /// retirement record exists, and the engine's silent drop or rebuild under a
+    /// column change is refused too (DEC-2448.3, measured on 16.15 and 18.6).
+    #[test]
+    fn dropping_replacing_or_changing_a_column_under_an_exclusion_is_refused_by_name() {
+        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let refusals = |declared: &Schema| -> Vec<String> {
+            let table: TableName = "app.booking".parse().unwrap();
+            let mut errs = Vec::new();
+            diff_exclusions(
+                &table,
+                &held.tables[&table],
+                &declared.tables[&table],
+                &mut errs,
+            );
+            errs.iter().map(ToString::to_string).collect()
+        };
+        // Dropped.
+        let said = refusals(&booking(&[]));
+        assert!(
+            said.len() == 1 && said[0].contains("retirement record"),
+            "{said:?}"
+        );
+        // Replaced (another operator), and renamed (a drop and an add).
+        let said = refusals(&booking(&[(
+            "no_overlap",
+            exclusion("int4range(a, b)", "-|-"),
+        )]));
+        assert!(said.len() == 1 && said[0].contains("replacing"), "{said:?}");
+        let said = refusals(&booking(&[("renamed", exclusion("int4range(a, b)", "&&"))]));
+        assert!(
+            said.len() == 2 && said.iter().any(|m| m.contains("no_overlap")),
+            "{said:?}"
+        );
+        // Unchanged, or only another table's change: nothing.
+        assert!(refusals(&held).is_empty());
+        // A column the constraint holds, by key text or by predicate, is held
+        // against a drop or a retype; one it does not hold is free.
+        let table: TableName = "app.booking".parse().unwrap();
+        let drop = |column: &str| Change::DropColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column(column),
+        };
+        let retype = |column: &str| Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column(column),
+            from: ty("integer"),
+            to: ty("bigint"),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+            using: None,
+        };
+        let mut with_filter = held.tables[&table].clone();
+        with_filter.exclude.get_mut("no_overlap").unwrap().filter = Some("c > 0".into());
+        type Edit<'a> = &'a dyn Fn(&str) -> Change;
+        let changes: [(Edit<'_>, &str, &str); 2] = [(&drop, "a", "id"), (&retype, "b", "id")];
+        for (change, held_column, free_column) in changes {
+            let mut errs = Vec::new();
+            exclusion_hazards(&table, &with_filter, &[change(held_column)], &mut errs);
+            assert_eq!(errs.len(), 1, "{held_column}: {errs:?}");
+            assert!(
+                errs[0]
+                    .to_string()
+                    .contains("while the constraint holds it"),
+                "{errs:?}"
+            );
+            let mut errs = Vec::new();
+            exclusion_hazards(&table, &with_filter, &[change("c")], &mut errs);
+            assert_eq!(errs.len(), 1, "the predicate holds `c`: {errs:?}");
+            let mut errs = Vec::new();
+            exclusion_hazards(&table, &with_filter, &[change(free_column)], &mut errs);
+            assert!(errs.is_empty(), "{free_column}: {errs:?}");
+        }
+        // And a table with no exclusion has no hazard at all.
+        let mut errs = Vec::new();
+        exclusion_hazards(&table, &Table::default(), &[drop("a")], &mut errs);
+        assert!(errs.is_empty());
+    }
 
     fn parameters_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -27096,7 +27381,7 @@ mod tests {
                         },
                     );
                 }
-                Part::Policy => unreachable!(),
+                Part::Policy | Part::Exclusion => unreachable!(),
             }
             let mut referenced = Table {
                 columns: shape.columns.clone(),
@@ -27157,7 +27442,7 @@ mod tests {
                     new.tables.insert(reference.clone(), renamed.clone());
                 }
                 Part::Check => {}
-                Part::Policy => unreachable!(),
+                Part::Policy | Part::Exclusion => unreachable!(),
             }
             for changed in [false, true] {
                 let mut desired = canonical.clone();
@@ -27185,7 +27470,7 @@ mod tests {
                             after.indexes.get_mut("ix").unwrap().columns[0].key =
                                 IndexKey::Column("other".into())
                         }
-                        Part::Policy => unreachable!(),
+                        Part::Policy | Part::Exclusion => unreachable!(),
                     }
                 }
                 let restoration = match kind {
@@ -27225,7 +27510,7 @@ mod tests {
                         index: Box::new(after.indexes["ix"].clone()),
                         clustered: after.index_is_clustered("ix"),
                     },
-                    Part::Policy => unreachable!(),
+                    Part::Policy | Part::Exclusion => unreachable!(),
                 };
                 let compare = restoration_comparison(
                     Side {
