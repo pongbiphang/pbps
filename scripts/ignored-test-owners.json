@@ -2111,6 +2111,8 @@
         "resolver::capture::read::subscripting_tests::subscripting_captures_elements_slices_assignments_and_composite_fields",
         "resolver::capture::read::tests::owned_capture_rejects_mixed_rendering_and_restores_its_session",
         "resolver::capture::read::tests::the_capture_in_a_callers_transaction_refuses_a_commit_between_its_reads",
+        "resolver::capture::staged::tests::a_scratch_object_that_arrives_mid_read_leaves_no_stale_refusal_behind",
+        "resolver::capture::staged::tests::a_target_object_that_arrives_mid_read_leaves_no_stale_absent_behind",
         "resolver::capture::apply::tests::the_apply_capture_reads_the_callers_transaction_and_binds_each_lookup_to_the_seal",
         "resolver::capture::tests::a_schemas_default_privileges_are_not_a_capture_input",
         "resolver::capture::tests::a_tables_toast_storage_is_not_a_capture_input",
