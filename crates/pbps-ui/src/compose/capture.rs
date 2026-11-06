@@ -150,7 +150,7 @@ fn inputs(project: &Path, fields: Paths) -> Result<(String, String)> {
         return Err(Error::new("The snapshot must resolve its own pbps.yml"));
     }
     let declarations = relative(project, &fields.declarations)?;
-    let ids = relative(project, &fields.identity_file)?;
+    let ids = relative(project, &fields.identity_dir)?;
     if ids == "pbps.yml" || declarations == "pbps.yml" || ids == declarations {
         return Err(Error::new(
             "Compose configuration, declarations and identity paths must be distinct",
@@ -742,6 +742,7 @@ fn bounded_inputs(
     root: &Root,
     names: &BTreeSet<String>,
     declarations: &str,
+    ids: &str,
     attributes: &BTreeMap<String, Option<FileBytes>>,
 ) -> Result<BTreeMap<String, Option<FileBytes>>> {
     let mut base_total: usize = attributes.values().flatten().map(|f| f.bytes.len()).sum();
@@ -758,7 +759,7 @@ fn bounded_inputs(
     }
     let mut bytes = BTreeMap::new();
     for name in names {
-        let file = root.input(name, declarations)?;
+        let file = root.input(name, declarations, ids)?;
         if let Some(file) = &file {
             base_total += file.bytes.len();
             live_total += file.bytes.len();
@@ -777,7 +778,8 @@ fn manifest(
     git: &Git,
     root: &Root,
     names: &BTreeSet<String>,
-    declarations: &str,
+    // The declarations directory and the identity directory.
+    dirs: (&str, &str),
     base: &str,
     view: &AttributeView,
     captured: Option<BTreeMap<String, Option<FileBytes>>>,
@@ -786,7 +788,7 @@ fn manifest(
     let mut attr = BTreeMap::new();
     let bytes = match captured {
         Some(bytes) => bytes,
-        None => bounded_inputs(root, names, declarations, &view.recorded)?,
+        None => bounded_inputs(root, names, dirs.0, dirs.1, &view.recorded)?,
     };
     let crlf = git.converts_line_endings()?;
     let attribute_files = view.files(root)?;
@@ -987,20 +989,23 @@ pub(super) fn capture(
     let declarations = join(&project, &declarations);
     let ids = join(&project, &ids);
     let is_input = |path: &str| {
-        path == ids
+        (path.starts_with(&format!("{ids}/")) && files::identity_path(path))
             || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
     };
+    // The declarations and the identity tree are both live inputs: what is
+    // there now, whether or not the base recorded it.
     let (live, names, attribute_inputs, captured) = workspace.check(&known, || {
-        let live = root.declarations(&declarations)?;
+        let mut live = root.declarations(&declarations)?;
+        live.extend(root.identities(&ids)?);
         let mut names: BTreeSet<String> =
             recorded.keys().filter(|p| is_input(p)).cloned().collect();
         names.extend(live.keys().cloned());
-        names.extend([project_file.clone(), ids.clone()]);
+        names.insert(project_file.clone());
         if names.len() > MAX_FILES {
             return Err(Error::rejected("Compose has too many input paths"));
         }
         let attribute_inputs = AttributeView::recorded(&git, &base, &names)?;
-        let captured = bounded_inputs(&root, &names, &declarations, &attribute_inputs)?;
+        let captured = bounded_inputs(&root, &names, &declarations, &ids, &attribute_inputs)?;
         Ok((live, names, attribute_inputs, captured))
     })?;
     let attribute_view = AttributeView::new(
@@ -1016,7 +1021,7 @@ pub(super) fn capture(
         &git,
         &root,
         &names,
-        &declarations,
+        (&declarations, &ids),
         &base,
         &attribute_view,
         Some(captured),
@@ -1058,6 +1063,18 @@ pub(super) fn capture(
         known_path(&mut known, &format!("repository/{name}"));
     }
     known_path(&mut known, &format!("repository/{declarations}"));
+    known_path(&mut known, &format!("repository/{ids}"));
+    // The CLI may write the identity file of a declaration it records an intent
+    // for, at the path the declaration mirrors; admit exactly those and no other
+    // new file in the tree.
+    for name in &names {
+        if let Some(rel) = name.strip_prefix(&format!("{declarations}/"))
+            && files::declaration_path(name)
+        {
+            let stem = rel.rsplit_once('.').map_or(rel, |(stem, _)| stem);
+            known_path(&mut known, &format!("repository/{ids}/{stem}.json"));
+        }
+    }
     known_git(&mut known, "attribute-view");
     known_path(&mut known, "attribute-view/.git/info/attributes");
     for (index, _) in &attribute_view.indexes {
@@ -1076,12 +1093,15 @@ pub(super) fn capture(
     observer(CaptureBoundary::IntentRecorded);
     let private = Root::open(&snapshot)?;
     let mut result = BTreeMap::new();
-    for name in &names {
-        result.insert(name.clone(), private.input(name, &declarations)?);
+    // The identity files now in the snapshot, which the recording may have added to.
+    let mut after = names.clone();
+    after.extend(private.identities(&ids)?.into_keys());
+    for name in &after {
+        result.insert(name.clone(), private.input(name, &declarations, &ids)?);
     }
     workspace.check(&known, || cli.validate(&snapshot_project, &base))?;
     for (name, expected) in &result {
-        if private.input(name, &declarations)? != *expected {
+        if private.input(name, &declarations, &ids)? != *expected {
             return Err(Error::new("Candidate inputs changed during validation"));
         }
     }
@@ -1136,12 +1156,16 @@ pub(super) fn capture(
     let current_root = Root::open(&source)?;
     if !root.same_directory(&current_root)?
         || !selected_root.same_directory(&Root::open(&selected)?)?
-        || current_root.declarations(&declarations)? != live
+        || {
+            let mut now = current_root.declarations(&declarations)?;
+            now.extend(current_root.identities(&ids)?);
+            now != live
+        }
         || manifest(
             &git,
             &current_root,
             &names,
-            &declarations,
+            (&declarations, &ids),
             &base,
             &attribute_view,
             None,

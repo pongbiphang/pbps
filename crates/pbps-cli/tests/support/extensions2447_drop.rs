@@ -66,7 +66,7 @@ fn saved(path: &Path) -> pbps_model::SavedPlan {
 }
 
 fn ids(d: &Demo) -> pbps_model::IdsFile {
-    serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap()
+    crate::idtree::model(&d.dir)
 }
 
 /// What a reviewer needs to know: removing the declaration alone is not a

@@ -97,7 +97,7 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             schema_dir.display()
         );
     }
-    let mut inputs = vec![project.config_file(), project.ids_file()];
+    let mut inputs = crate::ids_store::protected(project);
     // A listing that failed is not an empty directory (the loader reports
     // it); what could be listed is still protected.
     if let Ok(files) = pbps_load::schema_files(&project.schema_dir()) {

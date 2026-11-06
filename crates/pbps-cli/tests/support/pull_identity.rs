@@ -53,14 +53,14 @@ pub fn unchanged(server: &str, pg: bool) {
             args.extend(["--data", &table]);
         }
         ok(d.run(&args));
-        let ids_path = d.dir.join("schema.ids.json");
+        let ids_path = d.dir.clone();
         // Preserve historical tombstones as well as live IDs, and do not
         // silently canonicalize the user's JSON when nothing changed.
         let mut ids: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+            serde_json::to_value(crate::idtree::model(&ids_path)).unwrap();
         ids["tombstones"] = serde_json::json!({"t_r3t1rd": {"was": format!("{}.retired", schema(pg)), "dropped_at": "2026-01-01", "reason": "retired reference list", "operator": "test"}});
         let bytes = serde_json::to_vec(&ids).unwrap();
-        std::fs::write(&ids_path, &bytes).unwrap();
+        crate::idtree::restore(&ids_path, &bytes);
         d.commit();
         ok(d.run(&[
             "baseline",
@@ -73,7 +73,7 @@ pub fn unchanged(server: &str, pg: bool) {
         args.push("--force");
         for _ in 0..2 {
             ok(d.run(&args));
-            assert_eq!(std::fs::read(&ids_path).unwrap(), bytes);
+            assert_eq!(crate::idtree::snapshot(&ids_path), bytes);
             ok(d.run(&["validate"]));
             let offline = ok(d.run(&["plan"]));
             assert!(
@@ -122,7 +122,7 @@ pub fn unchanged(server: &str, pg: bool) {
             // First row adoption on an already managed table must preserve
             // identity too. Recording a zero-SQL adoption is #1803's scope.
             ok(d.run(&["pull", "--db", connection, "--force", "--data", &table]));
-            assert_eq!(std::fs::read(&ids_path).unwrap(), bytes);
+            assert_eq!(crate::idtree::snapshot(&ids_path), bytes);
             let plan = ok(d.run(&["plan", "--db", connection]));
             assert!(!stdout(&plan).contains("drop table"), "{}", stdout(&plan));
             assert!(!stdout(&plan).contains("create table"), "{}", stdout(&plan));
@@ -138,9 +138,8 @@ pub fn additions(server: &str, pg: bool) {
     prepare(connection, pg);
     let d = Demo::new("pull-identity-additions");
     ok(d.run(&["pull", "--db", connection]));
-    let path = d.dir.join("schema.ids.json");
-    let before: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let path = d.dir.clone();
+    let before: pbps_model::IdsFile = crate::idtree::model(&path);
     on_server(
         connection,
         &format!(
@@ -150,7 +149,7 @@ pub fn additions(server: &str, pg: bool) {
         ),
     );
     ok(d.run(&["pull", "--db", connection, "--force"]));
-    let bytes = std::fs::read(&path).unwrap();
+    let bytes = crate::idtree::snapshot(&path);
     let after: pbps_model::IdsFile = serde_json::from_slice(&bytes).unwrap();
     for (id, name) in &before.tables {
         assert_eq!(after.tables.get(id), Some(name));
@@ -161,7 +160,7 @@ pub fn additions(server: &str, pg: bool) {
     assert_eq!(after.tables.len(), before.tables.len() + 1);
     assert_eq!(after.columns.len(), before.columns.len() + 2);
     ok(d.run(&["pull", "--db", connection, "--force"]));
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(crate::idtree::snapshot(&path), bytes);
     assert_eq!(rows(connection, pg), 3);
 
     // PostgreSQL validation leaves this entire table out; SQL Server reaches
@@ -186,7 +185,7 @@ pub fn additions(server: &str, pg: bool) {
         "{}",
         stderr(&refused)
     );
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(crate::idtree::snapshot(&path), bytes);
     if pg {
         assert!(!declaration.exists());
         assert!(
@@ -210,8 +209,8 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
         d.commit();
         ok(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
         let before = history(&d, connection);
-        let ids_path = d.dir.join("schema.ids.json");
-        let ids = std::fs::read(&ids_path).unwrap();
+        let ids_path = d.dir.clone();
+        let ids = crate::idtree::snapshot(&ids_path);
         let old = format!("{}.country", schema(pg));
         let new = format!("{}.nation", schema(pg));
         let path = d.dir.join(format!("schema/{old}.yml"));
@@ -233,7 +232,7 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
                 "{}",
                 stderr(&out)
             );
-            assert_eq!(std::fs::read(&ids_path).unwrap(), ids);
+            assert_eq!(crate::idtree::snapshot(&ids_path), ids);
             assert!(!path.exists());
             assert_eq!(d.dir.join(format!("schema/{new}.yml")).exists(), rename);
             assert_eq!(history(&d, connection), before);
@@ -253,14 +252,13 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
             stdout(&unresolved),
             stderr(&unresolved)
         );
-        assert_eq!(std::fs::read(&ids_path).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&ids_path), ids);
         if rename {
             ok(d.run(&["rename-table", &old, &new]));
         } else {
             ok(d.run(&["drop-table", &old, "--reason", "retired reference list"]));
         }
-        let intent_ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        let intent_ids: pbps_model::IdsFile = crate::idtree::model(&ids_path);
         let old_ids: pbps_model::IdsFile = serde_json::from_slice(&ids).unwrap();
         if rename {
             let uid = old_ids.tables.keys().next().unwrap();
@@ -317,9 +315,9 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
             ]));
             assert_eq!(reference_rows(connection, pg, "nation"), 3);
             let after = history(&d, connection);
-            let renamed_ids = std::fs::read(&ids_path).unwrap();
+            let renamed_ids = crate::idtree::snapshot(&ids_path);
             ok(d.run(&["pull", "--db", connection, "--force"]));
-            assert_eq!(std::fs::read(&ids_path).unwrap(), renamed_ids);
+            assert_eq!(crate::idtree::snapshot(&ids_path), renamed_ids);
             let next = ok(d.run(&["plan", "--db", connection]));
             assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
             assert_eq!(history(&d, connection), after);
@@ -343,8 +341,8 @@ pub fn batch_after_forced_pull(server: &str, pg: bool) {
     d.commit();
     ok(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
     let before = history(&d, connection);
-    let path = d.dir.join("schema.ids.json");
-    let ids = std::fs::read(&path).unwrap();
+    let path = d.dir.clone();
+    let ids = crate::idtree::snapshot(&path);
     for column in ["legacy_email", "legacy_phone"] {
         on_server(
             connection,
@@ -362,7 +360,7 @@ pub fn batch_after_forced_pull(server: &str, pg: bool) {
         "{}",
         stderr(&out)
     );
-    assert_eq!(std::fs::read(&path).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&path), ids);
     ok(d.run(&[
         "intent",
         "--drop",
@@ -372,8 +370,7 @@ pub fn batch_after_forced_pull(server: &str, pg: bool) {
         &phone,
         "phone retired",
     ]));
-    let recorded: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let recorded: pbps_model::IdsFile = crate::idtree::model(&path);
     assert!(
         recorded
             .tombstones
@@ -403,9 +400,8 @@ pub fn column_history(server: &str, pg: bool) {
     ok(d.run(&["pull", "--db", connection]));
     d.commit();
     ok(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
-    let ids_path = d.dir.join("schema.ids.json");
-    let original: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+    let ids_path = d.dir.clone();
+    let original: pbps_model::IdsFile = crate::idtree::model(&ids_path);
     let uid = original
         .column_uid(&format!("{table}.obsolete").parse().unwrap())
         .unwrap();
@@ -454,7 +450,7 @@ pub fn column_history(server: &str, pg: bool) {
             "--allow",
             if rename { "rename" } else { "destructive" },
         ]));
-        let bytes = std::fs::read(&ids_path).unwrap();
+        let bytes = crate::idtree::snapshot(&ids_path);
         let ids: pbps_model::IdsFile = serde_json::from_slice(&bytes).unwrap();
         if rename {
             assert_eq!(
@@ -466,7 +462,7 @@ pub fn column_history(server: &str, pg: bool) {
         }
         let before = history(&d, connection);
         ok(d.run(&["pull", "--db", connection, "--force"]));
-        assert_eq!(std::fs::read(&ids_path).unwrap(), bytes);
+        assert_eq!(crate::idtree::snapshot(&ids_path), bytes);
         let next = ok(d.run(&["plan", "--db", connection]));
         assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
         assert_eq!(history(&d, connection), before);

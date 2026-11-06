@@ -24,7 +24,7 @@ fn setup(connection: &str, tag: &str) -> Demo {
     d
 }
 fn bytes(d: &Demo) -> Vec<u8> {
-    std::fs::read(d.ids_path()).unwrap()
+    crate::idtree::snapshot(&d.dir)
 }
 fn record(d: &Demo, connection: &str, predicate: &str) {
     ok(d.run(&[
@@ -276,7 +276,7 @@ fn unsafe_requirements_write_nothing_and_referenced_renames_split_the_plan_on_sq
             r.predicate = "GETDATE() IS NOT NULL".into();
         }
     }
-    std::fs::write(d.ids_path(), serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+    crate::idtree::write(&d.dir, &ids);
     d.commit();
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0);
@@ -285,7 +285,7 @@ fn unsafe_requirements_write_nothing_and_referenced_renames_split_the_plan_on_sq
         "{}",
         stderr(&refused)
     );
-    std::fs::write(d.ids_path(), original).unwrap();
+    crate::idtree::restore(&d.dir, &original);
     d.commit();
     d.table(&AFTER.replace("  cents: {type: int}", "  amount_cents: {type: int}"));
     ok(d.run(&["rename", "dbo.t.cents", "amount_cents"]));

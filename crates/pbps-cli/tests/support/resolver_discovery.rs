@@ -90,10 +90,7 @@ pub fn check(server: &str, dialect: &str) {
     );
     assert!(text.contains("introspection connection"), "{text}");
     assert!(!d.dir.join("docker-invoked").exists());
-    assert!(
-        !d.dir.join("schema.ids.json").exists(),
-        "doctor wrote identity"
-    );
+    assert!(!crate::idtree::exists(&d.dir), "doctor wrote identity");
     assert!(!text.contains("Password=") && !text.contains("password="));
 
     // The new metadata read has its own unanswerable path, independently of

@@ -55,6 +55,11 @@ pub(super) fn declaration_path(name: &str) -> bool {
     )
 }
 
+/// A file of the identity tree: one `.json` per declaration (#2600).
+pub(super) fn identity_path(name: &str) -> bool {
+    Path::new(name).extension().and_then(|s| s.to_str()) == Some("json")
+}
+
 pub(super) fn path(name: &str) -> Result<&str> {
     if name.is_empty()
         || name.contains(['\0', '\\', '\n', '\r'])
@@ -116,10 +121,11 @@ impl Root {
         self.read_file(name, false)
     }
 
-    pub fn input(&self, name: &str, declarations: &str) -> Result<Option<FileBytes>> {
+    pub fn input(&self, name: &str, declarations: &str, ids: &str) -> Result<Option<FileBytes>> {
         self.read_file(
             name,
-            name.starts_with(&format!("{declarations}/")) && declaration_path(name),
+            (name.starts_with(&format!("{declarations}/")) && declaration_path(name))
+                || (name.starts_with(&format!("{ids}/")) && identity_path(name)),
         )
     }
 
@@ -188,6 +194,21 @@ impl Root {
     }
 
     pub fn declarations(&self, directory: &str) -> Result<BTreeMap<String, FileBytes>> {
+        self.tree(directory, declaration_path, false)
+    }
+
+    /// The identity tree's files. A project that has not planned yet has no
+    /// tree, which is no files and not a failure.
+    pub fn identities(&self, directory: &str) -> Result<BTreeMap<String, FileBytes>> {
+        self.tree(directory, identity_path, true)
+    }
+
+    fn tree(
+        &self,
+        directory: &str,
+        wanted: fn(&str) -> bool,
+        may_be_absent: bool,
+    ) -> Result<BTreeMap<String, FileBytes>> {
         path(directory)?;
         let fd = openat2(
             &self.0,
@@ -195,10 +216,18 @@ impl Root {
             OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-        )
-        .map_err(|_| Error::new("Could not enumerate the contained declarations directory"))?;
+        );
+        let fd = match fd {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if may_be_absent => return Ok(BTreeMap::new()),
+            Err(_) => {
+                return Err(Error::new(
+                    "Could not enumerate the contained declarations directory",
+                ));
+            }
+        };
         let mut names = Vec::new();
-        Self::walk(&fd, directory, &mut names, 0, &mut 0)?;
+        Self::walk(&fd, directory, &mut names, 0, &mut 0, wanted)?;
         let mut result = BTreeMap::new();
         let mut bytes = 0;
         for name in names {
@@ -222,6 +251,7 @@ impl Root {
         names: &mut Vec<String>,
         depth: usize,
         count: &mut usize,
+        wanted: fn(&str) -> bool,
     ) -> Result<()> {
         if depth > 64 {
             return Err(Error::rejected(
@@ -258,10 +288,10 @@ impl Root {
                         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
                     )
                     .map_err(|_| Error::new("A declaration directory changed during capture"))?;
-                    Self::walk(&child, &full, names, depth + 1, count)?;
+                    Self::walk(&child, &full, names, depth + 1, count, wanted)?;
                 }
                 FileType::RegularFile => {
-                    if declaration_path(name) {
+                    if wanted(name) {
                         names.push(full);
                     }
                 }

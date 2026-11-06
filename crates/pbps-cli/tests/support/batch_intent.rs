@@ -7,7 +7,7 @@ fn success(d: &Demo, args: &[&str]) {
 }
 
 fn ids(d: &Demo) -> Vec<u8> {
-    std::fs::read(d.dir.join("schema.ids.json")).unwrap()
+    crate::idtree::snapshot(&d.dir)
 }
 
 fn table(d: &Demo, schema: &str, columns: &[&str]) {

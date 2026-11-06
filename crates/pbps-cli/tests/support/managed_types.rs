@@ -765,7 +765,7 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         assert!(mood_path.is_file() && phone_path.is_file());
         let mood_text = std::fs::read_to_string(&mood_path).unwrap();
         let phone_text = std::fs::read_to_string(&phone_path).unwrap();
-        let ids_text = std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap();
+        let ids_text = crate::idtree::text(&d.dir);
         let ids: pbps_model::IdsFile = serde_json::from_str(&ids_text).unwrap();
         assert_eq!(ids.types.len(), 2);
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
@@ -788,10 +788,7 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         succeeds(d.run(&["pull", "--db", db, "--force"]));
         assert_eq!(std::fs::read_to_string(&mood_path).unwrap(), mood_text);
         assert_eq!(std::fs::read_to_string(&phone_path).unwrap(), phone_text);
-        assert_eq!(
-            std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap(),
-            ids_text
-        );
+        assert_eq!(crate::idtree::text(&d.dir), ids_text);
         d.commit();
         succeeds(d.run(&[
             "baseline",
@@ -1886,8 +1883,7 @@ fn bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of
         .unwrap();
         d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  mood: {type: app.mood}\n  score: {type: app.score}\nprimary_key: [id]\n");
         succeeds(d.run(&["plan", "--no-dev"]));
-        let ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", db]));
         let snapshot = latest_snapshot(db);
@@ -1925,24 +1921,20 @@ fn bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of
 fn fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent() {
     let d = Demo::new("type-fmt1635");
     let old = d.dir.join("schema/app.old.type.yml");
-    let new = d.dir.join("schema/app.new.type.yml");
+    let new = old.clone();
     std::fs::write(&old, "enum: app.old\nvalues: [ok]\n").unwrap();
     succeeds(d.run(&["plan", "--no-dev"]));
     d.commit();
-    std::fs::remove_file(&old).unwrap();
     let pending = "enum: app.new\nrenamed_from: app.old\nvalues: [ok]\n";
     std::fs::write(&new, pending).unwrap();
-    let before = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let before = crate::idtree::snapshot(&d.dir);
     succeeds(d.run(&["fmt"]));
     assert!(
         std::fs::read_to_string(&new)
             .unwrap()
             .contains("renamed_from: app.old")
     );
-    assert_eq!(
-        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
-        before
-    );
+    assert_eq!(crate::idtree::snapshot(&d.dir), before);
     succeeds(d.run(&["plan", "--no-dev"]));
     succeeds(d.run(&["fmt"]));
     assert!(
@@ -1953,7 +1945,7 @@ fn fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent() {
     // An unknown target is unresolved intent; formatting neither guesses
     // identity nor writes an ids entry even when the source is misspelled.
     let future = d.dir.join("schema/app.future.type.yml");
-    let assigned = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let assigned = crate::idtree::snapshot(&d.dir);
     std::fs::write(
         &future,
         "enum: app.future\nrenamed_from: app.missing\nvalues: [ok]\n",
@@ -1965,10 +1957,7 @@ fn fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent() {
             .unwrap()
             .contains("renamed_from: app.missing")
     );
-    assert_eq!(
-        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
-        assigned
-    );
+    assert_eq!(crate::idtree::snapshot(&d.dir), assigned);
 }
 
 #[test]
@@ -2311,9 +2300,8 @@ fn same_name_type_replacements_warn_and_distinguish_new_and_retained_dependents(
                     }
                     // Mint the new declaration's uid without asking a refused
                     // retained-dependent plan to publish identity as a side effect.
-                    let ids_path = d.dir.join("schema.ids.json");
-                    let ids: pbps_model::IdsFile =
-                        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+                    let ids_path = d.dir.clone();
+                    let ids: pbps_model::IdsFile = crate::idtree::model(&ids_path);
                     let desired = pbps_load::load_schema_dir(&d.dir.join("schema"))
                         .unwrap()
                         .schema;
@@ -2327,8 +2315,7 @@ fn same_name_type_replacements_warn_and_distinguish_new_and_retained_dependents(
                         },
                     )
                     .unwrap();
-                    std::fs::write(&ids_path, serde_json::to_vec_pretty(&resolved.ids).unwrap())
-                        .unwrap();
+                    crate::idtree::write(&ids_path, &resolved.ids);
                     if !retained {
                         let offline = d.run(&["plan", "--no-dev"]);
                         succeeds(offline.clone());
@@ -3042,9 +3029,8 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
                 );
                 std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
                 // A refused plan cannot leave identities for removed files.
-                let ids_file = d.dir.join("schema.ids.json");
-                let mut ids: pbps_model::IdsFile =
-                    serde_json::from_slice(&std::fs::read(&ids_file).unwrap()).unwrap();
+                let ids_file = d.dir.clone();
+                let mut ids: pbps_model::IdsFile = crate::idtree::model(&ids_file);
                 ids.tables.clear();
                 ids.columns.clear();
                 std::fs::write(
@@ -3133,12 +3119,11 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
                     0
                 );
                 std::fs::remove_file(&domain_file).unwrap();
-                let ids_file = d.dir.join("schema.ids.json");
-                let mut ids: pbps_model::IdsFile =
-                    serde_json::from_slice(&std::fs::read(&ids_file).unwrap()).unwrap();
+                let ids_file = d.dir.clone();
+                let mut ids: pbps_model::IdsFile = crate::idtree::model(&ids_file);
                 ids.types
                     .retain(|_, name| name.raw().to_string() != "app.used");
-                std::fs::write(&ids_file, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+                crate::idtree::write(&ids_file, &ids);
                 d.commit();
                 label_plan(&d, db, &path);
                 succeeds(apply_plan(&d, db, &path, false));
@@ -3525,8 +3510,7 @@ fn declare_mood(d: &Demo, values: &str) {
 }
 
 fn type_ids(d: &Demo) -> serde_json::Value {
-    let ids: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
     ids["types"].clone()
 }
 

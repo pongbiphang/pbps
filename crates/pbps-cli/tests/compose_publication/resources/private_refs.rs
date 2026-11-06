@@ -163,7 +163,7 @@ fn hidden_or_malformed_private_ref_evidence_never_disappears_from_discovery() {
         let preserved = || {
             vec![
                 fs::read(f.repo.project.join("schema/t.yml")).unwrap(),
-                fs::read(f.repo.project.join("schema.ids.json")).unwrap(),
+                crate::idtree::snapshot(&f.repo.project),
                 fs::read(f.repo.root.join(".git/index")).unwrap(),
                 fs::read(f.repo.root.join(".git/HEAD")).unwrap(),
                 fs::read(f.repo.root.join(".git/refs/heads/master")).unwrap(),

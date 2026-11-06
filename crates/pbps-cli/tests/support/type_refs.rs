@@ -132,13 +132,12 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         // Ext.Mood must remain a reference, rather than managed type state.
         let external: pbps_model::TypeRef = "\"Ext\".\"Mood\"".parse().unwrap();
         std::fs::remove_file(d.dir.join("schema/Ext.Mood.type.yml")).unwrap();
-        let ids_path = d.dir.join("schema.ids.json");
-        let mut ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        let ids_path = d.dir.clone();
+        let mut ids: pbps_model::IdsFile = crate::idtree::model(&ids_path);
         let uid = ids.type_uid(&external).unwrap().clone();
         assert_eq!(ids.types.remove(&uid), Some(external.clone()));
         assert!(ids.types.values().all(|name| name.schema() == "app"));
-        std::fs::write(&ids_path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+        crate::idtree::write(&ids_path, &ids);
         succeeds(d.run(&["validate"]));
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
         assert!(
@@ -208,7 +207,7 @@ fn type_files_differing_only_in_case_refuse_pull_before_any_project_write() {
             let d = Demo::new("refs-case");
             let config = std::fs::read(d.dir.join("pbps.yml")).unwrap();
             let declaration = d.dir.join("schema/app.t.yml");
-            let ids = d.dir.join("schema.ids.json");
+            let ids = d.dir.clone();
             if existing {
                 d.table(&declarations(""));
                 succeeds(d.run(&["plan"]));

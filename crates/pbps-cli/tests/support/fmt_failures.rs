@@ -24,7 +24,7 @@ pub fn before_writes(dialect: &str) {
                 assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
                 assert_eq!(std::fs::read(&first).unwrap(), original.as_bytes());
                 assert_eq!(std::fs::read(&last).unwrap(), bad);
-                assert!(!d.dir.join("schema.ids.json").exists());
+                assert!(!crate::idtree::exists(&d.dir));
                 if format == "json" {
                     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
                     assert_eq!(report["command"], "fmt");
@@ -72,8 +72,7 @@ pub fn all_errors_and_warnings(dialect: &str) {
         for (name, bytes, _) in bad {
             std::fs::write(d.dir.join("schema").join(name), bytes).unwrap();
         }
-        let ids = d.dir.join("schema.ids.json");
-        std::fs::write(&ids, "broken identity file").unwrap();
+        crate::idtree::write_raw(&d.dir, "broken.json", "broken identity file");
         let out = d.run(&["fmt", "--format", format]);
         assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
         if format == "json" {
@@ -98,7 +97,7 @@ pub fn all_errors_and_warnings(dialect: &str) {
             );
         } else {
             let text = stderr(&out);
-            for name in ["x.yml", "y.yml", "z.yml", "schema.ids.json", "warning:"] {
+            for name in ["x.yml", "y.yml", "z.yml", ".pbps/ids", "warning:"] {
                 assert!(text.contains(name), "missing {name}: {text}");
             }
             assert!(!stdout(&out).contains("rewrote"));
@@ -111,7 +110,7 @@ pub fn all_errors_and_warnings(dialect: &str) {
             );
         }
         assert_eq!(
-            std::fs::read_to_string(ids).unwrap(),
+            std::fs::read_to_string(crate::idtree::dir(&d.dir).join("broken.json")).unwrap(),
             "broken identity file"
         );
     }

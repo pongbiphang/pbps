@@ -617,8 +617,7 @@ fn membership(d: &Demo, attached: bool, ty: &str, required: bool) {
     }
 }
 fn membership_uids(d: &Demo, attached: bool) -> (pbps_model::Uid, pbps_model::Uid) {
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     let leaf = "app.leaf".parse().unwrap();
     let local: pbps_model::ColumnRef = "app.leaf.v".parse().unwrap();
     assert_eq!(ids.column_uid(&local).is_none(), attached);

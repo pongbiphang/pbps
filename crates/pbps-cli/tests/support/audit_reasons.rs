@@ -60,11 +60,11 @@ pub fn offline(dialect: &str) {
             }
             _ => unreachable!(),
         };
-        let ids_path = d.dir.join("schema.ids.json");
-        let before = std::fs::read(&ids_path).unwrap();
+        let ids_path = d.dir.clone();
+        let before = crate::idtree::snapshot(&ids_path);
         for reason in BLANK {
             refused(&d, &[command, &target, "--reason", reason]);
-            assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+            assert_eq!(crate::idtree::snapshot(&ids_path), before);
             let blocked = d.run(&["plan", "--check"]);
             assert_eq!(
                 code(&blocked),
@@ -74,10 +74,10 @@ pub fn offline(dialect: &str) {
                 stderr(&blocked)
             );
             assert!(stderr(&blocked).contains(command), "{}", stderr(&blocked));
-            assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+            assert_eq!(crate::idtree::snapshot(&ids_path), before);
         }
         success(&d, &[command, &target, "--reason", MEANINGFUL]);
-        let ids: IdsFile = serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        let ids: IdsFile = crate::idtree::model(&ids_path);
         assert_eq!(
             ids.tombstones.len(),
             if command == "drop-table" { 3 } else { 1 }
@@ -129,7 +129,7 @@ pub fn before_io(dialect: &str) {
         missing_project_refuses(&["baseline", "--db", connection, "--reason", reason]);
     }
     assert!(!missing.exists());
-    assert!(!d.dir.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&d.dir));
 }
 
 pub fn connected(dialect: &str, connection: &str) {
@@ -146,11 +146,11 @@ pub fn connected(dialect: &str, connection: &str) {
     };
     let before = history();
     assert_eq!(before.as_array().unwrap().len(), 1);
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     for reason in BLANK {
         refused(&d, &["baseline", "--db", connection, "--reason", reason]);
         assert_eq!(history(), before);
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     }
     success(
         &d,

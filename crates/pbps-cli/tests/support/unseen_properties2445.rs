@@ -58,7 +58,7 @@ fn named(d: &Demo, connection: &str, expected: &str) {
     assert!(stderr(&pulled).contains(expected), "{}", stderr(&pulled));
     let artifact = d.dir.join("property.plan.json");
     std::fs::write(&artifact, b"existing approved artifact").unwrap();
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     let plan = d.run(&[
         "plan",
         "--db",
@@ -77,7 +77,7 @@ fn named(d: &Demo, connection: &str, expected: &str) {
         std::fs::read(artifact).unwrap(),
         b"existing approved artifact"
     );
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
 }
 
 #[test]

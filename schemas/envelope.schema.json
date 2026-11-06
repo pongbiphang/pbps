@@ -2686,7 +2686,7 @@
         "declarations": {
           "type": "string"
         },
-        "identity_file": {
+        "identity_dir": {
           "type": "string"
         },
         "dialect": {
@@ -2716,7 +2716,7 @@
       "required": [
         "project_file",
         "declarations",
-        "identity_file",
+        "identity_dir",
         "dialect",
         "tables",
         "modules",
@@ -2980,7 +2980,7 @@
         "declarations": {
           "type": "string"
         },
-        "identity_file": {
+        "identity_dir": {
           "type": "string"
         }
       },
@@ -2988,7 +2988,7 @@
         "mode",
         "project_file",
         "declarations",
-        "identity_file"
+        "identity_dir"
       ]
     },
     "InputPathMode": {
@@ -3885,6 +3885,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 92,
+  "x-pbps-schema-version": 93,
   "x-pbps-tool-version": "0.0.0"
 }

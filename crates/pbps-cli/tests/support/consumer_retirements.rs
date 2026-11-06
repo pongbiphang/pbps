@@ -318,9 +318,7 @@ fn consumer_retirements_treat_a_missing_historical_config_as_empty() {
 fn consumer_retirements_name_snapshot_provenance_and_missing_revision_evidence() {
     let (d, baseline) = start("retirement-file-baseline", WRITES);
     let retiring = retire(&d);
-    let ids: pbps_model::IdsFile =
-        serde_json::from_str(&std::fs::read_to_string(d.dir.join("schema.ids.json")).unwrap())
-            .unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     let mut shape = pbps_model::Table::default();
     for name in ["old", "kept"] {
         shape.columns.insert(
@@ -379,18 +377,17 @@ fn consumer_retirements_name_snapshot_provenance_and_missing_revision_evidence()
 #[test]
 fn consumer_retirements_preserve_the_requested_revision_in_identity_diagnostics() {
     let (d, _) = start("retirement-revision-label", "");
-    let ids = d.dir.join("schema.ids.json");
-    let valid = std::fs::read_to_string(&ids).unwrap();
-    std::fs::write(&ids, r#"{"version":1,"hostile\nfield":1}"#).unwrap();
+    let ids = d.dir.clone();
+    crate::idtree::write_raw(&ids, "hostile.json", r#"{"format":1,"hostile\nfield":1}"#);
     d.commit();
     let pinned = git(&d, &["rev-parse", "HEAD"]);
     git(&d, &["tag", "identity-label"]);
-    std::fs::write(&ids, &valid).unwrap();
+    std::fs::remove_file(crate::idtree::dir(&d.dir).join("hostile.json")).unwrap();
     let out = d.run(&["plan", "--no-dev", "--since", "identity-label"]);
     assert_eq!(code(&out), 1);
     let message = stderr(&out);
     assert!(
-        message.contains("the identity file at `identity-label` is malformed"),
+        message.contains("the identity tree at `identity-label` is inconsistent"),
         "{message}"
     );
     assert!(message.contains(r"hostile\nfield"), "{message}");

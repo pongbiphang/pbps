@@ -33,8 +33,33 @@ pub(super) struct Raw {
     pub revision: Revision,
     pub config: (String, Vec<u8>),
     pub declarations: Vec<(String, Vec<u8>)>,
-    /// `None` is a revision with no identity file: absent, which is not empty.
-    pub ids: Option<(String, Vec<u8>)>,
+    /// The files of the identity tree, each by the project-relative path it
+    /// was read from. No files is a revision with no tree.
+    pub ids: Vec<(String, Vec<u8>)>,
+    /// A legacy `schema.ids.json`: the layout of a revision made before
+    /// `pbps ids migrate`, the only place it is still read (design-2600 §6.3).
+    /// `None` is absent, which is not empty.
+    pub legacy_ids: Option<(String, Vec<u8>)>,
+    /// The project-relative directory of the tree, as `ids` paths spell it.
+    pub ids_dir: String,
+}
+
+/// The mapping an identity tree records, from the files of a revision, each by
+/// its project-relative path under `dir`.
+fn tree_ids(files: &[(String, Vec<u8>)], dir: &str) -> Result<IdsFile, Vec<Problem>> {
+    let below = format!("{dir}/");
+    let mut texts = std::collections::BTreeMap::new();
+    for (path, bytes) in files {
+        let text = utf8(path, bytes).map_err(|p| vec![p])?;
+        let rel = path.strip_prefix(&below).unwrap_or(path).to_owned();
+        texts.insert(rel, text);
+    }
+    pbps_model::ids_tree::assemble(&texts).map_err(|e| {
+        vec![Problem::IdsInconsistent {
+            path: dir.to_owned(),
+            reason: e.to_string(),
+        }]
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -143,6 +168,7 @@ fn consumed(role: Role, revision: &Revision, path: &str, bytes: &[u8]) -> Consum
 impl Raw {
     pub(super) fn files(&self) -> Vec<ConsumedFile> {
         std::iter::once((Role::Config, &self.config))
+            .chain(self.legacy_ids.iter().map(|ids| (Role::Ids, ids)))
             .chain(self.ids.iter().map(|ids| (Role::Ids, ids)))
             .chain(self.declarations.iter().map(|d| (Role::Declaration, d)))
             .map(|(role, (path, bytes))| consumed(role, &self.revision, path, bytes))
@@ -314,22 +340,26 @@ pub(super) fn read_commit_recorded(
             Vec::new()
         }
     };
-    let ids = tree_file(root, commit, &ids_rel, &prefix, observed, Role::Ids)
+    let legacy_ids = tree_file(root, commit, &ids_rel, &prefix, observed, Role::Ids)
         .map_err(|p| problems.push(p))
         .unwrap_or_default();
-    // Absent is a first run only where no identity tree stands in its place.
-    if ids.is_none() {
-        match crate::ids_guard::tree_present_at(root, commit.as_str(), &ids_dir_rel) {
-            Ok(false) => {}
-            Ok(true) => problems.push(Problem::Unreadable {
-                path: relative(&prefix, &ids_dir_rel),
-                reason: crate::ids_guard::message(&relative(&prefix, &ids_dir_rel)),
-            }),
-            Err(e) => problems.push(Problem::Unreadable {
-                path: relative(&prefix, &ids_dir_rel),
-                reason: format!("{e:#}"),
-            }),
-        }
+    let below = format!("{ids_dir_rel}/");
+    let ids = tree_entries(
+        root,
+        commit,
+        &ids_dir_rel,
+        |entry, _mode| entry.starts_with(&below),
+        &prefix,
+        observed,
+        Role::Ids,
+    )
+    .map_err(|p| problems.push(p))
+    .unwrap_or_default();
+    if legacy_ids.is_some() && !ids.is_empty() {
+        problems.push(Problem::Unreadable {
+            path: relative(&prefix, &ids_dir_rel),
+            reason: "both the legacy identity file and an identity tree exist".to_owned(),
+        });
     }
     if problems.is_empty() {
         Ok(Raw {
@@ -337,6 +367,8 @@ pub(super) fn read_commit_recorded(
             config,
             declarations,
             ids,
+            legacy_ids,
+            ids_dir: relative(&prefix, &ids_dir_rel),
         })
     } else {
         Err(problems)
@@ -519,23 +551,34 @@ pub(super) fn read_working_recorded(
         }
     };
     let ids_path = root.join(&parsed.ids_file);
-    let ids = regular(&ids_path, Role::Ids)
+    let legacy_ids = regular(&ids_path, Role::Ids)
         .map_err(|p| problems.push(p))
         .unwrap_or_default()
         .map(|bytes| (shown(&ids_path), bytes));
-    if ids.is_none() {
-        let dir = parsed.ids_dir();
-        match crate::ids_guard::working_tree_present(root, &dir) {
-            Ok(false) => {}
-            Ok(true) => problems.push(Problem::Unreadable {
-                path: shown(&root.join(&dir)),
-                reason: crate::ids_guard::message(&dir.display().to_string()),
-            }),
-            Err(e) => problems.push(Problem::Unreadable {
-                path: shown(&root.join(&dir)),
+    let ids_dir = root.join(parsed.ids_dir());
+    let ids = match pbps_load::read_ids_tree(&ids_dir) {
+        Ok(files) => files
+            .into_iter()
+            .map(|(rel, text)| {
+                let path = shown(&ids_dir.join(rel));
+                let bytes = text.into_bytes();
+                observed.push(consumed(Role::Ids, &Revision::Working, &path, &bytes));
+                (path, bytes)
+            })
+            .collect(),
+        Err(e) => {
+            problems.push(Problem::Unreadable {
+                path: shown(&ids_dir),
                 reason: e.to_string(),
-            }),
+            });
+            Vec::new()
         }
+    };
+    if legacy_ids.is_some() && !ids.is_empty() {
+        problems.push(Problem::Unreadable {
+            path: shown(&ids_dir),
+            reason: "both the legacy identity file and an identity tree exist".to_owned(),
+        });
     }
     if problems.is_empty() {
         Ok(Raw {
@@ -543,6 +586,8 @@ pub(super) fn read_working_recorded(
             config: (config_name, config_bytes),
             declarations,
             ids,
+            legacy_ids,
+            ids_dir: shown(&ids_dir),
         })
     } else {
         Err(problems)
@@ -605,9 +650,10 @@ pub(super) fn assemble(
         return Err(vec![Problem::Invalid(invalid)]);
     }
 
-    let ids = match &raw.ids {
-        None => IdsFile::default(),
-        Some((path, bytes)) => {
+    let ids = match (&raw.legacy_ids, raw.ids.is_empty()) {
+        (None, true) => IdsFile::default(),
+        (None, false) => tree_ids(&raw.ids, &raw.ids_dir)?,
+        (Some((path, bytes)), _) => {
             let text = utf8(path, bytes).map_err(|p| vec![p])?;
             // The version is read before the shape, as the manifest's is: a
             // newer format may add fields this one would refuse as unknown,
