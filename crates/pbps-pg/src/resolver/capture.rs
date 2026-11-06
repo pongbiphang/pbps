@@ -368,20 +368,13 @@ pub async fn capture_identifying(
     scope: &CaptureScope,
     dropped: &BTreeSet<DroppedSignature>,
 ) -> Result<CapturedInputs, CaptureError> {
-    let mut prepared = None;
-    let read = read::owned(connection, dropped, |catalog, major| {
+    let (read, prepared) = read::owned_with(connection, dropped, |catalog, major| {
         let mut result = scope::prepare(catalog, major, scope)?;
         let selection = std::mem::take(&mut result.render);
-        prepared = Some(result);
-        Ok(selection)
+        Ok((selection, result))
     })
     .await?;
-    manifest::finish(
-        read,
-        prepared.ok_or(CaptureError::Incomplete)?,
-        scope.clone(),
-    )
-    .map_err(CaptureError::Coverage)
+    manifest::finish(read, prepared, scope.clone()).map_err(CaptureError::Coverage)
 }
 
 /// Qualify recorded ownership while the final coherent read still holds its

@@ -62,6 +62,20 @@ impl Attempts {
     }
 }
 
+/// [`owned_with`] for a `qualify` with no facts of its own.
+#[cfg(test)]
+pub(super) async fn owned(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+    mut qualify: impl FnMut(&Catalog, u32) -> Result<Selection, Failure>,
+) -> Result<Read, Failure> {
+    owned_with(conn, dropped, |catalog, major| {
+        qualify(catalog, major).map(|selection| (selection, ()))
+    })
+    .await
+    .map(|(read, ())| read)
+}
+
 /// One owned capture, re-run while the catalog changes under it: a change
 /// that persists is read consistently by the next attempt and sealed, and one
 /// that never settles inside the bound is refused as [`Failure::Unsettled`].
@@ -70,18 +84,38 @@ impl Attempts {
 /// concurrent changes of this server, and the apply's bracket
 /// ([`in_callers_transaction`]) is never retried: a change there is the one
 /// DEC-616.1 and SPEC 7.6 exist to refuse. `qualify` runs once per attempt.
-pub(super) async fn owned(
+///
+/// A `qualify` that has facts of its own returns them with its selection, and
+/// **nothing else leaves it**: an attempt whose
+/// snapshot is rejected drops its facts with it, so the accepted read is
+/// always paired with the facts of that same snapshot and a closure has no
+/// outer state to leave stale between attempts (#2715 round 1).
+pub(super) async fn owned_with<T>(
     conn: &mut impl QueryConnection,
     dropped: &BTreeSet<super::DroppedSignature>,
-    mut qualify: impl FnMut(&Catalog, u32) -> Result<Selection, Failure>,
-) -> Result<Read, Failure> {
+    mut qualify: impl FnMut(&Catalog, u32) -> Result<(Selection, T), Failure>,
+) -> Result<(Read, T), Failure> {
     let mut attempts = Attempts::new();
     loop {
-        match owned_once(conn, dropped, &mut qualify).await {
+        match owned_once_with(conn, dropped, &mut qualify).await {
             Err(Failure::Changed) => tokio::time::sleep(attempts.changed()?).await,
             other => return other,
         }
     }
+}
+
+/// One attempt of [`owned_with`], for a test that pins what a single snapshot does.
+#[cfg(test)]
+pub(super) async fn owned_once(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+    qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
+) -> Result<Read, Failure> {
+    owned_once_with(conn, dropped, |catalog, major| {
+        qualify(catalog, major).map(|selection| (selection, ()))
+    })
+    .await
+    .map(|(read, ())| read)
 }
 
 /// The lifecycle owner must expire/drop the connection if this future is
@@ -89,11 +123,17 @@ pub(super) async fn owned(
 /// open caller transaction is refused before BEGIN and is left untouched.
 /// `qualify` is the adapter's private pre-render coverage check: in particular,
 /// custom datum output must not run before its type has qualified.
-pub(super) async fn owned_once(
+async fn owned_once_with<T>(
     conn: &mut impl QueryConnection,
     dropped: &BTreeSet<super::DroppedSignature>,
-    qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
-) -> Result<Read, Failure> {
+    qualify: impl FnOnce(&Catalog, u32) -> Result<(Selection, T), Failure>,
+) -> Result<(Read, T), Failure> {
+    let mut facts = None;
+    let qualify = |catalog: &Catalog, major: u32| {
+        let (selection, kept) = qualify(catalog, major)?;
+        facts = Some(kept);
+        Ok(selection)
+    };
     if in_transaction(conn).await? {
         return Err(Failure::CallerTransaction);
     }
@@ -124,7 +164,7 @@ pub(super) async fn owned_once(
     if current != witnesses {
         return Err(Failure::Changed);
     }
-    Ok(read)
+    Ok((read, facts.ok_or(Failure::Incomplete)?))
 }
 
 /// The capture inside the caller's open `READ COMMITTED` transaction, which
