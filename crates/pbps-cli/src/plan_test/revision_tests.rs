@@ -490,25 +490,91 @@ fn a_dialect_that_differs_from_the_manifest_is_refused_per_revision() {
     assert!(at(&found, &c1).is_empty() && at(&found, &c2).is_empty());
 }
 
-/// `ids migrate` deletes the legacy file; a revision that holds the tree and no
-/// file is migrated, not "no identities yet", until the switch reads the tree.
+/// The identity tree of the working tree and of a revision is read as the
+/// identities; a revision from before the migration still has the legacy file,
+/// which history alone may read (design-2600 §6.3); a revision with both is an
+/// unfinished migration and refused, not read as either.
 #[test]
-fn a_revision_with_an_identity_tree_and_no_legacy_file_is_refused_not_read_as_absent() {
+fn a_revision_is_read_from_its_identity_tree_or_its_legacy_file_and_never_from_both() {
     let (repo, c1, _) = standard();
-    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
-    repo.write(".pbps/ids/app.orders.json", "{}");
+    let legacy_path = repo.project.join("schema.ids.json");
+    let legacy_text = std::fs::read_to_string(&legacy_path).unwrap();
+    let legacy: pbps_model::IdsFile = serde_json::from_str(&legacy_text).unwrap();
+    // `pbps ids migrate`, by hand: the same mapping as files, the old file gone.
+    let mut placement = pbps_model::ids_tree::Placement::default();
+    for (uid, name) in &legacy.tables {
+        placement
+            .paths
+            .insert(uid.clone(), name.raw().to_string() + ".json");
+    }
+    std::fs::remove_file(&legacy_path).unwrap();
+    for (rel, text) in pbps_model::ids_tree::split(&legacy, &placement).unwrap() {
+        repo.write(&format!(".pbps/ids/{rel}"), text);
+    }
     let migrated = repo.commit("migrated");
     repo.manifest(&migrated, &[("f", &c1)], None);
+    let inputs = repo.validate().unwrap();
+    assert_eq!(
+        inputs.revisions[&migrated].ids, legacy,
+        "read from the tree"
+    );
+    assert_eq!(
+        inputs.revisions[&c1].ids.tables.len(),
+        1,
+        "the pre-migration pin is read from its legacy file"
+    );
+    assert_eq!(inputs.candidate.ids, legacy);
+
+    repo.write("schema.ids.json", &legacy_text);
+    let both = repo.commit("both layouts");
+    repo.manifest(&both, &[("f", &c1)], None);
     let found = refused(repo.validate());
-    let here = at(&found, &migrated);
     assert!(
-        here.iter().any(|p| matches!(
+        at(&found, &both).iter().any(|p| matches!(
             p,
             RevisionProblem::Unreadable { path, .. } if path == ".pbps/ids"
         )),
         "{found:?}"
     );
+}
+
+/// A tree that is not a valid mapping is refused as inconsistent, naming the
+/// directory, never read as "no identities".
+#[test]
+fn a_revision_with_a_damaged_identity_tree_is_refused() {
+    let (repo, c1, _) = standard();
+    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.write(".pbps/ids/app.orders.json", "{}");
+    let damaged = repo.commit("damaged");
+    repo.manifest(&damaged, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    let here = at(&found, &damaged);
+    assert!(
+        here.iter().any(|p| matches!(
+            p,
+            RevisionProblem::IdsInconsistent { path, .. } if path == ".pbps/ids"
+        )),
+        "{found:?}"
+    );
     assert!(!here.contains(&&RevisionProblem::IdsOutOfDate), "{found:?}");
+}
+
+/// `.pbps/ids` as a file is not an empty tree.
+#[test]
+fn a_revision_whose_identity_directory_is_a_file_is_refused() {
+    let (repo, c1, _) = standard();
+    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.write(".pbps/ids", "not a directory");
+    let bad = repo.commit("file where the tree should be");
+    repo.manifest(&bad, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &bad).iter().any(|p| matches!(
+            p,
+            RevisionProblem::NotRegular { path, .. } if path == ".pbps/ids"
+        )),
+        "{found:?}"
+    );
 }
 
 #[test]

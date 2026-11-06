@@ -87,9 +87,8 @@ pub(super) fn rows(server: &str) {
             }
             // Real resolution, without constructing an executable plan in a fixture.
             let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
-            let id_path = d.dir.join("schema.ids.json");
-            let old: pbps_model::IdsFile =
-                serde_json::from_slice(&std::fs::read(&id_path).unwrap()).unwrap();
+            let id_path = d.dir.clone();
+            let old: pbps_model::IdsFile = crate::idtree::model(&id_path);
             let ids = pbps_diff::resolve(
                 &loaded.schema,
                 &old,
@@ -101,7 +100,7 @@ pub(super) fn rows(server: &str) {
             )
             .unwrap()
             .ids;
-            std::fs::write(id_path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+            crate::idtree::write(&id_path, &ids);
             d.commit();
             let path = d.dir.join("plan.json");
             let sql = d.dir.join("plan.sql");

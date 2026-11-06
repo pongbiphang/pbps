@@ -1,6 +1,9 @@
 //! Complete output from the shipped CLI, with semantic assertions beside the goldens.
 //! Update with INSTA_UPDATE=new, then review each .snap.new individually.
 
+#[path = "support/idtree.rs"]
+mod idtree;
+
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -208,7 +211,7 @@ impl Capture {
 fn normalize(text: &str) -> String {
     let mut text = text.replace("\r\n", "\n");
     for path in [
-        "schema.ids.json",
+        ".pbps/ids",
         "schema/dbo.t.yml",
         "schema/dbo.café.yml",
         "schema/a.yml",
@@ -398,7 +401,7 @@ fn fmt_remedy_is_copyable_and_repairs_the_fixture() {
         std::fs::read_to_string(project.0.join("pbps.yml")).unwrap(),
         "dialect: mssql\n"
     );
-    assert!(!project.0.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&project.0));
 }
 
 #[test]
@@ -438,7 +441,7 @@ fn human_json_routes_keep_command_outcomes() {
                 std::fs::read_to_string(project.0.join("plan.json")).unwrap(),
                 "existing plan\n"
             );
-            assert!(!project.0.join("schema.ids.json").exists());
+            assert!(!crate::idtree::exists(&project.0));
             assert_eq!(
                 std::fs::read(project.0.join("schema/dbo.t.yml")).unwrap(),
                 bytes

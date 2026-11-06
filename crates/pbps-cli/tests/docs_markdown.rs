@@ -1,4 +1,7 @@
 //! Offline CLI coverage for Markdown table-cell boundaries (#1931).
+#[path = "support/idtree.rs"]
+mod idtree;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -136,10 +139,11 @@ fn loaded_descriptions_deprecations_and_tombstones_keep_their_cells() {
                 require: None,
             },
         );
-        project.write(
-            "schema.ids.json",
-            &serde_json::to_string_pretty(&ids).unwrap(),
+        ids.tables.insert(
+            "t_aaaaaa".parse().unwrap(),
+            format!("{schema}.sales").parse().unwrap(),
         );
+        crate::idtree::write(&project.0, &ids);
         project.run(&["validate"]);
         let out = project.run(&["docs", "--format", "markdown"]);
         let plain = "first\\|`second &lt;/td>&lt;tr>third";
@@ -188,10 +192,11 @@ fn loaded_prose_preserves_comparisons_and_escapes_html_openers_on_both_dialects(
                         require: None,
                     },
                 );
-                project.write(
-                    "schema.ids.json",
-                    &serde_json::to_string_pretty(&ids).unwrap(),
+                ids.tables.insert(
+                    "t_aaaaaa".parse().unwrap(),
+                    format!("{schema}.sales").parse().unwrap(),
                 );
+                crate::idtree::write(&project.0, &ids);
                 project.run(&["validate"]);
                 let out = project.run(&["docs", "--format", "markdown"]);
                 let plain = format!("{escaped} &lt;/td>&lt;/tr>&lt;tr>&lt;td>tail");

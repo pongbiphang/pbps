@@ -1460,17 +1460,11 @@ read back; a spelling the edit does not understand is refused, not half applied.
 `fmt` rewrites parseable files to canonical bytes and rewrites none when any
 file cannot be read.
 
-Until the switch, a migrated project fails closed. `migrate` deletes
-`schema.ids.json` and only the `ids` commands read the tree, so a reader that
-took "no legacy file" for "no identities" would mint fresh uids for every
-object. Wherever the legacy file is read and found absent, an identity tree in
-the project's `ids_dir` is a refusal naming the directory and #2600 PR 5: the
-working-tree reader, `--since` and the other history readers (a revision with
-the tree and no legacy blob), the `pbps test` revision reader, and `doctor`,
-which no longer calls such a project fresh. A directory with entries, or a path
-that is not a directory, is a tree; only an absent or empty directory is not.
-`migrate` itself reads the legacy file directly, so it can still finish an
-interrupted run. The guard goes away with the legacy reader in the switch.
+Until the switch, a migrated project failed closed: `migrate` deletes
+`schema.ids.json`, and a reader that took "no legacy file" for "no identities"
+would have minted fresh uids for every object, so wherever the legacy file was
+found absent a tree beside it was a refusal. DEC-2600.9 retires that guard
+where the tree is now read.
 
 `resolve` reads the index with `./`-relative paths and `ls-tree` with
 `--full-tree`: git runs in the project directory, and a bare path in a
@@ -1478,3 +1472,46 @@ interrupted run. The guard goes away with the legacy reader in the switch.
 below the root it reads another project's file or none. (A leftover `.tmp` file
 from a write cut off inside the rename is refused by name, like any entry that
 is not an identity file; delete it and run migrate again.)
+
+<a id="dec-2600-9"></a>
+
+**DEC-2600.9. The tree is read everywhere; the write side is the minimal sync, and every file move is refused by name until #2600 PR 5b.**
+Every reader of identities goes through `ids_store::read_opt`. A project with
+neither a tree nor `schema.ids.json` is fresh (`None`); one with only the legacy
+file is refused with "run `pbps ids migrate`", never read silently; one with
+both is an unfinished migration and refused. The legacy file is read in exactly
+one place: history (`baseline::ids_from` and the `pbps test` revision reader),
+which takes a revision's tree if it has one and its legacy blob otherwise, and
+refuses a revision with both. It stays until 1.0 (design §12 question 3). A
+listing or read that fails is an error, not "no identities". `validate` runs
+the validator over the tree and the declarations and reports its findings,
+including `ids.orphan`; a declaration that has no file yet (`ids.yaml-without-ids`)
+is what `plan` mints, and non-canonical bytes are `ids fmt --check`'s, so those
+two are not `validate`'s. `doctor`'s JSON field `identity_file` is `identity_dir`
+(schema set 95).
+
+The write is `ids_store::plan`, then `TreeWrite::apply`. `plan` decides the whole
+new tree and every refusal before anything is written, and proves the result
+reads back to the mapping it was made from. An identity stays in the file it
+already has, and a new declaration's file goes at the path its YAML mirrors;
+tables, columns (a new one after its YAML predecessor, a tombstone where it
+was), roles, types and extensions are added, renamed and retired in place, and a
+table drop marks its file dropped where it stands. `apply` writes every file
+beside its final name and renames them into place, `pbps.yml` last. The first
+write into a project that never named `ids_dir` names it, so an older pbps stops
+at the config (design §6.2). `init` and `pull` write through the same path, and
+`init` claims the root by creating `.pbps/ids`, which replaces the old
+`schema.ids.json` claim.
+
+What the write side refuses, by name and with the same closing sentence ("the
+switch to the identity tree is unfinished (#2600 PR 5b); nothing was written"),
+is exactly what moves a file: a declaration whose YAML moved or was renamed
+(relocation, design §3.4 step 2); a new declaration at a path another identity's
+file holds (displacement, step 5); a table that becomes or stops being a
+partition child, or changes parent (step 6); an identity file the new mapping no
+longer holds, or a drop of an identity the tree has no file for; and a
+declaration with an identity and no path. PR 5b turns each into a step of the
+sync and extends `plan` rather than replacing it. Until then `plan` only reaches
+a refusal when its mapping changed: a project whose YAML moved but whose
+identities did not is reported by `validate` as `ids.orphan`.
+

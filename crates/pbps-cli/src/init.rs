@@ -350,12 +350,17 @@ fn refuse_existing(root: &Path) -> anyhow::Result<()> {
             config.display()
         );
     }
-    let ids = root.join("schema.ids.json");
-    if ids.exists() {
-        bail!(
-            "`{}` already exists; init will not overwrite project data",
-            ids.display()
-        );
+    // Whether anything is there at all, not whether it is empty: creating this
+    // directory is the claim on the root (see `commit`), so another init's
+    // leftover or a user's own directory must stop this one.
+    for name in ["schema.ids.json", pbps_config::DEFAULT_IDS_DIR] {
+        let ids = root.join(name);
+        if std::fs::symlink_metadata(&ids).is_ok() {
+            bail!(
+                "`{}` already exists; init will not overwrite project data",
+                ids.display()
+            );
+        }
     }
     let schema = root.join("schema");
     if schema.is_dir() {
@@ -427,6 +432,9 @@ fn render_config(config: &Config) -> String {
         env!("CARGO_PKG_VERSION"),
         config.dialect
     );
+    // Named explicitly even though it is the default: it is what makes an older
+    // pbps stop at the config instead of reading no tree as no identities.
+    out.push_str(&format!("ids_dir: {}\n", pbps_config::DEFAULT_IDS_DIR));
     if !config.environments.is_empty() {
         out.push_str("environments:\n");
         for (name, environment) in &config.environments {
@@ -491,12 +499,6 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         crate::adopt::write_declarations(&schema_dir, &prepared.schema, &prepared.public_execute)?;
         std::fs::write(stage.join(pbps_config::CONFIG_FILE), &prepared.config_text)
             .context("cannot stage pbps.yml")?;
-        std::fs::write(
-            stage.join(&prepared.config.ids_file),
-            format!("{}\n", serde_json::to_string_pretty(&prepared.ids)?),
-        )
-        .context("cannot stage schema.ids.json")?;
-
         // Validate from the serialized files, not the values that produced
         // them. This catches renderer/loader drift before the project appears.
         let project = Project::load(&stage.join(pbps_config::CONFIG_FILE))?;
@@ -515,13 +517,17 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         if loaded.schema != prepared.schema {
             bail!("the staged declarations do not round-trip to the pulled schema");
         }
-        let ids: IdsFile = crate::artifact::decode(
-            &std::fs::read_to_string(project.ids_file())?,
-            serde_json::from_str,
-        )?;
-        ids.validate()?;
+        // The identities go into the tree the declarations mirror, decided and
+        // checked by the same writer `plan` uses, and read back from the files.
+        crate::ids_store::plan(
+            &project,
+            &prepared.ids,
+            &loaded.declared_paths(&project.schema_dir())?,
+        )?
+        .apply()?;
+        let ids = crate::ids_store::read_opt(&project)?.unwrap_or_default();
         if ids != prepared.ids {
-            bail!("the staged identity file does not round-trip");
+            bail!("the staged identity tree does not round-trip");
         }
         Ok(())
     })();
@@ -574,15 +580,17 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
 
     let final_schema = root.join("schema");
     let staged_schema = stage.join("schema");
-    let final_ids = root.join("schema.ids.json");
+    let staged_ids = stage.join(pbps_config::DEFAULT_IDS_DIR);
+    let final_ids = root.join(pbps_config::DEFAULT_IDS_DIR);
 
-    // schema.ids.json is installed first and released last: it is the exclusive
-    // claim on this root. The recheck above cannot serialize two inits on its
+    // The identity directory is created first and released last: creating it
+    // is the exclusive claim on this root. The recheck above cannot serialize two inits on its
     // own, because `rename` of a directory replaces an existing *empty* one on
     // Unix — both would believe they owned `schema`, and the loser's rollback
-    // would delete the winner's declarations. An atomic no-replace link stops
-    // the loser here, before it has touched anything.
-    if let Err(error) = install_file_no_replace(stage.join("schema.ids.json"), &final_ids) {
+    // would delete the winner's declarations. `create_dir` fails when the
+    // directory exists, atomically, which stops the loser here, before it has
+    // touched anything; the tree's files then arrive by no-replace link.
+    if let Err(error) = claim_identity_dir(&staged_ids, &final_ids) {
         let _ = std::fs::remove_dir_all(stage);
         return Err(error);
     }
@@ -643,7 +651,7 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         }
         // Released last, so no other init can reach the schema move while this
         // rollback is undoing it.
-        let _ = std::fs::remove_file(&final_ids);
+        let _ = std::fs::remove_dir_all(&final_ids);
         let _ = std::fs::remove_dir_all(stage);
         return Err(error);
     }
@@ -654,6 +662,46 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Claims `final_ids` by creating it, then installs the staged tree's files into
+/// it. The directory is created even when the tree is empty: the claim is the
+/// point. On failure after the claim, the directory is removed again.
+fn claim_identity_dir(staged: &Path, final_ids: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = final_ids.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create `{}`", parent.display()))?;
+    }
+    std::fs::create_dir(final_ids).map_err(|e| {
+        let what = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "refusing to replace `{}`; it appeared while init was preparing its output",
+                final_ids.display()
+            )
+        } else {
+            format!("cannot create `{}`", final_ids.display())
+        };
+        anyhow::Error::new(e).context(what)
+    })?;
+    let mut files = Vec::new();
+    if staged.is_dir() {
+        collect_files(staged, &mut files)?;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        for source in &files {
+            let rel = source.strip_prefix(staged)?;
+            let destination = final_ids.join(rel);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            install_file_no_replace(source, &destination)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(final_ids);
+    }
+    result
 }
 
 /// Installs one staged file without ever replacing an existing destination.
@@ -836,7 +884,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let stage = root.join(".pbps-init-test");
         std::fs::create_dir_all(stage.join("schema")).unwrap();
-        std::fs::write(stage.join("schema.ids.json"), "generated ids\n").unwrap();
+        std::fs::create_dir_all(stage.join(".pbps/ids")).unwrap();
+        std::fs::write(stage.join(".pbps/ids/x.json"), "generated ids\n").unwrap();
         // No staged pbps.yml, so the install fails after the schema move.
         std::fs::create_dir_all(root.join("schema")).unwrap();
         std::fs::write(root.join("schema").join(GITKEEP), "").unwrap();
@@ -846,7 +895,7 @@ mod tests {
             root.join("schema").join(GITKEEP).is_file(),
             "the rollback must restore the layout it displaced"
         );
-        assert!(!root.join("schema.ids.json").exists(), "claim not released");
+        assert!(!root.join(".pbps/ids").exists(), "claim not released");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -899,7 +948,8 @@ mod tests {
                 .map(|which| {
                     let stage = root.join(format!(".pbps-init-{which}"));
                     std::fs::create_dir_all(stage.join("schema")).unwrap();
-                    std::fs::write(stage.join("schema.ids.json"), which).unwrap();
+                    std::fs::create_dir_all(stage.join(".pbps/ids")).unwrap();
+                    std::fs::write(stage.join(".pbps/ids/x.json"), which).unwrap();
                     std::fs::write(stage.join("pbps.yml"), which).unwrap();
                     stage
                 })
@@ -931,7 +981,7 @@ mod tests {
                 panic!("round {round}: an init succeeded but left no config: {e}")
             });
             assert_eq!(
-                std::fs::read_to_string(root.join("schema.ids.json")).ok(),
+                std::fs::read_to_string(root.join(".pbps/ids/x.json")).ok(),
                 Some(winner),
                 "round {round}: the identity file does not belong to the init that won"
             );
@@ -950,7 +1000,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let stage = root.join(".pbps-init-test");
         std::fs::create_dir_all(stage.join("schema")).unwrap();
-        std::fs::write(stage.join("schema.ids.json"), "generated ids\n").unwrap();
+        std::fs::create_dir_all(stage.join(".pbps/ids")).unwrap();
+        std::fs::write(stage.join(".pbps/ids/x.json"), "generated ids\n").unwrap();
         std::fs::write(stage.join("pbps.yml"), "generated config\n").unwrap();
         // Simulates a file created while a long catalog read was in progress.
         std::fs::write(root.join("pbps.yml"), "user config\n").unwrap();

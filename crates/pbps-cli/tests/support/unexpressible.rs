@@ -10,8 +10,8 @@ fn report(output: std::process::Output) -> serde_json::Value {
 
 /// Compare the actual CLI envelopes and the files a refused plan must preserve.
 pub fn check(d: &Demo, connection: &str, objects: &[&str]) {
-    let ids_path = d.dir.join("schema.ids.json");
-    let ids = std::fs::read(&ids_path).unwrap();
+    let ids_path = d.dir.clone();
+    let ids = crate::idtree::snapshot(&ids_path);
     let offline = report(d.run(&["--no-input", "plan", "--format", "json"]));
     let reasons = offline["findings"].as_array().unwrap();
     assert_eq!(reasons.len(), objects.len(), "{offline}");
@@ -75,7 +75,7 @@ pub fn check(d: &Demo, connection: &str, objects: &[&str]) {
         } else {
             assert!(!plan.exists() && !sql.exists());
         }
-        assert_eq!(std::fs::read(&ids_path).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&ids_path), ids);
     }
 
     let human = d.run(&["--no-input", "plan", "--db", connection]);

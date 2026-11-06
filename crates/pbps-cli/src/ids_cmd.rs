@@ -60,7 +60,7 @@ pub(crate) fn run(project: &Project, command: IdsCommand) -> anyhow::Result<()> 
 // ---------------------------------------------------------------- shared ----
 
 /// `a/./b/` as `a/b`: the project-relative spelling the validator matches on.
-fn spelled(path: &Path) -> String {
+pub(crate) fn spelled(path: &Path) -> String {
     path.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -68,32 +68,32 @@ fn spelled(path: &Path) -> String {
         .join("/")
 }
 
-struct Dirs {
-    schema: String,
-    ids: String,
+pub(crate) struct Dirs {
+    pub(crate) schema: String,
+    pub(crate) ids: String,
 }
 
 impl Dirs {
-    fn of(project: &Project) -> Self {
+    pub(crate) fn of(project: &Project) -> Self {
         Self {
             schema: spelled(&project.config.schema_dir),
             ids: spelled(&project.config.ids_dir()),
         }
     }
-    fn layout(&self) -> Layout<'_> {
+    pub(crate) fn layout(&self) -> Layout<'_> {
         Layout {
             schema_dir: &self.schema,
             ids_dir: &self.ids,
         }
     }
     /// The ids path (relative to the ids directory) of a declaration file.
-    fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
+    pub(crate) fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
         ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema))
             .with_context(|| format!("`{rel_yaml}` is not a .yml or .yaml declaration"))
     }
 }
 
-fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
+pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
     let dir = project.schema_dir();
     let loaded = load_schema_dir(&dir).map_err(|errors| {
         anyhow::anyhow!(
@@ -111,7 +111,7 @@ fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
 
 /// Writes through a temporary name in the same directory, so a crash leaves
 /// either the old file or the new one (design §2.4 rule 4).
-fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -120,7 +120,7 @@ fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("cannot replace `{}`", path.display()))
 }
 
-fn shown(dirs: &Dirs, rel: &str) -> String {
+pub(crate) fn shown(dirs: &Dirs, rel: &str) -> String {
     pbps_model::Text::new(format!("{}/{rel}", dirs.ids))
         .shown()
         .to_string()
@@ -218,13 +218,16 @@ fn aside(was: &str, uid: &Uid) -> String {
     format!("{safe}.{uid}.json")
 }
 
-/// Section 6.1 steps 2 and 3: every object's records into the file at its
-/// mirrored path, columns in YAML order.
-fn place(
+/// Where the declarations say each identity lives: the mirrored path of the
+/// file that declares it, a partition child's parent, and a table's columns in
+/// YAML order. Identities with no declaration are simply absent from it; what
+/// to do about them is the caller's (migrate refuses or places them aside,
+/// `plan` keeps the file they already have).
+pub(crate) fn declared_placement(
     dirs: &Dirs,
     ids: &IdsFile,
     paths: &DeclaredPaths,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> anyhow::Result<Placement> {
     fn invert<K: Ord + Clone, V: Ord + Clone>(m: &BTreeMap<K, V>) -> BTreeMap<V, K> {
         m.iter().map(|(k, v)| (v.clone(), k.clone())).collect()
     }
@@ -259,6 +262,17 @@ fn place(
             placement.children.insert(c.clone(), p.clone());
         }
     }
+    Ok(placement)
+}
+
+/// Section 6.1 steps 2 and 3: every object's records into the file at its
+/// mirrored path, columns in YAML order.
+fn place(
+    dirs: &Dirs,
+    ids: &IdsFile,
+    paths: &DeclaredPaths,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut placement = declared_placement(dirs, ids, paths)?;
     let placed =
         |uid: &Uid| placement.paths.contains_key(uid) || placement.children.contains_key(uid);
     let mut missing: Vec<String> = Vec::new();
@@ -309,7 +323,7 @@ fn place(
 /// already says so. Edited as text so comments and order stay, then proved by
 /// reading it back: a spelling the line edit does not understand is refused,
 /// never half-applied.
-fn new_config_text(project: &Project) -> anyhow::Result<Option<String>> {
+pub(crate) fn new_config_text(project: &Project) -> anyhow::Result<Option<String>> {
     let path = project.config_file();
     let old = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read `{}`", path.display()))?;
@@ -437,7 +451,11 @@ fn named(source: &Source) -> Option<(UidKind, String)> {
 
 /// The declarations as the validator wants them: project-relative path, kind,
 /// name, and the `renamed_from` they carry.
-fn declarations(dirs: &Dirs, loaded: &Loaded, paths: &DeclaredPaths) -> Vec<Declaration> {
+pub(crate) fn declarations(
+    dirs: &Dirs,
+    loaded: &Loaded,
+    paths: &DeclaredPaths,
+) -> Vec<Declaration> {
     paths
         .files
         .iter()

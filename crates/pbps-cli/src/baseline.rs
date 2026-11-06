@@ -480,8 +480,15 @@ pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
     ids_from(&project.root, rev, &ids_rel, &ids_dir_rel, rev)
 }
 
-/// The identity file at `rev`, under a path already resolved for that
-/// revision.
+/// The identities at `rev`, under paths already resolved for that revision.
+///
+/// The tree under `ids_dir` if the revision has one, otherwise the legacy
+/// `schema.ids.json` blob: a revision from before `pbps ids migrate` is
+/// history, and this is the one place the legacy layout is still read
+/// (design-2600 §6.3). A revision with neither is a first run, which is empty
+/// and not a failure; one with both is an unfinished migration and refused.
+/// Absent, empty and unreadable stay three things: a listing or a read that
+/// fails is an error, never "no identities".
 fn ids_from(
     root: &Path,
     rev: &str,
@@ -489,8 +496,28 @@ fn ids_from(
     ids_dir_rel: &str,
     label: &str,
 ) -> anyhow::Result<ValidIds> {
-    match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
-        Ok(text) => {
+    // A name that does not resolve is the empty baseline only for an unborn
+    // `HEAD`; any other is a mistake, and says so in the words callers expect.
+    if !resolves(root, rev) {
+        refuse_unknown_revision(root, rev)?;
+        return Ok(IdsFile::default().validated()?);
+    }
+    let tree = crate::ids_store::tree_at(root, rev, ids_dir_rel)
+        .with_context(|| format!("cannot read the identity tree at `{label}`"))?;
+    // `--full-tree`: `ids_rel` is as git names it from the repository root.
+    let listed = git(root, &["ls-tree", "--full-tree", "-z", rev, "--", ids_rel])
+        .with_context(|| format!("cannot look for the identity file at `{label}`"))?;
+    let legacy = if listed.is_empty() {
+        None
+    } else {
+        Some(
+            git(root, &["show", &format!("{rev}:{ids_rel}")])
+                .with_context(|| format!("cannot read the identity file at `{label}`"))?,
+        )
+    };
+    match (legacy, tree.is_empty()) {
+        (None, true) => Ok(IdsFile::default().validated()?),
+        (Some(text), true) => {
             // The decoder's sentence repeats the file's text; `artifact::decode`
             // shows it escaped, like a plan's (DEC-2032.1, #2035).
             let ids: IdsFile = crate::artifact::decode(&text, serde_json::from_str)
@@ -500,17 +527,14 @@ fn ids_from(
             ids.validated()
                 .with_context(|| format!("the identity file at `{label}` is inconsistent"))
         }
-        Err(_) => {
-            // No legacy blob is a first run only where no tree stands in its
-            // place (#2600): a migrated revision is not empty.
-            // A listing that itself fails means the revision cannot be read
-            // at all; its declarations are read next under the same name and
-            // refuse it there, in the words callers already expect.
-            if let Ok(true) = crate::ids_guard::tree_present_at(root, rev, ids_dir_rel) {
-                anyhow::bail!("at `{label}`: {}", crate::ids_guard::message(ids_dir_rel));
-            }
-            Ok(IdsFile::default().validated()?)
-        }
+        (None, false) => pbps_model::ids_tree::assemble(&tree)
+            .with_context(|| format!("the identity tree at `{label}` is inconsistent"))?
+            .validated()
+            .with_context(|| format!("the identity tree at `{label}` is inconsistent")),
+        (Some(_), false) => anyhow::bail!(
+            "at `{label}`: both `{ids_rel}` and the identity tree `{ids_dir_rel}` exist, so a \
+             migration was unfinished there"
+        ),
     }
 }
 

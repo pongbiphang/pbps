@@ -51,8 +51,7 @@ fn intent_fixture(dialect: &str, slug: &str) -> Demo {
 }
 
 fn recorded_operator(d: &Demo) -> String {
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     assert_eq!(ids.tombstones.len(), 1);
     ids.tombstones.values().next().unwrap().operator.clone()
 }

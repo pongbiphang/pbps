@@ -81,3 +81,4 @@ DECISIONS 465).
 - `90/` adds recorded target assertions to plan output and `explain` (#2401 PR B).
 - `91/` adds the `gist` index method and an index key's `collation:` (#2448 PR B).
 - `92/` adds the `ids_dir` key of `pbps.yml`, the directory of per-declaration identity files (#2600 PR 3).
+- `95/` renames `doctor`'s `identity_file` to `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a, DEC-2600.9).

@@ -103,7 +103,7 @@ fn partition_identity_attach_accepts_plain_columns_and_refuses_own_identity() {
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", connection]));
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         std::fs::remove_file(&own_path).unwrap();
         std::fs::write(
             &tree,
@@ -117,7 +117,7 @@ fn partition_identity_attach_accepts_plain_columns_and_refuses_own_identity() {
             said.contains("app.own") && said.contains("its column `id` has its own identity"),
             "{said}"
         );
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         std::fs::write(&own_path, own_text).unwrap();
         std::fs::remove_file(&plain_path).unwrap();
         std::fs::write(

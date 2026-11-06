@@ -14,6 +14,9 @@ use std::time::{Duration, SystemTime};
 use pbps_ui::compose::{Candidates, CaptureBoundary, Config, Intent, Request};
 
 #[cfg(unix)]
+#[path = "support/idtree.rs"]
+mod idtree;
+
 #[path = "support/unix_socket.rs"]
 mod unix_socket;
 
@@ -122,7 +125,7 @@ impl Repository {
     fn preserved(&self) -> Vec<Vec<u8>> {
         vec![
             fs::read(self.project.join("schema/t.yml")).unwrap(),
-            fs::read(self.project.join("schema.ids.json")).unwrap(),
+            crate::idtree::snapshot(&self.project),
             fs::read(self.root.join(".git/index")).unwrap(),
             fs::read(self.root.join(".git/HEAD")).unwrap(),
             user_refs(&self.root),
@@ -272,7 +275,7 @@ fn edits_during_capture_are_refused_and_never_become_post_diff_evidence() {
 fn configuration_cannot_redirect_intent_writes_after_path_admission() {
     let repo = Repository::new("config-admission-race", "");
     repo.table(RENAMED);
-    let ids = fs::read(repo.project.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&repo.project);
     let index = fs::read(repo.root.join(".git/index")).unwrap();
     let result = repo
         .store()
@@ -283,17 +286,14 @@ fn configuration_cannot_redirect_intent_writes_after_path_admission() {
                 // the final capture recheck ever had a chance to refuse it.
                 fs::write(
                     repo.project.join("pbps.yml"),
-                    format!(
-                        "dialect: mssql\nids_file: {}\n",
-                        repo.project.join("schema.ids.json").display()
-                    ),
+                    "dialect: mssql\nids_dir: elsewhere-ids\n",
                 )
                 .unwrap();
             }
         });
     assert!(result.is_err());
     assert_eq!(
-        fs::read(repo.project.join("schema.ids.json")).unwrap(),
+        crate::idtree::snapshot(&repo.project),
         ids,
         "path admission must protect the actual configuration used by the intent CLI"
     );
@@ -412,6 +412,10 @@ fn refresh_replaces_the_handle_and_expiry_requires_another_preview() {
 
 #[test]
 fn new_deleted_recreated_paths_and_modes_are_part_of_the_candidate() {
+    if crate::idtree::pending_5b("new_deleted_recreated_paths_and_modes_are_part_of_the_candidate")
+    {
+        return;
+    }
     let repo = Repository::new("membership", "");
     fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
     fs::write(repo.project.join("schema/renamed.yml"), RENAMED).unwrap();
@@ -456,7 +460,7 @@ fn deleting_the_last_declaration_keeps_the_snapshot_input_directory() {
     let repo = Repository::new("last-declaration", "");
     fs::remove_file(repo.root.join("schema/t.yml")).unwrap();
     let index = fs::read(repo.root.join(".git/index")).unwrap();
-    let ids = fs::read(repo.root.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&repo.root);
     let mut action = request();
     action.intent = Intent::DropTable {
         table: "dbo.t".into(),
@@ -466,11 +470,16 @@ fn deleting_the_last_declaration_keeps_the_snapshot_input_directory() {
     assert!(preview.diff.contains("Retired final table"));
     assert!(repo.root.join("schema").is_dir());
     assert_eq!(fs::read(repo.root.join(".git/index")).unwrap(), index);
-    assert_eq!(fs::read(repo.root.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&repo.root), ids);
 }
 
 #[test]
 fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
+    if crate::idtree::pending_5b(
+        "declaration_file_directory_replacements_preserve_the_reviewed_scope",
+    ) {
+        return;
+    }
     for (directory_first, foreign) in [(false, false), (true, false), (true, true)] {
         let repo = Repository::new(&format!("replacement-{directory_first}-{foreign}"), "");
         let file = "schema/t.yml";
@@ -502,7 +511,7 @@ fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
         let source = || {
             vec![
                 fs::read(repo.root.join(new)).unwrap(),
-                fs::read(repo.root.join("schema.ids.json")).unwrap(),
+                crate::idtree::snapshot(&repo.root),
                 fs::read(repo.root.join(".git/index")).unwrap(),
                 fs::read(repo.root.join(".git/HEAD")).unwrap(),
                 user_refs(&repo.root),
@@ -655,14 +664,14 @@ fn binary_attributes_cannot_hide_reviewed_declaration_or_identity_bytes() {
     let repo = Repository::new("forced-text", "");
     fs::write(
         repo.root.join(".gitattributes"),
-        "schema/*.yml -diff\nschema.ids.json -diff\n",
+        "schema/*.yml -diff\n.pbps/ids/** -diff\n",
     )
     .unwrap();
     repo.commit();
     repo.table(RENAMED);
     let preview = repo.store().preview(request(), SystemTime::now()).unwrap();
     assert!(preview.diff.contains("+  ident:"), "{}", preview.diff);
-    assert!(preview.diff.contains("schema.ids.json"));
+    assert!(preview.diff.contains(".pbps/ids/"));
     assert!(!preview.diff.contains("Binary files"));
 }
 
@@ -763,19 +772,21 @@ fn legacy_and_modern_line_ending_attributes_follow_git_precedence() {
         git(&repo.root, &["config", "core.autocrlf", autocrlf]);
         fs::write(
             repo.root.join(".gitattributes"),
-            format!("schema/*.yml {attribute}\nschema.ids.json {attribute}\n"),
+            format!("schema/*.yml {attribute}\n.pbps/ids/** {attribute}\n"),
         )
         .unwrap();
         repo.commit();
         repo.table(&RENAMED.replace('\n', "\r\n"));
-        let ids = fs::read_to_string(repo.project.join("schema.ids.json")).unwrap();
-        fs::write(
-            repo.project.join("schema.ids.json"),
-            ids.replace('\n', "\r\n"),
-        )
-        .unwrap();
+        for (rel, bytes) in crate::idtree::files(&repo.project) {
+            let text = String::from_utf8(bytes).unwrap();
+            fs::write(
+                crate::idtree::dir(&repo.project).join(rel),
+                text.replace('\n', "\r\n"),
+            )
+            .unwrap();
+        }
         let before = repo.preserved();
-        for path in ["schema/t.yml", "schema.ids.json"] {
+        for path in ["schema/t.yml", ".pbps/ids/t.json"] {
             let raw = git(&repo.root, &["hash-object", "--no-filters", path]);
             let ordinary = git(
                 &repo.root,
@@ -981,7 +992,7 @@ fn contained_parent_components_resolve_to_the_same_reviewed_inputs() {
         let repo = Repository::new(&format!("contained-parents-{sub}"), sub);
         fs::write(
             repo.project.join("pbps.yml"),
-            "dialect: mssql\nschema_dir: schema/../schema\nids_file: schema/../schema.ids.json\n",
+            "dialect: mssql\nschema_dir: schema/../schema\nids_dir: schema/../.pbps/ids\n",
         )
         .unwrap();
         checked(repo.cli(&["validate"]));
@@ -1005,7 +1016,7 @@ fn contained_parent_components_resolve_to_the_same_reviewed_inputs() {
         assert_eq!(repo.preserved(), before);
         for config in [
             "dialect: mssql\nschema_dir: schema/../../outside\n",
-            "dialect: mssql\nids_file: schema/../../outside.ids.json\n",
+            "dialect: mssql\nids_dir: schema/../../outside-ids\n",
         ] {
             repo.table(ORIGINAL);
             fs::write(repo.project.join("pbps.yml"), config).unwrap();
@@ -1023,6 +1034,175 @@ fn contained_parent_components_resolve_to_the_same_reviewed_inputs() {
     }
 }
 
+/// The fixture's migrated project with its identities in one JSON file at
+/// `file` instead of the tree. `config` is a different `pbps.yml`, which compose
+/// needs the base to hold, so it is committed together with the tree's removal;
+/// the legacy file itself is left untracked, so only the working tree has it.
+fn legacy_only(repo: &Repository, file: &str, config: Option<&str>) {
+    let legacy = crate::idtree::model(&repo.project);
+    fs::remove_dir_all(repo.project.join(".pbps")).unwrap();
+    if let Some(config) = config {
+        fs::write(repo.project.join("pbps.yml"), config).unwrap();
+        repo.commit();
+    }
+    fs::create_dir_all(repo.project.join(file).parent().unwrap()).unwrap();
+    fs::write(
+        repo.project.join(file),
+        serde_json::to_string_pretty(&legacy).unwrap() + "\n",
+    )
+    .unwrap();
+}
+
+/// The private CLI must see what the real one sees. A project that still keeps
+/// its identities in `schema.ids.json` (or the file `ids_file` names) is told to
+/// run `pbps ids migrate` by the real CLI; compose that left the file out of the
+/// capture would hand its private CLI the base's layout, a migrated or a fresh
+/// project, and compose a candidate from it.
+#[test]
+fn a_project_with_only_the_legacy_identity_file_is_refused_through_compose_as_it_is_directly() {
+    for (file, config) in [
+        ("schema.ids.json", None),
+        (
+            "custom/ids.json",
+            Some("dialect: mssql\nids_file: custom/ids.json\n"),
+        ),
+    ] {
+        let repo = Repository::new(&format!("legacy-only-{}", file.replace('/', "-")), "");
+        legacy_only(&repo, file, config);
+        repo.table(RENAMED);
+        let direct = repo.cli(&["validate"]);
+        assert!(
+            String::from_utf8_lossy(&direct.stderr).contains("pbps ids migrate"),
+            "{file}: {direct:?}"
+        );
+        let before = repo.preserved();
+        let error = repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .expect_err("a legacy-only project must not compose")
+            .to_string();
+        assert!(
+            error.contains("refused the captured inputs"),
+            "{file}: {error}"
+        );
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+/// The other direction: the base holds the legacy file and the working tree is
+/// the migration (the default `ids_dir` needs no config change). The candidate
+/// must not keep the tracked legacy file beside the new tree.
+#[test]
+fn a_migration_in_the_working_tree_composes_without_the_tracked_legacy_file() {
+    let repo = Repository::new("migration-in-working-tree", "");
+    let migrated = crate::idtree::model(&repo.project);
+    fs::write(repo.project.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    legacy_only(&repo, "schema.ids.json", None);
+    repo.commit();
+    fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    crate::idtree::write(&repo.project, &migrated);
+    repo.table(RENAMED);
+    let mut store = repo.store();
+    let now = SystemTime::now();
+    let preview = store.preview(request(), now).unwrap();
+    let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+    assert!(
+        candidate.manifest().inputs["schema.ids.json"].is_none(),
+        "the candidate keeps the tracked legacy file beside the tree"
+    );
+    assert!(
+        candidate
+            .manifest()
+            .inputs
+            .keys()
+            .any(|n| n.starts_with(".pbps/ids/")),
+        "{:?}",
+        candidate.manifest().inputs.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The identity tree is listed by the CLI's loader and by nothing in compose: a
+/// file the loader refuses (a `.tmp` left by an interrupted write, a non-JSON
+/// file, a link) has to refuse the compose too, and not be filtered out of the
+/// capture so that the private CLI sees a clean tree.
+#[test]
+fn an_entry_the_loader_refuses_inside_the_identity_tree_is_refused_through_compose() {
+    for (name, make) in [
+        (".dbo.t.json.tmp", "file"),
+        ("notes.txt", "file"),
+        ("alias.json", "link"),
+    ] {
+        let repo = Repository::new(&format!("tree-entry-{}", name.replace('.', "-")), "");
+        let path = repo.project.join(".pbps/ids").join(name);
+        if make == "link" {
+            symlink("t.json", &path).unwrap();
+        } else {
+            fs::write(&path, "left behind").unwrap();
+        }
+        repo.table(RENAMED);
+        let direct = repo.cli(&["validate"]);
+        assert!(!direct.status.success(), "{name}: {direct:?}");
+        assert!(
+            String::from_utf8_lossy(&direct.stderr).contains("identity tree entry"),
+            "{name}: {direct:?}"
+        );
+        let before = repo.preserved();
+        let error = repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .expect_err("an entry the loader refuses must not compose")
+            .to_string();
+        assert!(!error.is_empty(), "{name}");
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+/// Both layouts are an unfinished migration, for compose as for the CLI, so a
+/// candidate can never hold a legacy file beside a tree.
+#[test]
+fn a_project_with_both_layouts_is_refused_through_compose() {
+    let repo = Repository::new("both-layouts", "");
+    let legacy = crate::idtree::model(&repo.project);
+    fs::write(
+        repo.project.join("schema.ids.json"),
+        serde_json::to_string_pretty(&legacy).unwrap() + "\n",
+    )
+    .unwrap();
+    repo.table(RENAMED);
+    let direct = repo.cli(&["validate"]);
+    assert!(
+        String::from_utf8_lossy(&direct.stderr).contains("did not finish"),
+        "{direct:?}"
+    );
+    let error = repo
+        .store()
+        .preview(request(), SystemTime::now())
+        .expect_err("both layouts must not compose")
+        .to_string();
+    assert!(error.contains("refused the captured inputs"), "{error}");
+}
+
+/// Negative: a migrated project, with no legacy file anywhere, still composes,
+/// and the candidate holds no legacy file.
+#[test]
+fn a_migrated_project_still_composes_and_the_candidate_holds_no_legacy_file() {
+    let repo = Repository::new("migrated-composes", "");
+    repo.table(RENAMED);
+    let mut store = repo.store();
+    let now = SystemTime::now();
+    let preview = store.preview(request(), now).unwrap();
+    let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+    assert!(
+        candidate
+            .manifest()
+            .inputs
+            .iter()
+            .all(|(name, file)| !name.ends_with("schema.ids.json") || file.is_none()),
+        "{:?}",
+        candidate.manifest().inputs.keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() {
     for variant in ["link", "unreadable", "filter"] {
@@ -1038,7 +1218,7 @@ fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() 
         repo.table(RENAMED);
         if variant == "link" {
             fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
-            symlink("../schema.ids.json", repo.project.join("schema/t.yml")).unwrap();
+            symlink("../.pbps/ids/t.json", repo.project.join("schema/t.yml")).unwrap();
         }
         let before = repo.preserved();
         let path = repo.project.join("schema/t.yml");

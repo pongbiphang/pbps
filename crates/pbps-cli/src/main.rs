@@ -21,7 +21,7 @@ mod explain;
 mod externals_draft;
 mod hooks;
 mod ids_cmd;
-mod ids_guard;
+mod ids_store;
 mod init;
 mod integration;
 mod intent_batch;
@@ -1744,6 +1744,9 @@ fn run() -> anyhow::Result<()> {
                 (None, None) => None,
                 _ => Some(target.resolve(&project)?),
             };
+            if let Some(path) = sql.as_deref() {
+                ids_store::refuse_output_inside(&project, path)?;
+            }
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
@@ -1836,6 +1839,7 @@ fn cmd_docs(
 
     match out {
         Some(path) => {
+            ids_store::refuse_output_inside(project, path)?;
             std::fs::write(path, &rendered)
                 .with_context(|| format!("cannot write `{}`", path.display()))?;
             // To stderr: stdout may be the document itself when --out is absent,
@@ -1907,7 +1911,7 @@ fn cmd_pull(
     // before connecting so damaged history cannot become a fresh adoption
     // (DEC-1790.1).
     let existing_ids = read_ids_opt(project).context(
-        "pull cannot preserve identities; restore the identity file from git, or deliberately \
+        "pull cannot preserve identities; restore the identity files from git, or deliberately \
          remove it only when starting a new adoption",
     )?;
     let mut would_overwrite = false;
@@ -1958,7 +1962,7 @@ fn cmd_pull(
         }
     }
 
-    let protected_inputs = [project.ids_file(), project.config_file()];
+    let protected_inputs = ids_store::protected(project);
     let extension_scope =
         adopt::extension_scope(&dir, existing_ids.as_ref(), extensions, &protected_inputs)?;
 
@@ -2220,13 +2224,17 @@ fn cmd_pull(
     // through an output name or one of the entries about to be removed.
     for path in written.iter().chain(&present) {
         paths::refuse_declaration_path(path, &root, &protected_inputs)?;
+        ids_store::refuse_output_inside(project, path)?;
     }
-    // Identity validation/serialization remains a semantic prerequisite for
-    // declaration publication. Keep unchanged JSON byte-exact.
-    let ids_json = match &resolution {
-        Ok(res) if existing_ids.is_none() || res.ids != ids => {
-            Some(serialize_ids(project, &res.ids)?)
-        }
+    // The identity tree is decided, and every refusal of it made, before any
+    // declaration is published: a pull that cannot record its identities must
+    // not leave declarations for them behind. Keep unchanged files byte-exact.
+    let tree_write = match &resolution {
+        Ok(res) if existing_ids.is_none() || res.ids != ids => Some(ids_store::plan(
+            project,
+            &res.ids,
+            &loaded.declared_paths(stage.path())?,
+        )?),
         _ => None,
     };
     // What a forced pull did not write, it removes. Leaving it would be worse
@@ -2279,27 +2287,13 @@ fn cmd_pull(
                 "Declarations were updated, but `{}` is unchanged. Record explicit rename/drop \
                  intent, then review and commit the files. Pull does not update database history \
                  or accept drift.",
-                project.ids_file().display()
+                project.ids_dir().display()
             ))
             .into());
         }
     };
-    // Leave even the original JSON formatting intact for an unchanged pull.
-    if let Some(json) = ids_json {
-        if let Some(parent) = project.ids_file().parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "cannot create identity directory `{}`",
-                    pbps_model::Text::new(parent.display().to_string()).shown()
-                )
-            })?;
-        }
-        std::fs::write(project.ids_file(), json).with_context(|| {
-            format!(
-                "cannot write identity file `{}`",
-                pbps_model::Text::new(project.ids_file().display().to_string()).shown()
-            )
-        })?;
+    if let Some(write) = tree_write {
+        write.apply()?;
     }
     let minted = res.created_tables.len()
         + res.added_columns.len()
@@ -3746,12 +3740,7 @@ fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
 /// file that is not there. Everything else wants [`read_ids`], for which "absent"
 /// and "empty" are the same thing.
 fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
-    let ids = read_legacy_ids_opt(project)?;
-    // Absent is "no identities" only where no tree stands in its place.
-    if ids.is_none() {
-        ids_guard::refuse_tree(project)?;
-    }
-    Ok(ids)
+    ids_store::read_opt(project)
 }
 
 /// The legacy file alone, with no regard for a tree: what `ids migrate` needs
@@ -3786,27 +3775,8 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
     Ok(read_ids_opt(project)?.unwrap_or_default())
 }
 
-fn serialize_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<String> {
-    ids.validate().with_context(|| {
-        format!(
-            "refusing to write inconsistent identity file `{}`",
-            pbps_model::Text::new(project.ids_file().display().to_string()).shown()
-        )
-    })?;
-    // A trailing newline, so the file never shows "\ No newline at end of file" in
-    // a diff.
-    Ok(format!("{}\n", serde_json::to_string_pretty(ids)?))
-}
-
 fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
-    let json = serialize_ids(project, ids)?;
-    let path = project.ids_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, json)
-        .with_context(|| format!("cannot write identity file `{}`", path.display()))?;
-    Ok(())
+    ids_store::write(project, ids)
 }
 
 fn context(root: &std::path::Path) -> anyhow::Result<Context> {
@@ -3994,8 +3964,14 @@ fn validate_inspected(
     if let Err(e) = &ids {
         findings.push(
             output::Finding::error("identity.inconsistent", format!("{e:#}"))
-                .at(project.ids_file(), None),
+                .at(project.ids_dir(), None),
         );
+    }
+    // The tree against the declarations it mirrors: an identity file whose
+    // declaration is gone (a merge that deleted the YAML must also carry the
+    // drop), a name that disagrees, a duplicate. Design §4.2.
+    if let (Ok(Some(_)), Ok(l)) = (&ids, &loaded) {
+        findings.extend(ids_store::validator_findings(project, l));
     }
 
     let data = ValidateData {
@@ -4184,7 +4160,7 @@ fn cmd_validate(
             {
                 println!(
                     "No identity file yet at `{}`; run `pbps plan` to create it.",
-                    project.ids_file().display()
+                    project.ids_dir().display()
                 )
             }
             None => {}
@@ -4380,7 +4356,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     "identity.unreadable",
                     format!("{e:#}; every `renamed_from` will be kept until it is fixed"),
                 )
-                .at(project.ids_file(), None)
+                .at(project.ids_dir(), None)
                 .remedy("pbps validate"),
             );
             IdsFile::default()
@@ -4605,7 +4581,7 @@ fn cmd_rebuild_table(
         println!("The identity file is unchanged; this rebuild intent is already recorded.");
     } else {
         write_ids(project, &updated)?;
-        println!("updated {}", project.ids_file().display());
+        println!("updated {}", project.ids_dir().display());
     }
     println!(
         "Approved a blocking rewrite and switched its identities; commit the declarations and identities, then plan against the database."
@@ -4620,7 +4596,7 @@ fn cmd_withdraw_rebuild(project: &Project, table: &TableName) -> anyhow::Result<
     let ids = read_ids(project)?;
     let updated = pbps_diff::rebuild::withdraw(&ids, table)?;
     write_ids(project, &updated)?;
-    println!("updated {}", project.ids_file().display());
+    println!("updated {}", project.ids_dir().display());
     println!(
         "Restored the source identities of {}. Revert its declarations to the source shape as well; \
          `git revert` of the approval commit does both.",
@@ -4712,7 +4688,7 @@ fn cmd_convert(
         println!("The identity file is unchanged; this conversion is already recorded.");
     } else {
         write_ids(project, &updated)?;
-        println!("updated {}", project.ids_file().display());
+        println!("updated {}", project.ids_dir().display());
     }
     Ok(())
 }
@@ -4751,7 +4727,7 @@ fn cmd_intent_with(
                 return Ok(());
             }
             write_ids(project, &res.ids)?;
-            println!("updated {}", project.ids_file().display());
+            println!("updated {}", project.ids_dir().display());
             Ok(())
         }
         Err(blockers) => {
@@ -4983,7 +4959,7 @@ fn refuse_aliased_outputs(
     if let (Some(out), Some(sql)) = (out, sql) {
         distinct(out, sql)?;
     }
-    let mut inputs = vec![project.config_file(), project.ids_file()];
+    let mut inputs = ids_store::protected(project);
     // The ordinary loader owns declaration-enumeration errors and runs before
     // writes or connection. An unreadable directory must not become a clean plan.
     if let Ok(files) = pbps_load::schema_files(&project.schema_dir()) {
@@ -5016,6 +4992,18 @@ fn refuse_aliased_outputs(
         for input in &inputs {
             distinct(destination, input)?;
         }
+    }
+    // After the aliases, which name the exact file: nothing else the user names
+    // may be written inside the identity tree either, whether or not the file
+    // is there yet.
+    for destination in [out, sql].into_iter().flatten() {
+        output::or_unanswerable_at(
+            "plan",
+            json,
+            "flags.conflicting",
+            destination,
+            ids_store::refuse_output_inside(project, destination),
+        )?;
     }
     Ok(())
 }
@@ -5068,7 +5056,7 @@ fn cmd_plan(
         "plan",
         json,
         "identity.unreadable",
-        project.ids_file(),
+        project.ids_dir(),
         read_ids(project),
     )?;
     let dialect = output::or_unanswerable(
@@ -5189,14 +5177,14 @@ fn cmd_plan(
         if res.ids != ids && check {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
-                project.ids_file().display()
+                project.ids_dir().display()
             );
             if json {
                 let report = output::Report::new(
                     "plan",
                     vec![
                         output::Finding::error("identity.stale", message)
-                            .at(project.ids_file(), None)
+                            .at(project.ids_dir(), None)
                             .remedy("pbps plan"),
                     ],
                     None::<PlanData>,
@@ -5342,7 +5330,7 @@ fn cmd_plan(
                         "identity.unwritable",
                         write_ids(project, &next),
                     )?;
-                    println!("updated {}", project.ids_file().display());
+                    println!("updated {}", project.ids_dir().display());
                     return cmd_plan(
                         project,
                         source,
@@ -5459,7 +5447,7 @@ fn cmd_plan(
                 write_ids(project, &minted),
             )?;
             if !json {
-                println!("updated {}", project.ids_file().display());
+                println!("updated {}", project.ids_dir().display());
             }
         }
 
@@ -6358,16 +6346,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_writes_refuse_invalid_mappings_before_touching_the_file() {
+    fn identity_writes_refuse_invalid_mappings_before_touching_the_tree() {
         let stage = adopt::Stage::new("invalid-identity-write").unwrap();
         let config = stage.path().join("pbps.yml");
-        std::fs::write(
-            &config,
-            "dialect: postgres\nids_file: nested/schema.ids.json\n",
-        )
-        .unwrap();
+        std::fs::write(&config, "dialect: postgres\nids_dir: nested/ids\n").unwrap();
         let project = Project::load(&config).unwrap();
-        let path = project.ids_file();
         let mut invalid = IdsFile::default();
         invalid
             .tables
@@ -6381,11 +6364,8 @@ mod tests {
                 .to_string()
                 .contains("inconsistent")
         );
-        assert!(!path.parent().unwrap().exists());
-        std::fs::create_dir(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"original identity bytes").unwrap();
-        assert!(write_ids(&project, &invalid).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"original identity bytes");
+        assert!(!project.ids_dir().exists());
+        std::fs::create_dir(project.schema_dir()).unwrap();
         write_ids(&project, &IdsFile::default()).unwrap();
         assert_eq!(read_ids(&project).unwrap(), IdsFile::default());
     }

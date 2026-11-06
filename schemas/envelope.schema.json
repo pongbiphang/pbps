@@ -2686,7 +2686,7 @@
         "declarations": {
           "type": "string"
         },
-        "identity_file": {
+        "identity_dir": {
           "type": "string"
         },
         "dialect": {
@@ -2716,7 +2716,7 @@
       "required": [
         "project_file",
         "declarations",
-        "identity_file",
+        "identity_dir",
         "dialect",
         "tables",
         "modules",
@@ -2980,7 +2980,11 @@
         "declarations": {
           "type": "string"
         },
-        "identity_file": {
+        "identity_dir": {
+          "type": "string"
+        },
+        "legacy_identity_file": {
+          "description": "Where the retired single identity file would be, as configured\n(`ids_file`). A consumer that captures the project's inputs needs it:\nthat file is what makes the project refuse with \"run `pbps ids migrate`\"\ninstead of reading as a fresh one.",
           "type": "string"
         }
       },
@@ -2988,7 +2992,8 @@
         "mode",
         "project_file",
         "declarations",
-        "identity_file"
+        "identity_dir",
+        "legacy_identity_file"
       ]
     },
     "InputPathMode": {
@@ -3885,6 +3890,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 92,
+  "x-pbps-schema-version": 95,
   "x-pbps-tool-version": "0.0.0"
 }

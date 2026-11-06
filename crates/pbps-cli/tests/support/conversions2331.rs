@@ -25,11 +25,11 @@ fn with_stdin(d: &Demo, args: &[&str], input: &[u8]) -> Output {
 }
 
 fn ids_bytes(d: &Demo) -> Vec<u8> {
-    std::fs::read(d.dir.join("schema.ids.json")).unwrap()
+    crate::idtree::snapshot(&d.dir)
 }
 
 fn ids(d: &Demo) -> IdsFile {
-    serde_json::from_slice(&ids_bytes(d)).unwrap()
+    crate::idtree::model(&d.dir)
 }
 
 /// The project at the moment a text column becomes an integer: committed
@@ -1245,11 +1245,7 @@ fn legacy_unbalanced_using_refuses_planning_and_balanced_controls_apply_on_both_
             .unwrap()
             .clone();
         legacy.conversions.get_mut(&uid).unwrap().using = "amount) IS NULL OR (amount".into();
-        std::fs::write(
-            d.dir.join("schema.ids.json"),
-            serde_json::to_vec_pretty(&legacy).unwrap(),
-        )
-        .unwrap();
+        crate::idtree::write(&d.dir, &legacy);
         // Keep HEAD at the text baseline so offline planning consumes the
         // legacy record, just as connected planning consumes it against text.
         let before = ids_bytes(&d);

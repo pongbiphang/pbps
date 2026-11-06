@@ -451,23 +451,24 @@ fn resolve_with_nothing_unmerged_checks_the_tree_and_succeeds() {
     assert!(text(&out).contains("no unmerged"), "{}", text(&out));
 }
 
-// -------------------------------------------- fail closed until the switch ---
-
-const NOT_READ: &str = "does not read it yet";
+// ----------------------------------------------------- the tree is read ---
 
 #[test]
-fn plan_and_validate_refuse_a_migrated_project_instead_of_reading_no_identities() {
+fn plan_and_validate_read_a_migrated_project_instead_of_reading_no_identities() {
     let p = migrated();
-    for args in [&["validate"][..], &["plan", "--check"][..], &["doctor"][..]] {
-        let out = p.pbps(args);
-        assert!(text(&out).contains(NOT_READ), "{args:?}: {}", text(&out));
-    }
-    for args in [&["validate"][..], &["plan", "--check"][..]] {
-        assert_refused(&p.pbps(args), "identity tree `.pbps/ids`");
-    }
+    let out = p.pbps(&["validate"]);
+    assert_ok(&out);
+    // The uids the migration kept, not an empty mapping about to mint new ones.
+    assert!(
+        text(&out).contains("1 table uid(s), 3 column uid(s)"),
+        "{}",
+        text(&out)
+    );
+    assert_ok(&p.pbps(&["plan", "--check"]));
     // `doctor` must not call a migrated project a fresh one.
-    assert!(!text(&p.pbps(&["doctor"])).contains("mints one"));
-    // Nothing was minted in the meantime.
+    let doctor = text(&p.pbps(&["doctor"]));
+    assert!(!doctor.contains("mints one"), "{doctor}");
+    // Nothing was minted in the meantime, and nothing came back as the old file.
     assert!(!p.has("schema.ids.json"));
 }
 
@@ -477,33 +478,223 @@ fn a_project_with_neither_file_still_validates_as_a_fresh_project() {
     p.write("pbps.yml", "dialect: postgres\n");
     p.write("schema/dbo/customer.yml", CUSTOMER);
     let out = p.pbps(&["validate"]);
-    assert!(!text(&out).contains(NOT_READ), "{}", text(&out));
+    assert!(!text(&out).contains("ids migrate"), "{}", text(&out));
     // An empty identity directory is no tree either.
     std::fs::create_dir_all(p.0.join(".pbps/ids")).unwrap();
     let out = p.pbps(&["validate"]);
-    assert!(!text(&out).contains(NOT_READ), "{}", text(&out));
+    assert!(!text(&out).contains("ids migrate"), "{}", text(&out));
 }
 
 #[test]
-fn a_revision_holding_the_tree_and_no_legacy_blob_is_refused_by_since() {
+fn a_project_that_still_has_only_the_legacy_file_is_told_to_migrate() {
+    let p = legacy_project();
+    for args in [&["validate"][..], &["plan", "--check"][..], &["doctor"][..]] {
+        let out = p.pbps(args);
+        assert!(
+            text(&out).contains("pbps ids migrate"),
+            "{args:?}: {}",
+            text(&out)
+        );
+    }
+    // Nothing was written in either place.
+    assert!(p.has("schema.ids.json"));
+    assert!(!p.0.join(".pbps/ids").exists());
+}
+
+/// The legacy file is read in one place only: history. A revision made before
+/// `pbps ids migrate` has `schema.ids.json`; the working tree has the tree.
+#[test]
+fn a_pre_migration_revision_is_read_from_its_legacy_file() {
+    let p = legacy_project();
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "before the migration"]);
+    assert_ok(&p.pbps(&["ids", "migrate"]));
+    let out = p.pbps(&["validate", "--since", "HEAD"]);
+    assert_ok(&out);
+    assert!(!text(&out).contains("changed"), "{}", text(&out));
+}
+
+#[test]
+fn a_migrated_revision_is_read_from_its_tree() {
     let p = migrated();
     p.git_ok(&["init", "-q", "-b", "main"]);
     p.git_ok(&["add", "-A"]);
     p.git_ok(&["commit", "-q", "-m", "migrated"]);
-    // The working tree goes back to the legacy layout; only the revision is migrated.
-    std::fs::remove_dir_all(p.0.join(".pbps")).unwrap();
-    p.write("pbps.yml", "dialect: postgres\n");
+    assert_ok(&p.pbps(&["validate", "--since", "HEAD"]));
+    // The baseline's identities are the tree's, not none: against itself, a
+    // plan changes nothing. Against an empty mapping every table would be new.
+    let out = p.pbps(&[
+        "plan", "--no-dev", "--since", "HEAD", "--check", "--format", "json",
+    ]);
+    assert_ok(&out);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["data"]["changes"], 0, "{report}");
+}
+
+#[test]
+fn a_revision_holding_both_layouts_is_refused_by_since() {
+    let p = migrated();
     p.write(
         "schema.ids.json",
         &(serde_json::to_string_pretty(&legacy()).unwrap() + "\n"),
     );
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "both"]);
+    std::fs::remove_file(p.0.join("schema.ids.json")).unwrap();
     let out = p.pbps(&["validate", "--since", "HEAD"]);
-    assert!(text(&out).contains(NOT_READ), "{}", text(&out));
-    assert!(
-        text(&out).contains("at `HEAD`") || text(&out).contains("HEAD"),
-        "{}",
-        text(&out)
+    assert!(text(&out).contains("both"), "{}", text(&out));
+    assert!(text(&out).contains("HEAD"), "{}", text(&out));
+}
+
+// ------------------------------------------------- the write side of plan ---
+
+#[test]
+fn a_first_plan_writes_the_tree_names_ids_dir_and_a_second_plan_leaves_it_alone() {
+    let p = Project::new();
+    p.write("pbps.yml", "dialect: postgres\n");
+    p.write("schema/dbo/customer.yml", CUSTOMER);
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    let file = p.read(".pbps/ids/dbo/customer.json");
+    assert!(file.contains("\"table\": \"dbo.customer\""), "{file}");
+    // An older pbps now stops at the config instead of minting fresh uids.
+    assert!(p.read("pbps.yml").contains("ids_dir: .pbps/ids"));
+    assert!(!p.has("schema.ids.json"));
+    let before = tree_of(&p);
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    assert_eq!(tree_of(&p), before);
+    assert_ok(&p.pbps(&["validate"]));
+}
+
+#[test]
+fn a_new_column_in_the_middle_changes_only_its_own_file() {
+    let p = migrated();
+    let before = tree_of(&p);
+    p.write(
+        "schema/dbo/customer.yml",
+        &CUSTOMER.replace(
+            "  email: {type: text}\n",
+            "  email: {type: text}\n  phone: {type: text}\n",
+        ),
     );
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    let after = tree_of(&p);
+    for (rel, text) in &before {
+        if rel != "dbo/customer.json" {
+            assert_eq!(&after[rel], text, "{rel} must not change");
+        }
+    }
+    let file = &after["dbo/customer.json"];
+    let at = |name: &str| file.find(&format!("\": \"{name}\"")).unwrap();
+    assert!(
+        at("email") < at("phone") && at("phone") < at("full_name"),
+        "{file}"
+    );
+}
+
+#[test]
+fn moving_a_declaration_file_is_refused_by_name_and_writes_nothing() {
+    let p = migrated();
+    let before = tree_of(&p);
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.yml"),
+        p.0.join("schema/dbo/client.yml"),
+    )
+    .unwrap();
+    // A new column makes the plan want to write the identities.
+    let moved = p.read("schema/dbo/client.yml") + "  phone: {type: text}\n";
+    p.write("schema/dbo/client.yml", &moved);
+    let out = p.pbps(&["plan", "--no-dev"]);
+    assert_refused(&out, "moving an identity file is not supported yet");
+    assert!(text(&out).contains("#2600 PR 5b"), "{}", text(&out));
+    assert_eq!(tree_of(&p), before, "a refusal writes nothing");
+}
+
+#[test]
+fn validate_reports_an_identity_file_whose_declaration_is_gone_as_an_orphan() {
+    let p = migrated();
+    std::fs::remove_file(p.0.join("schema/dbo/customer.yml")).unwrap();
+    let out = p.pbps(&["validate", "--format", "json"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("ids.orphan"), "{}", text(&out));
+    // The same project, declaration restored, is clean.
+    p.write("schema/dbo/customer.yml", CUSTOMER);
+    assert_ok(&p.pbps(&["validate"]));
+}
+
+// ------------------------------------- history that is not a directory ---
+
+/// A commit whose `.pbps/ids` is not a tree, made through git's index so the
+/// working tree keeps its valid one.
+fn revision_with_ids_object(kind: &str) -> Project {
+    let p = migrated();
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "good"]);
+    let sha = |out: Output| String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    let head = sha(p.git(&["rev-parse", "HEAD"]));
+    p.write("blob.txt", "../elsewhere\n");
+    let blob = sha(p.git(&["hash-object", "-w", "blob.txt"]));
+    p.git_ok(&["rm", "-r", "-q", "--cached", ".pbps/ids"]);
+    let (mode, oid) = match kind {
+        "symlink" => ("120000", blob),
+        "file" => ("100644", blob),
+        "gitlink" => ("160000", head),
+        other => panic!("{other}"),
+    };
+    p.git_ok(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("{mode},{oid},.pbps/ids"),
+    ]);
+    p.git_ok(&["commit", "-q", "-m", "bad"]);
+    p
+}
+
+#[test]
+fn a_revision_whose_ids_dir_is_a_symlink_a_file_or_a_submodule_is_refused_never_empty() {
+    for kind in ["symlink", "file", "gitlink"] {
+        let p = revision_with_ids_object(kind);
+        let out = p.pbps(&["validate", "--since", "HEAD"]);
+        assert_refused(&out, ".pbps/ids");
+        // Refused, not read as a baseline with no identities.
+        assert!(
+            text(&out).contains("is not a directory of identity files"),
+            "{kind}: {}",
+            text(&out)
+        );
+        // The revision before it is the same project and reads.
+        assert_ok(&p.pbps(&["validate", "--since", "HEAD~1"]));
+    }
+}
+
+// ------------------------------------- outputs inside the identity tree ---
+
+#[test]
+fn no_output_may_be_written_inside_the_identity_tree_existing_or_not() {
+    let p = migrated();
+    let before = tree_of(&p);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(".pbps/ids", p.0.join("alias")).unwrap();
+    let mut targets = vec![".pbps/ids/x.json", ".pbps/ids/sub/y.json"];
+    #[cfg(unix)]
+    targets.push("alias/z.json");
+    for target in targets {
+        for args in [
+            vec!["plan", "--no-dev", "--out", target],
+            vec!["plan", "--no-dev", "--sql", target],
+            vec!["docs", "--out", target],
+            vec!["bootstrap", "--sql", target],
+        ] {
+            let out = p.pbps(&args);
+            assert_refused(&out, "inside the identity tree");
+            assert_eq!(tree_of(&p), before, "{args:?} wrote into the tree");
+        }
+    }
+    // Beside the tree is fine.
+    assert_ok(&p.pbps(&["plan", "--no-dev", "--out", "plan.json"]));
 }
 
 // ------------------------------------------- a project below the repo root ---
@@ -530,14 +721,11 @@ fn since_sees_the_tree_of_a_revision_when_the_project_is_in_a_subdirectory() {
     p.git_ok(&["init", "-q", "-b", "main"]);
     p.git_ok(&["add", "-A"]);
     p.git_ok(&["commit", "-q", "-m", "migrated"]);
-    std::fs::remove_dir_all(p.0.join(".pbps")).unwrap();
-    p.write("pbps.yml", "dialect: postgres\n");
-    p.write(
-        "schema.ids.json",
-        &(serde_json::to_string_pretty(&legacy()).unwrap() + "\n"),
-    );
     let out = p.pbps(&["validate", "--since", "HEAD"]);
-    assert!(text(&out).contains(NOT_READ), "{}", text(&out));
+    assert_ok(&out);
+    // The tree it found is this project's own, with its uids: the revision's
+    // mapping equals the working tree's, so nothing is reported as changed.
+    assert!(!text(&out).contains("changed"), "{}", text(&out));
 }
 
 // ------------------------------------------------ migrate resumes mid-write ---

@@ -528,7 +528,7 @@ fn export(
             return Err(Refusal::new(
                 "state.export-ids-unreadable",
                 format!(
-                    "Entry #{} cannot be exported: the identity file cannot be read, so it is \
+                    "Entry #{} cannot be exported: the identity tree cannot be read, so it is \
                      unknown whether a rebuild was approved since: {e:#}. Nothing was written.",
                     entry.id
                 ),
@@ -569,7 +569,8 @@ fn export(
                 "`{}` resolves outside the declaration directory",
                 path.display()
             );
-            for protected in [project.ids_file(), project.config_file()] {
+            crate::ids_store::refuse_output_inside(project, path)?;
+            for protected in crate::ids_store::protected(project) {
                 anyhow::ensure!(
                     !crate::paths::same_file(path, &protected)?,
                     "`{}` aliases protected project input `{}`",
@@ -618,7 +619,7 @@ fn export(
         "Review and commit the declarations, then run pbps plan --db (or --env) ",
         "and apply the checksum-pinned approved plan. ",
         "Record any required rename/drop intent with the existing commands; ",
-        "schema.ids.json is unchanged."
+        "the identity files are unchanged."
     );
     findings.push(output::Finding::note("state.export-next", message));
     Ok((
@@ -641,9 +642,21 @@ fn export(
 
 #[cfg(test)]
 mod tests {
-    /// A readable identity file in a layout the tool never writes, so a test
-    /// can tell that the export left it byte for byte as it was.
-    const KEPT_IDS: &str = "{\n    \"version\":   1\n}\n";
+    /// A readable identity tree in a layout the tool never writes (a blank line
+    /// the writer leaves out), so a test can tell that the export left it byte
+    /// for byte as it was. Returns the file's path and bytes.
+    fn keep_ids(project: &Project) -> (std::path::PathBuf, String) {
+        let file = pbps_model::ids_tree::TreeFile {
+            uid: "r_aaaaaa".parse().unwrap(),
+            body: pbps_model::ids_tree::Body::Role("kept".into()),
+            dropped: None,
+        };
+        let text = pbps_model::ids_tree::render(&file).replacen("{\n", "{\n\n", 1);
+        let path = project.ids_dir().join("kept.json");
+        std::fs::create_dir_all(project.ids_dir()).unwrap();
+        std::fs::write(&path, &text).unwrap();
+        (path, text)
+    }
     use super::*;
     use clap::Parser as _;
 
@@ -678,7 +691,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("custom.yml");
         std::fs::write(&old, "keep these bytes").unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let dialect = crate::dialect(&project).unwrap();
         let error = crate::publication::tests::with_fault(&[("write", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
@@ -687,10 +700,7 @@ mod tests {
         .unwrap();
         assert!(error.message.contains("the project is unchanged"));
         assert_eq!(std::fs::read(&old).unwrap(), b"keep these bytes");
-        assert_eq!(
-            std::fs::read(project.ids_file()).unwrap(),
-            KEPT_IDS.as_bytes()
-        );
+        assert_eq!(std::fs::read(&kept.0).unwrap(), kept.1.as_bytes());
         let (data, findings) = crate::publication::tests::with_fault(&[("cleanup", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
         })
@@ -707,10 +717,7 @@ mod tests {
         assert!(report.outcome().is_ok());
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("state.export-backup") && json.contains("were published"));
-        assert_eq!(
-            std::fs::read(project.ids_file()).unwrap(),
-            KEPT_IDS.as_bytes()
-        );
+        assert_eq!(std::fs::read(&kept.0).unwrap(), kept.1.as_bytes());
     }
 
     #[test]
@@ -817,11 +824,7 @@ mod tests {
             },
         );
         current.validate().unwrap();
-        std::fs::write(
-            project.ids_file(),
-            serde_json::to_string_pretty(&current).unwrap(),
-        )
-        .unwrap();
+        crate::ids_store::write_ids_tree(&project, &current);
         // An entry that still holds the source is refused by name, writing nothing.
         entry.snapshot.ids.tables.insert(source, table);
         let error = export(&project, &entry, true, dialect.as_ref())
@@ -845,15 +848,11 @@ mod tests {
         let dialect_of = |p: &crate::Project| crate::dialect(p).unwrap();
         // Absent: no rewrite was approved, so the export proceeds.
         let (_stage, project, entry) = fixture("history-ids-absent");
-        assert!(!project.ids_file().exists());
+        assert!(!project.ids_dir().exists());
         assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
         // Readable and without a rebuild: proceeds.
         let (_stage, project, entry) = fixture("history-ids-clean");
-        std::fs::write(
-            project.ids_file(),
-            serde_json::to_string_pretty(&pbps_model::IdsFile::default()).unwrap(),
-        )
-        .unwrap();
+        keep_ids(&project);
         assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
         // Present but malformed, inconsistent or empty: refused by name before
         // anything is written, the file left as it was.
@@ -864,13 +863,15 @@ mod tests {
             ("inconsistent", orphan),
         ] {
             let (_stage, project, entry) = fixture(&format!("history-ids-{label}"));
-            std::fs::write(project.ids_file(), bytes).unwrap();
+            let bad = project.ids_dir().join("bad.json");
+            std::fs::create_dir_all(project.ids_dir()).unwrap();
+            std::fs::write(&bad, bytes).unwrap();
             let error = export(&project, &entry, true, dialect_of(&project).as_ref())
                 .err()
                 .unwrap_or_else(|| panic!("{label}: the export was allowed"));
             assert_eq!(error.id, "state.export-ids-unreadable", "{label}");
             assert!(
-                error.message.contains("schema.ids.json") || error.message.contains("identity"),
+                error.message.contains("identity"),
                 "{label}: {}",
                 error.message
             );
@@ -878,7 +879,7 @@ mod tests {
                 !project.schema_dir().exists(),
                 "{label}: wrote declarations"
             );
-            assert_eq!(std::fs::read_to_string(project.ids_file()).unwrap(), bytes);
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), bytes);
         }
     }
 
@@ -888,7 +889,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let path = project.schema_dir().join("custom.yml");
         std::fs::write(&path, "keep these exact bytes\n").unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let dialect = crate::dialect(&project).unwrap();
         let error = export(&project, &entry, false, dialect.as_ref())
             .err()
@@ -898,10 +899,7 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "keep these exact bytes\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(project.ids_file()).unwrap(),
-            KEPT_IDS
-        );
+        assert_eq!(std::fs::read_to_string(&kept.0).unwrap(), kept.1);
         // Force changes declaration files, but neither parses nor writes ids.
         let (data, _) = export(&project, &entry, true, dialect.as_ref())
             .ok()
@@ -911,10 +909,7 @@ mod tests {
             serde_json::json!([path])
         );
         assert!(!path.exists());
-        assert_eq!(
-            std::fs::read_to_string(project.ids_file()).unwrap(),
-            KEPT_IDS
-        );
+        assert_eq!(std::fs::read_to_string(&kept.0).unwrap(), kept.1);
     }
 
     #[test]
@@ -929,7 +924,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let file = project.schema_dir().join("keep.yml");
         std::fs::write(&file, "do not touch\n").unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let error = export(
             &project,
             &entry,
@@ -942,10 +937,7 @@ mod tests {
         assert!(error.message.contains("Nothing was written"));
         assert_eq!(std::fs::read_dir(project.schema_dir()).unwrap().count(), 1);
         assert_eq!(std::fs::read_to_string(file).unwrap(), "do not touch\n");
-        assert_eq!(
-            std::fs::read_to_string(project.ids_file()).unwrap(),
-            KEPT_IDS
-        );
+        assert_eq!(std::fs::read_to_string(&kept.0).unwrap(), kept.1);
     }
 
     #[test]
@@ -958,7 +950,7 @@ mod tests {
         .unwrap();
         let project = Project::discover(stage.path()).unwrap();
         std::fs::create_dir(project.schema_dir()).unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let error = export(
             &project,
             &entry,
@@ -969,10 +961,7 @@ mod tests {
         .unwrap();
         assert_eq!(error.id, "state.export-invalid");
         assert!(error.message.contains("aliases protected project input"));
-        assert_eq!(
-            std::fs::read_to_string(project.ids_file()).unwrap(),
-            KEPT_IDS
-        );
+        assert_eq!(std::fs::read_to_string(&kept.0).unwrap(), kept.1);
     }
 
     #[test]
@@ -1048,7 +1037,7 @@ mod tests {
                 output.clone()
             };
             std::fs::write(&old, "keep old declaration\n").unwrap();
-            std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+            let kept = keep_ids(&project);
             std::fs::create_dir(&directory).unwrap();
             let notes = directory.join("notes.txt");
             std::fs::write(&notes, "keep non-declaration\n").unwrap();
@@ -1059,7 +1048,7 @@ mod tests {
             let before = (
                 std::fs::read(&old).unwrap(),
                 std::fs::read(&notes).unwrap(),
-                std::fs::read(project.ids_file()).unwrap(),
+                std::fs::read(&kept.0).unwrap(),
                 std::fs::read(project.config_file()).unwrap(),
             );
             let result = export(
@@ -1076,7 +1065,7 @@ mod tests {
                 (
                     std::fs::read(&old).unwrap(),
                     std::fs::read(&notes).unwrap(),
-                    std::fs::read(project.ids_file()).unwrap(),
+                    std::fs::read(&kept.0).unwrap(),
                     std::fs::read(project.config_file()).unwrap(),
                 ),
                 before
@@ -1121,12 +1110,12 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("sales.country.yml");
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let roles = project.schema_dir().join("roles");
         std::os::unix::fs::symlink("missing-roles", &roles).unwrap();
         let before = (
             std::fs::read(&old).unwrap(),
-            std::fs::read(project.ids_file()).unwrap(),
+            std::fs::read(&kept.0).unwrap(),
             std::fs::read(project.config_file()).unwrap(),
             std::fs::read_link(&roles).unwrap(),
         );
@@ -1142,7 +1131,7 @@ mod tests {
         assert_eq!(
             (
                 std::fs::read(&old).unwrap(),
-                std::fs::read(project.ids_file()).unwrap(),
+                std::fs::read(&kept.0).unwrap(),
                 std::fs::read(project.config_file()).unwrap(),
                 std::fs::read_link(&roles).unwrap(),
             ),
@@ -1628,7 +1617,7 @@ mod tests {
             .schema_dir()
             .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
+        let kept = keep_ids(&project);
         let (data, findings) = export(
             &project,
             &entry,
@@ -1654,10 +1643,7 @@ mod tests {
         assert!(!old.exists());
         let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
         assert_eq!(loaded.schema, entry.snapshot.schema);
-        assert_eq!(
-            std::fs::read_to_string(project.ids_file()).unwrap(),
-            KEPT_IDS
-        );
+        assert_eq!(std::fs::read_to_string(&kept.0).unwrap(), kept.1);
     }
 
     #[test]

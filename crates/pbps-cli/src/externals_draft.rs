@@ -66,6 +66,7 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             out.display()
         );
     }
+    crate::ids_store::refuse_output_inside(project, out)?;
     for (name, profile) in &project.config.resolvers {
         let (pbps_config::resolver::ResolverProfile::Docker { externals, .. }
         | pbps_config::resolver::ResolverProfile::Server { externals, .. }) = profile;
@@ -97,7 +98,7 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             schema_dir.display()
         );
     }
-    let mut inputs = vec![project.config_file(), project.ids_file()];
+    let mut inputs = crate::ids_store::protected(project);
     // A listing that failed is not an empty directory (the loader reports
     // it); what could be listed is still protected.
     if let Ok(files) = pbps_load::schema_files(&project.schema_dir()) {

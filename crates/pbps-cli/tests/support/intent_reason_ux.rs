@@ -44,8 +44,8 @@ pub fn stdin_reasons(dialect: &str) {
             }
             _ => unreachable!(),
         };
-        let ids = d.dir.join("schema.ids.json");
-        let before = std::fs::read(&ids).unwrap();
+        let ids = d.dir.clone();
+        let before = crate::idtree::snapshot(&ids);
         // Both report formats offer an empty reason that cannot record intent.
         let human = d.run(&["plan", "--check"]);
         assert!(
@@ -57,11 +57,11 @@ pub fn stdin_reasons(dialect: &str) {
         assert!(stdout(&json).contains("--reason \\\"\\\""));
         let unedited = d.run(&[command, &target, "--reason", ""]);
         assert_eq!(code(&unedited), 2);
-        assert_eq!(std::fs::read(&ids).unwrap(), before);
+        assert_eq!(crate::idtree::snapshot(&ids), before);
         for input in [b"".as_slice(), b" \t\r\n", b"\xff"] {
             let out = piped(&d.dir, &[command, &target, "--reason", "-"], input);
             assert_eq!(code(&out), 2, "{}", stderr(&out));
-            assert_eq!(std::fs::read(&ids).unwrap(), before);
+            assert_eq!(crate::idtree::snapshot(&ids), before);
         }
         let reason = " \t核准?\n ticket ";
         let out = piped(
@@ -70,8 +70,7 @@ pub fn stdin_reasons(dialect: &str) {
             format!("{reason}\r\n").as_bytes(),
         );
         assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
-        let recorded: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(&ids).unwrap()).unwrap();
+        let recorded: pbps_model::IdsFile = crate::idtree::model(&ids);
         assert!(recorded.tombstones.values().all(|t| t.reason == reason));
         assert!(recorded.tombstones.values().any(|t| t.was == target));
         assert_eq!(
@@ -108,8 +107,7 @@ fn batch_stdin_reason(schema: &str) {
         format!("{reason}\n").as_bytes(),
     );
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
-    let recorded: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let recorded: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     let reason_of = |was: &str| {
         recorded
             .tombstones
@@ -196,7 +194,7 @@ pub fn refusal_before_io(dialect: &str) {
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
     assert!(!missing.exists());
-    assert!(!d.dir.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&d.dir));
 }
 
 fn partition_reasons() {
@@ -218,8 +216,7 @@ fn partition_reasons() {
         format!("{reason}\n").as_bytes(),
     );
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     assert_eq!(ids.moves.values().next().unwrap().reason, reason);
 
     use pbps_diff::rebuild::member_cases;
@@ -255,8 +252,7 @@ fn partition_reasons() {
         format!("{reason}\r\n").as_bytes(),
     );
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     assert_eq!(
         ids.rebuilds.values().next().unwrap().reason.as_ref(),
         reason
