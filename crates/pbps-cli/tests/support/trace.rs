@@ -8,6 +8,7 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const SOURCES: [&str; 5] = [
     "TRACE2488_PRIVATE_VIEW_s5C8",
@@ -289,6 +290,7 @@ struct Fixture {
     _scratch: resolver_publication::Confined,
     env: Vec<(String, String)>,
     trace: Trace,
+    slowest_command: Duration,
 }
 
 impl Fixture {
@@ -361,6 +363,7 @@ impl Fixture {
             _scratch: scratch,
             env,
             trace: Trace::new(),
+            slowest_command: Duration::ZERO,
         };
         let preview = fixture.d.dir.join("preview.json");
         fixture.ok(&["plan", "--no-dev", "--out", preview.to_str().unwrap()]);
@@ -382,6 +385,7 @@ impl Fixture {
     }
 
     fn run_at(&mut self, project: &Path, args: &[&str]) -> Output {
+        let started = Instant::now();
         let output = Command::new(BIN)
             .current_dir(project)
             .env_remove("PBPS_TRACE_KEY")
@@ -391,6 +395,7 @@ impl Fixture {
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .output()
             .unwrap();
+        self.slowest_command = self.slowest_command.max(started.elapsed());
         self.trace.output(&output);
         self.trace.files(&self.d.dir);
         output
@@ -834,7 +839,7 @@ impl Fixture {
     fn ui_action(&mut self, trigger: &mut Ui, action: &str, body: serde_json::Value) {
         let started = trigger.answer(action, &serde_json::to_vec(&body).unwrap());
         self.trace.ui(&started);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let waiting = Instant::now();
         loop {
             let response = trigger.answer("runs", b"{}");
             self.trace.ui(&response);
@@ -845,10 +850,7 @@ impl Fixture {
                 self.trace.files(&self.d.dir);
                 return;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "UI child never completed"
-            );
+            ui_child_wait(self.slowest_command, waiting.elapsed(), action, &runs[0]);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
@@ -936,6 +938,96 @@ impl Fixture {
             }
         }
     }
+}
+
+fn ui_child_wait(
+    slowest: Duration,
+    elapsed: Duration,
+    action: &str,
+    last: &serde_json::Value,
+) -> Duration {
+    // Resolver commands slow down with the host. Allow several times an earlier
+    // command's cost, but keep a hung child bounded even after a very slow step.
+    let budget = slowest
+        .saturating_mul(3)
+        .clamp(Duration::from_secs(180), Duration::from_secs(600));
+    assert!(
+        elapsed < budget,
+        "{action}: UI child never completed after {elapsed:?} (budget {budget:?}, slowest earlier command {slowest:?}); last state: ended={}, code={}, truncated={}, stdout_bytes={}, stderr_bytes={}",
+        last["ended"],
+        last["code"],
+        last["truncated"],
+        last["stdout"].as_str().map(str::len).unwrap_or(0),
+        last["stderr"].as_str().map(str::len).unwrap_or(0),
+    );
+    budget
+}
+
+#[test]
+fn ui_child_wait_scales_with_observed_commands_and_caps_the_budget() {
+    for (slowest, expected) in [
+        (0, 180),
+        (59, 180),
+        (60, 180),
+        (61, 183),
+        (199, 597),
+        (200, 600),
+        (201, 600),
+    ] {
+        assert_eq!(
+            ui_child_wait(
+                Duration::from_secs(slowest),
+                Duration::ZERO,
+                "plan",
+                &serde_json::Value::Null
+            ),
+            Duration::from_secs(expected),
+        );
+    }
+    assert_eq!(
+        ui_child_wait(
+            Duration::MAX,
+            Duration::ZERO,
+            "apply",
+            &serde_json::Value::Null
+        ),
+        Duration::from_secs(600),
+    );
+}
+
+#[test]
+fn ui_child_timeout_reports_the_last_state_without_captured_text() {
+    let last = serde_json::json!({
+        "ended": false, "code": null, "truncated": true,
+        "stdout": SOURCES[0], "stderr": DICTIONARY[0],
+    });
+    let slowest = Duration::from_secs(70);
+    assert_eq!(
+        ui_child_wait(slowest, Duration::from_secs(209), "plan", &last),
+        Duration::from_secs(210)
+    );
+    let failure = std::panic::catch_unwind(|| {
+        ui_child_wait(slowest, Duration::from_secs(210), "plan", &last)
+    })
+    .unwrap_err();
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap();
+    for expected in [
+        "plan: UI child never completed after 210s",
+        "budget 210s, slowest earlier command 70s",
+        "last state: ended=false, code=null, truncated=true",
+        &format!("stdout_bytes={}", SOURCES[0].len()),
+        &format!("stderr_bytes={}", DICTIONARY[0].len()),
+    ] {
+        assert!(
+            message.contains(expected),
+            "missing {expected:?}: {message}"
+        );
+    }
+    assert!(!message.contains(SOURCES[0]) && !message.contains(DICTIONARY[0]));
 }
 
 struct OfflineExport(PathBuf);
