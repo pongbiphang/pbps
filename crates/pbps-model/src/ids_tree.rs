@@ -126,7 +126,7 @@ pub struct TreeFile {
 }
 
 impl Body {
-    fn kind(&self) -> UidKind {
+    pub(crate) fn kind(&self) -> UidKind {
         match self {
             Body::Table(_) => UidKind::Table,
             Body::Role(_) => UidKind::Role,
@@ -902,4 +902,4 @@ pub fn next_order(existing: &[Uid], declared: &[Uid], retired: &BTreeSet<Uid>) -
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
