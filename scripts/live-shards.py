@@ -63,7 +63,8 @@ INPUT_PREFIXES = ("PBPS_", "INSTA_", "CARGO_", "RUST", "PYTHON", "NODE_", "GIT_C
 SCHEDULING_VARIABLES = {"CARGO_BUILD_JOBS", "CARGO_TARGET_DIR"}
 # Python checks read CI expiry scope and the LocalDB install root. Windows
 # uppercases environment keys, so compare their normalized spelling below.
-INPUT_NAMES = {"EVENT", "BASE_SHA", "PROGRAMFILES", "PATH", "HOME", "LANG", "LANGUAGE", "TZ"}
+INPUT_NAMES = {"EVENT", "BASE_SHA", "PROGRAMFILES", "PATH", "HOME", "LANG", "LANGUAGE", "TZ",
+               "TMPDIR", "TMP", "TEMP"}
 FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
@@ -496,7 +497,7 @@ def load_inherited(previous, manifest, tree, inputs, suites):
 
 
 def receipt_selector(args):
-    return tuple(args) if args[:1] == ["python"] else tuple(libtest_args(args)[0])
+    return tuple(args) if args[:1] in (["python"], ["cargo-check"]) else tuple(libtest_args(args)[0])
 
 
 def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
@@ -960,13 +961,19 @@ def sample_memory(stop, samples, errors):
 
 
 def drive(args, *, automatic=True):
-    suites = list(RUNNERS) if args.suite == "all" else [args.suite]
+    selected = args.suite if isinstance(args.suite, list) else [args.suite]
+    suites = [suite for item in selected for suite in (RUNNERS if item == "all" else [item])]
+    require(len(suites) == len(set(suites)), "duplicate suite selection")
     memory = available_gb()
-    counts = {"python": 1} if suites == ["python"] else shard_counts(
-        suites, memory, args.mssql_shards, args.pg_shards)
+    counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
+    counts.update({suite: 1 for suite in suites if suite in ("python", "cargo")})
     print(f"available memory: {memory:.2f} GiB; shards: "
           + ", ".join(f"{suite}={counts[suite]}" for suite in suites), flush=True)
     env = dict(os.environ, PBPS_LIVE_PREFIX=args.prefix)
+    if "cargo" in suites:
+        # Match quick's snapshot policy for both execution and its input digest.
+        env.update(INSTA_UPDATE="no", INSTA_FORCE_PASS="0")
+        RERUN.cargo_check(ROOT)
     # Identity and resume evidence are settled before anything is created, so a
     # refused resume leaves no output directory behind (DEC-2553.1).
     tree = tree_identity(ROOT)
@@ -1034,7 +1041,7 @@ def drive(args, *, automatic=True):
         count = counts[suite]
         suite_root = output / suite
         suite_root.mkdir()
-        if suite == "python":
+        if suite in ("python", "cargo"):
             tasks.append((suite, 0))
             continue
         identities = [fixture_env(suite, i, env) for i in range(count)]
@@ -1057,7 +1064,7 @@ def drive(args, *, automatic=True):
                          PBPS_LIVE_SHARD_DIR=str(shard_dir), PBPS_LIVE_SUITE=suite)
         try:
             with (suite_root / f"{index}.log").open("w") as log:
-                command = ([sys.executable, str(SCRIPT), "python-shard"] if suite == "python" else
+                command = ([sys.executable, str(SCRIPT), "check-shard", suite] if suite in ("python", "cargo") else
                            ["bash", str(ROOT / "scripts" / RUNNERS[suite])])
                 code = fixtures.run(command, cwd=ROOT,
                                     env=shard_env, stdout=log, stderr=subprocess.STDOUT)
@@ -1075,8 +1082,13 @@ def drive(args, *, automatic=True):
     with FixtureRun(used_names) as fixtures:
         try:
             sampler.start()
-            with ThreadPoolExecutor(max_workers=len(tasks) if automatic else 1) as pool:
-                finished = list(pool.map(launch, tasks))
+            # Keep the ordinary Cargo step ahead of live load, as the local gate
+            # did before receipts. A failed check still leaves live obligations.
+            finished = [launch(task) for task in tasks if task[0] == "cargo"]
+            remaining = [task for task in tasks if task[0] != "cargo"]
+            if remaining:
+                with ThreadPoolExecutor(max_workers=len(remaining) if automatic else 1) as pool:
+                    finished.extend(pool.map(launch, remaining))
         finally:
             stop.set()
             if sampler.ident is not None:
@@ -1125,7 +1137,7 @@ def drive(args, *, automatic=True):
         weights = weights or {}
         weights.update(measured)
         Path(args.measure).write_text(json.dumps(weights, indent=2, sort_keys=True) + "\n")
-    if failed and automatic and suites != ["python"] and not unregistered:
+    if failed and automatic and not set(suites).intersection(("python", "cargo")) and not unregistered:
         try:
             missing = lost_tests(output, summary, tree, inputs)
         except (ValueError, OSError, LookupError, TypeError, AttributeError) as error:
@@ -1198,14 +1210,15 @@ def python_checks():
     return RERUN.python_checks(ROOT)
 
 
-def python_shard():
+def check_shard(suite="python"):
     env = os.environ
     root = Path(env["PBPS_LIVE_SHARD_DIR"])
     root.mkdir(parents=True)
     (root / "expected").mkdir()
     failed = False
-    for name in python_checks():
-        args = ["python", name]
+    checks = [(["python", name], name) for name in python_checks()] if suite == "python" else [
+        (RERUN.cargo_check(ROOT), RERUN.CARGO_CHECK)]
+    for args, name in checks:
         key = invocation_id(args) + "-0"
         carried = resumed(env, key, [name])
         assigned = [] if carried else [name]
@@ -1217,7 +1230,8 @@ def python_shard():
         if assigned:
             started = time.monotonic()
             with (root / (key + ".log")).open("w") as log:
-                result = subprocess.run([sys.executable, name], cwd=ROOT, env=env,
+                command = [sys.executable, name] if suite == "python" else ["cargo", *args[1:]]
+                result = subprocess.run(command, cwd=ROOT, env=env,
                                         stdout=log, stderr=subprocess.STDOUT)
             code, seconds = result.returncode, time.monotonic() - started
             reported[name] = {"status": "FAILED" if code else "ok", "seconds": seconds}
@@ -1235,6 +1249,7 @@ def record_proof(argv):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--worktree", type=Path, help="clean tree to prove, including an origin/master worktree")
     parser.add_argument("--python", help="whole Python check path, instead of a cargo test")
+    parser.add_argument("--cargo-check", action="store_true", help="the whole canonical non-live Cargo step")
     parser.add_argument("--name", help="exact Rust test name")
     parser.add_argument("cargo", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -1244,9 +1259,18 @@ def record_proof(argv):
     os.chdir(ROOT)
     tree = tree_identity(ROOT)
     require(tree is not None, "an isolated pass proof requires a clean worktree")
-    inputs, _ = inputs_digest(os.environ)
+    env = dict(os.environ)
+    if args.cargo_check:
+        env.update(INSTA_UPDATE="no", INSTA_FORCE_PASS="0")
+    inputs, _ = inputs_digest(env)
     require(not args.output.exists(), "pass proof output already exists")
-    if args.python:
+    if args.cargo_check:
+        require(not args.python and not args.cargo and not args.name,
+                "a Cargo check proof must run the whole CI quick check")
+        cargo, name = RERUN.cargo_check(ROOT), RERUN.CARGO_CHECK
+        code = subprocess.run(["cargo", *cargo[1:]], cwd=ROOT, env=env).returncode
+        valid = True
+    elif args.python:
         require(not args.cargo and not args.name and args.python in python_checks(),
                 "proof must run one whole CI Python check")
         cargo, name = ["python", args.python], args.python
@@ -1255,12 +1279,13 @@ def record_proof(argv):
     else:
         require(args.name and args.cargo, "proof needs a cargo invocation and exact --name")
         cargo, flags, _ = libtest_args(args.cargo)
+        name = args.name
         results, code, _, valid, _ = run_tests(
             ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
              "--color=never", args.name], [args.name])
     require(tree_identity(ROOT) == tree, "worktree changed during the isolated check")
     proof = {"version": 1, "commit": git_output(ROOT, "rev-parse", "HEAD").strip(),
-             "tree": tree, "inputs": inputs, "cargo": cargo, "test": name if args.python else args.name,
+             "tree": tree, "inputs": inputs, "cargo": cargo, "test": name,
              "returncode": code, "valid": valid, "status": "ok" if valid and code == 0 else "FAILED"}
     write_atomic(args.output, json.dumps(proof, indent=2) + "\n")
     return int(not valid or code != 0)
@@ -1270,7 +1295,10 @@ def main():
     if sys.argv[1:2] == ["proof"]:
         return record_proof(sys.argv[2:])
     if sys.argv[1:2] == ["python-shard"]:
-        return python_shard()
+        return check_shard()
+    if sys.argv[1:2] == ["check-shard"]:
+        require(sys.argv[2:] in (["python"], ["cargo"]), "unknown whole-check suite")
+        return check_shard(sys.argv[2])
     if sys.argv[1:2] == ["ci"]:
         parser = argparse.ArgumentParser(description="Shard one ignored cargo test selection")
         parser.add_argument("--expected-tests", type=int)
@@ -1303,7 +1331,8 @@ def main():
         names = carried_attestation(sys.stdin.read(), json.loads(sys.argv[3]), os.environ, int(sys.argv[2]))
         return 0 if names else 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["all", "python", *RUNNERS], default="all")
+    parser.add_argument("--suite", choices=["all", "python", "cargo", *RUNNERS], action="append",
+                        help="repeat to combine suites; default all means the two live engines")
     parser.add_argument("--mssql-shards", type=int)
     parser.add_argument("--pg-shards", type=int)
     parser.add_argument("--prefix", default="pbps-live")
@@ -1316,7 +1345,9 @@ def main():
                         help="one targeted retry with recorded independence evidence (DEC-2651.1)")
     parser.add_argument("--flakes-ref", default="origin/master",
                         help="git ref whose scripts/known-flakes.json may waive FAILED names on --resume")
-    return drive(parser.parse_args())
+    options = parser.parse_args()
+    options.suite = options.suite or ["all"]
+    return drive(options)
 
 
 if __name__ == "__main__":

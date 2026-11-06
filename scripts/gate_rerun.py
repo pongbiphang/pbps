@@ -14,6 +14,9 @@ import subprocess
 import stat
 
 
+CARGO_CHECK = "quick/cargo-test"
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -88,6 +91,20 @@ def python_checks(root):
     return checks
 
 
+def cargo_check(root):
+    """CI's ordinary Cargo step is one check, not per-test receipts (DEC-2698.1)."""
+    from ignored_test_inventory import workflow_runs
+    commands = [command.split() for command in workflow_runs(
+        (root / ".github/workflows/ci.yml").read_text(), "quick")
+        if command.startswith("cargo test ") and "--workspace" in command.split()]
+    require(len(commands) == 1 and commands[0] in (
+        ["cargo", "test", "--workspace", "--all-targets"],
+        ["cargo", "test", "--workspace", "--all-targets", "--no-fail-fast"]),
+        "CI quick needs one canonical workspace/all-target Cargo check")
+    # The local full gate completes every target even after a failing binary.
+    return ["cargo-check", *commands[0][1:4], "--no-fail-fast"]
+
+
 def proof(path, root, commit, tree, inputs, cargo, name):
     data = read(path)
     require(isinstance(data, dict) and data.get("version") == 1
@@ -140,6 +157,9 @@ def load(path, root, tree, inputs):
         if cargo[:1] == ["python"]:
             require(cargo == ["python", name] and name == str(source) and source.suffix == ".py",
                     "Python reruns are whole checks identified by their script path")
+        elif cargo[:1] == ["cargo-check"]:
+            require(cargo == cargo_check(root) and name == CARGO_CHECK and source.suffix == ".rs",
+                    "Cargo reruns and proofs must cover the whole CI quick check")
         else:
             require(cargo[:1] == ["test"] and cargo[-1:] == ["--"] and source.suffix == ".rs"
                     and re.search(r"\bfn\s+" + re.escape(name.split("::")[-1]) + r"\s*\(", text),

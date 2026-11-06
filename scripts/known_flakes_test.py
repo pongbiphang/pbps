@@ -78,6 +78,17 @@ class Active(unittest.TestCase):
 
 
 class Check(unittest.TestCase):
+    def test_cargo_registration_names_the_whole_check_and_exact_canonical_command(self):
+        name = kf.gate_rerun.CARGO_CHECK
+        cargo = kf.gate_rerun.cargo_check(Path(__file__).resolve().parents[1])
+        entries = kf.load(register(entry(test=name, cargo=cargo)))
+        kf.check(entries, TODAY, {}, True, cargo_check=cargo)
+        kf.check(entries, TODAY, {}, True)
+        with self.assertRaisesRegex(kf.RegisterError, "whole CI quick Cargo check"):
+            kf.check(entries, TODAY, {}, True, cargo_check=cargo[:-1])
+        with self.assertRaises(kf.RegisterError):
+            kf.load(register(entry(test="recovery", cargo=cargo)))
+
     def test_whole_python_checks_can_be_registered_but_subtests_and_vanished_checks_cannot(self):
         name = "scripts/live_test_runners_test.py"
         item = entry(cargo=["python", name], test=name)

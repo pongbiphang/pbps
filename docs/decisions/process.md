@@ -1858,3 +1858,33 @@ alone establish independence either. This changes failure attribution, not
 current-head PR admission, required checks, or the existing infrastructure and
 conflict dispositions. AGENTS.md and TEST-EXECUTION.md apply the same rule;
 the earlier decision remains historical provenance.
+
+<a id="dec-2698-1"></a>
+
+**DEC-2698.1. The canonical non-live Cargo step is one whole resumable check.**
+Following leon's option A on 2026-11-06, extend DEC-2651.1 to the workspace /
+all-target Cargo command in CI's quick job at whole-step granularity, as for
+a Python check. A failure such as #2680's ordinary recovery unit test has no
+live receipt; an isolated single-name rerun cannot complete that gate. The
+whole step is short enough that per-test inventories and a Cargo runner
+adapter would add machinery without a useful reduction in gate cost.
+
+`--suite cargo` records `quick/cargo-test` as one obligation and one verdict.
+The command comes from quick, with the local full gate's `--no-fail-fast` and
+CI's snapshot policy. Combining it with live suites retains their valid
+receipts; rerunning the failed Cargo check repeats all tests within that step.
+The installed local full-gate wrappers call this receipt path, rather than a
+bare Cargo command. Other gate steps remain independently required.
+
+Admission reuses the strict evidence parser, tracked scope normalizer,
+complete failing-module/fixture independence review, current-master and PR
+pass proofs, and the common-Git attempt ledger. Both isolated proofs execute
+the whole step on their recorded tree and inputs. Every observed failure must
+be independent; unknown or touched scope refuses the attempt. The selector
+names the whole step, while its source is a tracked failing Rust source file.
+Temporary-directory settings join the shared input digest. A failed or
+interrupted attempt consumes the allowance, including through an older output,
+another worktree or later registration. It needs a fix and a new full gate.
+The final check union is exact; neither an old unstructured unit log nor a
+passing subset can replace the original whole-check receipt. Live/Python
+policy, register expiry and the existing per-head limits remain unchanged.
