@@ -82,6 +82,7 @@ pub mod partman;
 pub mod pins;
 mod preflight;
 pub mod provider;
+pub mod pull_coverage;
 pub mod rebuild;
 pub mod roles;
 pub mod rows;

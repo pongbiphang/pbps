@@ -25,6 +25,7 @@
 //! shape — and put back whatever the session had.
 
 mod census;
+mod properties;
 
 use pbps_model::ValueSource;
 use std::collections::BTreeMap;
@@ -1383,6 +1384,7 @@ fn batch_query(identity: &str) -> String {
         ("baseline_identity", identity.to_owned(), "database_oid"),
         ("owners", owners_query(), "schema_name, object_name, routine_oid, kind"),
         ("census", census::QUERY.to_owned(), "kind, identity"),
+        ("unheld_properties", properties::QUERY.to_owned(), "kind, identity, type"),
     ]
     .into_iter()
     .map(|(part, query, order)| format!(
@@ -1578,7 +1580,13 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         });
     }
 
-    let notices = census::notices(batch.get("census").ok_or_else(|| missing("census"))?)?;
+    let mut notices = census::notices(batch.get("census").ok_or_else(|| missing("census"))?)?;
+    notices.objects.extend(properties::notices(
+        batch
+            .get("unheld_properties")
+            .ok_or_else(|| missing("unheld_properties"))?,
+    )?);
+    notices.objects.sort();
     let mut raw = RawCatalog {
         catalog_notices: notices.objects,
         extension_notices: notices.extensions,
@@ -5336,6 +5344,7 @@ mod tests {
             "unheld_modules",
             "owners",
             "census",
+            "unheld_properties",
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }

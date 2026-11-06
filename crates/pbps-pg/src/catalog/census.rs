@@ -78,6 +78,24 @@ WITH RECURSIVE session_owned(classid, objid) AS (
     SELECT 'pg_catalog.pg_largeobject'::regclass, oid, 'large object', false FROM pg_catalog.pg_largeobject_metadata
     UNION ALL
     SELECT 'pg_catalog.pg_tablespace'::regclass, oid, 'tablespace', false FROM pg_catalog.pg_tablespace
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_config'::regclass, oid, 'text search configuration', false FROM pg_catalog.pg_ts_config
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_dict'::regclass, oid, 'text search dictionary', false FROM pg_catalog.pg_ts_dict
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_parser'::regclass, oid, 'text search parser', false FROM pg_catalog.pg_ts_parser
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_template'::regclass, oid, 'text search template', false FROM pg_catalog.pg_ts_template
+    UNION ALL
+    SELECT 'pg_catalog.pg_conversion'::regclass, oid, 'conversion', false FROM pg_catalog.pg_conversion
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_data_wrapper'::regclass, oid, 'foreign data wrapper', false FROM pg_catalog.pg_foreign_data_wrapper
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_server'::regclass, oid, 'foreign server', false FROM pg_catalog.pg_foreign_server
+    UNION ALL
+    SELECT 'pg_catalog.pg_user_mapping'::regclass, oid, 'user mapping', false FROM pg_catalog.pg_user_mapping
+    UNION ALL
+    SELECT 'pg_catalog.pg_language'::regclass, oid, 'procedural language', false FROM pg_catalog.pg_language
 )
 SELECT o.kind, i.identity,
        CASE WHEN o.classid = 'pg_extension'::regclass AND o.kind = 'extension' THEN
@@ -89,6 +107,19 @@ SELECT o.kind, i.identity,
  WHERE NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = o.classid AND s.objid = o.oid)
 "#
 );
+
+/// What else a census object costs, where it is more than being absent.
+/// An expression index or a generated column can name a text search
+/// configuration, and the declarations pulled from here then fail in an empty
+/// database (#168).
+fn consequence(kind: &str) -> &'static str {
+    match kind {
+        "text search configuration" | "text search dictionary" => {
+            "; a declaration that names it cannot be created until they are supported (#2728)"
+        }
+        _ => "",
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct Notices {
@@ -128,8 +159,9 @@ pub(super) fn notices(rows: &[Value]) -> Result<Notices, DbError> {
         };
         if !system && !extension && !owned {
             let message = format!(
-                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison",
+                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison{}",
                 pbps_model::escape::Escaped(&identity),
+                consequence(&kind),
             );
             if let Some(name) = name {
                 out.extensions.insert(name.into(), message);
