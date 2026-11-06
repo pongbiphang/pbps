@@ -1422,3 +1422,59 @@ multi-database loader reads a database's tree when its directory holds files
 and otherwise `schema.ids.json`; both together are refused, and a tree entry
 that is not a directory or a regular `.json` file is refused rather than
 skipped. The legacy reader for history and the switch itself follow in PR 5.
+
+<a id="dec-2600-8"></a>
+
+**DEC-2600.8. `pbps ids resolve` merges by uid and never picks a side; `migrate` finishes what it started.**
+`resolve` runs after the YAML conflicts are settled and refuses while any
+declaration file still holds conflict markers, because the resolved YAML is what
+decides a clash. For each identity path git left unmerged it reads base, ours
+and theirs from the index and merges the file by uid (`pbps-model::ids_merge`,
+no I/O): a record one side changed takes that side, an identical change is
+taken once, a record one side deleted and the other left alone is gone, and a
+file one side deleted is deleted only if the other left it alone. Two different
+changes to one record are decided by the name the resolved YAML declares (a
+column's local name, a table's header) and otherwise refused with the uid, both
+sides and the remedy (state the intent with `renamed_from`, `pbps rename` or
+`pbps drop`). Everything is decided before anything is written, so a refusal
+leaves the tree as git left it. There is no `--take ours|theirs`: choosing a
+side by hand is how a duplicate name gets in. The result is written as
+canonical bytes with the columns back in YAML order, nothing is staged, and the
+validator then runs over the tree and the declarations and its findings fail
+the command. The sync that creates, relocates and drops files is `plan`'s and
+arrives with the switch; until then a file `plan` would write shows up as a
+finding with `pbps plan` as the remedy.
+
+`migrate` places each object at its mirrored path, columns in YAML order, a
+dropped object at `<name>.<uid>.json` under the root because no YAML names its
+place, and writes nothing unless the tree reads back to the very mapping it came
+from. It refuses an identity with no declaration and no tombstone, and a tree
+that holds a file it would not write or would write differently. A tree whose
+every file is one it would write, byte for byte, is accepted, so an interrupted
+run (a subset of the tree, or the tree written and the file or config not yet
+changed) is finished by running it again, writing only what is missing; with no old file and a tree standing it only completes the
+config, and when that is done it says so and does nothing. The order is tree,
+old file, config, so the config still tells where a custom `ids_file` was until
+that file is gone. `pbps.yml` is edited as text to keep its comments and then
+read back; a spelling the edit does not understand is refused, not half applied.
+`fmt` rewrites parseable files to canonical bytes and rewrites none when any
+file cannot be read.
+
+Until the switch, a migrated project fails closed. `migrate` deletes
+`schema.ids.json` and only the `ids` commands read the tree, so a reader that
+took "no legacy file" for "no identities" would mint fresh uids for every
+object. Wherever the legacy file is read and found absent, an identity tree in
+the project's `ids_dir` is a refusal naming the directory and #2600 PR 5: the
+working-tree reader, `--since` and the other history readers (a revision with
+the tree and no legacy blob), the `pbps test` revision reader, and `doctor`,
+which no longer calls such a project fresh. A directory with entries, or a path
+that is not a directory, is a tree; only an absent or empty directory is not.
+`migrate` itself reads the legacy file directly, so it can still finish an
+interrupted run. The guard goes away with the legacy reader in the switch.
+
+`resolve` reads the index with `./`-relative paths and `ls-tree` with
+`--full-tree`: git runs in the project directory, and a bare path in a
+`:<stage>:<path>` lookup is relative to the repository root, so in a project
+below the root it reads another project's file or none. (A leftover `.tmp` file
+from a write cut off inside the rename is refused by name, like any entry that
+is not an identity file; delete it and run migrate again.)

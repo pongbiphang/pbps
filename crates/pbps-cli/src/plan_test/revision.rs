@@ -271,8 +271,9 @@ pub(super) fn read_commit_recorded(
         Path::new(&config.0),
     )
     .map_err(|e| vec![Problem::Config(e.to_string())])?;
-    let (schema_rel, ids_rel) = paths_from(&parsed, &config_rel, &prefix, commit.as_str())
-        .map_err(|e| vec![Problem::Paths(format!("{e:#}"))])?;
+    let (schema_rel, ids_rel, ids_dir_rel) =
+        paths_from(&parsed, &config_rel, &prefix, commit.as_str())
+            .map_err(|e| vec![Problem::Paths(format!("{e:#}"))])?;
 
     let mut problems = Vec::new();
     // A directory that is not in the tree is absent; one with no declaration
@@ -316,6 +317,20 @@ pub(super) fn read_commit_recorded(
     let ids = tree_file(root, commit, &ids_rel, &prefix, observed, Role::Ids)
         .map_err(|p| problems.push(p))
         .unwrap_or_default();
+    // Absent is a first run only where no identity tree stands in its place.
+    if ids.is_none() {
+        match crate::ids_guard::tree_present_at(root, commit.as_str(), &ids_dir_rel) {
+            Ok(false) => {}
+            Ok(true) => problems.push(Problem::Unreadable {
+                path: relative(&prefix, &ids_dir_rel),
+                reason: crate::ids_guard::message(&relative(&prefix, &ids_dir_rel)),
+            }),
+            Err(e) => problems.push(Problem::Unreadable {
+                path: relative(&prefix, &ids_dir_rel),
+                reason: format!("{e:#}"),
+            }),
+        }
+    }
     if problems.is_empty() {
         Ok(Raw {
             revision,
@@ -508,6 +523,20 @@ pub(super) fn read_working_recorded(
         .map_err(|p| problems.push(p))
         .unwrap_or_default()
         .map(|bytes| (shown(&ids_path), bytes));
+    if ids.is_none() {
+        let dir = parsed.ids_dir();
+        match crate::ids_guard::working_tree_present(root, &dir) {
+            Ok(false) => {}
+            Ok(true) => problems.push(Problem::Unreadable {
+                path: shown(&root.join(&dir)),
+                reason: crate::ids_guard::message(&dir.display().to_string()),
+            }),
+            Err(e) => problems.push(Problem::Unreadable {
+                path: shown(&root.join(&dir)),
+                reason: e.to_string(),
+            }),
+        }
+    }
     if problems.is_empty() {
         Ok(Raw {
             revision: Revision::Working,

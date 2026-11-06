@@ -197,12 +197,13 @@ fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
 /// right answer and not a guess: the project did not exist yet, so nothing it
 /// holds is at any path. A `pbps.yml` that is *there* and does not parse is an
 /// error — reading past it would silently be the bug this exists to fix.
-fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
+fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String, String)> {
     let root = &project.root;
     let here = || {
         Ok::<_, anyhow::Error>((
             relative_to(&project.schema_dir())?,
             relative_to(&project.ids_file())?,
+            under(&relative_to(root)?, &project.config.ids_dir())?,
         ))
     };
     let config_rel = relative_to(&project.config_file())?;
@@ -257,15 +258,15 @@ pub(crate) fn config_at(
     Ok(config)
 }
 
-/// The declarations directory and identity file `config` names, as git names
-/// them, for the revision `config` was read at. `prefix` is the project root's
+/// The declarations directory, identity file and identity directory `config`
+/// names, as git names them, for the revision `config` was read at. `prefix` is the project root's
 /// path inside the repository.
 pub(crate) fn paths_from(
     config: &pbps_config::Config,
     config_rel: &str,
     prefix: &str,
     rev: &str,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, String)> {
     // The config's paths are relative to the project root; git's are relative
     // to the repo root. Composed from the *root's* prefix rather than asked of
     // each path, because a path an old revision used may not exist in the
@@ -289,7 +290,11 @@ pub(crate) fn paths_from(
              subdirectory of the project, such as `schema/` (the default)"
         );
     }
-    Ok((schema, under(prefix, &config.ids_file)?))
+    Ok((
+        schema,
+        under(prefix, &config.ids_file)?,
+        under(prefix, &config.ids_dir())?,
+    ))
 }
 
 /// A path the config states, relative to the project root, as the path git
@@ -376,7 +381,7 @@ fn load_from_git(
     // git paths are relative to the repo root, whereas the declarations
     // directory is relative to the project root — and it is *that* revision's
     // directory, not today's, or a revision that moved it reads as empty.
-    let (rel, ids_rel) = paths_at(project, rev)?;
+    let (rel, ids_rel, ids_dir_rel) = paths_at(project, rev)?;
 
     let mut schema = Schema::default();
     let mut hints = pbps_model::Hints::default();
@@ -453,7 +458,7 @@ fn load_from_git(
     // The identity file must come from the same revision: using the current one as
     // the baseline would hide renames. Under that revision's own path, for the
     // reason `paths_at` gives.
-    let ids = ids_from(&project.root, rev, &ids_rel, revision_label)?;
+    let ids = ids_from(&project.root, rev, &ids_rel, &ids_dir_rel, revision_label)?;
 
     Ok(Baseline {
         schema,
@@ -471,13 +476,19 @@ fn load_from_git(
 /// Empty when that revision has none — a first run — which is the right
 /// answer rather than a failure: everything is new against it.
 pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
-    let (_, ids_rel) = paths_at(project, rev)?;
-    ids_from(&project.root, rev, &ids_rel, rev)
+    let (_, ids_rel, ids_dir_rel) = paths_at(project, rev)?;
+    ids_from(&project.root, rev, &ids_rel, &ids_dir_rel, rev)
 }
 
 /// The identity file at `rev`, under a path already resolved for that
 /// revision.
-fn ids_from(root: &Path, rev: &str, ids_rel: &str, label: &str) -> anyhow::Result<ValidIds> {
+fn ids_from(
+    root: &Path,
+    rev: &str,
+    ids_rel: &str,
+    ids_dir_rel: &str,
+    label: &str,
+) -> anyhow::Result<ValidIds> {
     match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => {
             // The decoder's sentence repeats the file's text; `artifact::decode`
@@ -489,7 +500,17 @@ fn ids_from(root: &Path, rev: &str, ids_rel: &str, label: &str) -> anyhow::Resul
             ids.validated()
                 .with_context(|| format!("the identity file at `{label}` is inconsistent"))
         }
-        Err(_) => Ok(IdsFile::default().validated()?),
+        Err(_) => {
+            // No legacy blob is a first run only where no tree stands in its
+            // place (#2600): a migrated revision is not empty.
+            // A listing that itself fails means the revision cannot be read
+            // at all; its declarations are read next under the same name and
+            // refuse it there, in the words callers already expect.
+            if let Ok(true) = crate::ids_guard::tree_present_at(root, rev, ids_dir_rel) {
+                anyhow::bail!("at `{label}`: {}", crate::ids_guard::message(ids_dir_rel));
+            }
+            Ok(IdsFile::default().validated()?)
+        }
     }
 }
 
@@ -590,7 +611,7 @@ pub fn schema_at(
     // That revision's own declarations directory, for the reason `paths_at`
     // gives — this is the second reader of a historical tree, and both have to
     // ask the same question of it.
-    let (dir_rel, _) = paths_at(project, rev)?;
+    let (dir_rel, _, _) = paths_at(project, rev)?;
     let scratch = std::env::temp_dir().join(format!(
         "pbps-since-{}-{}",
         std::process::id(),

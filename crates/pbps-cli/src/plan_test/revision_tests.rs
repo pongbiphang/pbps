@@ -490,6 +490,27 @@ fn a_dialect_that_differs_from_the_manifest_is_refused_per_revision() {
     assert!(at(&found, &c1).is_empty() && at(&found, &c2).is_empty());
 }
 
+/// `ids migrate` deletes the legacy file; a revision that holds the tree and no
+/// file is migrated, not "no identities yet", until the switch reads the tree.
+#[test]
+fn a_revision_with_an_identity_tree_and_no_legacy_file_is_refused_not_read_as_absent() {
+    let (repo, c1, _) = standard();
+    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.write(".pbps/ids/app.orders.json", "{}");
+    let migrated = repo.commit("migrated");
+    repo.manifest(&migrated, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    let here = at(&found, &migrated);
+    assert!(
+        here.iter().any(|p| matches!(
+            p,
+            RevisionProblem::Unreadable { path, .. } if path == ".pbps/ids"
+        )),
+        "{found:?}"
+    );
+    assert!(!here.contains(&&RevisionProblem::IdsOutOfDate), "{found:?}");
+}
+
 #[test]
 fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusals() {
     let (repo, c1, _) = standard();

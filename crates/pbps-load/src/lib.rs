@@ -1732,4 +1732,5 @@ mod object_ref_tests;
 pub use declared::{DeclaredFile, DeclaredPathError, DeclaredPaths};
 pub use project::{
     DatabaseDirs, LoadedDatabases, ProjectLoadError, load_database_dirs, load_databases,
+    read_ids_tree,
 };

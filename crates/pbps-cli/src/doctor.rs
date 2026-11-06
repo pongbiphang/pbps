@@ -351,7 +351,10 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         dialect: project.config.dialect,
     };
 
-    if !project.ids_file().exists() {
+    // "No identity file yet, the first plan mints one" is true only where no
+    // identity tree stands in its place; with one, reading it is refused (the
+    // finding above) and the note would be the lie the guard exists to stop.
+    if !project.ids_file().exists() && crate::ids_guard::refuse_tree(project).is_ok() {
         findings.push(
             output::Finding::note(
                 "project.no-identity-file",

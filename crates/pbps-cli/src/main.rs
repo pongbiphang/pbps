@@ -20,6 +20,8 @@ mod engine;
 mod explain;
 mod externals_draft;
 mod hooks;
+mod ids_cmd;
+mod ids_guard;
 mod init;
 mod integration;
 mod intent_batch;
@@ -621,6 +623,12 @@ enum Command {
         command: StateCommand,
     },
 
+    /// The identity tree under `ids_dir`: migrate, format, resolve (#2600)
+    Ids {
+        #[command(subcommand)]
+        command: ids_cmd::IdsCommand,
+    },
+
     /// Fingerprint keys for engine-assisted planning (DEC-952.1)
     Key {
         #[command(subcommand)]
@@ -696,6 +704,7 @@ impl Command {
             | Command::Baseline { .. }
             | Command::Bootstrap { .. }
             | Command::Unlock { .. }
+            | Command::Ids { .. }
             | Command::Key { .. } => return None,
             // The one subcommand that speaks an envelope. Matched on its own
             // rather than folded into the arm above, because a project that
@@ -1059,6 +1068,7 @@ fn run() -> anyhow::Result<()> {
         | Command::Docs { .. }
         | Command::Ui
         | Command::Unlock { .. }
+        | Command::Ids { .. }
         | Command::Key { .. }
         | Command::State { .. }
         | Command::Test { .. } => {}
@@ -1563,6 +1573,7 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Validate { format, since } => cmd_validate(&project, format, since.as_deref()),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
+        Command::Ids { command } => ids_cmd::run(&project, command),
         Command::Intent(_) => cmd_intent(&project, batch.expect("validated before discovery")),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;
@@ -3735,6 +3746,17 @@ fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
 /// file that is not there. Everything else wants [`read_ids`], for which "absent"
 /// and "empty" are the same thing.
 fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
+    let ids = read_legacy_ids_opt(project)?;
+    // Absent is "no identities" only where no tree stands in its place.
+    if ids.is_none() {
+        ids_guard::refuse_tree(project)?;
+    }
+    Ok(ids)
+}
+
+/// The legacy file alone, with no regard for a tree: what `ids migrate` needs
+/// to finish an interrupted run. Every other reader wants [`read_ids_opt`].
+fn read_legacy_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     let path = project.ids_file();
     // Target existence follows symlinks: a broken history link would look
     // absent and authorize fresh IDs. Inspect the directory entry instead,
