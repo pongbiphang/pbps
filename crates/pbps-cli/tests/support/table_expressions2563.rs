@@ -596,10 +596,10 @@ fn a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe() {
             &connection,
             "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                SET search_path = pg_catalog AS $$ BEGIN \
-               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' THEN \
+               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY % pg_temp.%' THEN \
                  RAISE EXCEPTION 'the binding table is refused'; END IF; END $$; \
              CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
-               WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.refuse_binding()",
+               WHEN TAG IN ('CREATE TABLE', 'CREATE VIEW') EXECUTE FUNCTION public.refuse_binding()",
         );
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -659,11 +659,11 @@ fn an_index_policy_or_domain_that_cannot_be_bound_is_refused_before_it_runs() {
                 &connection,
                 "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                    SET search_path = pg_catalog AS $$ BEGIN \
-                   IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' \
+                   IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY % pg_temp.%' \
                       OR pg_catalog.current_query() LIKE '%pbps_domain_expressions%' THEN \
                      RAISE EXCEPTION 'the binding object is refused'; END IF; END $$; \
                  CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
-                   WHEN TAG IN ('CREATE TABLE', 'CREATE DOMAIN') \
+                   WHEN TAG IN ('CREATE TABLE', 'CREATE VIEW', 'CREATE DOMAIN') \
                    EXECUTE FUNCTION public.refuse_binding()",
             );
             succeeds(d.run(&["plan"]));
@@ -709,25 +709,41 @@ fn an_index_policy_or_domain_that_cannot_be_bound_is_refused_before_it_runs() {
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn an_expression_that_closes_its_clause_is_refused_as_more_than_declared() {
     const MORE: &str = "more than the expressions declared";
-    // A key that adds a second key does not parse as a check: it cannot be bound.
+    // Text that closes the item it stands in and does not parse in the rest of
+    // the view cannot be bound.
     const UNBOUND: &str = "could not be bound just before they run";
-    let cases: [(Kind, &str, &str, &str); 4] = [
+    let cases: [(Kind, &str, &str, &str); 8] = [
         (
             Kind::IndexKey,
             "app.ok(email)",
             "lower(email) IS NOT NULL)), CONSTRAINT z CHECK ((true",
+            UNBOUND,
+        ),
+        // A key that adds a second target entry is one more than declared.
+        (Kind::IndexKey, "app.ok(email)", "lower(email)), (id", MORE),
+        (Kind::Check, "app.ok(email)", "true) IS TRUE, (true", MORE),
+        (
+            Kind::IndexFilter,
+            "app.ok(email)",
+            "true) IS TRUE, (true",
             MORE,
         ),
         (
-            Kind::IndexKey,
+            Kind::Generated,
             "app.ok(email)",
-            "lower(email)), (id",
-            UNBOUND,
+            "true) IS NOT NULL, (true",
+            MORE,
         ),
         (
             Kind::Policy,
             "using: 'app.ok(email)', with_check: 'app.ok(email)'",
             "using: 'true) WITH CHECK (true'",
+            UNBOUND,
+        ),
+        (
+            Kind::Policy,
+            "using: 'app.ok(email)', with_check: 'app.ok(email)'",
+            "using: 'true) IS TRUE, (true'",
             MORE,
         ),
         (
@@ -815,10 +831,10 @@ fn a_filtered_unique_index_that_cannot_be_bound_is_not_evaluated_by_the_prefligh
             &connection,
             "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                SET search_path = pg_catalog AS $$ BEGIN \
-               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' THEN \
+               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY % pg_temp.%' THEN \
                  RAISE EXCEPTION 'the binding table is refused'; END IF; END $$; \
              CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
-               WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.refuse_binding()",
+               WHEN TAG IN ('CREATE TABLE', 'CREATE VIEW') EXECUTE FUNCTION public.refuse_binding()",
         );
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -1123,6 +1139,185 @@ fn a_function_taking_another_composite_type_stays_refused_for_a_whole_row_refere
             text(&applied).contains("could not be bound just before they run"),
             "PG{version}: {}",
             text(&applied)
+        );
+        assert_eq!(
+            text_of(
+                &connection,
+                "SELECT count(*)::text FROM pg_constraint WHERE conname = 'ck'"
+            ),
+            "0",
+            "PG{version}"
+        );
+    }
+}
+
+/// The table's own name is spelled in more ways than `t`, and PostgreSQL accepts
+/// each on the real table in a policy, a CHECK and an index key and filter (a
+/// generated expression refuses a whole-row reference itself, so it is tried with
+/// the column spellings only). A table that stands is bound as a view over it, so
+/// each resolves as it does there: `t.*` as a function argument, a column
+/// qualified with the schema and the table, and a parenthesised row. The same
+/// routine owned by a role nobody trusts is still refused for `t.*`, which shows
+/// the tree with the row in it is the one judged (DEC-2563.8).
+/// A site's declaration, given the value spelled in it.
+type Declare = fn(&str) -> String;
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn every_spelling_of_the_table_binds_as_it_does_on_the_real_table_in_every_site() {
+    const PRESENT_INDEX: &str =
+        "SELECT count(*)::text FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'ix'";
+    // (name, the value spelled, whether PostgreSQL accepts it in a generated expression)
+    let spellings: [(&str, &str, bool); 3] = [
+        ("star", "app.val(t.*)", false),
+        ("schema", "app.t.id", true),
+        ("paren", "(t).id", true),
+    ];
+    let sites: [(&str, Declare, &str); 5] = [
+        (
+            "check",
+            |v| format!("{BASE}checks:\n  ck: '{v} > 0'\n"),
+            "SELECT count(*)::text FROM pg_constraint WHERE conname = 'ck' AND conrelid = 'app.t'::regclass",
+        ),
+        (
+            "policy",
+            |v| format!("{BASE}row_policies:\n  p: {{using: '{v} > 0', with_check: '{v} > 0'}}\n"),
+            "SELECT count(*)::text FROM pg_policy WHERE polrelid = 'app.t'::regclass",
+        ),
+        (
+            "key",
+            |v| format!("{BASE}indexes:\n  ix:\n    keys:\n      - expression: '({v} + 0)'\n"),
+            PRESENT_INDEX,
+        ),
+        (
+            "filter",
+            |v| format!("{BASE}indexes:\n  ix:\n    columns: [id]\n    where: '{v} > 0'\n"),
+            PRESENT_INDEX,
+        ),
+        (
+            "generated",
+            |v| {
+                BASE.replace(
+                    "email: {type: text}",
+                    &format!(
+                        "email: {{type: text}}\n  g: {{type: bigint, generated: {{expression: '{v} + 0', stored: true}}}}"
+                    ),
+                )
+            },
+            "SELECT count(*)::text FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'g'",
+        ),
+    ];
+    for (version, url) in [(16, old_server()), (18, server())] {
+        for (site, declare, present) in &sites {
+            for (spelling, value, generated_ok) in spellings {
+                if *site == "generated" && !generated_ok {
+                    continue;
+                }
+                // Only the whole-row spelling reaches a routine; the others are
+                // built-in, so there is nothing for a stranger to own.
+                let trusts: &[bool] = if spelling == "star" {
+                    &[true, false]
+                } else {
+                    &[true]
+                };
+                for &trusted in trusts {
+                    let slug = format!("tx2563-spell-{site}-{spelling}-{trusted}-{version}");
+                    let own = OwnDatabase::new(&url, &slug);
+                    let connection = own.connection().to_owned();
+                    let d = bootstrapped_demo(&connection, &slug, BASE);
+                    d.keyed(&connection);
+                    let stranger = format!(
+                        "pbps_tx2563s_{version}_{}_{site}_{spelling}",
+                        std::process::id()
+                    );
+                    let owner = if trusted {
+                        String::new()
+                    } else {
+                        on_server(&url, &format!("CREATE ROLE {stranger}"));
+                        format!(
+                            "GRANT USAGE ON SCHEMA app TO {stranger}; \
+                             ALTER FUNCTION app.val(app.t) OWNER TO {stranger}"
+                        )
+                    };
+                    on_server(
+                        &connection,
+                        &format!(
+                            "CREATE FUNCTION app.val(app.t) RETURNS int LANGUAGE sql IMMUTABLE \
+                               SET search_path = pg_catalog AS 'SELECT 1'; \
+                             INSERT INTO app.t VALUES (1, 'a'); {owner}"
+                        ),
+                    );
+                    d.table(&declare(value));
+                    succeeds(d.run(&["plan"]));
+                    d.commit();
+                    let plan = d.dir.join("spell-plan.json");
+                    let planned =
+                        d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+                    let label = format!("PG{version} {site} {spelling} trusted={trusted}");
+                    assert_eq!(code(&planned), 0, "{label}: {}", text(&planned));
+                    assert!(
+                        !text(&planned).contains("judged at apply only"),
+                        "{label}: {}",
+                        text(&planned)
+                    );
+                    let applied = approved_apply(
+                        &d,
+                        &connection,
+                        &plan,
+                        &["--allow", "destructive,narrowing,constraint,row-security"],
+                    );
+                    let shown = text(&applied);
+                    if trusted {
+                        assert_eq!(code(&applied), 0, "{label}: {shown}");
+                        assert_eq!(text_of(&connection, present), "1", "{label}");
+                    } else {
+                        assert_ne!(code(&applied), 0, "{label}: {shown}");
+                        assert!(
+                            shown.contains("`pin_type_routines: true`"),
+                            "{label}: {shown}"
+                        );
+                        assert_eq!(text_of(&connection, present), "0", "{label}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A CHECK with a sublink is not admitted by the view that binds it. PostgreSQL
+/// refuses a subquery in a CHECK at its statement, and a view accepts one in its
+/// select list, so it binds; the reader of the stored rule then refuses it as more
+/// than a list of plain expressions. Whichever of the plan or the apply stops it,
+/// the constraint is not in the database (DEC-2563.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_check_with_a_sublink_is_not_admitted_by_the_view_that_binds_it() {
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let slug = format!("tx2563-sublink-{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection().to_owned();
+        let d = bootstrapped_demo(&connection, &slug, BASE);
+        d.keyed(&connection);
+        d.table(&format!("{BASE}checks:\n  ck: '(SELECT 1) > 0'\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("sublink-plan.json");
+        let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        let shown = if code(&planned) == 0 {
+            let applied = approved_apply(
+                &d,
+                &connection,
+                &plan,
+                &["--allow", "destructive,narrowing,constraint"],
+            );
+            assert_ne!(code(&applied), 0, "PG{version}: {}", text(&applied));
+            text(&applied)
+        } else {
+            text(&planned)
+        };
+        assert!(
+            shown.contains("more than a list of plain expressions"),
+            "PG{version}: {shown}"
         );
         assert_eq!(
             text_of(

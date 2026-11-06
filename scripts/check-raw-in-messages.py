@@ -108,6 +108,10 @@ ALLOWED = {
         "Four shown adapters escape canonical raw spellings; the canonical formatters preserve "
         "its argument bytes.",
     ),
+    "crates/pbps-pg/src/table_expressions.rs": (
+        None,
+        "builds the binding view's SQL from a policy clause; diagnostic sinks remain checked (DEC-2563.8)",
+    ),
     "crates/pbps-pg/src/type_refs.rs": (
         1,
         "A test constructs a cast expression as SQL.",

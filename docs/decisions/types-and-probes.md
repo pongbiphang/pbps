@@ -5312,7 +5312,7 @@ changes.
 
 <a id="dec-2563-6"></a>
 
-**DEC-2563.6. Binding an expression never runs it, and the binding table is named for the table (PostgreSQL).**
+**DEC-2563.6. Binding an expression never runs it, and the binding table is named for the table (PostgreSQL).** *The naming now holds only for a table the plan creates; see [DEC-2563.8](#dec-2563-8). The rule that binding never runs an expression stands.*
 
 (#2563, review of #2705, round 1.) Two defects of the binder DEC-2563.4 and
 DEC-2563.5 share, measured on 16.15 and 18.6.
@@ -5347,7 +5347,7 @@ No plan format changes.
 
 <a id="dec-2563-7"></a>
 
-**DEC-2563.7. A bare table name in an expression binds as a column of the table's row type (PostgreSQL).**
+**DEC-2563.7. A bare table name in an expression binds as a column of the table's row type (PostgreSQL).** *Superseded by [DEC-2563.8](#dec-2563-8).*
 
 (#2563, review of #2705, ready round 1.) `t` alone in an expression is the row
 of the table, and PostgreSQL accepts it as the argument of a function that takes
@@ -5387,5 +5387,80 @@ noted at plan time and refused at its statement, with `t` as the equivalent
 spelling in a function argument. A generated expression that spells the row as
 `t` is now bound and then refused by the engine at its statement, where it was
 refused as unbindable before.
+
+No plan format changes.
+
+<a id="dec-2563-8"></a>
+
+**DEC-2563.8. The expressions of a table that stands are bound as a view over the real table (PostgreSQL).**
+
+(#2563, #2705, after ready round 1 and its design question.) Supersedes the
+column design of DEC-2563.7, and the table-name trick of DEC-2563.6 for every
+table that exists. The two earlier rounds each fixed one spelling of the
+table's own name inside an expression (`t.id`, then bare `t`) and left others
+(`t.*`, `app.t.id`) refused at their statements, because a copy of the table is
+a different relation, with a different name and a different row type. The
+general fix is to bind on the relation itself.
+
+Binding. The expressions of an `ADD CHECK`, an `ADD INDEX` (keys and filter), a
+`CREATE POLICY` (USING and WITH CHECK) and a generated expression (`ADD COLUMN`
+or `ALTER COLUMN`) are bound as one temporary view in the session's `pg_temp`:
+`CREATE TEMPORARY VIEW ... AS SELECT e0 AS c0, e1 AS c1, ... FROM app.t`, with
+no alias, one target entry per expression. A clause (a CHECK, a filter, a
+policy's USING or WITH CHECK) is selected `(e) IS TRUE`, a key and a generated
+expression keep the `IS NOT NULL` wrapper of DEC-2563.6. The engine resolves the
+table's own name in them exactly as it does on the table, because it is the
+table: `t`, `t.*`, `t.col`, `(t).col` and `app.t.col` all resolve, a whole row
+has the table's own row type, and a column named like the table wins over the
+row as on the real table. Measured on 16.15 and 18.6, spelling by spelling,
+against a real policy, CHECK, index key, index filter and generated column: the
+view accepts and refuses the same ones (a generated expression, and the schema-
+qualified bare `app.t` argument, are refused by the engine everywhere).
+
+What it costs. Creating a view analyses its query and plans nothing: a call of
+an IMMUTABLE function with constant arguments, in a select list, a clause, a
+cast or nested, runs nothing (a sequence its routine advances stays put), where
+the same call in a `CREATE INDEX` does. It holds `ACCESS SHARE` on the table to
+the end of the transaction, as `CREATE TABLE (LIKE ...)` did, and writes no row
+of the real table's catalog entries (its `pg_class` row is unchanged); one
+`pg_depend` row from the view to the table lasts until the view is dropped,
+which the binder does before the statement runs. It asks for `USAGE` on the
+schema and nothing more: no `SELECT` on the table (the copy needed it), no
+`EXECUTE` on a routine, no ownership. An event trigger sees `CREATE VIEW`
+and `DROP VIEW` in `pg_temp` where it saw `CREATE TABLE`.
+
+Judging. The stored rule (`pg_rewrite.ev_action`) is a `Query` list whose target
+entries hold the expressions, the same nodes `conbin` and `polqual` hold. It is
+read only as one plain `SELECT` of expressions over one relation: a range table
+of exactly one plain relation with no row-security quals, a FROM clause of that
+relation only, no WHERE, and every other field of the `Query` empty, so a CTE, a
+subquery, a sublink, a join, an aggregate, a window or a set-returning function
+is refused ("empty unless listed", as for a function body, DEC-2563.4). A rule
+with more or fewer entries than declared is refused as "more than the
+expressions declared", which is what a text that closes its item and adds
+another target entry becomes; one that adds a command or does not parse is "could
+not be bound". The entries are then judged by the one predicate, with the same
+verdicts and the same reasons as the CHECK of the same expression on the real
+table (pinned on 16 and 18 for a built-in, a trusted routine, an untrusted one
+and a constant call, each spelled as `t` and as `t.*`).
+
+Which path. By the kind of change, never by trying: the view for a table that
+stands, the temporary copy of DEC-2563.6 for `CREATE TABLE`, whose table does not
+exist yet, and for a DEFAULT, which cannot name a column or the row at all.
+At plan time a table that does not exist yet, or a column an earlier step of the
+plan adds, is still noted and judged at the statement; at the statement the view
+sees everything the plan did before it, in the caller's transaction.
+
+Strictness. A view's select list is as permissive as a policy and more than a
+CHECK: a subquery or `ctid` is accepted by a policy and a view and refused by the
+engine for a CHECK. So a CHECK the engine will refuse can now bind; the reader
+refuses a sublink, and the statement refuses `ctid`, so nothing the engine
+refuses is admitted to run. A policy with a subquery is refused as before, by the
+same reading.
+
+Removed. The extra column of DEC-2563.7 and `takes_row_type`; the shape count
+for a policy; the temporary policy on the binding table. `t.*` and `app.t.col`
+now resolve; the schema-qualified residual of DEC-2563.6 holds only for
+`CREATE TABLE`.
 
 No plan format changes.
