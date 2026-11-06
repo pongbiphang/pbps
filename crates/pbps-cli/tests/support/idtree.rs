@@ -196,6 +196,32 @@ pub fn write(project: &Path, ids: &IdsFile) {
             uid.clone(),
             mirror(UidKind::Table, name.raw().to_string(), uid),
         );
+        // The columns in the order the declaration gives them, as the writer
+        // keeps them: a tree in any other order is not what `plan` would write.
+        if let Some(yaml) = at.get(&(UidKind::Table, name.raw().to_string())) {
+            let text =
+                std::fs::read_to_string(project.join("schema").join(yaml)).unwrap_or_default();
+            let mut in_columns = false;
+            let mut order = Vec::new();
+            for line in text.lines() {
+                if line.starts_with("columns:") {
+                    in_columns = true;
+                } else if in_columns && !line.starts_with(' ') && !line.is_empty() {
+                    in_columns = false;
+                } else if in_columns
+                    && line.starts_with("  ")
+                    && !line.starts_with("   ")
+                    && let Some((key, _)) = line.trim().split_once(':')
+                    && let Some((u, _)) = ids
+                        .columns
+                        .iter()
+                        .find(|(_, c)| c.table == *name && c.name.raw() == key.trim())
+                {
+                    order.push(u.clone());
+                }
+            }
+            placement.order.insert(uid.clone(), order);
+        }
     }
     for (uid, name) in &ids.roles {
         placement.paths.insert(
@@ -295,11 +321,21 @@ pub fn copy_revision(project: &Path, rev: &str, dest: &Path) {
     }
 }
 
-/// Marks a test that exercises what the write side refuses until #2600 PR 5b
-/// (a file move: relocation, displacement, a partition changing hands). The
-/// test returns at once and says so; PR 5b removes every call and the helper.
-/// A test is never made to pass by what it asserts: it is not run.
-pub fn pending_5b(test: &str) -> bool {
-    eprintln!("SKIPPED {test}: needs the identity-file moves of #2600 PR 5b");
-    true
+/// Sets the reason of the allowed row move recorded for `uid`, in whichever
+/// file holds it, leaving every other file and every other byte of that file's
+/// layout to the writer. For tests that need a record a command would refuse to
+/// write, such as a blank reason.
+pub fn set_move_reason(project: &Path, uid: &pbps_model::Uid, reason: &str) {
+    for (rel, bytes) in files(project) {
+        let text = String::from_utf8(bytes).unwrap();
+        let mut file = ids_tree::parse(&rel, &text).unwrap();
+        if let ids_tree::Body::Table(table) = &mut file.body
+            && let Some((_, record)) = table.moves.iter_mut().find(|(u, _)| u == uid)
+        {
+            record.reason = reason.into();
+            std::fs::write(dir(project).join(rel), ids_tree::render(&file)).unwrap();
+            return;
+        }
+    }
+    panic!("no file records a move for {uid}");
 }

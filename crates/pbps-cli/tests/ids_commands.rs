@@ -594,21 +594,60 @@ fn a_new_column_in_the_middle_changes_only_its_own_file() {
 }
 
 #[test]
-fn moving_a_declaration_file_is_refused_by_name_and_writes_nothing() {
+fn moving_a_declaration_file_moves_its_identity_file_and_plan_check_sees_it_first() {
     let p = migrated();
     let before = tree_of(&p);
+    std::fs::create_dir_all(p.0.join("schema/sales")).unwrap();
     std::fs::rename(
         p.0.join("schema/dbo/customer.yml"),
-        p.0.join("schema/dbo/client.yml"),
+        p.0.join("schema/sales/client.yml"),
     )
     .unwrap();
-    // A new column makes the plan want to write the identities.
-    let moved = p.read("schema/dbo/client.yml") + "  phone: {type: text}\n";
-    p.write("schema/dbo/client.yml", &moved);
-    let out = p.pbps(&["plan", "--no-dev"]);
-    assert_refused(&out, "moving an identity file is not supported yet");
-    assert!(text(&out).contains("#2600 PR 5b"), "{}", text(&out));
-    assert_eq!(tree_of(&p), before, "a refusal writes nothing");
+    // The mapping is unchanged; only the declaration moved. The tree is stale
+    // all the same, and `--check` writes nothing.
+    let check = p.pbps(&["plan", "--check"]);
+    assert_refused(&check, "out of date");
+    assert_eq!(tree_of(&p), before);
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    let after = tree_of(&p);
+    assert!(!after.contains_key("dbo/customer.json"), "{after:?}");
+    assert_eq!(after["sales/client.json"], before["dbo/customer.json"]);
+    for (rel, text) in &before {
+        if rel != "dbo/customer.json" {
+            assert_eq!(&after[rel], text, "{rel} must not change");
+        }
+    }
+    // Settled: nothing is stale, and the project validates.
+    assert_ok(&p.pbps(&["plan", "--check"]));
+    assert_ok(&p.pbps(&["validate"]));
+}
+
+#[test]
+fn a_dropped_table_sends_its_file_aside_when_a_new_table_takes_its_path() {
+    let p = migrated();
+    // `dbo.customer` is dropped with its reason, and a new table is declared in
+    // the very file the old one had.
+    std::fs::remove_file(p.0.join("schema/dbo/customer.yml")).unwrap();
+    assert_ok(&p.pbps(&["drop-table", "dbo.customer", "--reason", "retired"]));
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    assert!(tree_of(&p)["dbo/customer.json"].contains("\"dropped\""));
+    p.write(
+        "schema/dbo/customer.yml",
+        "table: dbo.client\ncolumns:\n  id: {type: int}\n",
+    );
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    let after = tree_of(&p);
+    assert!(
+        after["dbo/customer.json"].contains("\"dbo.client\""),
+        "{after:?}"
+    );
+    let aside = after
+        .iter()
+        .find(|(rel, _)| rel.starts_with("dbo.customer.t_") && rel.ends_with(".json"))
+        .unwrap_or_else(|| panic!("no file was sent aside: {:?}", after.keys()));
+    assert!(aside.1.contains("\"dropped\""));
+    assert_ok(&p.pbps(&["validate"]));
+    assert_ok(&p.pbps(&["plan", "--check"]));
 }
 
 #[test]

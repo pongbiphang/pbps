@@ -511,9 +511,6 @@ mod intent_reason_ux;
 
 #[test]
 fn stdin_reasons_and_unedited_remedies_preserve_human_intent() {
-    if crate::idtree::pending_5b("stdin_reasons_and_unedited_remedies_preserve_human_intent") {
-        return;
-    }
     intent_reason_ux::stdin_reasons("mssql");
 }
 

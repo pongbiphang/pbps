@@ -271,9 +271,6 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
 
 #[test]
 fn rebuild_aliases_record_and_plan_from_one_canonical_schema() {
-    if crate::idtree::pending_5b("rebuild_aliases_record_and_plan_from_one_canonical_schema") {
-        return;
-    }
     let d = Demo::new("rebuild2298-aliases");
     d.table(REBUILD_ALIAS_SOURCE);
     succeeds(d.run(&["plan", "--no-dev"]));
@@ -384,40 +381,21 @@ fn check_offline_rebuild_additions(column: bool, partition: bool) {
 
 #[test]
 fn added_parent_columns_record_and_plan_with_switched_rebuild_identities() {
-    if crate::idtree::pending_5b(
-        "added_parent_columns_record_and_plan_with_switched_rebuild_identities",
-    ) {
-        return;
-    }
     check_offline_rebuild_additions(true, false);
 }
 
 #[test]
 fn added_partitions_record_and_plan_with_switched_rebuild_identities() {
-    if crate::idtree::pending_5b(
-        "added_partitions_record_and_plan_with_switched_rebuild_identities",
-    ) {
-        return;
-    }
     check_offline_rebuild_additions(false, true);
 }
 
 #[test]
 fn added_partitions_and_columns_record_and_plan_with_switched_rebuild_identities() {
-    if crate::idtree::pending_5b(
-        "added_partitions_and_columns_record_and_plan_with_switched_rebuild_identities",
-    ) {
-        return;
-    }
     check_offline_rebuild_additions(true, true);
 }
 
 #[test]
 fn every_recorded_member_change_reaches_the_rebuild_refusal_offline() {
-    if crate::idtree::pending_5b("every_recorded_member_change_reaches_the_rebuild_refusal_offline")
-    {
-        return;
-    }
     rebuild_members::check(None);
 }
 
@@ -463,11 +441,6 @@ fn partition_overrides_refuse_rebuild_recording_without_writing_ids() {
 
 #[test]
 fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
-    if crate::idtree::pending_5b(
-        "rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan",
-    ) {
-        return;
-    }
     let d = Demo::new("rebuild2298");
     let before = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     d.table(before);
@@ -605,11 +578,6 @@ fn recorded_rebuild_plans_without_changing_the_source_tree() {
 
 #[test]
 fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the_file() {
-    if crate::idtree::pending_5b(
-        "identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the_file",
-    ) {
-        return;
-    }
     let d = Demo::new("rebuild2298-intents");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     d.table(parent);
@@ -671,7 +639,8 @@ fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the
     // `--withdraw` takes neither a cap nor a reason, and edits only the file.
     let both = d.run(&["rebuild-table", "app.p", "--withdraw", "--max-rows", "1"]);
     assert_ne!(code(&both), 0);
-    assert_eq!(code(&d.run(&["rebuild-table", "app.p", "--withdraw"])), 0);
+    let withdraw = d.run(&["rebuild-table", "app.p", "--withdraw"]);
+    assert_eq!(code(&withdraw), 0, "{}", stderr(&withdraw));
     let withdrawn: pbps_model::IdsFile = crate::idtree::model(&path);
     assert!(withdrawn.rebuilds.is_empty() && withdrawn.tombstones.is_empty());
     // The file is what it was before the approval, whatever happened since.
@@ -694,11 +663,6 @@ fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the
 
 #[test]
 fn renaming_the_replacement_after_the_approval_can_be_reapproved_and_withdrawn() {
-    if crate::idtree::pending_5b(
-        "renaming_the_replacement_after_the_approval_can_be_reapproved_and_withdrawn",
-    ) {
-        return;
-    }
     let d = Demo::new("rebuild2298-rename");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     d.table(parent);
@@ -769,11 +733,6 @@ fn renaming_the_replacement_after_the_approval_can_be_reapproved_and_withdrawn()
 
 #[test]
 fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() {
-    if crate::idtree::pending_5b(
-        "a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision",
-    ) {
-        return;
-    }
     let d = Demo::new("rebuild2298-chain");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     let rev = || {
@@ -835,11 +794,6 @@ fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() 
 
 #[test]
 fn a_chain_that_returns_to_the_first_key_still_plans_as_one_composed_rebuild() {
-    if crate::idtree::pending_5b(
-        "a_chain_that_returns_to_the_first_key_still_plans_as_one_composed_rebuild",
-    ) {
-        return;
-    }
     let d = Demo::new("rebuild2298-there-and-back");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     d.table(parent);
@@ -1193,9 +1147,6 @@ mod intent_reason_ux;
 
 #[test]
 fn stdin_reasons_and_unedited_remedies_preserve_human_intent() {
-    if crate::idtree::pending_5b("stdin_reasons_and_unedited_remedies_preserve_human_intent") {
-        return;
-    }
     intent_reason_ux::stdin_reasons("postgres");
 }
 
@@ -1294,9 +1245,7 @@ fn move_rows_reasons_refuse_blanks_and_preserve_identity_bytes() {
     }
 
     for reason in ["", "   ", "\t\n", "\u{3000}"] {
-        let mut historical = ids.clone();
-        historical.moves.get_mut(uid).unwrap().reason = reason.into();
-        crate::idtree::write(&path, &historical);
+        crate::idtree::set_move_reason(&path, uid, reason);
         let bytes = crate::idtree::snapshot(&path);
         succeeds(d.run(&["plan", "--check"]));
         assert_eq!(crate::idtree::snapshot(&path), bytes);
@@ -36595,11 +36544,6 @@ fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
 
 #[test]
 fn consumer_retirements_do_not_mistake_partition_transitions_for_retirement() {
-    if crate::idtree::pending_5b(
-        "consumer_retirements_do_not_mistake_partition_transitions_for_retirement",
-    ) {
-        return;
-    }
     use consumer_retirements::{config, git, notes, ok, plan};
     for attach in [true, false] {
         let d = Demo::new("retirement-partition-identity");

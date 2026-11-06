@@ -204,7 +204,7 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
 
 /// The file name a dropped object keeps when no YAML names its place
 /// (design §3.4 step 5): its last name and its uid.
-fn aside(was: &str, uid: &Uid) -> String {
+pub(crate) fn aside(was: &str, uid: &Uid) -> String {
     let safe: String = was
         .chars()
         .map(|c| {
