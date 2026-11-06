@@ -1458,3 +1458,15 @@ that file is gone. `pbps.yml` is edited as text to keep its comments and then
 read back; a spelling the edit does not understand is refused, not half applied.
 `fmt` rewrites parseable files to canonical bytes and rewrites none when any
 file cannot be read.
+
+Until the switch, a migrated project fails closed. `migrate` deletes
+`schema.ids.json` and only the `ids` commands read the tree, so a reader that
+took "no legacy file" for "no identities" would mint fresh uids for every
+object. Wherever the legacy file is read and found absent, an identity tree in
+the project's `ids_dir` is a refusal naming the directory and #2600 PR 5: the
+working-tree reader, `--since` and the other history readers (a revision with
+the tree and no legacy blob), the `pbps test` revision reader, and `doctor`,
+which no longer calls such a project fresh. A directory with entries, or a path
+that is not a directory, is a tree; only an absent or empty directory is not.
+`migrate` itself reads the legacy file directly, so it can still finish an
+interrupted run. The guard goes away with the legacy reader in the switch.

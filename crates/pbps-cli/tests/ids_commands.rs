@@ -423,3 +423,58 @@ fn resolve_with_nothing_unmerged_checks_the_tree_and_succeeds() {
     assert_ok(&out);
     assert!(text(&out).contains("no unmerged"), "{}", text(&out));
 }
+
+// -------------------------------------------- fail closed until the switch ---
+
+const NOT_READ: &str = "does not read it yet";
+
+#[test]
+fn plan_and_validate_refuse_a_migrated_project_instead_of_reading_no_identities() {
+    let p = migrated();
+    for args in [&["validate"][..], &["plan", "--check"][..], &["doctor"][..]] {
+        let out = p.pbps(args);
+        assert!(text(&out).contains(NOT_READ), "{args:?}: {}", text(&out));
+    }
+    for args in [&["validate"][..], &["plan", "--check"][..]] {
+        assert_refused(&p.pbps(args), "identity tree `.pbps/ids`");
+    }
+    // `doctor` must not call a migrated project a fresh one.
+    assert!(!text(&p.pbps(&["doctor"])).contains("mints one"));
+    // Nothing was minted in the meantime.
+    assert!(!p.has("schema.ids.json"));
+}
+
+#[test]
+fn a_project_with_neither_file_still_validates_as_a_fresh_project() {
+    let p = Project::new();
+    p.write("pbps.yml", "dialect: postgres\n");
+    p.write("schema/dbo/customer.yml", CUSTOMER);
+    let out = p.pbps(&["validate"]);
+    assert!(!text(&out).contains(NOT_READ), "{}", text(&out));
+    // An empty identity directory is no tree either.
+    std::fs::create_dir_all(p.0.join(".pbps/ids")).unwrap();
+    let out = p.pbps(&["validate"]);
+    assert!(!text(&out).contains(NOT_READ), "{}", text(&out));
+}
+
+#[test]
+fn a_revision_holding_the_tree_and_no_legacy_blob_is_refused_by_since() {
+    let p = migrated();
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "migrated"]);
+    // The working tree goes back to the legacy layout; only the revision is migrated.
+    std::fs::remove_dir_all(p.0.join(".pbps")).unwrap();
+    p.write("pbps.yml", "dialect: postgres\n");
+    p.write(
+        "schema.ids.json",
+        &(serde_json::to_string_pretty(&legacy()).unwrap() + "\n"),
+    );
+    let out = p.pbps(&["validate", "--since", "HEAD"]);
+    assert!(text(&out).contains(NOT_READ), "{}", text(&out));
+    assert!(
+        text(&out).contains("at `HEAD`") || text(&out).contains("HEAD"),
+        "{}",
+        text(&out)
+    );
+}

@@ -135,7 +135,7 @@ fn read_tree(project: &Project) -> anyhow::Result<BTreeMap<String, String>> {
 fn migrate(project: &Project) -> anyhow::Result<()> {
     let dirs = Dirs::of(project);
     let tree = read_tree(project)?;
-    let Some(ids) = crate::read_ids_opt(project)? else {
+    let Some(ids) = crate::read_legacy_ids_opt(project)? else {
         if tree.is_empty() {
             bail!(
                 "nothing to migrate: `{}` does not exist and `{}` holds no identity files",

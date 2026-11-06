@@ -21,6 +21,7 @@ mod explain;
 mod externals_draft;
 mod hooks;
 mod ids_cmd;
+mod ids_guard;
 mod init;
 mod integration;
 mod intent_batch;
@@ -3745,6 +3746,17 @@ fn load_finding(e: &pbps_load::LoadError) -> output::Finding {
 /// file that is not there. Everything else wants [`read_ids`], for which "absent"
 /// and "empty" are the same thing.
 fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
+    let ids = read_legacy_ids_opt(project)?;
+    // Absent is "no identities" only where no tree stands in its place.
+    if ids.is_none() {
+        ids_guard::refuse_tree(project)?;
+    }
+    Ok(ids)
+}
+
+/// The legacy file alone, with no regard for a tree: what `ids migrate` needs
+/// to finish an interrupted run. Every other reader wants [`read_ids_opt`].
+fn read_legacy_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     let path = project.ids_file();
     // Target existence follows symlinks: a broken history link would look
     // absent and authorize fresh IDs. Inspect the directory entry instead,
