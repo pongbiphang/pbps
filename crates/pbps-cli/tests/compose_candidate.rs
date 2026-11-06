@@ -1034,6 +1034,139 @@ fn contained_parent_components_resolve_to_the_same_reviewed_inputs() {
     }
 }
 
+/// The fixture's migrated project with its identities in one JSON file at
+/// `file` instead of the tree. `config` is a different `pbps.yml`, which compose
+/// needs the base to hold, so it is committed together with the tree's removal;
+/// the legacy file itself is left untracked, so only the working tree has it.
+fn legacy_only(repo: &Repository, file: &str, config: Option<&str>) {
+    let legacy = crate::idtree::model(&repo.project);
+    fs::remove_dir_all(repo.project.join(".pbps")).unwrap();
+    if let Some(config) = config {
+        fs::write(repo.project.join("pbps.yml"), config).unwrap();
+        repo.commit();
+    }
+    fs::create_dir_all(repo.project.join(file).parent().unwrap()).unwrap();
+    fs::write(
+        repo.project.join(file),
+        serde_json::to_string_pretty(&legacy).unwrap() + "\n",
+    )
+    .unwrap();
+}
+
+/// The private CLI must see what the real one sees. A project that still keeps
+/// its identities in `schema.ids.json` (or the file `ids_file` names) is told to
+/// run `pbps ids migrate` by the real CLI; compose that left the file out of the
+/// capture would hand its private CLI the base's layout, a migrated or a fresh
+/// project, and compose a candidate from it.
+#[test]
+fn a_project_with_only_the_legacy_identity_file_is_refused_through_compose_as_it_is_directly() {
+    for (file, config) in [
+        ("schema.ids.json", None),
+        (
+            "custom/ids.json",
+            Some("dialect: mssql\nids_file: custom/ids.json\n"),
+        ),
+    ] {
+        let repo = Repository::new(&format!("legacy-only-{}", file.replace('/', "-")), "");
+        legacy_only(&repo, file, config);
+        repo.table(RENAMED);
+        let direct = repo.cli(&["validate"]);
+        assert!(
+            String::from_utf8_lossy(&direct.stderr).contains("pbps ids migrate"),
+            "{file}: {direct:?}"
+        );
+        let before = repo.preserved();
+        let error = repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .expect_err("a legacy-only project must not compose")
+            .to_string();
+        assert!(
+            error.contains("refused the captured inputs"),
+            "{file}: {error}"
+        );
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+/// The other direction: the base holds the legacy file and the working tree is
+/// the migration (the default `ids_dir` needs no config change). The candidate
+/// must not keep the tracked legacy file beside the new tree.
+#[test]
+fn a_migration_in_the_working_tree_composes_without_the_tracked_legacy_file() {
+    let repo = Repository::new("migration-in-working-tree", "");
+    let migrated = crate::idtree::model(&repo.project);
+    fs::write(repo.project.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    legacy_only(&repo, "schema.ids.json", None);
+    repo.commit();
+    fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    crate::idtree::write(&repo.project, &migrated);
+    repo.table(RENAMED);
+    let mut store = repo.store();
+    let now = SystemTime::now();
+    let preview = store.preview(request(), now).unwrap();
+    let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+    assert!(
+        candidate.manifest().inputs["schema.ids.json"].is_none(),
+        "the candidate keeps the tracked legacy file beside the tree"
+    );
+    assert!(
+        candidate
+            .manifest()
+            .inputs
+            .keys()
+            .any(|n| n.starts_with(".pbps/ids/")),
+        "{:?}",
+        candidate.manifest().inputs.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Both layouts are an unfinished migration, for compose as for the CLI, so a
+/// candidate can never hold a legacy file beside a tree.
+#[test]
+fn a_project_with_both_layouts_is_refused_through_compose() {
+    let repo = Repository::new("both-layouts", "");
+    let legacy = crate::idtree::model(&repo.project);
+    fs::write(
+        repo.project.join("schema.ids.json"),
+        serde_json::to_string_pretty(&legacy).unwrap() + "\n",
+    )
+    .unwrap();
+    repo.table(RENAMED);
+    let direct = repo.cli(&["validate"]);
+    assert!(
+        String::from_utf8_lossy(&direct.stderr).contains("did not finish"),
+        "{direct:?}"
+    );
+    let error = repo
+        .store()
+        .preview(request(), SystemTime::now())
+        .expect_err("both layouts must not compose")
+        .to_string();
+    assert!(error.contains("refused the captured inputs"), "{error}");
+}
+
+/// Negative: a migrated project, with no legacy file anywhere, still composes,
+/// and the candidate holds no legacy file.
+#[test]
+fn a_migrated_project_still_composes_and_the_candidate_holds_no_legacy_file() {
+    let repo = Repository::new("migrated-composes", "");
+    repo.table(RENAMED);
+    let mut store = repo.store();
+    let now = SystemTime::now();
+    let preview = store.preview(request(), now).unwrap();
+    let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+    assert!(
+        candidate
+            .manifest()
+            .inputs
+            .iter()
+            .all(|(name, file)| !name.ends_with("schema.ids.json") || file.is_none()),
+        "{:?}",
+        candidate.manifest().inputs.keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() {
     for variant in ["link", "unreadable", "filter"] {

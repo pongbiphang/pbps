@@ -39,6 +39,11 @@ pub struct InputPaths {
     pub project_file: String,
     pub declarations: String,
     pub identity_dir: String,
+    /// Where the retired single identity file would be, as configured
+    /// (`ids_file`). A consumer that captures the project's inputs needs it:
+    /// that file is what makes the project refuse with "run `pbps ids migrate`"
+    /// instead of reading as a fresh one.
+    pub legacy_identity_file: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -63,6 +68,7 @@ pub fn input_paths(project: &Project, json: bool) -> anyhow::Result<()> {
         project_file: project.config_file().display().to_string(),
         declarations: project.schema_dir().display().to_string(),
         identity_dir: project.ids_dir().display().to_string(),
+        legacy_identity_file: project.ids_file().display().to_string(),
     };
     if json {
         output::Report::new("doctor", Vec::new(), Some(data)).emit_json()
