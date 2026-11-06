@@ -2608,6 +2608,6 @@ mod tests {
         }
         // The method's policy says which methods may back one.
         assert!(IndexMethod::Btree.policy().exclusion && IndexMethod::Gist.policy().exclusion);
-        assert!(!IndexMethod::Gin.policy().exclusion);
+        assert!(!IndexMethod::Gin.policy().exclusion && !IndexMethod::Brin.policy().exclusion);
     }
 }

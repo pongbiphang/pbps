@@ -2122,6 +2122,21 @@ mod tests {
         );
         // Its own: a method that cannot back one, no keys, a missing column.
         assert!(said(&exclusion_table(Gin, &[("n", "")])).contains("cannot back an exclusion"));
+        // BRIN joined the policy table after exclusions did (DEC-2449.1): its row says
+        // `exclusion: false`, and the engine agrees ("does not support exclusion
+        // constraints"), so an exclusion over it is refused here and not at apply.
+        assert!(
+            said(&exclusion_table(
+                pbps_model::IndexMethod::Brin,
+                &[("n", "")]
+            ))
+            .contains("cannot back an exclusion"),
+            "{}",
+            said(&exclusion_table(
+                pbps_model::IndexMethod::Brin,
+                &[("n", "")]
+            ))
+        );
         assert!(said(&exclusion_table(Btree, &[])).contains("has no keys"));
         // `nope` is read as an expression, as any text that names no column is
         // (the engine then answers for it), so the check here is that it is held.
