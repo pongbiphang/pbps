@@ -1025,6 +1025,8 @@ mod live {
         let record = journal.record.clone();
         held.disown();
         drop(journal);
+        // A sibling fork may still hold the journal's open file description.
+        assert!(released(&d.dir, &record.run_id));
         let mut dead = record.clone();
         dead.process.pid = GONE;
         d.dir.write(&dead).unwrap();
@@ -1122,6 +1124,16 @@ mod live {
         }
         let d = Dir::new();
         let scratch = Box::pin(start_on(&d, driver, image)).await;
+        let foreign_dir = StateDir::open(d.base.join("foreign-runs")).unwrap();
+        let foreign = Box::pin(TestScratch::start(
+            &foreign_dir,
+            driver,
+            image,
+            PullPolicy::Never,
+        ))
+        .await
+        .unwrap();
+        let foreign_record = foreign_dir.read(foreign.run_id()).unwrap().unwrap();
         let (run_id, cid) = (
             scratch.run_id().to_owned(),
             scratch.journal.record.container.id.clone().unwrap(),
@@ -1137,8 +1149,20 @@ mod live {
         let mut dead = d.dir.read(&run_id).unwrap().unwrap();
         dead.process.pid = GONE;
         d.dir.write(&dead).unwrap();
-        assert_eq!(Box::pin(recover(&d)).await.removed, vec![run_id]);
+        // Failed finish drops the journal, but a sibling fork can retain its lock.
+        assert!(released(&d.dir, &run_id));
+        let done = Box::pin(recover(&d)).await;
+        assert_eq!(done.removed, vec![run_id], "{done:?}");
+        assert!(done.live.is_empty() && done.failures.is_empty(), "{done:?}");
         assert!(!exists(&cid).await);
+        // A run on the same daemon, outside this state directory, is not ours
+        // to remove or report, and recovery must not rewrite its record.
+        assert!(exists(foreign_record.container.id.as_deref().unwrap()).await);
+        assert_eq!(
+            foreign_dir.read(foreign.run_id()).unwrap(),
+            Some(foreign_record)
+        );
+        Box::pin(foreign.finish()).await.unwrap();
     }
 
     #[tokio::test]
