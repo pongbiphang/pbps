@@ -2006,6 +2006,10 @@
       ],
       "cases": [
         "extension_provider::tests::the_engine_reports_what_is_installable_and_what_a_package_owns",
+        "pull_coverage::tests::every_pg_catalog_column_has_a_disposition_on_pg16",
+        "pull_coverage::tests::every_pg_catalog_column_has_a_disposition_on_pg18",
+        "catalog::properties::tests::every_unheld_property_is_named_and_its_object_still_pulled_on_pg16",
+        "catalog::properties::tests::every_unheld_property_is_named_and_its_object_still_pulled_on_pg18",
         "extension_provider::tests::a_closure_vets_across_databases_and_prerequisites_are_read_not_guessed",
         "extension_provider::tests::a_member_table_with_toast_storage_compares_equal_across_databases",
         "extension_provider::tests::the_privilege_rule_is_what_the_engine_does_for_each_kind_of_control_file",
