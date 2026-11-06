@@ -3,11 +3,14 @@
 //!
 //! Before this, a table's expressions were only change-detected (DEC-319.1): a
 //! function any role owned ran as the deployer. Each change that carries one is
-//! bound here, in a transaction that is rolled back, the way a requirement is:
-//! a temporary table with the table's columns and the one expression, whose
-//! stored tree names every routine it calls. The routines are judged by the one
-//! predicate ([`crate::input_path::judge_trees`]), so what a human reviews and
-//! pins is what the engine would have run.
+//! bound here, in a transaction that is rolled back, the way a requirement is,
+//! and its stored tree names every routine it calls. A table that stands is
+//! bound as a view over it, so the engine resolves the table's own name in an
+//! expression as on the table itself (DEC-2563.8); a table the plan creates, and
+//! a default, are bound on a temporary table with the table's columns. The
+//! routines are judged by the one predicate ([`crate::input_path::judge_trees`],
+//! [`crate::input_path::judge_view`]), so what a human reviews and pins is what
+//! the engine would have run.
 //!
 //! The same function serves three moments. `plan` calls it to learn which
 //! routines the review admits, so the plan can show and pin them; apply calls it
@@ -18,17 +21,27 @@
 //! two cannot bind it, and say so as a note rather than refuse.
 
 use pbps_db::{Conn, Param};
-use pbps_model::{Change, TableName, ValueSource};
+use pbps_model::{Change, ManagedType, TableName, TypeRef, ValueSource};
 
 use crate::admission::Admission;
 use crate::input_path::{Part, Use, judge_trees};
 use crate::pins::Within;
 
+/// The savepoint the early binding runs inside. The binding table itself is
+/// named for the table it stands for ([`Spec::bound`]).
 const TEMP: &str = "pbps_table_expressions";
 
 /// The placeholder name of the column an existing column's new expression is
 /// bound as; [`name_bound_columns`] replaces it before anything runs.
 const BIND: &str = "pbps_bound";
+
+/// The domain a created domain's code is bound as. Another name than [`TEMP`],
+/// which a table's row type would share the namespace with.
+const TEMP_DOMAIN: &str = "pbps_domain_expressions";
+
+/// The view a table that stands is bound as (DEC-2563.8), in the session's own
+/// `pg_temp`.
+const TEMP_VIEW: &str = "pbps_table_expressions_view";
 
 /// When the expressions are judged, which decides what an unbindable one means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +63,41 @@ struct Spec {
     table: String,
     /// The schema whose path the statement that carries them runs on.
     schema: String,
+    /// The name of the table they belong to. The binding table of a table the
+    /// plan creates takes it, in `pg_temp`, so a column an expression qualifies
+    /// with the table's name (`CHECK (t.a > 0)`) resolves as it does on the real
+    /// table. A table of that name already in the session's `pg_temp` makes the
+    /// binding fail to build, which is an expression that cannot be bound, never
+    /// a table dropped. A table that stands needs none: it is bound as a view
+    /// over the table itself ([`Spec::on_table`]).
+    bound: String,
+    /// Whether the expressions are bound as a view over the real table
+    /// (DEC-2563.8) rather than as the temporary copy the other changes use. It
+    /// is a fact of the change's kind, never found by trying: every expression
+    /// of a table that stands except a default, which cannot name a column or
+    /// the row at all.
+    on_table: bool,
     /// The table the columns are copied from, or `None` for a table the plan
-    /// creates, whose columns are all listed.
+    /// creates, whose columns are all listed. A view over the real table
+    /// selects from it.
     like: Option<TableName>,
     /// Name in the temporary table, the name to show, the type, the value.
     columns: Vec<Column>,
     checks: Vec<(String, String)>,
+    /// An index whose expressions are bound, by name.
+    index: Option<(String, Box<pbps_model::Index>)>,
+    /// A policy created on the binding table, by name.
+    policy: Option<(String, Box<pbps_model::RowPolicy>)>,
+}
+
+/// One CHECK of the binding table and what its tree is called in a refusal.
+struct Constraint {
+    name: String,
+    expression: String,
+    label: String,
+    /// A clause of a CHECK, a filter or a policy, which must be a boolean.
+    /// A key and a generated expression are bound `IS NOT NULL` already.
+    boolean: bool,
 }
 
 struct Column {
@@ -70,13 +112,169 @@ enum Value {
     Generated(String),
 }
 
+impl Spec {
+    /// The binding table as SQL spells it.
+    fn relation(&self) -> Result<String, String> {
+        Ok(format!(
+            "pg_temp.{}",
+            crate::quote(&self.bound).map_err(|e| e.to_string())?
+        ))
+    }
+
+    /// The same, as the text of a `regclass` literal.
+    fn regclass(&self) -> Result<String, String> {
+        Ok(format!(
+            "'{}'::pg_catalog.regclass",
+            self.relation()?.replace('\'', "''")
+        ))
+    }
+
+    /// Everything bound as a CHECK. Binding a generated column, an index key
+    /// or an index filter as the column or index it is would let the engine
+    /// fold the expression while it prepares the object: measured on 16 and
+    /// 18, a call of an IMMUTABLE function with constant arguments runs then,
+    /// before anything has judged it. A CHECK is stored as written. A generated
+    /// expression is bound cast to the column's type, which is where its
+    /// assignment coercion would put any cast routine; a key is bound as
+    /// `IS NOT NULL`, which adds a node and no routine.
+    fn constraints(&self) -> Vec<Constraint> {
+        let mut taken: std::collections::BTreeSet<String> =
+            self.checks.iter().map(|(n, _)| n.clone()).collect();
+        let mut fresh = |prefix: &str| {
+            let mut name = prefix.to_owned();
+            let mut n = 0_usize;
+            while taken.contains(&name) {
+                n += 1;
+                name = format!("{prefix}_{n}");
+            }
+            taken.insert(name.clone());
+            name
+        };
+        let mut out: Vec<Constraint> = self
+            .checks
+            .iter()
+            .map(|(name, expression)| Constraint {
+                name: name.clone(),
+                expression: expression.clone(),
+                label: format!("the CHECK `{name}` of {}", self.table),
+                boolean: true,
+            })
+            .collect();
+        for c in &self.columns {
+            if let Some(Value::Generated(e)) = &c.value {
+                out.push(Constraint {
+                    name: fresh("pbps_generated"),
+                    expression: format!("({e}\n)::{} IS NOT NULL", c.ty),
+                    label: format!("the generated expression of {}.{}", self.table, c.shown),
+                    boolean: false,
+                });
+            }
+        }
+        if let Some((name, index)) = &self.index {
+            for (i, column) in index.columns.iter().enumerate() {
+                if let pbps_model::IndexKey::Expression(text) = &column.key {
+                    out.push(Constraint {
+                        name: fresh("pbps_key"),
+                        expression: format!("({text}\n) IS NOT NULL"),
+                        label: format!("key {} of index `{name}` on {}", i + 1, self.table),
+                        boolean: false,
+                    });
+                }
+            }
+            if let Some(filter) = &index.filter {
+                out.push(Constraint {
+                    name: fresh("pbps_filter"),
+                    expression: filter.clone(),
+                    label: format!("the filter of index `{name}` on {}", self.table),
+                    boolean: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// What a view over the real table selects, one target entry each, and what
+    /// a refusal calls it. A clause is selected `IS TRUE`, which is where the
+    /// engine's own demand that it be a boolean lands for a select list, and
+    /// which adds a node and no routine; a key and a generated expression keep
+    /// the `IS NOT NULL` wrapper of [`Self::constraints`]. Every item closes on
+    /// its own line, so one ending in a `--` comment cannot swallow what follows.
+    fn entries(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .constraints()
+            .into_iter()
+            .map(|c| {
+                let item = if c.boolean {
+                    format!("({}\n) IS TRUE", c.expression)
+                } else {
+                    c.expression
+                };
+                (c.label, item)
+            })
+            .collect();
+        if let Some((name, policy)) = &self.policy {
+            for (part, clause) in [("USING", &policy.using), ("WITH CHECK", &policy.with_check)] {
+                if let Some(clause) = clause {
+                    out.push((
+                        format!("the {part} of policy `{name}` on {}", self.table),
+                        format!("({}\n) IS TRUE", clause.raw()),
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Whether `change` is bound as a view over the table it is about, which stands
+/// (DEC-2563.8): every expression of a table that exists, except a default.
+/// [`Spec::on_table`] is this, read where the spec is built; the cleanup needs it
+/// without one.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the changes that carry no table expression are every other one"
+)]
+fn binds_on_table(change: &Change) -> bool {
+    match change {
+        Change::AddCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::CreatePolicy { .. }
+        | Change::AlterColumnExpression { .. } => true,
+        Change::AddColumn { column, .. } => {
+            matches!(column.value_source, ValueSource::Generated(_))
+        }
+        _ => false,
+    }
+}
+
+/// The name of the table `change` is about: what its binding table is called.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the changes that carry no table expression are every other one"
+)]
+fn bound_table(change: &Change) -> Option<&str> {
+    match change {
+        Change::CreateTable { name, .. } => Some(&name.name),
+        Change::AddColumn { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::AddIndex { table, .. }
+        | Change::CreatePolicy { table, .. } => Some(&table.name),
+        Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. } => Some(&column.table.name),
+        _ => None,
+    }
+}
+
 /// Whether `change` introduces an expression this module judges.
 #[must_use]
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "the changes that carry no table expression this module judges are every other one; indexes, policies and partition keys are the next slice"
+    reason = "the changes that carry no expression this module judges are every other one"
 )]
 pub fn carries(change: &Change) -> bool {
+    if domain_code(change).is_some() {
+        return true;
+    }
     match change {
         Change::CreateTable { table, .. } => {
             table.partition_of.is_none()
@@ -86,8 +284,100 @@ pub fn carries(change: &Change) -> bool {
         Change::AddColumn { column, .. } => has_value(&column.value_source),
         Change::AlterColumnDefault { to, .. } => to.is_some(),
         Change::AlterColumnExpression { .. } | Change::AddCheck { .. } => true,
+        // A key that is only a column, and no filter, calls nothing; such an
+        // index is also the one built concurrently, outside any transaction.
+        Change::AddIndex { index, .. } => index.holds_expression(),
+        Change::CreatePolicy { policy, .. } => {
+            policy.using.is_some() || policy.with_check.is_some()
+        }
         _ => false,
     }
+}
+
+/// Whether a pre-flight probe can evaluate the expressions `change` carries over
+/// stored rows, so that leaving them unjudged must leave the probe unrun. The
+/// only probe that evaluates an index is the duplicate count of a unique index
+/// under a filter; no probe evaluates a policy or a domain.
+#[must_use]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "every change this module judges, but these, can be probed"
+)]
+pub fn probed(change: &Change) -> bool {
+    match change {
+        Change::AddIndex { index, .. } => index.unique && index.filter.is_some(),
+        Change::CreatePolicy { .. } => false,
+        _ => domain_code(change).is_none(),
+    }
+}
+
+/// The code a domain gets from `change`, as a domain that holds only it, and
+/// the domain's name: its CHECKs and DEFAULT when it is created or rebuilt, and
+/// whichever half of an in-place alteration adds them. `None` when there is
+/// none (NOT NULL runs no code).
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the changes that give a domain no code are every other one"
+)]
+fn domain_code(change: &Change) -> Option<(TypeRef, ManagedType)> {
+    let (name, mut domain) = match change {
+        Change::CreateType {
+            name, definition, ..
+        } => (name, (**definition).clone()),
+        Change::EnumRebuild {
+            name,
+            step:
+                pbps_model::EnumRebuildStep::Create {
+                    definition, over, ..
+                },
+            ..
+        } => (
+            name,
+            crate::emit::over_the_replacement(definition, over.as_ref()),
+        ),
+        Change::AlterDomain {
+            name,
+            from,
+            to,
+            half,
+            ..
+        } => {
+            let delta = pbps_model::DomainDelta::of(from, to)?;
+            let mut domain = (**to).clone();
+            if let ManagedType::Domain {
+                default, checks, ..
+            } = &mut domain
+            {
+                match half {
+                    pbps_model::DomainHalf::Loosen => {
+                        *default = delta.default.flatten().map(str::to_owned);
+                        checks.clear();
+                    }
+                    pbps_model::DomainHalf::Tighten => {
+                        *default = None;
+                        *checks = delta
+                            .add_checks
+                            .iter()
+                            .map(|(n, t)| ((*n).clone(), (*t).to_owned()))
+                            .collect();
+                    }
+                }
+            }
+            (name, domain)
+        }
+        _ => return None,
+    };
+    let ManagedType::Domain {
+        not_null,
+        default,
+        checks,
+        ..
+    } = &mut domain
+    else {
+        return None;
+    };
+    *not_null = false;
+    (default.is_some() || !checks.is_empty()).then(|| (name.clone(), domain))
 }
 
 fn has_value(source: &ValueSource) -> bool {
@@ -177,17 +467,29 @@ async fn vet_in_callers_transaction(
         .and_then(|r| r.try_get::<&str>("path").ok().flatten())
         .map(str::to_owned)
         .ok_or_else(unclean)?;
-    let notes = vet_bound(conn, admission, moment, change).await?;
-    conn.execute(&format!("DROP TABLE IF EXISTS pg_temp.{TEMP}"))
-        .await
-        .map_err(|_| unclean())?;
+    let admitted = vet_bound(conn, admission, moment, change).await?;
+    // Only a binding that stood is removed: an unjudged one never built its
+    // table, and a table of that name in the session is not ours to drop.
+    if admitted != Vetted::Admitted {
+        return Ok(admitted);
+    }
+    let drop = match (domain_code(change), bound_table(change)) {
+        (Some(_), _) => format!("DROP DOMAIN IF EXISTS pg_temp.{TEMP_DOMAIN}"),
+        (None, _) if binds_on_table(change) => format!("DROP VIEW IF EXISTS pg_temp.{TEMP_VIEW}"),
+        (None, Some(table)) => format!(
+            "DROP TABLE IF EXISTS pg_temp.{}",
+            crate::quote(table).map_err(|_| unclean())?
+        ),
+        (None, None) => return Ok(admitted),
+    };
+    conn.execute(&drop).await.map_err(|_| unclean())?;
     conn.execute_with(
         "SELECT pg_catalog.set_config('search_path', $1::pg_catalog.text, true)",
         &[pbps_db::Param::Str(&path)],
     )
     .await
     .map_err(|_| unclean())?;
-    Ok(notes)
+    Ok(admitted)
 }
 
 async fn vet_bound(
@@ -204,38 +506,25 @@ async fn vet_bound(
         "the expressions of a table could not be vetted: its session settings could not be pinned"
             .to_owned()
     })?;
-    // A failure to bind is a note before the statement and a refusal at it.
-    let unbound = |what: &str, why: &str| match moment {
-        Moment::Early => Ok(Vetted::Unjudged(vec![note(what, why)])),
-        Moment::Statement => Err(format!(
-            "{what} could not be bound just before they run (SQLSTATE {why}), so they cannot be \
-             judged; nothing has been changed"
-        )),
-    };
+    let unbound = |what: &str, why: &str| unbound(moment, what, why);
+    if let Some((name, domain)) = domain_code(change) {
+        return vet_domain(conn, admission, moment, &describe(change), &name, &domain).await;
+    }
     let mut spec = match spec(conn, change).await {
         Ok(Some(spec)) => spec,
         Ok(None) => return Ok(Vetted::Admitted),
         Err(why) => return unbound(&describe(change), &why),
     };
-    if let Some(table) = &spec.like {
-        match column_names(conn, table).await {
+    if spec.on_table {
+        return vet_on_table(conn, admission, moment, &spec).await;
+    }
+    if let Some(table) = spec.like.clone() {
+        match column_names(conn, &table).await {
             Ok(taken) => name_bound_columns(&mut spec, taken),
             Err(why) => return unbound(&spec.what, &why),
         }
     }
-    // Bound on the path the real statement runs on, or an unqualified name
-    // would resolve differently here than where it is created (`SET LOCAL`
-    // ends with the transaction or savepoint that is rolled back).
-    let path = crate::emit::write_path(&crate::Postgres::new(), &spec.schema)
-        .map_err(|e| e.to_string())?;
-    conn.execute(&format!("SET LOCAL search_path = {path}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "{} could not be vetted: its search_path could not be set",
-                spec.what
-            )
-        })?;
+    bind_path(conn, &spec.schema, &spec.what).await?;
     // The extended protocol refuses more than one command, so an expression that
     // closes its clause and adds a statement is refused as one that does not
     // bind, never run before it is judged (as for a requirement, DEC-1635.4).
@@ -257,10 +546,17 @@ async fn vet_bound(
             .map_err(|_| unreadable())?,
         None => 0,
     };
+    let constraints = spec.constraints();
+    let regclass = spec.regclass()?;
     let expected = [
         like_columns + count(spec.columns.len()),
-        count(spec.checks.len()),
-        count(spec.columns.iter().filter(|c| c.value.is_some()).count()),
+        count(constraints.len()),
+        count(
+            spec.columns
+                .iter()
+                .filter(|c| matches!(c.value, Some(Value::Default(_))))
+                .count(),
+        ),
     ];
     let shape = conn
         .query(&format!(
@@ -274,7 +570,7 @@ async fn vet_bound(
                (SELECT count(*) FROM pg_catalog.pg_attrdef d
                  WHERE d.adrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS defaults
                FROM pg_catalog.pg_class r
-              WHERE r.oid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
+              WHERE r.oid OPERATOR(pg_catalog.=) {regclass}"
         ))
         .await
         .map_err(|_| unreadable())?;
@@ -295,15 +591,14 @@ async fn vet_bound(
         .query(&format!(
             "SELECT 'check' AS kind, c.conname::pg_catalog.text AS name, c.conbin::pg_catalog.text AS tree
                FROM pg_catalog.pg_constraint c
-              WHERE c.conrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass
+              WHERE c.conrelid OPERATOR(pg_catalog.=) {regclass}
                 AND c.contype OPERATOR(pg_catalog.=) 'c'
              UNION ALL
-             SELECT CASE WHEN a.attgenerated OPERATOR(pg_catalog.<>) '' THEN 'generated' ELSE 'default' END,
-                    a.attname::pg_catalog.text, d.adbin::pg_catalog.text
+             SELECT 'default', a.attname::pg_catalog.text, d.adbin::pg_catalog.text
                FROM pg_catalog.pg_attrdef d
                JOIN pg_catalog.pg_attribute a
                  ON a.attrelid OPERATOR(pg_catalog.=) d.adrelid AND a.attnum OPERATOR(pg_catalog.=) d.adnum
-              WHERE d.adrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
+              WHERE d.adrelid OPERATOR(pg_catalog.=) {regclass}"
         ))
         .await
         .map_err(|_| unreadable())?;
@@ -316,18 +611,17 @@ async fn vet_bound(
         ) else {
             return Err(unreadable());
         };
-        let label = match kind {
-            "check" => format!("the CHECK `{name}` of {}", spec.table),
-            "generated" => format!(
-                "the generated expression of {}.{}",
-                spec.table,
-                shown_column(&spec, name)
-            ),
-            _ => format!(
+        let label = if kind == "check" {
+            let Some(found) = constraints.iter().find(|c| c.name == name) else {
+                return Err(too_many(&spec.what));
+            };
+            found.label.clone()
+        } else {
+            format!(
                 "the DEFAULT of {}.{}",
                 spec.table,
                 shown_column(&spec, name)
-            ),
+            )
         };
         trees.push((
             Use {
@@ -337,12 +631,211 @@ async fn vet_bound(
             tree.to_owned(),
         ));
     }
-    let what = spec.what.clone();
+    judge(conn, admission, trees, &spec.what).await
+}
+
+/// Binds the expressions of a table that stands as a view over it, and judges
+/// the one stored rule (DEC-2563.8). The view selects from the real table with
+/// no alias, so the engine resolves every spelling of the table in an expression
+/// (`t`, `t.*`, `t.col`, `(t).col`, `app.t.col`) as it does on the table itself,
+/// and a whole row has the table's own row type. Creating a view analyses its
+/// query and plans nothing, so nothing in it runs (measured on 16 and 18, with a
+/// constant call in a select list and a clause); it asks for `USAGE` on the
+/// schema and nothing else, and it holds `ACCESS SHARE` on the table as the
+/// copy it replaces did.
+async fn vet_on_table(
+    conn: &mut Conn,
+    admission: &Admission,
+    moment: Moment,
+    spec: &Spec,
+) -> Result<Vetted, String> {
+    let unbound = |why: &str| unbound(moment, &spec.what, why);
+    let Some(table) = &spec.like else {
+        return unbound("0A000");
+    };
+    let entries = spec.entries();
+    if entries.is_empty() {
+        return Ok(Vetted::Admitted);
+    }
+    bind_path(conn, &spec.schema, &spec.what).await?;
+    let items = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (_, item))| format!("{item} AS c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let relation = format!("pg_temp.{TEMP_VIEW}");
+    // One statement, by the protocol: an expression that closes its clause and
+    // adds a command is refused as one that does not bind (DEC-1635.4).
+    if let Err(e) = conn
+        .execute_with(
+            &format!(
+                "CREATE TEMPORARY VIEW {relation} AS SELECT {items} FROM {}",
+                crate::emit::qualified(table).map_err(|e| e.to_string())?
+            ),
+            &[],
+        )
+        .await
+    {
+        return unbound(&server_code(&e));
+    }
+    let unreadable = || {
+        format!(
+            "{} could not be vetted: the catalog could not be read",
+            spec.what
+        )
+    };
+    let rows = conn
+        .query(&format!(
+            "SELECT r.ev_action::pg_catalog.text AS rule FROM pg_catalog.pg_rewrite r
+              WHERE r.ev_class OPERATOR(pg_catalog.=) '{relation}'::pg_catalog.regclass"
+        ))
+        .await
+        .map_err(|_| unreadable())?;
+    let [row] = rows.as_slice() else {
+        return Err(unreadable());
+    };
+    let Some(rule) = row.try_get::<&str>("rule").ok().flatten() else {
+        return Err(unreadable());
+    };
+    let uses = entries
+        .into_iter()
+        .map(|(label, _)| Use {
+            ty: label,
+            part: Part::TableExpression,
+        })
+        .collect();
+    let what = &spec.what;
+    crate::input_path::judge_view(conn, admission, rule, uses, &|why: &str| {
+        format!("{what} {why}")
+    })
+    .await?;
+    Ok(Vetted::Admitted)
+}
+
+async fn judge(
+    conn: &mut Conn,
+    admission: &Admission,
+    trees: Vec<(Use, String)>,
+    what: &str,
+) -> Result<Vetted, String> {
     judge_trees(conn, admission, trees, false, &|why: &str| {
         format!("{what} {why}")
     })
     .await?;
     Ok(Vetted::Admitted)
+}
+
+/// The code of a created, rebuilt or altered domain, bound as a domain of the
+/// session's own `pg_temp` and read from `pg_constraint.conbin` and
+/// `pg_type.typdefaultbin` (DEC-2563.5).
+async fn vet_domain(
+    conn: &mut Conn,
+    admission: &Admission,
+    moment: Moment,
+    what: &str,
+    name: &TypeRef,
+    domain: &ManagedType,
+) -> Result<Vetted, String> {
+    let ManagedType::Domain {
+        default, checks, ..
+    } = domain
+    else {
+        return Ok(Vetted::Admitted);
+    };
+    let temp = TableName::new("pg_temp", TEMP_DOMAIN);
+    let sql = crate::emit::domain_sql(&temp, domain).map_err(|e| e.to_string())?;
+    // The statement that creates the domain runs on its schema's path.
+    bind_path(conn, name.schema(), what).await?;
+    if let Err(e) = conn.execute_with(&sql, &[]).await {
+        return unbound(moment, what, &server_code(&e));
+    }
+    let unreadable = || format!("{what} could not be vetted: the catalog could not be read");
+    let rows = conn
+        .query(&format!(
+            "SELECT 'default' AS kind, ''::pg_catalog.text AS name, t.typdefaultbin::pg_catalog.text AS tree
+               FROM pg_catalog.pg_type t
+              WHERE t.oid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP_DOMAIN}'::pg_catalog.regtype
+                AND t.typdefaultbin IS NOT NULL
+             UNION ALL
+             SELECT 'check', c.conname::pg_catalog.text, c.conbin::pg_catalog.text
+               FROM pg_catalog.pg_constraint c
+              WHERE c.contypid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP_DOMAIN}'::pg_catalog.regtype
+                AND c.contype OPERATOR(pg_catalog.=) 'c'"
+        ))
+        .await
+        .map_err(|_| unreadable())?;
+    let mut trees = Vec::new();
+    let (mut defaults, mut checked) = (0, 0);
+    for row in &rows {
+        let (Some(kind), Some(label), Some(tree)) = (
+            row.try_get::<&str>("kind").ok().flatten(),
+            row.try_get::<&str>("name").ok().flatten(),
+            row.try_get::<&str>("tree").ok().flatten(),
+        ) else {
+            return Err(unreadable());
+        };
+        let shown = name.shown();
+        let label = if kind == "default" {
+            defaults += 1;
+            format!("the DEFAULT of domain {shown}")
+        } else {
+            checked += 1;
+            format!("the CHECK `{label}` of domain {shown}")
+        };
+        trees.push((
+            Use {
+                ty: label,
+                part: Part::TableExpression,
+            },
+            tree.to_owned(),
+        ));
+    }
+    // A domain over a domain takes the base's default when it declares none
+    // (measured: DEC-2537), so an undeclared default may be there once; a declared
+    // one replaces it and is the only one.
+    if defaults > 1 || (default.is_some() && defaults != 1) || checked != checks.len() {
+        return Err(too_many(what));
+    }
+    judge(conn, admission, trees, what).await
+}
+
+fn too_many(what: &str) -> String {
+    format!(
+        "{what} are more than the expressions declared: one closes its clause and adds to the \
+         statement, and each may be the one expression and nothing else; nothing has been changed"
+    )
+}
+
+/// The trees the policy bound on the binding table stores. Held to the
+/// one policy declared: a text that closes its clause and adds a check changes
+/// which of USING and WITH CHECK are there, and is refused.
+/// A failure to bind is a note before the statement and a refusal at it.
+fn unbound(moment: Moment, what: &str, why: &str) -> Result<Vetted, String> {
+    match moment {
+        Moment::Early => Ok(Vetted::Unjudged(vec![note(what, why)])),
+        Moment::Statement => Err(format!(
+            "{what} could not be bound just before they run (SQLSTATE {why}), so they cannot be \
+             judged; nothing has been changed"
+        )),
+    }
+}
+
+/// Bound on the path the real statement runs on, or an unqualified name would
+/// resolve differently here than where it is created (`SET LOCAL` ends with the
+/// transaction or savepoint that is rolled back).
+async fn bind_path(conn: &mut Conn, schema: &str, what: &str) -> Result<(), String> {
+    let path =
+        crate::emit::write_path(&crate::Postgres::new(), schema).map_err(|e| e.to_string())?;
+    conn.execute(&format!("SET LOCAL search_path = {path}"))
+        .await
+        .map_err(|_| format!("{what} could not be vetted: its search_path could not be set"))?;
+    Ok(())
+}
+
+fn server_code(e: &pbps_db::DbError) -> String {
+    e.server_error_code()
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn count(n: usize) -> i32 {
@@ -359,15 +852,18 @@ fn shown_column<'a>(spec: &'a Spec, bound: &'a str) -> &'a str {
 fn note(what: &str, why: &str) -> String {
     format!(
         "{what} cannot be bound at plan time (SQLSTATE {why}), so they are judged at apply only: \
-         they use a type or routine this plan creates, or a column it adds"
+         they use a type, routine, table or column this plan creates"
     )
 }
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "the changes that carry no table expression this module judges are every other one; indexes, policies and partition keys are the next slice"
+    reason = "the changes that carry no expression this module judges are every other one"
 )]
 fn describe(change: &Change) -> String {
+    if let Some((name, _)) = domain_code(change) {
+        return format!("the expressions of domain {}", name.shown());
+    }
     match change {
         Change::CreateTable { name, .. } => {
             format!("the expressions of the new table {}", name.shown())
@@ -386,13 +882,27 @@ fn describe(change: &Change) -> String {
         Change::AddCheck { table, name, .. } => {
             format!("the CHECK `{}` of {}", name.shown(), table.shown())
         }
+        Change::AddIndex { table, name, .. } => {
+            format!(
+                "the expressions of index `{}` on {}",
+                name.shown(),
+                table.shown()
+            )
+        }
+        Change::CreatePolicy { table, name, .. } => {
+            format!(
+                "the expressions of row policy `{name}` on {}",
+                table.shown()
+            )
+        }
         _ => "the expressions of a table".to_owned(),
     }
 }
 
 /// The statement that builds the binding table. Nothing in it is evaluated: the
-/// table has no row, and a default, a check and a generated expression run on
-/// one.
+/// table has no row, and a default and a check run on one; a generated
+/// expression and an index are bound as checks so that the engine does not fold
+/// them either ([`Spec::constraints`]).
 fn create_statement(spec: &Spec) -> Result<String, String> {
     let quoted = |name: &str| crate::quote(name).map_err(|e| e.to_string());
     // Each expression closes on its own line: one ending in a `--` comment
@@ -407,19 +917,20 @@ fn create_statement(spec: &Spec) -> Result<String, String> {
     for c in &spec.columns {
         let value = match &c.value {
             Some(Value::Default(e)) => format!(" DEFAULT ({e}\n)"),
-            Some(Value::Generated(e)) => format!(" GENERATED ALWAYS AS ({e}\n) STORED"),
-            None => String::new(),
+            Some(Value::Generated(_)) | None => String::new(),
         };
         parts.push(format!("{} {}{value}", quoted(&c.bound)?, c.ty));
     }
-    for (name, expression) in &spec.checks {
+    for c in spec.constraints() {
         parts.push(format!(
-            "CONSTRAINT {} CHECK ({expression}\n)",
-            quoted(name)?
+            "CONSTRAINT {} CHECK ({}\n)",
+            quoted(&c.name)?,
+            c.expression
         ));
     }
     Ok(format!(
-        "CREATE TEMPORARY TABLE pg_temp.{TEMP} ({})",
+        "CREATE TEMPORARY TABLE {} ({})",
+        spec.relation()?,
         parts.join(", ")
     ))
 }
@@ -500,7 +1011,7 @@ async fn column_type(conn: &mut Conn, column: &pbps_model::ColumnRef) -> Result<
 /// What `change` binds, or why it cannot be built here (a SQLSTATE).
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "the changes that carry no table expression this module judges are every other one; indexes, policies and partition keys are the next slice"
+    reason = "the changes that carry no expression this module judges are every other one"
 )]
 async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> {
     let value = |source: &ValueSource| match source {
@@ -513,8 +1024,10 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
     Ok(Some(match change {
         Change::CreateTable { name, table, .. } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: name.shown().to_string(),
             schema: name.schema.clone(),
+            on_table: false,
             like: None,
             columns: table
                 .columns
@@ -533,6 +1046,8 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 .iter()
                 .map(|(n, c)| (n.raw().to_owned(), c.expression.clone()))
                 .collect(),
+            index: None,
+            policy: None,
         },
         Change::AddColumn {
             table,
@@ -541,8 +1056,10 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             ..
         } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
             schema: table.schema.clone(),
+            on_table: matches!(column.value_source, ValueSource::Generated(_)),
             like: Some(table.clone()),
             columns: vec![Column {
                 bound: name.raw().to_owned(),
@@ -551,6 +1068,8 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 value: value(&column.value_source),
             }],
             checks: Vec::new(),
+            index: None,
+            policy: None,
         },
         Change::AddCheck {
             table,
@@ -558,12 +1077,35 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             constraint,
         } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
             schema: table.schema.clone(),
+            on_table: true,
             like: Some(table.clone()),
             columns: Vec::new(),
             checks: vec![(name.raw().to_owned(), constraint.expression.clone())],
+            index: None,
+            policy: None,
         },
+        Change::AddIndex {
+            table, name, index, ..
+        } => on_table(
+            change,
+            table,
+            Some((name.shown().to_string(), index.clone())),
+            None,
+        ),
+        Change::CreatePolicy {
+            table,
+            name,
+            policy,
+            ..
+        } => on_table(
+            change,
+            table,
+            None,
+            Some((name.clone(), Box::new(policy.clone()))),
+        ),
         Change::AlterColumnDefault { column, to, .. } => {
             let Some(expression) = to else {
                 return Ok(None);
@@ -585,10 +1127,13 @@ async fn existing(
     column: &pbps_model::ColumnRef,
     value: Value,
 ) -> Result<Spec, String> {
+    let on_table = matches!(value, Value::Generated(_));
     Ok(Spec {
         what: describe(change),
+        bound: bound_table(change).unwrap_or_default().to_owned(),
         table: column.table.shown().to_string(),
         schema: column.table.schema.clone(),
+        on_table,
         like: Some(column.table.clone()),
         columns: vec![Column {
             bound: BIND.to_owned(),
@@ -597,5 +1142,31 @@ async fn existing(
             value: Some(value),
         }],
         checks: Vec::new(),
+        index: None,
+        policy: None,
     })
 }
+
+/// An index or a policy of a table that stands: bound on a copy of its columns.
+fn on_table(
+    change: &Change,
+    table: &TableName,
+    index: Option<(String, Box<pbps_model::Index>)>,
+    policy: Option<(String, Box<pbps_model::RowPolicy>)>,
+) -> Spec {
+    Spec {
+        what: describe(change),
+        bound: bound_table(change).unwrap_or_default().to_owned(),
+        table: table.shown().to_string(),
+        schema: table.schema.clone(),
+        on_table: true,
+        like: Some(table.clone()),
+        columns: Vec::new(),
+        checks: Vec::new(),
+        index,
+        policy,
+    }
+}
+
+#[cfg(test)]
+mod view_tests;

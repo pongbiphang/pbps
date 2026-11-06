@@ -1156,8 +1156,13 @@ pub fn a_wrong_policy_is_refused(server: &str, kind: Kind) {
     assert_eq!(f.record(), serde_json::json!("off"));
     let applied = f.apply("revoke,row-security");
     assert_ne!(code(&applied), 0, "{kind:?}: {}", said(&applied));
+    // The policy's expression is bound and judged before the statement runs
+    // (DEC-2563.5); one the engine cannot bind stops there, naming the policy
+    // and the engine's code, and the engine's own text for it if the statement
+    // got that far.
     assert!(
-        said(&applied).contains("no_such_column"),
+        said(&applied).contains("no_such_column")
+            || said(&applied).contains("could not be bound just before they run (SQLSTATE 42703)"),
         "{}",
         said(&applied)
     );

@@ -1231,16 +1231,55 @@ pub(crate) async fn judge_trees(
     let major = server_major(conn)
         .await
         .map_err(|_| refuse("could not be vetted: the server version is unreadable"))?;
-    let denied = runs_sql_oids(conn)
-        .await
-        .map_err(|_| refuse("could not be vetted: the audited list could not be read"))?
-        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
     let mut bounds = Vec::new();
     for (used_by, text) in &trees {
         let bound = bound_objects(text, major)
             .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
         bounds.push((used_by.clone(), bound));
     }
+    judge_bounds(conn, admission, major, bounds, builtin_types_only, refuse).await
+}
+
+/// [`judge_trees`] for the expressions of one stored view rule (#2563,
+/// DEC-2563.8): `uses` names each target entry, in order. A rule with more or
+/// fewer entries than declared, or one that is not a plain `SELECT` over one
+/// relation, is refused, so what is judged is exactly what was declared.
+pub(crate) async fn judge_view(
+    conn: &mut Conn,
+    admission: &Admission,
+    rule: &str,
+    uses: Vec<Use>,
+    refuse: &dyn Fn(&str) -> String,
+) -> Result<Judged, String> {
+    let major = server_major(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the server version is unreadable"))?;
+    let found = crate::resolver::capture::bound_view(rule, major)
+        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
+    if found.len() != uses.len() {
+        return Err(refuse(
+            "are more than the expressions declared: one closes its clause and adds to the \
+             statement, and each may be the one expression and nothing else; nothing has \
+             been changed",
+        ));
+    }
+    let bounds = uses.into_iter().zip(found).collect();
+    judge_bounds(conn, admission, major, bounds, false, refuse).await
+}
+
+/// The judgement itself, over the objects each use binds.
+async fn judge_bounds(
+    conn: &mut Conn,
+    admission: &Admission,
+    major: u32,
+    mut bounds: Vec<(Use, Bound)>,
+    builtin_types_only: bool,
+    refuse: &dyn Fn(&str) -> String,
+) -> Result<Judged, String> {
+    let denied = runs_sql_oids(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the audited list could not be read"))?
+        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
     // A user function whose body is proven built-in-only adds its body's trees
     // under this use (#2563), so everything below judges them as the expression.
     let mut proven = body::Proven::default();

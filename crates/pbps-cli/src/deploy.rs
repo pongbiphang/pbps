@@ -11156,11 +11156,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 if let Some(change) = &stmt.introduces {
                     // Judged by the plan's own admission before the statement
                     // runs, with what the earlier steps created in place.
-                    let admission = pbps_pg::admission::Admission::new(
-                        project.config.trusted_roles.iter().cloned(),
-                        plan.pin_type_routines,
-                    )
-                    .approving(plan.type_routines.iter().map(|r| r.oid));
+                    let admission = crate::pins::applying(project, plan);
                     pbps_pg::table_expressions::vet_change(
                         conn,
                         &admission,
@@ -11179,7 +11175,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     pbps_pg::type_refs::declared::vet(
                         conn,
                         type_statement,
-                        &project.config.trusted_roles,
+                        &crate::pins::applying(project, plan),
                         &plan.declared_type_pins,
                         &plan.changes,
                         &statements[..=i],
@@ -12179,7 +12175,7 @@ async fn run_probes_observed(
                 Ok(pbps_pg::table_expressions::Vetted::Admitted) => {}
                 // Not judged, however it came about: refused, or unbound here.
                 Ok(pbps_pg::table_expressions::Vetted::Unjudged(_)) | Err(_) => {
-                    table_unjudged = true;
+                    table_unjudged |= pbps_pg::table_expressions::probed(&planned.change);
                 }
             }
         }
@@ -12519,7 +12515,7 @@ async fn execute_statement(
         pbps_pg::type_refs::declared::vet(
             conn,
             type_statement,
-            trusted,
+            &admission,
             reviewed.map_or(&[][..], |a| a.plan.declared_type_pins.as_slice()),
             changes,
             &statements[..=position],

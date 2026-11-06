@@ -187,12 +187,18 @@ impl Approved<'_> {
     /// each site refuses any other where it vets, before it evaluates.
     #[must_use]
     pub fn admission(&self) -> Admission {
-        Admission::new(
-            self.project.config.trusted_roles.iter().cloned(),
-            self.plan.pin_type_routines,
-        )
-        .approving(self.plan.type_routines.iter().map(|r| r.oid))
+        applying(self.project, self.plan)
     }
+}
+
+/// Apply's admission for `plan`: the routines it showed and pinned, and no others.
+#[must_use]
+pub fn applying(project: &Project, plan: &pbps_model::SavedPlan) -> Admission {
+    Admission::new(
+        project.config.trusted_roles.iter().cloned(),
+        plan.pin_type_routines,
+    )
+    .approving(plan.type_routines.iter().map(|r| r.oid))
 }
 
 /// The admission rule of a command that is about to plan.
@@ -267,7 +273,7 @@ pub async fn check(
         pbps_pg::type_refs::declared::check(
             conn,
             &plan.declared_type_pins,
-            &project.config.trusted_roles,
+            &applying(project, plan),
             at.within(),
             matches!(
                 at,

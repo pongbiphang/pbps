@@ -1961,6 +1961,43 @@ pub(crate) fn built_concurrently(index: &Index, strategy: Strategy) -> bool {
         && index.columns.iter().all(|c| c.key.column().is_some())
 }
 
+/// `CREATE POLICY`, as the plan runs it and as the expressions of a policy are
+/// bound (DEC-2563.5).
+pub(crate) fn create_policy_sql(
+    table: &TableName,
+    name: &str,
+    policy: &pbps_model::RowPolicy,
+) -> Result<String, DialectError> {
+    let targets = match &policy.to {
+        pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
+        pbps_model::PolicyRoles::Roles(roles) => roles
+            .iter()
+            .map(|r| quote(r.raw()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", "),
+    };
+    let mut sql = format!(
+        "CREATE POLICY {} ON {} AS {} FOR {} TO {}",
+        quote(name)?,
+        qualified(table)?,
+        if policy.restrictive {
+            "RESTRICTIVE"
+        } else {
+            "PERMISSIVE"
+        },
+        policy.command.as_str().to_ascii_uppercase(),
+        targets
+    );
+    if let Some(text) = &policy.using {
+        sql.push_str(&format!(" USING ({})", verbatim(text.raw())));
+    }
+    if let Some(text) = &policy.with_check {
+        sql.push_str(&format!(" WITH CHECK ({})", verbatim(text.raw())));
+    }
+    sql.push(';');
+    Ok(sql)
+}
+
 fn create_index(
     table: &TableName,
     name: &str,
@@ -1970,7 +2007,7 @@ fn create_index(
     create_index_on(table, name, index, strategy, false)
 }
 
-fn create_index_on(
+pub(crate) fn create_index_on(
     table: &TableName,
     name: &str,
     index: &Index,
@@ -4092,36 +4129,7 @@ fn emit_statements(
             name,
             policy,
             ..
-        } => {
-            let targets = match &policy.to {
-                pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
-                pbps_model::PolicyRoles::Roles(roles) => roles
-                    .iter()
-                    .map(|r| quote(r.raw()))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", "),
-            };
-            let mut sql = format!(
-                "CREATE POLICY {} ON {} AS {} FOR {} TO {}",
-                quote(name)?,
-                qualified(table)?,
-                if policy.restrictive {
-                    "RESTRICTIVE"
-                } else {
-                    "PERMISSIVE"
-                },
-                policy.command.as_str().to_ascii_uppercase(),
-                targets
-            );
-            if let Some(text) = &policy.using {
-                sql.push_str(&format!(" USING ({})", verbatim(text.raw())));
-            }
-            if let Some(text) = &policy.with_check {
-                sql.push_str(&format!(" WITH CHECK ({})", verbatim(text.raw())));
-            }
-            sql.push(';');
-            one(pg, table, sql)
-        }
+        } => one(pg, table, create_policy_sql(table, name, policy)?),
         Change::SetRowSecurity {
             table, from, to, ..
         } => {
@@ -5294,6 +5302,15 @@ fn create_domain_sql(
     name: &pbps_model::TypeRef,
     definition: &pbps_model::ManagedType,
 ) -> Result<String, DialectError> {
+    domain_sql(&TableName::new(name.schema(), name.name()), definition)
+}
+
+/// `CREATE DOMAIN` at `address`, which a binding domain gives to the session's
+/// own `pg_temp`, a schema no declared type can name.
+pub(crate) fn domain_sql(
+    address: &TableName,
+    definition: &pbps_model::ManagedType,
+) -> Result<String, DialectError> {
     let pbps_model::ManagedType::Domain {
         base,
         not_null,
@@ -5306,10 +5323,9 @@ fn create_domain_sql(
             "only a domain is created by CREATE DOMAIN".to_owned(),
         ));
     };
-    let address = TableName::new(name.schema(), name.name());
     let mut sql = format!(
         "CREATE DOMAIN {} AS {}",
-        qualified(&address)?,
+        qualified(address)?,
         sql_type(base)?
     );
     if let Some(c) = collation {
@@ -5339,7 +5355,7 @@ fn create_domain_sql(
 
 /// A domain's definition with its base replaced by the replacement of the base
 /// it is built over, while that is rebuilt too (DEC-1635.9).
-fn over_the_replacement(
+pub(crate) fn over_the_replacement(
     definition: &pbps_model::ManagedType,
     over: Option<&pbps_model::TypeRef>,
 ) -> pbps_model::ManagedType {
@@ -7656,6 +7672,37 @@ mod tests {
             "{plain:?}"
         );
         assert!(!plain[0].creates.is_empty() && !plain[0].sql.contains("LOCK"));
+    }
+
+    /// A partition key is columns only: text that reads as an expression is
+    /// one quoted identifier, so there is no key expression for an admission
+    /// predicate to judge (DEC-2563.5).
+    #[test]
+    fn a_partition_key_that_reads_as_an_expression_is_one_quoted_column() {
+        let mut table = pbps_model::Table::default();
+        table
+            .columns
+            .insert("k".into(), pbps_model::Column::new("text".parse().unwrap()));
+        table.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["lower(k)".into()],
+            strategy: pbps_model::PartitionStrategy::Range,
+        });
+        let change = Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: "app.p".parse().unwrap(),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        let sql = Postgres::new()
+            .fixture_emit(&change, Default::default())
+            .expect("emit")
+            .remove(0)
+            .sql;
+        assert!(sql.contains("PARTITION BY RANGE (\"lower(k)\")"), "{sql}");
+        // Nothing in the table holds an expression, so the change carries none.
+        assert!(!crate::table_expressions::carries(&change));
     }
 
     /// A LIST or HASH parent is created with its strategy, and its

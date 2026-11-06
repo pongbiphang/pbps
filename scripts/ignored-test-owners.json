@@ -224,13 +224,22 @@
         "domain_defaults2537::copied_defaults_bootstrap_and_keep_their_creation_values_after_base_edits",
         "domain_defaults2537::explicit_defaults_equal_to_a_copy_are_written_and_can_be_removed",
         "table_expressions2563::a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe",
+        "table_expressions2563::a_check_with_a_sublink_is_not_admitted_by_the_view_that_binds_it",
         "table_expressions2563::a_column_named_like_a_binder_helper_does_not_refuse_an_unrelated_expression_change",
+        "table_expressions2563::a_column_qualified_with_its_table_is_bound_in_every_expression_site",
+        "table_expressions2563::a_filtered_unique_index_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe",
+        "table_expressions2563::a_function_taking_another_composite_type_stays_refused_for_a_whole_row_reference",
         "table_expressions2563::a_reviewed_routine_is_shown_pinned_and_never_evaluated_at_plan",
         "table_expressions2563::a_reviewed_routine_that_is_harmless_applies_after_the_approval",
         "table_expressions2563::a_routine_the_same_plan_creates_is_noted_at_plan_and_judged_at_apply",
         "table_expressions2563::a_routine_without_a_fixed_path_is_refused_with_the_fix_before_its_statement",
         "table_expressions2563::a_trusted_owners_routine_with_a_fixed_path_is_admitted_in_a_table_expression",
-        "table_expressions2563::an_untrusted_owners_routine_is_refused_without_the_review"
+        "table_expressions2563::a_whole_row_reference_is_bound_as_the_table_it_names_in_every_site_postgres_accepts",
+        "table_expressions2563::an_expression_that_closes_its_clause_is_refused_as_more_than_declared",
+        "table_expressions2563::an_index_policy_or_domain_that_cannot_be_bound_is_refused_before_it_runs",
+        "table_expressions2563::an_untrusted_owners_routine_is_refused_without_the_review",
+        "table_expressions2563::binding_an_expression_never_runs_a_constant_call_in_it",
+        "table_expressions2563::every_spelling_of_the_table_binds_as_it_does_on_the_real_table_in_every_site"
       ]
     },
     {
@@ -2063,7 +2072,10 @@
         "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",
         "resolver::capture::nodes::partition1566::actual_partition_bounds_have_closed_layouts_on_both_majors",
         "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges",
-        "input_path::tests::a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs"
+        "input_path::tests::a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs",
+        "table_expressions::view_tests::a_view_over_the_table_is_judged_as_its_check_tree_is_on_both_majors",
+        "table_expressions::view_tests::the_view_binds_for_a_role_with_usage_only_and_refuses_what_it_must_not_admit",
+        "table_expressions::view_tests::a_binding_that_stood_leaves_no_view_so_the_next_one_in_the_transaction_builds"
       ]
     },
     {

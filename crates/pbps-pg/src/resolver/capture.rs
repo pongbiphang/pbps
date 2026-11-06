@@ -28,6 +28,7 @@ mod render;
 
 mod profile;
 mod scope;
+mod view;
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,6 +74,20 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
     let tree = nodes::decode(text, major)
         .map_err(|e| format!("the stored expression is not one this release can read ({e:?})"))?;
     bind(&tree, major, false)
+}
+
+/// The objects each expression of a stored view rule binds, in the order of
+/// its target entries (#2563, DEC-2563.8). The rule must be one plain `SELECT`
+/// of expressions over one relation ([`view::expressions`]); each expression is
+/// then proven as `conbin`'s own would be, so a table expression bound as a
+/// view over the real table is judged by the one predicate.
+pub(crate) fn bound_view(text: &str, major: u32) -> Result<Vec<Bound>, String> {
+    let tree = nodes::decode(text, major)
+        .map_err(|e| format!("the stored view is not one this release can read ({e:?})"))?;
+    view::expressions(&tree)?
+        .into_iter()
+        .map(|expression| bind(expression, major, false))
+        .collect()
 }
 
 /// Why a stored function body is not a tree the input-path proof can read.
@@ -448,6 +463,9 @@ mod session;
 
 #[cfg(test)]
 mod ordering_tests;
+
+#[cfg(test)]
+mod view_tests;
 
 #[cfg(test)]
 mod metadata_tests;
