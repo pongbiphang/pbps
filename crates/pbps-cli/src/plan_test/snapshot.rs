@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context as _;
+use pbps_db::{Conn, Driver};
 use pbps_model::Schema;
+use pbps_mssql::test_scratch::snapshot as sql;
 
 use super::report::{AllocatorComparison, Cell, RowDifference, TableComparison};
 use super::session::{Session, quoted, table};
@@ -41,6 +43,10 @@ pub(super) struct Snapshot {
 /// this database is discarded afterwards. `nextval` is the engine's own answer
 /// for increments, caches and exhaustion; `last_value + 1` is a guess.
 pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Snapshot> {
+    if session.driver() == Driver::Mssql {
+        // Boxed so the larger arm does not grow the frame of the other.
+        return Box::pin(read_mssql(session, schema)).await;
+    }
     let mut conn = session.admin().await?;
     let mut tables = BTreeMap::new();
     for name in schema.tables.keys() {
@@ -132,17 +138,52 @@ pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Resu
             .transpose()?
             .with_context(|| format!("sequence {shown} gave no next value"))?
             .to_owned();
-        // Two sequences owned by one column are told apart by name.
-        let key = used_by
-            .clone()
-            .filter(|owner| !allocators.contains_key(owner))
-            .unwrap_or_else(|| shown.clone());
-        allocators.insert(
-            key,
+        insert(
+            &mut allocators,
             Allocator {
                 name: shown,
                 used_by,
                 next,
+            },
+        );
+    }
+    Ok(Snapshot { tables, allocators })
+}
+
+/// Two allocators owned by one column are told apart by name.
+fn insert(allocators: &mut BTreeMap<String, Allocator>, allocator: Allocator) {
+    let key = allocator
+        .used_by
+        .clone()
+        .filter(|owner| !allocators.contains_key(owner))
+        .unwrap_or_else(|| allocator.name.clone());
+    allocators.insert(key, allocator);
+}
+
+/// The same read on SQL Server, as the apply login (see `pbps_mssql::test_scratch::snapshot`).
+/// Every table's rows come before any allocator probe: a probe runs the table's
+/// triggers, which are user code, and consumes values.
+async fn read_mssql(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Snapshot> {
+    let mut conn = Conn::connect(Driver::Mssql, session.target().connection()).await?;
+    let mut tables = BTreeMap::new();
+    for name in schema.tables.keys() {
+        let read = sql::read_table(&mut conn, &name.schema, &name.name).await?;
+        tables.insert(
+            name.shown().to_string(),
+            Rows {
+                columns: read.columns,
+                rows: read.rows,
+            },
+        );
+    }
+    let mut allocators = BTreeMap::new();
+    for read in sql::read_allocators(&mut conn).await? {
+        insert(
+            &mut allocators,
+            Allocator {
+                name: read.name,
+                used_by: read.used_by,
+                next: read.next,
             },
         );
     }

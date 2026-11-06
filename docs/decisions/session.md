@@ -1018,5 +1018,70 @@ storage, a session the server ended). A SQL Server number is not a SQLSTATE: a
 user `THROW 53300` is the user's own, and a permission error (229) or a write to
 the sealed database (3906) is a finding. The same reading applies to the error
 an assertion itself returns: a coded engine fault there is unanswerable (exit 1),
-not a finding about the SQL, on either engine. `fixtures repin` still refuses SQL
-Server until F3.
+not a finding about the SQL, on either engine. `fixtures repin` followed in F3
+(DEC-1165.16).
+
+<a id="dec-1165-16"></a>
+
+**DEC-1165.16. A SQL Server re-pin reads typed rows and really-taken allocator values, as the apply login.**
+`fixtures repin` runs on SQL Server through the same two fresh scratches, replay
+and comparison as PostgreSQL; only the read of a comparison database is the
+engine's. Rows come back as one text cell per column, chosen by the column's
+base type (a float to 17 digits, a money value to 4 decimals, dates in a fixed
+style, binary and spatial values as hex), and are counted in Rust, not by a
+server `GROUP BY`: the default collation folds case and trailing spaces, and the
+comparison must not. `NULL` stays apart from the empty string and columns are
+compared sorted by name. A table that cannot be compared makes the re-pin
+unanswerable and names the table and column: a `rowversion`, a system-versioned
+period or ledger column differs between any two databases by construction, and a
+`sql_variant` or an unknown type has no faithful text. It is never skipped
+silently (ADR-0019 §5), so a table with a temporal or rowversion column cannot be
+re-pinned until that is declared another way.
+
+A table with an enabled row-level security FILTER predicate is refused too, before
+its rows are read. Measured: SQL Server has no owner bypass, so the apply login
+(`dbo`) and even `sa` read only the rows the predicate lets through (1 of 3 in
+the measurement), two databases differing only in hidden rows would read as equal,
+and a wrong pin would be written. The policy catalog counts as evidence only when
+fully visible (database `VIEW DEFINITION` and no effective metadata DENY, the test
+`drop_requirements` uses); an unreadable catalog is not an empty one. A disabled
+policy and a BLOCK-only policy hide nothing and still read. PostgreSQL has no such
+gap in this path: its re-pin reads as the scratch superuser, which bypasses row
+security even under `FORCE ROW LEVEL SECURITY` (3 of 3 rows, measured, against 1
+for a non-bypassing owner). Found by ready review round 1 on the head the first
+full gate covered.
+
+The next value of an identity column is the one the engine hands out. Measured:
+`IDENT_CURRENT` alone is ambiguous (after `DBCC CHECKIDENT … RESEED, 50` a column
+that never generated a value hands out 50, one that had hands out 51) and
+`last_value` is `NULL` after `TRUNCATE`; a failed `INSERT` still consumes a value
+(NOT NULL and UNIQUE violations both). So the probe is `INSERT … DEFAULT VALUES`
+in `TRY/CATCH` inside `BEGIN TRANSACTION … ROLLBACK`; the identity survives the
+rollback and the row and a trigger's writes do not, and the pair (`IDENT_CURRENT`,
+`last_value`) must have moved, and by exactly what one allocation takes from the
+state just before (the current value of a column that never generated one, else
+the last plus the increment), or the allocator is unestablishable and named: an
+exhausted column, a failure before a value is taken, an `INSTEAD OF` trigger that
+swallows the insert, a trigger that inserts into the same table.
+A probe can also move other allocators (a trigger inserting into another table,
+possibly only while that table is in some state; a default taking a value of a
+sequence), and identity values survive the rollback. So no allocator is reported
+from a probe: every identity column's next value is taken from its state before
+any probe, and the probe only has to agree with the state it started from
+(draft review rounds 1 and 2 of #2690 each found a way a probe could otherwise let
+two different allocator states compare equal). A column a trigger moved earlier
+is not probed again (a probe of a column whose last value another table's trigger
+took would exhaust it and refuse an equivalent re-pin): the move is checked
+against its state read first (onward, in whole increments), and the shifted value
+never reaches the report. Disabling the table's triggers during the probe was
+tried and rejected: the DDL discards the table's cached identity range and
+the next value jumps (measured: 1002 for a next value of 3). A sequence is read
+with `NEXT VALUE FOR`, before any identity probe, and compared under the one
+column whose default names it, else by its own name. Every table's rows are read
+before any probe.
+
+Both reads run on the apply login, the owner of the objects, not on the
+administrator: a table can carry a computed column or a trigger, which is user
+code. PostgreSQL's re-pin keeps reading as the administrator. No report or
+manifest field is added and no format version changes. The cause of a failed
+scratch start is no longer lost in the lifecycle test (#2683).

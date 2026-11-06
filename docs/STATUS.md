@@ -240,8 +240,7 @@ committed candidate through the ordinary deployment services in owned scratch,
 on PostgreSQL and on SQL Server. It reports typed evidence without an applyable
 plan file; `test --cleanup` reconciles owned dead runs. `test fixtures repin`
 moves one fixture pin only after the edited SQL provably leaves the same rows
-and next allocator values (DEC-1165.12, DEC-1165.13); it is PostgreSQL only
-until the SQL Server re-pin lands (#1165 F3). A SQL Server run seals its
+and next allocator values (DEC-1165.12, DEC-1165.13, DEC-1165.16), on both engines. A SQL Server run seals its
 database READ_ONLY before any assertion (DEC-1165.15; ADR-0019).
 
 ## Live tests

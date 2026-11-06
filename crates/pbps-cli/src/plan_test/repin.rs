@@ -377,15 +377,6 @@ pub(crate) fn command(
         }
     };
     data.input = Some(plan.inputs.identity.clone());
-    if plan.inputs.identity.dialect != pbps_config::DialectName::Postgres {
-        data.failure(
-            0,
-            "test.input",
-            "pbps test currently supports PostgreSQL; SQL Server follows in #1165".into(),
-            false,
-        );
-        return publish(data.finish(), json);
-    }
     data.phases[0].outcome = Status::Passed;
     match crate::db::runtime() {
         Ok(runtime) => runtime.block_on(execute(&plan, &mut data)),
@@ -435,7 +426,7 @@ async fn side(
         timeouts,
     };
     let provision = data.phases.len();
-    let mut p = Phase::on(driver, "provision", "owned PostgreSQL scratch");
+    let mut p = Phase::on(driver, "provision", super::runner::scratch_label(driver));
     p.side = Some(label.to_owned());
     data.phases.push(p);
     let first = data.phases.len();
@@ -540,7 +531,8 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     let Some(dir) = reconcile(data, ms(timeouts.cleanup_ms)).await else {
         return;
     };
-    let mut control = Control::new(timeouts, tokio::signal::ctrl_c());
+    let mut control = Control::new(timeouts, tokio::signal::ctrl_c())
+        .with_driver(crate::db::driver_for(plan.inputs.identity.dialect));
     let mut snapshots = Vec::new();
     // Stop at the first side that does not complete; the other is listed as skipped.
     for label in ["original", "proposed"] {

@@ -4070,9 +4070,8 @@ the third system copies and edits it (14.3).
 candidate declaration change using SQL fixtures and assertions in a scratch
 **it created**. The accepted contract is
 [ADR-0019](ADR-0019-plan-tests.md); implementation is #1165 (PostgreSQL first,
-then SQL Server, both required). The run and `test --cleanup` are implemented
-for both engines; `test fixtures repin` for PostgreSQL only, until the SQL Server
-re-pin lands. It accepts no `--db`, `--env`, supplied server
+then SQL Server, both required). The run, `test --cleanup` and `test fixtures repin`
+are implemented for both engines. It accepts no `--db`, `--env`, supplied server
 or production plan, and writes **no applyable plan file**. The result reports
 the exact executed test-plan checksum, not a promise that a future production
 plan will have identical bytes. §9.3's preview/rehearsal remains separate.
@@ -4108,7 +4107,17 @@ Require complete managed-row multiset equality **and** equal next values for
 every managed-table sequence (owned or default) and identity allocator. Refuse
 and name any difference or allocator whose next value cannot be established,
 including unreadable/non-standard allocation. Equal rows alone can hide a
-sequence already advanced by an inserted-then-deleted row. Confirm comparison,
+sequence already advanced by an inserted-then-deleted row. On SQL Server the
+rows are read as typed text and counted byte for byte (the default collation
+folds case and trailing spaces), and the next value of an identity column is
+the one the engine hands out when a probe insert, rolled back, takes it, never
+`IDENT_CURRENT + 1`, which cannot tell a column reseeded before it generated a
+value from one that had. A table with a column no two databases agree on (a
+`rowversion`, a system-versioned period or a ledger column) or of a type that
+cannot be compared makes the re-pin unanswerable and names the column; so does a
+table with an enabled row-level security FILTER predicate, because SQL Server has
+no owner bypass and rows the predicate hides from the apply login would compare
+as equal, and a policy catalog that cannot be seen completely. Confirm comparison,
 cleanup and unchanged input hashes before replacing the manifest; the ADR
 specifies old-input provenance and comparisons across other fixture groups.
 

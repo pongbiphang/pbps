@@ -11,6 +11,8 @@ use pbps_db::query::AssertionResult;
 use pbps_model::{IdsFile, Intent, TableName};
 use std::time::Duration;
 
+mod snapshot_tests;
+
 struct Fixture(crate::adopt::Stage);
 impl Fixture {
     fn new() -> anyhow::Result<Self> {
@@ -433,7 +435,31 @@ async fn exercise(scratch: &TestScratch<'_>, session: &Session<'_>) -> anyhow::R
     Ok(())
 }
 
-async fn lifecycle(image: &str, sealed: bool) -> anyhow::Result<()> {
+/// What the phases recorded. A start that fails records its cause as a finding
+/// and returns nothing, so a test that reports only "did not start" hides the
+/// one thing that tells a crash from a clash from a missing image (#2683).
+fn recorded(data: &TestData) -> String {
+    let all: Vec<String> = data
+        .phases
+        .iter()
+        .flat_map(|phase| phase.findings.iter())
+        .map(|finding| format!("{}: {}", finding.id, finding.message))
+        .collect();
+    if all.is_empty() {
+        "no finding was recorded".to_owned()
+    } else {
+        all.join("; ")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Case {
+    Identities,
+    Sealed,
+    Snapshot,
+}
+
+async fn lifecycle(image: &str, case: Case) -> anyhow::Result<()> {
     let dir = crate::adopt::Stage::new("m1165-registry")?;
     let registry = crate::test_scratch::StateDir::open(dir.path().join("runs"))?;
     let timeouts = pbps_config::test_manifest::Timeouts {
@@ -449,10 +475,11 @@ async fn lifecycle(image: &str, sealed: bool) -> anyhow::Result<()> {
     data.phases.push(Phase::new("input", "none"));
     data.phases
         .push(Phase::new("provision", "owned SQL Server scratch"));
-    let scratch =
+    let started =
         crate::deploy::test_run::boxed_future(|| control.start(&registry, image, &mut data, 1))
-            .await
-            .context("the SQL Server scratch did not start")?;
+            .await;
+    let scratch = started
+        .with_context(|| format!("the SQL Server scratch did not start: {}", recorded(&data)))?;
     ensure!(scratch.driver() == Driver::Mssql);
     let run = scratch.run_id().to_owned();
     let outcome = async {
@@ -470,10 +497,10 @@ async fn lifecycle(image: &str, sealed: bool) -> anyhow::Result<()> {
         tokio::time::timeout(
             Duration::from_secs(300),
             crate::deploy::test_run::boxed_future(|| async {
-                if sealed {
-                    exercise_sealed(&session).await
-                } else {
-                    exercise(&scratch, &session).await
+                match case {
+                    Case::Identities => exercise(&scratch, &session).await,
+                    Case::Sealed => exercise_sealed(&session).await,
+                    Case::Snapshot => snapshot_tests::exercise_snapshot(&session).await,
                 }
             }),
         )
@@ -493,14 +520,40 @@ async fn lifecycle(image: &str, sealed: bool) -> anyhow::Result<()> {
 async fn m1165_mssql_session_owns_least_privilege_identities_and_executes_only_accepted_sealed_plans()
  {
     let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
-    Box::pin(lifecycle(&image, false)).await.unwrap();
+    Box::pin(lifecycle(&image, Case::Identities)).await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "needs docker and the pinned SQL Server scratch image"]
 async fn m1165_mssql_sealed_database_bounds_every_assertion_and_refuses_a_held_session() {
     let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
-    Box::pin(lifecycle(&image, true)).await.unwrap();
+    Box::pin(lifecycle(&image, Case::Sealed)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and the pinned SQL Server scratch image"]
+async fn m1165_mssql_snapshot_reads_typed_rows_and_the_engines_own_next_values_as_the_apply_login()
+{
+    let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
+    Box::pin(lifecycle(&image, Case::Snapshot)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn m1165_mssql_a_scratch_that_cannot_start_reports_its_recorded_cause() {
+    // A PostgreSQL image under a SQL Server run cannot serve it, so the start
+    // fails and records why; the error must carry that, not a fixed string.
+    let error = lifecycle(
+        "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+        Case::Identities,
+    )
+    .await
+    .expect_err("an image of the other engine started");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("did not start") && text.contains("test.infrastructure"),
+        "{text}"
+    );
 }
 
 fn kind(result: &AssertionResult) -> &'static str {
