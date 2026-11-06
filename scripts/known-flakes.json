@@ -79,19 +79,6 @@
       ],
       "issue": 2652,
       "expires": "2026-12-02"
-    },
-    {
-      "test": "two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide",
-      "cargo": [
-        "test",
-        "-p",
-        "pbps-cli",
-        "--test",
-        "flow_pg",
-        "--"
-      ],
-      "issue": 2715,
-      "expires": "2026-12-06"
     }
   ]
 }

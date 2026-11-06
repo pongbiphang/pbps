@@ -6284,3 +6284,85 @@ the new label is not added to the versioned run record's labels mapping.
 A residual-window container whose record was already deleted and which no
 resolver swept before a reboot is kept as unprovable after it and needs manual
 `docker rm`.
+
+<a id="dec-2715-1"></a>
+
+**DEC-2715.1. The owned PostgreSQL capture re-reads, inside a time bound, when
+the catalog changed under it; the apply's bracket never does.** The owned
+capture is a read-only snapshot, a render, a commit and a fresh witness read
+(`read::owned`, DEC-612.1, DEC-882.1). The witness covers every row of
+`pg_roles` (its full public value) and the same complete role, membership and
+setting sets the capture seals (`scope.rs`, "complete snapshot sets"), so any
+session's role DDL on the server inside the 1 to 2.6 s window between the first
+read and the closing witness read is `Failure::Changed`, mapped to a read
+failure. Another plan's rehearsal does exactly that (`two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide`
+failed under the gate, #2715). `owned` is now a loop over `owned_once` (the
+former body): a `Changed` attempt is followed by another after 200 ms, at most
+five attempts and about ten seconds, and the accepted read is, as before, one
+whose render snapshot equals its fresh witness, so what is sealed is a state
+the catalog was in at the close. A change that persists is read consistently
+by the next attempt and sealed; the apply's recheck (DEC-616.1) still compares
+the target with that seal, so a role changed after the accepted read still
+refuses the apply. A catalog that never settles ends as
+`CaptureError::Unsettled`, "the catalog kept changing across 5 reads over 10 s;
+another session is changing roles or objects on this server; retry when it is
+quiet", a read failure like `Changed` (`catalog_read_failed`), not an answer
+(SPEC 9.8). `qualify` runs once per attempt, so it is `FnMut`.
+
+**Only `Changed` is retried.** `EnvironmentChanged` (the session's own
+settings moved), `Incomplete`, `Read` and the `held` subset check are not a
+concurrent change of this server's catalog and return at once. The capture in
+the caller's transaction (`in_callers_transaction`, the apply's bracket) is
+never retried: a change there is the apply-time change DEC-616.1 and SPEC 7.6
+exist to refuse, and a savepoint cannot take a new snapshot. Nothing in
+`pbps-mssql` changes: its `Changed` is a single-capture contradiction, not a
+cluster-wide witness.
+
+**Why the bound is time and not a count.** Measured on PG 18.6 with the
+test's own role DDL (server `log_statement=ddl`): a plan issues two bursts, the
+first of about 60 ms and 8 statements starting 0.6 to 0.9 s before its first
+capture window, then 2.5 to 3.0 s of quiet, then two `CREATE ROLE` 150 to
+310 ms apart after both of its captures have closed; a plan that lags by about
+a second puts a burst inside the other's window. One attempt takes 1 to 2.5 s
+(the render is about 90% of it), so a pause budget of 400 ms across three
+attempts is shorter than one window.
+
+| condition (the test, 5 to 10 runs each) | pass | `Changed` |
+|---|---|---|
+| no retry, realistic churn | 2 of 5 | 2 |
+| no retry, tight `CREATE ROLE x; DROP ROLE x` loop | 0 of 5 | 4 |
+| 3 attempts, 100/300 ms, realistic | 9 of 10 | 1 |
+| 3 attempts, tight | 1 of 10 | 9 |
+| 5 s deadline, realistic | 10 of 10 | 0 |
+| 5 s deadline, tight | 4 of 10 | 4 |
+
+Idle, the two plans run in lockstep and 15 of 15 runs pass. Realistic churn is
+finite (two bursts of at most 0.3 s, 2.5 s or more apart), so a time bound
+longer than the longest quiet gap absorbs it; the tight loop is not a shape a
+real server has and keeps refusing, now with a message that says why.
+
+**Why not narrow the witness to the roles the capture names.** The capture does
+not read "the roles its rows name": `scope::prepare` seals every row of
+`pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_parameter_acl` and
+`pg_database` as inputs (`scope.rs`, lines 236 to 247), and the apply's recheck
+compares that complete set (DEC-616.1). A witness narrower than the sealed set
+would let a sealed role change between the render and the witness with no
+refusal, removing the DEC-612.1 and DEC-882.1 closing check for those rows;
+narrowing the sealed set too is a new rule version (`postgres-catalog-inputs`
+v3 to v4) and an evidence-version bump, and it would change what the apply
+refuses (an unrelated role change would stop refusing), which is a SPEC 7.6
+decision and not a capture detail. The nine role-freshness cases of
+`role_tests.rs` assert refusal for roles nothing selected, on purpose. No demand
+exists for it, so it is not opened.
+
+Pinned by the unit test `only_a_changed_read_earns_another_attempt_and_only_inside_both_bounds`
+and, on 16 and 18, by `a_catalog_that_settles_is_sealed_settled_and_one_that_never_does_is_refused_by_name`
+(churn on the first attempt only settles and the settled state is read; a
+depended-on role changed on the first attempt is read with its new value while a
+recheck against the older seal still differs; churn on every attempt is
+`Unsettled` after exactly five attempts naming the bound; `Incomplete`, `Read`
+and `Version` return after one attempt; the apply's bracket refuses a change
+after one attempt). The nine single-attempt freshness cases call `owned_once`.
+
+Formats: none. No sealed bytes, plan, state, schema set or evidence change; the
+rule stays `postgres-catalog-inputs-v3`.

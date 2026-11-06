@@ -796,6 +796,7 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
         | CaptureError::Engine { .. }
         | CaptureError::Incomplete
         | CaptureError::Changed
+        | CaptureError::Unsettled { .. }
         | CaptureError::EnvironmentChanged
         | CaptureError::Close => Error::Read(error.to_string()),
     }
@@ -877,6 +878,10 @@ mod tests {
             },
             CaptureError::Incomplete,
             CaptureError::Changed,
+            CaptureError::Unsettled {
+                attempts: 5,
+                seconds: 10,
+            },
             CaptureError::EnvironmentChanged,
             CaptureError::Close,
         ] {

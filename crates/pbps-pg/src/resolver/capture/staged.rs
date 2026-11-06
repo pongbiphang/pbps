@@ -261,7 +261,7 @@ pub async fn compare(
 /// One owned snapshot of `retained`, as `choose` picks it from the catalog.
 async fn read(
     conn: &mut impl QueryConnection,
-    choose: impl FnOnce(&Catalog) -> BTreeSet<ObjectIdentity>,
+    mut choose: impl FnMut(&Catalog) -> BTreeSet<ObjectIdentity>,
 ) -> Result<CapturedInputs, CaptureError> {
     let mut prepared = None;
     let mut chosen = None;
