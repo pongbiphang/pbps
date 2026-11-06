@@ -35,6 +35,19 @@ FAKE_CARGO = '''#!{python}
 import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
+if "--workspace" in args:
+    assert args == ["test", "--workspace", "--all-targets", "--no-fail-fast"], args
+    assert os.environ["INSTA_UPDATE"] == "no" and os.environ["INSTA_FORCE_PASS"] == "0"
+    if os.environ.get("FAKE_TRACE"):
+        with open(os.environ["FAKE_TRACE"], "a") as log:
+            log.write(json.dumps({{"event": "whole", "args": args,
+                "run": os.environ.get("PBPS_LIVE_RUN", "proof"), "names": ["stable", "recovery"]}}) + "\\n")
+    if os.environ.get("FAKE_CARGO_KILL"):
+        os.kill(os.getppid(), signal.SIGKILL)
+        sys.exit(137)
+    failed = os.environ.get("FAKE_CARGO_FAIL") == "1"
+    print("test stable ... ok\\ntest recovery ... " + ("FAILED" if failed else "ok"), flush=True)
+    sys.exit(101 if failed else 0)
 names = json.loads(os.environ["FAKE_A"]) if "--lib" in args else json.loads(os.environ["FAKE_B"])
 if "--test" in args and args[args.index("--test") + 1] == "tls":
     names = [args[args.index("--exact") + 1]]
@@ -708,6 +721,152 @@ class IndependentFailures(Harness):
                 result, _ = self.drive("--resume", str(after), suite="python", check=int(fails))
                 if fails:
                     self.assertIn("targeted rerun failed", result.stderr)
+
+
+class WholeCargoChecks(Harness):
+    """The #2680 failure is one whole-step obligation (DEC-2698.1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        (cls.repo / "src").mkdir()
+        (cls.repo / "fixtures").mkdir()
+        (cls.repo / "src/cases.rs").write_text("fn recovery() {}\n")
+        (cls.repo / "fixtures/data.sql").write_text("SELECT 1;\n")
+        (cls.repo / ".github/workflows").mkdir(parents=True)
+        (cls.repo / ".github/workflows/ci.yml").write_text(
+            "jobs:\n  quick:\n    steps:\n      - run: cargo test --workspace --all-targets\n")
+        git(cls.repo, "add", "-A")
+        git(cls.repo, "commit", "-q", "-m", "whole Cargo check and recovery source")
+        cls.master = git(cls.repo, "rev-parse", "HEAD")
+        git(cls.repo, "update-ref", "refs/remotes/origin/master", cls.master)
+        cls.master_copy = cls.repo.parent / "master"
+        git(cls.repo, "worktree", "add", "--detach", str(cls.master_copy), cls.master)
+
+    setUp = IndependentFailures.setUp
+
+    def cargo_run(self, *options, failing=False, interrupted=False, **kwargs):
+        return self.drive("--suite", "cargo", *options, suite="pg", shards=1,
+            env={"FAKE_CARGO_FAIL": str(int(failing)), **({"FAKE_CARGO_KILL": "1"} if interrupted else {}),
+                 **kwargs.pop("env", {})}, **kwargs)
+
+    def evidence(self, output):
+        selector = self.shards.RERUN.cargo_check(self.repo)
+        name = self.shards.RERUN.CARGO_CHECK
+        proofs = {}
+        for label, worktree in (("master", self.master_copy), ("head", self.repo)):
+            path = self.runs / f"cargo-proof-{label}-{self.counter}.json"
+            result = subprocess.run([sys.executable, str(self.repo / "scripts/live-shards.py"),
+                "proof", "--cargo-check", "--worktree", str(worktree), "--output", str(path)],
+                env=dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}"),
+                text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            proof = json.loads(path.read_text())
+            self.assertEqual(proof["cargo"], selector)
+            self.assertEqual(proof["inputs"], json.loads((output / "manifest.json").read_text())["inputs"])
+            proofs[label] = str(path)
+        path = self.runs / f"cargo-evidence-{self.counter}.json"
+        path.write_text(json.dumps({"version": 1, "pr": "https://github.com/o/r/pull/1#issuecomment-1",
+            "names": [{"cargo": selector, "test": name, "source": "src/cases.rs",
+                "paths": ["src/cases.rs", "fixtures/data.sql"],
+                "scope_review": "All failures are the recovery module and its only fixture; the PR edits notes only.",
+                "issue": 2697, "master_pass": proofs["master"], "head_pass": proofs["head"]}]}))
+        return path
+
+    def attempted(self, *, failing=False, interrupted=False):
+        _, before = self.cargo_run(failing=True, check=1)
+        evidence = self.evidence(before)
+        result, after = self.cargo_run("--resume", str(before), "--rerun-unregistered", str(evidence),
+            failing=failing, interrupted=interrupted, check=int(failing or interrupted))
+        return before, evidence, after
+
+    def test_an_independent_unit_failure_reruns_the_whole_step_and_carries_live_receipts(self):
+        before, _, after = self.attempted()
+        summary = self.summary(after)
+        self.assertEqual((summary["cargo"]["passed"], summary["cargo"]["union"]), (1, "exact"))
+        self.assertEqual((summary["pg"]["passed"], summary["pg"]["carried"], summary["pg"]["union"]),
+                         (18, 18, "exact"))
+        events = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(len(events), 1, "no live or successful test subset may run independently")
+        self.assertEqual(events[0]["names"], ["stable", "recovery"])
+        self.assertEqual(events[0]["args"], ["test", "--workspace", "--all-targets", "--no-fail-fast"])
+        self.assertEqual(len(summary["run"]["targeted"]), 1)
+        _, carried = self.cargo_run("--resume", str(after), check=0)
+        self.assertEqual(self.summary(carried)["cargo"]["carried"], 1)
+        self.assertEqual(self.summary(carried)["pg"]["carried"], 18)
+        self.assertFalse(self.trace.exists())
+        self.assertNotEqual(str(before), str(after))
+
+    def test_a_second_whole_step_attempt_from_the_original_output_is_refused(self):
+        before, evidence, _ = self.attempted()
+        result, refused = self.cargo_run("--resume", str(before), "--rerun-unregistered", str(evidence), check=1)
+        self.assertIn("already attempted", result.stderr)
+        self.assertFalse(refused.exists())
+        self.assertFalse(self.trace.exists())
+
+    def test_touched_recovery_scope_refuses_the_whole_step_attempt(self):
+        (self.repo / "src/cases.rs").write_text("fn recovery() { /* PR changed it */ }\n")
+        git(self.repo, "commit", "-q", "-am", "touch failing scope")
+        _, before = self.cargo_run(failing=True, check=1)
+        evidence = self.evidence(before)
+        result, refused = self.cargo_run("--resume", str(before), "--rerun-unregistered", str(evidence), check=1)
+        self.assertIn("diff touches", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_a_whole_step_resume_refuses_a_changed_tree(self):
+        _, before = self.cargo_run(check=0)
+        (self.repo / "notes.md").write_text("new PR tree\n")
+        git(self.repo, "commit", "-q", "-am", "changed tree")
+        result, refused = self.cargo_run("--resume", str(before), check=1)
+        self.assertIn("previous tree", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_a_whole_step_resume_refuses_changed_inputs(self):
+        _, before = self.cargo_run(check=0)
+        for change in ({"PBPS_TEST_INPUT": "changed"}, {"TMPDIR": str(self.repo.parent)}):
+            with self.subTest(change=change):
+                result, refused = self.cargo_run("--resume", str(before), env=change, check=1)
+                self.assertIn("previous inputs", result.stderr)
+                self.assertFalse(refused.exists())
+
+    def test_a_failed_whole_step_attempt_requires_a_fix_and_new_full_gate(self):
+        before, _, after = self.attempted(failing=True)
+        result, refused = self.cargo_run("--resume", str(after), check=1)
+        self.assertIn("targeted rerun failed", result.stderr)
+        self.assertFalse(refused.exists())
+        self.assertEqual(self.summary(after)["cargo"]["failed"], 1)
+
+    def test_an_interrupted_whole_step_attempt_cannot_resume_an_older_output(self):
+        before, evidence, after = self.attempted(interrupted=True)
+        result, refused = self.cargo_run("--resume", str(before), "--rerun-unregistered", str(evidence), check=1)
+        self.assertIn("already attempted", result.stderr)
+        self.assertFalse(refused.exists())
+        self.assertFalse(self.trace.exists())
+        result, refused = self.cargo_run("--resume", str(after), check=1)
+        self.assertIn("targeted rerun has no passing receipt", result.stderr)
+
+    def test_registration_after_a_failed_whole_step_attempt_cannot_bypass_the_ledger(self):
+        before, _, _ = self.attempted(failing=True)
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.set_register([{"cargo": self.shards.RERUN.cargo_check(self.repo),
+            "test": self.shards.RERUN.CARGO_CHECK, "issue": 2697, "expires": Resume.soon(self)}])
+        registered = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "reset", "--hard", head)
+        git(self.repo, "update-ref", "refs/remotes/origin/master", registered)
+        try:
+            result, refused = self.cargo_run("--resume", str(before), "--flakes-ref", "origin/master", check=1)
+            self.assertIn("already attempted", result.stderr)
+            self.assertFalse(refused.exists())
+            self.assertFalse(self.trace.exists())
+        finally:
+            git(self.repo, "update-ref", "refs/remotes/origin/master", self.master)
+
+    def test_a_cargo_proof_cannot_select_only_one_unit_test(self):
+        result = subprocess.run([sys.executable, "scripts/live-shards.py", "proof", "--cargo-check",
+            "--name", "recovery", "--output", str(self.runs / f"invalid-{self.counter}.json")],
+            cwd=self.repo, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("whole CI quick check", result.stderr)
 
 
 class PlainRun(Harness):
@@ -1662,7 +1821,7 @@ class Identity(unittest.TestCase):
         for name in ("PBPS_TEST_DEV_IMAGE", "PBPS_TEST_PG_SCRATCH_IMAGE", "RUSTFLAGS", "INSTA_UPDATE",
                      "CARGO_PROFILE_DEV_DEBUG", "PBPS_SOMETHING_NEW", "EVENT", "BASE_SHA",
                      "ProgramFiles", "PROGRAMFILES", "CARGO_BUILD_RUSTFLAGS", "RUSTC_WRAPPER", "NODE_OPTIONS",
-                     "GIT_CONFIG_NOSYSTEM", "LC_ALL", "TZ"):
+                     "GIT_CONFIG_NOSYSTEM", "LC_ALL", "TZ", "TMPDIR", "TMP", "TEMP"):
             with self.subTest(name):
                 self.assertNotEqual(self.digest(**{name: "x"}), reference)
 
@@ -1682,7 +1841,7 @@ class Identity(unittest.TestCase):
     def test_the_inputs_digest_ignores_scheduling_and_fixture_identity(self):
         reference = self.digest()
         for name in ("PBPS_LIVE_PREFIX", "PBPS_LIVE_WEIGHTS", "PBPS_LIVE_SHARD", "PBPS_TEST_PG_NAME",
-                     "PBPS_TEST_PG_PORT", "PBPS_TEST_MSSQL_SCRATCH_NAME", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR", "TMPDIR"):
+                     "PBPS_TEST_PG_PORT", "PBPS_TEST_MSSQL_SCRATCH_NAME", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR"):
             with self.subTest(name):
                 self.assertEqual(self.digest(**{name: "x"}), reference)
 

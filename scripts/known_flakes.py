@@ -2,7 +2,8 @@
 """The register of known flaky live tests (DEC-2553.2).
 
 `scripts/known-flakes.json` names each flake by its exact libtest name and the
-cargo invocation prefix that runs it, or a whole Python check (DEC-2651.1),
+cargo invocation prefix that runs it, or a whole Python/Cargo check
+(DEC-2651.1, DEC-2698.1),
 the open issue that records it and an expiry. `scripts/live-shards.py --resume` may complete a gate that failed only
 on registered, unexpired entries (DEC-2553.1); the register never skips or
 selects a test.
@@ -29,6 +30,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+
+import gate_rerun
 
 
 REGISTER = "scripts/known-flakes.json"
@@ -78,8 +81,9 @@ def load(text):
         require(isinstance(cargo, list) and all(isinstance(a, str) and a for a in cargo)
                 and (cargo[:1] == ["test"] and cargo[-1:] == ["--"]
                      or cargo == ["python", entry["test"]] and re.fullmatch(
-                         r"scripts/[A-Za-z0-9_-]+\.py", entry["test"])),
-                f"{label}: cargo must be the invocation prefix from `test` to `--`, or a whole Python check")
+                         r"scripts/[A-Za-z0-9_-]+\.py", entry["test"])
+                     or cargo[:1] == ["cargo-check"] and entry["test"] == gate_rerun.CARGO_CHECK),
+                f"{label}: cargo must be the invocation prefix from `test` to `--`, or a whole Python/Cargo check")
         require(isinstance(entry["expires"], str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", entry["expires"]),
                 f"{label}: expires must be YYYY-MM-DD")
         try:
@@ -97,7 +101,7 @@ def active(entries, today):
     return {(tuple(e["cargo"]), e["test"]): e for e in entries if expiry(e) >= today}
 
 
-def check(entries, today, targets, strict, *, python_checks=None):
+def check(entries, today, targets, strict, *, python_checks=None, cargo_check=None):
     """Raise RegisterError unless every entry is valid against the compiled inventory."""
     import ignored_test_inventory as inventory  # the resume path needs only load and active
     for entry in entries:
@@ -106,9 +110,13 @@ def check(entries, today, targets, strict, *, python_checks=None):
                 f"{label} expires {entry['expires']}, more than {MAX_DAYS} days out")
         require(not strict or expiry(entry) >= today,
                 f"{label} expired {entry['expires']}: remove it or renew it with a new date")
+        if entry["cargo"][:1] == ["cargo-check"]:
+            require(entry["cargo"] == (cargo_check if cargo_check is not None else
+                    gate_rerun.cargo_check(Path(__file__).resolve().parents[1])),
+                    f"{label}: no longer exists as the whole CI quick Cargo check")
+            continue
         if entry["cargo"][:1] == ["python"]:
             if python_checks is None:
-                import gate_rerun
                 python_checks = gate_rerun.python_checks(Path(__file__).resolve().parents[1])
             require(entry["test"] in python_checks, f"{label}: no longer exists in CI's Python gate")
             continue
