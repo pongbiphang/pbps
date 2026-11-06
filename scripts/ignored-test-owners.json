@@ -208,6 +208,17 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "catalog_warnings1739::catalog_permission_warnings_follow_the_managed_scope_and_its_refusals",
+        "catalog_warnings1739::catalog_warnings_follow_plan_and_verify_reports_in_both_formats",
+        "catalog_warnings1739::catalog_warnings_survive_a_row_read_failure_and_disappear_when_not_observed"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
         "domain_defaults2537::copied_defaults_bootstrap_and_keep_their_creation_values_after_base_edits",
         "domain_defaults2537::explicit_defaults_equal_to_a_copy_are_written_and_can_be_removed"
       ]
