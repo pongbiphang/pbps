@@ -596,7 +596,7 @@ fn a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe() {
             &connection,
             "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                SET search_path = pg_catalog AS $$ BEGIN \
-               IF pg_catalog.current_query() LIKE '%pbps_table_expressions%' THEN \
+               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' THEN \
                  RAISE EXCEPTION 'the binding table is refused'; END IF; END $$; \
              CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
                WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.refuse_binding()",
@@ -659,7 +659,7 @@ fn an_index_policy_or_domain_that_cannot_be_bound_is_refused_before_it_runs() {
                 &connection,
                 "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                    SET search_path = pg_catalog AS $$ BEGIN \
-                   IF pg_catalog.current_query() LIKE '%pbps_table_expressions%' \
+                   IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' \
                       OR pg_catalog.current_query() LIKE '%pbps_domain_expressions%' THEN \
                      RAISE EXCEPTION 'the binding object is refused'; END IF; END $$; \
                  CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
@@ -708,21 +708,37 @@ fn an_index_policy_or_domain_that_cannot_be_bound_is_refused_before_it_runs() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn an_expression_that_closes_its_clause_is_refused_as_more_than_declared() {
-    let cases: [(Kind, &str, &str); 3] = [
-        (Kind::IndexKey, "app.ok(email)", "lower(email)), (id"),
+    const MORE: &str = "more than the expressions declared";
+    // A key that adds a second key does not parse as a check: it cannot be bound.
+    const UNBOUND: &str = "could not be bound just before they run";
+    let cases: [(Kind, &str, &str, &str); 4] = [
+        (
+            Kind::IndexKey,
+            "app.ok(email)",
+            "lower(email) IS NOT NULL)), CONSTRAINT z CHECK ((true",
+            MORE,
+        ),
+        (
+            Kind::IndexKey,
+            "app.ok(email)",
+            "lower(email)), (id",
+            UNBOUND,
+        ),
         (
             Kind::Policy,
             "using: 'app.ok(email)', with_check: 'app.ok(email)'",
             "using: 'true) WITH CHECK (true'",
+            MORE,
         ),
         (
             Kind::Domain,
             "app.ok(VALUE)",
             "VALUE IS NOT NULL) CONSTRAINT z CHECK (true",
+            MORE,
         ),
     ];
     for (version, url) in [(16, old_server()), (18, server())] {
-        for (kind, declared, injected) in cases {
+        for (kind, declared, injected, expected) in cases {
             let c = cell(
                 version,
                 &url,
@@ -764,8 +780,8 @@ fn an_expression_that_closes_its_clause_is_refused_as_more_than_declared() {
             let shown = text(&applied);
             assert_ne!(code(&applied), 0, "PG{version} {kind:?}: {shown}");
             assert!(
-                shown.contains("more than the expressions declared"),
-                "PG{version} {kind:?}: {shown}"
+                shown.contains(expected),
+                "PG{version} {kind:?} {expected}: {shown}"
             );
             assert!(!kind.applied(&c.connection), "PG{version} {kind:?}");
         }
@@ -799,7 +815,7 @@ fn a_filtered_unique_index_that_cannot_be_bound_is_not_evaluated_by_the_prefligh
             &connection,
             "CREATE FUNCTION public.refuse_binding() RETURNS event_trigger LANGUAGE plpgsql \
                SET search_path = pg_catalog AS $$ BEGIN \
-               IF pg_catalog.current_query() LIKE '%pbps_table_expressions%' THEN \
+               IF pg_catalog.current_query() LIKE '%CREATE TEMPORARY TABLE pg_temp.%' THEN \
                  RAISE EXCEPTION 'the binding table is refused'; END IF; END $$; \
              CREATE EVENT TRIGGER refuse_binding ON ddl_command_start \
                WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.refuse_binding()",
@@ -825,5 +841,144 @@ fn a_filtered_unique_index_that_cannot_be_bound_is_not_evaluated_by_the_prefligh
             shown.contains("unchecked until source review"),
             "PG{version}: {shown}"
         );
+    }
+}
+
+/// Binding must not run what it binds. The engine folds a call of an IMMUTABLE
+/// function with constant arguments while it prepares an index or a generated
+/// column, even on an empty table (measured on 16 and 18), so an index key, an
+/// index filter and a generated expression are bound as CHECKs, which are stored
+/// as written. The routine here advances a sequence, which a rolled-back
+/// transaction does not undo; an untrusted owner's routine that nobody has
+/// reviewed must leave it where it was, through the plan and the refused apply
+/// (review of #2705, round 1; DEC-2563.6).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn binding_an_expression_never_runs_a_constant_call_in_it() {
+    let sites = [
+        (
+            "key",
+            format!("{BASE}indexes:\n  ix:\n    keys:\n      - expression: 'app.f(1)'\n"),
+        ),
+        (
+            "filter",
+            format!("{BASE}indexes:\n  ix:\n    columns: [id]\n    where: 'app.f(1) > 0'\n"),
+        ),
+        (
+            "generated",
+            BASE.replace(
+                "email: {type: text}",
+                "email: {type: text}\n  g: {type: integer, generated: {expression: 'app.f(1)', stored: true}}",
+            ),
+        ),
+    ];
+    for (version, url) in [(16, old_server()), (18, server())] {
+        for (site, declared) in &sites {
+            let slug = format!("tx2563-const-{site}-{version}");
+            let own = OwnDatabase::new(&url, &slug);
+            let connection = own.connection().to_owned();
+            let d = bootstrapped_demo(&connection, &slug, BASE);
+            d.keyed(&connection);
+            let stranger = format!("pbps_tx2563c_{version}_{}_{site}", std::process::id());
+            on_server(&url, &format!("CREATE ROLE {stranger}"));
+            on_server(
+                &connection,
+                &format!(
+                    "CREATE SEQUENCE app.s START 100; \
+                     CREATE FUNCTION app.f(int) RETURNS int LANGUAGE plpgsql IMMUTABLE \
+                       SET search_path = pg_catalog AS $$ BEGIN \
+                       PERFORM pg_catalog.nextval('app.s'); RETURN 1; END $$; \
+                     GRANT USAGE ON SCHEMA app TO {stranger}; \
+                     ALTER FUNCTION app.f(int) OWNER TO {stranger}; \
+                     INSERT INTO app.t VALUES (1, 'a')"
+                ),
+            );
+            d.table(declared);
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("const-plan.json");
+            let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+            assert_eq!(code(&planned), 0, "PG{version} {site}: {}", text(&planned));
+            let untouched = |when: &str| {
+                assert_eq!(
+                    text_of(&connection, "SELECT is_called::text FROM app.s"),
+                    "false",
+                    "PG{version} {site}: the routine ran {when}"
+                );
+            };
+            untouched("while the plan bound it");
+            let applied = approved_apply(
+                &d,
+                &connection,
+                &plan,
+                &["--allow", "destructive,narrowing,constraint"],
+            );
+            let shown = text(&applied);
+            assert_ne!(code(&applied), 0, "PG{version} {site}: {shown}");
+            assert!(
+                shown.contains("`pin_type_routines: true`"),
+                "PG{version} {site}: {shown}"
+            );
+            untouched("while the apply bound it");
+        }
+    }
+}
+
+/// A column the expression qualifies with its table's name resolves on the
+/// binding table, which takes the table's name in `pg_temp`: a valid plan is
+/// not noted as unbindable at plan time nor refused at its statement (review of
+/// #2705, round 1; DEC-2563.6).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_column_qualified_with_its_table_is_bound_in_every_expression_site() {
+    let sites = [
+        ("check", format!("{BASE}checks:\n  ck: 't.id > 0'\n")),
+        (
+            "policy",
+            format!("{BASE}row_policies:\n  p: {{using: 't.id > 0', with_check: 't.id > 0'}}\n"),
+        ),
+        (
+            "key",
+            format!("{BASE}indexes:\n  ix:\n    keys:\n      - expression: '(t.id + 1)'\n"),
+        ),
+        (
+            "filter",
+            format!("{BASE}indexes:\n  ix:\n    columns: [id]\n    where: 't.id > 0'\n"),
+        ),
+        (
+            "generated",
+            BASE.replace(
+                "email: {type: text}",
+                "email: {type: text}\n  g: {type: bigint, generated: {expression: 't.id + 1', stored: true}}",
+            ),
+        ),
+    ];
+    for (version, url) in [(16, old_server()), (18, server())] {
+        for (site, declared) in &sites {
+            let slug = format!("tx2563-qualified-{site}-{version}");
+            let own = OwnDatabase::new(&url, &slug);
+            let connection = own.connection().to_owned();
+            let d = bootstrapped_demo(&connection, &slug, BASE);
+            d.keyed(&connection);
+            on_server(&connection, "INSERT INTO app.t VALUES (1, 'a')");
+            d.table(declared);
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("qualified-plan.json");
+            let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+            assert_eq!(code(&planned), 0, "PG{version} {site}: {}", text(&planned));
+            assert!(
+                !text(&planned).contains("judged at apply only"),
+                "PG{version} {site}: {}",
+                text(&planned)
+            );
+            let applied = approved_apply(
+                &d,
+                &connection,
+                &plan,
+                &["--allow", "destructive,narrowing,constraint,row-security"],
+            );
+            assert_eq!(code(&applied), 0, "PG{version} {site}: {}", text(&applied));
+        }
     }
 }

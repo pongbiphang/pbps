@@ -5309,3 +5309,38 @@ without a fixed `search_path`, is refused at the statement with the exact
 gives it a policy or an expression index now says so as a plan note, since the
 table does not exist to bind against; it is judged at apply. No plan format
 changes.
+
+<a id="dec-2563-6"></a>
+
+**DEC-2563.6. Binding an expression never runs it, and the binding table is named for the table (PostgreSQL).**
+
+(#2563, review of #2705, round 1.) Two defects of the binder DEC-2563.4 and
+DEC-2563.5 share, measured on 16.15 and 18.6.
+
+Running. The engine folds a call of an IMMUTABLE function whose arguments are
+constants while it prepares an index (`CREATE INDEX`, key and filter) and a
+generated column (`CREATE TABLE` and `ADD COLUMN ... GENERATED`), even on an
+empty table, so the routine ran before `judge_trees` read the tree; a CHECK, a
+DEFAULT, a policy and a domain's CHECK and DEFAULT are stored as written and
+ran nothing. An index key, an index filter and a generated expression are now
+bound as CHECKs of the binding table: a key as `(key) IS NOT NULL`, a filter
+as itself, and a generated expression cast to its column's type
+(`(e)::type IS NOT NULL`), which puts any cast routine where the assignment
+coercion would. The trees judged are the expressions' own; `IS NOT NULL` adds a
+node and no routine. The shape check counts the constraints, so a text that
+closes its clause and adds one is refused as more than declared, as before; a
+key that adds a second key no longer parses as a check and is refused as
+unbindable.
+
+Names. A column an expression qualifies with its table (`CHECK (t.a > 0)`,
+`USING (t.id > 0)`) did not resolve on a binding table with a name of its own,
+so a valid expression was noted at plan time and refused at its statement. The
+binding table is now `pg_temp."<the table's name>"`. A table of that name
+already in the session's `pg_temp` makes the binding fail to build, which is an
+unbindable expression, not a dropped table (the cleanup runs only after a
+binding that stood). A reference qualified with the schema as well
+(`app.t.a`) cannot resolve against a table of `pg_temp` (measured: "invalid
+reference to FROM-clause entry"), so such an expression is noted at plan time
+and refused at its statement; the fix is to drop the schema from the reference.
+
+No plan format changes.

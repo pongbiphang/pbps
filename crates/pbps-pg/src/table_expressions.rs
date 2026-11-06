@@ -24,21 +24,21 @@ use crate::admission::Admission;
 use crate::input_path::{Part, Use, judge_trees};
 use crate::pins::Within;
 
+/// The savepoint the early binding runs inside. The binding table itself is
+/// named for the table it stands for ([`Spec::bound`]).
 const TEMP: &str = "pbps_table_expressions";
+
+/// The placeholder name of the column an existing column's new expression is
+/// bound as; [`name_bound_columns`] replaces it before anything runs.
+const BIND: &str = "pbps_bound";
 
 /// The domain a created domain's code is bound as. Another name than [`TEMP`],
 /// which a table's row type would share the namespace with.
 const TEMP_DOMAIN: &str = "pbps_domain_expressions";
 
-/// The index and the policy bound on [`TEMP`]. They live in the session's own
-/// `pg_temp` beside a table that copies no index or policy, so neither can meet
-/// a name of the real table.
-const TEMP_INDEX: &str = "pbps_table_expressions_ix";
+/// The policy bound on the binding table, which lives in the session's own
+/// `pg_temp` beside a table that copies no policy.
 const TEMP_POLICY: &str = "pbps_table_expressions_policy";
-
-/// The placeholder name of the column an existing column's new expression is
-/// bound as; [`name_bound_columns`] replaces it before anything runs.
-const BIND: &str = "pbps_bound";
 
 /// When the expressions are judged, which decides what an unbindable one means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,20 +60,30 @@ struct Spec {
     table: String,
     /// The schema whose path the statement that carries them runs on.
     schema: String,
+    /// The name of the table they belong to. The binding table takes it, in
+    /// `pg_temp`, so a column an expression qualifies with the table's name
+    /// (`CHECK (t.a > 0)`) resolves as it does on the real table. A table of
+    /// that name already in the session's `pg_temp` makes the binding fail to
+    /// build, which is an expression that cannot be bound, never a table
+    /// dropped.
+    bound: String,
     /// The table the columns are copied from, or `None` for a table the plan
     /// creates, whose columns are all listed.
     like: Option<TableName>,
     /// Name in the temporary table, the name to show, the type, the value.
     columns: Vec<Column>,
     checks: Vec<(String, String)>,
-    /// An index or a policy created on the binding table.
-    extra: Option<Extra>,
+    /// An index whose expressions are bound, by name.
+    index: Option<(String, Box<pbps_model::Index>)>,
+    /// A policy created on the binding table, by name.
+    policy: Option<(String, Box<pbps_model::RowPolicy>)>,
 }
 
-/// What is created on the binding table once it stands.
-enum Extra {
-    Index(String, Box<pbps_model::Index>),
-    Policy(String, Box<pbps_model::RowPolicy>),
+/// One CHECK of the binding table and what its tree is called in a refusal.
+struct Constraint {
+    name: String,
+    expression: String,
+    label: String,
 }
 
 struct Column {
@@ -86,6 +96,102 @@ struct Column {
 enum Value {
     Default(String),
     Generated(String),
+}
+
+impl Spec {
+    /// The binding table as SQL spells it.
+    fn relation(&self) -> Result<String, String> {
+        Ok(format!(
+            "pg_temp.{}",
+            crate::quote(&self.bound).map_err(|e| e.to_string())?
+        ))
+    }
+
+    /// The same, as the text of a `regclass` literal.
+    fn regclass(&self) -> Result<String, String> {
+        Ok(format!(
+            "'{}'::pg_catalog.regclass",
+            self.relation()?.replace('\'', "''")
+        ))
+    }
+
+    /// Everything bound as a CHECK. Binding a generated column, an index key
+    /// or an index filter as the column or index it is would let the engine
+    /// fold the expression while it prepares the object: measured on 16 and
+    /// 18, a call of an IMMUTABLE function with constant arguments runs then,
+    /// before anything has judged it. A CHECK is stored as written. A generated
+    /// expression is bound cast to the column's type, which is where its
+    /// assignment coercion would put any cast routine; a key is bound as
+    /// `IS NOT NULL`, which adds a node and no routine.
+    fn constraints(&self) -> Vec<Constraint> {
+        let mut taken: std::collections::BTreeSet<String> =
+            self.checks.iter().map(|(n, _)| n.clone()).collect();
+        let mut fresh = |prefix: &str| {
+            let mut name = prefix.to_owned();
+            let mut n = 0_usize;
+            while taken.contains(&name) {
+                n += 1;
+                name = format!("{prefix}_{n}");
+            }
+            taken.insert(name.clone());
+            name
+        };
+        let mut out: Vec<Constraint> = self
+            .checks
+            .iter()
+            .map(|(name, expression)| Constraint {
+                name: name.clone(),
+                expression: expression.clone(),
+                label: format!("the CHECK `{name}` of {}", self.table),
+            })
+            .collect();
+        for c in &self.columns {
+            if let Some(Value::Generated(e)) = &c.value {
+                out.push(Constraint {
+                    name: fresh("pbps_generated"),
+                    expression: format!("({e}\n)::{} IS NOT NULL", c.ty),
+                    label: format!("the generated expression of {}.{}", self.table, c.shown),
+                });
+            }
+        }
+        if let Some((name, index)) = &self.index {
+            for (i, column) in index.columns.iter().enumerate() {
+                if let pbps_model::IndexKey::Expression(text) = &column.key {
+                    out.push(Constraint {
+                        name: fresh("pbps_key"),
+                        expression: format!("({text}\n) IS NOT NULL"),
+                        label: format!("key {} of index `{name}` on {}", i + 1, self.table),
+                    });
+                }
+            }
+            if let Some(filter) = &index.filter {
+                out.push(Constraint {
+                    name: fresh("pbps_filter"),
+                    expression: filter.clone(),
+                    label: format!("the filter of index `{name}` on {}", self.table),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// The name of the table `change` is about: what its binding table is called.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the changes that carry no table expression are every other one"
+)]
+fn bound_table(change: &Change) -> Option<&str> {
+    match change {
+        Change::CreateTable { name, .. } => Some(&name.name),
+        Change::AddColumn { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::AddIndex { table, .. }
+        | Change::CreatePolicy { table, .. } => Some(&table.name),
+        Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. } => Some(&column.table.name),
+        _ => None,
+    }
 }
 
 /// Whether `change` introduces an expression this module judges.
@@ -290,11 +396,19 @@ async fn vet_in_callers_transaction(
         .and_then(|r| r.try_get::<&str>("path").ok().flatten())
         .map(str::to_owned)
         .ok_or_else(unclean)?;
-    let notes = vet_bound(conn, admission, moment, change).await?;
-    let drop = if domain_code(change).is_some() {
-        format!("DROP DOMAIN IF EXISTS pg_temp.{TEMP_DOMAIN}")
-    } else {
-        format!("DROP TABLE IF EXISTS pg_temp.{TEMP}")
+    let admitted = vet_bound(conn, admission, moment, change).await?;
+    // Only a binding that stood is removed: an unjudged one never built its
+    // table, and a table of that name in the session is not ours to drop.
+    if admitted != Vetted::Admitted {
+        return Ok(admitted);
+    }
+    let drop = match (domain_code(change), bound_table(change)) {
+        (Some(_), _) => format!("DROP DOMAIN IF EXISTS pg_temp.{TEMP_DOMAIN}"),
+        (None, Some(table)) => format!(
+            "DROP TABLE IF EXISTS pg_temp.{}",
+            crate::quote(table).map_err(|_| unclean())?
+        ),
+        (None, None) => return Ok(admitted),
     };
     conn.execute(&drop).await.map_err(|_| unclean())?;
     conn.execute_with(
@@ -303,7 +417,7 @@ async fn vet_in_callers_transaction(
     )
     .await
     .map_err(|_| unclean())?;
-    Ok(notes)
+    Ok(admitted)
 }
 
 async fn vet_bound(
@@ -357,10 +471,17 @@ async fn vet_bound(
             .map_err(|_| unreadable())?,
         None => 0,
     };
+    let constraints = spec.constraints();
+    let regclass = spec.regclass()?;
     let expected = [
         like_columns + count(spec.columns.len()),
-        count(spec.checks.len()),
-        count(spec.columns.iter().filter(|c| c.value.is_some()).count()),
+        count(constraints.len()),
+        count(
+            spec.columns
+                .iter()
+                .filter(|c| matches!(c.value, Some(Value::Default(_))))
+                .count(),
+        ),
     ];
     let shape = conn
         .query(&format!(
@@ -374,7 +495,7 @@ async fn vet_bound(
                (SELECT count(*) FROM pg_catalog.pg_attrdef d
                  WHERE d.adrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS defaults
                FROM pg_catalog.pg_class r
-              WHERE r.oid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
+              WHERE r.oid OPERATOR(pg_catalog.=) {regclass}"
         ))
         .await
         .map_err(|_| unreadable())?;
@@ -395,15 +516,14 @@ async fn vet_bound(
         .query(&format!(
             "SELECT 'check' AS kind, c.conname::pg_catalog.text AS name, c.conbin::pg_catalog.text AS tree
                FROM pg_catalog.pg_constraint c
-              WHERE c.conrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass
+              WHERE c.conrelid OPERATOR(pg_catalog.=) {regclass}
                 AND c.contype OPERATOR(pg_catalog.=) 'c'
              UNION ALL
-             SELECT CASE WHEN a.attgenerated OPERATOR(pg_catalog.<>) '' THEN 'generated' ELSE 'default' END,
-                    a.attname::pg_catalog.text, d.adbin::pg_catalog.text
+             SELECT 'default', a.attname::pg_catalog.text, d.adbin::pg_catalog.text
                FROM pg_catalog.pg_attrdef d
                JOIN pg_catalog.pg_attribute a
                  ON a.attrelid OPERATOR(pg_catalog.=) d.adrelid AND a.attnum OPERATOR(pg_catalog.=) d.adnum
-              WHERE d.adrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
+              WHERE d.adrelid OPERATOR(pg_catalog.=) {regclass}"
         ))
         .await
         .map_err(|_| unreadable())?;
@@ -416,18 +536,17 @@ async fn vet_bound(
         ) else {
             return Err(unreadable());
         };
-        let label = match kind {
-            "check" => format!("the CHECK `{name}` of {}", spec.table),
-            "generated" => format!(
-                "the generated expression of {}.{}",
-                spec.table,
-                shown_column(&spec, name)
-            ),
-            _ => format!(
+        let label = if kind == "check" {
+            let Some(found) = constraints.iter().find(|c| c.name == name) else {
+                return Err(too_many(&spec.what));
+            };
+            found.label.clone()
+        } else {
+            format!(
                 "the DEFAULT of {}.{}",
                 spec.table,
                 shown_column(&spec, name)
-            ),
+            )
         };
         trees.push((
             Use {
@@ -437,12 +556,17 @@ async fn vet_bound(
             tree.to_owned(),
         ));
     }
-    if let Some(extra) = &spec.extra {
-        let sql = extra.statement(&spec.what)?;
+    if let Some((name, policy)) = &spec.policy {
+        // The roles it names may be ones the plan creates: they run no code.
+        let mut bound = policy.clone();
+        bound.to = pbps_model::PolicyRoles::Public;
+        let table = TableName::new("pg_temp", &spec.bound);
+        let sql = crate::emit::create_policy_sql(&table, TEMP_POLICY, &bound)
+            .map_err(|e| format!("{} could not be bound: {e}", spec.what))?;
         if let Err(e) = conn.execute_with(&sql, &[]).await {
             return unbound(&spec.what, &server_code(&e));
         }
-        trees.extend(extra.trees(conn, &spec).await?);
+        trees.extend(policy_trees(conn, &spec, name, policy).await?);
     }
     judge(conn, admission, trees, &spec.what).await
 }
@@ -541,118 +665,56 @@ fn too_many(what: &str) -> String {
     )
 }
 
-impl Extra {
-    /// The statement that creates it on the binding table.
-    fn statement(&self, what: &str) -> Result<String, String> {
-        let table = TableName::new("pg_temp", TEMP);
-        match self {
-            Self::Index(_, index) => crate::emit::create_index_on(
-                &table,
-                TEMP_INDEX,
-                index,
-                pbps_model::Strategy { online: false },
-                false,
-            ),
-            // The roles it names may be ones the plan creates: they run no code.
-            Self::Policy(_, policy) => {
-                let mut policy = policy.clone();
-                policy.to = pbps_model::PolicyRoles::Public;
-                crate::emit::create_policy_sql(&table, TEMP_POLICY, &policy)
-            }
-        }
-        .map_err(|e| format!("{what} could not be bound: {e}"))
+/// The trees the policy bound on the binding table stores. Held to the
+/// one policy declared: a text that closes its clause and adds a check changes
+/// which of USING and WITH CHECK are there, and is refused.
+async fn policy_trees(
+    conn: &mut Conn,
+    spec: &Spec,
+    name: &str,
+    policy: &pbps_model::RowPolicy,
+) -> Result<Vec<(Use, String)>, String> {
+    let unreadable = || {
+        format!(
+            "{} could not be vetted: the catalog could not be read",
+            spec.what
+        )
+    };
+    let regclass = spec.regclass()?;
+    let rows = conn
+        .query(&format!(
+            "SELECT p.polqual::pg_catalog.text AS using_tree, p.polwithcheck::pg_catalog.text AS check_tree
+               FROM pg_catalog.pg_policy p
+              WHERE p.polrelid OPERATOR(pg_catalog.=) {regclass}"
+        ))
+        .await
+        .map_err(|_| unreadable())?;
+    let [row] = rows.as_slice() else {
+        return Err(too_many(&spec.what));
+    };
+    let text = |column: &str| {
+        row.try_get::<&str>(column)
+            .map(|v| v.map(str::to_owned))
+            .map_err(|_| unreadable())
+    };
+    let (using, check) = (text("using_tree")?, text("check_tree")?);
+    if using.is_some() != policy.using.is_some() || check.is_some() != policy.with_check.is_some() {
+        return Err(too_many(&spec.what));
     }
-
-    /// The stored trees it leaves, after holding it to the one index or policy
-    /// declared: a text that closes its clause and adds a key, a filter or a
-    /// check changes the shape and is refused.
-    async fn trees(&self, conn: &mut Conn, spec: &Spec) -> Result<Vec<(Use, String)>, String> {
-        let unreadable = || {
-            format!(
-                "{} could not be vetted: the catalog could not be read",
-                spec.what
-            )
-        };
-        let use_of = |ty: String| Use {
-            ty,
-            part: Part::TableExpression,
-        };
-        let text = |row: &pbps_db::Row, column: &str| {
-            row.try_get::<&str>(column)
-                .map(|v| v.map(str::to_owned))
-                .map_err(|_| unreadable())
-        };
-        let mut trees = Vec::new();
-        match self {
-            Self::Index(name, index) => {
-                let rows = conn
-                    .query(&format!(
-                        "SELECT i.indnatts::pg_catalog.int4 AS width,
-                                i.indexprs::pg_catalog.text AS keys, i.indpred::pg_catalog.text AS filter
-                           FROM pg_catalog.pg_index i
-                          WHERE i.indrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
-                    ))
-                    .await
-                    .map_err(|_| unreadable())?;
-                let [row] = rows.as_slice() else {
-                    return Err(too_many(&spec.what));
-                };
-                let width = row.try_get::<i32>("width").ok().flatten();
-                let (keys, filter) = (text(row, "keys")?, text(row, "filter")?);
-                if width != Some(count(index.columns.len() + index.include.len()))
-                    || filter.is_some() != index.filter.is_some()
-                {
-                    return Err(too_many(&spec.what));
-                }
-                let on = &spec.table;
-                if let Some(tree) = keys {
-                    trees.push((
-                        use_of(format!("the expression keys of index `{name}` on {on}")),
-                        tree,
-                    ));
-                }
-                if let Some(tree) = filter {
-                    trees.push((
-                        use_of(format!("the filter of index `{name}` on {on}")),
-                        tree,
-                    ));
-                }
-            }
-            Self::Policy(name, policy) => {
-                let rows = conn
-                    .query(&format!(
-                        "SELECT p.polqual::pg_catalog.text AS using_tree, p.polwithcheck::pg_catalog.text AS check_tree
-                           FROM pg_catalog.pg_policy p
-                          WHERE p.polrelid OPERATOR(pg_catalog.=) 'pg_temp.{TEMP}'::pg_catalog.regclass"
-                    ))
-                    .await
-                    .map_err(|_| unreadable())?;
-                let [row] = rows.as_slice() else {
-                    return Err(too_many(&spec.what));
-                };
-                let (using, check) = (text(row, "using_tree")?, text(row, "check_tree")?);
-                if using.is_some() != policy.using.is_some()
-                    || check.is_some() != policy.with_check.is_some()
-                {
-                    return Err(too_many(&spec.what));
-                }
-                let on = &spec.table;
-                if let Some(tree) = using {
-                    trees.push((
-                        use_of(format!("the USING of policy `{name}` on {on}")),
-                        tree,
-                    ));
-                }
-                if let Some(tree) = check {
-                    trees.push((
-                        use_of(format!("the WITH CHECK of policy `{name}` on {on}")),
-                        tree,
-                    ));
-                }
-            }
+    let on = &spec.table;
+    let mut trees = Vec::new();
+    for (tree, part) in [(using, "USING"), (check, "WITH CHECK")] {
+        if let Some(tree) = tree {
+            trees.push((
+                Use {
+                    ty: format!("the {part} of policy `{name}` on {on}"),
+                    part: Part::TableExpression,
+                },
+                tree,
+            ));
         }
-        Ok(trees)
     }
+    Ok(trees)
 }
 
 /// A failure to bind is a note before the statement and a refusal at it.
@@ -745,8 +807,9 @@ fn describe(change: &Change) -> String {
 }
 
 /// The statement that builds the binding table. Nothing in it is evaluated: the
-/// table has no row, and a default, a check and a generated expression run on
-/// one.
+/// table has no row, and a default and a check run on one; a generated
+/// expression and an index are bound as checks so that the engine does not fold
+/// them either ([`Spec::constraints`]).
 fn create_statement(spec: &Spec) -> Result<String, String> {
     let quoted = |name: &str| crate::quote(name).map_err(|e| e.to_string());
     // Each expression closes on its own line: one ending in a `--` comment
@@ -761,19 +824,20 @@ fn create_statement(spec: &Spec) -> Result<String, String> {
     for c in &spec.columns {
         let value = match &c.value {
             Some(Value::Default(e)) => format!(" DEFAULT ({e}\n)"),
-            Some(Value::Generated(e)) => format!(" GENERATED ALWAYS AS ({e}\n) STORED"),
-            None => String::new(),
+            Some(Value::Generated(_)) | None => String::new(),
         };
         parts.push(format!("{} {}{value}", quoted(&c.bound)?, c.ty));
     }
-    for (name, expression) in &spec.checks {
+    for c in spec.constraints() {
         parts.push(format!(
-            "CONSTRAINT {} CHECK ({expression}\n)",
-            quoted(name)?
+            "CONSTRAINT {} CHECK ({}\n)",
+            quoted(&c.name)?,
+            c.expression
         ));
     }
     Ok(format!(
-        "CREATE TEMPORARY TABLE pg_temp.{TEMP} ({})",
+        "CREATE TEMPORARY TABLE {} ({})",
+        spec.relation()?,
         parts.join(", ")
     ))
 }
@@ -867,6 +931,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
     Ok(Some(match change {
         Change::CreateTable { name, table, .. } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: name.shown().to_string(),
             schema: name.schema.clone(),
             like: None,
@@ -887,7 +952,8 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 .iter()
                 .map(|(n, c)| (n.raw().to_owned(), c.expression.clone()))
                 .collect(),
-            extra: None,
+            index: None,
+            policy: None,
         },
         Change::AddColumn {
             table,
@@ -896,6 +962,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             ..
         } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
             schema: table.schema.clone(),
             like: Some(table.clone()),
@@ -906,7 +973,8 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
                 value: value(&column.value_source),
             }],
             checks: Vec::new(),
-            extra: None,
+            index: None,
+            policy: None,
         },
         Change::AddCheck {
             table,
@@ -914,19 +982,22 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
             constraint,
         } => Spec {
             what: describe(change),
+            bound: bound_table(change).unwrap_or_default().to_owned(),
             table: table.shown().to_string(),
             schema: table.schema.clone(),
             like: Some(table.clone()),
             columns: Vec::new(),
             checks: vec![(name.raw().to_owned(), constraint.expression.clone())],
-            extra: None,
+            index: None,
+            policy: None,
         },
         Change::AddIndex {
             table, name, index, ..
         } => on_table(
             change,
             table,
-            Extra::Index(name.shown().to_string(), index.clone()),
+            Some((name.shown().to_string(), index.clone())),
+            None,
         ),
         Change::CreatePolicy {
             table,
@@ -936,7 +1007,8 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
         } => on_table(
             change,
             table,
-            Extra::Policy(name.clone(), Box::new(policy.clone())),
+            None,
+            Some((name.clone(), Box::new(policy.clone()))),
         ),
         Change::AlterColumnDefault { column, to, .. } => {
             let Some(expression) = to else {
@@ -961,6 +1033,7 @@ async fn existing(
 ) -> Result<Spec, String> {
     Ok(Spec {
         what: describe(change),
+        bound: bound_table(change).unwrap_or_default().to_owned(),
         table: column.table.shown().to_string(),
         schema: column.table.schema.clone(),
         like: Some(column.table.clone()),
@@ -971,19 +1044,27 @@ async fn existing(
             value: Some(value),
         }],
         checks: Vec::new(),
-        extra: None,
+        index: None,
+        policy: None,
     })
 }
 
 /// An index or a policy of a table that stands: bound on a copy of its columns.
-fn on_table(change: &Change, table: &TableName, extra: Extra) -> Spec {
+fn on_table(
+    change: &Change,
+    table: &TableName,
+    index: Option<(String, Box<pbps_model::Index>)>,
+    policy: Option<(String, Box<pbps_model::RowPolicy>)>,
+) -> Spec {
     Spec {
         what: describe(change),
+        bound: bound_table(change).unwrap_or_default().to_owned(),
         table: table.shown().to_string(),
         schema: table.schema.clone(),
         like: Some(table.clone()),
         columns: Vec::new(),
         checks: Vec::new(),
-        extra: Some(extra),
+        index,
+        policy,
     }
 }
