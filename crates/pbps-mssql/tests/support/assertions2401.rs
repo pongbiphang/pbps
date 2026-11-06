@@ -30,11 +30,107 @@ struct Fixture {
     db: TestDb,
     role: String,
     assertion: String,
+    cleanup: FixtureCleanup,
 }
+
+// Keep this guard local: the assertion fixtures also own users in system
+// databases and a login, which the ordinary TestDb does not know about.
+struct FixtureCleanup {
+    database: String,
+    role: String,
+    armed: bool,
+}
+impl FixtureCleanup {
+    fn new(database: &str, role: &str) -> Self {
+        Self {
+            database: database.into(),
+            role: role.into(),
+            armed: true,
+        }
+    }
+
+    async fn remove(&self) -> Result<(), pbps_db::DbError> {
+        tokio::time::timeout(DEADLINE, async {
+            let _gate = SINGLE_USER_GATE.read().await;
+            let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await?;
+            admin.execute(&format!(
+                "USE master; IF DB_ID(N'{0}') IS NOT NULL BEGIN ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{0}]; END",
+                self.database
+            )).await?;
+            for system in ["master", "msdb", "tempdb"] {
+                admin.execute(&format!(
+                    "USE [{system}]; IF DATABASE_PRINCIPAL_ID(N'{0}') IS NOT NULL DROP USER [{0}]",
+                    self.role
+                )).await?;
+            }
+            admin.execute(&format!(
+                "USE master; IF SUSER_ID(N'{0}') IS NOT NULL DROP LOGIN [{0}]",
+                self.role
+            )).await?;
+            Ok(())
+        }).await.map_err(|_| pbps_db::DbError::DeadlineExceeded("assertion fixture cleanup deadline exceeded"))?
+    }
+}
+impl Drop for FixtureCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cleanup = Self {
+            database: self.database.clone(),
+            role: self.role.clone(),
+            armed: false,
+        };
+        // Drop can run inside a current-thread test runtime, including during
+        // setup or unwinding. Await cleanup on another thread before the next
+        // case can observe these resources (DECISIONS 199); spawning a task on
+        // the dying test runtime would lose it. Never replace the first panic.
+        let worker = std::thread::Builder::new().spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime
+                .block_on(cleanup.remove())
+                .map_err(|e| e.to_string())
+        });
+        let result = match worker {
+            Ok(worker) => worker
+                .join()
+                .unwrap_or_else(|_| Err("cleanup thread panicked".into())),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "assertion fixture {} cleanup failed: {error}",
+                self.database
+            );
+        }
+    }
+}
+
+async fn retry_admission_deadlocks<T, F, Fut>(mut attempt: F) -> Result<T, pbps_db::DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, pbps_db::DbError>>,
+{
+    for number in 1..=5 {
+        match attempt().await {
+            Err(error) if number < 5 && error.server_error_code().as_deref() == Some("1205") => {
+                tokio::time::sleep(Duration::from_millis(100 * number)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt returns its result")
+}
+
 impl Fixture {
     async fn new(tag: &str) -> Self {
         let mut db = TestDb::create(tag).await;
         let role = format!("{}_reader", db.name);
+        // Arm before the first login/user DDL, so partial setup is owned too.
+        let cleanup = FixtureCleanup::new(&db.name, &role);
         db.conn.execute(&format!("CREATE LOGIN [{role}] WITH PASSWORD='OnlyAssert!2401',CHECK_POLICY=OFF; CREATE USER [{role}] FOR LOGIN [{role}]; GRANT VIEW DEFINITION TO [{role}]")).await.unwrap();
         // A mapped read-only user avoids guest's implicit schema ownership
         // (including permanent CREATE SEQUENCE) in accessible system databases.
@@ -88,6 +184,7 @@ impl Fixture {
             db,
             role,
             assertion,
+            cleanup,
         }
     }
     async fn target(&mut self) -> Target {
@@ -95,23 +192,77 @@ impl Fixture {
     }
     async fn run(&mut self, sql: &str) -> Result<AssertionResult, pbps_db::DbError> {
         let target = self.target().await;
-        run_target(&self.assertion, &target, sql, DEADLINE).await
+        // #2733 failed here, during target admission, even in the serial run.
+        // Rerun the whole admission on the engine's 1205 advice. Refusals and
+        // user-SQL errors (inside AssertionResult) retain their first verdict.
+        retry_admission_deadlocks(|| run_target(&self.assertion, &target, sql, DEADLINE)).await
     }
-    async fn finish(self) {
+    async fn finish(mut self) {
         self.db.drop().await;
-        let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await.unwrap();
-        for system in ["master", "msdb", "tempdb"] {
-            admin
-                .execute(&format!("USE [{system}]; DROP USER [{}]", self.role))
-                .await
-                .unwrap();
-        }
-        admin.execute("USE master").await.unwrap();
-        admin
-            .execute(&format!("DROP LOGIN [{}]", self.role))
-            .await
-            .unwrap();
+        self.cleanup.remove().await.unwrap();
+        self.cleanup.armed = false;
     }
+}
+
+#[tokio::test]
+async fn admission_retries_only_deadlock_errors_and_stops_at_the_bound() {
+    let driver = |code: Option<&str>| pbps_db::DbError::Driver {
+        diagnostic: None,
+        message: "deadlock victim text is not an error code".into(),
+        code: code.map(str::to_owned),
+    };
+    let mut attempts = 0;
+    let result = retry_admission_deadlocks(|| {
+        attempts += 1;
+        std::future::ready(if attempts < 3 {
+            Err(driver(Some("1205")).context("target admission"))
+        } else {
+            Ok(2401)
+        })
+    })
+    .await;
+    assert_eq!(result.unwrap(), 2401);
+    assert_eq!(attempts, 3);
+
+    attempts = 0;
+    let result: Result<(), _> = retry_admission_deadlocks(|| {
+        attempts += 1;
+        std::future::ready(Err(driver(Some("1205"))))
+    })
+    .await;
+    assert_eq!(
+        result.unwrap_err().server_error_code().as_deref(),
+        Some("1205")
+    );
+    assert_eq!(attempts, 5, "persistent contention must still fail");
+
+    for error in [
+        driver(Some("229")),
+        driver(Some("8134")),
+        driver(None),
+        pbps_db::DbError::Refused("write capability".into()),
+        pbps_db::DbError::DeadlineExceeded("target admission"),
+    ] {
+        let mut error = Some(error);
+        attempts = 0;
+        let result: Result<(), _> = retry_admission_deadlocks(|| {
+            attempts += 1;
+            std::future::ready(Err(error.take().expect("a non-deadlock must not retry")))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    attempts = 0;
+    let result = retry_admission_deadlocks(|| {
+        attempts += 1;
+        std::future::ready(Ok(AssertionResult::SqlError(driver(Some("1205")))))
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, AssertionResult::SqlError(_)));
+    assert_eq!(attempts, 1, "user SQL is not retried");
 }
 
 #[tokio::test]
@@ -1288,6 +1439,40 @@ async fn server_grant_options_refuse_before_assertion_sql() {
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_target_deadline_is_a_typed_error_never_a_refusal() {
+    async fn residue(database: &str, role: &str) -> Vec<String> {
+        let mut admin = Conn::connect(Driver::Mssql, &conn_str()).await.unwrap();
+        let mut names = Vec::new();
+        for (context, sql) in [
+            (
+                "master",
+                format!(
+                    "SELECT name FROM sys.databases WHERE name=N'{database}' UNION ALL SELECT name FROM sys.server_principals WHERE name=N'{role}'"
+                ),
+            ),
+            (
+                "master",
+                format!("SELECT name FROM sys.database_principals WHERE name=N'{role}'"),
+            ),
+            (
+                "msdb",
+                format!("SELECT name FROM sys.database_principals WHERE name=N'{role}'"),
+            ),
+            (
+                "tempdb",
+                format!("SELECT name FROM sys.database_principals WHERE name=N'{role}'"),
+            ),
+        ] {
+            admin.execute(&format!("USE [{context}]")).await.unwrap();
+            for row in admin.query(&sql).await.unwrap() {
+                names.push(format!(
+                    "{context}:{}",
+                    row.try_get::<&str>("name").unwrap().unwrap()
+                ));
+            }
+        }
+        names
+    }
+
     let _case = TARGET_CASE.lock().await;
     let mut f = Fixture::new("assert_late2401").await;
     let target = f.target().await;
@@ -1310,5 +1495,62 @@ async fn a_target_deadline_is_a_typed_error_never_a_refusal() {
         .await
         .unwrap_err();
     assert!(matches!(error, pbps_db::DbError::Refused(_)), "{error:?}");
+    let database = f.db.name.clone();
+    let role = f.role.clone();
     f.finish().await;
+    assert!(
+        residue(&database, &role).await.is_empty(),
+        "passing case cleanup"
+    );
+
+    // The next case on this instance must be able to start even when a setup
+    // batch or an assertion panics. Catch the panic only to verify its cleanup;
+    // neither a non-deadlock error nor cleanup turns that case into a pass.
+    for partial in [false, true] {
+        let (database, role, result) = if partial {
+            let mut db = TestDb::create("assert_setup_unwind2733").await;
+            let role = format!("{}_reader", db.name);
+            let cleanup = FixtureCleanup::new(&db.name, &role);
+            let database = db.name.clone();
+            let login = role.clone();
+            let result = tokio::spawn(async move {
+                let _cleanup = cleanup;
+                db.conn
+                    .execute(&format!(
+                        "CREATE LOGIN [{login}] WITH PASSWORD='OnlyAssert!2401',CHECK_POLICY=OFF"
+                    ))
+                    .await
+                    .unwrap();
+                // Before the system users or the rest of setup exist.
+                db.conn.execute("SELECT 1/0").await.unwrap();
+            })
+            .await;
+            (database, role, result)
+        } else {
+            let mut f = Fixture::new("assert_unwind2733").await;
+            let database = f.db.name.clone();
+            let role = f.role.clone();
+            let result = tokio::spawn(async move {
+                let result = f.run("SELECT 1/0").await.unwrap();
+                assert!(
+                    matches!(result, AssertionResult::Pass(_)),
+                    "non-deadlock SQL error must fail the case: {result:?}"
+                );
+            })
+            .await;
+            (database, role, result)
+        };
+        let remaining = residue(&database, &role).await;
+        // Restore even a deliberately reverted guard before asserting, so a
+        // witness cannot poison later tests on the same warm fixture.
+        let mut rescue = FixtureCleanup::new(&database, &role);
+        rescue.remove().await.unwrap();
+        rescue.armed = false;
+        assert!(result.unwrap_err().is_panic(), "the case must still fail");
+        assert!(remaining.is_empty(), "unwind cleanup: {remaining:?}");
+    }
+    let mut next = Fixture::new("assert_after_unwind2733").await;
+    let result = next.run("SELECT 1 WHERE 1=0").await;
+    next.finish().await;
+    assert!(matches!(result.unwrap(), AssertionResult::Pass(_)));
 }
