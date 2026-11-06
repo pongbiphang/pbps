@@ -217,6 +217,7 @@ impl<'a> Session<'a> {
             pin_type_routines: source.pin_type_routines,
             schema_dir: source.schema_dir.clone(),
             ids_file: source.ids_file.clone(),
+            ids_dir: source.ids_dir.clone(),
             environments: std::collections::BTreeMap::from([(
                 "test".into(),
                 pbps_config::Environment {

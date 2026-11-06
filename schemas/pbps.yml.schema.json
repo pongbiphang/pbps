@@ -28,8 +28,17 @@
       "default": "schema"
     },
     "ids_file": {
+      "description": "The single identity file. `ids_dir` replaces it; name one or the other.",
       "type": "string",
       "default": "schema.ids.json"
+    },
+    "ids_dir": {
+      "description": "The directory of per-declaration identity files, relative to the project\nroot. Defaults to `.pbps/ids`. It must not be the project root,\n`schema_dir`, or a directory holding either.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^(?!(?:\\.\\.?(?:[/\\\\]+|$))*$)"
     },
     "environments": {
       "description": "Deployment targets, by name. Optional: a project that only ever passes\n`--db` explicitly needs none.",
@@ -1006,6 +1015,6 @@
       "additionalProperties": false
     }
   },
-  "x-pbps-schema-version": 91,
+  "x-pbps-schema-version": 92,
   "x-pbps-tool-version": "0.0.0"
 }
