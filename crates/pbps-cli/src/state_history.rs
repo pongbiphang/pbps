@@ -569,6 +569,7 @@ fn export(
                 "`{}` resolves outside the declaration directory",
                 path.display()
             );
+            crate::ids_store::refuse_output_inside(project, path)?;
             for protected in crate::ids_store::protected(project) {
                 anyhow::ensure!(
                     !crate::paths::same_file(path, &protected)?,

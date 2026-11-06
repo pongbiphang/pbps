@@ -66,6 +66,7 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             out.display()
         );
     }
+    crate::ids_store::refuse_output_inside(project, out)?;
     for (name, profile) in &project.config.resolvers {
         let (pbps_config::resolver::ResolverProfile::Docker { externals, .. }
         | pbps_config::resolver::ResolverProfile::Server { externals, .. }) = profile;
