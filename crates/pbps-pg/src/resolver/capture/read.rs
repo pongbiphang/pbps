@@ -23,12 +23,73 @@ pub(super) struct Read {
 
 pub(super) use pbps_db::resolver::capture::CaptureError as Failure;
 
+/// How long the owned capture keeps re-reading a catalog that keeps moving
+/// (#2715, DEC-2715.1). Measured, another session's role DDL arrives in two
+/// bursts of at most 0.3 s with 2.5 s or more between them, and one attempt
+/// takes 1 to 2.5 s, so the bound is time and not a count: a count of three
+/// over 400 ms still failed one run in ten.
+const ATTEMPTS: u32 = 5;
+const PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The retry policy of [`owned`], apart from the reads so it can be pinned
+/// without a server: only a witness that differs from the render asks for
+/// another attempt, and only while both bounds hold.
+struct Attempts {
+    made: u32,
+    started: std::time::Instant,
+}
+
+impl Attempts {
+    fn new() -> Self {
+        Self {
+            made: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// One attempt ended `Changed`. How long to pause before the next, or the
+    /// refusal that names the bound.
+    fn changed(&mut self) -> Result<std::time::Duration, Failure> {
+        self.made += 1;
+        if self.made >= ATTEMPTS || self.started.elapsed() + PAUSE >= BUDGET {
+            return Err(Failure::Unsettled {
+                attempts: self.made,
+                seconds: BUDGET.as_secs(),
+            });
+        }
+        Ok(PAUSE)
+    }
+}
+
+/// One owned capture, re-run while the catalog changes under it: a change
+/// that persists is read consistently by the next attempt and sealed, and one
+/// that never settles inside the bound is refused as [`Failure::Unsettled`].
+/// Only [`Failure::Changed`] is retried. A session-setting change, an
+/// incomplete or unreadable catalog and the `held` subset check are not
+/// concurrent changes of this server, and the apply's bracket
+/// ([`in_callers_transaction`]) is never retried: a change there is the one
+/// DEC-616.1 and SPEC 7.6 exist to refuse. `qualify` runs once per attempt.
+pub(super) async fn owned(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+    mut qualify: impl FnMut(&Catalog, u32) -> Result<Selection, Failure>,
+) -> Result<Read, Failure> {
+    let mut attempts = Attempts::new();
+    loop {
+        match owned_once(conn, dropped, &mut qualify).await {
+            Err(Failure::Changed) => tokio::time::sleep(attempts.changed()?).await,
+            other => return other,
+        }
+    }
+}
+
 /// The lifecycle owner must expire/drop the connection if this future is
 /// cancelled. Ordinary failures roll back the transaction here; an already
 /// open caller transaction is refused before BEGIN and is left untouched.
 /// `qualify` is the adapter's private pre-render coverage check: in particular,
 /// custom datum output must not run before its type has qualified.
-pub(super) async fn owned(
+pub(super) async fn owned_once(
     conn: &mut impl QueryConnection,
     dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
@@ -641,7 +702,7 @@ mod tests {
         conn.execute(&format!("ALTER ROLE {fixture_role} SET work_mem = '8MB'"))
             .await
             .unwrap();
-        let read = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
+        let read = owned_once(&mut conn, &BTreeSet::new(), |catalog, major| {
             // A new catalog property must be noticed even though the
             // SQL projection still names only previously known fields.
             let relation = catalog.rows["pg_class"]
@@ -691,7 +752,7 @@ mod tests {
         }));
         restored(&mut conn).await;
 
-        let changed = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
+        let changed = owned_once(&mut conn, &BTreeSet::new(), |catalog, major| {
             writer(connection.clone(), "ALTER TABLE app.a RENAME TO changed")?;
             fixture_selection(catalog, major)
         })
@@ -704,14 +765,14 @@ mod tests {
         conn.execute("ALTER TABLE app.changed RENAME TO a")
             .await
             .unwrap();
-        let aba = owned(&mut conn, &BTreeSet::new(), |catalog,major| { writer(connection.clone(),"ALTER TABLE app.a RENAME TO temporary_name; ALTER TABLE app.temporary_name RENAME TO a")?; fixture_selection(catalog,major) }).await;
+        let aba = owned_once(&mut conn, &BTreeSet::new(), |catalog,major| { writer(connection.clone(),"ALTER TABLE app.a RENAME TO temporary_name; ALTER TABLE app.temporary_name RENAME TO a")?; fixture_selection(catalog,major) }).await;
         assert!(
             matches!(aba, Err(Failure::Changed)),
             "change-and-restore escaped the rendering witness"
         );
         restored(&mut conn).await;
 
-        let candidate = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
+        let candidate = owned_once(&mut conn, &BTreeSet::new(), |catalog, major| {
             writer(
                 connection.clone(),
                 "CREATE FUNCTION app.arriving(integer) RETURNS integer LANGUAGE SQL RETURN $1+1",
@@ -728,7 +789,8 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = owned(&mut conn, &BTreeSet::new(), |_, _| Err(Failure::Incomplete)).await;
+        let refusal =
+            owned_once(&mut conn, &BTreeSet::new(), |_, _| Err(Failure::Incomplete)).await;
         assert!(matches!(refusal, Err(Failure::Incomplete)));
         restored(&mut conn).await;
         let scope = super::super::CaptureScope {
@@ -774,7 +836,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let unreadable = owned(&mut conn, &BTreeSet::new(), |_, _| {
+        let unreadable = owned_once(&mut conn, &BTreeSet::new(), |_, _| {
             panic!("unreadable catalog must fail before qualification")
         })
         .await;
@@ -787,7 +849,7 @@ mod tests {
             .await
             .unwrap();
         conn.execute("BEGIN; CREATE TEMP TABLE caller_owned(value integer); INSERT INTO caller_owned VALUES (1)").await.unwrap();
-        let caller = owned(&mut conn, &BTreeSet::new(), |_, _| {
+        let caller = owned_once(&mut conn, &BTreeSet::new(), |_, _| {
             panic!("must refuse before reading")
         })
         .await;
@@ -804,13 +866,14 @@ mod tests {
         // needs no native fixture library or invalid memory layout.
         // A raw catalog is readable even when its type cannot render.
         conn.execute("CREATE TYPE app.unqualified; CREATE FUNCTION app.type_in(cstring) RETURNS app.unqualified LANGUAGE internal IMMUTABLE AS 'textin'; CREATE FUNCTION app.type_out(app.unqualified) RETURNS cstring LANGUAGE internal AS 'shell_out'; CREATE TYPE app.unqualified (INPUT=app.type_in,OUTPUT=app.type_out,INTERNALLENGTH=variable,STORAGE=extended); CREATE TABLE app.unselected(value app.unqualified DEFAULT 'private-fixture'); CREATE TABLE app.fast_default(id integer); INSERT INTO app.fast_default VALUES (1); ALTER TABLE app.fast_default ADD value app.unqualified DEFAULT 'private-fixture'; CREATE FUNCTION app.unselected_function(value app.unqualified DEFAULT 'private-fixture') RETURNS integer LANGUAGE sql AS 'SELECT 1' ").await.unwrap();
-        let unselected = owned(&mut conn, &BTreeSet::new(), |_, _| Ok(Selection::default())).await;
+        let unselected =
+            owned_once(&mut conn, &BTreeSet::new(), |_, _| Ok(Selection::default())).await;
         assert!(
             unselected.is_ok(),
             "an unselected output handler was invoked"
         );
         restored(&mut conn).await;
-        let selected = owned(&mut conn, &BTreeSet::new(), fixture_selection).await;
+        let selected = owned_once(&mut conn, &BTreeSet::new(), fixture_selection).await;
         assert!(
             matches!(selected, Err(Failure::Read)),
             "required unreadable output was accepted"
@@ -842,3 +905,6 @@ mod stored_tests;
 
 #[cfg(test)]
 mod role_tests;
+
+#[cfg(test)]
+mod settle_tests;
