@@ -180,6 +180,7 @@ async fn refusals(conn: &mut Conn) -> anyhow::Result<()> {
     // Absent is not empty.
     let text = refused_table(conn, "snap", "missing").await?;
     assert!(text.contains("no readable columns"), "{text}");
+    row_filters(conn).await?;
     // A name with every quote in it still reads.
     run(conn, "CREATE SCHEMA [we'ird]]s]").await?;
     run(
@@ -197,6 +198,69 @@ async fn refusals(conn: &mut Conn) -> anyhow::Result<()> {
          DROP TABLE snap.temporal; DROP TABLE snap.versioned; DROP TABLE snap.variant",
     )
     .await?;
+    Ok(())
+}
+
+/// SQL Server has no owner bypass for row-level security: the apply login sees
+/// only what an enabled FILTER predicate lets through, so such a table cannot
+/// be compared. A disabled policy and a BLOCK-only one hide nothing.
+async fn row_filters(conn: &mut Conn) -> anyhow::Result<()> {
+    run(conn, "CREATE TABLE snap.rls (v nvarchar(10) NOT NULL)").await?;
+    run(
+        conn,
+        "INSERT snap.rls VALUES (N'a'), (N'hidden'), (N'hidden')",
+    )
+    .await?;
+    run(
+        conn,
+        "CREATE FUNCTION snap.rlsf(@v nvarchar(10)) RETURNS TABLE WITH SCHEMABINDING \
+         AS RETURN SELECT 1 AS ok WHERE @v <> N'hidden'",
+    )
+    .await?;
+    run(
+        conn,
+        "CREATE SECURITY POLICY snap.rlsp ADD FILTER PREDICATE snap.rlsf(v) ON snap.rls \
+         WITH (STATE = ON)",
+    )
+    .await?;
+    let text = refused_table(conn, "snap", "rls").await?;
+    assert!(
+        text.contains("snap.rls") && text.contains("FILTER predicate"),
+        "{text}"
+    );
+    // The policy hides rows from this table only: another table still reads.
+    assert_eq!(read_table(conn, "snap", "words").await?.rows.len(), 6);
+    // Disabled, it hides nothing: all three rows are read, hidden ones included.
+    run(conn, "ALTER SECURITY POLICY snap.rlsp WITH (STATE = OFF)").await?;
+    let read = read_table(conn, "snap", "rls").await?;
+    assert_eq!(count_of(&read, &[Some("hidden")]), 2);
+    assert_eq!(count_of(&read, &[Some("a")]), 1);
+    // A session that cannot see the policy catalog cannot tell "no policy" from
+    // "a policy it cannot see": that is refused too, not read as empty.
+    run(conn, "CREATE USER blind WITHOUT LOGIN").await?;
+    run(conn, "GRANT SELECT ON snap.words TO blind").await?;
+    run(conn, "EXECUTE AS USER = N'blind'").await?;
+    let blind = refused_table(conn, "snap", "words").await;
+    run(conn, "REVERT").await?;
+    let text = blind?;
+    assert!(
+        text.contains("snap.words") && text.contains("could not be seen completely"),
+        "{text}"
+    );
+    // A BLOCK-only policy decides which writes succeed, not which rows are read.
+    run(conn, "CREATE TABLE snap.rlsb (v nvarchar(10) NOT NULL)").await?;
+    run(
+        conn,
+        "CREATE SECURITY POLICY snap.rlsq ADD BLOCK PREDICATE snap.rlsf(v) ON snap.rlsb \
+         AFTER INSERT WITH (STATE = ON)",
+    )
+    .await?;
+    run(conn, "INSERT snap.rlsb VALUES (N'x'), (N'y')").await?;
+    let read = read_table(conn, "snap", "rlsb").await?;
+    assert_eq!(
+        count_of(&read, &[Some("x")]) + count_of(&read, &[Some("y")]),
+        2
+    );
     Ok(())
 }
 

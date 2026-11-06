@@ -3318,7 +3318,9 @@
         "plan_test::session::mssql_tests::m1165_mssql_sealed_database_bounds_every_assertion_and_refuses_a_held_session",
         "test_scratch::tests::live_mssql::a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record",
         "test_scratch::tests::live_mssql::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
-        "test_scratch::tests::live_mssql::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone"
+        "test_scratch::tests::live_mssql::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone",
+        "plan_test::session::mssql_tests::m1165_mssql_snapshot_reads_typed_rows_and_the_engines_own_next_values_as_the_apply_login",
+        "plan_test::session::mssql_tests::m1165_mssql_a_scratch_that_cannot_start_reports_its_recorded_cause"
       ]
     },
     {
@@ -3336,7 +3338,12 @@
         "plan_test1165_mssql::plan_test1165_mssql_replays_a_pinned_fixture_and_the_sealed_candidate_decides_the_exit",
         "plan_test1165_mssql::plan_test1165_mssql_every_assertion_outcome_other_than_zero_rows_fails_with_its_own_kind",
         "plan_test1165_mssql::plan_test1165_mssql_a_fixture_that_leaves_a_transaction_open_fails_and_runs_nothing_after",
-        "plan_test1165_mssql::plan_test1165_mssql_cancellation_and_changed_inputs_cannot_qualify_and_cleanup_is_confirmed"
+        "plan_test1165_mssql::plan_test1165_mssql_cancellation_and_changed_inputs_cannot_qualify_and_cleanup_is_confirmed",
+        "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_moves_the_pin_when_rows_and_allocators_match_even_through_a_trigger",
+        "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_refuses_when_only_the_next_generated_id_differs_and_writes_nothing",
+        "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_refuses_rows_that_differ_only_by_case_or_a_trailing_space",
+        "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_cannot_compare_a_rowversion_and_names_it_without_writing",
+        "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_cannot_establish_an_exhausted_identity_column_and_names_it"
       ]
     }
   ]

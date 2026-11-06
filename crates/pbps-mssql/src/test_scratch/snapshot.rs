@@ -93,6 +93,7 @@ pub async fn read_table(
             "{schema}.{table} has no readable columns, so its rows cannot be compared"
         )));
     }
+    reject_row_filter(conn, schema, table, &relation).await?;
     let mut columns = Vec::new();
     for [column, base, generated] in described.iter().map(|row| [&row[0], &row[1], &row[2]]) {
         // `timestamp` is the catalog's name for `rowversion`.
@@ -131,6 +132,49 @@ pub async fn read_table(
         columns: columns.into_iter().map(|(column, _)| column).collect(),
         rows: counted,
     })
+}
+
+/// Refuses a table whose rows an enabled row-level security FILTER predicate
+/// can hide from this session. SQL Server has no owner bypass: the apply login
+/// (`dbo`) sees only what the predicate lets through, so two databases that
+/// differ only in hidden rows would read as equal and a wrong pin would be
+/// written. The policy catalog counts as evidence only when it is fully
+/// visible (the same test as `drop_requirements`): an unreadable catalog is
+/// not an empty one. A disabled policy and a BLOCK-only policy hide nothing.
+async fn reject_row_filter(
+    conn: &mut impl ExecuteConnection,
+    schema: &str,
+    table: &str,
+    relation: &str,
+) -> Result<(), DbError> {
+    let read = rows_of(
+        conn.query(&format!(
+            "SELECT CONVERT(nvarchar(1), CASE WHEN COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), \
+             N'DATABASE', N'VIEW DEFINITION'), 0) = 1 AND NOT ({denied}) THEN 1 ELSE 0 END) \
+             AS visible, \
+             CONVERT(nvarchar(1), CASE WHEN EXISTS (SELECT 1 FROM sys.security_predicates sp \
+             JOIN sys.security_policies pol ON pol.object_id = sp.object_id \
+             WHERE sp.target_object_id = OBJECT_ID({object}) AND sp.predicate_type = 0 \
+             AND pol.is_enabled = 1) THEN 1 ELSE 0 END) AS filtered",
+            denied = crate::preflight::ROW_SECURITY_DENIED,
+            object = literal(relation),
+        ))
+        .await?,
+        &["visible", "filtered"],
+    )?;
+    match read.first().map(|row| (row[0].as_str(), row[1].as_str())) {
+        Some(("1", "0")) => Ok(()),
+        Some(("1", "1")) => Err(refused(format!(
+            "{schema}.{table} has an enabled row-level security FILTER predicate, which can \
+             hide rows from this session (SQL Server has no owner bypass), so its rows cannot \
+             be compared; disable the policy to re-pin"
+        ))),
+        _ => Err(refused(format!(
+            "{schema}.{table}: the row-level security policies could not be seen completely, \
+             so whether rows are hidden is unknown; grant database VIEW DEFINITION and remove \
+             effective object/schema metadata DENYs"
+        ))),
+    }
 }
 
 /// What `IDENT_CURRENT`, the column's `last_value` and its increment say.

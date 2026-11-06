@@ -4094,7 +4094,10 @@ the one the engine hands out when a probe insert, rolled back, takes it, never
 `IDENT_CURRENT + 1`, which cannot tell a column reseeded before it generated a
 value from one that had. A table with a column no two databases agree on (a
 `rowversion`, a system-versioned period or a ledger column) or of a type that
-cannot be compared makes the re-pin unanswerable and names the column. Confirm comparison,
+cannot be compared makes the re-pin unanswerable and names the column; so does a
+table with an enabled row-level security FILTER predicate, because SQL Server has
+no owner bypass and rows the predicate hides from the apply login would compare
+as equal, and a policy catalog that cannot be seen completely. Confirm comparison,
 cleanup and unchanged input hashes before replacing the manifest; the ADR
 specifies old-input provenance and comparisons across other fixture groups.
 

@@ -1038,6 +1038,19 @@ period or ledger column differs between any two databases by construction, and a
 silently (ADR-0019 §5), so a table with a temporal or rowversion column cannot be
 re-pinned until that is declared another way.
 
+A table with an enabled row-level security FILTER predicate is refused too, before
+its rows are read. Measured: SQL Server has no owner bypass, so the apply login
+(`dbo`) and even `sa` read only the rows the predicate lets through (1 of 3 in
+the measurement), two databases differing only in hidden rows would read as equal,
+and a wrong pin would be written. The policy catalog counts as evidence only when
+fully visible (database `VIEW DEFINITION` and no effective metadata DENY, the test
+`drop_requirements` uses); an unreadable catalog is not an empty one. A disabled
+policy and a BLOCK-only policy hide nothing and still read. PostgreSQL has no such
+gap in this path: its re-pin reads as the scratch superuser, which bypasses row
+security even under `FORCE ROW LEVEL SECURITY` (3 of 3 rows, measured, against 1
+for a non-bypassing owner). Found by ready review round 1 on the head the first
+full gate covered.
+
 The next value of an identity column is the one the engine hands out. Measured:
 `IDENT_CURRENT` alone is ambiguous (after `DBCC CHECKIDENT … RESEED, 50` a column
 that never generated a value hands out 50, one that had hands out 51) and
