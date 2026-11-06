@@ -1444,6 +1444,12 @@ pub struct IndexKeyDto {
     /// collation (`C`), where it is not the column's own (DEC-2448.2).
     #[serde(default)]
     pub collation: Option<String>,
+    /// An operator class's own parameters (BRIN's minmax-multi and Bloom). Read
+    /// only to be refused by name until the part of #2449 that holds them, and
+    /// left out of the published schema for the same reason (DEC-2449.1).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub opclass_parameters: Option<serde::de::IgnoredAny>,
     /// `asc`, the default, or `desc`.
     #[serde(default)]
     pub order: Option<IndexOrder>,

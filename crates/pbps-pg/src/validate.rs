@@ -285,7 +285,9 @@ fn exclusion(
 /// support unique indexes"), `INCLUDE` and `ASC`/`DESC`, and an `int` column
 /// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
-    use crate::index_policy::{ClassProblem, class_problem, holds_key_type, key_scope, offered};
+    use crate::index_policy::{
+        ClassProblem, class_problem, holds_key_type, key_scope, later_class, offered,
+    };
     let policy = index.method.policy();
     let method = index.method.as_str().to_ascii_uppercase();
     let mut found = Vec::new();
@@ -334,19 +336,44 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
             }
         }
         found.extend(key_collation(what, policy, &method, key, table));
+        let mut spoke = false;
         if let (Some(column), false) = (column, policy.typed_columns.is_empty()) {
-            found.extend(typed_column(what, policy, &method, key, column, table));
+            let typed = typed_column(what, policy, &method, key, column, table);
+            spoke = typed.is_some();
+            found.extend(typed);
         }
         let Some(class) = &key.opclass else { continue };
         let at = format!("`{shown}`");
         let named = class.shown();
+        if later_class(policy, class) {
+            // Said instead of the type's own message: the class is the engine's,
+            // and the part that holds it is the next one.
+            if spoke {
+                found.pop();
+            }
+            found.push(invalid(format!(
+                "{what} indexes {at} with operator class `{named}`, which a {method} index \
+                 takes in the next part of #2449 (minmax-multi and Bloom); until then leave \
+                 the class out for the type's default"
+            )));
+            continue;
+        }
+        // The type's message already named the class; a method with no class of
+        // its own to offer has nothing to add to it.
+        if spoke && policy.classes.is_empty() {
+            continue;
+        }
         found.push(invalid(match class_problem(policy, class) {
             None => continue,
             // The B-tree's own wording: its direction words are the likelier slip.
-            Some(ClassProblem::DefaultOnly) => format!(
+            Some(ClassProblem::DefaultOnly) if method == "BTREE" => format!(
                 "{what} indexes {at} with operator class `{named}`; a B-tree index here \
                  takes only its type's default class, so leave the class out \
                  (or, if `{named}` was meant as a direction, it is `asc` or `desc`)"
+            ),
+            Some(ClassProblem::DefaultOnly) => format!(
+                "{what} indexes {at} with operator class `{named}`; a {method} index here \
+                 takes only its type's default class, so leave the class out"
             ),
             Some(ClassProblem::DefaultSpelledOut) => format!(
                 "{what} names `{named}` for {at}, which is {method}'s default for \
@@ -463,10 +490,15 @@ fn typed_column(
                 .find(|(base, _)| *base == ty.base)
         })
         .flatten();
+    let example = if method == "BRIN" {
+        "(flag::integer)"
+    } else {
+        "int4range(a, b)"
+    };
     let Some((_, required)) = admitted else {
         return Some(invalid(format!(
             "{what} is a {method} index over `{shown}` of type `{}`, which has no {method} \
-             operator class here; index an expression over it, such as `int4range(a, b)` \
+             operator class here; index an expression over it, such as `{example}` \
              (this model holds {method} over a column of the types {} only)",
             pbps_model::escape::Escaped(&ty.base),
             policy
@@ -1269,6 +1301,109 @@ mod tests {
         let mut desc = gist_table(Gist, &[("doc", None, None)]);
         desc.indexes.get_mut("ix").unwrap().columns[0].descending = true;
         assert!(structure(&desc).join("\n").contains("has no order"));
+    }
+
+    /// BRIN over every column type the engine gives a default class (the minmax
+    /// ones, and inclusion for `inet`/`cidr`) and over any expression, with
+    /// several keys, a predicate and either option (DEC-2449.1; measured on
+    /// 16.15 and 18.6).
+    #[test]
+    fn a_brin_key_is_a_type_with_a_default_class_or_an_expression() {
+        use IndexMethod::Brin;
+        for keys in [
+            vec![("n", None, None)],
+            vec![("body", None, None)],
+            vec![("ip", None, None)],
+            vec![("net", None, None)],
+            vec![("n", None, None), ("body", None, None)],
+            // An expression over a type with no BRIN class is the advised way.
+            vec![("(doc::text)", None, None)],
+            vec![("int4range(n, n + 1)", None, None)],
+        ] {
+            assert!(structure(&gist_table(Brin, &keys)).is_empty(), "{keys:?}");
+        }
+        let mut filtered = gist_table(Brin, &[("n", None, None)]);
+        let ix = filtered.indexes.get_mut("ix").unwrap();
+        ix.filter = Some("n > 0".into());
+        ix.storage_parameters = [
+            ("pages_per_range".to_owned(), "16".to_owned()),
+            ("autosummarize".to_owned(), "true".to_owned()),
+        ]
+        .into();
+        assert!(structure(&filtered).is_empty());
+    }
+
+    /// Negative: BRIN is never unique, ordered or `INCLUDE`d; a column the
+    /// engine has no class for (`tsvector`, an array, a user type) is refused with
+    /// the advice to index an expression; the type's own default class is
+    /// "leave it out"; minmax-multi and Bloom are named as the next part; a
+    /// collation and a class of another schema are refused by name.
+    #[test]
+    fn a_brin_index_the_engine_or_this_part_does_not_hold_is_refused_by_name() {
+        use IndexMethod::Brin;
+        let said = |keys: &[(&str, Option<&str>, Option<&str>)]| {
+            structure(&gist_table(Brin, keys)).join("\n")
+        };
+        for column in ["doc", "tags", "nums"] {
+            let found = said(&[(column, None, None)]);
+            assert!(
+                found.contains("index an expression") && found.contains("(flag::integer)"),
+                "{column}: {found}"
+            );
+        }
+        let mut user = gist_table(Brin, &[("n", None, None)]);
+        user.columns.insert(
+            "mood".into(),
+            pbps_model::Column::new("app.mood".parse().unwrap()),
+        );
+        user.indexes.get_mut("ix").unwrap().columns = vec![pbps_model::IndexColumn::column("mood")];
+        assert!(structure(&user).join("\n").contains("index an expression"));
+        let spelled = said(&[("n", Some("int4_minmax_ops"), None)]);
+        assert!(
+            spelled.contains("leave the class out") && !spelled.contains("B-tree"),
+            "{spelled}"
+        );
+        for class in [
+            "int4_minmax_multi_ops",
+            "int4_bloom_ops",
+            "pg_catalog.int4_bloom_ops",
+        ] {
+            let later = said(&[("n", Some(class), None)]);
+            assert!(
+                later.contains("next part of #2449")
+                    && later.matches("operator class").count() == 1,
+                "{class}: {later}"
+            );
+        }
+        let expression = said(&[("int4range(n, n)", Some("range_inclusion_ops"), None)]);
+        assert!(
+            expression.contains("only its type's default class"),
+            "{expression}"
+        );
+        let outside = said(&[("n", Some("ext.int4_minmax_ops"), None)]);
+        assert!(
+            outside.contains("a schema owns") || outside.contains("leave the class out"),
+            "{outside}"
+        );
+        assert!(said(&[("body", None, Some("C"))]).contains("a BRIN index has no collation"));
+        let mut unique = gist_table(Brin, &[("n", None, None)]);
+        unique.indexes.get_mut("ix").unwrap().unique = true;
+        assert!(structure(&unique).join("\n").contains("cannot be unique"));
+        let mut include = gist_table(Brin, &[("n", None, None)]);
+        include.indexes.get_mut("ix").unwrap().include = vec!["body".into()];
+        assert!(structure(&include).join("\n").contains("cannot include"));
+        let mut desc = gist_table(Brin, &[("n", None, None)]);
+        desc.indexes.get_mut("ix").unwrap().columns[0].descending = true;
+        assert!(structure(&desc).join("\n").contains("has no order"));
+        // Negative control for the message change: the B-tree keeps its words.
+        let btree = structure(&gist_table(
+            IndexMethod::Btree,
+            &[("n", Some("int4_ops"), None)],
+        ));
+        assert!(
+            btree.join("\n").contains("a B-tree index here"),
+            "{btree:?}"
+        );
     }
 
     /// A column key may be collated by a `pg_catalog` collation on a column the

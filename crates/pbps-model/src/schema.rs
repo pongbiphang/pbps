@@ -1639,11 +1639,20 @@ pub enum IndexMethod {
     /// PostgreSQL's generalized search tree: range, `tsvector`, `inet` and the
     /// other geometric-style keys, mostly through an expression (DEC-2448.2).
     Gist,
+    /// PostgreSQL's block range index: the built-in minmax and inclusion
+    /// classes over a column of a type with a default class, or an expression
+    /// (DEC-2449.1).
+    Brin,
 }
 
 impl IndexMethod {
     /// Every method this model holds, in the order a message lists them.
-    pub const ALL: [IndexMethod; 3] = [IndexMethod::Btree, IndexMethod::Gin, IndexMethod::Gist];
+    pub const ALL: [IndexMethod; 4] = [
+        IndexMethod::Btree,
+        IndexMethod::Gin,
+        IndexMethod::Gist,
+        IndexMethod::Brin,
+    ];
 
     pub fn is_btree(&self) -> bool {
         *self == IndexMethod::Btree
@@ -1655,6 +1664,7 @@ impl IndexMethod {
             IndexMethod::Btree => "btree",
             IndexMethod::Gin => "gin",
             IndexMethod::Gist => "gist",
+            IndexMethod::Brin => "brin",
         }
     }
 

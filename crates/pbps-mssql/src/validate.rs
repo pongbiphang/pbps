@@ -2285,6 +2285,8 @@ mod tests {
         );
         let gist = messages(index(IndexMethod::Gist, None));
         assert!(gist.iter().any(|m| m.contains("`gist` method")), "{gist:?}");
+        let brin = messages(index(IndexMethod::Brin, None));
+        assert!(brin.iter().any(|m| m.contains("`brin` method")), "{brin:?}");
         let class = messages(index(IndexMethod::Btree, Some("dsc")));
         assert!(
             class

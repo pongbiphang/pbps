@@ -82,3 +82,4 @@ DECISIONS 465).
 - `91/` adds the `gist` index method and an index key's `collation:` (#2448 PR B).
 - `92/` adds the `ids_dir` key of `pbps.yml`, the directory of per-declaration identity files (#2600 PR 3).
 - `94/` adds the `exclude:` block of a table: an exclusion constraint's method, keys with their operators, payload, predicate, storage parameters and timing (#2448 PR C1).
+- `96/` adds the `brin` index method (#2449 PR R1).

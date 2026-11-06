@@ -40,6 +40,16 @@ pub(crate) fn class_problem(policy: &MethodPolicy, class: &OpClassRef) -> Option
     (!policy.classes.contains(&name)).then_some(ClassProblem::NotHeld)
 }
 
+/// Whether `class` is one of the engine's own that a later part of the same
+/// issue brings to `policy`'s method (BRIN's minmax-multi and Bloom, DEC-2449.1):
+/// refused by name as arriving, not as unknown.
+pub(crate) fn later_class(policy: &MethodPolicy, class: &OpClassRef) -> bool {
+    policy.method == pbps_model::IndexMethod::Brin
+        && class
+            .as_bare()
+            .is_some_and(|n| n.ends_with("_minmax_multi_ops") || n.ends_with("_bloom_ops"))
+}
+
 /// Whether `column` is of the one type the method is held over, where it has
 /// one. Not an array of it, whose base is the element's (#1525 review).
 pub(crate) fn holds_key_type(policy: &MethodPolicy, column: &Column) -> bool {

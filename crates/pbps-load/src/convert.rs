@@ -1136,6 +1136,8 @@ fn convert_exclusions(
                 opclass: e.opclass.clone(),
                 collation: e.collation.clone(),
                 order: e.order,
+                // An exclusion key has no class parameters to declare.
+                opclass_parameters: None,
             };
             let spanned = Spanned {
                 value: as_index,
@@ -1363,6 +1365,12 @@ fn parse_index_key(
         (Some(_), Some(_)) => return Err(bad("a key names a column or an expression, not both")),
         (None, None) => return Err(bad("a key names a column or an expression")),
     };
+    if e.opclass_parameters.is_some() {
+        return Err(bad(
+            "`opclass_parameters:` arrives with BRIN's minmax-multi and Bloom classes, the next \
+             part of #2449",
+        ));
+    }
     let opclass = e
         .opclass
         .as_deref()

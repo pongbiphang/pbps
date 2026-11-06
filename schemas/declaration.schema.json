@@ -819,6 +819,11 @@
           "description": "PostgreSQL's generalized search tree: range, `tsvector`, `inet` and the\nother geometric-style keys, mostly through an expression (DEC-2448.2).",
           "type": "string",
           "const": "gist"
+        },
+        {
+          "description": "PostgreSQL's block range index: the built-in minmax and inclusion\nclasses over a column of a type with a default class, or an expression\n(DEC-2449.1).",
+          "type": "string",
+          "const": "brin"
         }
       ]
     },
@@ -1997,6 +2002,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 94,
+  "x-pbps-schema-version": 96,
   "x-pbps-tool-version": "0.0.0"
 }

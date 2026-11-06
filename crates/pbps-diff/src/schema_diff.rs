@@ -6754,6 +6754,7 @@ fn diff_constraints_by(
     let pk_bare = |pk: &PrimaryKey| bare(pk, |p| p.storage_parameters.clear());
     let unique_bare = |u: &UniqueConstraint| bare(u, |u| u.storage_parameters.clear());
     let index_bare = |ix: &Index| bare(ix, |ix| ix.storage_parameters.clear());
+    let partitioned = declared.partition_by.is_some();
     let refused = std::cell::RefCell::new(Vec::new());
     // `None` replaces the part, `Some(None)` leaves it, `Some(Some(_))` alters it.
     let parameters = |target: IndexPart,
@@ -6764,6 +6765,12 @@ fn diff_constraints_by(
         match parameter_edit(policy_of(method), was, now) {
             ParameterEdit::Unchanged => Some(None),
             ParameterEdit::Rebuild => None,
+            // A partitioned parent's index takes no `ALTER INDEX SET`/`RESET`
+            // of any method (42809, measured on 16.15 and 18.6, #2709), so an
+            // option the engine would change in place on an ordinary table is
+            // a rebuild here: the parent is dropped and created again with
+            // the declared options, which its leaves are created from.
+            ParameterEdit::Alter { .. } if partitioned => None,
             ParameterEdit::Refuse { parameter } => {
                 refused.borrow_mut().push(DiffError::IndexParameterRefused {
                     table: name.clone(),
@@ -11093,6 +11100,15 @@ mod tests {
     fn every_parameter_btree_and_gin_hold_is_altered_in_place() {
         for method in IndexMethod::ALL {
             for parameter in method.policy().parameters {
+                // BRIN's `pages_per_range` is the one rebuild (DEC-2449.1).
+                if parameter.change == pbps_model::storage::ParameterChange::Rebuild {
+                    let now = parameters_of(&[(parameter.name, "1")]);
+                    assert!(matches!(
+                        parameter_edit(method.policy(), &BTreeMap::new(), &now),
+                        ParameterEdit::Rebuild
+                    ));
+                    continue;
+                }
                 let now = parameters_of(&[(parameter.name, "1")]);
                 assert!(
                     matches!(
@@ -11259,6 +11275,101 @@ mod tests {
                     [Change::SetIndexStorageParameters { .. }]
                 )
         );
+    }
+
+    /// A partitioned parent's index takes no `ALTER INDEX SET`/`RESET` in any
+    /// method (42809, #2709), so an option the engine alters in place on an
+    /// ordinary table is a rebuild on the parent, for every method, in both
+    /// directions; the ordinary table still alters in place (negative), and an
+    /// option that is a rebuild anyway stays one (DEC-2449.1).
+    #[test]
+    fn an_index_option_change_on_a_partitioned_parent_is_a_rebuild_for_every_method() {
+        let table_with = |method: IndexMethod, parameters: &[(&str, &str)], partitioned: bool| {
+            let mut t = Table::default();
+            t.columns
+                .insert("a".into(), Column::new("int".parse().unwrap()));
+            t.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![pbps_model::IndexColumn::column("a")],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method,
+                    storage_parameters: parameters_of(parameters),
+                },
+            );
+            if partitioned {
+                t.partition_by = Some(pbps_model::PartitionBy {
+                    external: false,
+                    columns: vec!["a".into()],
+                    strategy: Default::default(),
+                });
+            }
+            t
+        };
+        let run = |method, was: &[(&str, &str)], now: &[(&str, &str)], partitioned| {
+            let mut changes = Vec::new();
+            let mut errs = Vec::new();
+            diff_constraints(
+                &"app.t".parse().unwrap(),
+                &table_with(method, was, partitioned),
+                &table_with(method, now, partitioned),
+                &mut changes,
+                &mut errs,
+            );
+            assert!(errs.is_empty(), "{errs:?}");
+            changes
+        };
+        for (method, name, value) in [
+            (IndexMethod::Btree, "fillfactor", "70"),
+            (IndexMethod::Gin, "fastupdate", "false"),
+            (IndexMethod::Gist, "fillfactor", "70"),
+            (IndexMethod::Brin, "autosummarize", "true"),
+        ] {
+            let now = [(name, value)];
+            // Set, change and reset on the parent are each a drop and an add
+            // that carries the final options.
+            for (was, now) in [(&[][..], &now[..]), (&now[..], &[][..])] {
+                let changes = run(method, was, now, true);
+                assert!(
+                    matches!(
+                        changes.as_slice(),
+                        [Change::DropIndex { .. }, Change::AddIndex { index, .. }]
+                            if index.storage_parameters.len() == now.len()
+                    ),
+                    "{method:?} {name}: {changes:?}"
+                );
+                // Negative: the same edit on an ordinary table alters in place.
+                let changes = run(method, was, now, false);
+                assert!(
+                    matches!(
+                        changes.as_slice(),
+                        [Change::SetIndexStorageParameters { .. }]
+                    ),
+                    "{method:?} {name}: {changes:?}"
+                );
+            }
+            // Negative: nothing changed, nothing planned, partitioned or not.
+            assert!(run(method, &now, &now, true).is_empty());
+        }
+        // BRIN's `pages_per_range` is a rebuild whether the table is partitioned
+        // or not: the native `ALTER` leaves the metapage at the old granularity.
+        for partitioned in [false, true] {
+            let changes = run(
+                IndexMethod::Brin,
+                &[("pages_per_range", "16")],
+                &[("pages_per_range", "4")],
+                partitioned,
+            );
+            assert!(
+                matches!(
+                    changes.as_slice(),
+                    [Change::DropIndex { .. }, Change::AddIndex { .. }]
+                ),
+                "{partitioned}: {changes:?}"
+            );
+        }
     }
 
     /// A table with a key, a UNIQUE constraint and an index, clustered on

@@ -291,7 +291,9 @@ use crate::zone::SessionZone;
 // build would reject the field as malformed rather than as a newer plan.
 // 68 adds a table's exclusion constraints (DEC-2448.3): an older build would drop a table's
 // `exclude` from a payload it carries.
-pub const CURRENT_VERSION: u32 = 68;
+// 69 adds the BRIN index method (DEC-2449.1): an older build would read `brin` as an unknown
+// value.
+pub const CURRENT_VERSION: u32 = 69;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1421,7 +1423,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 68);
+        assert_eq!(plan.version, 69);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

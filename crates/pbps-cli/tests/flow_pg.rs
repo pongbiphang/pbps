@@ -150,6 +150,8 @@ mod extensions2447_move;
 mod extensions2447_types;
 #[path = "support/extensions2447_update.rs"]
 mod extensions2447_update;
+#[path = "support/index_brin2449.rs"]
+mod index_brin2449;
 #[path = "support/index_gist2448.rs"]
 mod index_gist2448;
 
