@@ -165,13 +165,21 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
         bail!("the new tree reads back to a different mapping; nothing was written");
     }
     // A tree beside the file is acceptable only as the half-finished result of
-    // this very command; anything else is somebody's work.
-    if !tree.is_empty() && tree != files {
+    // this very command: every file already there is one it would write, byte
+    // for byte, and the rest are still to come. A crash inside the write loop
+    // leaves exactly that. A file it would not write, or would write
+    // differently, is somebody's work.
+    for (rel, text) in &tree {
+        let why = match files.get(rel) {
+            Some(expected) if expected == text => continue,
+            Some(_) => "differs from what migrate would write",
+            None => "is not a file migrate would write",
+        };
         bail!(
-            "`{}` already holds an identity tree that differs from `{}`; migrate refuses to \
-             overwrite it. Remove one of them after checking `git diff`",
-            dirs.ids,
-            project.ids_file().display()
+            "`{}` {why}, so `{}` is not the half-finished result of an earlier migrate; migrate \
+             refuses to overwrite it. Remove one of them after checking `git diff`",
+            shown(&dirs, rel),
+            dirs.ids
         );
     }
     let config = new_config_text(project)?;
@@ -507,7 +515,10 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
                 return Ok(None);
             }
             let text =
-                crate::baseline::git(project.root(), &["show", &format!(":{n}:{git_path}")])?;
+                // `./` makes the path relative to the project, which is where git
+            // runs; a bare path is relative to the repository root, and in a
+            // subdirectory that names another project's file or none.
+            crate::baseline::git(project.root(), &["show", &format!(":{n}:./{git_path}")])?;
             Ok(Some(ids_tree::parse(&rel, &text)?))
         };
         let (base, ours, theirs) = match (stage(1), stage(2), stage(3)) {

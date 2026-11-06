@@ -59,7 +59,20 @@ pub(crate) fn working_tree_present(root: &Path, dir: &Path) -> std::io::Result<b
 pub(crate) fn tree_present_at(root: &Path, rev: &str, ids_dir_rel: &str) -> anyhow::Result<bool> {
     let listed = crate::baseline::git(
         root,
-        &["ls-tree", "-r", "--name-only", "-z", rev, "--", ids_dir_rel],
+        // `--full-tree`: the path is as git names it from the repository root
+        // (callers compose it with the project's prefix), while `ls-tree` reads
+        // a bare path from where it runs, which in a subdirectory is the wrong
+        // place and finds nothing.
+        &[
+            "ls-tree",
+            "--full-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            rev,
+            "--",
+            ids_dir_rel,
+        ],
     )
     .with_context(|| format!("cannot list `{ids_dir_rel}` at `{rev}`"))?;
     Ok(!listed.is_empty())

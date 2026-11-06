@@ -6,18 +6,24 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct Project(PathBuf);
+/// The project directory, and the root of the git repository around it (the
+/// same directory unless the project lives in a subdirectory).
+struct Project(PathBuf, PathBuf);
 
 impl Project {
     fn new() -> Self {
+        Self::in_subdirectory("")
+    }
+    fn in_subdirectory(sub: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pbps-ids-cmd-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        let dir = root.join(sub);
         std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(dir, root)
     }
     fn write(&self, rel: &str, text: &str) {
         let path = self.0.join(rel);
@@ -42,7 +48,7 @@ impl Project {
             .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
-            .current_dir(&self.0)
+            .current_dir(&self.1)
             .output()
             .unwrap()
     }
@@ -53,7 +59,7 @@ impl Project {
 }
 impl Drop for Project {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
@@ -100,7 +106,11 @@ fn legacy() -> IdsFile {
 }
 
 fn legacy_project() -> Project {
-    let p = Project::new();
+    legacy_project_in("")
+}
+
+fn legacy_project_in(sub: &str) -> Project {
+    let p = Project::in_subdirectory(sub);
     p.write(
         "pbps.yml",
         "# the project\ndialect: postgres\nids_file: schema.ids.json\n",
@@ -270,7 +280,11 @@ fn migrate_without_any_identity_file_says_there_is_nothing_to_migrate() {
 // -------------------------------------------------------------------- fmt ---
 
 fn migrated() -> Project {
-    let p = legacy_project();
+    migrated_in("")
+}
+
+fn migrated_in(sub: &str) -> Project {
+    let p = legacy_project_in(sub);
     assert_ok(&p.pbps(&["ids", "migrate"]));
     p
 }
@@ -312,7 +326,20 @@ fn fmt_refuses_a_malformed_file_and_rewrites_none() {
 /// A project in git where two branches renamed the same column differently.
 /// The merge is left in progress: the YAML and the ids file both conflict.
 fn conflicted() -> Project {
-    let p = migrated();
+    conflicted_in("")
+}
+
+fn conflicted_in(sub: &str) -> Project {
+    let p = migrated_in(sub);
+    if !sub.is_empty() {
+        // Another project at the repository root keeps a file at the very same
+        // relative path: a bare path in an index lookup would read it instead.
+        let other = p
+            .read(".pbps/ids/dbo/customer.json")
+            .replace("t_aaaaaa", "t_bbbbbb");
+        std::fs::create_dir_all(p.1.join(".pbps/ids/dbo")).unwrap();
+        std::fs::write(p.1.join(".pbps/ids/dbo/customer.json"), other).unwrap();
+    }
     p.git_ok(&["init", "-q", "-b", "main"]);
     p.git_ok(&["add", "-A"]);
     p.git_ok(&["commit", "-q", "-m", "base"]);
@@ -477,4 +504,88 @@ fn a_revision_holding_the_tree_and_no_legacy_blob_is_refused_by_since() {
         "{}",
         text(&out)
     );
+}
+
+// ------------------------------------------- a project below the repo root ---
+
+#[test]
+fn resolve_reads_its_own_projects_stages_when_the_project_is_in_a_subdirectory() {
+    let p = conflicted_in("apps/db");
+    let neighbour = std::fs::read_to_string(p.1.join(".pbps/ids/dbo/customer.json")).unwrap();
+    p.write(
+        "schema/dbo/customer.yml",
+        &CUSTOMER.replace("full_name", "display_name"),
+    );
+    assert_ok(&p.pbps(&["ids", "resolve"]));
+    let ids = p.read(".pbps/ids/dbo/customer.json");
+    assert!(ids.contains("\"c_aaaaa2\": \"display_name\""), "{ids}");
+    // The project at the repository root was neither read nor touched.
+    let after = std::fs::read_to_string(p.1.join(".pbps/ids/dbo/customer.json")).unwrap();
+    assert_eq!(after, neighbour);
+}
+
+#[test]
+fn since_sees_the_tree_of_a_revision_when_the_project_is_in_a_subdirectory() {
+    let p = migrated_in("apps/db");
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "migrated"]);
+    std::fs::remove_dir_all(p.0.join(".pbps")).unwrap();
+    p.write("pbps.yml", "dialect: postgres\n");
+    p.write(
+        "schema.ids.json",
+        &(serde_json::to_string_pretty(&legacy()).unwrap() + "\n"),
+    );
+    let out = p.pbps(&["validate", "--since", "HEAD"]);
+    assert!(text(&out).contains(NOT_READ), "{}", text(&out));
+}
+
+// ------------------------------------------------ migrate resumes mid-write ---
+
+/// The files `migrate` writes for `legacy_project()`, taken from a run on a twin.
+fn expected_tree() -> std::collections::BTreeMap<String, String> {
+    let twin = migrated();
+    tree_of(&twin)
+}
+
+#[test]
+fn migrate_resumes_from_a_tree_missing_some_of_its_files() {
+    let expected = expected_tree();
+    assert!(expected.len() >= 4);
+    // A crash inside the write loop leaves a prefix of the files, whichever.
+    for kept in 1..expected.len() {
+        let p = legacy_project();
+        for (rel, text) in expected.iter().take(kept) {
+            p.write(&format!(".pbps/ids/{rel}"), text);
+        }
+        assert_ok(&p.pbps(&["ids", "migrate"]));
+        assert_eq!(tree_of(&p), expected, "after keeping {kept}");
+        assert!(!p.has("schema.ids.json"));
+        assert!(p.read("pbps.yml").contains("ids_dir: .pbps/ids"));
+    }
+}
+
+#[test]
+fn migrate_refuses_a_partial_tree_with_an_extra_or_a_differing_file_and_writes_nothing() {
+    let expected = expected_tree();
+    let (first, text) = expected.iter().next().unwrap();
+    let stray = legacy_project();
+    stray.write(&format!(".pbps/ids/{first}"), text);
+    stray.write(".pbps/ids/stray.json", "{}");
+    assert_refused(&stray.pbps(&["ids", "migrate"]), "stray.json");
+    // A file migrate would write, with its identity changed (proved to differ,
+    // since a replace that matches nothing reads like one that worked).
+    let customer = &expected["dbo/customer.json"];
+    let changed = customer.replace("t_aaaaaa", "t_cccccc");
+    assert_ne!(&changed, customer);
+    let differing = legacy_project();
+    differing.write(".pbps/ids/dbo/customer.json", &changed);
+    assert_refused(&differing.pbps(&["ids", "migrate"]), "differs");
+    for p in [&stray, &differing] {
+        assert!(p.has("schema.ids.json"));
+        assert!(p.read("pbps.yml").contains("ids_file"));
+        // Only what was put there: nothing else was written beside it.
+        let files = tree_of(p);
+        assert!(files.len() <= 2, "{:?}", files.keys().collect::<Vec<_>>());
+    }
 }

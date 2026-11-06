@@ -1449,9 +1449,10 @@ finding with `pbps plan` as the remedy.
 dropped object at `<name>.<uid>.json` under the root because no YAML names its
 place, and writes nothing unless the tree reads back to the very mapping it came
 from. It refuses an identity with no declaration and no tombstone, and a tree
-that differs from the one it would write. A tree identical to it is accepted, so
-an interrupted run (tree written, file or config not yet changed) is finished by
-running it again; with no old file and a tree standing it only completes the
+that holds a file it would not write or would write differently. A tree whose
+every file is one it would write, byte for byte, is accepted, so an interrupted
+run (a subset of the tree, or the tree written and the file or config not yet
+changed) is finished by running it again, writing only what is missing; with no old file and a tree standing it only completes the
 config, and when that is done it says so and does nothing. The order is tree,
 old file, config, so the config still tells where a custom `ids_file` was until
 that file is gone. `pbps.yml` is edited as text to keep its comments and then
@@ -1470,3 +1471,10 @@ which no longer calls such a project fresh. A directory with entries, or a path
 that is not a directory, is a tree; only an absent or empty directory is not.
 `migrate` itself reads the legacy file directly, so it can still finish an
 interrupted run. The guard goes away with the legacy reader in the switch.
+
+`resolve` reads the index with `./`-relative paths and `ls-tree` with
+`--full-tree`: git runs in the project directory, and a bare path in a
+`:<stage>:<path>` lookup is relative to the repository root, so in a project
+below the root it reads another project's file or none. (A leftover `.tmp` file
+from a write cut off inside the rename is refused by name, like any entry that
+is not an identity file; delete it and run migrate again.)
