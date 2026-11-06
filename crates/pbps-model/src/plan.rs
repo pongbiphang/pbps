@@ -289,7 +289,9 @@ use crate::zone::SessionZone;
 // would read `gist` as an unknown value and drop the collation; 65 belongs to another change.
 // 67 adds the package a referenced base type belongs to on a type pin (DEC-2447.12): an older
 // build would reject the field as malformed rather than as a newer plan.
-pub const CURRENT_VERSION: u32 = 67;
+// 68 adds a table's exclusion constraints (DEC-2448.3): an older build would drop a table's
+// `exclude` from a payload it carries.
+pub const CURRENT_VERSION: u32 = 68;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1419,7 +1421,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 67);
+        assert_eq!(plan.version, 68);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

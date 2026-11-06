@@ -855,6 +855,7 @@ fn mirror(selector: &Selector) -> SelectorWire {
             PartKey::Unique(n) => SelectorWire::Unique(named(n.raw())),
             PartKey::ForeignKey(n) => SelectorWire::ForeignKey(named(n.raw())),
             PartKey::Check(n) => SelectorWire::Check(named(n.raw())),
+            PartKey::Exclusion(n) => SelectorWire::Exclusion(named(n.raw())),
             PartKey::Index(n) => SelectorWire::Index(named(n.raw())),
             PartKey::Computed(n) => SelectorWire::Computed(named(n.raw())),
             PartKey::Policy(n) => SelectorWire::Policy(n.clone()),
@@ -875,6 +876,7 @@ fn every_selector() -> Vec<Selector> {
         Selector::Part(PartKey::Unique(n("u"))),
         Selector::Part(PartKey::ForeignKey(n("f"))),
         Selector::Part(PartKey::Check(n("c"))),
+        Selector::Part(PartKey::Exclusion(n("x"))),
         Selector::Part(PartKey::Index(n("i"))),
         Selector::Part(PartKey::Computed("k".into())),
         Selector::Part(PartKey::Policy("p".into())),
@@ -897,8 +899,8 @@ fn a_selectors_schema_describes_what_its_codec_writes() {
 fn a_selectors_schema_has_one_branch_per_wire_form() {
     let schema = schemars::schema_for!(Selector).to_value();
     let branches = schema["oneOf"].as_array().expect("an enum schema");
-    // Seven kinds with no name share one `enum` branch; six carry a name.
-    assert_eq!(branches.len(), 1 + 6, "{schema}");
+    // Seven kinds with no name share one `enum` branch; seven carry a name.
+    assert_eq!(branches.len(), 1 + 7, "{schema}");
     let unit = branches
         .iter()
         .find_map(|b| b["enum"].as_array())

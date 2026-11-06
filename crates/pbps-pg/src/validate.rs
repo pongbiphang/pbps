@@ -146,7 +146,13 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         .filter_map(|key| key.name.as_ref().map(|name| ("primary key", name)))
         .chain(table.unique.keys().map(|name| ("unique constraint", name)))
         .chain(table.foreign_keys.keys().map(|name| ("foreign key", name)))
-        .chain(table.checks.keys().map(|name| ("check constraint", name)));
+        .chain(table.checks.keys().map(|name| ("check constraint", name)))
+        .chain(
+            table
+                .exclude
+                .keys()
+                .map(|name| ("exclusion constraint", name)),
+        );
     for (kind, name) in constraints {
         if name.raw().starts_with(crate::emit::SCAN_CHECK_PREFIX) {
             found.push(invalid(format!(
@@ -159,44 +165,111 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     }
     for (name, index) in &table.indexes {
         let what = format!("index `{name}`", name = name.shown(),);
-        // Column keys are held to the table; an expression key to being an
-        // expression at all, as a filter is (DEC-1169.2). An index of
-        // expression keys alone names no column and is not empty.
-        let keys: Vec<_> = index
-            .columns
-            .iter()
-            .filter_map(|c| c.key.column().cloned())
-            .collect();
-        if index.columns.is_empty() || !keys.is_empty() {
-            found.extend(key_columns(&what, &keys, table, false));
-        }
-        for key in &index.columns {
-            if let Some(expression) = key.key.expression()
-                && crate::LEXICON.expression_in(expression) == Expression::Absent
-            {
-                found.push(invalid(format!("{what} has an empty key expression")));
-            }
-        }
-        for column in &index.include {
-            if !table.columns.contains_key(column) {
-                found.push(invalid(format!(
-                    "{what} includes `{column}`, which is not a column of this table",
-                    column = column.shown(),
-                )));
-            }
-        }
-        // The same question, and the same answer: measured, a partial index's
-        // `WHERE` refuses a comment-only or whitespace-only expression exactly
-        // as a check constraint does.
-        if index
-            .filter
-            .as_ref()
-            .is_some_and(|f| crate::LEXICON.expression_in(f) == Expression::Absent)
-        {
-            found.push(invalid(format!("{what} has an empty filter expression")));
-        }
-        found.extend(index_method(&what, index, table));
+        found.extend(index_shape(&what, index, table));
     }
+    found
+}
+
+/// The checks of a table's exclusion constraints. Apart from
+/// [`table_structure`]: that one is skipped for a partition, whose columns are
+/// its parent's, but an exclusion declared on a partition is the very thing
+/// `exclusion` refuses, so these run for every declaration.
+pub(crate) fn table_exclusions(table: &Table) -> Vec<DialectError> {
+    table
+        .exclude
+        .iter()
+        .flat_map(|(name, x)| exclusion(name, x, table))
+        .collect()
+}
+
+/// What an index and an exclusion constraint's backing index have in common:
+/// the keys held to the table, an expression to being one, the payload and
+/// the predicate, then the method's rules (DEC-1169.2, DEC-2448.1).
+fn index_shape(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    // Column keys are held to the table; an expression key to being an
+    // expression at all, as a filter is (DEC-1169.2). An index of
+    // expression keys alone names no column and is not empty.
+    let keys: Vec<_> = index
+        .columns
+        .iter()
+        .filter_map(|c| c.key.column().cloned())
+        .collect();
+    if index.columns.is_empty() || !keys.is_empty() {
+        found.extend(key_columns(what, &keys, table, false));
+    }
+    for key in &index.columns {
+        if let Some(expression) = key.key.expression()
+            && crate::LEXICON.expression_in(expression) == Expression::Absent
+        {
+            found.push(invalid(format!("{what} has an empty key expression")));
+        }
+    }
+    for column in &index.include {
+        if !table.columns.contains_key(column) {
+            found.push(invalid(format!(
+                "{what} includes `{column}`, which is not a column of this table",
+                column = column.shown(),
+            )));
+        }
+    }
+    // The same question, and the same answer: measured, a partial index's
+    // `WHERE` refuses a comment-only or whitespace-only expression exactly
+    // as a check constraint does.
+    if index
+        .filter
+        .as_ref()
+        .is_some_and(|f| crate::LEXICON.expression_in(f) == Expression::Absent)
+    {
+        found.push(invalid(format!("{what} has an empty filter expression")));
+    }
+    found.extend(index_method(what, index, table));
+    found
+}
+
+/// An exclusion constraint (DEC-2448.3). Its keys, payload and predicate are an
+/// index's, so they are asked as an index's are; what is its own is the method
+/// (one the engine can back one with), the operator of each key, and where it
+/// may stand. Whether an operator is commutative, is a member of the key's
+/// operator family or returns a boolean is the engine's to say, as which key
+/// types a method takes is: it refuses with its own message at the rehearsal.
+fn exclusion(
+    name: &pbps_model::ObjectLocalName,
+    x: &pbps_model::ExclusionConstraint,
+    table: &Table,
+) -> Vec<DialectError> {
+    let what = format!("exclusion constraint `{name}`", name = name.shown());
+    let mut found = Vec::new();
+    // A partitioned parent's and a partition's own arrive in PR E: the engine
+    // differs by version (16 refuses a parent's, 18 requires the partition key).
+    if table.partition_by.is_some() || table.partition_of.is_some() {
+        found.push(invalid(format!(
+            "{what} is declared on a partitioned table or a partition, which this tool does not \
+             hold yet: PostgreSQL 16 refuses one on a partitioned table and 18 requires the \
+             partition key (DEC-2448.3)"
+        )));
+        return found;
+    }
+    if !x.method.policy().exclusion {
+        found.push(invalid(format!(
+            "{what} names the `{}` method, which cannot back an exclusion constraint; use `btree` \
+             or `gist`",
+            x.method.as_str()
+        )));
+        return found;
+    }
+    if x.keys.is_empty() {
+        found.push(invalid(format!("{what} has no keys")));
+    }
+    let as_index = Index {
+        columns: x.keys.iter().map(|k| k.key.clone()).collect(),
+        include: x.include.clone(),
+        unique: false,
+        filter: x.filter.clone(),
+        method: x.method,
+        storage_parameters: x.storage_parameters.clone(),
+    };
+    found.extend(index_shape(&what, &as_index, table));
     found
 }
 
@@ -1083,6 +1156,16 @@ mod tests {
         table
     }
 
+    /// The public entry every declaration takes, a partition's included.
+    fn entry(table: &Table) -> Vec<String> {
+        use pbps_dialect::Dialect;
+        crate::Postgres::new()
+            .validate_table(&"public.t".parse().unwrap(), table)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
     fn structure(table: &Table) -> Vec<String> {
         table_structure(table)
             .into_iter()
@@ -1839,5 +1922,118 @@ mod tests {
             [Permission::Execute].into_iter().collect(),
         );
         assert!(!messages("app_reader", &role).is_empty());
+    }
+
+    fn exclusion_table(method: IndexMethod, keys: &[(&str, &str)]) -> Table {
+        let mut table = gist_table(IndexMethod::Gist, &[("doc", None, None)]);
+        table.indexes.clear();
+        // The public entry also reads column types, and this model declares no
+        // `tsquery`; no exclusion case here keys on it.
+        table.columns.shift_remove("q");
+        table.exclude.insert(
+            "x".into(),
+            pbps_model::ExclusionConstraint {
+                method,
+                keys: keys
+                    .iter()
+                    .map(|(key, class)| pbps_model::ExclusionKey {
+                        key: pbps_model::IndexColumn {
+                            key: if table.columns.contains_key(*key) {
+                                pbps_model::IndexKey::Column((*key).into())
+                            } else {
+                                pbps_model::IndexKey::Expression((*key).to_owned())
+                            },
+                            descending: false,
+                            opclass: (!class.is_empty()).then(|| class.parse().unwrap()),
+                            collation: None,
+                        },
+                        operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                    })
+                    .collect(),
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            },
+        );
+        table
+    }
+
+    /// An exclusion's keys are an index's, so they are held to the same rules
+    /// (the GiST types and classes), and what is its own is the method, a key to
+    /// stand on and where it may stand (DEC-2448.3).
+    #[test]
+    fn an_exclusion_is_held_to_the_index_rules_and_to_its_own() {
+        use IndexMethod::{Btree, Gin, Gist};
+        // Held: an expression, `inet` under its class, a B-tree over a column.
+        for (method, keys) in [
+            (Gist, vec![("int4range(n, n + 1)", "")]),
+            (Gist, vec![("ip", "inet_ops")]),
+            (Gist, vec![("int4range(n, n)", ""), ("ip", "inet_ops")]),
+            (Btree, vec![("n", "")]),
+        ] {
+            assert!(
+                entry(&exclusion_table(method, &keys)).is_empty(),
+                "{method:?} {keys:?}: {:?}",
+                entry(&exclusion_table(method, &keys))
+            );
+        }
+        let said = |table: &Table| entry(table).join("\n");
+        // The index rules apply to its keys: no GiST class for `integer`.
+        assert!(
+            said(&exclusion_table(Gist, &[("n", "")])).contains("index an expression"),
+            "{}",
+            said(&exclusion_table(Gist, &[("n", "")]))
+        );
+        // Its own: a method that cannot back one, no keys, a missing column.
+        assert!(said(&exclusion_table(Gin, &[("n", "")])).contains("cannot back an exclusion"));
+        assert!(said(&exclusion_table(Btree, &[])).contains("has no keys"));
+        // `nope` is read as an expression, as any text that names no column is
+        // (the engine then answers for it), so the check here is that it is held.
+        assert!(
+            entry(&exclusion_table(Btree, &[("nope", "")])).is_empty(),
+            "{}",
+            said(&exclusion_table(Btree, &[("nope", "")]))
+        );
+        let mut missing = exclusion_table(Btree, &[("n", "")]);
+        missing.exclude.get_mut("x").unwrap().include = vec!["ghost".into()];
+        assert!(said(&missing).contains("ghost"), "{}", said(&missing));
+        // A partitioned table or a partition is PR E's.
+        let mut partitioned = exclusion_table(Btree, &[("n", "")]);
+        partitioned.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["n".into()],
+            strategy: Default::default(),
+        });
+        assert!(said(&partitioned).contains("partitioned table or a partition"));
+        // A partition declares no columns of its own, so `table_structure` is
+        // not asked of it; the refusal is still, as the public entry is the
+        // path every declaration takes.
+        let mut partition = exclusion_table(Btree, &[("n", "")]);
+        partition.columns.clear();
+        partition.partition_of = Some(pbps_model::PartitionOf {
+            parent: "public.p".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Default,
+            columns: Default::default(),
+        });
+        assert!(said(&partition).contains("partitioned table or a partition"));
+        let ordinary_partition = Table {
+            partition_of: partition.partition_of.clone(),
+            ..Default::default()
+        };
+        assert!(said(&ordinary_partition).is_empty());
+        // A name shared with another constraint of the table is refused.
+        let mut shared = exclusion_table(Btree, &[("n", "")]);
+        shared.checks.insert(
+            "x".into(),
+            pbps_model::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        assert!(
+            said(&shared).contains("both named `x`"),
+            "{}",
+            said(&shared)
+        );
     }
 }

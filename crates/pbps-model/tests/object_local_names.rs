@@ -284,9 +284,11 @@ fn whole_and_individual_operation_slots_claim_and_release_raw_local_names() {
             panic!("part key");
         };
         let key_name = match key {
-            PartKey::Unique(n) | PartKey::ForeignKey(n) | PartKey::Check(n) | PartKey::Index(n) => {
-                n
-            }
+            PartKey::Unique(n)
+            | PartKey::ForeignKey(n)
+            | PartKey::Check(n)
+            | PartKey::Exclusion(n)
+            | PartKey::Index(n) => n,
             other @ (PartKey::PrimaryKey
             | PartKey::Computed(_)
             | PartKey::Policy(_)

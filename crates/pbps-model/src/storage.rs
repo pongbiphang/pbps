@@ -144,6 +144,10 @@ pub struct MethodPolicy {
     /// Whether a column key may be compared under a collation of its own
     /// (`COLLATE` on a key). GIN's `jsonb` has none.
     pub collation: bool,
+    /// `pg_indexam_has_property(…, 'can_exclude')`: the method may back an
+    /// exclusion constraint (DEC-2448.3). Measured: B-tree and GiST can; GIN
+    /// and BRIN refuse ("does not support exclusion constraints").
+    pub exclusion: bool,
     /// For a method held over a few column types only: each admitted base type
     /// and the engine class its key must name (`None`: the type's default
     /// class, so none is written). Empty where the method is not held by type
@@ -226,6 +230,7 @@ static BTREE: MethodPolicy = MethodPolicy {
     classes: &[],
     default_class: None,
     collation: true,
+    exclusion: true,
     typed_columns: &[],
     lock: IndexLock::ShareUpdateExclusive,
     parameters: &[
@@ -244,6 +249,7 @@ static GIN: MethodPolicy = MethodPolicy {
     classes: &["jsonb_path_ops"],
     default_class: Some("jsonb_ops"),
     collation: false,
+    exclusion: false,
     typed_columns: &[],
     lock: IndexLock::AccessExclusive,
     parameters: &[
@@ -272,6 +278,7 @@ static GIST: MethodPolicy = MethodPolicy {
     classes: &["inet_ops"],
     default_class: None,
     collation: true,
+    exclusion: true,
     typed_columns: &[
         ("tsvector", None),
         ("tsquery", None),

@@ -441,6 +441,7 @@ pub(crate) fn convert_for_diagnostics(
         .collect();
 
     let indexes = convert_indexes(src, dto.indexes, &mut errs);
+    let exclude = convert_exclusions(src, dto.exclude, &mut errs);
 
     let row_security = pbps_model::RowSecurity {
         enabled: dto.row_security.enabled,
@@ -854,6 +855,7 @@ pub(crate) fn convert_for_diagnostics(
                     foreign_keys,
                     checks,
                     indexes,
+                    exclude,
                     data,
                     clustered: dto.clustered.map(|c| match c {
                         ClusteredDto::Heap => Clustered::Heap,
@@ -1099,6 +1101,118 @@ fn convert_indexes(
         }
     }
     indexes
+}
+
+/// A table's `exclude:` (DEC-2448.3), each error pushed to `errs`. The keys
+/// are index keys, read by the one reader an index's `keys:` use, and each also
+/// names its operator; the timing is the three states the engine has, so
+/// `deferrable: false` with `initially: deferred` is an error here and never a
+/// value.
+fn convert_exclusions(
+    src: &SourceFile,
+    dtos: std::collections::BTreeMap<pbps_model::ObjectLocalName, crate::dto::ExclusionDto>,
+    errs: &mut Vec<LoadError>,
+) -> std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExclusionConstraint> {
+    use crate::dto::InitiallyDto;
+    let mut out = std::collections::BTreeMap::new();
+    for (name, x) in dtos {
+        let mut keys = Vec::with_capacity(x.keys.len());
+        let mut ok = true;
+        if x.keys.is_empty() {
+            errs.push(LoadError::semantic(
+                src,
+                // No span of its own: the constraint has no keys to point at.
+                to_span(&serde_saphyr::Location::UNKNOWN),
+                format!("exclusion constraint `{}` has no keys", name.shown()),
+                "an exclusion constraint needs at least one key",
+            ));
+            ok = false;
+        }
+        for key in &x.keys {
+            let e = &key.value;
+            let as_index = crate::dto::IndexKeyDto {
+                column: e.column.clone(),
+                expression: e.expression.clone(),
+                opclass: e.opclass.clone(),
+                collation: e.collation.clone(),
+                order: e.order,
+            };
+            let spanned = Spanned {
+                value: as_index,
+                defined: key.defined,
+                referenced: key.referenced,
+            };
+            let column = parse_index_key(src, &spanned);
+            let operator = e.operator.parse::<pbps_model::OperatorRef>();
+            match (column, operator) {
+                (Ok(key), Ok(operator)) => keys.push(pbps_model::ExclusionKey { key, operator }),
+                (column, operator) => {
+                    ok = false;
+                    errs.extend(column.err());
+                    if let Err(why) = operator {
+                        errs.push(
+                            LoadError::semantic(
+                                src,
+                                to_span(&key.defined),
+                                format!("invalid exclusion operator: {why}"),
+                                "here",
+                            )
+                            .with_help(
+                                "write the operator as its symbol, such as `&&`, `=` or `-|-`",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        let method = x.method;
+        let storage_parameters = storage_parameters_of(
+            src,
+            &x.storage_parameters,
+            &|n, v| pbps_model::storage::canonical_index(method, n, v),
+            "a B-tree takes `fillfactor` and `deduplicate_items`, a GiST index `buffering` \
+             and `fillfactor`",
+            errs,
+        );
+        let timing = match (x.deferrable, x.initially) {
+            (false, None | Some(InitiallyDto::Immediate)) => pbps_model::ExclusionTiming::Immediate,
+            (true, None | Some(InitiallyDto::Immediate)) => {
+                pbps_model::ExclusionTiming::DeferrableImmediate
+            }
+            (true, Some(InitiallyDto::Deferred)) => pbps_model::ExclusionTiming::DeferrableDeferred,
+            (false, Some(InitiallyDto::Deferred)) => {
+                errs.push(LoadError::semantic(
+                    src,
+                    to_span(
+                        &x.keys
+                            .first()
+                            .map_or(serde_saphyr::Location::UNKNOWN, |k| k.defined),
+                    ),
+                    format!(
+                        "exclusion constraint `{}` is `initially: deferred` but not deferrable",
+                        name.shown()
+                    ),
+                    "the engine refuses a constraint declared INITIALLY DEFERRED that is not DEFERRABLE",
+                ));
+                ok = false;
+                pbps_model::ExclusionTiming::Immediate
+            }
+        };
+        if ok {
+            out.insert(
+                name,
+                pbps_model::ExclusionConstraint {
+                    method,
+                    keys,
+                    include: x.include,
+                    filter: x.filter,
+                    storage_parameters,
+                    timing,
+                },
+            );
+        }
+    }
+    out
 }
 
 /// `created_at`, `created_at desc`, `body jsonb_path_ops`, or all three

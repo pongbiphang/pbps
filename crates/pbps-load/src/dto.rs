@@ -470,6 +470,13 @@ pub struct TableDto {
     #[serde(default)]
     pub indexes: BTreeMap<pbps_model::ObjectLocalName, IndexDto>,
 
+    /// PostgreSQL exclusion constraints (#2448): each names its `method:`
+    /// (`btree` or `gist`) and its `keys:`, every key with the `operator:` it
+    /// is excluded with. Never `NOT VALID` or `NOT ENFORCED`: the engine has
+    /// neither for one.
+    #[serde(default)]
+    pub exclude: BTreeMap<pbps_model::ObjectLocalName, ExclusionDto>,
+
     /// Which index holds the table's rows, on SQL Server: `heap`, `{unique:
     /// <constraint>}` or `{index: <index>}`. Absent means the primary key is
     /// the clustered index, or the table is a heap if it has no primary key.
@@ -1440,6 +1447,62 @@ pub struct IndexKeyDto {
     /// `asc`, the default, or `desc`.
     #[serde(default)]
     pub order: Option<IndexOrder>,
+}
+
+/// An `exclude:` entry (DEC-2448.3).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionDto {
+    /// `btree` or `gist`. Required: the engine's default is a B-tree, and a
+    /// declaration that leaves it out must not be read as a GiST one.
+    pub method: pbps_model::IndexMethod,
+    /// The keys, one mapping each, in the constraint's order.
+    #[schemars(with = "Vec<ExclusionKeyDto>")]
+    pub keys: Vec<Spanned<ExclusionKeyDto>>,
+    /// Payload columns of the backing index; they have no operator.
+    #[serde(default)]
+    pub include: Vec<ColumnName>,
+    /// The predicate, kept verbatim.
+    #[serde(rename = "where", default)]
+    pub filter: Option<String>,
+    /// The backing index's storage parameters, by its method.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+    /// Whether the constraint may be deferred. Default `false`.
+    #[serde(default)]
+    pub deferrable: bool,
+    /// When a deferrable constraint is checked: `immediate` (the default) or
+    /// `deferred`. `deferred` needs `deferrable: true`.
+    #[serde(default)]
+    pub initially: Option<InitiallyDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum InitiallyDto {
+    Immediate,
+    Deferred,
+}
+
+/// One key of an `exclude:` entry: an index key (`column:` or `expression:`,
+/// with the optional `opclass:`, `collation:` and `order:` of an index key) and
+/// the `operator:` it is excluded with, a symbol of `pg_catalog` such as `&&`
+/// or `=`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionKeyDto {
+    #[serde(default)]
+    pub column: Option<ColumnName>,
+    #[serde(default)]
+    pub expression: Option<String>,
+    #[serde(default)]
+    pub opclass: Option<String>,
+    #[serde(default)]
+    pub collation: Option<String>,
+    #[serde(default)]
+    pub order: Option<IndexOrder>,
+    pub operator: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]

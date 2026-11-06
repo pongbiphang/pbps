@@ -400,7 +400,6 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
             ),
             ("ix_pattern", "B-tree key's default class"),
             ("ix_ext", "#2447 PR F"),
-            ("ex_r", "exclusion constraint"),
         ] {
             let note = pulled
                 .warnings
@@ -409,14 +408,20 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
                 .unwrap_or_else(|| panic!("{what} is named: {:?}", pulled.warnings));
             assert!(note.contains(expected), "{what}: {note}");
         }
-        // The notes about this table are these five and no other; the two about
+        // The exclusion constraint is held since C1a (DEC-2448.3): read whole, as
+        // a constraint and not as an index, with no note.
+        let held = &table.exclude[&pbps_model::ObjectLocalName::from("ex_r")];
+        assert_eq!(held.method, IndexMethod::Gist);
+        assert_eq!(held.keys.len(), 1);
+        assert_eq!(held.keys[0].operator.raw().to_string(), "&&");
+        // The notes about this table are these four and no other; the two about
         // the fixture's superuser and `PUBLIC` are the cluster's, not the table's.
         let own = pulled
             .warnings
             .iter()
             .filter(|w| w.contains("`app.t`"))
             .count();
-        assert_eq!(own, 5, "{:#?}", pulled.warnings);
+        assert_eq!(own, 4, "{:#?}", pulled.warnings);
         db.finish().await;
     }
 }

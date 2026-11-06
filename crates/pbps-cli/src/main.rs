@@ -2781,7 +2781,7 @@ mod consumer_contract_tests {
                         },
                     );
                 }
-                Part::Policy => unreachable!(),
+                Part::Policy | Part::Exclusion => unreachable!(),
             }
             let mut referenced = Table {
                 columns: shape.columns.clone(),
@@ -2842,7 +2842,7 @@ mod consumer_contract_tests {
                     new.tables.insert(reference.clone(), renamed.clone());
                 }
                 Part::Check => {}
-                Part::Policy => unreachable!(),
+                Part::Policy | Part::Exclusion => unreachable!(),
             }
             for changed in [false, true] {
                 let mut desired = canonical.clone();
@@ -2870,7 +2870,7 @@ mod consumer_contract_tests {
                             after.indexes.get_mut("ix").unwrap().columns[0].key =
                                 IndexKey::Column("other".into())
                         }
-                        Part::Policy => unreachable!(),
+                        Part::Policy | Part::Exclusion => unreachable!(),
                     }
                 }
                 let restoration = match kind {
@@ -2910,7 +2910,7 @@ mod consumer_contract_tests {
                         index: Box::new(after.indexes["ix"].clone()),
                         clustered: after.index_is_clustered("ix"),
                     },
-                    Part::Policy => unreachable!(),
+                    Part::Policy | Part::Exclusion => unreachable!(),
                 };
                 let mut changes = vec![PlannedChange::new(restoration)];
                 if kind == Part::Computed {

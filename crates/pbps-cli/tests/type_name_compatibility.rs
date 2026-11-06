@@ -279,6 +279,18 @@ where
         .as_array_mut()
         .unwrap()
         .retain(|variant| variant["const"] != "gist");
+    // #2448 PR C1 adds a table's `exclude:` (schema set 94); the captured table
+    // branch predates it.
+    for definition in ["ExclusionDto", "ExclusionKeyDto", "InitiallyDto"] {
+        declaration_schema["$defs"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove(definition);
+    }
+    declaration_schema["$defs"]["TableDto"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("exclude");
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
@@ -289,7 +301,9 @@ where
             .iter()
             .all(|step| step.drop_guard.is_none())
     );
-    let changes_debug = format!("{:?}", plan.changes).replace(", drop_guard: None", "");
+    let changes_debug = format!("{:?}", plan.changes)
+        .replace(", drop_guard: None", "")
+        .replace(" exclude: {},", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (

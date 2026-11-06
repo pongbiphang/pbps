@@ -469,7 +469,7 @@ How each kind is handled today:
 | Kind | Today | Tracking |
 |---|---|---|
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
-| `gist` indexes and `EXCLUDE` constraints | named | #2448 |
+| `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read and round trip held, DEC-2448.3; add, drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
 
 ### Silent today (bugs)
@@ -715,8 +715,10 @@ a GIN index over an expression or an expression key under a non-default class
 or collation (a B-tree expression index is held, DEC-1169.2), a key collation
 that is not a `pg_catalog` collation of a column key (DEC-2448.2), a class a
 schema owns (refused by name until the provider work of #2447, DEC-2448.1), a
-null ordering that is not its direction's default, and a `NOT VALID`
-check. A foreign key whose action is `RESTRICT` is held as `restrict`, never as
+null ordering that is not its direction's default, a `NOT VALID`
+check, and an exclusion constraint of a method other than `btree` and `gist`, over
+a key class the method does not hold, of a non-`pg_catalog` operator, or on a
+partitioned table (DEC-2448.3). A foreign key whose action is `RESTRICT` is held as `restrict`, never as
 `NO ACTION` (DEC-1633.1). Such a key used to be left out of the pull and named.
 A project that declared it as `no_action` now gets a plan that drops the key and
 adds it back as declared, so applying it turns the database's `RESTRICT` into `NO

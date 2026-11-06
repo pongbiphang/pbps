@@ -801,6 +801,12 @@ pub(crate) fn table_sources(
              them, so remove the block",
         ));
     }
+    if !table.exclude.is_empty() {
+        errs.push(invalid(
+            "`exclude` declares PostgreSQL exclusion constraints; SQL Server has no such \
+             constraint, so remove the block",
+        ));
+    }
     if table.unlogged {
         errs.push(invalid(
             "`unlogged` is a PostgreSQL table's persistence; SQL Server has no unlogged table, \
@@ -3562,6 +3568,42 @@ mod tests {
         assert!(
             super::table(&"app.t".parse().unwrap(), &table).is_empty(),
             "a check and an ordinary index may share a name"
+        );
+    }
+
+    /// SQL Server has no exclusion constraint: a declaration of one is refused by
+    /// name at validation, and no plan change for one is emitted (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraint_is_refused_by_name() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), pbps_model::Column::new("int".parse().unwrap()));
+        assert!(
+            table_sources(&"dbo.t".parse().unwrap(), &table, Default::default())
+                .iter()
+                .all(|e| !e.to_string().contains("exclusion")),
+            "a table with none is unaffected"
+        );
+        table.exclude.insert(
+            "x".into(),
+            pbps_model::ExclusionConstraint {
+                method: IndexMethod::Btree,
+                keys: Vec::new(),
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            },
+        );
+        let said: Vec<String> =
+            table_sources(&"dbo.t".parse().unwrap(), &table, Default::default())
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+        assert!(
+            said.iter().any(|m| m.contains("exclusion constraints")),
+            "{said:?}"
         );
     }
 }

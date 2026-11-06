@@ -151,7 +151,9 @@ fn dependent_meetings_keep_the_complete_canonical_changes_order_and_spellings() 
                                     // These empty fields were added on master after c97cd4ad.
                                     // Nonempty options/USING remain visible and fail the oracle.
                                     .replace("options: ModuleOptions { schemabinding: false, indexes: {}, clustered: None }, ", "")
-                                    .replace(", using: None", ""))
+                                    .replace(", using: None", "")
+                                    // And this one, with the exclusion constraints (#2448).
+                                    .replace(" exclude: {},", ""))
                                 .collect();
                             let spellings: Vec<String> = ordered
                                 .operations()

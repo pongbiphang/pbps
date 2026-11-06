@@ -28,8 +28,8 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, IndexMethod, PrimaryKey,
-    ReplicaIdentity, Table, UniqueConstraint, ValueSource,
+    CheckConstraint, Collation, Column, ComputedColumn, ExclusionConstraint, ForeignKey, Index,
+    IndexMethod, PrimaryKey, ReplicaIdentity, Table, UniqueConstraint, ValueSource,
 };
 use crate::strategy::Strategy;
 use crate::types::ColumnType;
@@ -1222,6 +1222,9 @@ pub enum Part {
     ForeignKey,
     Check,
     Index,
+    /// A PostgreSQL exclusion constraint (#2448): named, and never an index of
+    /// its own although it owns one.
+    Exclusion,
     /// A SQL Server computed column (#1174). A part rather than a column:
     /// added and dropped whole by name, never altered in place, and outside
     /// `columns`, as an index is.
@@ -1338,6 +1341,7 @@ pub enum PartDefinition<'a> {
     Unique(&'a UniqueConstraint, bool),
     ForeignKey(&'a ForeignKey),
     Check(&'a CheckConstraint),
+    Exclusion(&'a ExclusionConstraint),
     Index(&'a Index, bool),
     Computed(&'a ComputedColumn),
     Policy(&'a crate::RowPolicy),
@@ -1350,6 +1354,7 @@ impl PartDefinition<'_> {
             PartDefinition::Unique(..) => Part::Unique,
             PartDefinition::ForeignKey(_) => Part::ForeignKey,
             PartDefinition::Check(_) => Part::Check,
+            PartDefinition::Exclusion(_) => Part::Exclusion,
             PartDefinition::Index(..) => Part::Index,
             PartDefinition::Computed(_) => Part::Computed,
             PartDefinition::Policy(_) => Part::Policy,

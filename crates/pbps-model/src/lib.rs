@@ -143,18 +143,20 @@ pub use rehearsal::{AuthorizationRehearsal, Rehearsal};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
-    BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, Extension,
-    ForeignKey, Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, ListDatum,
-    OwnedSequence, PartitionBound, PartitionBy, PartitionColumn, PartitionOf, PartitionStrategy,
-    PolicyCommand, PolicyRoles, PrimaryKey, ReferentialAction, ReplicaIdentity, Retention,
-    RetentionUnit, RowPolicy, RowSecurity, Schema, SequenceOptions, SystemTime, SystemVersioning,
-    Table, UniqueConstraint, ValueSource,
+    BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ExclusionConstraint,
+    ExclusionKey, ExclusionTiming, Extension, ForeignKey, Generated, Identity, Index, IndexColumn,
+    IndexKey, IndexMethod, ListDatum, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn,
+    PartitionOf, PartitionStrategy, PolicyCommand, PolicyRoles, PrimaryKey, ReferentialAction,
+    ReplicaIdentity, Retention, RetentionUnit, RowPolicy, RowSecurity, Schema, SequenceOptions,
+    SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use target_assertion::{AssertionOutcome, TargetAssertion};
 pub use text::Text;
-pub use types::{CollationName, ColumnType, OpClassRef, TypeArg, TypeParseError, TypeRef};
+pub use types::{
+    CollationName, ColumnType, OpClassRef, OperatorRef, TypeArg, TypeParseError, TypeRef,
+};
 pub use uid::{Uid, UidError, UidKind};
 pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};
