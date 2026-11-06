@@ -790,6 +790,7 @@ fn columns_query() -> String {
                 AND ud.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
                 AND ud.deptype = 'e'
               LIMIT 1) AS user_type_extension,
+            (a.atttypmod <> -1) AS user_type_modified,
             (el.oid IS NOT NULL) AS type_array,
             NOT a.attnotnull AS nullable,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr,
@@ -1727,6 +1728,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                     defined: flag(row, "user_type_defined")?,
                     relkind: optional_text(row, "user_type_relkind")?,
                     extension: optional_text(row, "user_type_extension")?,
+                    modified: flag(row, "user_type_modified")?,
                     array: flag(row, "type_array")?,
                 })
             } else {

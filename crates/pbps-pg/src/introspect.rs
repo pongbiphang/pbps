@@ -202,6 +202,8 @@ pub struct RawUserType {
     /// The package the type row is a direct member of, for a base type one
     /// provides (DEC-2447.12).
     pub extension: Option<String>,
+    /// `atttypmod <> -1`: the column's type carries a modifier (`t(5)`).
+    pub modified: bool,
     pub array: bool,
 }
 
@@ -210,7 +212,11 @@ impl RawUserType {
         if !self.defined
             || !(matches!(self.kind.as_str(), "e" | "d")
                 || self.kind == "c" && self.relkind.as_deref() == Some("c")
-                || self.kind == "b" && self.extension.is_some())
+                // A package's base type is held bare: its modifier has nowhere to
+                // go, and recording `t` for a column that is `t(5)` would read
+                // back as another column (the table is left out and named
+                // instead).
+                || self.kind == "b" && self.extension.is_some() && !self.modified)
         {
             return None;
         }
@@ -8582,6 +8588,7 @@ mod tests {
                 defined,
                 relkind: None,
                 extension: extension.map(str::to_owned),
+                modified: false,
                 array,
             });
             raw
@@ -8609,6 +8616,25 @@ mod tests {
             ..RawCatalog::default()
         });
         assert!(none.provided_types.is_empty());
+        // A modifier (`t(5)`, `atttypmod <> -1`) has nowhere to go on a package's
+        // type: the column is not held bare, so the table is left out and named
+        // like any type the catalogue cannot spell, and no package is recorded.
+        let mut modified = provided(Some("citext"), true, false);
+        modified.ty = "ext.citext(5)".into();
+        modified.user_type.as_mut().unwrap().modified = true;
+        assert!(column_type(&modified).is_err());
+        let pulled = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![modified],
+            ..RawCatalog::default()
+        });
+        assert!(pulled.provided_types.is_empty());
+        assert!(
+            pulled.schema.tables.is_empty(),
+            "{:?}",
+            pulled.schema.tables.keys().collect::<Vec<_>>()
+        );
+        assert!(!pulled.warnings.is_empty());
     }
 
     #[test]
@@ -8621,6 +8647,7 @@ mod tests {
             defined: true,
             relkind: None,
             extension: None,
+            modified: false,
             array: true,
         });
         assert_eq!(

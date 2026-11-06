@@ -128,6 +128,68 @@ fn a_provided_type_is_read_when_its_package_is_managed_and_left_out_with_the_com
     });
 }
 
+/// A base type a package provides, carrying a modifier (`t(5)`), is not held
+/// bare: the table is left out of the pull and named, never recorded as the bare
+/// reference it would read back as another column from. Measured on 16.15 and
+/// 18.6: no package in the images ships a type with a modifier, so the case
+/// makes one (a base type over `varchar`'s own functions with `typmod_in`, joined to
+/// `citext` by `ALTER EXTENSION ... ADD TYPE`, which makes it the package's member). The plain
+/// column of the same type, and the table beside it, are still pulled.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_provided_type_with_a_modifier_leaves_its_table_out_and_a_plain_one_is_held() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("types2447-typmod-{slug}"));
+        on_server(
+            f.target(),
+            "CREATE TYPE ext.tm; \
+             CREATE FUNCTION ext.tm_in(cstring, oid, integer) RETURNS ext.tm \
+               AS 'varcharin' LANGUAGE internal IMMUTABLE STRICT; \
+             CREATE FUNCTION ext.tm_out(ext.tm) RETURNS cstring \
+               AS 'varcharout' LANGUAGE internal IMMUTABLE STRICT; \
+             CREATE FUNCTION ext.tm_modin(cstring[]) RETURNS integer \
+               AS 'varchartypmodin' LANGUAGE internal IMMUTABLE STRICT; \
+             CREATE FUNCTION ext.tm_modout(integer) RETURNS cstring \
+               AS 'varchartypmodout' LANGUAGE internal IMMUTABLE STRICT; \
+             CREATE TYPE ext.tm (INPUT = ext.tm_in, OUTPUT = ext.tm_out, \
+               TYPMOD_IN = ext.tm_modin, TYPMOD_OUT = ext.tm_modout, \
+               INTERNALLENGTH = VARIABLE, STORAGE = extended); \
+             ALTER EXTENSION citext ADD TYPE ext.tm; \
+             CREATE TABLE app.plain_tm (id integer PRIMARY KEY, v ext.tm); \
+             CREATE TABLE app.sized_tm (id integer PRIMARY KEY, v ext.tm(5))",
+        );
+        let out = succeeds(f.d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            f.target(),
+            "--extension",
+            "citext",
+        ]));
+        let pulled = said(&out);
+        assert!(
+            pulled.contains("app.sized_tm"),
+            "the table is named: {pulled}"
+        );
+        assert!(!f.d.dir.join("schema/app.sized_tm.yml").exists());
+        let plain = std::fs::read_to_string(f.d.dir.join("schema/app.plain_tm.yml")).unwrap();
+        assert!(plain.contains("ext.tm"), "{plain}");
+        assert!(!plain.contains("ext.tm("), "{plain}");
+        // A declaration cannot hold the modifier either: it is refused by name,
+        // and nothing reaches the engine.
+        std::fs::write(
+            f.d.dir.join("schema/app.sized_tm.yml"),
+            "table: app.sized_tm\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+             v: {type: \"ext.tm(5)\"}\nprimary_key: [id]\n",
+        )
+        .unwrap();
+        f.d.commit();
+        let refused = f.d.run(&["plan", "--db", f.target()]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(said(&refused).contains("ext.tm"), "{}", said(&refused));
+    });
+}
+
 /// A declared column of a type whose package the project does not manage is
 /// refused at plan, by name, with the command; a base type no package owns is
 /// refused as before.
@@ -310,6 +372,73 @@ fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
             ),
             before,
             "the type keeps its OID through the move"
+        );
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+    });
+}
+
+/// A domain the plan creates over the moved package's type follows the move: the
+/// type is named in the destination, which exists only after the move, so the
+/// plan orders the package first by what the domain reads and not by luck (a
+/// tie in the type class left it to the identity; #2696 ready round).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_created_over_the_moved_type_is_planned_after_the_move() {
+    servers(|server, slug| {
+        // PostgreSQL 18's server scratch only, as the move case above.
+        if slug != "PBPS_TEST_PG_DB" {
+            return;
+        }
+        let f = fixture_on(server, &format!("types2447-newdom-{slug}"), Kind::Server);
+        adopted(&f, &["citext", "hstore", "ltree"]);
+        on_server(f.target(), "CREATE SCHEMA moved");
+        let spelled = |text: String| text.replace("ext.citext", "moved.citext");
+        for entry in std::fs::read_dir(f.d.dir.join("schema")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "yml") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if text.contains("ext.citext") {
+                    std::fs::write(&path, spelled(text)).unwrap();
+                }
+            }
+        }
+        let declaration = f.d.dir.join("schema/extensions/citext.yml");
+        let text = std::fs::read_to_string(&declaration).unwrap();
+        std::fs::write(&declaration, text.replace("schema: ext", "schema: moved")).unwrap();
+        std::fs::write(
+            f.d.dir.join("schema/app.newdom.type.yml"),
+            "domain: app.newdom\ntype: moved.citext\n",
+        )
+        .unwrap();
+        f.d.commit();
+        minted(&f);
+        let out = f.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let kinds: Vec<String> = saved(&f)
+            .changes
+            .changes
+            .iter()
+            .map(|c| format!("{:?}", c.change))
+            .collect();
+        let at = |prefix: &str| {
+            kinds
+                .iter()
+                .position(|k| k.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} in {kinds:#?}"))
+        };
+        assert!(
+            at("SetExtensionSchema") < at("CreateType"),
+            "the move comes first: {kinds:#?}"
+        );
+        succeeds(f.apply("rename,extension-code,destructive"));
+        assert_eq!(
+            scalar(
+                f.target(),
+                "SELECT count(*) FROM pg_type WHERE typname = 'newdom' \
+                   AND typbasetype = 'moved.citext'::regtype"
+            ),
+            1
         );
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         succeeds(f.d.run(&["verify", "--db", f.target()]));

@@ -411,11 +411,38 @@ pub fn effects(
 
 impl Cx<'_> {
     fn type_input(&mut self, ty: &crate::ColumnType) {
-        if let Some(name) = ty.type_ref()
-            && let Ok(uid) = self.owners.managed_type(name, Spelling::Final)
-        {
+        let Some(name) = ty.type_ref() else { return };
+        if let Ok(uid) = self.owners.managed_type(name, Spelling::Final) {
             self.requires(Requirement::Is(
                 ObjectKey::Type(Recorded(uid)),
+                Incarnation::Final,
+            ));
+            return;
+        }
+        // A type this project does not manage is a package's when a package
+        // stands in the schema it names: a domain, a column or an array over it
+        // waits for the plan's create, update or move of that package, as one
+        // over a managed type waits for its create (DEC-2447.12). Asked of the
+        // final schema, so a type named in the destination of a move needs the
+        // move. Any package standing in that schema counts, which can only add
+        // an edge a package change already makes true: packages sort first.
+        let packages: Vec<_> = self
+            .after
+            .ids
+            .extensions
+            .iter()
+            .filter(|(_, package)| {
+                self.after
+                    .schema
+                    .extensions
+                    .get(*package)
+                    .is_some_and(|e| e.schema == name.schema())
+            })
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        for uid in packages {
+            self.requires(Requirement::Is(
+                ObjectKey::Extension(Recorded(uid)),
                 Incarnation::Final,
             ));
         }

@@ -750,6 +750,8 @@
         "extensions2447_types::a_type_of_an_unmanaged_package_or_of_no_package_is_refused_by_name",
         "extensions2447_types::a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_changes",
         "extensions2447_types::a_move_of_the_package_carries_its_columns_without_retyping_them",
+        "extensions2447_types::a_domain_created_over_the_moved_type_is_planned_after_the_move",
+        "extensions2447_types::a_provided_type_with_a_modifier_leaves_its_table_out_and_a_plain_one_is_held",
         "extensions2447_types::a_move_the_confined_scratch_cannot_perform_is_refused_by_the_rehearsal",
         "extensions2447_types::a_package_and_its_consumer_are_planned_together_and_the_type_is_proved_after_the_rehearsal",
         "extensions2447_types::a_retype_to_or_from_a_provided_type_is_refused_by_name",
