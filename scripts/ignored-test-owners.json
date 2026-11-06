@@ -2058,7 +2058,10 @@
         "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",
         "resolver::capture::nodes::partition1566::actual_partition_bounds_have_closed_layouts_on_both_majors",
         "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges",
-        "input_path::tests::a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs"
+        "input_path::tests::a_copy_conversions_routine_the_plan_did_not_hold_is_refused_before_it_runs",
+        "table_expressions::view_tests::a_view_over_the_table_is_judged_as_its_check_tree_is_on_both_majors",
+        "table_expressions::view_tests::the_view_binds_for_a_role_with_usage_only_and_refuses_what_it_must_not_admit",
+        "table_expressions::view_tests::a_binding_that_stood_leaves_no_view_so_the_next_one_in_the_transaction_builds"
       ]
     },
     {
