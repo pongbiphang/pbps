@@ -217,12 +217,18 @@ fn read_database_ids(db: &DatabaseName, dirs: &DatabaseDirs) -> Result<IdsFile, 
     if tree.is_empty() {
         return read_ids(&legacy);
     }
-    if std::fs::symlink_metadata(&legacy).is_ok() {
-        return Err(ProjectLoadError::Layout(format!(
-            "database `{}` has both `{}` and an identity tree; keep one",
-            db.shown(),
-            legacy.display()
-        )));
+    // Only a file that is not there lets the tree stand alone; one that
+    // cannot be examined is not "absent" (AGENTS.md).
+    match std::fs::symlink_metadata(&legacy) {
+        Ok(_) => {
+            return Err(ProjectLoadError::Layout(format!(
+                "database `{}` has both `{}` and an identity tree; keep one",
+                db.shown(),
+                legacy.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(&legacy, e)),
     }
     let dir = dirs.ids_dir.as_deref().unwrap_or(Path::new(""));
     pbps_model::ids_tree::assemble(&tree).map_err(|e| ProjectLoadError::Identities {
@@ -233,24 +239,29 @@ fn read_database_ids(db: &DatabaseName, dirs: &DatabaseDirs) -> Result<IdsFile, 
 
 /// Every identity file under `dir`, by `/`-separated path relative to it.
 ///
-/// A directory that is not there is an empty tree. Anything that is not a
-/// directory or a regular `.json` file, a symlink included, is refused rather
-/// than skipped: a file the loader walked past would read as "no identity".
+/// Absent, empty and unreadable differ. Only a path that is not there is an
+/// empty tree; `dir` itself is looked at without following a link, so a
+/// dangling or live symlink is refused like any other entry that is not a
+/// directory or a regular `.json` file, rather than read as "no identity".
 fn read_tree(dir: &Path) -> Result<BTreeMap<String, String>, ProjectLoadError> {
     let mut files = BTreeMap::new();
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(e) => return Err(io(dir, e)),
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(ProjectLoadError::Layout(format!(
+                "identity tree `{}` is not a directory",
+                dir.display()
+            )));
+        }
+    }
     let mut pending = vec![(dir.to_owned(), String::new())];
     let refuse = |path: &Path, what: &str| {
         ProjectLoadError::Layout(format!("identity tree entry `{}` {what}", path.display()))
     };
     while let Some((current, prefix)) = pending.pop() {
-        let entries = match std::fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && prefix.is_empty() => {
-                return Ok(files);
-            }
-            Err(e) => return Err(io(&current, e)),
-        };
-        for entry in entries {
+        for entry in std::fs::read_dir(&current).map_err(|e| io(&current, e))? {
             let entry = entry.map_err(|e| io(&current, e))?;
             let path = entry.path();
             let name = entry

@@ -646,14 +646,18 @@ impl Project {
         }
         // The same question against the disk, for the spellings the lexical
         // check leaves (`..`, an absolute path, a symlink). A directory that
-        // does not exist yet cannot hold anything, so it is not judged.
+        // does not exist yet cannot hold anything, so it is not judged; but
+        // each directory it might hold is asked on its own, because a new
+        // project has no `schema/` and that must not excuse an `ids_dir` that
+        // is the root or above it.
+        let held_by_ids = |ids: &Path| {
+            [real(&root), real(&root.join(&config.schema_dir))]
+                .into_iter()
+                .flatten()
+                .any(|held| held.starts_with(ids))
+        };
         if config.ids_dir.is_some()
-            && let (Ok(ids), Ok(base), Ok(schema)) = (
-                real(&root.join(config.ids_dir())),
-                real(&root),
-                real(&root.join(&config.schema_dir)),
-            )
-            && (base.starts_with(&ids) || schema.starts_with(&ids))
+            && real(&root.join(config.ids_dir())).is_ok_and(|ids| held_by_ids(&ids))
         {
             return Err(ConfigError::Parse {
                 path: config_path.to_owned(),

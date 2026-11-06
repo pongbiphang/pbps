@@ -217,3 +217,26 @@ fn a_database_project_still_refuses_a_project_level_ids_file_override() {
     let error = parse(&format!("{NAMED}ids_file: ids.json\n")).unwrap_err();
     assert!(error.contains("ids_file override"), "{error}");
 }
+
+#[test]
+fn a_missing_schema_dir_does_not_excuse_an_ids_dir_that_is_the_project_or_above_it() {
+    // A new project has no `schema/` yet; the root check stands on its own.
+    let dir = Dir::new();
+    assert!(!dir.0.join("schema").exists());
+    for ids_dir in [
+        dir.0.display().to_string(),
+        dir.0.parent().unwrap().display().to_string(),
+        format!("{}/sub/..", dir.0.display()),
+    ] {
+        std::fs::create_dir_all(dir.0.join("sub")).unwrap();
+        let path = dir.config(&format!("dialect: postgres\nids_dir: '{ids_dir}'\n"));
+        let error = Project::load(&path).unwrap_err().to_string();
+        assert!(error.contains("`ids_dir`"), "{ids_dir}: {error}");
+    }
+    // Negative: a directory of its own that does not exist yet is fine.
+    let path = dir.config(&format!(
+        "dialect: postgres\nids_dir: '{}'\n",
+        dir.0.join(".pbps/ids").display()
+    ));
+    assert!(Project::load(&path).is_ok());
+}

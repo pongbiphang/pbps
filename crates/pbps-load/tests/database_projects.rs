@@ -512,3 +512,34 @@ fn a_damaged_or_unexpected_tree_entry_is_refused_not_skipped() {
         Err(ProjectLoadError::Identities { .. })
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_or_file_in_place_of_the_tree_directory_is_refused_not_read_as_absent() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (_, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+    }
+    std::fs::create_dir_all(&trees.0).unwrap();
+    let alpha = trees.0.join("alpha");
+    // Dangling: read_dir says NotFound, which must not pass for "no tree" and
+    // fall back to a legacy file that may be absent too.
+    std::os::unix::fs::symlink(trees.0.join("gone"), &alpha).unwrap();
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    // A live link is refused the same way.
+    std::fs::remove_file(&alpha).unwrap();
+    std::fs::create_dir(trees.0.join("real")).unwrap();
+    std::os::unix::fs::symlink(trees.0.join("real"), &alpha).unwrap();
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    // So is a plain file.
+    std::fs::remove_file(&alpha).unwrap();
+    std::fs::write(&alpha, "x").unwrap();
+    assert!(load_databases(&databases).is_err());
+    // Negative: with nothing there at all the database simply has no tree.
+    std::fs::remove_file(&alpha).unwrap();
+    assert!(load_databases(&databases).is_ok());
+}
