@@ -51,7 +51,9 @@ pub fn process_count() {
                     .iter()
                     .filter(|c| c.starts_with("cat-file --batch"))
                     .count(),
-                1,
+                // One stream for the declarations and one for the identity
+                // tree, whatever the number of files in either.
+                2,
                 "{label}: {trace}"
             );
             assert!(
@@ -74,7 +76,7 @@ pub fn paths() {
     std::fs::rename(d.dir.join("schema"), d.dir.join(old)).unwrap();
     std::fs::write(
         d.dir.join("pbps.yml"),
-        format!("dialect: mssql\nschema_dir: \"{old}\"\nids_file: old.ids.json\n"),
+        format!("dialect: mssql\nschema_dir: \"{old}\"\nids_dir: old-ids\n"),
     )
     .unwrap();
     let names = vec!["space ' one.yaml", "té.yml"];
@@ -94,10 +96,10 @@ pub fn paths() {
     succeeds(&d, &["plan", "--no-dev"]);
     d.commit();
     std::fs::rename(d.dir.join(old), d.dir.join("schema new")).unwrap();
-    std::fs::rename(d.dir.join("old.ids.json"), d.dir.join("new.ids.json")).unwrap();
+    std::fs::rename(d.dir.join("old-ids"), d.dir.join("new-ids")).unwrap();
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: mssql\nschema_dir: schema new\nids_file: new.ids.json\n",
+        "dialect: mssql\nschema_dir: schema new\nids_dir: new-ids\n",
     )
     .unwrap();
     let report: serde_json::Value =
@@ -159,7 +161,7 @@ pub fn broken() {
             }
             _ => unreachable!(),
         }
-        let ids = std::fs::read(d.ids_path()).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         for args in [
             vec!["plan", "--no-dev"],
             vec!["validate", "--since", "HEAD"],
@@ -179,7 +181,7 @@ pub fn broken() {
                 message.contains(expected_path) && message.contains(&format!("`{requested}`")),
                 "{case}: {message}"
             );
-            assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
+            assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         }
     }
 }

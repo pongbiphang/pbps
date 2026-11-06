@@ -54,7 +54,7 @@ fn blank_non_utf8_and_competing_stdin_requirements_are_usage_errors_before_recor
     );
     assert_eq!(code(&out), 2);
     assert!(stderr(&out).contains("--reason and --require cannot both read standard input"));
-    assert!(!d.dir.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&d.dir));
 }
 
 const BEFORE: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  amount: {type: integer}\n  cents: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\n";
@@ -62,7 +62,7 @@ const AFTER: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: fal
 const PREDICATE: &str = "cents = amount * 100";
 
 fn bytes(d: &Demo) -> Vec<u8> {
-    std::fs::read(d.dir.join("schema.ids.json")).unwrap()
+    crate::idtree::snapshot(&d.dir)
 }
 fn ids(d: &Demo) -> IdsFile {
     serde_json::from_slice(&bytes(d)).unwrap()
@@ -390,11 +390,7 @@ fn recording(server: &str) {
             requirement.predicate = "false) AND (false".into();
         }
     }
-    std::fs::write(
-        d.dir.join("schema.ids.json"),
-        serde_json::to_vec_pretty(&malformed).unwrap(),
-    )
-    .unwrap();
+    crate::idtree::write(&d.dir, &malformed);
     d.commit();
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0);
@@ -403,7 +399,7 @@ fn recording(server: &str) {
         "{}",
         stderr(&refused)
     );
-    std::fs::write(d.dir.join("schema.ids.json"), guarded).unwrap();
+    crate::idtree::restore(&d.dir, &guarded);
     d.commit();
     d.table(&AFTER.replace(
         "  cents: {type: integer}",
@@ -602,11 +598,7 @@ fn record_after_rename(server: &str) {
             require: None,
         },
     );
-    std::fs::write(
-        d.dir.join("schema.ids.json"),
-        serde_json::to_vec_pretty(&history).unwrap(),
-    )
-    .unwrap();
+    crate::idtree::write(&d.dir, &history);
     succeeds(d.run(&[
         "drop",
         "app.renamed.amount",

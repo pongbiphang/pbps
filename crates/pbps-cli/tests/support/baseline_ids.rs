@@ -13,8 +13,7 @@ fn fixture(dialect: &str, name: &str) -> (Demo, Value, &'static str) {
     d.table(&format!("table: {schema}.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  old: {{type: varchar(40)}}\n"));
     std::fs::write(d.dir.join("schema/reader.yml"), "role: reader\n").unwrap();
     success(&d, &["plan", "--no-dev"]);
-    let ids: Value =
-        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let ids: Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
     let mut snapshot = json!({
         "version": pbps_model::state::OLDEST_READABLE_VERSION,
         "kind": "baseline", "operator": "offline-test",
@@ -72,14 +71,17 @@ pub fn corrupt_files(dialect: &str) {
     let sql = d.dir.join("plan.sql");
     std::fs::write(&out, "existing reviewed plan\n").unwrap();
     std::fs::write(&sql, "existing reviewed SQL\n").unwrap();
-    let held = [
-        d.dir.join("schema.ids.json"),
+    let mut held: Vec<_> = crate::idtree::files(&d.dir)
+        .keys()
+        .map(|rel| crate::idtree::dir(&d.dir).join(rel))
+        .collect();
+    held.extend([
         d.dir.join(format!("schema/{schema}.t.yml")),
         d.dir.join("schema/reader.yml"),
         d.dir.join("pbps.yml"),
         out.clone(),
         sql.clone(),
-    ];
+    ]);
     let before: Vec<_> = held.iter().map(|p| std::fs::read(p).unwrap()).collect();
     let base = d.dir.join("base.json");
     let table = format!("{schema}.t");
@@ -259,26 +261,37 @@ pub fn corrupt_files(dialect: &str) {
 }
 
 pub fn corrupt_git(dialect: &str) {
-    let (d, snapshot, _) = fixture(dialect, "git");
-    let path = d.dir.join("schema.ids.json");
-    let valid = std::fs::read(&path).unwrap();
+    let (d, _, _) = fixture(dialect, "git");
+    let path = d.dir.clone();
+    let valid = crate::idtree::snapshot(&path);
+    // The first table file of the tree, and what it says now.
+    let rel = crate::idtree::files(&path).into_keys().next().unwrap();
+    let file = crate::idtree::dir(&path).join(&rel);
+    let good = std::fs::read_to_string(&file).unwrap();
     for case in ["version", "duplicate"] {
-        let mut bad = snapshot["ids"].clone();
-        if case == "version" {
-            bad["version"] = json!(999);
+        let bad = if case == "version" {
+            good.replacen("\"format\": 1", "\"format\": 999", 1)
         } else {
-            let uid = spare_uid(&bad, "columns", "c");
-            bad["columns"][uid] = bad["columns"]
-                .as_object()
+            // A second uid for the name its first record already holds.
+            let name = good
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("\"c_")?;
+                    l.split_once("\": \"")?.1.strip_suffix("\",")
+                })
                 .unwrap()
-                .values()
-                .next()
-                .unwrap()
-                .clone();
-        }
-        std::fs::write(&path, bad.to_string()).unwrap();
+                .to_owned();
+            good.replacen(
+                "    \"_end\": true",
+                &format!("    \"c_zzzzzz\": \"{name}\",\n\n    \"_end\": true"),
+                1,
+            )
+        };
+        assert_ne!(bad, good, "{case}: the file was not changed");
+        std::fs::write(&file, bad).unwrap();
         d.commit();
-        std::fs::write(&path, &valid).unwrap();
+        std::fs::write(&file, &good).unwrap();
         for args in [
             vec!["plan", "--check", "--format", "json"],
             vec!["plan", "--check", "--since", "HEAD", "--format", "json"],
@@ -296,7 +309,7 @@ pub fn corrupt_git(dialect: &str) {
                         && f["message"].as_str().unwrap().contains("HEAD")),
                 "{report}"
             );
-            assert_eq!(std::fs::read(&path).unwrap(), valid);
+            assert_eq!(crate::idtree::snapshot(&path), valid);
         }
         // Fixing the working file does not repair HEAD's evidence; committing
         // the repair does. No silent fallback or identity replacement.

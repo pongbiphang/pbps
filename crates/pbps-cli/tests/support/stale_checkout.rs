@@ -150,7 +150,7 @@ pub(super) fn expected(sha: &str, list: &str, missing: bool) -> String {
     format!("Cannot plan deletions against `target`: {reason}\nDeletions:\n  {list}\n{remedy}")
 }
 pub(super) fn refused(d: &Demo, connection: &str, pg: bool, message: &str) {
-    let before_ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let before_ids = crate::idtree::snapshot(&d.dir);
     let before_ledger = records(connection, pg);
     let out = d.dir.join("sentinel-plan.json");
     let sql = d.dir.join("sentinel.sql");
@@ -187,10 +187,7 @@ pub(super) fn refused(d: &Demo, connection: &str, pg: bool, message: &str) {
     assert_eq!(std::fs::read(&sql).unwrap(), b"existing sql\n");
     std::fs::remove_file(out).unwrap();
     std::fs::remove_file(sql).unwrap();
-    assert_eq!(
-        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
-        before_ids
-    );
+    assert_eq!(crate::idtree::snapshot(&d.dir), before_ids);
     assert_eq!(records(connection, pg), before_ledger);
 }
 fn note(d: &Demo, connection: &str, message: &str) {
@@ -308,11 +305,9 @@ pub fn acceptance(server: &str, pg: bool) {
 
     // Importing reviewed identities and recording a drop never supplies Git
     // ancestry: this is exactly the stale checkout the guard must still refuse.
-    let ids = git(&d.dir, &["show", &format!("{deployed}:schema.ids.json")]);
-    let mut imported: pbps_model::IdsFile = serde_json::from_str(&ids).unwrap();
-    let path = d.dir.join("schema.ids.json");
-    let local: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut imported = crate::idtree::model_at(&d.dir, &deployed);
+    let path = d.dir.clone();
+    let local: pbps_model::IdsFile = crate::idtree::model(&path);
     // Import deployed identities without retiring the local-only coupon UID
     // and minting a replacement for the same declaration (DEC-2414.1).
     let coupon: pbps_model::ColumnRef = format!("{schema}.customer.coupon").parse().unwrap();
@@ -416,15 +411,11 @@ pub fn acceptance(server: &str, pg: bool) {
 
     // A no-Git baseline is actual NULL evidence, not a missing object. Record
     // the complete live A declaration scope, then plan the stale removal tree.
-    for file in [
-        "schema/customer.yml",
-        "schema/owned.yml",
-        "schema/role.yml",
-        "schema.ids.json",
-    ] {
+    for file in ["schema/customer.yml", "schema/owned.yml", "schema/role.yml"] {
         let contents = git(&d.dir, &["show", &format!("{deployed}:{file}")]);
         std::fs::write(export.dir.join(file), format!("{contents}\n")).unwrap();
     }
+    crate::idtree::copy_revision(&d.dir, &deployed, &export.dir);
     ok(export.run(&[
         "baseline",
         "--db",

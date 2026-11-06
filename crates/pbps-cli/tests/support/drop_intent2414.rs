@@ -115,13 +115,13 @@ pub(super) fn check(server: &str, postgres: bool) {
     assert!(output.status.success());
     let baseline = String::from_utf8(output.stdout).unwrap();
     succeeds(d.run(&["bootstrap", "--db", connection]));
-    let ids_path = d.dir.join("schema.ids.json");
-    let ids = std::fs::read(&ids_path).unwrap();
+    let ids_path = d.dir.clone();
+    let ids = crate::idtree::snapshot(&ids_path);
     let restore = || {
         for (name, text) in &files {
             std::fs::write(directory.join(name), text).unwrap();
         }
-        std::fs::write(&ids_path, &ids).unwrap();
+        crate::idtree::restore(&ids_path, &ids);
     };
     let column = format!("{schema}.keep.gone");
     let victim = format!("{schema}.victim");
@@ -254,8 +254,8 @@ pub(super) fn check(server: &str, postgres: bool) {
                         .unwrap()
                         .retain(|_, name| !name.as_str().unwrap().starts_with(&prefix));
                 }
-                std::fs::write(&ids_path, serde_json::to_vec_pretty(&local).unwrap()).unwrap();
-                let before = std::fs::read(&ids_path).unwrap();
+                crate::idtree::write(&ids_path, &serde_json::from_value(local).unwrap());
+                let before = crate::idtree::snapshot(&ids_path);
                 let args: Vec<_> = case.command.iter().map(String::as_str).collect();
                 let output = d.run(&args);
                 assert_eq!(
@@ -271,10 +271,10 @@ pub(super) fn check(server: &str, postgres: bool) {
                     "or the identity file, likely a typo:"
                 );
                 assert!(stderr(&output).contains(unused), "{}", stderr(&output));
-                assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+                assert_eq!(crate::idtree::snapshot(&ids_path), before);
             }
             d.commit();
-            let before = std::fs::read(&ids_path).unwrap();
+            let before = crate::idtree::snapshot(&ids_path);
             for connected in [false, true] {
                 for format in ["human", "json"] {
                     let artifact = d.dir.join("refused.plan.json");
@@ -329,7 +329,7 @@ pub(super) fn check(server: &str, postgres: bool) {
                             stderr(&output)
                         );
                     }
-                    assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+                    assert_eq!(crate::idtree::snapshot(&ids_path), before);
                     assert_eq!(std::fs::read(&artifact).unwrap(), b"existing plan\n");
                     assert_eq!(std::fs::read(&script).unwrap(), b"existing script\n");
                 }
@@ -417,12 +417,12 @@ pub(super) fn check(server: &str, postgres: bool) {
     let output = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["data"]["changes"], 0);
-    let after = std::fs::read(&ids_path).unwrap();
+    let after = crate::idtree::snapshot(&ids_path);
     for case in &cases {
         let args: Vec<_> = case.command.iter().map(String::as_str).collect();
         let output = succeeds(d.run(&args));
         assert!(stdout(&output).contains("these intents may have taken effect already"));
-        assert_eq!(std::fs::read(&ids_path).unwrap(), after);
+        assert_eq!(crate::idtree::snapshot(&ids_path), after);
     }
     let output = d.run(&[
         "drop",
@@ -469,9 +469,8 @@ pub(super) fn check(server: &str, postgres: bool) {
     assert!(snapshot.git_sha.is_none());
     let text = std::fs::read_to_string(&table).unwrap();
     std::fs::write(table, text.replace("  gone: {type: bigint}\n", "")).unwrap();
-    let path = plain.dir.join("schema.ids.json");
-    let mut ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let path = plain.dir.clone();
+    let mut ids: pbps_model::IdsFile = crate::idtree::model(&path);
     let column = format!("{schema}.plain.gone").parse().unwrap();
     let uid = ids.column_uid(&column).unwrap().clone();
     ids.columns.remove(&uid);
@@ -487,5 +486,5 @@ pub(super) fn check(server: &str, postgres: bool) {
             .iter()
             .any(|finding| finding["id"] == "identity.drop-column-needs-reason")
     );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(crate::idtree::snapshot(&path), before);
 }

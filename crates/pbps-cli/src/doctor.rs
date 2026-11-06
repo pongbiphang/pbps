@@ -38,7 +38,7 @@ pub struct InputPaths {
     pub mode: InputPathMode,
     pub project_file: String,
     pub declarations: String,
-    pub identity_file: String,
+    pub identity_dir: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -62,14 +62,14 @@ pub fn input_paths(project: &Project, json: bool) -> anyhow::Result<()> {
         mode: InputPathMode::PathsOnly,
         project_file: project.config_file().display().to_string(),
         declarations: project.schema_dir().display().to_string(),
-        identity_file: project.ids_file().display().to_string(),
+        identity_dir: project.ids_dir().display().to_string(),
     };
     if json {
         output::Report::new("doctor", Vec::new(), Some(data)).emit_json()
     } else {
         println!(
             "Project: {}\nDeclarations: {}\nIdentity: {}",
-            data.project_file, data.declarations, data.identity_file
+            data.project_file, data.declarations, data.identity_dir
         );
         Ok(())
     }
@@ -80,7 +80,7 @@ pub fn input_paths(project: &Project, json: bool) -> anyhow::Result<()> {
 pub struct Diagnosis {
     pub project_file: String,
     pub declarations: String,
-    pub identity_file: String,
+    pub identity_dir: String,
     pub dialect: &'static str,
     pub tables: usize,
     pub modules: usize,
@@ -351,16 +351,15 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         dialect: project.config.dialect,
     };
 
-    // "No identity file yet, the first plan mints one" is true only where no
-    // identity tree stands in its place; with one, reading it is refused (the
-    // finding above) and the note would be the lie the guard exists to stop.
-    if !project.ids_file().exists() && crate::ids_guard::refuse_tree(project).is_ok() {
+    // "No identity yet, the first plan mints one" is true of a fresh project,
+    // and only of one: a tree that cannot be read is the finding above, not news.
+    if matches!(crate::ids_store::read_opt(project), Ok(None)) {
         findings.push(
             output::Finding::note(
                 "project.no-identity-file",
-                "no identity file yet; the first `pbps plan` mints one",
+                "no identity tree yet; the first `pbps plan` mints one",
             )
-            .at(project.ids_file(), None)
+            .at(project.ids_dir(), None)
             .remedy("pbps plan"),
         );
     }
@@ -483,7 +482,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         Some(Diagnosis {
             project_file: project.config_file().display().to_string(),
             declarations: project.schema_dir().display().to_string(),
-            identity_file: project.ids_file().display().to_string(),
+            identity_dir: project.ids_dir().display().to_string(),
             dialect: counts.dialect,
             tables: counts.tables,
             modules: counts.modules,
@@ -1605,7 +1604,7 @@ fn render(report: &output::Report<Diagnosis>) -> String {
     let mut out = String::from("Project\n");
     out.push_str(&format!("  config        {}\n", d.project_file));
     out.push_str(&format!("  declarations  {}\n", d.declarations));
-    out.push_str(&format!("  identity      {}\n", d.identity_file));
+    out.push_str(&format!("  identity      {}\n", d.identity_dir));
     out.push_str(&format!(
         "  dialect       {} — {} table(s), {} module(s)\n",
         d.dialect, d.tables, d.modules

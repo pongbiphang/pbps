@@ -189,8 +189,8 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
         );
         let d = adopted(connection, "rls-c-dependents");
         let original = std::fs::read_to_string(d.dir.join("schema/app.t.yml")).unwrap();
-        let ids_path = d.dir.join("schema.ids.json");
-        let opening_ids = std::fs::read(&ids_path).unwrap();
+        let ids_path = d.dir.clone();
+        let opening_ids = crate::idtree::snapshot(&ids_path);
         // Retyping and dropping a bound column are refused before any DDL.
         for target in [
             original.replace("\"n\":\n    type: integer", "\"n\":\n    type: bigint"),
@@ -209,7 +209,7 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
                 "{}",
                 stderr(&out)
             );
-            std::fs::write(&ids_path, &opening_ids).unwrap();
+            crate::idtree::restore(&ids_path, &opening_ids);
         }
         write(&d, &original);
         declare_function(&d, "visible", "SELECT x+1");

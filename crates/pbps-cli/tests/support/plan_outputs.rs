@@ -110,10 +110,10 @@ fn project_inputs_are_never_plan_or_sql_destinations() {
     for dialect in ["mssql", "postgres"] {
         let d = project("inputs", dialect, true);
         std::fs::rename(d.dir.join("schema"), d.dir.join("declarations")).unwrap();
-        std::fs::rename(d.ids_path(), d.dir.join("identities.json")).unwrap();
+        std::fs::rename(crate::idtree::dir(&d.dir), d.dir.join("identities")).unwrap();
         std::fs::write(
             d.dir.join("pbps.yml"),
-            format!("dialect: {dialect}\nschema_dir: declarations\nids_file: identities.json\n"),
+            format!("dialect: {dialect}\nschema_dir: declarations\nids_dir: identities\n"),
         )
         .unwrap();
         std::fs::create_dir(d.dir.join("declarations/roles")).unwrap();
@@ -125,7 +125,7 @@ fn project_inputs_are_never_plan_or_sql_destinations() {
         std::fs::write(d.dir.join("other.out"), "other reviewed artifact\n").unwrap();
         for input in [
             "pbps.yml",
-            "identities.json",
+            "identities/dbo.t.json",
             "declarations/dbo.t.yml",
             "declarations/roles/reader.yaml",
         ] {
@@ -157,9 +157,9 @@ fn an_absent_identity_file_cannot_be_replaced_by_an_artifact() {
                     "--format",
                     "json",
                 ],
-                Some(&d.ids_path()),
+                Some(&d.dir.join("schema.ids.json")),
             );
-            assert!(!d.ids_path().exists());
+            assert!(!crate::idtree::exists(&d.dir));
         }
     }
 }
@@ -260,7 +260,7 @@ fn connected_planning_refuses_output_aliases_before_contacting_the_target() {
                 "--format",
                 "json",
             ],
-            Some(&d.ids_path()),
+            Some(&d.dir.join("schema.ids.json")),
         );
     }
 }
@@ -456,8 +456,7 @@ fn assertion_aliases_follow_the_reader_when_the_working_directory_differs_from_t
 fn snapshot_baselines_and_resolver_externals_files_are_protected_inputs() {
     for dialect in ["mssql", "postgres"] {
         let d = project("baselines", dialect, true);
-        let ids: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(d.ids_path()).unwrap()).unwrap();
+        let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
         let baseline = serde_json::json!({
             "version": pbps_model::state::OLDEST_READABLE_VERSION,
             "kind": "baseline", "operator": "offline-test", "ids": ids,
@@ -510,14 +509,15 @@ fn snapshot_baselines_and_resolver_externals_files_are_protected_inputs() {
 #[test]
 fn symlink_and_hardlink_aliases_protect_inputs_and_artifacts() {
     let d = project("filesystem-aliases", "postgres", true);
-    std::os::unix::fs::symlink(d.ids_path(), d.dir.join("ids-alias.json")).unwrap();
+    let ids_file = crate::idtree::dir(&d.dir).join("dbo.t.json");
+    std::os::unix::fs::symlink(&ids_file, d.dir.join("ids-alias.json")).unwrap();
     std::fs::hard_link(
         d.dir.join("schema/dbo.t.yml"),
         d.dir.join("declaration-alias.out"),
     )
     .unwrap();
     for (alias, input) in [
-        ("ids-alias.json", d.ids_path()),
+        ("ids-alias.json", ids_file),
         ("declaration-alias.out", d.dir.join("schema/dbo.t.yml")),
     ] {
         for flag in ["--out", "--sql"] {

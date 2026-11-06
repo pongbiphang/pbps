@@ -1887,7 +1887,7 @@ fn interrupted_children_and_unknown_or_changed_snapshot_entries_remain_retained(
             "signal" => "kill -KILL $$",
             "panic-status" => "exit 101",
             "temporary" => "printf foreign > ../.git/index.lock; exit 1",
-            "changed" => "printf changed > schema.ids.json; exit 1",
+            "changed" => "printf changed > .pbps/ids/t.json; exit 1",
             _ => "exit 1",
         };
         fs::write(
@@ -1952,7 +1952,7 @@ fn interrupted_children_and_unknown_or_changed_snapshot_entries_remain_retained(
         }
         let retained = match mode {
             "temporary" => Some((snapshot.join(".git/index.lock"), "foreign")),
-            "changed" => Some((snapshot.join("project/schema.ids.json"), "changed")),
+            "changed" => Some((snapshot.join("project/.pbps/ids/t.json"), "changed")),
             "early-foreign" => Some((snapshot.join("foreign"), "foreign")),
             "early-lock" => Some((snapshot.join("foreign.lock"), "foreign")),
             _ => None,
@@ -2154,8 +2154,8 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
         "live-attribute-total",
     ] {
         let f = Fixture::new(&format!("remaining-budget-{mode}"));
-        let ids = f.repo.project.join("schema.ids.json");
-        let original_ids = fs::read(&ids).unwrap();
+        let ids = f.repo.project.clone();
+        let original_ids = crate::idtree::snapshot(&ids);
         if matches!(mode, "attributes" | "attribute-object") {
             f.repo.table(ORIGINAL);
             let size = if mode == "attributes" { 31 } else { 65 };
@@ -2169,12 +2169,15 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
         match mode {
             "identity" => fs::OpenOptions::new()
                 .write(true)
-                .open(&ids)
+                .open(crate::idtree::dir(&ids).join("t.json"))
                 .unwrap()
                 .set_len(64 * 1024 * 1024 + 1)
                 .unwrap(),
             "aggregate" => {
-                let mut file = fs::OpenOptions::new().append(true).open(&ids).unwrap();
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(crate::idtree::dir(&ids).join("t.json"))
+                    .unwrap();
                 file.write_all(&padding[..62 * 1024 * 1024]).unwrap();
                 f.repo
                     .table(&format!("{RENAMED}#{}\n", " ".repeat(3 * 1024 * 1024)));
@@ -2213,7 +2216,7 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
             );
             f.source_unchanged(&before);
         }
-        fs::write(&ids, &original_ids).unwrap();
+        crate::idtree::restore(&ids, &original_ids);
         if matches!(
             mode,
             "attributes" | "attribute-object" | "live-attribute" | "live-attribute-total"

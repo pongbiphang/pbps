@@ -179,7 +179,7 @@ fn check(slug: &str, sql: &str, kind: &str, identity: &str) {
                 .any(|m| m.starts_with(&format!("{kind} `{identity}`"))),
             "{expected:?}"
         );
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         // Default warnings permit even an empty saved plan to be applied.
         succeeds(approved_apply(
             &d,
@@ -189,7 +189,7 @@ fn check(slug: &str, sql: &str, kind: &str, identity: &str) {
         ));
         assert_eq!(messages(&report(&d, connection)), expected);
         succeeds(d.run(&["verify", "--db", connection]));
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         if slug == "large_object" {
             on_server(connection, "SELECT pg_catalog.lo_create(44)");
             assert!(

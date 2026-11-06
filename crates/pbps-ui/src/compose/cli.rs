@@ -83,7 +83,7 @@ impl Intent {
 pub(super) struct Paths {
     pub project_file: String,
     pub declarations: String,
-    pub identity_file: String,
+    pub identity_dir: String,
 }
 
 pub(super) struct Cli {

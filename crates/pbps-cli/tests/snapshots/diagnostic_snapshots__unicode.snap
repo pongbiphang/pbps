@@ -4,7 +4,7 @@ expression: human.snapshot()
 ---
 exit: 2
 --- stdout ---
-No identity file yet at `./schema.ids.json`; run `pbps plan` to create it.
+No identity file yet at `./.pbps/ids`; run `pbps plan` to create it.
 --- stderr ---
 pbps::load::semantic
 

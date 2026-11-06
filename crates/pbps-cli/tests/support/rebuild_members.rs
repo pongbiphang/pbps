@@ -40,8 +40,8 @@ pub(super) fn check(connection: Option<&str>) {
         if let Some(connection) = connection {
             succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt source"]));
         }
-        let ids_path = d.dir.join("schema.ids.json");
-        let source_bytes = std::fs::read(&ids_path).unwrap();
+        let ids_path = d.dir.clone();
+        let source_bytes = crate::idtree::snapshot(&ids_path);
         let source_ids: pbps_model::IdsFile = serde_json::from_slice(&source_bytes).unwrap();
         std::fs::write(&path, declaration(&case.desired)).unwrap();
         let record = d.run(&[
@@ -61,7 +61,7 @@ pub(super) fn check(connection: Option<&str>) {
                 stderr(&record)
             );
             assert_eq!(
-                std::fs::read(&ids_path).unwrap(),
+                crate::idtree::snapshot(&ids_path),
                 source_bytes,
                 "{}",
                 case.name
@@ -69,7 +69,7 @@ pub(super) fn check(connection: Option<&str>) {
             continue;
         }
         assert_eq!(code(&record), 0, "{}: {}", case.name, stderr(&record));
-        let recorded = std::fs::read(&ids_path).unwrap();
+        let recorded = crate::idtree::snapshot(&ids_path);
         let approved: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
         approved.validate().unwrap();
         // Approval switched the tree: every source uid is retired and none of
@@ -130,7 +130,12 @@ pub(super) fn check(connection: Option<&str>) {
                     case.name,
                     stderr(&out)
                 );
-                assert_eq!(std::fs::read(&ids_path).unwrap(), recorded, "{}", case.name);
+                assert_eq!(
+                    crate::idtree::snapshot(&ids_path),
+                    recorded,
+                    "{}",
+                    case.name
+                );
             }
         };
         check();

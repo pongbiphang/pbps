@@ -122,7 +122,7 @@ pub fn check(admin: &str) {
         let path = d.dir.join("advisory.plan.json");
         let before: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         on_server(
             connection,
             &format!(
@@ -160,7 +160,7 @@ pub fn check(admin: &str) {
         );
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains(ID) && !saved.contains(&role), "{saved}");
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         let human = succeeds(d.run(&["plan", "--db", connection]));
         for finding in &expected {
             assert_eq!(
@@ -199,8 +199,7 @@ pub fn check(admin: &str) {
             "SELECT state_json::text FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
         );
         assert!(!state.contains(ID) && !state.contains(&role), "{state}");
-        let ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
         assert!(ids.roles.is_empty());
 
         // Registration uses the ordinary policy settings and suppression path,

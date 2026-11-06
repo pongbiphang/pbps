@@ -17,7 +17,7 @@ fn preserved(repo: &Repository) -> Vec<Vec<u8>> {
     };
     vec![
         fs::read(repo.project.join("schema/t.yml")).unwrap(),
-        fs::read(repo.project.join("schema.ids.json")).unwrap(),
+        crate::idtree::snapshot(&repo.project),
         fs::read(path("index")).unwrap(),
         fs::read(path("HEAD")).unwrap(),
         user_refs(&repo.root),

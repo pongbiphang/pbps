@@ -39,8 +39,8 @@ fn consumer_contracts_refuse_recorded_drops_without_publishing_and_retirement_pe
     config(&d, "consumers:\n  billing-v41: {uses: [app.t.old]}\n");
     table(&d, "  kept: {type: integer}\n");
     ok(d.run(&["drop", "app.t.old", "--reason", "retired"]));
-    let ids = d.dir.join("schema.ids.json");
-    let before = std::fs::read(&ids).unwrap();
+    let ids = d.dir.clone();
+    let before = crate::idtree::snapshot(&ids);
     let plan = d.dir.join("plan.json");
     let sql = d.dir.join("plan.sql");
     std::fs::write(&plan, "keep plan").unwrap();
@@ -70,7 +70,7 @@ fn consumer_contracts_refuse_recorded_drops_without_publishing_and_retirement_pe
             && message.contains("alongside"),
         "{message}"
     );
-    assert_eq!(std::fs::read(&ids).unwrap(), before);
+    assert_eq!(crate::idtree::snapshot(&ids), before);
     assert_eq!(std::fs::read_to_string(&plan).unwrap(), "keep plan");
     assert_eq!(std::fs::read_to_string(&sql).unwrap(), "keep sql");
     config(&d, "");
