@@ -8053,7 +8053,7 @@ fn plan_db(
         no_rehearse,
         assertions,
         carried,
-        false,
+        None,
     ))
 }
 
@@ -8073,7 +8073,7 @@ fn plan_db_async<'a>(
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
     no_rehearse: bool,
     carried: &'a mut Vec<crate::output::Finding>,
-    quiet: bool,
+    owned: Option<&'a services::Progress>,
 ) -> impl std::future::Future<Output = anyhow::Result<services::PlanResult>> + 'a {
     plan_db_selected(
         project,
@@ -8087,7 +8087,7 @@ fn plan_db_async<'a>(
         no_rehearse,
         None,
         carried,
-        quiet,
+        owned,
     )
 }
 
@@ -8104,8 +8104,12 @@ async fn plan_db_selected(
     no_rehearse: bool,
     assertions: Option<&crate::plan_assert::Selection>,
     carried: &mut Vec<crate::output::Finding>,
-    quiet: bool,
+    // An owned test run lends the collector its caller drains after the phase:
+    // a cancelled or expired phase drops this future, and a collector local to
+    // it would take the observed findings along (#2694). `None` is the command.
+    owned: Option<&services::Progress>,
 ) -> anyhow::Result<services::PlanResult> {
+    let quiet = owned.is_some();
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
@@ -8394,7 +8398,8 @@ async fn plan_db_selected(
         // the label it had (DEC-2346.2).
         let mut to_read = pbps_model::data::read_scopes(&recorded_data, &declared_data);
         pbps_diff::enum_labels::read_before_the_renames(&mut to_read, &declared_live, &loaded.hints);
-        let catalog = std::cell::RefCell::new(Vec::new());
+        let local_catalog = std::cell::RefCell::new(Vec::new());
+        let catalog = owned.map_or(&local_catalog, |p| &p.findings);
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -8406,10 +8411,10 @@ async fn plan_db_selected(
             target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &to_read,
             crate::engine::Read::Snapshot,
-            CatalogWarnings::for_output(json, &catalog),
+            CatalogWarnings::for_output(json, catalog),
         )
         .await;
-        findings.extend(catalog.into_inner());
+        findings.extend(catalog.take());
         if json {
             carried.clone_from(&findings);
         }
@@ -9192,7 +9197,6 @@ async fn plan_db_selected(
             })
         {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
-            let observation = services::Progress::default();
             let result = run_probes_observed(
                 &mut conn,
                 &site_admission,
@@ -9204,10 +9208,12 @@ async fn plan_db_selected(
                     ids: &recorded_ids,
                 }),
                 None,
-                quiet.then_some(&observation),
+                owned,
             )
             .await;
-            findings.extend(observation.findings.into_inner());
+            if let Some(owned) = owned {
+                findings.extend(owned.findings.take());
+            }
             if json { carried.clone_from(&findings); }
             result?;
         }

@@ -256,8 +256,8 @@ fn d2b1_1165_owned_execution_future_frames_are_bounded() {
         ("control.finish", frame!(Control::finish; A, B, C)),
         ("service.provision", frame!(Session::new; A)),
         ("service.grants", frame!(Session::grants; A, B)),
-        ("service.bootstrap", frame!(test_run::bootstrap; A, B, C)),
-        ("service.plan", frame!(test_run::plan; A, B, C)),
+        ("service.bootstrap", frame!(test_run::bootstrap; A, B, C, D)),
+        ("service.plan", frame!(test_run::plan; A, B, C, D, E)),
         ("service.apply", frame!(test_run::apply; A, B, C, D, E, G)),
     ] {
         eprintln!("{name}: {bytes} bytes");

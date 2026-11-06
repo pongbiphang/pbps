@@ -1,7 +1,8 @@
 //! The owned SQL Server session on the pinned image: identities, fixture
 //! framing, and the ordinary sealed plan and apply (ADR-0019 §3, §4, §6).
 use super::*;
-use crate::deploy::test_run::{Progress, apply, bootstrap, plan};
+use crate::deploy::test_run::whole::{bootstrap, plan};
+use crate::deploy::test_run::{Progress, apply};
 use crate::plan_test::{
     Revision,
     execution::Control,

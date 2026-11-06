@@ -2,6 +2,7 @@ use super::*;
 use crate::plan_test::{
     execution::Control,
     report::{Assertion, TestData},
+    session::Session,
 };
 
 #[derive(Clone, Copy)]
@@ -12,6 +13,8 @@ enum Case {
     Refusals,
     CancelProvision,
     CancelApply,
+    CancelBootstrap,
+    CancelPlan,
 }
 
 fn limits() -> pbps_config::test_manifest::Timeouts {
@@ -51,8 +54,18 @@ async fn exercise_control(
     let candidate = fixture.input(&base.ids, true, true)?;
     let before = fixture.bytes()?;
     let session = control.provision(scratch, data, 0).await?;
+    if matches!(case, Case::CancelBootstrap) {
+        return cancel_bootstrap(scratch, control, data, send, &session, &base).await;
+    }
     let mut phase = Phase::new("bootstrap", "base");
     control.bootstrap(&session, &base, &mut phase).await?;
+    // Each of the build's catalog reads reports the scratch's PUBLIC grant
+    // once; a second drain must not repeat any of them (#2694).
+    ensure!(
+        public_usage_warnings(&phase) == BOOTSTRAP_READS,
+        "{:?}",
+        phase.findings
+    );
     let entry = phase.entry.context("bootstrap entry absent")?;
     phase.elapsed_ms = 60000;
     control.grants(&session, &base, &mut phase).await?;
@@ -63,8 +76,16 @@ async fn exercise_control(
         .execute("INSERT INTO app.orders(code,amount) VALUES ('kept',1164)")
         .await?;
     drop(writer);
+    if matches!(case, Case::CancelPlan) {
+        return cancel_plan(scratch, control, data, send, &session, &candidate).await;
+    }
     let mut phase = Phase::new("candidate_plan", "candidate");
     let planned = control.plan(&session, &candidate, &mut phase).await?;
+    ensure!(
+        public_usage_warnings(&phase) == PLAN_READS,
+        "{:?}",
+        phase.findings
+    );
     let checksum = planned.artifact.checksum();
     ensure!(phase.checksum.as_deref() == Some(checksum.as_str()));
     data.candidate_sealed_checksum = Some(checksum.clone());
@@ -211,7 +232,7 @@ async fn exercise_control(
             data.assertions.push(assertion);
             data.phases.push(phase);
         }
-        Case::CancelProvision => unreachable!(),
+        Case::CancelProvision | Case::CancelBootstrap | Case::CancelPlan => unreachable!(),
     }
     ensure!(
         fixture.bytes()? == before,
@@ -219,6 +240,155 @@ async fn exercise_control(
     );
     ensure!(!fixture.0.path().join("plan.json").exists());
     ensure!(!std::path::Path::new("in-memory test plan").exists());
+    Ok(())
+}
+
+/// Catalog reads one bootstrap makes, measured on the engine.
+const BOOTSTRAP_READS: usize = 3;
+/// Catalog reads one plan makes; each reports the scratch's PUBLIC grant once.
+const PLAN_READS: usize = 1;
+
+fn public_usage_warnings(phase: &Phase) -> usize {
+    phase
+        .findings
+        .iter()
+        .filter(|f| {
+            f.id == "catalog.warning" && f.message.contains("PUBLIC holds USAGE on schema `public`")
+        })
+        .count()
+}
+
+/// A phase whose cancellation arrived before it started has observed nothing:
+/// no warning, and still failed without an answer.
+async fn cancelled_before_any_warning(
+    session: &Session<'_>,
+    input: &Assembled,
+    plan: bool,
+) -> anyhow::Result<()> {
+    let mut control = Control::new(limits(), async { Ok(()) });
+    let mut phase = Phase::new("early", "cancelled");
+    let error = if plan {
+        control.plan(session, input, &mut phase).await.err()
+    } else {
+        control.bootstrap(session, input, &mut phase).await.err()
+    };
+    ensure!(
+        error
+            .context("a cancelled phase succeeded")?
+            .to_string()
+            .contains("cancelled"),
+        "{:?}",
+        phase.findings
+    );
+    ensure!(public_usage_warnings(&phase) == 0, "{:?}", phase.findings);
+    ensure!(matches!(phase.outcome, Status::Unanswerable));
+    Ok(())
+}
+
+/// Sends the cancellation once the owned apply role waits on a lock: the
+/// service has then made every catalog read that precedes the blocked work.
+async fn cancel_when_blocked(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+    send: tokio::sync::oneshot::Sender<()>,
+) -> anyhow::Result<()> {
+    let mut monitor = admin(scratch).await?;
+    let until = tokio::time::Instant::now() + Duration::from_secs(25);
+    let sql = format!(
+        "SELECT pid FROM pg_stat_activity WHERE usename='pbps_test_apply_{}' AND wait_event_type='Lock'",
+        scratch.run_id()
+    );
+    loop {
+        if !monitor.query(&sql).await?.is_empty() {
+            send.send(()).unwrap();
+            return Ok(());
+        }
+        ensure!(
+            tokio::time::Instant::now() < until,
+            "the phase never reached the blocked work"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn cancel_bootstrap(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+    control: &mut Control,
+    data: &mut TestData,
+    send: tokio::sync::oneshot::Sender<()>,
+    session: &Session<'_>,
+    base: &Assembled,
+) -> anyhow::Result<()> {
+    cancelled_before_any_warning(session, base, false).await?;
+    // The first table the build creates waits on a lock this test holds, which
+    // is after the existing-state read has reported its warning.
+    let mut holder = admin(scratch).await?;
+    holder.execute("SELECT pg_advisory_lock(2694)").await?;
+    let mut ddl = admin(scratch).await?;
+    ddl.execute(concat!(
+        "CREATE FUNCTION public.hold_2694() RETURNS event_trigger LANGUAGE plpgsql AS $$ ",
+        "BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() ",
+        "WHERE object_identity = 'app.orders') THEN PERFORM pg_advisory_xact_lock(2694); ",
+        "END IF; END $$; ",
+        "CREATE EVENT TRIGGER hold_2694 ON ddl_command_end WHEN TAG IN ('CREATE TABLE') ",
+        "EXECUTE FUNCTION public.hold_2694()"
+    ))
+    .await?;
+    let mut phase = Phase::new("bootstrap", "base");
+    let (result, observed) = tokio::join!(
+        control.bootstrap(session, base, &mut phase),
+        cancel_when_blocked(scratch, send)
+    );
+    holder.execute("SELECT pg_advisory_unlock(2694)").await?;
+    observed?;
+    ensure!(result.unwrap_err().to_string().contains("cancelled"));
+    ensure!(phase.entry.is_none());
+    ensure!(
+        public_usage_warnings(&phase) == 1,
+        "the cancelled bootstrap lost or repeated its warning: {:?}",
+        phase.findings
+    );
+    ensure!(matches!(phase.outcome, Status::Unanswerable));
+    data.phases.push(phase);
+    Ok(())
+}
+
+async fn cancel_plan(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+    control: &mut Control,
+    data: &mut TestData,
+    send: tokio::sync::oneshot::Sender<()>,
+    session: &Session<'_>,
+    candidate: &Assembled,
+) -> anyhow::Result<()> {
+    cancelled_before_any_warning(session, candidate, true).await?;
+    // The exact data scope on `app.codes` is read after the catalog warning;
+    // the lock holds that read.
+    let mut holder = admin(scratch).await?;
+    holder
+        .execute("BEGIN; LOCK TABLE app.codes IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    let mut phase = Phase::new("candidate_plan", "candidate");
+    let (result, observed) = tokio::join!(
+        control.plan(session, candidate, &mut phase),
+        cancel_when_blocked(scratch, send)
+    );
+    holder.execute("ROLLBACK").await?;
+    observed?;
+    ensure!(
+        result
+            .err()
+            .context("a cancelled plan succeeded")?
+            .to_string()
+            .contains("cancelled")
+    );
+    ensure!(phase.checksum.is_none());
+    ensure!(
+        public_usage_warnings(&phase) == PLAN_READS,
+        "the cancelled plan lost or repeated its warning: {:?}",
+        phase.findings
+    );
+    ensure!(matches!(phase.outcome, Status::Unanswerable));
+    data.phases.push(phase);
     Ok(())
 }
 
@@ -254,7 +424,9 @@ async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
     let expected = match case {
         Case::Preservation | Case::Budgets => crate::output::Outcome::Ok,
         Case::Violation | Case::Refusals => crate::output::Outcome::Findings,
-        Case::CancelProvision | Case::CancelApply => crate::output::Outcome::Unanswerable,
+        Case::CancelProvision | Case::CancelApply | Case::CancelBootstrap | Case::CancelPlan => {
+            crate::output::Outcome::Unanswerable
+        }
     };
     ensure!(
         report.result == expected,
@@ -360,6 +532,25 @@ async fn d2b1_1165_pg16_cancelled_apply_retains_admission_submission_and_finding
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2b1_1165_pg18_cancelled_apply_retains_admission_submission_and_findings() {
     Box::pin(lifecycle("PBPS_TEST_PG_SCRATCH_IMAGE", Case::CancelApply))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and a pinned PostgreSQL scratch image"]
+async fn d2694_pg18_cancelled_bootstrap_keeps_its_catalog_warning_once() {
+    Box::pin(lifecycle(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Case::CancelBootstrap,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and a pinned PostgreSQL scratch image"]
+async fn d2694_pg18_cancelled_plan_keeps_its_catalog_warning_once() {
+    Box::pin(lifecycle("PBPS_TEST_PG_SCRATCH_IMAGE", Case::CancelPlan))
         .await
         .unwrap();
 }

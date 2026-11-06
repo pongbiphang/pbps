@@ -269,6 +269,8 @@
         "deploy::test_run::tests::execution_tests::d2b1_1165_pg18_cancellation_during_provision_reaches_no_sql",
         "deploy::test_run::tests::execution_tests::d2b1_1165_pg16_cancelled_apply_retains_admission_submission_and_findings",
         "deploy::test_run::tests::execution_tests::d2b1_1165_pg18_cancelled_apply_retains_admission_submission_and_findings",
+        "deploy::test_run::tests::execution_tests::d2694_pg18_cancelled_bootstrap_keeps_its_catalog_warning_once",
+        "deploy::test_run::tests::execution_tests::d2694_pg18_cancelled_plan_keeps_its_catalog_warning_once",
         "deploy::test_run::tests::d2a1165_pg16_owns_credentials_and_executes_only_accepted_sealed_plans",
         "deploy::test_run::tests::d2a1165_pg18_owns_credentials_and_executes_only_accepted_sealed_plans",
         "deploy::test_run::tests::d2a1165_pg16_unmanaged_error_excludes_only_owned_run_roles",

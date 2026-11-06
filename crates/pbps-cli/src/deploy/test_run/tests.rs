@@ -1,3 +1,4 @@
+use super::whole::{bootstrap, plan};
 use super::*;
 use crate::plan_test::{Revision, report::Status};
 use anyhow::{Context as _, ensure};
@@ -1348,6 +1349,7 @@ fn d2a1165_composed_service_futures_stay_below_256_kib() {
             let apply_size = std::mem::size_of_val(&apply);
             drop(apply);
             let mut findings = Vec::new();
+            let progress = Progress::default();
             let future = super::super::plan_db_async(
                 &project,
                 &target,
@@ -1362,7 +1364,7 @@ fn d2a1165_composed_service_futures_stay_below_256_kib() {
                 None,
                 false,
                 &mut findings,
-                true,
+                Some(&progress),
             );
             (bootstrap_size, std::mem::size_of_val(&future), apply_size)
         })
