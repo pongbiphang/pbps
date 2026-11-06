@@ -252,13 +252,16 @@ pub fn read_ids_tree(dir: &Path) -> Result<BTreeMap<String, String>, ProjectLoad
         Ok(_) => {
             return Err(ProjectLoadError::Layout(format!(
                 "identity tree `{}` is not a directory",
-                dir.display()
+                pbps_model::escape::Escaped(&dir.display().to_string())
             )));
         }
     }
     let mut pending = vec![(dir.to_owned(), String::new())];
     let refuse = |path: &Path, what: &str| {
-        ProjectLoadError::Layout(format!("identity tree entry `{}` {what}", path.display()))
+        ProjectLoadError::Layout(format!(
+            "identity tree entry `{}` {what}",
+            pbps_model::escape::Escaped(&path.display().to_string())
+        ))
     };
     while let Some((current, prefix)) = pending.pop() {
         for entry in std::fs::read_dir(&current).map_err(|e| io(&current, e))? {
