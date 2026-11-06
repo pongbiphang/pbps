@@ -20,6 +20,7 @@ mod engine;
 mod explain;
 mod externals_draft;
 mod hooks;
+mod ids_cmd;
 mod init;
 mod integration;
 mod intent_batch;
@@ -621,6 +622,12 @@ enum Command {
         command: StateCommand,
     },
 
+    /// The identity tree under `ids_dir`: migrate, format, resolve (#2600)
+    Ids {
+        #[command(subcommand)]
+        command: ids_cmd::IdsCommand,
+    },
+
     /// Fingerprint keys for engine-assisted planning (DEC-952.1)
     Key {
         #[command(subcommand)]
@@ -696,6 +703,7 @@ impl Command {
             | Command::Baseline { .. }
             | Command::Bootstrap { .. }
             | Command::Unlock { .. }
+            | Command::Ids { .. }
             | Command::Key { .. } => return None,
             // The one subcommand that speaks an envelope. Matched on its own
             // rather than folded into the arm above, because a project that
@@ -1059,6 +1067,7 @@ fn run() -> anyhow::Result<()> {
         | Command::Docs { .. }
         | Command::Ui
         | Command::Unlock { .. }
+        | Command::Ids { .. }
         | Command::Key { .. }
         | Command::State { .. }
         | Command::Test { .. } => {}
@@ -1563,6 +1572,7 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Validate { format, since } => cmd_validate(&project, format, since.as_deref()),
         Command::Fmt { check, format } => cmd_fmt(&project, check, format),
+        Command::Ids { command } => ids_cmd::run(&project, command),
         Command::Intent(_) => cmd_intent(&project, batch.expect("validated before discovery")),
         Command::Rename { from, to } => {
             let col: ColumnRef = from.parse()?;

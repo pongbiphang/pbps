@@ -1422,3 +1422,39 @@ multi-database loader reads a database's tree when its directory holds files
 and otherwise `schema.ids.json`; both together are refused, and a tree entry
 that is not a directory or a regular `.json` file is refused rather than
 skipped. The legacy reader for history and the switch itself follow in PR 5.
+
+<a id="dec-2600-8"></a>
+
+**DEC-2600.8. `pbps ids resolve` merges by uid and never picks a side; `migrate` finishes what it started.**
+`resolve` runs after the YAML conflicts are settled and refuses while any
+declaration file still holds conflict markers, because the resolved YAML is what
+decides a clash. For each identity path git left unmerged it reads base, ours
+and theirs from the index and merges the file by uid (`pbps-model::ids_merge`,
+no I/O): a record one side changed takes that side, an identical change is
+taken once, a record one side deleted and the other left alone is gone, and a
+file one side deleted is deleted only if the other left it alone. Two different
+changes to one record are decided by the name the resolved YAML declares (a
+column's local name, a table's header) and otherwise refused with the uid, both
+sides and the remedy (state the intent with `renamed_from`, `pbps rename` or
+`pbps drop`). Everything is decided before anything is written, so a refusal
+leaves the tree as git left it. There is no `--take ours|theirs`: choosing a
+side by hand is how a duplicate name gets in. The result is written as
+canonical bytes with the columns back in YAML order, nothing is staged, and the
+validator then runs over the tree and the declarations and its findings fail
+the command. The sync that creates, relocates and drops files is `plan`'s and
+arrives with the switch; until then a file `plan` would write shows up as a
+finding with `pbps plan` as the remedy.
+
+`migrate` places each object at its mirrored path, columns in YAML order, a
+dropped object at `<name>.<uid>.json` under the root because no YAML names its
+place, and writes nothing unless the tree reads back to the very mapping it came
+from. It refuses an identity with no declaration and no tombstone, and a tree
+that differs from the one it would write. A tree identical to it is accepted, so
+an interrupted run (tree written, file or config not yet changed) is finished by
+running it again; with no old file and a tree standing it only completes the
+config, and when that is done it says so and does nothing. The order is tree,
+old file, config, so the config still tells where a custom `ids_file` was until
+that file is gone. `pbps.yml` is edited as text to keep its comments and then
+read back; a spelling the edit does not understand is refused, not half applied.
+`fmt` rewrites parseable files to canonical bytes and rewrites none when any
+file cannot be read.

@@ -211,7 +211,7 @@ fn read_ids(path: &Path) -> Result<IdsFile, ProjectLoadError> {
 fn read_database_ids(db: &DatabaseName, dirs: &DatabaseDirs) -> Result<IdsFile, ProjectLoadError> {
     let legacy = dirs.schema_dir.join("schema.ids.json");
     let tree = match &dirs.ids_dir {
-        Some(dir) => read_tree(dir)?,
+        Some(dir) => read_ids_tree(dir)?,
         None => BTreeMap::new(),
     };
     if tree.is_empty() {
@@ -243,7 +243,7 @@ fn read_database_ids(db: &DatabaseName, dirs: &DatabaseDirs) -> Result<IdsFile, 
 /// empty tree; `dir` itself is looked at without following a link, so a
 /// dangling or live symlink is refused like any other entry that is not a
 /// directory or a regular `.json` file, rather than read as "no identity".
-fn read_tree(dir: &Path) -> Result<BTreeMap<String, String>, ProjectLoadError> {
+pub fn read_ids_tree(dir: &Path) -> Result<BTreeMap<String, String>, ProjectLoadError> {
     let mut files = BTreeMap::new();
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),

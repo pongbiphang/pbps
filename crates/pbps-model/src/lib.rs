@@ -63,6 +63,7 @@ pub mod finding;
 pub mod fingerprint;
 pub mod ids;
 pub mod ids_check;
+pub mod ids_merge;
 pub mod ids_tree;
 pub mod intent;
 pub mod managed_type;
