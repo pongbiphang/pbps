@@ -1610,6 +1610,13 @@
         "reconstruct2374::a_scalar_function_with_an_exists_over_a_top_wildcard_compiles_before_the_column_it_serves",
         "reconstruct2374::a_check_over_a_hash_named_computed_column_compiles_after_the_column",
         "reconstruct2374::a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles",
+        "reconstruct2374::a_view_that_reads_a_view_its_text_only_names_is_created_after_it_on_208",
+        "reconstruct2374::a_view_that_calls_a_function_its_text_only_names_is_created_after_it_on_4121",
+        "reconstruct2374::a_schema_bound_view_over_an_unbound_function_is_deferred_and_refused_on_4513",
+        "reconstruct2374::an_error_that_is_not_a_missing_object_is_not_retried",
+        "reconstruct2374::a_stated_edge_is_never_overtaken_by_a_trial",
+        "reconstruct2374::two_views_that_really_read_each_other_are_refused_naming_both",
+        "reconstruct2374::a_function_that_only_names_the_column_calling_it_compiles_on_the_engine",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",
@@ -3000,7 +3007,10 @@
         "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_reference_is_matched_by_the_engines_own_lookup_path",
         "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_created_object_that_shadows_a_resolved_fallback_refuses_by_name",
         "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_a_plan_that_creates_nothing_is_not_refused_for_the_roots_it_keeps",
-        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_path"
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_path",
+        "resolver::server::scratch::mssql_live_tests::captured2143::mssql_an_alias_column_spelled_like_a_view_is_no_call_of_it",
+        "resolver::server::scratch::mssql_live_tests::captured2143::mssql_two_modules_that_really_read_each_other_are_refused_by_name",
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_arriving_unrelated_routine_does_not_rebuild_a_managed_view"
       ]
     },
     {

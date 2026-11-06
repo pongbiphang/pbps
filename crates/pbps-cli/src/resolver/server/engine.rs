@@ -121,7 +121,7 @@ pub(super) enum Prepared {
 }
 pub(super) enum Binding {
     Postgres(Box<postgres::Binding>),
-    Mssql(mssql::Binding),
+    Mssql(Box<mssql::Binding>),
 }
 pub(super) enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
@@ -322,7 +322,7 @@ impl Scratch<'_> {
         match self {
             Self::Mssql(scratch) => scratch
                 .reconstruction(binding, ids, dependencies)
-                .map(Binding::Mssql),
+                .map(|binding| Binding::Mssql(Box::new(binding))),
             Self::Postgres(scratch) => {
                 let Prepared::Postgres(prepared) = prepared else {
                     return Err(unsupported());

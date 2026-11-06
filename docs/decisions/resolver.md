@@ -6011,3 +6011,72 @@ minute inside a one-second wait keeps the container with that reason.
 Docker has no `stopping` to observe, so those tests say so and return there.
 #2689 is not this: a `running` container whose server read failed with a
 transport error has no status in transit to wait for.
+
+<a id="dec-2143-9"></a>
+
+**DEC-2143.9. SQL Server scratch treats a name matched in a text as a guess,
+and the engine corrects it by creation trials (#2143 c3b).** The scratch
+bootstrap orders the declared modules before any capture exists, so DEC-2143.8
+cannot reach it. A function whose body reads column `dbo.v` of a table aliased
+`dbo` names the view `dbo.v`, and the view calls the function: the text of each
+names the other, and the lexer cannot tell a call from an alias. Measured on
+17.0.4075.5, the order the schedule settles for the pair creates the view first
+whether the text edges are guesses or not (the route states no module-to-module
+edge for it), and the engine refuses that order (4121). Only the engine can say
+which name is a call, so the engine is made the judge.
+
+Two changes, both mirroring PostgreSQL. The trial cursor below is what corrects
+the pair. `Mssql::scratch_text_edges_are_guesses` is true, as DEC-2389.4 has it
+for PostgreSQL, so that the edges that do exist cannot force a refusal either: an edge that rests only on a name
+matched in a text (a module another module's text names, a call in a computed
+column or a default, a column a function reads) gives way where it closes a
+cycle, so the plan's order decides there. Stated edges stay hard: `depends_on:`,
+the declared-order column chain, a table's own parts and keys. And
+`Engine::trial_order` is true: order issues the branded trial cursor of
+DEC-2465.1 and `Reconstruction::compile_steps` runs the group it selects. A
+group whose first statement fails with 208 (invalid object name), 4121 (no
+column or function of that name) or 4513 (a schema-bound caller of an object
+that is not bound) is deferred whole and tried again after another group
+succeeds in its range, with every hard predecessor still required. Any other
+error, a deadlock, a lock or resource limit is not retried and surfaces as it
+did. A pass in which no group can progress refuses by name, naming each
+declaration with the last sentence of the engine and what it waits for
+(`ReconstructError::Stalled`); the loop is finite, by the cursor's own budget
+of n(n+1)/2 attempts per range.
+
+Differences from PostgreSQL, each measured. A failed statement leaves nothing
+behind in autocommit (DEC-2374.2) and there is no savepoint, so only a group
+whose *first* statement failed is retried: a later statement failing leaves the
+earlier ones in place (a view's index after the view), and that is a verdict.
+SQL Server publishes nothing per range: its observations are read from the
+catalog after the run (DEC-2143.8), so there is no commit receipt beyond the
+cursor's own progress. A setup-connection step (chained externals) is a hard
+boundary between two ranges and is never retried. 4513 needs the callee to
+exist (measured: a missing callee is 208 or 4121), and a callee that exists
+does not change in a bootstrap, so a 4513 group is deferred like the others and
+ends in the stall that names it with the engine's sentence; it is kept in the
+class because the engine states the same fact for it.
+
+A plan that refused before SQL for a cycle of text guesses (a function reading
+the column that calls it, an alias spelled like the column) is now left to the
+engine: an alias compiles, and a pair that truly needs each other stalls with
+both names. Their `Cycle` text and its remedy are unchanged for the cycles
+that remain stated. The resolver's bootstrap plan comes from `pbps_diff::bootstrap`,
+the differ from nothing whose order the debug observer does not judge, as it
+does not judge the resolver's other intermediate plans: nothing runs that order,
+and the alias pair has no lexical order for the observer to find. An ordinary
+plan from nothing is still observed. The plan the run seals is ordered by the
+captured bindings (DEC-2143.8); deployment keeps its certified sequence and
+never runs a trial.
+
+Pinned on the engine by `a_view_that_reads_a_view_its_text_only_names_is_created_after_it_on_208`,
+`a_view_that_calls_a_function_its_text_only_names_is_created_after_it_on_4121`
+and `a_schema_bound_view_over_an_unbound_function_is_deferred_and_refused_on_4513`
+(one per class), `mssql_an_alias_column_spelled_like_a_view_is_no_call_of_it`
+(the motivating pair, through the resolver), and the negatives
+`an_error_that_is_not_a_missing_object_is_not_retried`,
+`a_stated_edge_is_never_overtaken_by_a_trial`,
+`two_views_that_really_read_each_other_are_refused_naming_both` and
+`mssql_two_modules_that_really_read_each_other_are_refused_by_name`; offline by
+`only_a_missing_object_class_is_retried`, `a_stated_loop_is_refused_before_anything_compiles`
+and the two `bootstrap` tests of `captured_bindings.rs`.

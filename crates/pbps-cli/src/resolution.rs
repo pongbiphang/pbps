@@ -407,7 +407,7 @@ pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
     }
     let dialect = crate::dialect_for(request.project.config.dialect);
     let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(request.desired);
-    let bootstrap = pbps_diff::diff(
+    let bootstrap = pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,

@@ -100,7 +100,10 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> Change {
     }
 }
 
-fn reconstruction(changes: Vec<Change>) -> Result<Reconstruction, ReconstructError> {
+fn reconstruction(
+    changes: Vec<Change>,
+    deps: &ModuleDeps,
+) -> Result<Reconstruction, ReconstructError> {
     // The identities the declarations record: a split default names its column.
     let mut declared = pbps_model::Schema::default();
     for change in &changes {
@@ -122,14 +125,21 @@ fn reconstruction(changes: Vec<Change>) -> Result<Reconstruction, ReconstructErr
     let plan = pbps_diff::order::propose(ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     });
-    Reconstruction::new(&Mssql, &plan, &ids, &ModuleDeps::new())
+    Reconstruction::new(&Mssql, &plan, &ids, deps)
 }
 
 async fn compile(conn: &mut Conn, changes: Vec<Change>) -> Result<(), ReconstructError> {
-    let reconstruction = reconstruction(changes)?;
-    reconstruction
-        .compile_steps(conn, 0..reconstruction.len())
-        .await
+    compile_with(conn, changes, &ModuleDeps::new()).await
+}
+
+async fn compile_with(
+    conn: &mut Conn,
+    changes: Vec<Change>,
+    deps: &ModuleDeps,
+) -> Result<(), ReconstructError> {
+    let mut reconstruction = reconstruction(changes, deps)?;
+    let len = reconstruction.len();
+    reconstruction.compile_steps(conn, 0..len).await
 }
 
 async fn count(conn: &mut Conn, sql: &str) -> i32 {
@@ -525,15 +535,16 @@ async fn a_declaration_that_does_not_compile_names_itself_and_leaves_the_connect
         )
         .await
         .unwrap_err();
-        let ReconstructError::Compile {
-            declaration,
-            reason,
-        } = &refused
-        else {
-            panic!("a missing table is a verdict on the view: {refused}");
+        // Nothing declared makes `app.nowhere`, so the view waits for an
+        // object no other declaration can supply: a stall that names it and
+        // carries the engine's own sentence (DEC-2143.9).
+        let ReconstructError::Stalled(stalled) = &refused else {
+            panic!("a missing table stalls the view: {refused}");
         };
         assert!(
-            declaration == "view app.v" && reason.contains("nowhere") && reason.contains("208"),
+            stalled.contains("view app.v")
+                && stalled.contains("nowhere")
+                && stalled.contains("code: 208"),
             "{refused}"
         );
         // What came before stands (autocommit), and the session is intact.
@@ -981,4 +992,255 @@ async fn a_mid_table_computed_column_keeps_the_target_s_column_positions() {
         );
     })
     .await;
+}
+
+// Creation trials (DEC-2143.9). A text only guesses what a module needs, so a
+// group the engine refuses for a missing object waits for another's success.
+// In each case the plan's own order puts the caller first, so the first
+// attempt fails and only the engine's answer corrects it.
+
+fn bound_view(id: &str, definition: &str) -> Change {
+    let mut change = module(ModuleKind::View, id, definition);
+    if let Change::CreateModule { module, .. } = &mut change {
+        module.options.schemabinding = true;
+    }
+    change
+}
+
+async fn views_named(conn: &mut Conn, name: &str) -> i32 {
+    count(
+        conn,
+        &format!("SELECT COUNT(*) FROM sys.views WHERE name = N'{name}'"),
+    )
+    .await
+}
+
+/// 208, the invalid object name of a view: `a_caller` reads `b_callee`, whose
+/// text spells the column `a_caller` of a table aliased `app`, so each text
+/// names the other and neither edge can be told from a real one.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_view_that_reads_a_view_its_text_only_names_is_created_after_it_on_208() {
+    case("trial208", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.columns.insert("a_caller".into(), int());
+                }),
+                module(ModuleKind::View, "a_caller", "SELECT id FROM app.b_callee"),
+                module(
+                    ModuleKind::View,
+                    "b_callee",
+                    "SELECT app.a_caller AS id FROM app.t AS app",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(views_named(&mut conn, "a_caller").await, 1);
+        assert_eq!(views_named(&mut conn, "b_callee").await, 1);
+    })
+    .await;
+}
+
+/// 4121, a function the engine cannot find: the same pair with a view that
+/// calls a function whose body spells the view's name as an alias column.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_view_that_calls_a_function_its_text_only_names_is_created_after_it_on_4121() {
+    case("trial4121", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.columns.insert("view_c".into(), int());
+                }),
+                module(ModuleKind::View, "view_c", "SELECT app.fn_d(1) AS id"),
+                module(
+                    ModuleKind::Function,
+                    "fn_d",
+                    "(@x int) RETURNS int AS BEGIN RETURN (SELECT TOP 1 app.view_c FROM app.t AS app) END",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(views_named(&mut conn, "view_c").await, 1);
+    })
+    .await;
+}
+
+/// 4513 is the engine's refusal of a schema-bound caller of a function that is
+/// not schema-bound. Measured on 17.0 it needs the callee to exist, and a
+/// callee that exists does not change in a bootstrap, so no retry can cure
+/// it: the group is deferred like the other classes and the pass that makes
+/// no progress refuses by name with the engine's sentence.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_schema_bound_view_over_an_unbound_function_is_deferred_and_refused_on_4513() {
+    case("trial4513", |mut conn| async move {
+        let refused = compile(
+            &mut conn,
+            vec![
+                table("t", |_| {}),
+                module(
+                    ModuleKind::Function,
+                    "plain_f",
+                    "(@x int) RETURNS int AS BEGIN RETURN @x END",
+                ),
+                bound_view("bound_v", "SELECT app.plain_f(id) AS x FROM app.t"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        let ReconstructError::Stalled(stalled) = &refused else {
+            panic!("4513 is deferred, then refused as a stall: {refused}");
+        };
+        assert!(
+            stalled.contains("view app.bound_v") && stalled.contains("code: 4513"),
+            "{refused}"
+        );
+        assert_eq!(views_named(&mut conn, "bound_v").await, 0);
+    })
+    .await;
+}
+
+/// A syntax error is a verdict on the declaration. It is surfaced at once and
+/// never retried, whatever else is still waiting.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn an_error_that_is_not_a_missing_object_is_not_retried() {
+    case("trial_syntax", |mut conn| async move {
+        let refused = compile(
+            &mut conn,
+            vec![
+                table("t", |_| {}),
+                module(ModuleKind::View, "bad", "SELECT id FROM"),
+                module(ModuleKind::View, "good", "SELECT id FROM app.t"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        let ReconstructError::Compile {
+            declaration,
+            reason,
+        } = &refused
+        else {
+            panic!("a syntax error is a verdict on the view: {refused}");
+        };
+        assert!(
+            declaration == "view app.bad" && !reason.contains("code: 208"),
+            "{refused}"
+        );
+    })
+    .await;
+}
+
+/// A stated edge is hard. `b` would compile at once, but it declares that it
+/// needs `a`, which can never be created, so a trial never tries it.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_stated_edge_is_never_overtaken_by_a_trial() {
+    case("trial_stated", |mut conn| async move {
+        let mut deps = ModuleDeps::new();
+        deps.insert(
+            ModuleId::Named(name("b")),
+            [ModuleId::Named(name("a"))].into(),
+        );
+        let refused = compile_with(
+            &mut conn,
+            vec![
+                table("t", |_| {}),
+                module(ModuleKind::View, "a", "SELECT i FROM app.nowhere"),
+                module(ModuleKind::View, "b", "SELECT id FROM app.t"),
+            ],
+            &deps,
+        )
+        .await
+        .unwrap_err();
+        let ReconstructError::Stalled(stalled) = &refused else {
+            panic!("`a` never compiles, so the pass stalls: {refused}");
+        };
+        assert!(
+            stalled.contains("view app.a") && stalled.contains("view app.b (waits for view app.a)"),
+            "{refused}"
+        );
+        assert_eq!(views_named(&mut conn, "b").await, 0, "{refused}");
+    })
+    .await;
+}
+
+/// Two views that really read each other have no order: the pass that makes
+/// no progress refuses, and names both.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn two_views_that_really_read_each_other_are_refused_naming_both() {
+    case("trial_cycle", |mut conn| async move {
+        let refused = compile(
+            &mut conn,
+            vec![
+                table("t", |_| {}),
+                module(ModuleKind::View, "m1", "SELECT id FROM app.m2"),
+                module(ModuleKind::View, "m2", "SELECT id FROM app.m1"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        let ReconstructError::Stalled(stalled) = &refused else {
+            panic!("a real cycle is a stall: {refused}");
+        };
+        assert!(
+            stalled.contains("view app.m1") && stalled.contains("view app.m2"),
+            "{refused}"
+        );
+    })
+    .await;
+}
+
+/// The function that only names the computed column it is called by (through
+/// an alias, or a table's own column of that name) used to be read as reading
+/// it and refused; the engine says it does not, and it compiles.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_function_that_only_names_the_column_calling_it_compiles_on_the_engine() {
+    for (tag, text) in [
+        (
+            "alias_a",
+            "SELECT COUNT(o.c) AS c FROM app.other AS o JOIN app.t ON 1 = 1",
+        ),
+        ("alias_b", "SELECT id AS c FROM app.t"),
+    ] {
+        case(tag, move |mut conn| async move {
+            conn.execute("CREATE TABLE app.other (c int);")
+                .await
+                .unwrap();
+            compile(
+                &mut conn,
+                vec![
+                    table("t", |t| {
+                        t.computed.insert("c".into(), computed("app.g(id)"));
+                    }),
+                    module(
+                        ModuleKind::Function,
+                        "g",
+                        &format!(
+                            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM ({text}) AS q); END"
+                        ),
+                    ),
+                ],
+            )
+            .await
+            .unwrap_or_else(|refused| panic!("{text}: {refused}"));
+            assert_eq!(
+                count(
+                    &mut conn,
+                    "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t')"
+                )
+                .await,
+                1
+            );
+        })
+        .await;
+    }
 }

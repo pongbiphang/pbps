@@ -124,10 +124,30 @@ fn at(statements: &[String], needle: &str) -> usize {
 const FUNCTION: &str = "(@x int) RETURNS int AS BEGIN RETURN @x + 1; END";
 
 #[test]
-fn setup_connection_auxiliaries_do_not_opt_into_managed_creation_trials() {
-    // Chained steps execute once on the setup connection. Enabling trials
-    // here would need an executor that also honours auxiliary boundaries.
-    assert!(!pbps_diff::order::scratch::Engine::trial_order(&Mssql));
+fn trial_authority_is_issued_and_a_setup_connection_step_is_never_a_trial() {
+    // Order issues the cursor (DEC-2143.9). A chained step runs once on the
+    // setup connection and is a hard boundary between two trial ranges, so
+    // `compile_steps` refuses to run one (`creation2469` pins it live).
+    assert!(pbps_diff::order::scratch::Engine::trial_order(&Mssql));
+    let mut changes = vec![table("t", &[]), view("v", "SELECT id FROM app.t")];
+    let plan = pbps_diff::order::propose(ChangeSet {
+        changes: changes.drain(..).map(PlannedChange::new).collect(),
+    });
+    let reconstruction = Reconstruction::with_chained(
+        &Mssql,
+        &plan,
+        &IdsFile::default(),
+        &ModuleDeps::new(),
+        None,
+        true,
+    )
+    .unwrap();
+    let last = reconstruction.len() - 1;
+    assert!(matches!(
+        reconstruction.auxiliary(last),
+        Some(AuxiliaryStep::Deferred)
+    ));
+    assert!((0..last).all(|at| reconstruction.auxiliary(at).is_none()));
 }
 
 #[test]
@@ -188,19 +208,19 @@ fn a_schema_bound_function_reading_the_table_still_compiles_before_the_column_it
 }
 
 #[test]
-fn a_function_that_reads_the_column_it_is_called_by_is_refused_by_name() {
-    let refused = build(vec![
+fn a_function_that_reads_the_column_it_is_called_by_is_left_to_the_engine() {
+    // Whether `f` reads `c`, or only names it, is for the engine to say: both
+    // edges of the pair rest on a name matched in a text, so each is a guess
+    // and neither forces an order (DEC-2143.9). The refusal of a pair that
+    // truly needs each other is the engine's, live in `reconstruct2374`.
+    build(vec![
         table("t", &[("c", "app.f(id)")]),
         function(
             "f",
             "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(c) FROM app.t WHERE id = @x); END",
         ),
     ])
-    .expect_err("no order compiles both");
-    assert!(
-        matches!(&refused, ReconstructError::Cycle(subject) if subject.contains("app")),
-        "{refused:?}"
-    );
+    .expect("a cycle of guesses is no refusal before SQL");
 }
 
 #[test]
@@ -689,60 +709,93 @@ fn a_function_reading_a_column_declared_before_the_one_that_calls_it_follows_tha
 }
 
 #[test]
-fn a_function_reading_a_column_declared_after_the_one_that_calls_it_is_refused_with_its_remedy() {
+fn a_function_reading_a_column_declared_after_the_one_that_calls_it_keeps_the_declared_chain() {
     // `c AS (f(id))` is declared before `d AS (id + 1)` and `f` reads `d`.
-    // `d` must exist before `f`, and `f` before `c`, but declared order is a
-    // hard chain: positions are compared as reported, columns are appended
-    // and cannot be reordered (measured on 17.0: `d` then `c` gives `d=3, c=4`
-    // where the target has `c=3, d=4`), so no order both compiles and
-    // reproduces them. It is refused by name, with the remedy.
-    let refused = build(vec![
+    // Declared order is a hard chain: positions are compared as reported and
+    // columns are appended, so `c` is added before `d` whatever the text
+    // guesses (measured on 17.0: `d` then `c` gives `d=3, c=4` where the
+    // target has `c=3, d=4`). The call and the read are guesses that give way;
+    // the engine refuses the pair when it is truly unorderable.
+    let statements = sql(&build(vec![
         table("t", &[("c", "app.f(id)"), ("d", "id + 1")]),
         reads("f", "d"),
     ])
-    .expect_err("no order compiles and keeps the declared positions");
-    let ReconstructError::Cycle(subject) = &refused else {
-        panic!("{refused:?}");
-    };
-    assert!(subject.contains("app.f()"), "{refused}");
+    .expect("the guesses give way"));
     assert!(
-        refused
-            .to_string()
-            .contains("declare the column the function reads first"),
-        "{refused}"
+        at(&statements, "ADD [c] AS") < at(&statements, "ADD [d] AS"),
+        "{statements:#?}"
     );
 }
 
 #[test]
-fn a_function_reading_the_column_that_calls_it_is_still_a_cycle() {
+fn a_function_reading_the_column_that_calls_it_is_left_to_the_engine() {
     // Measured on 17.0: the column cannot be added before the function, nor
-    // the function created before the column it reads (207). Another column
-    // of the table makes no difference to that.
-    let own = build(vec![
+    // the function created before the column it reads (207). Both edges are
+    // guesses, so the schedule does not refuse and the engine does.
+    build(vec![
         table("t", &[("c", "app.f(id)"), ("d", "id + 1")]),
         reads("f", "c"),
     ])
-    .expect_err("f reads the column that calls it");
+    .expect("a cycle of guesses is no refusal before SQL");
+}
+
+#[test]
+fn a_function_spelling_a_views_name_as_an_alias_column_is_no_refusal() {
+    // The motivating pair of #2143 c3b: `app.v` in the function is column `v`
+    // of a table aliased `app`, and the view calls the function. The text
+    // names each module in the other and only the engine knows which is a
+    // call, so scratch does not refuse the pair before SQL. The order it
+    // settles creates the view first, whatever the text guesses (measured with
+    // the guess flag on and off): the engine's 4121 and the trial cursor
+    // correct it (DEC-2143.9), live in
+    // `mssql_an_alias_column_spelled_like_a_view_is_no_call_of_it`.
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.columns.insert("v".into(), int());
+        }),
+        view("v", "SELECT app.f(1) AS x"),
+        function(
+            "f",
+            "(@a int) RETURNS int AS BEGIN RETURN (SELECT TOP 1 app.v FROM app.t AS app) END",
+        ),
+    ])
+    .expect("the pair is no refusal before SQL"));
     assert!(
-        matches!(&own, ReconstructError::Cycle(subject) if subject.contains("app.f()")),
-        "{own:?}"
+        at(&statements, "VIEW [app].[v]") < at(&statements, "FUNCTION [app].[f]"),
+        "{statements:#?}"
     );
 }
 
 #[test]
-fn a_cycle_across_two_columns_is_refused_before_anything_compiles() {
-    // Each function reads the other's column: a graph cycle, now found in the
-    // route and not by the engine's 207.
-    let refused = build(vec![
+fn a_stated_loop_is_refused_before_anything_compiles() {
+    // `depends_on:` is stated by the user, never a guess (DEC-2143.9): two
+    // modules that declare each other have no order, with or without an engine.
+    let mut deps = ModuleDeps::new();
+    let (a, b) = (ModuleId::Named(name("a")), ModuleId::Named(name("b")));
+    deps.insert(a.clone(), [b.clone()].into());
+    deps.insert(b, [a].into());
+    let plan = pbps_diff::order::propose(ChangeSet {
+        changes: vec![view("a", "SELECT 1 AS x"), view("b", "SELECT 2 AS x")]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+    });
+    let refused = Reconstruction::new(&Mssql, &plan, &IdsFile::default(), &deps)
+        .expect_err("each declares the other");
+    assert!(
+        matches!(&refused, ReconstructError::Cycle(subject) if subject.contains("app.a") && subject.contains("app.b")),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_cycle_of_text_guesses_across_two_columns_is_left_to_the_engine() {
+    build(vec![
         table("t", &[("c1", "app.g1(id)"), ("c2", "app.g2(id)")]),
         reads("g1", "c2"),
         reads("g2", "c1"),
     ])
-    .expect_err("each column needs the function that reads the other");
-    assert!(
-        matches!(&refused, ReconstructError::Cycle(_)),
-        "{refused:?}"
-    );
+    .expect("each edge of the cycle is a guess");
 }
 
 #[test]
@@ -847,16 +900,17 @@ fn a_parameter_a_local_a_string_and_a_comment_are_no_reads_of_a_column() {
 }
 
 #[test]
-fn a_name_shared_with_the_column_by_an_alias_or_another_table_is_a_refusal_naming_the_remedy() {
+fn a_name_shared_with_the_column_by_an_alias_or_another_table_is_no_refusal() {
     // Content-dependent: whether `o.c` is `t.c` is for the engine to say, and
-    // a lexical test cannot. Reading it as `t.c` only ever adds a constraint,
-    // so what it can cost is a refusal, and the refusal says what to rename.
+    // a lexical test cannot. Reading it as `t.c` only ever adds a guess, and a
+    // guess that closes a cycle gives way, so such a function is created after
+    // the column or before it, whichever the engine accepts (DEC-2143.9).
     for text in [
         "SELECT COUNT(o.c) FROM app.other AS o JOIN app.t ON 1 = 1",
         "SELECT id AS c FROM app.t",
         "SELECT COUNT(c) FROM other.t",
     ] {
-        let refused = build(vec![
+        build(vec![
             table("t", &[("c", "app.g(id)")]),
             function(
                 "g",
@@ -865,14 +919,7 @@ fn a_name_shared_with_the_column_by_an_alias_or_another_table_is_a_refusal_namin
                 ),
             ),
         ])
-        .expect_err("g is read as reading the column that calls it");
-        let ReconstructError::Cycle(subject) = &refused else {
-            panic!("{refused:?}");
-        };
-        assert!(
-            subject.contains("app.g()") && refused.to_string().contains("rename"),
-            "{refused}"
-        );
+        .unwrap_or_else(|refused| panic!("{text}: {refused}"));
     }
 }
 

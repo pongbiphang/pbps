@@ -526,6 +526,34 @@ pub fn diff(
     diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
 }
 
+/// [`diff`] for the plan a resolver's scratch compiles: from the packages the
+/// declarations adopt to the declarations. Nothing runs this order. Scratch
+/// takes its changes and re-settles its own sequence over them, one part at a
+/// time, with the text edges as guesses the engine corrects (DEC-1959.6,
+/// DEC-2143.9), so the debug observer does not judge it as an order that runs,
+/// as it does not judge the resolver's other intermediate plans. A pair of
+/// modules whose texts name each other, one name being only an alias, has no
+/// lexical order at all and would otherwise fail the observer here.
+pub fn bootstrap(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    hints: &Hints,
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
+    rebuilding_by(
+        base,
+        declared,
+        dialect,
+        hints,
+        &BTreeSet::new(),
+        // From nothing, no module stands to be rebuilt, so the only difference
+        // from `diff` is that the plan is not observed.
+        Rebinding::Evidence,
+        Screen::Text,
+        None,
+    )
+}
+
 /// [`diff`], with these unchanged modules rebuilt as if the declarations had
 /// edited them.
 ///

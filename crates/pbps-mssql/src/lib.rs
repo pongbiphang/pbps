@@ -223,6 +223,15 @@ impl pbps_dialect::PlanDialect for Mssql {
 }
 
 impl Dialect for Mssql {
+    /// A name a text spells is a guess at what it needs, so it gives way where
+    /// it closes a cycle (DEC-2143.9): an alias column spelled like a view
+    /// states no call of it, and a lexer cannot tell. The engine corrects a
+    /// wrong guess by creation trials (DEC-2389.4 is the same rule for
+    /// PostgreSQL).
+    fn scratch_text_edges_are_guesses(&self) -> bool {
+        true
+    }
+
     fn filter_binds_expression(&self) -> bool {
         false
     }

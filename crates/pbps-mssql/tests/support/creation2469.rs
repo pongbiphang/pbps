@@ -192,7 +192,7 @@ async fn scratch_creation_facets_keep_auxiliary_setup_boundaries() {
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
         let f = Fixture::new(facet, "mssql");
         let input = f.bootstrap(&engine).unwrap();
-        let scratch =
+        let mut scratch =
             Reconstruction::with_chained(&engine, &input, &f.ids, &Default::default(), None, true)
                 .unwrap();
         let last = scratch.len() - 1;
@@ -373,7 +373,7 @@ async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
         let mut scratch_db = TestDb::create(&format!("prefix2469_scratch_{facet}")).await;
         scratch_db.conn.execute("CREATE SCHEMA app").await.unwrap();
         let input = f.bootstrap(&engine).unwrap();
-        let scratch = pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
+        let mut scratch = pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
             &engine,
             &input,
             &f.ids,
