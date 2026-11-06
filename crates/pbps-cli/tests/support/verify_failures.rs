@@ -53,7 +53,12 @@ fn refused(d: &Demo, connection: &str, cause: &str) -> String {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["command"], "verify");
     assert_eq!(report["result"], "unanswerable");
-    let findings = report["findings"].as_array().unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["severity"] == "error")
+        .collect();
     assert_eq!(findings.len(), 1, "{report}");
     assert_eq!(findings[0]["severity"], "error");
     let message = findings[0]["message"].as_str().unwrap();

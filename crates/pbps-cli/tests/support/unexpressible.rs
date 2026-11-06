@@ -54,7 +54,15 @@ pub fn check(d: &Demo, connection: &str, objects: &[&str]) {
             assert!(!stderr(&output).contains(reason["message"].as_str().unwrap()));
         }
         let connected = report(output);
-        assert_eq!(connected["findings"], offline["findings"], "{connected}");
+        // The connected catalog contributes context beside these refusals.
+        let errors: Vec<_> = connected["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["severity"] == "error")
+            .cloned()
+            .collect();
+        assert_eq!(&errors, reasons, "{connected}");
         if existing {
             assert_eq!(
                 std::fs::read_to_string(&plan).unwrap(),

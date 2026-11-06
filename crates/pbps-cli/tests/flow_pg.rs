@@ -19,6 +19,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/catalog_warnings1739.rs"]
+mod catalog_warnings1739;
+
 #[cfg(unix)]
 #[path = "support/unix_socket.rs"]
 mod unix_socket;
@@ -32228,10 +32231,9 @@ fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() 
 
         let o = d.run(&["plan", "--db", &conn, "--format", "json"]);
         assert_eq!(code(&o), 1, "{version}: {}{}", stdout(&o), stderr(&o));
-        // The catalog's own warnings (a superuser here) go to stderr on every
-        // connected plan; the unasked one must not.
+        // Catalog and unasked warnings both stay in the failure envelope.
         assert!(
-            !stderr(&o).contains("not checked before the plan"),
+            !stderr(&o).contains("warning:"),
             "{version}: {}",
             stderr(&o)
         );

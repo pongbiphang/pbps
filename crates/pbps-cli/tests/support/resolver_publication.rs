@@ -91,8 +91,14 @@ pub fn published(server: &str) {
     let staged = run(&d, &args, Some(&targets));
     assert_eq!(code(&staged), 2, "{}{}", stdout(&staged), stderr(&staged));
     let value: serde_json::Value = serde_json::from_str(&stdout(&staged)).unwrap();
-    let finding = &value["findings"][0];
-    assert_eq!(finding["id"], "resolver.unresolved", "{value}");
+    let findings: Vec<_> = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "resolver.unresolved" && finding["severity"] == "error")
+        .collect();
+    assert_eq!(findings.len(), 1, "{value}");
+    let finding = findings[0];
     assert!(
         finding["message"]
             .as_str()
@@ -134,7 +140,16 @@ pub fn published(server: &str) {
     ] {
         assert_eq!(code(output), 2, "{}{}", stdout(output), stderr(output));
         let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
-        assert_eq!(value["findings"][0]["id"], id, "{value}");
+        assert_eq!(
+            value["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["id"] == id && finding["severity"] == "error")
+                .count(),
+            1,
+            "{value}"
+        );
     }
     assert_prior(&artifact, &sql);
 

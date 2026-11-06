@@ -203,7 +203,7 @@ fn each_drifted_object_prints_three_remedies_without_changing_exit_two_or_json_i
     let clean_json: serde_json::Value = serde_json::from_slice(&clean_json.stdout).unwrap();
     assert_eq!(clean_json["result"], "ok");
     assert_eq!(
-        database_findings(&clean_json),
+        database_errors(&clean_json),
         Vec::<&serde_json::Value>::new()
     );
     on_server(
@@ -228,7 +228,7 @@ fn each_drifted_object_prints_three_remedies_without_changing_exit_two_or_json_i
     assert_eq!(code(&json), 2);
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(report["result"], "findings");
-    let findings = database_findings(&report);
+    let findings = database_errors(&report);
     assert_eq!(findings.len(), 1, "{report}");
     assert_eq!(findings[0]["id"], "state.drift");
     let remedy = findings[0]["remedy"].as_str().unwrap();
@@ -308,14 +308,14 @@ fn partial_index_estimates_explain_the_write_lock_and_unfiltered_neighbours_do_n
     }
 }
 
-/// The findings about this test's own database. Roles are cluster-wide, so a
-/// role created by a concurrently running test is reported as a
-/// `state.unmanaged` note on every verify; it says nothing about this schema.
-fn database_findings(report: &serde_json::Value) -> Vec<&serde_json::Value> {
+/// Compare drift refusals independently of the catalog context in the report.
+/// Roles are cluster-wide, so an unmanaged role created by another test also
+/// says nothing about this schema.
+fn database_errors(report: &serde_json::Value) -> Vec<&serde_json::Value> {
     report["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|finding| finding["id"] != "state.unmanaged")
+        .filter(|finding| finding["severity"] == "error" && finding["id"] != "state.unmanaged")
         .collect()
 }

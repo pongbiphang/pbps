@@ -40,6 +40,42 @@ pub(crate) mod test_run;
 use services::{Attempt, apply_identified};
 pub(crate) use services::{cmd_bootstrap, cmd_plan_db};
 
+/// The command owns catalog diagnostics even when a later read fails. Keep
+/// them beside errors, never inside an error or recorded schema (DEC-1739.1).
+#[derive(Clone, Copy)]
+enum CatalogWarnings<'a> {
+    Human,
+    Findings(&'a std::cell::RefCell<Vec<crate::output::Finding>>),
+}
+
+impl<'a> CatalogWarnings<'a> {
+    fn for_output(
+        json: bool,
+        findings: &'a std::cell::RefCell<Vec<crate::output::Finding>>,
+    ) -> Self {
+        if json {
+            Self::Findings(findings)
+        } else {
+            Self::Human
+        }
+    }
+
+    fn for_progress(progress: Option<&'a services::Progress>) -> Self {
+        progress.map_or(Self::Human, |p| Self::Findings(&p.findings))
+    }
+
+    fn emit(self, findings: impl IntoIterator<Item = crate::output::Finding>) {
+        match self {
+            Self::Human => {
+                for finding in findings {
+                    eprintln!("warning: {}", finding.message);
+                }
+            }
+            Self::Findings(collected) => collected.borrow_mut().extend(findings),
+        }
+    }
+}
+
 /// A scoped live state, plus the declared modules the read could not express.
 ///
 /// The second list cannot live in [`pbps_diff::Scoped`] — "pbps cannot read
@@ -124,6 +160,7 @@ async fn managed_state(
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let request = ManagedRead {
         ids,
@@ -133,6 +170,7 @@ async fn managed_state(
         scopes,
         reference,
         read,
+        warnings,
     };
     managed_state_then(conn, &request, || std::future::ready(Ok(()))).await
 }
@@ -145,6 +183,7 @@ struct ManagedRead<'a> {
     scopes: &'a DataScopes,
     reference: &'a Schema,
     read: crate::engine::Read,
+    warnings: CatalogWarnings<'a>,
 }
 
 impl ManagedRead<'_> {
@@ -158,6 +197,7 @@ impl ManagedRead<'_> {
             self.scopes,
             self.reference,
             self.read,
+            self.warnings,
         )
         .await
     }
@@ -205,6 +245,7 @@ async fn managed_state_once(
     scopes: &DataScopes,
     reference: &Schema,
     read: crate::engine::Read,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<pbps_diff::Scoped> {
     let managed = managed_state_full(
         conn,
@@ -214,6 +255,7 @@ async fn managed_state_once(
         unmanaged,
         &rows_to_read(scopes),
         read,
+        warnings,
     )
     .await?;
     refuse_managed_limitations(&managed.limitations)?;
@@ -3035,6 +3077,7 @@ async fn baseline_state(
     scopes: &DataScopes,
     recorded: &Schema,
     as_the_apply_reads_it: &DataScopes,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<(
     pbps_diff::Scoped,
     Schema,
@@ -3051,6 +3094,7 @@ async fn baseline_state(
         unmanaged,
         &rows_to_read(&pinned_scopes(scopes, as_the_apply_reads_it)),
         crate::engine::Read::Snapshot,
+        warnings,
     )
     .await?;
     refuse_managed_limitations(&managed.limitations)?;
@@ -3094,12 +3138,19 @@ async fn staged_baseline(
     checked_scopes: &DataScopes,
     recorded: &Schema,
     watched_scopes: &DataScopes,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<(
     pbps_diff::Scoped,
     Schema,
     Vec<pbps_db::catalog::Unrevocable>,
 )> {
     let pulled = pull(conn, crate::engine::Read::Snapshot).await?;
+    warnings.emit(
+        pulled
+            .warnings
+            .iter()
+            .map(|message| crate::output::Finding::warning("catalog.warning", message)),
+    );
     let unreadable = unreadable_objects(&pulled);
     // Over the *watched* set, which contains the checked one: a module this
     // plan is about to write that the catalog cannot read back is a
@@ -3109,13 +3160,21 @@ async fn staged_baseline(
     debug_assert!(checked.is_subset(watched));
     refuse_managed_limitations(&managed_limitations(&pulled, ids, watched, external))?;
 
-    let mut scoped = cut(&pulled, ids, checked, external, &unreadable, unmanaged)?;
+    let mut scoped = cut_report(
+        &pulled,
+        ids,
+        checked,
+        external,
+        &unreadable,
+        unmanaged,
+        warnings,
+    )?;
     // The watch cut is the one the row read is taken against, because it is
     // the wider of the two: a module the plan creates is in it and not in the
     // checksum's, and no table is in either alone. `Unmanaged::Ignore`
     // because the policy has already been applied, by the cut above — running
     // it twice would report the same object twice.
-    let watching = cut(
+    let watching = cut_report(
         &pulled,
         ids,
         watched,
@@ -3125,6 +3184,7 @@ async fn staged_baseline(
             unmanaged: pbps_config::Unmanaged::Ignore,
             ..unmanaged
         },
+        warnings,
     )?;
     let rows = crate::engine::read_rows(
         conn,
@@ -3151,15 +3211,15 @@ async fn staged_baseline(
 /// every table in `read`, and reports whatever the read itself could not
 /// express.
 ///
-/// Every connected command starts here. The warnings are printed rather than
-/// returned because ignoring them is never right: a drift check that silently
-/// skipped a computed column would report "no drift" about a database it only
-/// half read.
+/// Every connected command starts here. Its catalog diagnostics go to the
+/// command's collector before fallible projection and row reads, so a failure
+/// cannot discard warnings that belong in its JSON envelope (DEC-1739.1).
 ///
 /// The rows come from the catalog under a scope the caller supplies, because
 /// which of a table's rows are declared is not something the database knows
 /// (ADR-0004). A row read that fails is an error, not an empty answer: a
 /// state recorded without the rows would say the table declares none.
+#[allow(clippy::too_many_arguments)]
 async fn managed_state_full(
     conn: &mut Conn,
     ids: &IdsFile,
@@ -3168,8 +3228,15 @@ async fn managed_state_full(
     unmanaged: db::CatalogPolicy<'_>,
     rows: &BTreeMap<TableName, RowScope>,
     read: crate::engine::Read,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<Managed> {
     let pulled = pull(conn, read).await?;
+    warnings.emit(
+        pulled
+            .warnings
+            .iter()
+            .map(|message| crate::output::Finding::warning("catalog.warning", message)),
+    );
     let unreadable = unreadable_objects(&pulled);
     let limitations = managed_limitations(&pulled, ids, modules, external);
     let permission_advisories = permission_advisories(&pulled.unexpressible, ids, modules)
@@ -3193,7 +3260,15 @@ async fn managed_state_full(
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
         })
         .collect();
-    let scoped = cut(&pulled, ids, modules, external, &unreadable, unmanaged)?;
+    let scoped = cut_report(
+        &pulled,
+        ids,
+        modules,
+        external,
+        &unreadable,
+        unmanaged,
+        warnings,
+    )?;
     let rows = crate::engine::read_rows(conn, &scoped.schema, rows, read)
         .await
         .context("cannot read the declared rows back")?;
@@ -3333,13 +3408,27 @@ async fn pull(
     conn: &mut Conn,
     read: crate::engine::Read,
 ) -> anyhow::Result<pbps_db::catalog::Pulled> {
-    let pulled = crate::engine::introspect(conn, read)
+    crate::engine::introspect(conn, read)
         .await
-        .context("cannot read the database catalog")?;
-    for w in &pulled.warnings {
-        eprintln!("warning: {w}");
-    }
-    Ok(pulled)
+        .context("cannot read the database catalog")
+}
+
+/// Report the cut's diagnostics before its unmanaged policy can refuse it.
+fn cut_report(
+    pulled: &pbps_db::catalog::Pulled,
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+    external: &BTreeSet<TableName>,
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    unmanaged: db::CatalogPolicy<'_>,
+    warnings: CatalogWarnings<'_>,
+) -> anyhow::Result<pbps_diff::Scoped> {
+    let scoped = cut(pulled, ids, modules, external, unmanaged);
+    warnings.emit(scoped.unexpressible.iter().map(|message| {
+        crate::output::Finding::warning("catalog.unexpressible-permission", message)
+    }));
+    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
+    Ok(scoped)
 }
 
 /// One cut of a pulled catalog down to a managed set. Pure.
@@ -3348,9 +3437,8 @@ fn cut(
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
-    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     unmanaged: db::CatalogPolicy<'_>,
-) -> anyhow::Result<pbps_diff::Scoped> {
+) -> pbps_diff::Scoped {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
     // These exact roles belong to the verified owned run, not its declarations.
     // A similarly named role remains subject to the project's ordinary policy.
@@ -3363,7 +3451,6 @@ fn cut(
     // as drift and `plan --db` refuses to plan over it; on an unmanaged role,
     // or on somebody else's object, it is not ours (DECISIONS 95, 176).
     for what in unexpressible_permissions(pulled, ids, modules) {
-        eprintln!("warning: {what}");
         scoped.unexpressible.push(what.to_owned());
     }
     // Carried beside the comparison, never into it, exactly as the line above
@@ -3386,8 +3473,7 @@ fn cut(
         .baseline_evidence
         .as_ref()
         .map(|evidence| evidence.for_managed(&scoped.schema));
-    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
-    Ok(scoped)
+    scoped
 }
 
 /// The modules the declarations name and the rows they declare, for the
@@ -6415,6 +6501,7 @@ fn recorded_verify_state(
 /// mapping the environment has never seen would report every uncommitted local
 /// rename as drift in production.
 pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Result<()> {
+    let catalog = std::cell::RefCell::new(Vec::new());
     let dialect = crate::output::or_unanswerable(
         "verify",
         json,
@@ -6447,6 +6534,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &rows_to_read(&recorded_scopes),
             crate::engine::Read::Snapshot,
+            CatalogWarnings::for_output(json, &catalog),
         )
         .await
         .map_err(|error| VerifyFailure::at("environment.unreadable", error))?;
@@ -6558,13 +6646,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             // "produced no output" instead of a report naming the target
             // (SPEC §9.8).
             if json {
-                crate::output::unanswerable(
-                    "verify",
-                    vec![crate::output::Finding::error(
-                        id,
-                        format!("{}: {error:#}", pbps_model::escape::Escaped(&target.label)),
-                    )],
-                );
+                let mut findings = vec![crate::output::Finding::error(
+                    id,
+                    format!("{}: {error:#}", pbps_model::escape::Escaped(&target.label)),
+                )];
+                findings.extend(catalog.take());
+                crate::output::unanswerable("verify", findings);
             }
             return Err(error);
         }
@@ -6576,7 +6663,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     // stdout did.
     let payload = format!("{}\n", serde_json::to_string_pretty(&report)?);
 
-    let mut findings = Vec::new();
+    let mut findings = catalog.into_inner();
     if report.has_drift() {
         findings.push(
             crate::output::Finding::error(
@@ -6694,6 +6781,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 &declared_data,
                 &loaded.schema,
                 crate::engine::Read::Snapshot,
+                CatalogWarnings::Human,
             )
             .await?;
             report_missing(&scoped);
@@ -6947,6 +7035,7 @@ pub fn cmd_baseline(
                     &declared_data,
                     &loaded.schema,
                     read,
+                    CatalogWarnings::Human,
                 )
                 .await?;
                 // Adoption certifies only the selected exact packages, never
@@ -7304,6 +7393,7 @@ fn bootstrap(
         declarations,
         dialect,
         operator,
+        CatalogWarnings::Human,
     ))
 }
 
@@ -7314,6 +7404,7 @@ async fn bootstrap_async(
     declarations: services::Declarations,
     dialect: crate::emission::SelectedDialect,
     operator: &str,
+    warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<Option<services::Bootstrapped>> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
@@ -7576,6 +7667,7 @@ async fn bootstrap_async(
                     target.catalog_policy(project.config.unmanaged),
                     &BTreeMap::new(),
                     crate::engine::Read::Snapshot,
+                    warnings,
                 )
                 .await?;
 
@@ -7679,6 +7771,7 @@ async fn bootstrap_async(
                     &loaded.schema.data_scopes(),
                     &loaded.schema,
                     crate::engine::Read::InsideOwnTransaction,
+                    warnings,
                 )
                 .await?;
                 // A database-side trigger can add a privilege during the build.
@@ -8284,6 +8377,7 @@ async fn plan_db_selected(
         // the label it had (DEC-2346.2).
         let mut to_read = pbps_model::data::read_scopes(&recorded_data, &declared_data);
         pbps_diff::enum_labels::read_before_the_renames(&mut to_read, &declared_live, &loaded.hints);
+        let catalog = std::cell::RefCell::new(Vec::new());
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -8295,8 +8389,14 @@ async fn plan_db_selected(
             target.catalog_policy(pbps_config::Unmanaged::Ignore),
             &to_read,
             crate::engine::Read::Snapshot,
+            CatalogWarnings::for_output(json, &catalog),
         )
-        .await?;
+        .await;
+        findings.extend(catalog.into_inner());
+        if json {
+            carried.clone_from(&findings);
+        }
+        let managed = managed?;
         refuse_unexpressible(&managed.scoped, &target.label, "plan again")?;
         let mut advisories = permission_advisory_findings(&managed.permission_advisories, project);
         // Both report-only inventories must reach the same policy gate.
@@ -10067,6 +10167,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         ),
         &entry.snapshot.schema,
         &held_scopes,
+        CatalogWarnings::for_progress(d.progress),
     )
     .await?;
     retain_managed_roles(&mut before, &plan.ids, dialect);
@@ -10266,6 +10367,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             &plan.data,
             &Schema::default(),
             crate::engine::Read::InsideOwnTransaction,
+            CatalogWarnings::for_progress(d.progress),
         )
         .await?;
         // A deferred trigger runs at COMMIT unless explicitly settled. Compare
@@ -10294,6 +10396,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
                 &plan.data,
                 &Schema::default(),
                 crate::engine::Read::InsideOwnTransaction,
+                CatalogWarnings::for_progress(d.progress),
             )
             .await?;
             refuse_unexpressible(&settled, &target.label, "apply again")?;
@@ -10642,6 +10745,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 at_checkpoint,
                 &scopes_at(plan, at_checkpoint),
             ),
+            CatalogWarnings::for_progress(d.progress),
         )
         .await?;
 
@@ -10759,6 +10863,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 &entry.snapshot.ids,
                 &scopes_at(plan, &recorded_ids),
             ),
+            CatalogWarnings::for_progress(d.progress),
         )
         .await?;
         retain_managed_roles(&mut watching, &plan.ids, dialect);
@@ -11185,6 +11290,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &scopes_at(plan, &live_ids),
             &Schema::default(),
             crate::engine::Read::Snapshot,
+            CatalogWarnings::for_progress(d.progress),
         )
         .await?;
         // Scoped and identified by `live_ids`, not by the plan's mapping: a
@@ -11295,6 +11401,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             } else {
                 crate::engine::Read::Snapshot
             },
+            CatalogWarnings::for_progress(d.progress),
         )
         .await?;
         refuse_recreated_tables(conn, &plan.changes, statements, &after.unmanaged)
@@ -18275,6 +18382,7 @@ mod tests {
             scopes: &scopes,
             reference: &reference,
             read,
+            warnings: CatalogWarnings::Human,
         };
         let result = managed_state_then(&mut reader, &request, || async {
             writer
@@ -24710,13 +24818,14 @@ mod tests {
             unmanaged_objects(&scoped, &unreadable, &ids, &modules),
             ["type app.mood (type app.mood cannot be represented)"]
         );
-        let refusal = cut(
+        let refusal = cut_report(
             &pulled,
             &ids,
             &modules,
             &BTreeSet::new(),
             &unreadable,
             pbps_config::Unmanaged::Error.into(),
+            CatalogWarnings::Human,
         )
         .unwrap_err();
         assert!(refusal.is::<UnmanagedPolicy>(), "{refusal:#}");
@@ -24730,13 +24839,14 @@ mod tests {
             ["type app.mood cannot be represented"]
         );
         assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules).is_empty());
-        cut(
+        cut_report(
             &pulled,
             &ids,
             &modules,
             &BTreeSet::new(),
             &unreadable,
             pbps_config::Unmanaged::Error.into(),
+            CatalogWarnings::Human,
         )
         .expect("a declared type is refused by managed limitations, not unmanaged policy");
         let relation = Pulled {

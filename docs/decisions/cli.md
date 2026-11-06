@@ -1663,3 +1663,25 @@ Renderer and offline CLI regressions cover comparisons and raw HTML openers
 in descriptions, deprecation reasons and graveyard metadata, LF/CRLF, pipes
 inside spans, backticks, backslashes and the link-destination breakout. The
 ordinary output golden stays byte-identical.
+
+
+<a id="dec-1739-1"></a>
+
+**DEC-1739.1. Catalog warnings belong to the calling command's diagnostics,
+including when a later read fails.** `pull` returns the catalog's warnings
+and `cut` returns managed unexpressible permissions beside its scoped schema;
+neither prints them. The CLI read helpers deliver these facts to a collector
+chosen by the command before a policy refusal or row read can fail. Human
+commands keep their `warning:` lines, while JSON commands retain warning
+findings with the stable IDs `catalog.warning` and
+`catalog.unexpressible-permission`. The owned test services use their existing
+phase findings for the same diagnostics.
+
+Waiting for a successful `Managed` result would lose warnings when a later
+row read fails. Wrapping the error would hide typed causes (DEC-1726.1). The
+collector therefore lives with the command: connected planning includes it
+in `carried` for `output::or_unanswerable_beside`, and verification includes it
+in its success or failure envelope. Catalog warnings never enter saved plans,
+checksums or recorded state, and finding IDs are unrestricted strings in the
+published schema, so no format version changes. Unmanaged policy, probe, hook
+and cleanup warnings retain their separate behavior.

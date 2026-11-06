@@ -26,6 +26,7 @@ pub(crate) async fn bootstrap(
 ) -> anyhow::Result<i64> {
     session.prepare(&input.loaded.schema).await?;
     let project = session.project(input);
+    let catalog = std::cell::RefCell::new(Vec::new());
     let built = super::bootstrap_async(
         &project,
         Some(session.target()),
@@ -33,9 +34,11 @@ pub(crate) async fn bootstrap(
         declarations(input),
         crate::dialect(&project)?,
         "pbps-test",
+        super::CatalogWarnings::Findings(&catalog),
     )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("connected bootstrap produced no result"))?;
+    .await;
+    phase.findings.extend(catalog.into_inner());
+    let built = built?.ok_or_else(|| anyhow::anyhow!("connected bootstrap produced no result"))?;
     finish_attempt(
         phase,
         Attempt::Applied {
