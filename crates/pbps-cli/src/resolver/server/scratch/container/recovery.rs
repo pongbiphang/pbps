@@ -36,7 +36,7 @@ use pbps_db::{Conn, Driver};
 use super::super::super::engine;
 use super::super::recovery::{self, Adapter, Failed, Liveness, Resource};
 use super::READY;
-use super::{docker, remove_with_volumes, wait_removed};
+use super::{docker, remove_with_volumes, wait_removed, wait_until};
 
 /// The label carrying the run's token.
 pub(super) const TOKEN: &str = "pbps.resolver.token";
@@ -53,6 +53,13 @@ const GRACE: Duration = Duration::from_secs(READY.as_secs() + 120);
 
 /// How long one probe of a candidate's server may take.
 const PROBE: Duration = Duration::from_secs(15);
+
+/// How long a container the runtime reports `stopping` is waited for before it
+/// is kept: the ten seconds a stop gives its server before the runtime kills
+/// it (Podman's default, measured on 5.7.0), and the five a removal then gets.
+/// Only Podman reports the status; Docker kills at once and has none
+/// (DEC-2674.1).
+const STOPPING: Duration = Duration::from_secs(15);
 
 /// The run's session in its own container, held until the container is
 /// removed (see the module docs).
@@ -122,7 +129,7 @@ fn epoch(text: &str) -> Option<i64> {
 }
 
 /// The candidates' state as the runtime reports it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct State {
     id: String,
     volumes: Vec<String>,
@@ -142,8 +149,10 @@ fn verdict(
 ) -> Liveness {
     let grace = grace.as_secs() as i64;
     match state.status.as_str() {
-        // A server that is not running serves no run.
-        "exited" | "dead" => Liveness::Dead,
+        // A server that is not running serves no run. Podman's `stopped` is
+        // a process that has exited and is not yet cleaned up, which `exited`
+        // follows (DEC-2674.1).
+        "exited" | "dead" | "stopped" => Liveness::Dead,
         "removing" => Liveness::Unprovable("its removal has not yet been confirmed".into()),
         "created" => match age {
             Some(age) if age > grace => Liveness::Dead,
@@ -227,10 +236,20 @@ fn state_from_json(text: &str, token: &str) -> Result<State, String> {
     })
 }
 
+/// What a container the runtime was stopping became.
+enum Stopped {
+    /// The runtime says there is no such container.
+    Gone,
+    /// The first status that is not `stopping`.
+    Now(State),
+}
+
 /// The scratch containers on the runner, other than this run's.
 pub(super) struct Containers<'a> {
     own: &'a str,
     grace: Duration,
+    /// How long a stop in progress is waited for (see [`STOPPING`]).
+    stopping: Duration,
     /// The one run whose container is judged, when a test confines a sweep
     /// to its own.
     only: Option<&'a str>,
@@ -242,6 +261,7 @@ impl<'a> Containers<'a> {
         Self {
             own,
             grace: GRACE,
+            stopping: STOPPING,
             only: None,
             listed: BTreeMap::new(),
         }
@@ -250,6 +270,54 @@ impl<'a> Containers<'a> {
     async fn state(&self, reference: &str, token: &str) -> Result<State, String> {
         let text = docker(&["container", "inspect", "--format", "{{json .}}", reference]).await?;
         state_from_json(&text, token)
+    }
+
+    /// A status the runtime itself moves a container out of is not a verdict
+    /// on its owner: the sweep that read it was racing the stop or the removal
+    /// of another remover, and giving up on it kept a container that was gone
+    /// moments later. Podman's `stopping` is waited out through `observe`, a
+    /// fresh read of the container, and so is `removing`; the status after
+    /// either is judged like any other. `Err` is the verdict when waiting
+    /// settles it. Only the runtime's own missing-container answer is a
+    /// container gone: a failed read, a container that is another's by now
+    /// and a stop that outlasts [`STOPPING`] settle nothing (DEC-2674.1).
+    async fn settled<F: std::future::Future<Output = Result<State, String>>>(
+        &self,
+        listed: &State,
+        state: State,
+        mut observe: impl FnMut() -> F,
+    ) -> Result<State, Liveness> {
+        let state = if state.status == "stopping" {
+            let ended = wait_until(self.stopping, "its stop did not finish", || {
+                let seen = observe();
+                async move {
+                    match seen.await {
+                        Err(why) if super::no_such_container(&why) => Ok(Some(Stopped::Gone)),
+                        Err(why) => Err(why),
+                        Ok(now) if now.id != listed.id => {
+                            Err("its container identity changed".into())
+                        }
+                        Ok(now) if now.status == "stopping" => Ok(None),
+                        Ok(now) => Ok(Some(Stopped::Now(now))),
+                    }
+                }
+            })
+            .await;
+            match ended {
+                Ok(Stopped::Gone) => return Err(Liveness::Dead),
+                Ok(Stopped::Now(now)) => now,
+                Err(why) => return Err(Liveness::Unprovable(why)),
+            }
+        } else {
+            state
+        };
+        if state.status == "removing" {
+            return Err(match wait_removed(&listed.id).await {
+                Ok(()) => Liveness::Dead,
+                Err(why) => Liveness::Unprovable(why),
+            });
+        }
+        Ok(state)
     }
 
     async fn classify(&self, token: &str, observed: Result<State, String>) -> Liveness {
@@ -272,12 +340,13 @@ impl<'a> Containers<'a> {
             Ok(state) if state.id == listed.id => state,
             Ok(_) => return Liveness::Unprovable("its container identity changed".into()),
         };
-        if state.status == "removing" {
-            return match wait_removed(&listed.id).await {
-                Ok(()) => Liveness::Dead,
-                Err(why) => Liveness::Unprovable(why),
-            };
-        }
+        let state = match self
+            .settled(listed, state, || self.state(&listed.id, token))
+            .await
+        {
+            Ok(state) => state,
+            Err(verdict) => return verdict,
+        };
         let seen = match (state.status.as_str(), state.driver) {
             ("running", Some(driver)) => Some(match self.connection(&listed.id, driver).await {
                 Ok(connection) => look(driver, &connection, self.own, token).await,
@@ -296,7 +365,8 @@ impl<'a> Containers<'a> {
         let live = verdict(&state, seen, age, self.grace);
         // A keeper probe can race the same removal. A live keeper always wins;
         // only an unreadable running server needs another runtime observation.
-        // A remover can stop it before deletion enters `removing` (DEC-2513.1).
+        // A remover can stop it before deletion enters `removing` (DEC-2513.1),
+        // and Podman shows that stop as `stopping` (DEC-2674.1).
         if state.status == "running" && matches!(live, Liveness::Unprovable(_)) {
             match self.state(&listed.id, token).await {
                 Err(why) if super::no_such_container(&why) => return Liveness::Dead,
@@ -304,16 +374,16 @@ impl<'a> Containers<'a> {
                 Ok(now) if now.id != listed.id => {
                     return Liveness::Unprovable("its container identity changed".into());
                 }
-                Ok(now) if matches!(now.status.as_str(), "exited" | "dead") => {
-                    return Liveness::Dead;
-                }
-                Ok(now) if now.status == "removing" => {
-                    return match wait_removed(&listed.id).await {
-                        Ok(()) => Liveness::Dead,
-                        Err(why) => Liveness::Unprovable(why),
-                    };
-                }
-                _ => {}
+                Ok(now) => match self
+                    .settled(listed, now, || self.state(&listed.id, token))
+                    .await
+                {
+                    Err(verdict) => return verdict,
+                    Ok(now) if matches!(now.status.as_str(), "exited" | "dead" | "stopped") => {
+                        return Liveness::Dead;
+                    }
+                    Ok(_) => {}
+                },
             }
         }
         live
@@ -508,6 +578,19 @@ pub(in crate::resolver::server::scratch) async fn swept_with_observation(
     expected_status: &str,
     between: impl AsyncFnOnce(&str) -> String,
 ) -> recovery::Report {
+    swept_with_observation_within(own, token, expected_status, STOPPING, between).await
+}
+
+/// [`swept_with_observation`] waiting only `stopping` for a stop in progress,
+/// so that a stop which truly does not end can be crossed in a second.
+#[cfg(test)]
+pub(in crate::resolver::server::scratch) async fn swept_with_observation_within(
+    own: &str,
+    token: &str,
+    expected_status: &str,
+    stopping: Duration,
+    between: impl AsyncFnOnce(&str) -> String,
+) -> recovery::Report {
     struct Listed<'a> {
         inner: Containers<'a>,
         found: BTreeMap<String, Vec<Resource>>,
@@ -539,6 +622,7 @@ pub(in crate::resolver::server::scratch) async fn swept_with_observation(
     }
     let mut inner = Containers::new(own);
     inner.only = Some(token);
+    inner.stopping = stopping;
     let found = inner.leftovers().await.unwrap();
     let state = inner.listed[token].as_ref().unwrap();
     let observed = state_from_json(&between(&state.id).await, token).unwrap();
@@ -684,6 +768,131 @@ mod tests {
         }
     }
 
+    /// What `settled` makes of a `stopping` container when the runtime answers
+    /// `answers` in turn (the last one from then on), and how often it was
+    /// asked, within `within`.
+    async fn settled_by(
+        within: Duration,
+        answers: &[Result<State, String>],
+    ) -> (Result<State, Liveness>, usize) {
+        let mut containers = Containers::new("reader");
+        containers.stopping = within;
+        let asked = std::cell::Cell::new(0);
+        let outcome = containers
+            .settled(&state("stopping"), state("stopping"), || {
+                let at = asked.get();
+                asked.set(at + 1);
+                std::future::ready(answers[at.min(answers.len() - 1)].clone())
+            })
+            .await;
+        (outcome, asked.get())
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_ends_is_judged_by_what_it_leaves() {
+        let (outcome, asked) = settled_by(
+            Duration::from_secs(5),
+            &[
+                Ok(state("stopping")),
+                Ok(state("stopping")),
+                Ok(state("stopped")),
+            ],
+        )
+        .await;
+        let now = outcome.unwrap_or_else(|verdict| panic!("{verdict:?}"));
+        // It reads until the status changes, and then stops reading. Podman
+        // goes on to `stopped` before it cleans the container up.
+        assert_eq!((now.status.as_str(), asked), ("stopped", 3));
+        assert_eq!(verdict(&now, None, None, GRACE), Liveness::Dead);
+        // A stop that did not take leaves a server to ask, not a verdict.
+        let (outcome, _) = settled_by(
+            Duration::from_secs(5),
+            &[Ok(state("stopping")), Ok(state("running"))],
+        )
+        .await;
+        assert_eq!(outcome.unwrap().status, "running");
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_removes_the_container_leaves_it_dead() {
+        let (outcome, asked) = settled_by(
+            Duration::from_secs(5),
+            &[
+                Ok(state("stopping")),
+                Err("Error: no such container abc".into()),
+            ],
+        )
+        .await;
+        assert_eq!((outcome.unwrap_err(), asked), (Liveness::Dead, 2));
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_does_not_end_is_kept_once_its_bound_has_passed() {
+        let (outcome, asked) =
+            settled_by(Duration::from_millis(250), &[Ok(state("stopping"))]).await;
+        assert_eq!(
+            outcome.unwrap_err(),
+            Liveness::Unprovable("its stop did not finish within 250ms".into()),
+            "the reason names what was waited for"
+        );
+        assert!((2..=4).contains(&asked), "polled every 100ms: {asked}");
+        // A runtime that stalls inside a read is bounded too.
+        let mut containers = Containers::new("reader");
+        containers.stopping = Duration::from_millis(250);
+        let stalled = tokio::time::timeout(
+            Duration::from_secs(2),
+            containers.settled(&state("stopping"), state("stopping"), || async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(state("exited"))
+            }),
+        )
+        .await
+        .expect("the bound includes a stalled read");
+        assert!(matches!(stalled, Err(Liveness::Unprovable(why)) if why.contains("within 250ms")));
+    }
+
+    #[tokio::test]
+    async fn only_the_runtimes_missing_container_answer_ends_a_stop_as_absence() {
+        for unread in [
+            "permission denied",
+            "Cannot connect to the Docker daemon",
+            "No such volume: abc",
+            "its container name and ownership labels do not agree",
+        ] {
+            let (outcome, asked) = settled_by(
+                Duration::from_secs(5),
+                &[Ok(state("stopping")), Err(unread.into())],
+            )
+            .await;
+            assert_eq!(outcome.unwrap_err(), Liveness::Unprovable(unread.into()));
+            assert_eq!(asked, 2, "an unreadable runtime is not retried");
+        }
+        // A name that came to be another container's proves nothing of this one.
+        let mut other = state("stopping");
+        other.id = "b".repeat(64);
+        let (outcome, _) = settled_by(Duration::from_secs(5), &[Ok(other)]).await;
+        assert_eq!(
+            outcome.unwrap_err(),
+            Liveness::Unprovable("its container identity changed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn statuses_that_are_not_in_transit_are_judged_as_they_are() {
+        let containers = Containers::new("reader");
+        for status in ["running", "exited", "stopped", "dead", "created", "paused"] {
+            let asked = std::cell::Cell::new(0);
+            let settled = containers
+                .settled(&state("running"), state(status), || {
+                    asked.set(asked.get() + 1);
+                    std::future::ready(Err("never asked".into()))
+                })
+                .await;
+            assert_eq!(settled.unwrap().status, status);
+            assert_eq!(asked.get(), 0, "{status} is not waited on");
+        }
+    }
+
     fn seen(alive: bool, ever: bool) -> Option<Result<Option<Kept>, String>> {
         Some(Ok(Some(Kept { alive, ever })))
     }
@@ -695,6 +904,11 @@ mod tests {
         // A server that is not running serves no run.
         assert_eq!(verdict(&state("exited"), None, None, GRACE), Liveness::Dead);
         assert_eq!(verdict(&state("dead"), None, None, GRACE), Liveness::Dead);
+        // Podman's process that has exited and is not yet cleaned up.
+        assert_eq!(
+            verdict(&state("stopped"), None, None, GRACE),
+            Liveness::Dead
+        );
         // Its keeper is there.
         assert_eq!(
             verdict(&state("running"), seen(true, true), old, GRACE),

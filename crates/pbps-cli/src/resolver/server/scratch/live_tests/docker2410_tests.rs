@@ -6,7 +6,9 @@
 //! `tests/flow_pg.rs`. The grace for a container that never had a keeper is
 //! twenty seconds here, not five minutes.
 
-use super::super::container::{Keeper, swept, swept_alone, swept_with_observation};
+use super::super::container::{
+    Keeper, swept, swept_alone, swept_with_observation, swept_with_observation_within,
+};
 use super::setting;
 use crate::resolver::server::engine;
 use pbps_db::resolver::Kept;
@@ -466,6 +468,203 @@ async fn recovery_confirms_another_remover_started_between_listing_and_liveness(
     assert!(removed(&report, &name), "{report:?}");
     assert!(kept_why(&report, &name).is_empty(), "{report:?}");
     assert!(report.render().unwrap().contains("confirmed removal of"));
+}
+
+/// Whether this runtime reports a container as `stopping` while something
+/// stops it. Podman does, for the whole stop timeout (measured on 5.7.0:
+/// 100ms for a PostgreSQL server, 2.1s under `--stop-timeout 2`, 10.1s for a
+/// PID 1 that ignores SIGTERM); Docker's `rm --force` kills at once and has no
+/// such status, so there is nothing to observe there. The decisions made about
+/// the status are pinned without a runtime in `container::recovery`.
+fn reports_stopping() -> bool {
+    docker(&["--version"])
+        .to_ascii_lowercase()
+        .contains("podman")
+}
+
+/// A run's container whose server ignores SIGTERM (`sleep` is PID 1), so that
+/// once something stops it the runtime reports it `stopping` for
+/// `stop_timeout` seconds, and then kills it.
+fn slow_to_stop(made: &mut Made, token: &str, stop_timeout: u32) -> String {
+    let name = format!("pbps-scratch-{token}");
+    docker(&[
+        "run",
+        "--detach",
+        "--pull",
+        "never",
+        "--name",
+        &name,
+        "--stop-timeout",
+        &stop_timeout.to_string(),
+        "--label",
+        "pbps.resolver=scratch",
+        "--label",
+        &format!("pbps.resolver.token={token}"),
+        "--label",
+        "pbps.resolver.engine=postgres",
+        "--env",
+        "POSTGRES_PASSWORD=secret2674",
+        "--entrypoint",
+        "sleep",
+        &image(),
+        "600",
+    ]);
+    made.0.push(name.clone());
+    name
+}
+
+/// Another remover starts on `id`, and this returns it with the runtime's own
+/// report of the container once that report says `stopping`: the remover has
+/// begun and has not finished.
+async fn begin_removal(id: &str) -> (std::process::Child, String) {
+    let mut remover = Command::new("docker")
+        .args(["rm", "--force", "--volumes", id])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let failure = loop {
+        let output = Command::new("docker")
+            .args(["container", "inspect", "--format", "{{json .}}", id])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            break format!("the stopping observation must precede absence: {output:?}");
+        }
+        let text = String::from_utf8(output.stdout).unwrap();
+        let observed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if observed["State"]["Status"] == "stopping" {
+            return (remover, text);
+        }
+        if std::time::Instant::now() >= deadline {
+            break format!("the runtime never reported the stop: {observed}");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    // The remover is reaped before the test fails, not left running.
+    let _ = remover.kill();
+    let _ = remover.wait();
+    panic!("{failure}");
+}
+
+/// What a sweep that began inside another remover's stop must leave: the
+/// container and its volumes gone, by that remover, and confirmed, not kept.
+fn assert_confirmed_after_the_other_remover(
+    report: &super::super::recovery::Report,
+    name: &str,
+    volumes: &[String],
+    remover: std::process::Child,
+) {
+    let output = remover.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!exists(name), "{report:?}");
+    assert!(volumes.iter().all(|v| !volume_exists(v)), "{volumes:?}");
+    assert!(removed(report, name), "{report:?}");
+    assert!(kept_why(report, name).is_empty(), "{report:?}");
+    assert!(report.render().unwrap().contains("confirmed removal of"));
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn recovery_waits_for_a_stop_the_runtime_is_still_finishing() {
+    if !reports_stopping() {
+        eprintln!("skipped: this runtime has no stopping status to observe");
+        return;
+    }
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let name = slow_to_stop(&mut made, &dead, 3);
+    let volumes = volumes_of(&name);
+    assert!(!volumes.is_empty(), "the pinned image has a data volume");
+    let remover = std::cell::RefCell::new(None);
+    // The sweep reads the container in the middle of another remover's stop,
+    // which the runtime holds for three seconds: it must wait for the stop to
+    // end rather than keep the container as one that "is stopping".
+    let report = swept_with_observation(&token(), &dead, "stopping", async |id| {
+        let (child, stopping) = begin_removal(id).await;
+        *remover.borrow_mut() = Some(child);
+        stopping
+    })
+    .await;
+    let remover = remover.take().expect("the other remover began");
+    assert_confirmed_after_the_other_remover(&report, &name, &volumes, remover);
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn a_container_stopping_after_a_running_observation_is_removed_once_the_stop_ends() {
+    if !reports_stopping() {
+        eprintln!("skipped: this runtime has no stopping status to observe");
+        return;
+    }
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let name = slow_to_stop(&mut made, &dead, 3);
+    let volumes = volumes_of(&name);
+    let remover = std::cell::RefCell::new(None);
+    // The keeper probe finds no server (nothing is published) after a running
+    // observation, and the re-read finds another remover's stop under way.
+    let report = swept_with_observation(&token(), &dead, "running", async |id| {
+        let running = docker(&["container", "inspect", "--format", "{{json .}}", id]);
+        let (child, _) = begin_removal(id).await;
+        *remover.borrow_mut() = Some(child);
+        running
+    })
+    .await;
+    let remover = remover.take().expect("the other remover began");
+    assert_confirmed_after_the_other_remover(&report, &name, &volumes, remover);
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn recovery_keeps_a_container_whose_stop_does_not_end_within_the_wait() {
+    if !reports_stopping() {
+        eprintln!("skipped: this runtime has no stopping status to observe");
+        return;
+    }
+    let mut made = Made(Vec::new());
+    let dead = token();
+    // The runtime holds it for a minute; the sweep waits for one second.
+    let name = slow_to_stop(&mut made, &dead, 60);
+    let remover = std::cell::RefCell::new(None);
+    let report = swept_with_observation_within(
+        &token(),
+        &dead,
+        "stopping",
+        Duration::from_secs(1),
+        async |id| {
+            let (child, stopping) = begin_removal(id).await;
+            *remover.borrow_mut() = Some(child);
+            stopping
+        },
+    )
+    .await;
+    let still_there = exists(&name);
+    // Let the other remover finish now: this test does not wait out its minute.
+    let _ = Command::new("docker").args(["kill", &name]).output();
+    let output = remover
+        .take()
+        .expect("the other remover began")
+        .wait_with_output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(still_there, "{report:?}");
+    assert!(!removed(&report, &name), "{report:?}");
+    let group = report
+        .groups
+        .iter()
+        .find(|group| group.token == dead)
+        .unwrap_or_else(|| panic!("no group for {dead}: {report:?}"));
+    assert!(group.removed.is_empty(), "{group:?}");
+    assert_eq!(
+        group.kept[0].statement,
+        format!("docker rm --force --volumes {name}")
+    );
+    assert_eq!(
+        group.kept[0].why, "its stop did not finish within 1000ms",
+        "a stop that does not end is reported with what was waited for"
+    );
 }
 
 #[tokio::test]
