@@ -348,13 +348,24 @@ pub(super) fn read_commit_recorded(
         root,
         commit,
         &ids_dir_rel,
-        |entry, _mode| entry.starts_with(&below),
+        |entry, _mode| entry == ids_dir_rel || entry.starts_with(&below),
         &prefix,
         observed,
         Role::Ids,
     )
     .map_err(|p| problems.push(p))
     .unwrap_or_default();
+    // A file standing where the directory should be is not an empty tree.
+    // (A symlink or a submodule there is refused by `tree_entries`.)
+    if ids
+        .iter()
+        .any(|(path, _)| *path == relative(&prefix, &ids_dir_rel))
+    {
+        problems.push(Problem::NotRegular {
+            path: relative(&prefix, &ids_dir_rel),
+            what: "it is a file where the identity directory should be".to_owned(),
+        });
+    }
     if legacy_ids.is_some() && !ids.is_empty() {
         problems.push(Problem::Unreadable {
             path: relative(&prefix, &ids_dir_rel),

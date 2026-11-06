@@ -43,6 +43,13 @@ pub(crate) fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Whether `path` is `dir` or below it, by resolved path: a symlinked parent
+/// is followed and a destination that does not exist yet is judged by where it
+/// would be.
+pub(crate) fn is_inside(path: &Path, dir: &Path) -> anyhow::Result<bool> {
+    Ok(absolute(path)?.starts_with(absolute(dir)?))
+}
+
 /// Existing aliases are compared by filesystem identity; missing destinations
 /// still need a spelling comparison because planning can create the ids file.
 pub(crate) fn same_file(a: &Path, b: &Path) -> anyhow::Result<bool> {

@@ -559,6 +559,24 @@ fn a_revision_with_a_damaged_identity_tree_is_refused() {
     assert!(!here.contains(&&RevisionProblem::IdsOutOfDate), "{found:?}");
 }
 
+/// `.pbps/ids` as a file is not an empty tree.
+#[test]
+fn a_revision_whose_identity_directory_is_a_file_is_refused() {
+    let (repo, c1, _) = standard();
+    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.write(".pbps/ids", "not a directory");
+    let bad = repo.commit("file where the tree should be");
+    repo.manifest(&bad, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &bad).iter().any(|p| matches!(
+            p,
+            RevisionProblem::NotRegular { path, .. } if path == ".pbps/ids"
+        )),
+        "{found:?}"
+    );
+}
+
 #[test]
 fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusals() {
     let (repo, c1, _) = standard();

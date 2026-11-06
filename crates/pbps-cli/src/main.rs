@@ -1744,6 +1744,9 @@ fn run() -> anyhow::Result<()> {
                 (None, None) => None,
                 _ => Some(target.resolve(&project)?),
             };
+            if let Some(path) = sql.as_deref() {
+                ids_store::refuse_output_inside(&project, path)?;
+            }
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
@@ -1836,6 +1839,7 @@ fn cmd_docs(
 
     match out {
         Some(path) => {
+            ids_store::refuse_output_inside(project, path)?;
             std::fs::write(path, &rendered)
                 .with_context(|| format!("cannot write `{}`", path.display()))?;
             // To stderr: stdout may be the document itself when --out is absent,
@@ -2220,6 +2224,7 @@ fn cmd_pull(
     // through an output name or one of the entries about to be removed.
     for path in written.iter().chain(&present) {
         paths::refuse_declaration_path(path, &root, &protected_inputs)?;
+        ids_store::refuse_output_inside(project, path)?;
     }
     // The identity tree is decided, and every refusal of it made, before any
     // declaration is published: a pull that cannot record its identities must
@@ -4987,6 +4992,18 @@ fn refuse_aliased_outputs(
         for input in &inputs {
             distinct(destination, input)?;
         }
+    }
+    // After the aliases, which name the exact file: nothing else the user names
+    // may be written inside the identity tree either, whether or not the file
+    // is there yet.
+    for destination in [out, sql].into_iter().flatten() {
+        output::or_unanswerable_at(
+            "plan",
+            json,
+            "flags.conflicting",
+            destination,
+            ids_store::refuse_output_inside(project, destination),
+        )?;
     }
     Ok(())
 }

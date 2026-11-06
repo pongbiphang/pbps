@@ -88,9 +88,16 @@ pub(crate) fn tree_at(
         root,
         rev,
         ids_dir_rel,
-        |path, _mode| path.starts_with(&below),
+        // The directory's own entry too: at a revision where `ids_dir` is a
+        // symlink, a file or a submodule, the listing names that one entry and
+        // nothing below it, which must not read as an empty tree.
+        |path, _mode| path == ids_dir_rel || path.starts_with(&below),
         |path, mode, bytes| {
             let shown = pbps_model::Text::new(path.to_owned()).shown().to_string();
+            anyhow::ensure!(
+                path != ids_dir_rel,
+                "`{shown}` at `{rev}` is not a directory of identity files (git mode {mode})"
+            );
             anyhow::ensure!(
                 matches!(mode, "100644" | "100755") && path.ends_with(".json"),
                 "`{shown}` at `{rev}` is not a regular .json file"
@@ -106,14 +113,30 @@ pub(crate) fn tree_at(
 
 /// The files `plan` and the other commands must not write over: the project
 /// file, the legacy identity file if one is still there, and every file of the
-/// tree. A file of the tree not yet written is not listed, so callers that
-/// write somewhere new also refuse a destination inside the directory.
+/// tree that exists. A file of the tree not yet written is not listed, so every
+/// command that writes somewhere the user names also calls
+/// [`refuse_output_inside`].
 pub(crate) fn protected(project: &Project) -> Vec<PathBuf> {
     let mut out = vec![project.config_file(), project.ids_file()];
     if let Ok(tree) = read_ids_tree(&project.ids_dir()) {
         out.extend(tree.keys().map(|rel| project.ids_dir().join(rel)));
     }
     out
+}
+
+/// Refuses an output destination inside the identity tree, whether or not the
+/// file exists yet and however the path reaches it (a symlinked parent
+/// included): a file written there becomes an identity file or collides with
+/// one the next `plan` writes.
+pub(crate) fn refuse_output_inside(project: &Project, destination: &Path) -> anyhow::Result<()> {
+    if crate::paths::is_inside(destination, &project.ids_dir())? {
+        bail!(
+            "`{}` is inside the identity tree `{}`, which only pbps writes; write it elsewhere",
+            pbps_model::Text::new(destination.display().to_string()).shown(),
+            pbps_model::Text::new(project.config.ids_dir().display().to_string()).shown()
+        );
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------- write ----

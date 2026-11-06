@@ -623,6 +623,80 @@ fn validate_reports_an_identity_file_whose_declaration_is_gone_as_an_orphan() {
     assert_ok(&p.pbps(&["validate"]));
 }
 
+// ------------------------------------- history that is not a directory ---
+
+/// A commit whose `.pbps/ids` is not a tree, made through git's index so the
+/// working tree keeps its valid one.
+fn revision_with_ids_object(kind: &str) -> Project {
+    let p = migrated();
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "good"]);
+    let sha = |out: Output| String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    let head = sha(p.git(&["rev-parse", "HEAD"]));
+    p.write("blob.txt", "../elsewhere\n");
+    let blob = sha(p.git(&["hash-object", "-w", "blob.txt"]));
+    p.git_ok(&["rm", "-r", "-q", "--cached", ".pbps/ids"]);
+    let (mode, oid) = match kind {
+        "symlink" => ("120000", blob),
+        "file" => ("100644", blob),
+        "gitlink" => ("160000", head),
+        other => panic!("{other}"),
+    };
+    p.git_ok(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("{mode},{oid},.pbps/ids"),
+    ]);
+    p.git_ok(&["commit", "-q", "-m", "bad"]);
+    p
+}
+
+#[test]
+fn a_revision_whose_ids_dir_is_a_symlink_a_file_or_a_submodule_is_refused_never_empty() {
+    for kind in ["symlink", "file", "gitlink"] {
+        let p = revision_with_ids_object(kind);
+        let out = p.pbps(&["validate", "--since", "HEAD"]);
+        assert_refused(&out, ".pbps/ids");
+        // Refused, not read as a baseline with no identities.
+        assert!(
+            text(&out).contains("is not a directory of identity files"),
+            "{kind}: {}",
+            text(&out)
+        );
+        // The revision before it is the same project and reads.
+        assert_ok(&p.pbps(&["validate", "--since", "HEAD~1"]));
+    }
+}
+
+// ------------------------------------- outputs inside the identity tree ---
+
+#[test]
+fn no_output_may_be_written_inside_the_identity_tree_existing_or_not() {
+    let p = migrated();
+    let before = tree_of(&p);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(".pbps/ids", p.0.join("alias")).unwrap();
+    let mut targets = vec![".pbps/ids/x.json", ".pbps/ids/sub/y.json"];
+    #[cfg(unix)]
+    targets.push("alias/z.json");
+    for target in targets {
+        for args in [
+            vec!["plan", "--no-dev", "--out", target],
+            vec!["plan", "--no-dev", "--sql", target],
+            vec!["docs", "--out", target],
+            vec!["bootstrap", "--sql", target],
+        ] {
+            let out = p.pbps(&args);
+            assert_refused(&out, "inside the identity tree");
+            assert_eq!(tree_of(&p), before, "{args:?} wrote into the tree");
+        }
+    }
+    // Beside the tree is fine.
+    assert_ok(&p.pbps(&["plan", "--no-dev", "--out", "plan.json"]));
+}
+
 // ------------------------------------------- a project below the repo root ---
 
 #[test]
