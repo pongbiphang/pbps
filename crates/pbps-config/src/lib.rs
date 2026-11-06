@@ -357,8 +357,22 @@ pub struct Config {
     #[schemars(regex(pattern = r"^(?!(?:\.\.?(?:[/\\]+|$))*$)"))]
     pub schema_dir: PathBuf,
 
+    /// The single identity file. `ids_dir` replaces it; name one or the other.
+    // The reason behind the pair, kept out of the published schema's text:
+    // every reader and writer still uses this file until the identity tree
+    // takes over (#2600, DEC-2600.7), so it cannot be removed yet.
     #[serde(default = "default_ids_file")]
     pub ids_file: PathBuf,
+
+    /// The directory of per-declaration identity files, relative to the project
+    /// root. Defaults to `.pbps/ids`. It must not be the project root,
+    /// `schema_dir`, or a directory holding either.
+    // Held as given, so a config that does not name it serializes as before.
+    // It is also the key an older pbps rejects as unknown, which is how a
+    // migrated project stops it from minting fresh uids (DEC-2600.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^(?!(?:\.\.?(?:[/\\]+|$))*$)"))]
+    pub ids_dir: Option<PathBuf>,
 
     /// Deployment targets, by name. Optional: a project that only ever passes
     /// `--db` explicitly needs none.
@@ -459,8 +473,14 @@ fn default_schema_dir() -> PathBuf {
     PathBuf::from("schema")
 }
 
+/// Where the identity tree lives when `ids_dir` is not named (design-2600 §3.2).
+pub const DEFAULT_IDS_DIR: &str = ".pbps/ids";
+
+/// The legacy identity file's name, until the switch to the tree (#2600).
+pub(crate) const DEFAULT_IDS_FILE: &str = "schema.ids.json";
+
 fn default_ids_file() -> PathBuf {
-    PathBuf::from("schema.ids.json")
+    PathBuf::from(DEFAULT_IDS_FILE)
 }
 
 impl Config {
@@ -538,7 +558,8 @@ impl Config {
             });
         }
         config
-            .check_databases()
+            .check_ids_dir()
+            .and_then(|()| config.check_databases())
             .map_err(|message| ConfigError::Parse {
                 path: path.to_owned(),
                 message,
@@ -623,6 +644,26 @@ impl Project {
                 path: config_path.to_owned(),
             });
         }
+        // The same question against the disk, for the spellings the lexical
+        // check leaves (`..`, an absolute path, a symlink). A directory that
+        // does not exist yet cannot hold anything, so it is not judged; but
+        // each directory it might hold is asked on its own, because a new
+        // project has no `schema/` and that must not excuse an `ids_dir` that
+        // is the root or above it.
+        let held_by_ids = |ids: &Path| {
+            [real(&root), real(&root.join(&config.schema_dir))]
+                .into_iter()
+                .flatten()
+                .any(|held| held.starts_with(ids))
+        };
+        if config.ids_dir.is_some()
+            && real(&root.join(config.ids_dir())).is_ok_and(|ids| held_by_ids(&ids))
+        {
+            return Err(ConfigError::Parse {
+                path: config_path.to_owned(),
+                message: "`ids_dir` is the project root, `schema_dir`, or a directory holding either; identity files live in their own subdirectory, such as `.pbps/ids` (the default)".into(),
+            });
+        }
         Ok(Self { root, config })
     }
 
@@ -634,6 +675,12 @@ impl Project {
 
     pub fn ids_file(&self) -> PathBuf {
         self.root.join(&self.config.ids_file)
+    }
+
+    /// The identity tree's directory, absolute or relative to the caller's
+    /// working directory like [`Project::schema_dir`].
+    pub fn ids_dir(&self) -> PathBuf {
+        self.root.join(self.config.ids_dir())
     }
 
     /// The directory holding `pbps.yml`. Every path in the config is relative

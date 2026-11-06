@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 91;
+pub const SCHEMA_VERSION: u32 = 92;
+// 92: the `ids_dir` key of `pbps.yml`, where the identity tree lives (#2600 PR 3).
 // 91: the `gist` index method and a key's `collation` in declarations, plans and state (#2448).
 // 90: a plan's and `explain`'s `target_assertions`, recorded reviewed assertions (#2401).
 // 89: verified fixture re-pin results of `pbps test fixtures repin` (issue #1165).

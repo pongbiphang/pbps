@@ -1387,3 +1387,38 @@ follows in a later change and is not decided here.
 
 Pinned by one positive and one negative test per code and by a test that
 splits generated models and checks them without a finding.
+
+<a id="dec-2600-7"></a>
+
+**DEC-2600.7. `ids_dir` names the identity tree; until the switch it lives beside `ids_file`, never with it.**
+`pbps.yml` gains `ids_dir`, relative to the project root like `schema_dir`,
+default `.pbps/ids` (design-2600 §3.2, §6.2; open question 2 taken as
+recommended). The design says it replaces `ids_file`, but every reader and
+writer still uses the file until the switch (PR 5), and a config that stopped
+accepting `ids_file` would change what users see before then. So until the
+switch both keys exist: `ids_file` alone is the legacy project and keeps its
+meaning, `ids_dir` alone is a project that has moved, and naming both is
+refused, because the pair has no meaning and nothing could say which is
+authoritative. "Naming `ids_file`" means a value other than the default: a typed
+config always carries the default, and one written out and read back must stay
+valid. `ids_dir` is held as given
+and written out only when named, so a config that does not name it serializes
+as before. Like `schema_dir` it must not be the project root or above it, and
+it must not be `schema_dir` or a directory holding it: spelling is judged in
+the parse and the disk (symlinks, `..`, absolute paths) when the project
+loads. Inside `schema_dir` is allowed; only the declarations' own directory is
+not. With `databases:` the project's `ids_dir` is the base and each database's
+tree is `<ids_dir>/<database>`, which is the path rule applied to YAML paths
+that already begin with the database name; the project-level `ids_file`
+override stays refused. The key is also the fail-closed switch: an older pbps
+rejects it as an unknown field instead of reading "no identity file" and
+minting fresh uids. The published schema set moves to 92 for the new key.
+
+The loader hands the tree its paths: `Loaded::declared_paths` is the view of
+the sources the successful load already holds (path relative to the schema
+directory with `/` separators, a table's columns in YAML order, a partition
+child naming its parent), so the tree is never mirrored from a second walk. The
+multi-database loader reads a database's tree when its directory holds files
+and otherwise `schema.ids.json`; both together are refused, and a tree entry
+that is not a directory or a regular `.json` file is refused rather than
+skipped. The legacy reader for history and the switch itself follow in PR 5.

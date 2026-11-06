@@ -1,4 +1,4 @@
-use pbps_load::{ProjectLoadError, load_database_dirs};
+use pbps_load::{DatabaseDirs, ProjectLoadError, load_database_dirs, load_databases};
 use pbps_model::{DatabaseMap, DatabaseName, IdsFile, UidKind};
 use std::{
     path::PathBuf,
@@ -389,4 +389,157 @@ fn declared_extensions_and_held_identities_stay_in_their_database() {
     for name in ["alpha", "beta", "e_aaaaaa"] {
         assert!(error.contains(name), "{error}");
     }
+}
+
+fn tree_file(ids_dir: &std::path::Path, rel: &str, uid: &str, name: &str) {
+    use pbps_model::ids_tree::{self, Placement};
+    let ids = IdsFile {
+        tables: [(uid.parse().unwrap(), name.parse().unwrap())].into(),
+        ..Default::default()
+    };
+    let placement = Placement {
+        paths: [(uid.parse().unwrap(), rel.to_owned())].into(),
+        ..Default::default()
+    };
+    for (path, text) in ids_tree::split(&ids, &placement).unwrap() {
+        let path = ids_dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+fn schema_dirs(databases: &DatabaseMap<DatabaseDirs>) -> DatabaseMap<PathBuf> {
+    databases.map(|_, dirs| dirs.schema_dir.clone())
+}
+
+/// The identity trees beside, not inside, the declarations root: the loader
+/// refuses any other entry there.
+struct Trees(PathBuf);
+impl Trees {
+    fn of(dir: &Dir) -> Self {
+        Self(dir.0.with_extension("ids"))
+    }
+}
+impl Drop for Trees {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn dirs(dir: &Dir, trees: &Trees, with_tree: bool) -> DatabaseMap<DatabaseDirs> {
+    let tree = trees.0.clone();
+    dir.paths().map(|name, schema_dir| DatabaseDirs {
+        schema_dir: schema_dir.clone(),
+        ids_dir: with_tree.then(|| tree.join(name.raw())),
+    })
+}
+
+#[test]
+fn a_databases_identities_are_read_from_its_own_tree_when_it_has_one() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (name, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+        let uid = if name.raw() == "alpha" {
+            "t_aaaaaa"
+        } else {
+            "t_bbbbbb"
+        };
+        tree_file(dirs.ids_dir.as_ref().unwrap(), "t.json", uid, "dbo.same");
+    }
+    let loaded = load_databases(&databases).unwrap();
+    for (name, uid) in [("alpha", "t_aaaaaa"), ("beta", "t_bbbbbb")] {
+        let ids = loaded.ids().get(&db(name)).unwrap();
+        assert_eq!(
+            ids.tables
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [uid]
+        );
+    }
+}
+
+#[test]
+fn a_database_without_a_tree_keeps_reading_schema_ids_json() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (_, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+    }
+    write_ids(&schema_dirs(&databases), "alpha", &identities("t_aaaaaa"));
+    let loaded = load_databases(&databases).unwrap();
+    assert_eq!(loaded.ids().get(&db("alpha")).unwrap().tables.len(), 1);
+    // A tree directory that is absent, or present but empty, is no tree.
+    assert!(loaded.ids().get(&db("beta")).unwrap().tables.is_empty());
+    std::fs::create_dir_all(trees.0.join("beta")).unwrap();
+    assert!(load_databases(&databases).is_ok());
+}
+
+#[test]
+fn a_tree_beside_the_legacy_file_is_refused_as_ambiguous() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (_, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+    }
+    write_ids(&schema_dirs(&databases), "alpha", &identities("t_aaaaaa"));
+    tree_file(&trees.0.join("alpha"), "t.json", "t_aaaaaa", "dbo.same");
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("both") && error.contains("alpha"), "{error}");
+}
+
+#[test]
+fn a_damaged_or_unexpected_tree_entry_is_refused_not_skipped() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (_, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+    }
+    let alpha = trees.0.join("alpha");
+    tree_file(&alpha, "t.json", "t_aaaaaa", "dbo.same");
+    std::fs::write(alpha.join("notes.txt"), "x").unwrap();
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("notes.txt"), "{error}");
+    std::fs::remove_file(alpha.join("notes.txt")).unwrap();
+    std::fs::write(alpha.join("t.json"), "{").unwrap();
+    assert!(matches!(
+        load_databases(&databases),
+        Err(ProjectLoadError::Identities { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_or_file_in_place_of_the_tree_directory_is_refused_not_read_as_absent() {
+    let dir = Dir::new();
+    let trees = Trees::of(&dir);
+    let databases = dirs(&dir, &trees, true);
+    for (_, dirs) in databases.iter() {
+        std::fs::write(dirs.schema_dir.join("t.yml"), declaration()).unwrap();
+    }
+    std::fs::create_dir_all(&trees.0).unwrap();
+    let alpha = trees.0.join("alpha");
+    // Dangling: read_dir says NotFound, which must not pass for "no tree" and
+    // fall back to a legacy file that may be absent too.
+    std::os::unix::fs::symlink(trees.0.join("gone"), &alpha).unwrap();
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    // A live link is refused the same way.
+    std::fs::remove_file(&alpha).unwrap();
+    std::fs::create_dir(trees.0.join("real")).unwrap();
+    std::os::unix::fs::symlink(trees.0.join("real"), &alpha).unwrap();
+    let error = load_databases(&databases).unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    // So is a plain file.
+    std::fs::remove_file(&alpha).unwrap();
+    std::fs::write(&alpha, "x").unwrap();
+    assert!(load_databases(&databases).is_err());
+    // Negative: with nothing there at all the database simply has no tree.
+    std::fs::remove_file(&alpha).unwrap();
+    assert!(load_databases(&databases).is_ok());
 }

@@ -80,3 +80,4 @@ DECISIONS 465).
 - `89/` adds the verified fixture re-pin result: the `repin` record (both input hash sets, per-side runs, row and allocator comparisons, manifest write) and a phase's `side` (#1165).
 - `90/` adds recorded target assertions to plan output and `explain` (#2401 PR B).
 - `91/` adds the `gist` index method and an index key's `collation:` (#2448 PR B).
+- `92/` adds the `ids_dir` key of `pbps.yml`, the directory of per-declaration identity files (#2600 PR 3).

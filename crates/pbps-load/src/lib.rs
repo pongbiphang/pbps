@@ -7,6 +7,7 @@
 //! [`docs/ADR-0001`](../../../docs/ADR-0001-yaml-crate.md).
 
 pub mod convert;
+mod declared;
 mod dependencies;
 pub mod dto;
 pub mod error;
@@ -1728,4 +1729,7 @@ mod dependency_remedy_tests {
 #[cfg(test)]
 mod object_ref_tests;
 
-pub use project::{LoadedDatabases, ProjectLoadError, load_database_dirs};
+pub use declared::{DeclaredFile, DeclaredPathError, DeclaredPaths};
+pub use project::{
+    DatabaseDirs, LoadedDatabases, ProjectLoadError, load_database_dirs, load_databases,
+};

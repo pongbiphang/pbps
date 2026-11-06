@@ -101,3 +101,142 @@ fn a_flat_identity_file_cannot_silently_disappear_when_switching_layout() {
     std::fs::remove_file(dir.0.join("schema.ids.json")).unwrap();
     assert!(Project::load_project(&path).is_ok());
 }
+
+fn parse(text: &str) -> Result<Config, String> {
+    Config::parse_project(text, Path::new("pbps.yml")).map_err(|e| e.to_string())
+}
+
+#[test]
+fn ids_dir_defaults_to_the_identity_tree_beside_the_project_and_is_not_serialized() {
+    let dir = Dir::new();
+    let project = Project::load(&dir.config("dialect: postgres\n")).unwrap();
+    assert_eq!(project.config.ids_dir, None);
+    assert_eq!(project.ids_dir(), dir.0.join(".pbps/ids"));
+    // The legacy file is still the one in use, and nothing new is written out.
+    assert_eq!(project.ids_file(), dir.0.join("schema.ids.json"));
+    assert!(
+        !serde_json::to_string(&project.config)
+            .unwrap()
+            .contains("ids_dir")
+    );
+}
+
+#[test]
+fn a_named_ids_dir_is_kept_relative_to_the_project_root() {
+    let dir = Dir::new();
+    let project = Project::load(&dir.config("dialect: postgres\nids_dir: meta/ids\n")).unwrap();
+    assert_eq!(project.ids_dir(), dir.0.join("meta/ids"));
+    let text = serde_json::to_string(&project.config).unwrap();
+    assert_eq!(parse(&text).unwrap(), project.config);
+}
+
+#[test]
+fn ids_file_alone_stays_valid_until_the_switch() {
+    let config = parse("dialect: postgres\nids_file: db/ids.json\n").unwrap();
+    assert_eq!(config.ids_file, PathBuf::from("db/ids.json"));
+    assert_eq!(config.ids_dir, None);
+}
+
+#[test]
+fn moving_ids_file_while_naming_ids_dir_is_refused_but_its_default_is_not() {
+    let error =
+        parse("dialect: postgres\nids_file: db/ids.json\nids_dir: .pbps/ids\n").unwrap_err();
+    assert!(error.contains("`ids_dir` replaces `ids_file`"), "{error}");
+    // A config written out always carries the default `ids_file`, so a
+    // round trip through the typed value must read back.
+    let config = parse("dialect: postgres\nids_file: schema.ids.json\nids_dir: .pbps/ids\n");
+    assert!(config.is_ok(), "{config:?}");
+}
+
+#[test]
+fn an_ids_dir_that_is_the_project_or_holds_the_declarations_is_refused() {
+    for ids_dir in [".", "./", "..", "../..", "./."] {
+        let error = parse(&format!("dialect: postgres\nids_dir: \"{ids_dir}\"\n")).unwrap_err();
+        assert!(error.contains("project root"), "{ids_dir:?}: {error}");
+    }
+    for (ids_dir, schema_dir) in [
+        ("schema", "schema"),
+        ("./schema/", "schema"),
+        ("db", "db/tables"),
+    ] {
+        let text = format!("dialect: postgres\nschema_dir: {schema_dir}\nids_dir: {ids_dir}\n");
+        let error = parse(&text).unwrap_err();
+        assert!(error.contains("holding it"), "{ids_dir:?}: {error}");
+    }
+    // Beside, inside or elsewhere is fine: only the declarations' own
+    // directory is off limits.
+    for (ids_dir, schema_dir) in [
+        (".pbps/ids", "schema"),
+        ("schema/ids", "schema"),
+        ("schemata", "schema"),
+        ("db/ids", "db/tables"),
+    ] {
+        let text = format!("dialect: postgres\nschema_dir: {schema_dir}\nids_dir: {ids_dir}\n");
+        assert!(parse(&text).is_ok(), "{ids_dir:?} beside {schema_dir:?}");
+    }
+}
+
+#[test]
+fn an_ids_dir_reaching_the_project_by_a_symlink_or_parent_is_refused_on_disk() {
+    let dir = Dir::new();
+    std::fs::create_dir(dir.0.join("schema")).unwrap();
+    for ids_dir in [
+        dir.0.display().to_string(),
+        dir.0.join("schema").display().to_string(),
+        format!("{}/schema/..", dir.0.display()),
+    ] {
+        let path = dir.config(&format!("dialect: postgres\nids_dir: '{ids_dir}'\n"));
+        let error = Project::load(&path).unwrap_err().to_string();
+        assert!(error.contains("`ids_dir`"), "{ids_dir}: {error}");
+    }
+    let path = dir.config(&format!(
+        "dialect: postgres\nids_dir: '{}'\n",
+        dir.0.join("elsewhere").display()
+    ));
+    assert!(Project::load(&path).is_ok());
+}
+
+#[test]
+fn a_database_project_puts_each_identity_tree_under_ids_dir_by_database_name() {
+    let dir = Dir::new();
+    for (config, base) in [
+        (NAMED.to_owned(), ".pbps/ids"),
+        (format!("{NAMED}ids_dir: meta/ids\n"), "meta/ids"),
+    ] {
+        let project = Project::load_project(&dir.config(&config)).unwrap();
+        for (db, paths) in project.database_paths().unwrap().iter() {
+            assert_eq!(paths.ids_dir, dir.0.join(base).join(db.raw()));
+            // The legacy file keeps its place until the switch.
+            assert_eq!(paths.ids_file, paths.schema_dir.join("schema.ids.json"));
+        }
+    }
+}
+
+#[test]
+fn a_database_project_still_refuses_a_project_level_ids_file_override() {
+    let error = parse(&format!("{NAMED}ids_file: ids.json\n")).unwrap_err();
+    assert!(error.contains("ids_file override"), "{error}");
+}
+
+#[test]
+fn a_missing_schema_dir_does_not_excuse_an_ids_dir_that_is_the_project_or_above_it() {
+    // A new project has no `schema/` yet; the root check stands on its own.
+    let dir = Dir::new();
+    assert!(!dir.0.join("schema").exists());
+    for ids_dir in [
+        dir.0.display().to_string(),
+        dir.0.parent().unwrap().display().to_string(),
+        format!("{}/sub/..", dir.0.display()),
+    ] {
+        std::fs::create_dir_all(dir.0.join("sub")).unwrap();
+        let path = dir.config(&format!("dialect: postgres\nids_dir: '{ids_dir}'\n"));
+        let error = Project::load(&path).unwrap_err().to_string();
+        assert!(error.contains("`ids_dir`"), "{ids_dir}: {error}");
+    }
+    // Negative: a directory of its own that does not exist yet is fine.
+    let path = dir.config(&format!(
+        "dialect: postgres\nids_dir: '{}'\n",
+        dir.0.join(".pbps/ids").display()
+    ));
+    assert!(Project::load(&path).is_ok());
+}

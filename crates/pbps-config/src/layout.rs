@@ -2,7 +2,7 @@
 use crate::{Config, ConfigError, DialectName, Project};
 use pbps_model::{DatabaseMap, DatabaseName};
 use serde::{Deserialize, Deserializer};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "Vec<DatabaseName>", into = "Vec<DatabaseName>")]
@@ -37,13 +37,62 @@ pub(crate) fn names<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DatabaseLi
     DatabaseList::deserialize(d).map(Some)
 }
 
+/// The path as its normal segments, or `None` when `..`, a root or a prefix
+/// makes the answer depend on the file system (judged by [`Project::load`]).
+fn lexical(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .map(|c| match c {
+            Component::Normal(name) => Some(name),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
 impl Config {
+    /// The identity tree's directory as the config spells it, relative to the
+    /// project root.
+    pub fn ids_dir(&self) -> PathBuf {
+        self.ids_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(crate::DEFAULT_IDS_DIR))
+    }
+
+    /// The spelling half of the #739 rule for `ids_dir`: not the project root
+    /// or above it, and not `schema_dir` or a directory holding it. Both would
+    /// put identity files where declarations are read, or scatter declarations
+    /// among them. The file system half is [`Project::load`]'s.
+    pub(crate) fn check_ids_dir(&self) -> Result<(), String> {
+        let Some(dir) = &self.ids_dir else {
+            return Ok(());
+        };
+        // `ids_dir` replaces `ids_file` (DEC-2600.7). A config that moved the
+        // file and also names the tree has no one meaning. The default value
+        // is tolerated: a typed config always carries it, and one written out
+        // and read back must stay valid.
+        if self.ids_file.as_os_str() != crate::DEFAULT_IDS_FILE {
+            return Err("`ids_dir` replaces `ids_file`; name only one of them. A project that names `ids_file` keeps reading that file until it moves to `ids_dir`".into());
+        }
+        if dir.is_relative() && crate::only_dot_segments(dir) {
+            return Err("`ids_dir` is the project root or a directory above it; identity files live in a subdirectory, such as `.pbps/ids` (the default)".into());
+        }
+        if let (Some(ids), Some(schema)) = (lexical(dir), lexical(&self.schema_dir))
+            && schema.starts_with(&ids)
+        {
+            return Err("`ids_dir` is `schema_dir` or a directory holding it; identity files must live apart from the declarations".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_databases(&self) -> Result<(), String> {
         if self.databases.is_some() {
             if self.dialect != DialectName::Mssql {
                 return Err("databases: is supported only for SQL Server; PostgreSQL projects use the single-database layout".into());
             }
-            if self.ids_file.as_os_str() != "schema.ids.json" {
+            if self.ids_file.as_os_str() != crate::DEFAULT_IDS_FILE {
                 return Err("databases: keeps schema.ids.json inside each database directory; remove the project-level ids_file override".into());
             }
         }
@@ -55,6 +104,10 @@ impl Config {
 pub struct DatabasePaths {
     pub schema_dir: PathBuf,
     pub ids_file: PathBuf,
+    /// This database's identity tree: `<ids_dir>/<database>`. The path rule
+    /// mirrors the YAML path, which already starts with the database name
+    /// (design-2600 §3.2), so no case of its own is needed.
+    pub ids_dir: PathBuf,
 }
 impl Project {
     /// A1's configuration/layout entry point; it grants no deployment authority.
@@ -83,11 +136,13 @@ impl Project {
         DatabaseMap::new(names.iter().cloned().map(|name| {
             let schema_dir = self.schema_dir().join(name.raw());
             let ids_file = schema_dir.join("schema.ids.json");
+            let ids_dir = self.ids_dir().join(name.raw());
             (
                 name,
                 DatabasePaths {
                     schema_dir,
                     ids_file,
+                    ids_dir,
                 },
             )
         }))
