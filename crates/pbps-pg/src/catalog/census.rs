@@ -529,38 +529,35 @@ mod tests {
         const WRITERS: usize = 4;
         const SESSIONS_EACH: usize = 25;
         let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
-        let finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let writers: Vec<_> = (0..WRITERS)
-            .map(|_| {
-                let server = server.clone();
-                let finished = finished.clone();
-                tokio::spawn(async move {
-                    for _ in 0..SESSIONS_EACH {
-                        let mut session = Conn::connect(Driver::Postgres, &server).await.unwrap();
-                        session
-                            .execute("CREATE TEMP TABLE census2681_helper (n serial)")
-                            .await
-                            .unwrap();
-                        // Ended the way a fixture session is: the client only drops it.
-                        drop(session);
-                    }
-                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-            .collect();
+        let mut writers = tokio::task::JoinSet::new();
+        for _ in 0..WRITERS {
+            let server = server.clone();
+            writers.spawn(async move {
+                for _ in 0..SESSIONS_EACH {
+                    let mut session = Conn::connect(Driver::Postgres, &server).await.unwrap();
+                    session
+                        .execute("CREATE TEMP TABLE census2681_helper (n serial)")
+                        .await
+                        .unwrap();
+                    // Ended the way a fixture session is: the client only drops it.
+                    drop(session);
+                }
+            });
+        }
         let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
         let mut reads = 0;
         loop {
-            let done = finished.load(std::sync::atomic::Ordering::SeqCst) == WRITERS;
+            // Failed writers finish too; report their panic while the reader runs.
+            while let Some(writer) = writers.try_join_next() {
+                writer.unwrap();
+            }
+            let done = writers.is_empty();
             let pulled = super::super::introspect(&mut reader).await;
             assert!(pulled.is_ok(), "{:?}", pulled.err());
             reads += 1;
             if done {
                 break;
             }
-        }
-        for writer in writers {
-            writer.await.unwrap();
         }
         assert!(reads > 0);
     }
