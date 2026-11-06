@@ -145,18 +145,25 @@ fn relative(root: &Path, value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn inputs(project: &Path, fields: Paths) -> Result<(String, String)> {
+fn inputs(project: &Path, fields: Paths) -> Result<(String, String, String)> {
     if relative(project, &fields.project_file)? != "pbps.yml" {
         return Err(Error::new("The snapshot must resolve its own pbps.yml"));
     }
     let declarations = relative(project, &fields.declarations)?;
     let ids = relative(project, &fields.identity_dir)?;
-    if ids == "pbps.yml" || declarations == "pbps.yml" || ids == declarations {
+    let legacy = relative(project, &fields.legacy_identity_file)?;
+    if ids == "pbps.yml"
+        || declarations == "pbps.yml"
+        || ids == declarations
+        || legacy == "pbps.yml"
+        || legacy == ids
+        || legacy == declarations
+    {
         return Err(Error::new(
             "Compose configuration, declarations and identity paths must be distinct",
         ));
     }
-    Ok((declarations, ids))
+    Ok((declarations, ids, legacy))
 }
 
 fn tree_entries(git: &Git, base: &str, project: &str) -> Result<BTreeMap<String, TreeEntry>> {
@@ -981,15 +988,17 @@ pub(super) fn capture(
         deadline: config.deadline,
     };
     let snapshot_project = snapshot.join(&project);
-    let (declarations, ids) = workspace.check(&known, || {
+    let (declarations, ids, legacy) = workspace.check(&known, || {
         let paths = cli.paths(&snapshot_project)?;
         inputs(&snapshot_project, paths).map_err(Error::rejection)
     })?;
     observer(CaptureBoundary::PathsResolved);
     let declarations = join(&project, &declarations);
     let ids = join(&project, &ids);
+    let legacy = join(&project, &legacy);
     let is_input = |path: &str| {
-        (path.starts_with(&format!("{ids}/")) && files::identity_path(path))
+        path == legacy
+            || (path.starts_with(&format!("{ids}/")) && files::identity_path(path))
             || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
     };
     // The declarations and the identity tree are both live inputs: what is
@@ -1001,6 +1010,9 @@ pub(super) fn capture(
             recorded.keys().filter(|p| is_input(p)).cloned().collect();
         names.extend(live.keys().cloned());
         names.insert(project_file.clone());
+        // The retired identity file, as configured: present or absent, it is
+        // what decides whether the private CLI refuses as the real one does.
+        names.insert(legacy.clone());
         if names.len() > MAX_FILES {
             return Err(Error::rejected("Compose has too many input paths"));
         }

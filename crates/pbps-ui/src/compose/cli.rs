@@ -84,6 +84,7 @@ pub(super) struct Paths {
     pub project_file: String,
     pub declarations: String,
     pub identity_dir: String,
+    pub legacy_identity_file: String,
 }
 
 pub(super) struct Cli {

@@ -2982,13 +2982,18 @@
         },
         "identity_dir": {
           "type": "string"
+        },
+        "legacy_identity_file": {
+          "description": "Where the retired single identity file would be, as configured\n(`ids_file`). A consumer that captures the project's inputs needs it:\nthat file is what makes the project refuse with \"run `pbps ids migrate`\"\ninstead of reading as a fresh one.",
+          "type": "string"
         }
       },
       "required": [
         "mode",
         "project_file",
         "declarations",
-        "identity_dir"
+        "identity_dir",
+        "legacy_identity_file"
       ]
     },
     "InputPathMode": {
