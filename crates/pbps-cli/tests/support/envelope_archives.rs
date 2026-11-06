@@ -11,9 +11,9 @@ use std::path::PathBuf;
 /// Before the first release a breaking change raises it to its own set
 /// instead of moving the wire version (DEC-1734.1): 89 adds the `repin`
 /// operation's closed `repin` record and phase `side`, which every older set
-/// refuses. 93 renames `doctor`'s required `identity_file` to `identity_dir`
+/// refuses. 95 renames `doctor`'s required `identity_file` to `identity_dir`
 /// (#2600 PR 5a), which every older set refuses in turn.
-const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 93;
+const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 95;
 
 fn wire(document: &serde_json::Value) -> serde_json::Value {
     document["$defs"]["envelope.status"]["properties"]["schema_version"]["const"].clone()

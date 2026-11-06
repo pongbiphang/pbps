@@ -1488,7 +1488,7 @@ the validator over the tree and the declarations and reports its findings,
 including `ids.orphan`; a declaration that has no file yet (`ids.yaml-without-ids`)
 is what `plan` mints, and non-canonical bytes are `ids fmt --check`'s, so those
 two are not `validate`'s. `doctor`'s JSON field `identity_file` is `identity_dir`
-(schema set 93).
+(schema set 95).
 
 The write is `ids_store::plan`, then `TreeWrite::apply`. `plan` decides the whole
 new tree and every refusal before anything is written, and proves the result
