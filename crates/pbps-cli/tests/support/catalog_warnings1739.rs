@@ -35,6 +35,10 @@ fn project(connection: &str, slug: &str) -> Demo {
         connection,
         "CREATE SCHEMA app; CREATE TABLE app.t (id integer NOT NULL PRIMARY KEY)",
     );
+    adopt_project(connection, slug)
+}
+
+fn adopt_project(connection: &str, slug: &str) -> Demo {
     let d = Demo::new(slug);
     std::fs::write(
         d.dir.join("pbps.yml"),
@@ -103,6 +107,86 @@ fn catalog_warnings_follow_plan_and_verify_reports_in_both_formats() {
                 .matches(&format!("warning: {SUPERUSER}"))
                 .count(),
             1
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn partition_diagnostics_are_not_permission_warnings_on_pg16() {
+    partition_diagnostics_are_not_permission_warnings(
+        "16",
+        &std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(),
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn partition_diagnostics_are_not_permission_warnings_on_pg18() {
+    partition_diagnostics_are_not_permission_warnings("18", &server());
+}
+
+fn partition_diagnostics_are_not_permission_warnings(version: &str, server: &str) {
+    let slug = format!("catalog2695-partition-{version}");
+    let own = OwnDatabase::new(server, &slug);
+    let conn = own.connection();
+    on_server(
+        conn,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.p (id integer NOT NULL PRIMARY KEY) PARTITION BY RANGE (id); \
+         CREATE TABLE app.p0 PARTITION OF app.p FOR VALUES FROM (0) TO (10)",
+    );
+    let d = adopt_project(conn, &slug);
+    on_server(
+        conn,
+        "CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (10) TO (20)",
+    );
+    let reason = "app.p1 is a partition of the managed table app.p and is not declared";
+    for (command, exit, result, finding) in [
+        ("plan", 1, "unanswerable", "plan.failed"),
+        ("verify", 2, "findings", "state.drift-unexpressible"),
+    ] {
+        let out = d.run(&[command, "--db", conn, "--format", "json"]);
+        let json = report(&out, exit);
+        assert_eq!(json["result"], result, "{version}: {json}");
+        assert_eq!(
+            json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["id"] == finding && f["message"].as_str().unwrap().contains(reason))
+                .count(),
+            1,
+            "{version}: {json}"
+        );
+        assert_eq!(
+            warnings(&json, "catalog.unexpressible-permission", ""),
+            0,
+            "{version}: {json}"
+        );
+        assert_eq!(warnings(&json, "catalog.warning", SUPERUSER), 1, "{json}");
+        assert!(
+            !stderr(&out).contains("warning:"),
+            "{version}: {}",
+            stderr(&out)
+        );
+
+        let out = d.run(&[command, "--db", conn]);
+        assert_eq!(code(&out), exit, "{}{}", stdout(&out), stderr(&out));
+        let human = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(human.contains(reason), "{version}: {human}");
+        assert!(
+            !stderr(&out)
+                .lines()
+                .any(|line| line.starts_with("warning:") && line.contains(reason)),
+            "{version}: {human}"
+        );
+        assert_eq!(
+            stderr(&out)
+                .matches(&format!("warning: {SUPERUSER}"))
+                .count(),
+            1,
+            "{version}: {human}"
         );
     }
 }
