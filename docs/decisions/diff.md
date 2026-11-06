@@ -9527,6 +9527,6 @@ machinery's, which an exclusion is not on yet), a method that cannot back one
 SQL Server as a whole.
 
 Formats: plan 68 (an older build would drop `exclude` from a table in a
-payload), state 39, published schema set 92 (the declaration schema gains
+payload), state 39, published schema set 94 (the declaration schema gains
 `exclude:`). The ids file and its tree are untouched. A table with no exclusion
 serialises exactly as before.

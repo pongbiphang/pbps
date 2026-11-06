@@ -343,7 +343,7 @@ where
         .as_array_mut()
         .unwrap()
         .retain(|variant| variant["const"] != "gist");
-    // #2448 PR C1 adds a table's `exclude:` (schema set 92); the captured table
+    // #2448 PR C1 adds a table's `exclude:` (schema set 94); the captured table
     // branch predates it.
     for definition in ["ExclusionDto", "ExclusionKeyDto", "InitiallyDto"] {
         declaration_schema["$defs"]
