@@ -81,6 +81,7 @@ mod partition_series;
 pub mod partman;
 pub mod pins;
 mod preflight;
+pub mod pull_coverage;
 pub mod rebuild;
 pub mod roles;
 pub mod rows;
