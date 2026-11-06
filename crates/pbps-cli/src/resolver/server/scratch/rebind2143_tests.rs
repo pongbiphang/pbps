@@ -4,7 +4,7 @@
 
 use super::reconstruct2374::{both, declared, exec, module, table};
 use super::*;
-use pbps_model::ModuleKind;
+use pbps_model::{Change, ModuleKind};
 use std::pin::Pin;
 
 const BODY: &str = "AS SELECT 1 AS id FROM ghost";
@@ -543,6 +543,71 @@ async fn mssql_a_managed_module_an_unmanaged_one_calls_is_not_refused_as_unmanag
                     .limitations
                     .keys()
                     .any(|name| name.raw() == "binding-change:dbo.worker2143"),
+                "{:?}",
+                plan.evidence.qualification().limitations
+            );
+        })
+    }
+    both(case).await;
+}
+
+/// The motivating pair, #2143's own acceptance: a routine arrives in the plan
+/// beside a managed view whose one-part name no routine can take. The
+/// differ's candidate rule alone would rebuild the view for any arrival in its
+/// schema; on the resolver's path only the engine's binding evidence can ask
+/// for a rebuild, and it asks for none, so the view stands, unreported.
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_an_arriving_unrelated_routine_does_not_rebuild_a_managed_view() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            exec(
+                target,
+                &[
+                    "CREATE TABLE dbo.t2143(id int NOT NULL);",
+                    "CREATE VIEW dbo.v2143 AS SELECT id FROM t2143;",
+                ],
+            )
+            .await;
+            let (view_id, view) = module(ModuleKind::View, "dbo.v2143", "SELECT id FROM t2143");
+            let (function_id, function) = module(
+                ModuleKind::Function,
+                "dbo.f2143",
+                "() RETURNS int AS BEGIN RETURN 1 END",
+            );
+            let mut declared = declared(&[(view_id.clone(), view)]);
+            creates(&mut declared, "dbo.t2143");
+            declared.base = declared.desired.clone();
+            declared
+                .desired
+                .modules
+                .insert(function_id.clone(), function);
+            let (plan, _) = declared_plan(target, scratch, &declared, None)
+                .await
+                .unwrap_or_else(|error| panic!("the run should seal a plan: {error}"));
+            let changes = &plan.changes.changes().changes;
+            let touches = |wanted: &pbps_model::ModuleId| {
+                changes.iter().any(|planned| {
+                    matches!(
+                        &planned.change,
+                        Change::CreateModule { id, .. }
+                            | Change::AlterModule { id, .. }
+                            | Change::DropModule { id, .. } if id == wanted
+                    )
+                })
+            };
+            assert!(touches(&function_id), "the routine arrives: {changes:?}");
+            assert!(!touches(&view_id), "the view is not rebuilt: {changes:?}");
+            assert_eq!(changes.len(), 1, "{changes:?}");
+            assert!(
+                plan.evidence
+                    .qualification()
+                    .limitations
+                    .keys()
+                    .all(|name| !name.raw().starts_with("binding-change:")),
                 "{:?}",
                 plan.evidence.qualification().limitations
             );
