@@ -167,10 +167,19 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         let what = format!("index `{name}`", name = name.shown(),);
         found.extend(index_shape(&what, index, table));
     }
-    for (name, x) in &table.exclude {
-        found.extend(exclusion(name, x, table));
-    }
     found
+}
+
+/// The checks of a table's exclusion constraints. Apart from
+/// [`table_structure`]: that one is skipped for a partition, whose columns are
+/// its parent's, but an exclusion declared on a partition is the very thing
+/// `exclusion` refuses, so these run for every declaration.
+pub(crate) fn table_exclusions(table: &Table) -> Vec<DialectError> {
+    table
+        .exclude
+        .iter()
+        .flat_map(|(name, x)| exclusion(name, x, table))
+        .collect()
 }
 
 /// What an index and an exclusion constraint's backing index have in common:
@@ -1147,6 +1156,16 @@ mod tests {
         table
     }
 
+    /// The public entry every declaration takes, a partition's included.
+    fn entry(table: &Table) -> Vec<String> {
+        use pbps_dialect::Dialect;
+        crate::Postgres::new()
+            .validate_table(&"public.t".parse().unwrap(), table)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
     fn structure(table: &Table) -> Vec<String> {
         table_structure(table)
             .into_iter()
@@ -1908,6 +1927,9 @@ mod tests {
     fn exclusion_table(method: IndexMethod, keys: &[(&str, &str)]) -> Table {
         let mut table = gist_table(IndexMethod::Gist, &[("doc", None, None)]);
         table.indexes.clear();
+        // The public entry also reads column types, and this model declares no
+        // `tsquery`; no exclusion case here keys on it.
+        table.columns.shift_remove("q");
         table.exclude.insert(
             "x".into(),
             pbps_model::ExclusionConstraint {
@@ -1951,11 +1973,12 @@ mod tests {
             (Btree, vec![("n", "")]),
         ] {
             assert!(
-                structure(&exclusion_table(method, &keys)).is_empty(),
-                "{method:?} {keys:?}"
+                entry(&exclusion_table(method, &keys)).is_empty(),
+                "{method:?} {keys:?}: {:?}",
+                entry(&exclusion_table(method, &keys))
             );
         }
-        let said = |table: &Table| structure(table).join("\n");
+        let said = |table: &Table| entry(table).join("\n");
         // The index rules apply to its keys: no GiST class for `integer`.
         assert!(
             said(&exclusion_table(Gist, &[("n", "")])).contains("index an expression"),
@@ -1968,7 +1991,7 @@ mod tests {
         // `nope` is read as an expression, as any text that names no column is
         // (the engine then answers for it), so the check here is that it is held.
         assert!(
-            structure(&exclusion_table(Btree, &[("nope", "")])).is_empty(),
+            entry(&exclusion_table(Btree, &[("nope", "")])).is_empty(),
             "{}",
             said(&exclusion_table(Btree, &[("nope", "")]))
         );
@@ -1983,6 +2006,22 @@ mod tests {
             strategy: Default::default(),
         });
         assert!(said(&partitioned).contains("partitioned table or a partition"));
+        // A partition declares no columns of its own, so `table_structure` is
+        // not asked of it; the refusal is still, as the public entry is the
+        // path every declaration takes.
+        let mut partition = exclusion_table(Btree, &[("n", "")]);
+        partition.columns.clear();
+        partition.partition_of = Some(pbps_model::PartitionOf {
+            parent: "public.p".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Default,
+            columns: Default::default(),
+        });
+        assert!(said(&partition).contains("partitioned table or a partition"));
+        let ordinary_partition = Table {
+            partition_of: partition.partition_of.clone(),
+            ..Default::default()
+        };
+        assert!(said(&ordinary_partition).is_empty());
         // A name shared with another constraint of the table is refused.
         let mut shared = exclusion_table(Btree, &[("n", "")]);
         shared.checks.insert(

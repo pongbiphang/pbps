@@ -342,3 +342,50 @@ fn a_retype_of_a_quoted_key_column_in_an_expression_is_refused_by_name() {
         assert_eq!(constraints(connection, "x"), 1);
     });
 }
+
+/// A label removed from an enum rebuilds the type and retypes every column of
+/// it, in a change the enum pass pushes before the table loop runs: the guard
+/// is asked of the whole plan, so it refuses by name where an exclusion holds
+/// that column, and a rebuild of a column no exclusion holds still plans
+/// (DEC-2448.3).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_enum_rebuild_that_retypes_a_held_column_is_refused_by_name() {
+    let _ = server();
+    servers(|url| {
+        for (held, expect_refused) in [("m", true), ("n", false)] {
+            let own = OwnDatabase::new(url, "exclude-enum");
+            let connection = own.connection();
+            on_server(
+                connection,
+                &format!(
+                    "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('a', 'b', 'c'); \
+                     CREATE TABLE app.e (id integer PRIMARY KEY, m app.mood, n integer); \
+                     ALTER TABLE app.e ADD CONSTRAINT x EXCLUDE USING btree ({held} WITH =)"
+                ),
+            );
+            let d = Demo::new("exclude-enum");
+            succeeds(d.run(&["pull", "--db", connection]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+            let path = d.dir.join("schema/app.mood.type.yml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let without = text.replace("a, b, c", "a, c");
+            assert_ne!(text, without, "{text}");
+            std::fs::write(&path, without).unwrap();
+            d.commit();
+            let out = d.run(&["plan", "--db", connection]);
+            let said = said(&out);
+            if expect_refused {
+                assert_ne!(code(&out), 0, "{held}: {said}");
+                assert!(said.contains("while the constraint holds it"), "{said}");
+            } else {
+                assert!(
+                    !said.contains("while the constraint holds it"),
+                    "control {held}: {said}"
+                );
+            }
+            assert_eq!(constraints(connection, "x"), 1);
+        }
+    });
+}

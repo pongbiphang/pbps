@@ -1252,6 +1252,7 @@ pub(crate) fn diff_partial_rebuilding(
     // Table present on both sides: possibly renamed, and its contents must be
     // compared.
     let renames = renames_of(base, declared);
+    let mut standing: BTreeMap<TableName, Table> = BTreeMap::new();
     for (name, table) in &declared.schema.tables {
         if table.unlogged {
             continue;
@@ -1554,7 +1555,6 @@ pub(crate) fn diff_partial_rebuilding(
             continue;
         }
 
-        let mark = changes.len();
         diff_columns(
             &index,
             &types,
@@ -1567,13 +1567,14 @@ pub(crate) fn diff_partial_rebuilding(
             &mut changes,
             &mut errs,
         );
-        exclusion_hazards(
-            declared_name,
-            &renames.apply(base_table, base_name),
-            &changes[mark..],
-            dialect,
-            &mut errs,
-        );
+        // Asked of the whole change list below, not of this loop's own: an enum
+        // or domain rebuild retypes a column before this loop runs.
+        if !base_table.exclude.is_empty() {
+            standing.insert(
+                declared_name.clone(),
+                renames.apply(base_table, base_name).into_owned(),
+            );
+        }
         diff_constraints(
             declared_name,
             &renames.apply(base_table, base_name),
@@ -1873,6 +1874,17 @@ pub(crate) fn diff_partial_rebuilding(
     // exactly as a plan would be.
     // After every pass that rebuilds an index: its `CREATE` carries the
     // declared parameters (#1483 review).
+    // Every change is in: whichever pass produced a retype or a drop of a held
+    // column is seen, not only the table loop's.
+    for (table, held) in &standing {
+        exclusion_hazards(
+            table,
+            held,
+            changes.iter().filter(|c| c.table() == Some(table)),
+            dialect,
+            &mut errs,
+        );
+    }
     crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
@@ -6627,10 +6639,10 @@ fn diff_exclusions(name: &TableName, base: &Table, declared: &Table, errs: &mut 
 /// expression, or a predicate, names its columns in text this model does not
 /// parse, so a column its text mentions counts as one it holds.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn exclusion_hazards(
+fn exclusion_hazards<'a>(
     name: &TableName,
     base: &Table,
-    changes: &[Change],
+    changes: impl IntoIterator<Item = &'a Change>,
     dialect: &(impl Dialect + ?Sized),
     errs: &mut Vec<DiffError>,
 ) {
@@ -10814,6 +10826,87 @@ mod tests {
             errs.iter()
                 .any(|e| e.to_string().contains("adding one arrives")),
             "{errs:?}"
+        );
+    }
+
+    /// A retype an enum or a domain rebuild pushes before the table loop runs is
+    /// seen by the hazard check as much as the loop's own: the check is asked of
+    /// the whole change list, so no pass can hide one (DEC-2448.3).
+    #[test]
+    fn a_rebuild_that_retypes_a_held_column_is_refused_and_one_that_does_not_still_plans() {
+        let refused = |base: &Schema, declared: &Schema| -> Vec<String> {
+            match alter_domain(base, declared, &[]) {
+                Ok(_) => Vec::new(),
+                Err(errors) => errors.iter().map(ToString::to_string).collect(),
+            }
+        };
+        let hold = |mut world: Schema, key: &str| {
+            let t: TableName = "app.t".parse().unwrap();
+            world
+                .tables
+                .get_mut(&t)
+                .unwrap()
+                .exclude
+                .insert("x".into(), exclusion(key, "&&"));
+            world
+        };
+        // Domain: a collation change is the rebuild, which retypes `v`.
+        let mut collated = code(false, None, &[], "text");
+        if let pbps_model::ManagedType::Domain { collation, .. } = &mut collated {
+            *collation = Some("pg_catalog.\"C\"".parse().unwrap());
+        }
+        let before = domain_world(code(false, None, &[], "text"), false, false);
+        let after = domain_world(collated, false, false);
+        let said = refused(
+            &hold(before.clone(), "int4range(v::int, 1)"),
+            &hold(after.clone(), "int4range(v::int, 1)"),
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`v`") && m.contains("while the constraint holds it")),
+            "{said:?}"
+        );
+        // Negative: the same rebuild beside an exclusion that holds `id` only.
+        let said = refused(
+            &hold(before.clone(), "int4range(id, 1)"),
+            &hold(after.clone(), "int4range(id, 1)"),
+        );
+        assert!(said.is_empty(), "{said:?}");
+        // Negative: a rebuild with no exclusion at all.
+        assert!(refused(&before, &after).is_empty());
+        // Enum: removing a label rebuilds the type and retypes `m`.
+        let moods = |labels: &[&str], key: &str| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("m", Column::new(ty("app.mood"))),
+            ]);
+            t.exclude.insert("x".into(), exclusion(key, "&&"));
+            let mut s = schema_of("app.t", t);
+            s.types.insert(
+                "app.mood".parse().unwrap(),
+                pbps_model::ManagedType::Enum {
+                    values: labels.iter().map(|v| (*v).into()).collect(),
+                },
+            );
+            s
+        };
+        let said = refused(
+            &moods(&["a", "b", "c"], "int4range(m::int, 1)"),
+            &moods(&["a", "c"], "int4range(m::int, 1)"),
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`m`") && m.contains("while the constraint holds it")),
+            "{said:?}"
+        );
+        let said = refused(
+            &moods(&["a", "b", "c"], "int4range(id, 1)"),
+            &moods(&["a", "c"], "int4range(id, 1)"),
+        );
+        assert!(
+            said.iter()
+                .all(|m| !m.contains("while the constraint holds it")),
+            "{said:?}"
         );
     }
 

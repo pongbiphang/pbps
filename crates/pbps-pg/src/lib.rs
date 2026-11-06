@@ -2017,6 +2017,7 @@ impl Dialect for Postgres {
         if table.partition_of.is_none() {
             found.extend(validate::table_structure(table));
         }
+        found.extend(validate::table_exclusions(table));
         // An exclusion constraint's expression or predicate that may call a
         // function this project declares is refused for now: the plan's
         // ordering of such a constraint against the function it calls is the
