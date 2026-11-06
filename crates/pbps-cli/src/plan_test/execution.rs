@@ -149,12 +149,16 @@ impl Control {
         phase: &mut Phase,
     ) -> anyhow::Result<i64> {
         let started = Instant::now();
+        // Outside the bounded future, as in `apply`: a drop on timeout or
+        // cancellation skips the service's own drain (#2694).
+        let progress = test_run::Progress::default();
         let result = self
             .bounded(
                 ms(self.timeouts.step_ms),
-                test_run::boxed_future(|| test_run::bootstrap(session, input, phase)),
+                test_run::boxed_future(|| test_run::bootstrap(session, input, phase, &progress)),
             )
             .await;
+        test_run::collect_findings(phase, &progress);
         phase.record(started, "test.plan", &result);
         result
     }
@@ -165,12 +169,19 @@ impl Control {
         phase: &mut Phase,
     ) -> anyhow::Result<Box<test_run::Planned>> {
         let started = Instant::now();
+        // The snapshot and the live collector both outlive a dropped future (#2694).
+        let progress = test_run::Progress::default();
+        let mut carried = Vec::new();
         let result = self
             .bounded(
                 ms(self.timeouts.step_ms),
-                test_run::boxed_future(|| test_run::plan(session, input, phase)),
+                test_run::boxed_future(|| {
+                    test_run::plan(session, input, phase, &mut carried, &progress)
+                }),
             )
             .await;
+        phase.findings.append(&mut carried);
+        test_run::collect_findings(phase, &progress);
         phase.record(started, "test.plan", &result);
         result
     }

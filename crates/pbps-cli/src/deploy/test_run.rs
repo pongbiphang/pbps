@@ -19,14 +19,16 @@ fn declarations(input: &Assembled) -> Declarations {
         ids: input.ids.clone(),
     }
 }
+/// `progress` is the caller's: a cancelled or expired phase drops this future, and
+/// a collector owned here would take its catalog findings along (#2694).
 pub(crate) async fn bootstrap(
     session: &Session<'_>,
     input: &Assembled,
     phase: &mut Phase,
+    progress: &Progress,
 ) -> anyhow::Result<i64> {
     session.prepare(&input.loaded.schema).await?;
     let project = session.project(input);
-    let catalog = std::cell::RefCell::new(Vec::new());
     let built = super::bootstrap_async(
         &project,
         Some(session.target()),
@@ -34,10 +36,11 @@ pub(crate) async fn bootstrap(
         declarations(input),
         crate::dialect(&project)?,
         "pbps-test",
-        super::CatalogWarnings::Findings(&catalog),
+        super::CatalogWarnings::for_progress(Some(progress)),
     )
     .await;
-    phase.findings.extend(catalog.into_inner());
+    // Before the cleanup finding below; the caller drains again after a drop.
+    collect_findings(phase, progress);
     let built = built?.ok_or_else(|| anyhow::anyhow!("connected bootstrap produced no result"))?;
     finish_attempt(
         phase,
@@ -62,20 +65,23 @@ pub(crate) fn plan<'a>(
     session: &'a Session<'_>,
     input: &'a Assembled,
     phase: &'a mut Phase,
+    carried: &'a mut Vec<crate::output::Finding>,
+    progress: &'a Progress,
 ) -> HopFuture<'a, Box<Planned>> {
-    Box::pin(plan_hop(session, input, phase))
+    Box::pin(plan_hop(session, input, phase, carried, progress))
 }
 
 async fn plan_hop(
     session: &Session<'_>,
     input: &Assembled,
     phase: &mut Phase,
+    carried: &mut Vec<crate::output::Finding>,
+    progress: &Progress,
 ) -> anyhow::Result<Box<Planned>> {
     session.prepare(&input.loaded.schema).await?;
     session.revoke_fixture_routines().await?;
     let project = session.project(input);
     let selected = project.config.select_resolver(None, Some("test"))?;
-    let mut carried = Vec::new();
     // Boxed for the same reason: its future is large and this frame is on the
     // test stack (#2661).
     let result = Box::pin(super::plan_db_async(
@@ -88,11 +94,13 @@ async fn plan_hop(
         true,
         selected,
         false,
-        &mut carried,
-        true,
+        carried,
+        Some(progress),
     ))
     .await;
-    phase.findings.extend(carried);
+    // Taken, not moved: the caller drains the same two after a dropped future.
+    phase.findings.append(carried);
+    collect_findings(phase, progress);
     match result? {
         PlanResult::Refused(report) => {
             phase.findings.extend(report.findings);
@@ -160,6 +168,11 @@ async fn apply_hop(
 pub(crate) fn collect_progress(phase: &mut Phase, progress: &Progress) {
     phase.accepted = progress.accepted.get();
     phase.started = progress.started.get();
+    collect_findings(phase, progress);
+}
+
+/// The findings alone, for a phase with no accepted/started facts to report.
+pub(crate) fn collect_findings(phase: &mut Phase, progress: &Progress) {
     phase.findings.extend(progress.findings.take());
 }
 
@@ -183,6 +196,33 @@ fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {
         return result.and(Err(error.into()));
     }
     result
+}
+
+/// The hops as a caller that never drops them sees them: nothing outlives the
+/// future, so the collectors can be its own. The service tests drive these.
+// Gated like its callers: on another platform it would be dead code.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod whole {
+    use super::{Assembled, HopFuture, Phase, Planned, Progress, Session};
+
+    pub(crate) async fn bootstrap(
+        session: &Session<'_>,
+        input: &Assembled,
+        phase: &mut Phase,
+    ) -> anyhow::Result<i64> {
+        super::bootstrap(session, input, phase, &Progress::default()).await
+    }
+
+    pub(crate) fn plan<'a>(
+        session: &'a Session<'_>,
+        input: &'a Assembled,
+        phase: &'a mut Phase,
+    ) -> HopFuture<'a, Box<Planned>> {
+        Box::pin(async move {
+            let mut carried = Vec::new();
+            super::plan(session, input, phase, &mut carried, &Progress::default()).await
+        })
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
