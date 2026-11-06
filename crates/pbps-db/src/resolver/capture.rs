@@ -124,6 +124,13 @@ pub enum CaptureError {
     Incomplete,
     #[error("catalog changed while canonical definitions were rendered")]
     Changed,
+    /// The catalog changed under every re-read the capture was allowed
+    /// (#2715): another session keeps changing roles or objects on the server.
+    #[error(
+        "the catalog kept changing across {attempts} reads over {seconds} s; another session \
+         is changing roles or objects on this server; retry when it is quiet"
+    )]
+    Unsettled { attempts: u32, seconds: u64 },
     #[error("session inputs changed during target capture")]
     EnvironmentChanged,
     #[error("target capture could not close its read transaction")]
