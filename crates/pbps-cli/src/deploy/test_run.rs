@@ -200,7 +200,8 @@ fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {
 
 /// The hops as a caller that never drops them sees them: nothing outlives the
 /// future, so the collectors can be its own. The service tests drive these.
-#[cfg(test)]
+// Gated like its callers: on another platform it would be dead code.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod whole {
     use super::{Assembled, HopFuture, Phase, Planned, Progress, Session};
 
