@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
+use crate::escape::Escaped;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{Conversion, IdsError, IdsFile, Move, Tombstone};
@@ -39,33 +40,37 @@ pub const GENERATED: &str = "This file is written by pbps and records the identi
 /// acted on without opening anything.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TreeError {
-    #[error("{path} still has merge conflict markers")]
+    // Every path and every piece of text a serde error repeats is the file's own
+    // spelling, so it is shown escaped: a line break in a file name or an
+    // unknown field must not start a line of the refusal (DEC-2032.1).
+    #[error("{} still has merge conflict markers", Escaped(.path))]
     ConflictMarkers { path: String },
-    #[error("{path} is not a valid identity file: {message}")]
+    #[error("{} is not a valid identity file: {}", Escaped(.path), Escaped(.message))]
     Malformed { path: String, message: String },
-    #[error("{path} names `{key}` twice")]
+    #[error("{} names `{}` twice", Escaped(.path), Escaped(.key))]
     DuplicateKey { path: String, key: String },
-    #[error("{path} is layout format {found}, but this tool reads {FORMAT}")]
+    #[error("{} is layout format {found}, but this tool reads {FORMAT}", Escaped(.path))]
     Format { path: String, found: u32 },
-    #[error("{path}: the prefix of {uid} does not match where it appears")]
+    #[error("{}: the prefix of {uid} does not match where it appears", Escaped(.path))]
     KindMismatch { path: String, uid: Uid },
-    #[error("{path}: section `{section}` has no `_end` entry")]
+    #[error("{}: section `{section}` has no `_end` entry", Escaped(.path))]
     SentinelMissing { path: String, section: &'static str },
-    #[error("{path}: `_end` is not the last entry of section `{section}`")]
+    #[error("{}: `_end` is not the last entry of section `{section}`", Escaped(.path))]
     SentinelNotLast { path: String, section: &'static str },
-    #[error("{path} is marked dropped but holds live entries or intent")]
+    #[error("{} is marked dropped but holds live entries or intent", Escaped(.path))]
     DroppedWithLive { path: String },
-    #[error("{uid} appears in {a} and {b}")]
+    #[error("{uid} appears in {} and {}", Escaped(.a), Escaped(.b))]
     DuplicateUid { uid: Uid, a: String, b: String },
-    #[error("{path}: the `{section}` entry {uid} does not belong to this file")]
+    #[error("{}: the `{section}` entry {uid} does not belong to this file", Escaped(.path))]
     Misplaced {
         path: String,
         section: &'static str,
         uid: Uid,
     },
     #[error(
-        "{path}: `{}` is not a name the identity mapping can read back: {why}",
-        crate::escape::Escaped(.name)
+        "{}: `{}` is not a name the identity mapping can read back: {why}",
+        Escaped(.path),
+        Escaped(.name)
     )]
     BadName {
         path: String,
@@ -78,7 +83,7 @@ pub enum TreeError {
     NoPath { uid: Uid },
     #[error("the placement names a file for {uid}, which the mapping does not hold")]
     UnknownPath { uid: Uid },
-    #[error("{a} and {b} would both be written to {path}")]
+    #[error("{} and {} would both be written to {}", Escaped(.a.as_str()), Escaped(.b.as_str()), Escaped(.path))]
     PathCollision { path: String, a: Uid, b: Uid },
     #[error("the tombstone {uid} has no table to live in; name its owner in the placement")]
     UnownedTombstone { uid: Uid },

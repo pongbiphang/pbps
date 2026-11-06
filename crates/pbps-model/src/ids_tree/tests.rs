@@ -888,3 +888,23 @@ fn a_dropped_object_may_remember_a_name_nothing_parses() {
     p.owners.insert(uid("c_aaaaa3"), uid("t_aaaaaa"));
     assert_eq!(assemble(&split(&ids, &p).unwrap()).unwrap(), ids);
 }
+
+/// A file's own spelling reaches the refusal through serde's text and through
+/// its path; neither may start a line of it or rewrite what came before
+/// (DEC-2032.1).
+#[test]
+fn a_refusal_shows_the_file_s_own_text_escaped() {
+    let hostile = "x\n\u{1b}[31mred";
+    let text = format!(
+        "{{\"_generated\": \"g\", \"format\": 1, \"uid\": \"t_aaaaaa\", \"table\": \"dbo.t\", \"{hostile}\": 1}}"
+    )
+    .replace('\n', "\\n")
+    .replace('\u{1b}', "\\u001b");
+    let path = "dir\n/a\u{1b}[0m.json";
+    let message = parse(path, &text).unwrap_err().to_string();
+    assert!(!message.chars().any(char::is_control), "{message:?}");
+    assert!(
+        message.contains("\\n") && message.contains("\\u{1b}"),
+        "{message}"
+    );
+}
