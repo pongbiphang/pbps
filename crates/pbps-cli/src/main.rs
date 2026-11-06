@@ -5174,7 +5174,13 @@ fn cmd_plan(
         // (DEC-2331.1).
         let mut res = res;
         pbps_diff::conversion::prune(&mut res.ids, &loaded.schema, dialect.as_ref());
-        if res.ids != ids && check {
+        // Stale is the tree not being what the mapping and the declarations say
+        // (design §3.5): a changed mapping, but also a declaration that moved or
+        // bytes that are not canonical when the mapping is unchanged. A plan that
+        // cannot be made is stale too, and `plan` reports why.
+        let stale =
+            res.ids != ids || ids_store::is_stale(project, &res.ids, &loaded).unwrap_or(true);
+        if stale && check {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_dir().display()
@@ -5198,7 +5204,7 @@ fn cmd_plan(
         // file: minting a uid and then refusing left `pbps.ids.json` changed for a
         // plan that does not exist, so the next run compared against identities no
         // reviewed plan ever used (DECISIONS 154).
-        let ids_to_write = (res.ids != ids).then(|| res.ids.clone());
+        let ids_to_write = stale.then(|| res.ids.clone());
 
         // plan never rewrites the user's YAML (SPEC §6.2), so without this line
         // nothing tells the author that the annotations they just had absorbed are now

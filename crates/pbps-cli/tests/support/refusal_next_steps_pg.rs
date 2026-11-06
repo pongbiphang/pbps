@@ -8,11 +8,6 @@ const LOCK_GUIDANCE: &str = "write-blocking lock while it builds";
 
 #[test]
 fn partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_code() {
-    if crate::idtree::pending_5b(
-        "partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_code",
-    ) {
-        return;
-    }
     let d = Demo::new("refusal2333-partition");
     let base = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\n\
                 partition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";

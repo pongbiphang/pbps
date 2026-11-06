@@ -11,14 +11,19 @@
 //! would leave two sources of truth, and writing the tree beside it would split
 //! the history in two. A tree beside the legacy file is an unfinished migration.
 //!
-//! **The write is the minimal sync.** [`plan`] decides the whole new tree, every
-//! refusal included, before [`TreeWrite::apply`] writes the first byte, and it
-//! proves the result reads back to the very mapping it was made from. It places
-//! an identity in the file it already has, or at the path its declaration
-//! mirrors if it has none, and it writes nothing else. What needs a decision
-//! about *moving* files (design §3.4 steps 2, 5 and 6) is refused by name; that
-//! is #2600 PR 5b, which extends [`plan`] rather than replacing it. The refused
-//! cases are listed in [`Unfinished`].
+//! **The write is the sync of design §3.4.** [`plan`] decides the whole new
+//! tree, every refusal included, before [`TreeWrite::apply`] writes the first
+//! byte, and it proves the result reads back to the very mapping it was made
+//! from. An identity keeps its file unless its declaration moved: then the file
+//! is written at the path the declaration mirrors and the old one removed
+//! (step 2). A dropped object keeps its file (step 4), and one a live
+//! declaration now wants the path of is sent aside to `<name>.<uid>.json`
+//! (step 5). A table that becomes, stops being, or changes parent as a
+//! partition has its record moved between files (step 6). An identity the
+//! mapping no longer has (a withdrawn rebuild takes its replacement's away) has
+//! its file removed: the mapping is the resolver's to decide, and the proof
+//! below that the tree reads back to it is what keeps the store honest. What is
+//! still refused is a live declaration with no place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -141,47 +146,9 @@ pub(crate) fn refuse_output_inside(project: &Project, destination: &Path) -> any
 
 // ----------------------------------------------------------------- write ----
 
-/// What the write side does not do yet. Each is refused by name, before
-/// anything is written, with the same closing sentence; #2600 PR 5b turns each
-/// into a step of the sync (design §3.4) and removes it from here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unfinished {
-    /// A declaration moved or was renamed to another file (§3.4 step 2).
-    Relocation,
-    /// A new declaration's path is held by another identity's file
-    /// (§3.4 step 5, the dropped file renamed aside).
-    PathDisplacement,
-    /// A table became, or stopped being, a partition child of another table's
-    /// file (§3.4 step 6).
-    PartitionMove,
-    /// An identity file the new mapping no longer holds, or a drop of an
-    /// identity that has no file to mark (§3.4 step 4 for an object the tree
-    /// never held).
-    Removal,
-    /// A declaration with an identity and no path to put its file at.
-    NoPlace,
-}
-
-impl Unfinished {
-    fn case(self) -> &'static str {
-        match self {
-            Self::Relocation => "moving an identity file",
-            Self::PathDisplacement => {
-                "placing a new declaration over a path another identity holds"
-            }
-            Self::PartitionMove => "attaching or detaching a partition",
-            Self::Removal => "removing an identity file",
-            Self::NoPlace => "placing an identity that has no declaration",
-        }
-    }
-}
-
-fn unfinished(case: Unfinished, detail: String) -> anyhow::Error {
-    anyhow::anyhow!(
-        "cannot write the identity tree: {} is not supported yet ({detail}). The switch to the \
-         identity tree is unfinished (#2600 PR 5b); nothing was written",
-        case.case()
-    )
+/// A write that cannot be made, decided before anything is written.
+fn refused(detail: String) -> anyhow::Error {
+    anyhow::anyhow!("cannot write the identity tree: {detail}; nothing was written")
 }
 
 /// What one write changes, decided and checked, not yet written.
@@ -191,15 +158,27 @@ pub(crate) struct TreeWrite {
     /// Files whose bytes change or that do not exist yet, by path relative to
     /// `dir`.
     files: BTreeMap<String, String>,
+    /// Files that stop existing: the old path of an identity file that moved,
+    /// and the own file of a table that became a partition.
+    removals: Vec<String>,
     /// `pbps.yml` with `ids_dir` named, when this write creates the tree.
     config: Option<(PathBuf, String)>,
 }
 
 impl TreeWrite {
+    /// Nothing to write, move or remove: the tree is what the mapping and the
+    /// declarations say it should be.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.removals.is_empty() && self.config.is_none()
+    }
+
     /// Writes every file next to its final name first, and only then renames
     /// them into place, so a failure while writing leaves the tree as it was.
-    /// `pbps.yml` goes last: it is what tells an old pbps not to read the
-    /// project as having no identities.
+    /// What moved is removed after the new files are in place: a crash in
+    /// between leaves both, never neither, and the next read names the
+    /// duplicate (`ids.duplicate-uid`, remedy: delete the old file). `pbps.yml`
+    /// goes last: it is what tells an old pbps not to read the project as
+    /// having no identities.
     pub(crate) fn apply(&self) -> anyhow::Result<()> {
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
         let result = (|| -> anyhow::Result<()> {
@@ -225,6 +204,20 @@ impl TreeWrite {
         for (tmp, path) in &staged {
             std::fs::rename(tmp, path)
                 .with_context(|| format!("cannot replace `{}`", path.display()))?;
+        }
+        for rel in &self.removals {
+            let path = self.dir.join(rel);
+            std::fs::remove_file(&path)
+                .with_context(|| format!("cannot remove `{}`", path.display()))?;
+            // A directory a move emptied goes too; one that still holds
+            // something stays.
+            let mut parent = path.parent();
+            while let Some(dir) = parent.filter(|d| *d != self.dir && d.starts_with(&self.dir)) {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                parent = dir.parent();
+            }
         }
         if let Some((path, text)) = &self.config {
             write_atomic(path, text)?;
@@ -326,93 +319,78 @@ pub(crate) fn plan(
         }))
         .cloned()
         .collect();
-    if let Some((path, _)) = existing
-        .files
-        .iter()
-        .find(|(u, _)| !objects.contains(*u))
-        .map(|(_, v)| v)
-    {
-        return Err(unfinished(
-            Unfinished::Removal,
-            format!(
-                "`{}` holds an identity the new mapping no longer has",
-                shown(&dirs, path)
-            ),
-        ));
-    }
-
-    let mut placement = Placement::default();
+    // Where each object goes (design §3.4). A child lives in its parent's file
+    // and has none of its own; everything else owns the file its declaration
+    // mirrors, or the one it already has, and a dropped object keeps its.
+    let mut children: BTreeMap<Uid, Uid> = BTreeMap::new();
+    let mut want: BTreeMap<Uid, String> = BTreeMap::new();
     for uid in &objects {
         let live = !after.tombstones.contains_key(uid);
-        let old = existing.files.get(uid).map(|(p, f)| (p, f));
-        let is_table = uid.kind() == UidKind::Table;
-        // A table's place among partitions (§3.4 step 6): a child lives in its
-        // parent's file and has none of its own.
-        if is_table {
-            let was_child = existing.child_home.get(uid);
-            let wants = wanted.children.get(uid).filter(|_| live);
-            let refuse = |what: String| unfinished(Unfinished::PartitionMove, what);
-            if old.is_some() && wants.is_some() {
-                return Err(refuse(format!("{} becomes a partition", name_of(uid))));
-            }
-            if live && was_child.is_some() && wants.is_none() {
-                return Err(refuse(format!("{} stops being a partition", name_of(uid))));
-            }
-            if let (Some(was), Some(now)) = (was_child, wants)
-                && was != now
-            {
-                return Err(refuse(format!("{} changes parent table", name_of(uid))));
-            }
-            if let Some(parent) = wants.or(was_child) {
-                placement.children.insert(uid.clone(), parent.clone());
+        let old = existing.files.get(uid).map(|(p, _)| p);
+        if uid.kind() == UidKind::Table {
+            // Step 6: a table that becomes, stops being, or changes parent as a
+            // partition. A dropped child stays recorded where it was.
+            // A table with no declaration of its own, live or dropped, stays
+            // where the tree has it, as a primary identity keeps its file.
+            let parent = if live {
+                wanted.children.get(uid).or_else(|| {
+                    (!wanted.paths.contains_key(uid))
+                        .then(|| existing.child_home.get(uid))
+                        .flatten()
+                })
+            } else {
+                existing.child_home.get(uid)
+            };
+            if let Some(parent) = parent {
+                children.insert(uid.clone(), parent.clone());
                 continue;
             }
         }
-        let new_path = wanted.paths.get(uid);
-        let path = match (old, new_path) {
-            (Some((p, _)), Some(n)) if live && p != n => {
-                return Err(unfinished(
-                    Unfinished::Relocation,
-                    format!(
-                        "{} is recorded in `{}` but its declaration now mirrors `{}`",
-                        name_of(uid),
-                        shown(&dirs, p),
-                        shown(&dirs, n)
-                    ),
-                ));
+        let path = match (live, wanted.paths.get(uid).or(old)) {
+            (true, Some(path)) => path.clone(),
+            (true, None) => {
+                return Err(refused(format!(
+                    "{} has no declaration to mirror and no file of its own",
+                    name_of(uid)
+                )));
             }
-            (Some((p, _)), _) => p.clone(),
-            (None, Some(n)) if live => {
-                if tree.contains_key(n) {
-                    return Err(unfinished(
-                        Unfinished::PathDisplacement,
-                        format!(
-                            "{} is declared where `{}` already holds another identity",
-                            name_of(uid),
-                            shown(&dirs, n)
-                        ),
-                    ));
-                }
-                n.clone()
-            }
-            (None, _) if live => {
-                return Err(unfinished(
-                    Unfinished::NoPlace,
-                    format!("{} has no declaration to mirror", name_of(uid)),
-                ));
-            }
-            (None, _) => {
-                return Err(unfinished(
-                    Unfinished::Removal,
-                    format!(
-                        "{} is dropped but the tree holds no file for it",
-                        name_of(uid)
-                    ),
-                ));
-            }
+            // Step 4: a drop keeps the file it has. One the tree never held gets
+            // the aside name, as `migrate` gives a dropped object with no YAML.
+            (false, _) => old.cloned().unwrap_or_else(|| aside_of(after, uid)),
         };
-        placement.paths.insert(uid.clone(), path);
+        want.insert(uid.clone(), path);
     }
+    // Step 5: a path wanted by a live object and held by a dropped one sends the
+    // dropped file aside (`<name>.<uid>.json`); the live object takes the path.
+    // Two live objects for one path would be two declarations for one file,
+    // which the loader already refuses.
+    let mut holders: BTreeMap<String, Vec<Uid>> = BTreeMap::new();
+    for (uid, path) in &want {
+        holders.entry(path.clone()).or_default().push(uid.clone());
+    }
+    for (path, uids) in holders.into_iter().filter(|(_, u)| u.len() > 1) {
+        let (dead, live): (Vec<_>, Vec<_>) = uids
+            .into_iter()
+            .partition(|u| after.tombstones.contains_key(u));
+        if live.len() > 1 {
+            return Err(refused(format!(
+                "{} and {} are both declared at `{}`",
+                name_of(&live[0]),
+                name_of(&live[1]),
+                shown(&dirs, &path)
+            )));
+        }
+        // At most one dropped file kept this path, but a dropped object with no
+        // file of its own may have been assigned it too; all go aside.
+        for uid in dead {
+            want.insert(uid.clone(), aside_of(after, &uid));
+        }
+    }
+    let mut placement = Placement {
+        paths: want,
+        children,
+        ..Placement::default()
+    };
     // A column tombstone belongs to the file that held its record, even when
     // the table has been renamed since.
     for uid in after.tombstones.keys() {
@@ -446,6 +424,11 @@ pub(crate) fn plan(
     }
 
     let new = ids_tree::split(after, &placement).context("cannot place the identities in files")?;
+    let removals: Vec<String> = tree
+        .keys()
+        .filter(|rel| !new.contains_key(*rel))
+        .cloned()
+        .collect();
     let files: BTreeMap<String, String> = new
         .into_iter()
         .filter(|(rel, text)| tree.get(rel) != Some(text))
@@ -454,6 +437,9 @@ pub(crate) fn plan(
     // for. A tree that does not is never written.
     let mut merged = tree.clone();
     merged.extend(files.clone());
+    for rel in &removals {
+        merged.remove(rel);
+    }
     let back = ids_tree::assemble(&merged).context("the new tree does not read back")?;
     if &back != after {
         bail!("the new tree reads back to a different mapping; nothing was written");
@@ -468,8 +454,31 @@ pub(crate) fn plan(
     Ok(TreeWrite {
         dir: project.ids_dir(),
         files,
+        removals,
         config,
     })
+}
+
+/// The file a dropped object gets when no declaration names its place.
+fn aside_of(after: &IdsFile, uid: &Uid) -> String {
+    let was = after
+        .tombstones
+        .get(uid)
+        .map_or_else(|| uid.to_string(), |t| t.was.clone());
+    crate::ids_cmd::aside(&was, uid)
+}
+
+/// Whether the tree on disk is not what `after` and the declarations in
+/// `loaded` say it should be: a file to write, move or remove (design §3.5).
+/// This is `plan --check`'s "stale", and it also sees a declaration that moved
+/// or bytes that are not canonical when the mapping itself is unchanged.
+pub(crate) fn is_stale(
+    project: &Project,
+    after: &IdsFile,
+    loaded: &pbps_load::Loaded,
+) -> anyhow::Result<bool> {
+    let paths = loaded.declared_paths(&project.schema_dir())?;
+    Ok(!plan(project, after, &paths)?.is_empty())
 }
 
 /// The live columns of the table that owns `file`, in YAML order when its
