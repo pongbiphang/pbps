@@ -873,6 +873,8 @@ pub(crate) fn diff_partial_rebuilding(
     let (mut label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
     let comparison = crate::retained::comparison(base, declared, hints, &mut label_changes);
+    let comparison =
+        crate::extensions::forward_moved_types(comparison, base, declared, &hints.extension_moves);
     let base = Side {
         schema: &comparison,
         ids: base.ids,
@@ -2640,6 +2642,19 @@ pub(crate) fn diff_partial_rebuilding(
         if matches!(c, Change::DropComputedColumn { .. }) {
             return (2, 4);
         }
+        // A package's own objects are what a column, a domain or a module of
+        // the plan may use (DEC-2447.12), and its create, update and move share
+        // the type class with them, so they go first inside it: nothing else
+        // there is ordered against them, and a tie would be decided by a random
+        // uid.
+        if matches!(
+            c,
+            Change::CreateExtension { .. }
+                | Change::UpdateExtension { .. }
+                | Change::SetExtensionSchema { .. }
+        ) {
+            return (order_key(c), 0);
+        }
         if matches!(c, Change::AddComputedColumn { .. }) {
             return (COLUMN_ALTERATIONS, 3);
         }
@@ -2692,6 +2707,40 @@ pub(crate) fn diff_partial_rebuilding(
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
     let extension_rank = crate::extensions::depths(planned.iter().map(|p| &p.change));
+    // A domain this plan creates may be built on a type a package of this plan
+    // provides, created or moved here (the effects say so: its base needs the
+    // package's change). The draft is what orders two changes of one class, and
+    // the effects only check it, so the creation ranks behind the last package
+    // change instead of tying with it, where the subject decided (#2696 ready
+    // round, DEC-2447.12).
+    let builds_a_domain = |c: &Change| {
+        if let Change::CreateType { definition, .. } = c {
+            return matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. });
+        }
+        if let Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Create { definition, .. },
+            ..
+        } = c
+        {
+            return matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. });
+        }
+        false
+    };
+    let package_floor: isize = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateExtension { uid, .. } | Change::UpdateExtension { uid, .. } =
+                &p.change
+            {
+                Some(extension_rank.get(uid).copied().unwrap_or(0) + 1)
+            } else if let Change::SetExtensionSchema { uid, .. } = &p.change {
+                Some(extension_rank.get(uid).copied().unwrap_or(0) + 2)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
     crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
@@ -2722,7 +2771,11 @@ pub(crate) fn diff_partial_rebuilding(
                     &role_rank,
                     &type_rank,
                     &drop_type_rank,
-                )
+                ) + if builds_a_domain(&p.change) {
+                    package_floor
+                } else {
+                    0
+                }
             },
             rebuild_subject(&p.change),
             // Columns added to one table in the order they are declared:
@@ -9634,6 +9687,292 @@ mod tests {
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
         }
+    }
+
+    /// `MinimalDialect` under PostgreSQL's name, for the shapes only that
+    /// dialect plans: a package's lifecycle (DEC-2447.12).
+    struct Postgres;
+
+    impl Dialect for Postgres {
+        fn name(&self) -> &'static str {
+            "postgres"
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// A package's create, update and move come before a table of the plan in
+    /// their shared class, whatever the identities the run happened to mint: a
+    /// column of a type the package provides needs it first, and a tie left to
+    /// a random uid would put the table ahead of it half the time
+    /// (DEC-2447.12).
+    #[test]
+    fn a_packages_create_comes_before_a_table_of_the_same_class_every_time() {
+        let mut declared = schema_of("app.mail", table(&[("who", Column::new(ty("ext.citext")))]));
+        declared.extensions.insert(
+            "citext".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        );
+        for _ in 0..40 {
+            let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+            let position = |wanted: fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            let package = position(|c| matches!(c, Change::CreateExtension { .. }));
+            let table = position(|c| matches!(c, Change::CreateTable { .. }));
+            assert!(package < table, "{:#?}", plan.changes);
+        }
+    }
+
+    /// A reference to a type a package provides waits for the plan's create or
+    /// move of that package, through the same requirement a managed type's
+    /// create gives, so it holds for a domain over it, a new table's column and
+    /// a column added to a standing table alike, and never by the luck of a
+    /// uid: a domain over `moved.citext` named the destination before the move
+    /// made it (#2696 ready round).
+    #[test]
+    fn a_reference_to_a_package_provided_type_waits_for_its_create_or_move() {
+        let package = |schema: &str| pbps_model::Extension {
+            schema: schema.into(),
+            version: "1.6".into(),
+        };
+        let domain = |base: &str| pbps_model::ManagedType::Domain {
+            base: ty(base),
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        let planned = |base: &Schema, declared: &Schema, moves: bool| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let mut hints = Hints::default();
+            if moves {
+                hints
+                    .extension_moves
+                    .insert("citext".into(), Default::default());
+            }
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &Postgres,
+                &hints,
+            )
+            .unwrap()
+            .changes()
+            .clone()
+        };
+        let position = |plan: &ChangeSet, wanted: fn(&Change) -> bool| {
+            plan.changes
+                .iter()
+                .position(|p| wanted(&p.change))
+                .unwrap_or_else(|| panic!("the plan holds it: {plan:#?}"))
+        };
+        let is_package = |c: &Change| {
+            matches!(
+                c,
+                Change::CreateExtension { .. } | Change::SetExtensionSchema { .. }
+            )
+        };
+        let is_domain = |c: &Change| matches!(c, Change::CreateType { .. });
+        let is_table = |c: &Change| matches!(c, Change::CreateTable { .. });
+        let is_column = |c: &Change| matches!(c, Change::AddColumn { .. });
+        // Create: a new package and a domain over its type; and a move of a
+        // standing package with a domain, a new table and an added column over
+        // the destination's type.
+        let mut created = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+        created.extensions.insert("citext".into(), package("ext"));
+        created
+            .types
+            .insert("app.d".parse().unwrap(), domain("ext.citext"));
+        let mut standing = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+        standing.extensions.insert("citext".into(), package("ext"));
+        let mut moved = schema_of(
+            "app.mail",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("who", Column::new(ty("moved.citext"))),
+            ]),
+        );
+        moved.tables.insert(
+            "app.note".parse().unwrap(),
+            table(&[("t", Column::new(ty("moved.citext")))]),
+        );
+        moved.extensions.insert("citext".into(), package("moved"));
+        moved
+            .types
+            .insert("app.d".parse().unwrap(), domain("moved.citext"));
+        for _ in 0..40 {
+            let plan = planned(&Schema::default(), &created, false);
+            assert!(
+                position(&plan, is_package) < position(&plan, is_domain),
+                "{plan:#?}"
+            );
+            let plan = planned(&standing, &moved, true);
+            let package = position(&plan, is_package);
+            assert!(
+                matches!(
+                    plan.changes[package].change,
+                    Change::SetExtensionSchema { .. }
+                ),
+                "{plan:#?}"
+            );
+            for (what, wanted) in [
+                ("domain", is_domain as fn(&Change) -> bool),
+                ("table", is_table),
+                ("column", is_column),
+            ] {
+                assert!(package < position(&plan, wanted), "{what}: {plan:#?}");
+            }
+        }
+        // Negative: a type in a schema no package stands in is not a package's,
+        // so the domain over it is ordered by its class alone and adds no edge
+        // (the plan is still produced).
+        let mut other = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+        other.extensions.insert("citext".into(), package("ext"));
+        other
+            .types
+            .insert("app.d".parse().unwrap(), domain("elsewhere.t"));
+        assert!(
+            planned(&Schema::default(), &other, false)
+                .changes
+                .iter()
+                .any(|p| is_domain(&p.change))
+        );
+    }
+
+    /// The requirement itself, apart from the draft's rank: the effects of a
+    /// domain over a package's type say the package's move comes first, so the
+    /// order verifier refuses the plan with the two swapped and accepts it as
+    /// planned (the verifier is the check the draft's rank has to satisfy).
+    #[test]
+    fn the_effects_of_a_domain_over_a_moved_type_require_the_move_first() {
+        let package = |schema: &str| pbps_model::Extension {
+            schema: schema.into(),
+            version: "1.6".into(),
+        };
+        let mut standing = schema_of("app.mail", table(&[("id", Column::new(ty("int")))]));
+        standing.extensions.insert("citext".into(), package("ext"));
+        let mut moved = standing.clone();
+        moved.extensions.insert("citext".into(), package("moved"));
+        moved.types.insert(
+            "app.d".parse().unwrap(),
+            pbps_model::ManagedType::Domain {
+                base: ty("moved.citext"),
+                not_null: false,
+                default: None,
+                checks: Default::default(),
+                collation: None,
+            },
+        );
+        let base_ids = crate::resolve(&standing, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&moved, &base_ids, &[], &ctx()).unwrap().ids;
+        let mut hints = Hints::default();
+        hints
+            .extension_moves
+            .insert("citext".into(), Default::default());
+        let sides = || {
+            (
+                Side {
+                    schema: &standing,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &moved,
+                    ids: &declared_ids,
+                },
+            )
+        };
+        let (base, declared) = sides();
+        let planned = diff(base, declared, &Postgres, &hints)
+            .unwrap()
+            .changes()
+            .clone();
+        let at = |plan: &ChangeSet, wanted: fn(&Change) -> bool| {
+            plan.changes.iter().position(|p| wanted(&p.change)).unwrap()
+        };
+        let package_at = at(&planned, |c| matches!(c, Change::SetExtensionSchema { .. }));
+        let domain_at = at(&planned, |c| matches!(c, Change::CreateType { .. }));
+        assert!(package_at < domain_at);
+        let observe = |plan: &ChangeSet| {
+            let (base, declared) = sides();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::order::shadow::observe_plan(base, declared, &Postgres, &hints, plan);
+            }))
+        };
+        assert!(observe(&planned).is_ok());
+        let mut swapped = planned.clone();
+        swapped.changes.swap(package_at, domain_at);
+        let refused = observe(&swapped).expect_err("the swapped order contradicts the effects");
+        let said = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            said.contains("effects contradict") && said.contains("SetExtensionSchema"),
+            "{said}"
+        );
     }
 
     /// A dialect whose collation changes take every dependent down, and whose

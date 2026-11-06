@@ -257,6 +257,10 @@ fn without_oids(def: &Definition) -> Definition {
                 a.collation = if a.collation == 0 { 0 } else { 1 };
             }
         }
+        Body::Provided(p) => {
+            p.input = 0;
+            p.output = 0;
+        }
     }
     out
 }
@@ -552,6 +556,74 @@ async fn a_read_that_fails_is_unreadable_and_never_absent() {
     }
 }
 
+/// A base type a package owns (the type row itself is an `e` member) is read in
+/// full as the package's: its provider, version and support functions are the
+/// pin, the pin moves when a support function is replaced, and it does not name
+/// the schema, which follows the package. A base type no package owns, and one
+/// of a package whose support function is not its member, are refused by name
+/// (DEC-2447.12; measured on 16.15 and 18.6).
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_base_type_a_package_owns_is_read_as_the_packages_and_pinned_by_it() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "provided").await;
+        db.sql(
+            "CREATE SCHEMA ext; CREATE SCHEMA moved;
+             CREATE EXTENSION citext SCHEMA ext;
+             CREATE TYPE public.mytxt;
+             CREATE FUNCTION public.mytxt_in(cstring) RETURNS public.mytxt
+               LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+             CREATE FUNCTION public.mytxt_out(public.mytxt) RETURNS cstring
+               LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+             CREATE TYPE public.mytxt (INPUT = public.mytxt_in, OUTPUT = public.mytxt_out, LIKE = text)",
+        )
+        .await;
+        let held = present(&mut db.conn, "ext", "citext").await;
+        assert_eq!(held.kind(), Kind::Provided);
+        let (extension, version) = held.provider().expect("a provided type names its package");
+        assert_eq!(extension, "citext");
+        assert!(!version.is_empty());
+        let before = held.pin().clone();
+        // Negative: a base type no package owns.
+        assert_eq!(
+            read_as(&mut db.conn, "public", "mytxt").await,
+            TypeRead::NotAdmitted(NotAdmitted::Base)
+        );
+        // The pin holds the support functions: replacing one moves it.
+        db.sql("ALTER TYPE ext.citext SET (RECEIVE = NONE)").await;
+        let changed = present(&mut db.conn, "ext", "citext").await;
+        assert_ne!(changed.pin(), &before);
+        db.sql("ALTER TYPE ext.citext SET (RECEIVE = ext.citextrecv)")
+            .await;
+        assert_eq!(present(&mut db.conn, "ext", "citext").await.pin(), &before);
+        // And not the schema: the package moves, the type keeps its OID, and
+        // the pin is the one it was.
+        db.sql("ALTER EXTENSION citext SET SCHEMA moved").await;
+        let moved = present(&mut db.conn, "moved", "citext").await;
+        assert_eq!(moved.oid(), held.oid());
+        assert_eq!(
+            moved.pin(),
+            &before,
+            "the schema is the package's, not the pin's"
+        );
+        // Negative: a support function that is not a member of the package.
+        db.sql(
+            "CREATE FUNCTION public.fake_recv(internal) RETURNS moved.citext
+               LANGUAGE internal IMMUTABLE STRICT AS 'textrecv';
+             ALTER TYPE moved.citext SET (RECEIVE = public.fake_recv)",
+        )
+        .await;
+        let (read, text) = refusal_of(&mut db.conn, "moved", "citext").await;
+        assert!(
+            matches!(&read, TypeRead::NotAdmitted(NotAdmitted::ProviderRoutines { extension, routines })
+                if extension == "citext" && routines == &["fake_recv".to_owned()]),
+            "{read:?}"
+        );
+        assert!(text.contains("not a member of it"), "{text}");
+        db.drop().await;
+    }
+}
+
 /// Types that exist and are not an enum, a domain or a standalone composite
 /// are refused by name, each for what it is (#1523).
 #[tokio::test]
@@ -575,26 +647,11 @@ async fn other_kinds_of_type_are_refused_by_name() {
         .await;
         let label = server.label;
         let cases: Vec<(&str, &str, NotAdmitted)> = vec![
-            (
-                "public",
-                "citext",
-                NotAdmitted::Base {
-                    extension: Some("citext".to_owned()),
-                },
-            ),
-            ("pg_catalog", "int4", NotAdmitted::Base { extension: None }),
-            ("pg_catalog", "text", NotAdmitted::Base { extension: None }),
+            ("pg_catalog", "int4", NotAdmitted::Base),
+            ("pg_catalog", "text", NotAdmitted::Base),
             // Array category and an element type, and not an array.
-            (
-                "pg_catalog",
-                "int2vector",
-                NotAdmitted::Base { extension: None },
-            ),
-            (
-                "pg_catalog",
-                "oidvector",
-                NotAdmitted::Base { extension: None },
-            ),
+            ("pg_catalog", "int2vector", NotAdmitted::Base),
+            ("pg_catalog", "oidvector", NotAdmitted::Base),
             ("app", "span", NotAdmitted::Range),
             ("pg_catalog", "int4range", NotAdmitted::Range),
             ("app", "span_multirange", NotAdmitted::Multirange),
@@ -649,7 +706,7 @@ async fn other_kinds_of_type_are_refused_by_name() {
         }
         assert_eq!(
             texts.len(),
-            15,
+            14,
             "every refusal names its own kind: {texts:#?}"
         );
         // A sequence has no row type: nothing by its name is found, which is
@@ -1131,7 +1188,9 @@ async fn a_base_type_filed_in_pg_catalog_after_initdb_is_pinned_by_its_propertie
         // carries its properties, and the one it made carries none.
         let attribute = |t: &UserType, index: usize| match &t.definition().body {
             Body::Composite(c) => c.attributes[index].ty.clone(),
-            Body::Enum { .. } | Body::Domain(_) => panic!("{:?}", t.definition()),
+            Body::Enum { .. } | Body::Domain(_) | Body::Provided(_) => {
+                panic!("{:?}", t.definition())
+            }
         };
         for (name, version) in [("ci", Some("1.4")), ("own", None)] {
             let held = present(&mut db.conn, "app", name).await;
@@ -1612,7 +1671,9 @@ async fn a_vector_type_is_not_an_array_of_its_element() {
         let array = present(&mut db.conn, "app", "with_array").await;
         let attribute = |t: &UserType, i: usize| match &t.definition().body {
             Body::Composite(c) => c.attributes[i].ty.clone(),
-            Body::Enum { .. } | Body::Domain(_) => panic!("{:?}", t.definition()),
+            Body::Enum { .. } | Body::Domain(_) | Body::Provided(_) => {
+                panic!("{:?}", t.definition())
+            }
         };
         assert!(
             matches!(attribute(&vector, 0), Component::Other { ref name, .. } if name == "int2vector")

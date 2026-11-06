@@ -6597,6 +6597,7 @@ mod type_pin_identity_tests {
             oid: 1,
             kind: "enum".into(),
             digest: "ab".repeat(32),
+            provider: None,
         };
         require_type_pins(std::slice::from_ref(&pin), &required).unwrap();
         let other = pbps_model::TypePin {
@@ -6655,15 +6656,15 @@ pub async fn type_input_routines(
 ) -> anyhow::Result<BTreeSet<i64>> {
     match conn.driver() {
         Driver::Postgres => {
-            let references = pins
-                .iter()
-                .map(|p| pbps_model::TypeRef::new(&p.schema, &p.name))
-                .collect::<Result<Vec<_>, _>>()?;
             let within = if inside {
                 pbps_pg::pins::Within::CallersTransaction
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
+            // Where each type is now: a placeholder names a type the plan itself
+            // brings and is not read, and a type its package's move carried is
+            // found under the name the move gave it (DEC-2447.12).
+            let references = pbps_pg::type_refs::current_references(conn, within, pins).await?;
             let admission =
                 pbps_pg::admission::Admission::new(trusted.iter().cloned(), pin_routines);
             Ok(pbps_pg::type_refs::input_routines(conn, within, &references, &admission).await?)

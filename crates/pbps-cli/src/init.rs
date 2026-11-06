@@ -203,6 +203,11 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 // As `pull` does, and before identities are minted for it:
                 // what `validate` would refuse is left out and named, rather
                 // than refusing the whole adoption over it (#902).
+                // `init` selects no extension (it has no `--extension`), so
+                // every package is unmanaged: a table of a type one provides
+                // goes first, so its triggers follow it through the one
+                // cleanup below (DEC-2447.12).
+                crate::adopt::leave_out_unmanaged_providers(&mut pulled, &Default::default());
                 crate::adopt::leave_out_what_validate_refuses(
                     &mut pulled,
                     crate::dialect_for(config.dialect).as_ref(),

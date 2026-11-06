@@ -12,7 +12,7 @@ on the resolver scratch, gated as `extension-code`, sealed with the package's
 member manifest and vetted in the transaction that installs it. A recorded
 package is dropped by `pbps drop-extension` and a gated, sealed `DROP EXTENSION
 RESTRICT` (#2447 PR C, DEC-2447.8, DEC-2447.9; plan format 61), and updated by a
-rehearsed, sealed `ALTER EXTENSION ... UPDATE TO` (#2447 PR D-update, DEC-2447.10; plan format 63) and moved by a rehearsed, sealed `ALTER EXTENSION ... SET SCHEMA`, alone or after the update (#2447 PR D-relocation, DEC-2447.11; plan format 64). Exact quoted versions, explicit schemas, `e_` identities, pull,
+rehearsed, sealed `ALTER EXTENSION ... UPDATE TO` (#2447 PR D-update, DEC-2447.10; plan format 63) and moved by a rehearsed, sealed `ALTER EXTENSION ... SET SCHEMA`, alone or after the update (#2447 PR D-relocation, DEC-2447.11; plan format 64). A column of a type a managed package provides is pinned against that provider and carried through a move (#2447 PR E, DEC-2447.12; plan format 67). Exact quoted versions, explicit schemas, `e_` identities, pull,
 baseline, verify and no-op plans. Pull selects new packages only through
 repeatable `--extension NAME`; existing declarations/identities stay selected.
 Unselected installed packages remain inventory with an opt-in hint (DEC-2447.3).

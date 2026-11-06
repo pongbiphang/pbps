@@ -5555,9 +5555,15 @@ fn refuse_pinned_movement(
             _ => {}
         }
     }
-    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
+    // A managed domain over a type a moved package provides reads back with
+    // its base in the new schema and no change of the plan on it: the same
+    // carrying as for a column of the table (DEC-2447.12).
+    let package_moves = pbps_diff::package_moves(changes);
+    let mut types_before = before.types.clone();
+    pbps_diff::forward_domain_moves(&mut types_before, &after.types, &package_moves);
+    let types: BTreeSet<_> = types_before.keys().chain(after.types.keys()).collect();
     for name in types {
-        if before.types.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
+        if types_before.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
             bail!("type `{}` changed during {label}", name.shown());
         }
     }
@@ -5674,8 +5680,15 @@ fn refuse_pinned_movement(
     // change of its own (DEC-2346.1).
     let label_renames =
         pbps_diff::enum_labels::label_renames(changes.changes.iter().map(|p| &p.change));
-    let label_forwarded = |table: &pbps_model::Table| {
+    // The same for a column of a type a moved package provides: the type keeps
+    // its OID and its name, and only its schema follows the package, so a table
+    // this plan does not touch reads back with the new schema in its column
+    // types and no change of the plan on it (DEC-2447.12).
+    let label_forwarded = |table: &pbps_model::Table, now: Option<&pbps_model::Table>| {
         let mut table = table.clone();
+        if let Some(now) = now {
+            pbps_diff::forward_schema_moves(&mut table, now, &package_moves);
+        }
         if let Some(of) = &mut table.partition_of
             && let Some(parent) = before.tables.get(&of.parent)
         {
@@ -5700,7 +5713,8 @@ fn refuse_pinned_movement(
         &after.tables,
         named,
         |name: &TableName, was: &pbps_model::Table, now: &pbps_model::Table| {
-            label_forwarded(&undo_before.apply(was, name)) == *undo_after.apply(now, name)
+            let read = undo_after.apply(now, name);
+            label_forwarded(&undo_before.apply(was, name), Some(&read)) == *read
         },
         &mut moved,
         |n| n.shown().to_string(),
@@ -5840,7 +5854,7 @@ fn refuse_pinned_movement(
             // plan does not rename, so a read from either side of a statement
             // lands in the same spelling.
             let was = &undo_before.apply(was, name);
-            let was = &label_forwarded(was);
+            let was = &label_forwarded(was, after.tables.get(now_name));
             let now = &undo_after.apply(now, now_name);
             let expected_columns = column_changes.expect(now_name, was, now);
             let was_fields = guard::Fields::of(was);
@@ -9797,6 +9811,14 @@ async fn plan_db_selected(
         plan.extension_drops = extension_drops;
         plan.target_assertions = target_assertions;
         plan.extension_changes = extension_changes;
+        // A type the plan expects its own package to bring must be one the
+        // rehearsal found in that package (DEC-2447.12).
+        pbps_pg::type_refs::provider_proof(
+            &plan.type_pins,
+            &plan.extension_pins,
+            &plan.extension_changes,
+        )
+        .map_err(anyhow::Error::msg)?;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -18481,6 +18503,7 @@ mod tests {
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
+            provided_types: BTreeMap::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -24573,6 +24596,7 @@ mod tests {
             onboarding_notices: Vec::new(),
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
+            provided_types: BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![

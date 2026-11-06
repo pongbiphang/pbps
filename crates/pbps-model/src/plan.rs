@@ -287,7 +287,9 @@ use crate::zone::SessionZone;
 // unknown change (DEC-2447.11).
 // 66 adds the GiST index method and a column key's collation (DEC-2448.2): an older build
 // would read `gist` as an unknown value and drop the collation; 65 belongs to another change.
-pub const CURRENT_VERSION: u32 = 66;
+// 67 adds the package a referenced base type belongs to on a type pin (DEC-2447.12): an older
+// build would reject the field as malformed rather than as a newer plan.
+pub const CURRENT_VERSION: u32 = 67;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -614,6 +616,27 @@ pub struct TypePin {
     pub oid: i64,
     pub kind: String,
     pub digest: String,
+    /// The package a provided base type belongs to, as the connected read saw
+    /// it (DEC-2447.12). Absent for every other type, so those pins keep their
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<TypeProvider>,
+}
+
+/// The package a [`TypePin`]'s type is a member of, and the version it was at.
+/// A plan approved over one version does not apply over another: the type's
+/// digest holds the support functions, and this names the package for the
+/// message and for the check that the project still manages it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeProvider {
+    pub extension: String,
+    pub version: String,
+    /// The schema the type is in once this plan's move of the package has run,
+    /// when it moves it (DEC-2447.12). The type keeps its OID through the move,
+    /// so the checks that read it again look under this name too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_to: Option<String>,
 }
 
 /// The routines a plan pins, one keyed digest each (DEC-319.1, DEC-2333.1).
@@ -1305,6 +1328,49 @@ mod tests {
         );
     }
 
+    /// A type pin without a provider is written as it always was, and the
+    /// provider and the schema it moves to are written only when there are
+    /// some, so every plan from before keeps its bytes (DEC-2447.12).
+    #[test]
+    fn a_type_pin_writes_its_provider_only_when_it_has_one() {
+        let pin = TypePin {
+            schema: "app".into(),
+            name: "mood".into(),
+            oid: 1,
+            kind: "enum".into(),
+            digest: "ab".repeat(32),
+            provider: None,
+        };
+        let plain = serde_json::to_string(&pin).unwrap();
+        assert!(!plain.contains("provider"), "{plain}");
+        assert_eq!(serde_json::from_str::<TypePin>(&plain).unwrap(), pin);
+        let provided = TypePin {
+            provider: Some(TypeProvider {
+                extension: "citext".into(),
+                version: "1.6".into(),
+                moved_to: None,
+            }),
+            ..pin
+        };
+        let written = serde_json::to_string(&provided).unwrap();
+        assert!(written.contains(r#""provider":{"extension":"citext","version":"1.6"}"#));
+        assert!(!written.contains("moved_to"), "{written}");
+        let moved = TypePin {
+            provider: provided.provider.clone().map(|p| TypeProvider {
+                moved_to: Some("app".into()),
+                ..p
+            }),
+            ..provided.clone()
+        };
+        assert_eq!(
+            serde_json::from_str::<TypePin>(&serde_json::to_string(&moved).unwrap()).unwrap(),
+            moved
+        );
+        // Negative: an unknown field is still refused.
+        let bad = written.replace("\"version\"", "\"edition\"");
+        assert!(serde_json::from_str::<TypePin>(&bad).is_err());
+    }
+
     #[test]
     fn type_pins_and_declared_trust_survive_serialization_and_change_the_approved_checksum() {
         let mut plan = plan_over(ChangeSet::default());
@@ -1315,6 +1381,7 @@ mod tests {
             oid: 40000,
             kind: "enum".into(),
             digest: "ab".repeat(32),
+            provider: None,
         });
         plan.trusted_roles.insert("platform_owner".into());
         let json = serde_json::to_string(&plan).unwrap();
@@ -1352,7 +1419,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 66);
+        assert_eq!(plan.version, 67);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

@@ -1985,6 +1985,9 @@ fn cmd_pull(
         adopt::hand_over_external_partitions(&mut conn, &mut pulled, &partitions_external).await?;
         let read_before: std::collections::BTreeSet<TableName> =
             pulled.schema.tables.keys().cloned().collect();
+        // Before the validate leave-out, so what hangs off such a table (its
+        // triggers, a role's grants) goes through that one cleanup.
+        adopt::leave_out_unmanaged_providers(&mut pulled, &extension_scope);
         adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());
         adopt::leave_out_cluster_roles_without_grants(&mut pulled, dialect.as_ref());
         // `--data`: the table's rows become a `data: exact` block (ADR-0004),

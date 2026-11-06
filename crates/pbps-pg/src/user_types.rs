@@ -122,6 +122,7 @@ use std::fmt;
 use pbps_db::{Conn, DbError, Param, Row};
 use pbps_dialect::TransactionFraming;
 use pbps_model::TypeRef;
+use pbps_model::escape::Escaped;
 use sha2::{Digest, Sha256};
 
 use crate::pins::Within;
@@ -216,9 +217,16 @@ impl Unreadable {
 /// by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotAdmitted {
-    /// A base type, which includes an extension's (`citext`).
-    Base {
-        extension: Option<String>,
+    /// A base type no extension owns: a superuser's own, or one of the
+    /// engine's. A base type an extension owns is admitted as
+    /// [`Body::Provided`] (DEC-2447.12).
+    Base,
+    /// A base type an extension owns, one of whose support functions is not a
+    /// member of that extension. What the type runs is then not what the
+    /// package installed.
+    ProviderRoutines {
+        extension: String,
+        routines: Vec<String>,
     },
     /// The array type of another (`_mood`); an array is written `type[]`.
     Array,
@@ -242,14 +250,24 @@ impl NotAdmitted {
     fn describe(&self, name: &str) -> String {
         let tail = "only an enum, a domain or a standalone composite type can be named";
         match self {
-            Self::Base { extension: None } => {
-                format!("the type `{name}` is a base type, and {tail}")
-            }
-            Self::Base {
-                extension: Some(extension),
+            Self::Base => format!(
+                "the type `{name}` is a base type no extension owns, and {tail}, or a type a \
+                 package the project manages provides"
+            ),
+            Self::ProviderRoutines {
+                extension,
+                routines,
             } => format!(
-                "the type `{name}` is a base type that belongs to the extension `{extension}`, \
-                 and {tail}"
+                "the type `{name}` belongs to the extension `{extension}`, but its support \
+                 function{} {} {} not a member of it, so what the type runs is not what the \
+                 package installed",
+                if routines.len() == 1 { "" } else { "s" },
+                routines
+                    .iter()
+                    .map(|r| format!("`{}`", Escaped(r)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if routines.len() == 1 { "is" } else { "are" },
             ),
             Self::Array => format!(
                 "the type `{name}` is the array type of another; write the element's name \
@@ -289,6 +307,8 @@ pub enum Kind {
     Enum,
     Domain,
     Composite,
+    /// A base type a package provides (DEC-2447.12).
+    Provided,
 }
 
 impl Kind {
@@ -298,6 +318,7 @@ impl Kind {
             Self::Enum => "enum",
             Self::Domain => "domain",
             Self::Composite => "composite",
+            Self::Provided => "provided",
         }
     }
 }
@@ -330,6 +351,44 @@ pub struct UserType {
     owners: BTreeMap<Oid, Owner>,
     reached: Vec<Reached>,
     pin: Pin,
+}
+
+#[cfg(test)]
+impl UserType {
+    /// A type a package provides, as a read would hold it, for the tests of the
+    /// callers that never reach a catalog.
+    pub(crate) fn provided_for_test(reference: TypeRef, extension: &str, version: &str) -> Self {
+        let definition = Definition {
+            oid: 17_000,
+            schema: reference.schema().to_owned(),
+            name: reference.name().to_owned(),
+            owner: 10,
+            body: Body::Provided(Provided {
+                extension: extension.to_owned(),
+                input: 17_001,
+                output: 17_002,
+                properties: BaseProperties {
+                    storage: "x".to_owned(),
+                    receive: 0,
+                    send: 0,
+                    analyze: 0,
+                    subscript: 0,
+                    modin: 0,
+                    modout: 0,
+                    extension_version: Some(version.to_owned()),
+                },
+                outside: Vec::new(),
+            }),
+        };
+        let pin = definition.pin();
+        Self {
+            reference,
+            definition,
+            owners: BTreeMap::new(),
+            reached: Vec::new(),
+            pin,
+        }
+    }
 }
 
 impl UserType {
@@ -380,6 +439,22 @@ impl UserType {
     #[must_use]
     pub fn pin(&self) -> &Pin {
         &self.pin
+    }
+
+    /// The package and its installed version, for a base type a package
+    /// provides (DEC-2447.12); `None` for every other kind.
+    #[must_use]
+    pub fn provider(&self) -> Option<(&str, &str)> {
+        let Body::Provided(p) = &self.definition.body else {
+            return None;
+        };
+        Some((
+            p.extension.as_str(),
+            p.properties
+                .extension_version
+                .as_deref()
+                .unwrap_or_default(),
+        ))
     }
 
     /// The owners that are not trusted, by name, to say in a refusal who owns
@@ -458,6 +533,22 @@ pub enum Body {
     },
     Domain(Domain),
     Composite(Composite),
+    /// A base type a package provides, read as the package's own: the package,
+    /// the type's input and output functions and everything `ALTER TYPE … SET`
+    /// can change, all of them members of that package (DEC-2447.12).
+    Provided(Provided),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provided {
+    /// `pg_extension.extname` of the package the type is a direct member of.
+    pub extension: String,
+    pub input: Oid,
+    pub output: Oid,
+    pub properties: BaseProperties,
+    /// The support functions that are not members of the package and not
+    /// built in. Empty for an admitted type; kept so a read can refuse by name.
+    pub outside: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,6 +669,7 @@ impl Definition {
             Body::Enum { .. } => Kind::Enum,
             Body::Domain(_) => Kind::Domain,
             Body::Composite(_) => Kind::Composite,
+            Body::Provided(_) => Kind::Provided,
         }
     }
 
@@ -616,6 +708,13 @@ impl Definition {
                         .collect::<Vec<Value>>(),
                 ])
             }
+            Body::Provided(p) => json!([
+                "provided",
+                p.extension,
+                p.input,
+                p.output,
+                p.properties.canonical()
+            ]),
             Body::Composite(c) => json!([
                 "composite",
                 c.relkind,
@@ -625,7 +724,15 @@ impl Definition {
                     .collect::<Vec<Value>>(),
             ]),
         };
-        json!([self.oid, self.schema, self.name, self.owner, body])
+        // A type a package provides is its OID, its name and the package's own
+        // support code; the schema it is in is the package's and moves with it
+        // (DEC-2447.12), so it is not part of what the pin says.
+        let schema = if matches!(self.body, Body::Provided(_)) {
+            ""
+        } else {
+            self.schema.as_str()
+        };
+        json!([self.oid, schema, self.name, self.owner, body])
     }
 
     /// Every owner this definition and the types nested in it name.
@@ -633,7 +740,7 @@ impl Definition {
         out.insert(self.owner);
         let mut nested = |c: &Component| c.collect_owners(out);
         match &self.body {
-            Body::Enum { .. } => {}
+            Body::Enum { .. } | Body::Provided(_) => {}
             Body::Domain(d) => nested(&d.base),
             Body::Composite(c) => c.attributes.iter().for_each(|a| nested(&a.ty)),
         }
@@ -884,6 +991,14 @@ async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbEr
         return Ok(TypeRead::NotAdmitted(not_admitted));
     }
     let definition = define(conn, oid).await?;
+    if let Body::Provided(p) = &definition.body
+        && !p.outside.is_empty()
+    {
+        return Ok(TypeRead::NotAdmitted(NotAdmitted::ProviderRoutines {
+            extension: p.extension.clone(),
+            routines: p.outside.clone(),
+        }));
+    }
     let (reached, type_owners) = closure(conn, oid).await?;
     let mut ids = type_owners;
     definition.collect_owners(&mut ids);
@@ -922,9 +1037,12 @@ fn classify(
             }),
         },
         "b" if array_of => Some(NotAdmitted::Array),
-        "b" => Some(NotAdmitted::Base {
-            extension: extension.map(str::to_owned),
-        }),
+        // A base type is admitted when a package owns the type row itself
+        // (its own `e` dependency), and never by schema or name: a base type a
+        // superuser made out of ordinary support functions has none
+        // (measured on 16.15 and 18.6, DEC-2447.12).
+        "b" if extension.is_some() => None,
+        "b" => Some(NotAdmitted::Base),
         "r" => Some(NotAdmitted::Range),
         "m" => Some(NotAdmitted::Multirange),
         "p" => Some(NotAdmitted::Pseudo),
@@ -957,6 +1075,13 @@ struct TypeRow {
     /// What `ALTER TYPE … SET (…)` can change, read for every row and kept
     /// only for a base type the engine did not make (see [`TypeRow::base`]).
     properties: BaseProperties,
+    /// `pg_extension.extname` of the package this type row is a direct member of.
+    extension: Option<String>,
+    input: Oid,
+    output: Oid,
+    /// The support functions that are neither built in nor members of that
+    /// package, by name.
+    outside: Vec<String>,
 }
 
 impl TypeRow {
@@ -1118,6 +1243,20 @@ impl Built {
                     attributes,
                 })
             }
+            "b" => {
+                let Some(extension) = &t.extension else {
+                    return Err(DbError::BadRow(format!(
+                        "type {oid} is a base type no extension owns, which has no definition to pin"
+                    )));
+                };
+                Body::Provided(Provided {
+                    extension: extension.clone(),
+                    input: t.input,
+                    output: t.output,
+                    properties: t.properties.clone(),
+                    outside: t.outside.clone(),
+                })
+            }
             other => {
                 return Err(DbError::BadRow(format!(
                     "type {oid} is of kind `{other}`, which has no definition to pin"
@@ -1201,17 +1340,35 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                     t.typsubscript::pg_catalog.oid::pg_catalog.int8 AS subscript,
                     t.typmodin::pg_catalog.oid::pg_catalog.int8 AS modin,
                     t.typmodout::pg_catalog.oid::pg_catalog.int8 AS modout,
-                    (SELECT x.extversion::pg_catalog.text
-                       FROM pg_catalog.pg_depend d
-                       JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid
-                      WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
-                        AND d.objid = t.oid
-                        AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
-                        AND d.deptype = 'e'
-                      LIMIT 1) AS extension_version
+                    t.typinput::pg_catalog.oid::pg_catalog.int8 AS input,
+                    t.typoutput::pg_catalog.oid::pg_catalog.int8 AS output,
+                    ext.version AS extension_version,
+                    ext.name AS extension,
+                    (SELECT pg_catalog.string_agg(p.proname::pg_catalog.text, ','
+                                ORDER BY p.proname::pg_catalog.text COLLATE \"C\")
+                       FROM pg_catalog.unnest(ARRAY[t.typinput, t.typoutput, t.typreceive,
+                              t.typsend, t.typmodin, t.typmodout, t.typanalyze,
+                              t.typsubscript]::pg_catalog.oid[]) AS f(oid)
+                       JOIN pg_catalog.pg_proc p ON p.oid = f.oid
+                      WHERE f.oid >= 16384 AND ext.oid IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend m
+                                         WHERE m.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                                           AND m.objid = f.oid
+                                           AND m.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                                           AND m.refobjid = ext.oid AND m.deptype = 'e')) AS outside
                FROM pg_catalog.pg_type t
                JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
                LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
+               LEFT JOIN LATERAL (
+                    SELECT x.oid AS oid, x.extname::pg_catalog.text AS name,
+                           x.extversion::pg_catalog.text AS version
+                      FROM pg_catalog.pg_depend d
+                      JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid
+                     WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                       AND d.objid = t.oid
+                       AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                       AND d.deptype = 'e'
+                     LIMIT 1) ext ON true
               WHERE t.oid = ANY({})
               ORDER BY t.oid"
             ),
@@ -1245,6 +1402,13 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                     modout: need(row, "modout")?,
                     extension_version: row.try_get::<&str>("extension_version")?.map(str::to_owned),
                 },
+                extension: row.try_get::<&str>("extension")?.map(str::to_owned),
+                input: need(row, "input")?,
+                output: need(row, "output")?,
+                outside: row
+                    .try_get::<&str>("outside")?
+                    .map(|list| list.split(',').map(str::to_owned).collect())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -1849,7 +2013,9 @@ mod tests {
                     base: Component::Array(Box::new(citext(base))),
                     ..match domain().body {
                         Body::Domain(d) => d,
-                        Body::Enum { .. } | Body::Composite(_) => unreachable!(),
+                        Body::Enum { .. } | Body::Composite(_) | Body::Provided(_) => {
+                            unreachable!()
+                        }
                     }
                 }),
                 ..domain()
@@ -1888,6 +2054,10 @@ mod tests {
             default: None,
             relkind: None,
             properties: extension_base(),
+            extension: None,
+            input: 0,
+            output: 0,
+            outside: Vec::new(),
         }
     }
 
@@ -2086,7 +2256,7 @@ mod tests {
                 base: Component::Array(Box::new(Component::Defined(Box::new(enumeration(labels))))),
                 ..match domain().body {
                     Body::Domain(d) => d,
-                    Body::Enum { .. } | Body::Composite(_) => unreachable!(),
+                    Body::Enum { .. } | Body::Composite(_) | Body::Provided(_) => unreachable!(),
                 }
             }),
             ..domain()
@@ -2243,23 +2413,18 @@ mod tests {
         assert_eq!(row_of("r"), Some(NotAdmitted::Range));
         assert_eq!(row_of("m"), Some(NotAdmitted::Multirange));
         assert_eq!(row_of("p"), Some(NotAdmitted::Pseudo));
+        // A base type is admitted exactly when a package owns the type row
+        // itself (DEC-2447.12), and the array type of one is still the array.
+        assert_eq!(classify("b", false, None, Some("citext")), None);
         assert_eq!(
-            classify("b", false, None, Some("citext")),
-            Some(NotAdmitted::Base {
-                extension: Some("citext".to_owned())
-            })
+            classify("b", true, None, Some("citext")),
+            Some(NotAdmitted::Array)
         );
-        assert_eq!(
-            classify("b", false, None, None),
-            Some(NotAdmitted::Base { extension: None })
-        );
+        assert_eq!(classify("b", false, None, None), Some(NotAdmitted::Base));
         assert_eq!(classify("b", true, None, None), Some(NotAdmitted::Array));
         // `int2vector` has the array category and an element type, and is not
         // the array of it: the engine says so by `typarray` (review of #2039).
-        assert_eq!(
-            classify("b", false, None, None),
-            Some(NotAdmitted::Base { extension: None })
-        );
+        assert_eq!(classify("b", false, None, None), Some(NotAdmitted::Base));
         for relkind in ["r", "p", "v", "m", "f"] {
             assert_eq!(
                 classify("c", false, Some(relkind), None),
