@@ -55,11 +55,6 @@ pub(super) fn declaration_path(name: &str) -> bool {
     )
 }
 
-/// A file of the identity tree: one `.json` per declaration (#2600).
-pub(super) fn identity_path(name: &str) -> bool {
-    Path::new(name).extension().and_then(|s| s.to_str()) == Some("json")
-}
-
 pub(super) fn path(name: &str) -> Result<&str> {
     if name.is_empty()
         || name.contains(['\0', '\\', '\n', '\r'])
@@ -125,7 +120,7 @@ impl Root {
         self.read_file(
             name,
             (name.starts_with(&format!("{declarations}/")) && declaration_path(name))
-                || (name.starts_with(&format!("{ids}/")) && identity_path(name)),
+                || name.starts_with(&format!("{ids}/")),
         )
     }
 
@@ -197,10 +192,19 @@ impl Root {
         self.tree(directory, declaration_path, false)
     }
 
-    /// The identity tree's files. A project that has not planned yet has no
-    /// tree, which is no files and not a failure.
+    /// Every file under the identity directory, whatever it is called. A
+    /// project that has not planned yet has no tree, which is no files and not
+    /// a failure.
+    ///
+    /// There is deliberately no filter here. The CLI's loader (`read_ids_tree`)
+    /// is the one thing that decides which entries are identity files and which
+    /// refuse the directory (a `.tmp` left by an interrupted write, a non-JSON
+    /// file); this crate may not depend on it (ADR-0015), so it captures
+    /// everything and lets the private CLI, which reads the snapshot through
+    /// that loader, refuse exactly as the real one does. A link or special
+    /// file is refused by the walk, as it is for the declarations.
     pub fn identities(&self, directory: &str) -> Result<BTreeMap<String, FileBytes>> {
-        self.tree(directory, identity_path, true)
+        self.tree(directory, |_| true, true)
     }
 
     fn tree(

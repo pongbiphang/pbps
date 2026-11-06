@@ -998,7 +998,7 @@ pub(super) fn capture(
     let legacy = join(&project, &legacy);
     let is_input = |path: &str| {
         path == legacy
-            || (path.starts_with(&format!("{ids}/")) && files::identity_path(path))
+            || path.starts_with(&format!("{ids}/"))
             || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
     };
     // The declarations and the identity tree are both live inputs: what is

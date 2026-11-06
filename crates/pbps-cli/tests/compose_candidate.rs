@@ -1121,6 +1121,42 @@ fn a_migration_in_the_working_tree_composes_without_the_tracked_legacy_file() {
     );
 }
 
+/// The identity tree is listed by the CLI's loader and by nothing in compose: a
+/// file the loader refuses (a `.tmp` left by an interrupted write, a non-JSON
+/// file, a link) has to refuse the compose too, and not be filtered out of the
+/// capture so that the private CLI sees a clean tree.
+#[test]
+fn an_entry_the_loader_refuses_inside_the_identity_tree_is_refused_through_compose() {
+    for (name, make) in [
+        (".dbo.t.json.tmp", "file"),
+        ("notes.txt", "file"),
+        ("alias.json", "link"),
+    ] {
+        let repo = Repository::new(&format!("tree-entry-{}", name.replace('.', "-")), "");
+        let path = repo.project.join(".pbps/ids").join(name);
+        if make == "link" {
+            symlink("t.json", &path).unwrap();
+        } else {
+            fs::write(&path, "left behind").unwrap();
+        }
+        repo.table(RENAMED);
+        let direct = repo.cli(&["validate"]);
+        assert!(!direct.status.success(), "{name}: {direct:?}");
+        assert!(
+            String::from_utf8_lossy(&direct.stderr).contains("identity tree entry"),
+            "{name}: {direct:?}"
+        );
+        let before = repo.preserved();
+        let error = repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .expect_err("an entry the loader refuses must not compose")
+            .to_string();
+        assert!(!error.is_empty(), "{name}");
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
 /// Both layouts are an unfinished migration, for compose as for the CLI, so a
 /// candidate can never hold a legacy file beside a tree.
 #[test]
