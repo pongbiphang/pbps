@@ -1617,6 +1617,13 @@
         "reconstruct2374::a_stated_edge_is_never_overtaken_by_a_trial",
         "reconstruct2374::two_views_that_really_read_each_other_are_refused_naming_both",
         "reconstruct2374::a_function_that_only_names_the_column_calling_it_compiles_on_the_engine",
+        "apply2144::the_opening_recheck_in_the_apply_transaction_finds_only_a_lasting_change",
+        "apply2144::a_different_deployer_differs_at_the_opening_recheck",
+        "apply2144::a_deployer_missing_the_dependency_grants_is_refused_with_both_named",
+        "apply2144::the_unnamed_objects_a_plan_installs_compare_equal_to_scratchs",
+        "apply2144::the_closing_capture_finds_another_writers_lasting_change_and_not_a_restored_one",
+        "apply2144::an_engine_refusal_during_the_read_keeps_its_number_and_text",
+        "apply2144::a_read_waits_for_another_sessions_uncommitted_ddl_and_then_reads",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",
@@ -3010,7 +3017,15 @@
         "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_unmanaged_call_is_matched_by_the_executing_principals_lookup_path",
         "resolver::server::scratch::mssql_live_tests::captured2143::mssql_an_alias_column_spelled_like_a_view_is_no_call_of_it",
         "resolver::server::scratch::mssql_live_tests::captured2143::mssql_two_modules_that_really_read_each_other_are_refused_by_name",
-        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_arriving_unrelated_routine_does_not_rebuild_a_managed_view"
+        "resolver::server::scratch::mssql_live_tests::rebind2143::mssql_an_arriving_unrelated_routine_does_not_rebuild_a_managed_view",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_resolved_plan_applies_without_docker",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_name_that_arrived_after_planning_refuses_before_the_first_statement",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_an_external_property_change_invalidates_the_plan",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_another_key_or_another_instance_refuses_before_anything_is_read",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_role_removed_after_planning_refuses_at_the_opening_check",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_the_planned_authorization_inventory_is_what_planning_sealed_before",
+        "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_plan_that_creates_unnamed_keys_and_defaults_applies_and_closes"
       ]
     },
     {

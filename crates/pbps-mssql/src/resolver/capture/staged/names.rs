@@ -1,6 +1,7 @@
 //! Engine-resolved identities for staged comparison (DEC-2268.1).
 //! Resolution proves presence; it never licenses changing a stored spelling.
 
+use super::super::read_failed;
 use super::{CaptureError, ObjectIdentity, class};
 use pbps_db::transport::QueryConnection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,7 +64,10 @@ impl Names {
                    AND i.object_id=COALESCE(o.object_id,tt.type_table_object_id) \
                    AND i.name=q.m COLLATE DATABASE_DEFAULT;"
             );
-            let rows = conn.query(&sql).await.map_err(|_| CaptureError::Read)?;
+            let rows = conn
+                .query(&sql)
+                .await
+                .map_err(|error| read_failed(&error))?;
             let mut seen = BTreeSet::new();
             for row in rows {
                 let text = |key| {

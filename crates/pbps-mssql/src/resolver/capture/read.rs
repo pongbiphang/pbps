@@ -4,7 +4,7 @@
 //! column's driver type never decides what a fact reads as. A row that does
 //! not parse is incomplete input, never a default.
 
-use super::CaptureError;
+use super::{CaptureError, read_failed};
 use pbps_db::transport::QueryConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -288,6 +288,13 @@ pub(super) struct Lookups {
 const PERMISSIONS: &str = "SELECT \
     CONVERT(nvarchar(10), ISNULL(HAS_PERMS_BY_NAME(NULL, N'DATABASE', N'VIEW DEFINITION'), 0)) AS view_definition, \
     CONVERT(nvarchar(10), ISNULL(HAS_PERMS_BY_NAME(N'sys.sql_expression_dependencies', N'OBJECT', N'SELECT'), 0)) AS dependencies;";
+
+/// The two refusals of [`qualify`] name both grants: a deployer that is not
+/// `db_owner` needs both, and a refusal that named one would be followed by
+/// the other (measured on #2144: schema `CONTROL` alone reads neither).
+const MISSING_VIEW_DEFINITION: &str = "the capture needs VIEW DEFINITION on the database: without it the dependency catalog reads empty. The deployer needs both of `GRANT VIEW DEFINITION TO [deployer]` and `GRANT SELECT ON sys.sql_expression_dependencies TO [deployer]`";
+
+const MISSING_DEPENDENCY_SELECT: &str = "the capture needs SELECT on sys.sql_expression_dependencies, which only db_owner holds by default. The deployer needs both of `GRANT VIEW DEFINITION TO [deployer]` and `GRANT SELECT ON sys.sql_expression_dependencies TO [deployer]`";
 
 const SESSION: &str = "SELECT \
     CONVERT(nvarchar(128), USER_NAME()) AS [user], \
@@ -698,7 +705,7 @@ async fn rows(
     conn: &mut impl QueryConnection,
     sql: &str,
 ) -> Result<Vec<pbps_db::Row>, CaptureError> {
-    conn.query(sql).await.map_err(|_| CaptureError::Read)
+    conn.query(sql).await.map_err(|error| read_failed(&error))
 }
 
 async fn session(conn: &mut impl QueryConnection) -> Result<(Session, u32), CaptureError> {
@@ -733,13 +740,13 @@ async fn qualify(conn: &mut impl QueryConnection) -> Result<(), CaptureError> {
     if row.required("view_definition")? != "1" {
         return Err(CaptureError::Coverage(super::Uncovered::class(
             "sys.sql_expression_dependencies",
-            "the capture needs VIEW DEFINITION on the database: without it the dependency catalog reads empty",
+            MISSING_VIEW_DEFINITION,
         )));
     }
     if row.required("dependencies")? != "1" {
         return Err(CaptureError::Coverage(super::Uncovered::class(
             "sys.sql_expression_dependencies",
-            "the capture needs SELECT on sys.sql_expression_dependencies, which only db_owner holds by default",
+            MISSING_DEPENDENCY_SELECT,
         )));
     }
     Ok(())

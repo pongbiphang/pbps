@@ -395,6 +395,41 @@ impl ExternalInputs {
         target::CreationNames::statement(text)
     }
 
+    /// The externals of a capture, given the managed objects it holds: the
+    /// one derivation planning and apply share (#2144). Apply holds the
+    /// managed set the sealed manifest proved, planning the declared one.
+    pub fn of(captured: CapturedInputs, managed: BTreeSet<ObjectIdentity>) -> Self {
+        let roots = captured
+            .inputs
+            .iter()
+            .filter(|(id, input)| {
+                !managed.contains(*id)
+                    && input.properties.get("engine") != Some(&Value::Bool(true))
+                    && ((id.class == class::TYPE
+                        && input.properties.get("user_defined") == Some(&Value::Bool(true)))
+                        || ((id.class == class::OBJECT || id.class.starts_with("pbps-unnamed-"))
+                            && (reference(input, "parent").is_none()
+                                || captured.scope().retained.contains(*id))))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        Self {
+            captured,
+            roots,
+            managed,
+        }
+    }
+
+    /// What staged authorization leaves out: the managed objects and the
+    /// externals that wait on them.
+    pub fn excluded(&self) -> BTreeSet<ObjectIdentity> {
+        self.managed
+            .iter()
+            .cloned()
+            .chain(self.prerequisites().into_keys())
+            .collect()
+    }
+
     pub fn managed(&self) -> &BTreeSet<ObjectIdentity> {
         &self.managed
     }
@@ -448,25 +483,7 @@ pub async fn required_externals_declared(
     scope.retained.extend(managed.objects.iter().cloned());
     let captured =
         target::prepare(target, scope, &schemas, &managed.objects, declarations, key).await?;
-    let roots = captured
-        .inputs
-        .iter()
-        .filter(|(id, input)| {
-            !managed.objects.contains(*id)
-                && input.properties.get("engine") != Some(&Value::Bool(true))
-                && ((id.class == class::TYPE
-                    && input.properties.get("user_defined") == Some(&Value::Bool(true)))
-                    || ((id.class == class::OBJECT || id.class.starts_with("pbps-unnamed-"))
-                        && (reference(input, "parent").is_none()
-                            || captured.scope().retained.contains(*id))))
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    Ok(ExternalInputs {
-        captured,
-        roots,
-        managed: managed.objects,
-    })
+    Ok(ExternalInputs::of(captured, managed.objects))
 }
 
 fn managed_dependencies(

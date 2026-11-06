@@ -1619,6 +1619,9 @@ mod rebind2143;
 #[path = "captured2143_tests.rs"]
 mod captured2143;
 
+#[path = "apply2144_tests.rs"]
+mod apply2144;
+
 #[path = "recovery2410_mssql_tests.rs"]
 mod recovery2410;
 

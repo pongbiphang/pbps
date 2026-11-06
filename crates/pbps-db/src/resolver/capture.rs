@@ -103,6 +103,13 @@ impl Uncovered {
     }
 }
 
+fn engine_error(number: &Option<String>, text: &str) -> String {
+    match number {
+        Some(number) => format!("engine error {number}: {text}"),
+        None => text.to_owned(),
+    }
+}
+
 /// Source-free capture refusals shared by the engine adapters and CLI routing.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureError {
@@ -120,6 +127,14 @@ pub enum CaptureError {
     Version,
     #[error("target capture could not read a required catalog")]
     Read,
+    /// A catalog read the engine refused, with the engine's own number and
+    /// text: a refusal that hides them (a lock timeout, a permission, a
+    /// deadlock victim) cannot be told from any other failed read (#2144).
+    #[error("target capture could not read a required catalog: {}", engine_error(.number, .text))]
+    Engine {
+        number: Option<String>,
+        text: String,
+    },
     #[error("target capture received incomplete catalog input")]
     Incomplete,
     #[error("catalog changed while canonical definitions were rendered")]

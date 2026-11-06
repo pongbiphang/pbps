@@ -2,7 +2,7 @@
 //! The API enumerates no property names. Extend this manifest deliberately;
 //! unlike scalar catalog columns, future names are not discovered automatically.
 
-use super::{CaptureError, read::Object};
+use super::{CaptureError, read::Object, read_failed};
 use pbps_db::transport::QueryConnection;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -276,7 +276,11 @@ pub(super) async fn read(
              CROSS APPLY (VALUES(OBJECTPROPERTYEX(o.object_id,p.name))) v(value) \
              WHERE o.object_id IN ({ids});"
         );
-        for row in conn.query(&sql).await.map_err(|_| CaptureError::Read)? {
+        for row in conn
+            .query(&sql)
+            .await
+            .map_err(|error| read_failed(&error))?
+        {
             let text = |field| -> Result<Option<String>, CaptureError> {
                 row.try_get::<&str>(field)
                     .map(|v| v.map(str::to_owned))

@@ -24,6 +24,7 @@
 //! Scratch, separation, the externals comparison and assessment are #2142;
 //! planning and sealing from this capture are #2143.
 
+mod apply;
 mod assess;
 mod catalog;
 mod columns;
@@ -39,6 +40,7 @@ mod staged;
 mod unmanaged;
 mod whole;
 
+pub use apply::{answered_authorization, capture_closing, recheck_opening};
 pub use compiled::{BindingRecord, CompiledCapture, capture_desired_for_plan};
 pub use manifest::CapturedInputs;
 pub use object_properties::{OBJECT_PROPERTIES, PropertyDisposition, property_disposition};
@@ -105,6 +107,25 @@ impl CandidateClass {
             Self::SystemProcedure => "sys.system_objects",
             Self::Type => "sys.types",
         }
+    }
+
+    /// The class a sealed manifest's candidate set names by its catalog. A
+    /// catalog this build does not read has no class: read as nothing, it
+    /// would be a candidate that never arrives.
+    pub fn of_catalog(catalog: &str) -> Option<Self> {
+        [Self::Object, Self::SystemProcedure, Self::Type]
+            .into_iter()
+            .find(|class| class.catalog() == catalog)
+    }
+}
+
+/// A catalog read the engine refused, with the engine's number and text, so
+/// that a lock timeout, a permission or a deadlock victim is told apart from
+/// every other failed read (#2144).
+fn read_failed(error: &pbps_db::DbError) -> CaptureError {
+    CaptureError::Engine {
+        number: error.server_error_code(),
+        text: error.to_string(),
     }
 }
 

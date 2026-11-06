@@ -68,6 +68,9 @@ mod deployer2267;
 #[path = "live/reconstruct2374.rs"]
 mod reconstruct2374;
 
+#[path = "live/apply2144.rs"]
+mod apply2144;
+
 #[path = "support/creation2469.rs"]
 mod creation2469;
 

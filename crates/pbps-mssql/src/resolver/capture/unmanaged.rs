@@ -8,7 +8,7 @@
 //! names, whether the first match on its lookup path moves once the objects the
 //! plan creates exist.
 
-use super::{CaptureError, CaptureScope, ObjectIdentity, Uncovered, class};
+use super::{CaptureError, CaptureScope, ObjectIdentity, Uncovered, class, read_failed};
 use pbps_db::transport::QueryConnection;
 use std::collections::BTreeSet;
 
@@ -58,7 +58,7 @@ pub async fn unmanaged_rebinds(
              N'VIEW DEFINITION')) AS visible;",
         )
         .await
-        .map_err(|_| CaptureError::Read)?;
+        .map_err(|error| read_failed(&error))?;
     let allowed = visible
         .first()
         .and_then(|row| row.try_get::<&str>("visible").ok().flatten())
@@ -88,7 +88,11 @@ pub async fn unmanaged_rebinds(
         pairs.join(", ")
     );
     let mut referrers = BTreeSet::new();
-    for row in target.query(&sql).await.map_err(|_| CaptureError::Read)? {
+    for row in target
+        .query(&sql)
+        .await
+        .map_err(|error| read_failed(&error))?
+    {
         let text = |field| -> Result<String, CaptureError> {
             row.try_get::<&str>(field)
                 .ok()

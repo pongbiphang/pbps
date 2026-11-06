@@ -1,4 +1,5 @@
-//! Resolver-backed transactional apply on PostgreSQL (#616, SPEC 9.3.2).
+//! Resolver-backed transactional apply (#616 on PostgreSQL, #2144 on SQL
+//! Server; SPEC 9.3.2).
 //!
 //! A resolved plan is applied as it was sealed: no resolver, no scratch, no
 //! new binding decision. What this adds to an ordinary apply is the check
@@ -8,10 +9,16 @@
 //! authorization and the opening manifest; after the last statement and
 //! before recording, the closing manifest and the authorization the plan
 //! leaves. Any difference refuses, and inside the transaction it rolls back.
+//!
+//! The checks are the same on both engines and the reads are not. PostgreSQL
+//! reads inside one snapshot; SQL Server has none (DEC-619.1), so its checks
+//! are plain reads compared at both ends, and a change made and restored in
+//! between leaves nothing to find (DEC-2144.1).
 
 use crate::resolver::{scope, sealing};
 use pbps_db::Driver;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_model::dependency::Dependencies;
 use pbps_model::resolver::{ObjectIdentity, ObjectOwnership, ResolverEvidence, Surface};
 use pbps_model::{IdsFile, ModuleId, SavedPlan, Schema};
 use std::collections::BTreeMap;
@@ -21,6 +28,7 @@ use std::collections::BTreeMap;
 pub struct Keyed<'a> {
     evidence: &'a ResolverEvidence,
     changes: &'a pbps_model::ChangeSet,
+    declarations: Dependencies,
     key: EnvironmentFingerprintKey,
     label: String,
 }
@@ -30,6 +38,8 @@ pub struct Keyed<'a> {
 pub struct Guard<'a> {
     evidence: &'a ResolverEvidence,
     changes: &'a pbps_model::ChangeSet,
+    declarations: &'a Dependencies,
+    driver: Driver,
     key: &'a EnvironmentFingerprintKey,
     scope_schemas: Vec<String>,
     label: &'a str,
@@ -38,20 +48,6 @@ pub struct Guard<'a> {
 /// The remedy for a target that is no longer the sealed one: the evidence
 /// describes another, and only a new plan describes this one.
 const PLAN_AGAIN: &str = "Plan again against the target as it is now.";
-
-pub const MSSQL_APPLY_PENDING: &str =
-    "this build cannot yet enforce SQL Server resolver evidence during apply (#2144)";
-
-/// Reader admission does not authorize applying evidence whose checks this
-/// build cannot execute. Ordinary SQL Server and resolved PostgreSQL keep
-/// their existing admission path (DEC-2143.3).
-pub fn enforceable(plan: &SavedPlan) -> bool {
-    !(plan.dialect == "mssql"
-        && matches!(
-            plan.analysis,
-            pbps_model::resolver::PlanAnalysis::Resolved(_)
-        ))
-}
 
 impl<'a> Keyed<'a> {
     /// Before apply connects (#616 step 1): the environment's key is the one
@@ -66,9 +62,6 @@ impl<'a> Keyed<'a> {
         let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis else {
             return Ok(None);
         };
-        if !enforceable(plan) {
-            anyhow::bail!(MSSQL_APPLY_PENDING);
-        }
         let sealed = evidence.before().key_id();
         let key = key.map_err(|why| {
             anyhow::anyhow!(
@@ -86,9 +79,18 @@ impl<'a> Keyed<'a> {
                 key.id()
             );
         }
+        // The plan retains the declarations the planning capture read under
+        // (DEC-2322.1); a recapture without them would read a module that
+        // names a declared database as an uncovered name.
+        let declarations = plan
+            .dependencies
+            .iter()
+            .map(|(name, planned)| (name.clone(), planned.declaration.clone()))
+            .collect();
         Ok(Some(Self {
             evidence,
             changes: &plan.changes,
+            declarations,
             key,
             label: label.to_owned(),
         }))
@@ -104,16 +106,23 @@ impl<'a> Keyed<'a> {
                 "this plan's resolver evidence names no cluster it was sealed against. {PLAN_AGAIN}"
             );
         }
-        let identity = pbps_pg::resolver::scratch::cluster_identity(conn)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("cannot read `{label}`'s cluster identity: {error}")
-            })?;
-        let reached = sealing::hex(key.fingerprint(
-            crate::resolver::server::CLUSTER_RULE,
-            "system-identifier",
-            identity.as_bytes(),
-        ));
+        let driver = conn.driver();
+        let (identity, rule, component) = match driver {
+            Driver::Postgres => (
+                pbps_pg::resolver::scratch::cluster_identity(conn).await,
+                crate::resolver::server::CLUSTER_RULE,
+                "system-identifier",
+            ),
+            Driver::Mssql => (
+                pbps_mssql::resolver::scratch::cluster_identity(conn).await,
+                crate::resolver::server::MSSQL_CLUSTER_RULE,
+                "family-guid",
+            ),
+        };
+        let identity = identity.map_err(|error| {
+            anyhow::anyhow!("cannot read `{label}`'s cluster identity: {error}")
+        })?;
+        let reached = sealing::hex(key.fingerprint(rule, component, identity.as_bytes()));
         if reached != qualification.target_cluster {
             anyhow::bail!(
                 "`{label}` reaches another cluster than the one this plan was sealed against \
@@ -122,11 +131,13 @@ impl<'a> Keyed<'a> {
         }
         let target = &qualification.target_scope;
         let scope_schemas =
-            scope::scope_schemas(Driver::Postgres, &target.schemas, &target.write_path_extras)
+            scope::scope_schemas(driver, &target.schemas, &target.write_path_extras)
                 .map_err(|why| anyhow::anyhow!("the sealed analysis scope: {why}"))?;
         Ok(Guard {
             evidence,
             changes: self.changes,
+            declarations: &self.declarations,
+            driver,
             key,
             scope_schemas,
             label,
@@ -147,11 +158,23 @@ impl Guard<'_> {
                 Phase::Before,
             )
             .await?;
-        let fresh =
-            pbps_pg::resolver::capture::recheck_opening(conn, self.evidence.before(), self.key)
+        let sealed = self.evidence.before();
+        let fresh = match self.driver {
+            Driver::Postgres => {
+                pbps_pg::resolver::capture::recheck_opening(conn, sealed, self.key).await
+            }
+            Driver::Mssql => {
+                pbps_mssql::resolver::capture::recheck_opening(
+                    conn,
+                    sealed,
+                    self.declarations,
+                    self.key,
+                )
                 .await
-                .map_err(|error| self.unreadable("the opening capture", error))?;
-        changed.extend(self.evidence.before().opening_differences(&fresh));
+            }
+        }
+        .map_err(|error| self.unreadable("the opening capture", error))?;
+        changed.extend(sealed.opening_differences(&fresh));
         self.refuse(changed, "before its first statement")
     }
 
@@ -175,7 +198,6 @@ impl Guard<'_> {
             )
             .await?;
         let after = self.evidence.after();
-        let routines = self.routines();
         let namespaces = self
             .evidence
             .qualification()
@@ -185,21 +207,45 @@ impl Guard<'_> {
             .chain(&self.evidence.qualification().target_scope.write_path_extras)
             .cloned()
             .collect();
-        let recorded = pbps_pg::resolver::capture::RecordedOwnership {
-            schema,
-            ids,
-            routines: &routines,
-            dropped: &BTreeMap::new(),
-            namespaces: &namespaces,
-        };
-        let fresh = pbps_pg::resolver::capture::capture_closing(
-            conn,
-            after,
-            &after.vanishable(),
-            self.key,
-            &recorded,
-        )
-        .await
+        let fresh = match self.driver {
+            Driver::Postgres => {
+                let routines = self.routines();
+                let recorded = pbps_pg::resolver::capture::RecordedOwnership {
+                    schema,
+                    ids,
+                    routines: &routines,
+                    dropped: &BTreeMap::new(),
+                    namespaces: &namespaces,
+                };
+                pbps_pg::resolver::capture::capture_closing(
+                    conn,
+                    after,
+                    &after.vanishable(),
+                    self.key,
+                    &recorded,
+                )
+                .await
+            }
+            Driver::Mssql => {
+                // No routine identity is proved apart from the declarations:
+                // SQL Server routines are objects of their schema like any
+                // other (DEC-2144.1).
+                let recorded = pbps_mssql::resolver::capture::RecordedOwnership {
+                    schema,
+                    ids,
+                    namespaces: &namespaces,
+                };
+                pbps_mssql::resolver::capture::capture_closing(
+                    conn,
+                    after,
+                    &after.vanishable(),
+                    self.declarations,
+                    self.key,
+                    &recorded,
+                )
+                .await
+            }
+        }
         .map_err(|error| self.unreadable("the closing capture", error))?;
         changed.extend(after.closing_differences(&fresh, self.evidence.transitions()));
         self.refuse(changed, "after its last statement")
@@ -214,16 +260,58 @@ impl Guard<'_> {
         phase: Phase,
     ) -> anyhow::Result<Vec<String>> {
         let target = &self.evidence.qualification().target_scope;
-        let pbps_pg_scope = pbps_pg::resolver::environment::Scope {
-            schemas: &target.schemas,
-            write_path_extras: &target.write_path_extras,
-        };
-        let (catalog, authorization) = pbps_pg::resolver::scope_facts_in_transaction(
-            conn,
-            &pbps_pg_scope,
-            &self.scope_schemas,
-        )
-        .await
+        let (catalog, authorization) = match self.driver {
+            Driver::Postgres => {
+                let scope = pbps_pg::resolver::environment::Scope {
+                    schemas: &target.schemas,
+                    write_path_extras: &target.write_path_extras,
+                };
+                pbps_pg::resolver::scope_facts_in_transaction(conn, &scope, &self.scope_schemas)
+                    .await
+                    .map(|(catalog, authorization)| {
+                        (catalog, scope::Authorization::Postgres(authorization))
+                    })
+            }
+            // The bracketed double read the planning used, inside the apply's
+            // transaction. The principals the plan's own grants name are
+            // resolved to the catalog's spelling within each read.
+            Driver::Mssql => {
+                let planned = scope::planned_schema_grants(self.changes)
+                    .map_err(|why| anyhow::anyhow!("the plan's own grants: {why}"))?;
+                async {
+                    let (catalog, read) = scope::read_target(
+                        conn,
+                        Driver::Mssql,
+                        &target.schemas,
+                        &target.write_path_extras,
+                        &self.scope_schemas,
+                        &planned,
+                    )
+                    .await?;
+                    // What the plan sealed is the deployer's answers, not the
+                    // catalog read alone: the engine-read effective
+                    // permissions of the same questions (DEC-2143.1).
+                    let scope::Authorization::Mssql(read) = read else {
+                        unreachable!("a SQL Server read answers with SQL Server's context")
+                    };
+                    let planned_principals: Vec<_> = planned
+                        .iter()
+                        .map(|grant| grant.principal.clone())
+                        .collect();
+                    let answered = pbps_mssql::resolver::capture::answered_authorization(
+                        conn,
+                        &read,
+                        &planned_principals,
+                        [self.evidence.before(), self.evidence.after()],
+                        self.declarations,
+                        self.key,
+                    )
+                    .await?;
+                    Ok((catalog, scope::Authorization::Mssql(Box::new(answered))))
+                }
+                .await
+            }
+        }
         .map_err(|error| {
             anyhow::anyhow!(
                 "cannot read `{}`'s analysis scope: {error}\n\nNothing has been applied — the \
@@ -239,7 +327,6 @@ impl Guard<'_> {
         {
             changed.push("the target's reported facts".to_owned());
         }
-        let authorization = scope::Authorization::Postgres(authorization);
         let expected = match phase {
             Phase::Before => &self.evidence.authorization().before,
             Phase::After => &self.evidence.authorization().after,
@@ -247,6 +334,14 @@ impl Guard<'_> {
         let grants = &self.evidence.authorization().object_grants;
         let (fingerprints, grant_changes) = if grants.is_empty() {
             (Vec::new(), Vec::new())
+        } else if self.driver == Driver::Mssql {
+            // SQL Server's object permissions are part of the authorization
+            // context the engine read (DEC-2143.1); evidence that claims
+            // separate grants was not sealed by this build.
+            return Err(self.unreadable(
+                "the object grant postconditions",
+                "SQL Server evidence carries none",
+            ));
         } else {
             let read = pbps_pg::catalog::introspect_within_transaction(conn)
                 .await

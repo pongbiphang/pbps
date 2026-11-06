@@ -772,6 +772,7 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
         CaptureError::CallerTransaction
         | CaptureError::NoTransaction
         | CaptureError::Read
+        | CaptureError::Engine { .. }
         | CaptureError::Incomplete
         | CaptureError::Changed
         | CaptureError::EnvironmentChanged
@@ -849,6 +850,10 @@ mod tests {
             CaptureError::CallerTransaction,
             CaptureError::NoTransaction,
             CaptureError::Read,
+            CaptureError::Engine {
+                number: Some("1222".into()),
+                text: "lock request time out period exceeded".into(),
+            },
             CaptureError::Incomplete,
             CaptureError::Changed,
             CaptureError::EnvironmentChanged,

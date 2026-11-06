@@ -70,8 +70,7 @@ pub struct Explanation {
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
-    /// one it is is [`Explanation::applyable`]. Empty when this build cannot
-    /// enforce the plan's resolver evidence at apply, which no new plan changes.
+    /// one it is is [`Explanation::applyable`].
     pub approve_with: String,
 
     /// Set only when the plan path could not be spelled safely for every shell
@@ -386,8 +385,7 @@ fn explain(
     // whatever `--allow` it is given (§7.3). Printing one anyway would have the
     // report contradict its own first line — which says the plan is a preview —
     // and hand the reviewer something that cannot work.
-    let enforceable = pbps_cli::resolver::apply::enforceable(plan);
-    let applyable = plan.origin.is_applyable() && enforceable;
+    let applyable = plan.origin.is_applyable();
     let approve = if applyable {
         // `apply` requires exactly one of --db / --env, so a command printed
         // without one fails the moment it is pasted. The environment's *name*
@@ -422,10 +420,6 @@ fn explain(
             approve.push_str(" --staged");
         }
         approve
-    } else if !enforceable {
-        // Planning again would seal the same evidence. There is nothing to
-        // approve with until this build can enforce it at apply (DEC-2143.3).
-        String::new()
     } else {
         format!(
             "pbps plan --env {} --out {plan_arg}",
@@ -666,19 +660,11 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         "  origin      {}\n",
         match plan.origin {
             PlanOrigin::Database => "computed against the target environment — applyable",
-            PlanOrigin::ResolvedDatabase if !e.applyable =>
-                "computed against the target with sealed resolver evidence — apply refused by this build",
             PlanOrigin::ResolvedDatabase =>
                 "computed against the target with sealed resolver evidence — applyable",
             PlanOrigin::Preview => "computed offline — a preview; `apply` will refuse it",
         }
     ));
-    if !pbps_cli::resolver::apply::enforceable(plan) {
-        out.push_str(&format!(
-            "  apply       {}\n",
-            pbps_cli::resolver::apply::MSSQL_APPLY_PENDING
-        ));
-    }
     if let Some(detail) = &e.resolver {
         out.push_str(&format!("  resolver    {}\n", resolver::line(detail)));
     }
