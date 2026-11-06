@@ -3423,8 +3423,8 @@ fn cut_report(
     unmanaged: db::CatalogPolicy<'_>,
     warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<pbps_diff::Scoped> {
-    let scoped = cut(pulled, ids, modules, external, unmanaged);
-    warnings.emit(scoped.unexpressible.iter().map(|message| {
+    let (scoped, permissions) = cut(pulled, ids, modules, external, unmanaged);
+    warnings.emit(permissions.into_iter().map(|message| {
         crate::output::Finding::warning("catalog.unexpressible-permission", message)
     }));
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
@@ -3432,13 +3432,15 @@ fn cut_report(
 }
 
 /// One cut of a pulled catalog down to a managed set. Pure.
-fn cut(
-    pulled: &pbps_db::catalog::Pulled,
+/// Returns the same permission subset added to the scoped reasons, so warnings
+/// cannot label partition limitations as permissions (DEC-1739.1).
+fn cut<'a>(
+    pulled: &'a pbps_db::catalog::Pulled,
     ids: &IdsFile,
     modules: &BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
     unmanaged: db::CatalogPolicy<'_>,
-) -> pbps_diff::Scoped {
+) -> (pbps_diff::Scoped, Vec<&'a str>) {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
     // These exact roles belong to the verified owned run, not its declarations.
     // A similarly named role remains subject to the project's ordinary policy.
@@ -3450,9 +3452,10 @@ fn cut(
     // than folded in. Carried beside the comparison so `verify` reports it
     // as drift and `plan --db` refuses to plan over it; on an unmanaged role,
     // or on somebody else's object, it is not ours (DECISIONS 95, 176).
-    for what in unexpressible_permissions(pulled, ids, modules) {
-        scoped.unexpressible.push(what.to_owned());
-    }
+    let permissions = unexpressible_permissions(pulled, ids, modules);
+    scoped
+        .unexpressible
+        .extend(permissions.iter().map(|what| (*what).to_owned()));
     // Carried beside the comparison, never into it, exactly as the line above
     // carries a `WITH GRANT OPTION` (DECISIONS 95, 371). Cut to the managed
     // modules for the same reason every other field here is: what `PUBLIC`
@@ -3473,7 +3476,7 @@ fn cut(
         .baseline_evidence
         .as_ref()
         .map(|evidence| evidence.for_managed(&scoped.schema));
-    scoped
+    (scoped, permissions)
 }
 
 /// The modules the declarations name and the rows they declare, for the
