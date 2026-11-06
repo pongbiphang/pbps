@@ -60,7 +60,6 @@ fn refusal(project: &Project, after: &IdsFile, paths: &DeclaredPaths, case: &str
     let before = tree(project);
     let error = format!("{:#}", plan(project, after, paths).unwrap_err());
     assert!(error.contains(case), "{error}");
-    assert!(error.contains("#2600 PR 5b"), "{error}");
     assert!(error.contains("nothing was written"), "{error}");
     assert_eq!(tree(project), before, "a refusal must write nothing");
 }
@@ -165,15 +164,67 @@ fn a_renamed_table_changes_its_header_only_and_a_dropped_one_stays_where_it_is()
 }
 
 #[test]
-fn a_declaration_whose_file_moved_is_refused_as_a_relocation() {
+fn a_declaration_whose_file_moved_is_written_at_its_new_path_and_the_old_one_removed() {
     let project = written("relocation", &customer(), &customer_declared());
-    let moved = declared(&[("dbo.customer", "dbo/client.yml", &["id", "name"])]);
-    refusal(&project, &customer(), &moved, "moving an identity file");
+    let moved = declared(&[("dbo.customer", "sales/client.yml", &["id", "name"])]);
+    let write = plan(&project, &customer(), &moved).unwrap();
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["sales/client.json"]
+    );
+    assert_eq!(write.removals, ["dbo/customer.json"]);
+    // The mapping is unchanged, so only the declaration moved.
+    write.apply().unwrap();
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        ["sales/client.json"]
+    );
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    // The directory the move emptied is gone, and the file's bytes are the
+    // writer's, not a copy of the old ones.
+    assert!(!project.ids_dir().join("dbo").exists());
+    assert!(plan(&project, &customer(), &moved).unwrap().is_empty());
 }
 
 #[test]
-fn a_new_declaration_over_a_path_another_identity_holds_is_refused_as_a_displacement() {
+fn a_dropped_file_whose_path_a_new_declaration_takes_is_sent_aside() {
     let project = written("displacement", &customer(), &customer_declared());
+    // The table is dropped, and a different table is declared where it was.
+    let after = ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other"},
+        "columns": {"c_bbbbb1": "dbo.other.id"},
+        "tombstones": {
+            T: {"was": "dbo.customer", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa1": {"was": "dbo.customer.id", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa2": {"was": "dbo.customer.name", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }));
+    let paths = declared(&[("dbo.other", "dbo/customer.yml", &["id"])]);
+    let write = plan(&project, &after, &paths).unwrap();
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["dbo.customer.t_aaaaaa.json", "dbo/customer.json"]
+    );
+    assert!(
+        write.removals.is_empty(),
+        "the path is rewritten, not removed"
+    );
+    write.apply().unwrap();
+    let after_tree = tree(&project);
+    assert!(after_tree["dbo/customer.json"].contains("\"dbo.other\""));
+    assert!(after_tree["dbo.customer.t_aaaaaa.json"].contains("\"dropped\""));
+    assert_eq!(read_opt(&project).unwrap(), Some(after));
+    assert!(
+        plan(&project, &read_opt(&project).unwrap().unwrap(), &paths)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn two_live_declarations_for_one_file_are_refused_and_nothing_is_written() {
+    let project = written("one-file-two-tables", &customer(), &customer_declared());
     let both = ids(json!({
         "version": 1,
         "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.other"},
@@ -183,65 +234,145 @@ fn a_new_declaration_over_a_path_another_identity_holds_is_refused_as_a_displace
         ("dbo.customer", "dbo/customer.yml", &["id", "name"]),
         ("dbo.other", "dbo/customer.yml", &[]),
     ]);
-    // Two declarations for one file: the old one keeps it, so the new one has
-    // nowhere to go.
-    refusal(&project, &both, &paths, "another identity holds");
+    refusal(&project, &both, &paths, "are both declared at");
 }
 
 #[test]
-fn a_table_that_becomes_or_stops_being_a_partition_is_refused() {
-    let two = ids(json!({
+fn a_dropped_object_the_tree_never_held_gets_the_aside_name() {
+    let project = project("never-held");
+    let after = ids(json!({
         "version": 1,
-        "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.child"},
-        "columns": {"c_aaaaa1": "dbo.customer.id", "c_bbbbb1": "dbo.child.id"},
+        "tombstones": {
+            T: {"was": "dbo.gone", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
     }));
-    let own_files = declared(&[
-        ("dbo.customer", "dbo/customer.yml", &["id"]),
-        ("dbo.child", "dbo/child.yml", &["id"]),
-    ]);
-    let project = written("attach", &two, &own_files);
-    // `dbo.child` is declared inside `dbo.customer` now: an attach.
-    let mut attached = declared(&[("dbo.customer", "dbo/customer.yml", &["id"])]);
-    attached.children.insert(
-        "dbo.child".parse().unwrap(),
-        "dbo.customer".parse().unwrap(),
+    plan(&project, &after, &DeclaredPaths::default())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        ["dbo.gone.t_aaaaaa.json"]
     );
-    refusal(
-        &project,
-        &two,
-        &attached,
-        "attaching or detaching a partition",
-    );
+    assert_eq!(read_opt(&project).unwrap(), Some(after));
+}
 
-    // And the other way round: a child recorded in its parent's file whose
-    // declaration is a table of its own again. A child has no column uids.
-    let child_ids = ids(json!({
+#[test]
+fn a_table_that_becomes_a_partition_moves_into_its_parents_file_and_back() {
+    let alone = ids(json!({
         "version": 1,
         "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.child"},
         "columns": {"c_aaaaa1": "dbo.customer.id"},
     }));
-    let mut as_child = declared(&[("dbo.customer", "dbo/customer.yml", &["id"])]);
-    as_child.children.insert(
+    let own = declared(&[
+        ("dbo.customer", "dbo/customer.yml", &["id"]),
+        ("dbo.child", "dbo/child.yml", &[]),
+    ]);
+    let project = written("attach", &alone, &own);
+    assert_eq!(tree(&project).len(), 2);
+    // `dbo.child` is declared inside `dbo.customer` now: an attach.
+    let mut inside = declared(&[("dbo.customer", "dbo/customer.yml", &["id"])]);
+    inside.children.insert(
         "dbo.child".parse().unwrap(),
         "dbo.customer".parse().unwrap(),
     );
-    let child_project = written("detach", &child_ids, &as_child);
-    refusal(
-        &child_project,
-        &child_ids,
-        &own_files,
-        "attaching or detaching a partition",
+    let write = plan(&project, &alone, &inside).unwrap();
+    assert_eq!(write.removals, ["dbo/child.json"]);
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["dbo/customer.json"]
     );
+    write.apply().unwrap();
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        ["dbo/customer.json"]
+    );
+    assert!(tree(&project)["dbo/customer.json"].contains("t_bbbbbb"));
+    assert_eq!(read_opt(&project).unwrap(), Some(alone.clone()));
+    // And the other way: detached, it has a file of its own again.
+    let write = plan(&project, &alone, &own).unwrap();
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["dbo/child.json", "dbo/customer.json"]
+    );
+    assert!(write.removals.is_empty());
+    write.apply().unwrap();
+    assert_eq!(tree(&project).len(), 2);
+    assert_eq!(read_opt(&project).unwrap(), Some(alone));
 }
 
 #[test]
-fn an_identity_file_the_new_mapping_no_longer_holds_is_refused() {
-    let project = written("removal", &customer(), &customer_declared());
-    refusal(
-        &project,
-        &IdsFile::default(),
-        &DeclaredPaths::default(),
-        "removing an identity file",
+fn a_live_child_no_declaration_names_stays_in_its_parents_file() {
+    let two = ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.child"},
+    }));
+    let mut with_child = declared(&[("dbo.customer", "dbo/customer.yml", &[])]);
+    with_child.children.insert(
+        "dbo.child".parse().unwrap(),
+        "dbo.customer".parse().unwrap(),
+    );
+    let project = written("undeclared-child", &two, &with_child);
+    // A withdrawn rebuild restores a name the declarations no longer spell.
+    let bare = declared(&[("dbo.customer", "dbo/customer.yml", &[])]);
+    assert!(plan(&project, &two, &bare).unwrap().is_empty());
+}
+
+#[test]
+fn a_child_that_changes_parent_moves_its_record() {
+    let ids3 = ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.a", "t_bbbbbb": "dbo.b", "t_cccccc": "dbo.child"},
+    }));
+    let mut under_a = declared(&[("dbo.a", "dbo/a.yml", &[]), ("dbo.b", "dbo/b.yml", &[])]);
+    under_a
+        .children
+        .insert("dbo.child".parse().unwrap(), "dbo.a".parse().unwrap());
+    let project = written("reparent", &ids3, &under_a);
+    let mut under_b = under_a.clone();
+    under_b
+        .children
+        .insert("dbo.child".parse().unwrap(), "dbo.b".parse().unwrap());
+    let write = plan(&project, &ids3, &under_b).unwrap();
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["dbo/a.json", "dbo/b.json"]
+    );
+    assert!(write.removals.is_empty());
+    write.apply().unwrap();
+    assert!(!tree(&project)["dbo/a.json"].contains("t_cccccc"));
+    assert!(tree(&project)["dbo/b.json"].contains("t_cccccc"));
+    assert_eq!(read_opt(&project).unwrap(), Some(ids3));
+}
+
+#[test]
+fn an_identity_the_mapping_no_longer_has_loses_its_file() {
+    let two = ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.order"},
+        "columns": {"c_aaaaa1": "dbo.customer.id", "c_bbbbb1": "dbo.order.id"},
+    }));
+    let both = declared(&[
+        ("dbo.customer", "dbo/customer.yml", &["id"]),
+        ("dbo.order", "dbo/order.yml", &["id"]),
+    ]);
+    let project = written("vanish", &two, &both);
+    // A withdrawn rebuild is the case: the replacement's identities go and the
+    // tree follows the mapping.
+    let one = ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.customer"},
+        "columns": {"c_aaaaa1": "dbo.customer.id"},
+    }));
+    let only = declared(&[("dbo.customer", "dbo/customer.yml", &["id"])]);
+    let write = plan(&project, &one, &only).unwrap();
+    assert_eq!(write.removals, ["dbo/order.json"]);
+    assert!(write.files.is_empty());
+    write.apply().unwrap();
+    assert_eq!(read_opt(&project).unwrap(), Some(one));
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        ["dbo/customer.json"]
     );
 }
 
@@ -254,7 +385,7 @@ fn a_declaration_with_an_identity_and_no_file_to_mirror_is_refused() {
         plan(&project, &customer(), &DeclaredPaths::default()).unwrap_err()
     );
     assert!(error.contains("no declaration to mirror"), "{error}");
-    assert!(error.contains("#2600 PR 5b"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
     assert_eq!(tree(&project), before);
     assert!(!project.ids_dir().exists());
 }

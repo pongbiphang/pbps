@@ -412,10 +412,6 @@ fn refresh_replaces_the_handle_and_expiry_requires_another_preview() {
 
 #[test]
 fn new_deleted_recreated_paths_and_modes_are_part_of_the_candidate() {
-    if crate::idtree::pending_5b("new_deleted_recreated_paths_and_modes_are_part_of_the_candidate")
-    {
-        return;
-    }
     let repo = Repository::new("membership", "");
     fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
     fs::write(repo.project.join("schema/renamed.yml"), RENAMED).unwrap();
@@ -475,11 +471,6 @@ fn deleting_the_last_declaration_keeps_the_snapshot_input_directory() {
 
 #[test]
 fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
-    if crate::idtree::pending_5b(
-        "declaration_file_directory_replacements_preserve_the_reviewed_scope",
-    ) {
-        return;
-    }
     for (directory_first, foreign) in [(false, false), (true, false), (true, true)] {
         let repo = Repository::new(&format!("replacement-{directory_first}-{foreign}"), "");
         let file = "schema/t.yml";

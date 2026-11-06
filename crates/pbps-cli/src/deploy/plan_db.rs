@@ -295,7 +295,9 @@ pub(super) async fn plan_db_selected(
                 );
             }
         }
-        if resolved.ids != ids {
+        if resolved.ids != ids
+            || crate::ids_store::is_stale(project, &resolved.ids, &loaded).unwrap_or(true)
+        {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
              A deployment plan must be computed against the identity its reviewers read.",

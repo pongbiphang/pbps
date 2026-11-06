@@ -1475,7 +1475,7 @@ is not an identity file; delete it and run migrate again.)
 
 <a id="dec-2600-9"></a>
 
-**DEC-2600.9. The tree is read everywhere; the write side is the minimal sync, and every file move is refused by name until #2600 PR 5b.**
+**DEC-2600.9. The tree is read everywhere; the write side is the sync of §3.4, which decides every file it writes, moves, sends aside or removes before it writes any.**
 Every reader of identities goes through `ids_store::read_opt`. A project with
 neither a tree nor `schema.ids.json` is fresh (`None`); one with only the legacy
 file is refused with "run `pbps ids migrate`", never read silently; one with
@@ -1503,15 +1503,28 @@ at the config (design §6.2). `init` and `pull` write through the same path, and
 `init` claims the root by creating `.pbps/ids`, which replaces the old
 `schema.ids.json` claim.
 
-What the write side refuses, by name and with the same closing sentence ("the
-switch to the identity tree is unfinished (#2600 PR 5b); nothing was written"),
-is exactly what moves a file: a declaration whose YAML moved or was renamed
-(relocation, design §3.4 step 2); a new declaration at a path another identity's
-file holds (displacement, step 5); a table that becomes or stops being a
-partition child, or changes parent (step 6); an identity file the new mapping no
-longer holds, or a drop of an identity the tree has no file for; and a
-declaration with an identity and no path. PR 5b turns each into a step of the
-sync and extends `plan` rather than replacing it. Until then `plan` only reaches
-a refusal when its mapping changed: a project whose YAML moved but whose
-identities did not is reported by `validate` as `ids.orphan`.
+A write places each identity in the file it already has, and moves it when its
+declaration moved. A declaration whose YAML moved or was renamed has its file
+written at the path the declaration now mirrors and the old one removed (§3.4
+step 2); the pairing is by uid, which `resolve` has already matched by name or
+`renamed_from`, so `ids.ambiguous-move` cannot arise here. A dropped object keeps
+its file (step 4), and a dropped file whose path a live declaration now wants is
+sent aside to `<name>.<uid>.json` (step 5), as is the dropped file of an object the
+tree never held. A table that becomes, stops being, or changes parent as a
+partition has its record moved between files, its own file removed or created
+(step 6). All of it is decided before `apply` writes: new files are renamed into
+place first and the removals follow, so a crash leaves both copies and never
+neither; the next read names the duplicate uid and the remedy is to delete the
+old file. A move empties no directory that holds something else.
+An identity the new mapping no longer has (a withdrawn rebuild takes its
+replacement's away) has its file removed: the mapping is the resolver's to decide,
+and the proof that the tree reads back to it is what keeps the store honest. Still
+refused, with nothing written: a live declaration with an identity and no file to
+put it in.
 
+`plan --check` and `deploy`'s `identity.stale` ask whether the tree is what the
+mapping and the declarations say it should be (design §3.5): a changed mapping,
+but also a declaration that moved, or bytes that are not canonical, when the
+mapping is unchanged. A plan that cannot be made is stale too, and `plan`
+reports why. `validate` keeps the tree validator's findings (including
+`ids.orphan`); `plan --check` does not repeat them.
