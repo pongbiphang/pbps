@@ -5344,3 +5344,48 @@ reference to FROM-clause entry"), so such an expression is noted at plan time
 and refused at its statement; the fix is to drop the schema from the reference.
 
 No plan format changes.
+
+<a id="dec-2563-7"></a>
+
+**DEC-2563.7. A bare table name in an expression binds as a column of the table's row type (PostgreSQL).**
+
+(#2563, review of #2705, ready round 1.) `t` alone in an expression is the row
+of the table, and PostgreSQL accepts it as the argument of a function that takes
+the table's row type: a policy `USING (app.visible(t))`, a CHECK, an index key
+and an index filter, on 16.15 and 18.6. A generated expression refuses a
+whole-row reference itself ("cannot use whole-row variable in column generation
+expression"), and a DEFAULT refuses any column reference, so those two stay as
+the engine has them. On the binding table (DEC-2563.6) the same `t` was the row
+of the binding table, a type no function takes, so a valid plan was noted at
+plan time and refused at its statement.
+
+The binding table now has one more column, named like the table, whose type is
+the real table's row type. A column of that name is found before the row, so
+`t` resolves to a value of the type the function takes, and `t.a` still resolves
+on the binding table's own columns. The stored tree has a `VAR` of that column
+where the real table has the whole-row `VAR`; the routines in it, which are what
+is judged, are the same, and the column adds none. It is added only when some
+function or operator takes the table's row type (`takes_row_type`), so a binding
+that no such routine can reach is built exactly as before, and a table whose
+owner has revoked USAGE on the row type from PUBLIC is not newly refused. It is
+not added when the table, or the change, already has a column of that name: that
+is what the name means on the real table too.
+
+Measured and refused as designs, each on 16 and 18: a cast from the binding
+table's type to the real one (`CREATE CAST ... WITHOUT FUNCTION` needs a
+superuser, and `WITH FUNCTION` puts that function in the judged tree); a typed
+table (`CREATE TABLE ... OF app.t` is refused, since `app.t` is the row type of
+another table); a table that inherits from the real one (the deployer must own
+it, and it sets `relhassubclass` on the real table).
+
+Not covered: `t.*`. PostgreSQL accepts it where `t` is accepted, as the same
+whole-row value, but it names the relation, which is found before any column, and
+a relation's row type is always its own (measured: with the column present,
+`app.visible(t.*)` still fails to resolve). Making it resolve needs a rewrite of
+the expression text that finds the reference, which needs a parser, so it stays
+noted at plan time and refused at its statement, with `t` as the equivalent
+spelling in a function argument. A generated expression that spells the row as
+`t` is now bound and then refused by the engine at its statement, where it was
+refused as unbindable before.
+
+No plan format changes.

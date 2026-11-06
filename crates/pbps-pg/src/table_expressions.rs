@@ -67,6 +67,15 @@ struct Spec {
     /// build, which is an expression that cannot be bound, never a table
     /// dropped.
     bound: String,
+    /// The real table whose row type a column of the binding table, named like
+    /// the table, carries ([`takes_row_type`]). A bare `t` in an expression is
+    /// the row of the table. On the binding table it would be the row of the
+    /// binding table, a type no function takes, so a policy
+    /// `USING (app.visible(t))` that PostgreSQL accepts on the real table would
+    /// not resolve. A column of that name is found before the row and has the
+    /// type the function takes. `t.*` is not covered: it names the relation, and
+    /// a relation's row type is always its own (DEC-2563.7).
+    whole_row: Option<TableName>,
     /// The table the columns are copied from, or `None` for a table the plan
     /// creates, whose columns are all listed.
     like: Option<TableName>,
@@ -443,9 +452,22 @@ async fn vet_bound(
         Ok(None) => return Ok(Vetted::Admitted),
         Err(why) => return unbound(&describe(change), &why),
     };
-    if let Some(table) = &spec.like {
-        match column_names(conn, table).await {
-            Ok(taken) => name_bound_columns(&mut spec, taken),
+    if let Some(table) = spec.like.clone() {
+        match column_names(conn, &table).await {
+            Ok(taken) => {
+                // A column the table, or this change, already calls by the
+                // table's name is what that name means on the real table too.
+                let free = !taken.contains(&spec.bound)
+                    && !spec.columns.iter().any(|c| c.bound == spec.bound);
+                name_bound_columns(&mut spec, taken);
+                if free {
+                    match takes_row_type(conn, &table).await {
+                        Ok(true) => spec.whole_row = Some(table),
+                        Ok(false) => {}
+                        Err(why) => return unbound(&spec.what, &why),
+                    }
+                }
+            }
             Err(why) => return unbound(&spec.what, &why),
         }
     }
@@ -474,7 +496,7 @@ async fn vet_bound(
     let constraints = spec.constraints();
     let regclass = spec.regclass()?;
     let expected = [
-        like_columns + count(spec.columns.len()),
+        like_columns + count(spec.columns.len()) + count(usize::from(spec.whole_row.is_some())),
         count(constraints.len()),
         count(
             spec.columns
@@ -821,6 +843,13 @@ fn create_statement(spec: &Spec) -> Result<String, String> {
             crate::emit::qualified(table).map_err(|e| e.to_string())?
         ));
     }
+    if let Some(table) = &spec.whole_row {
+        parts.push(format!(
+            "{} {}",
+            quoted(&spec.bound)?,
+            crate::emit::qualified(table).map_err(|e| e.to_string())?
+        ));
+    }
     for c in &spec.columns {
         let value = match &c.value {
             Some(Value::Default(e)) => format!(" DEFAULT ({e}\n)"),
@@ -865,6 +894,33 @@ async fn column_names(
         .iter()
         .filter_map(|r| r.try_get::<&str>("name").ok().flatten().map(str::to_owned))
         .collect())
+}
+
+/// Whether any function or operator takes the row type of `table`, which is
+/// the only way a bare `t` in an expression can need that type. Asked so that a
+/// binding that no such routine can reach is built exactly as before: the extra
+/// column asks for USAGE on the type, which a table owner may have revoked.
+async fn takes_row_type(conn: &mut Conn, table: &TableName) -> Result<bool, String> {
+    let qualified = crate::emit::qualified(table).map_err(|e| e.to_string())?;
+    let rows = conn
+        .query_with(
+            "SELECT (EXISTS (SELECT 1 FROM pg_catalog.pg_proc p
+                              WHERE r.reltype OPERATOR(pg_catalog.=) ANY (p.proargtypes::pg_catalog.oid[]))
+                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_operator o
+                              WHERE r.reltype OPERATOR(pg_catalog.=) o.oprleft
+                                 OR r.reltype OPERATOR(pg_catalog.=) o.oprright)) AS taken
+               FROM pg_catalog.pg_class r
+              WHERE r.oid OPERATOR(pg_catalog.=) $1::pg_catalog.text::pg_catalog.regclass",
+            &[Param::Str(&qualified)],
+        )
+        .await
+        .map_err(|e| {
+            e.server_error_code()
+                .unwrap_or_else(|| "unknown".to_owned())
+        })?;
+    rows.first()
+        .and_then(|r| r.try_get::<bool>("taken").ok().flatten())
+        .ok_or_else(|| "42P01".to_owned())
 }
 
 /// Gives every bound column a name the copied columns do not have. The copy
@@ -932,6 +988,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
         Change::CreateTable { name, table, .. } => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
+            whole_row: None,
             table: name.shown().to_string(),
             schema: name.schema.clone(),
             like: None,
@@ -963,6 +1020,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
         } => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
+            whole_row: None,
             table: table.shown().to_string(),
             schema: table.schema.clone(),
             like: Some(table.clone()),
@@ -983,6 +1041,7 @@ async fn spec(conn: &mut Conn, change: &Change) -> Result<Option<Spec>, String> 
         } => Spec {
             what: describe(change),
             bound: bound_table(change).unwrap_or_default().to_owned(),
+            whole_row: None,
             table: table.shown().to_string(),
             schema: table.schema.clone(),
             like: Some(table.clone()),
@@ -1034,6 +1093,7 @@ async fn existing(
     Ok(Spec {
         what: describe(change),
         bound: bound_table(change).unwrap_or_default().to_owned(),
+        whole_row: None,
         table: column.table.shown().to_string(),
         schema: column.table.schema.clone(),
         like: Some(column.table.clone()),
@@ -1059,6 +1119,7 @@ fn on_table(
     Spec {
         what: describe(change),
         bound: bound_table(change).unwrap_or_default().to_owned(),
+        whole_row: None,
         table: table.shown().to_string(),
         schema: table.schema.clone(),
         like: Some(table.clone()),

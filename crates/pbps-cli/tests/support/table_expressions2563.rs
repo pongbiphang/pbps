@@ -982,3 +982,155 @@ fn a_column_qualified_with_its_table_is_bound_in_every_expression_site() {
         }
     }
 }
+
+/// `t` alone in an expression is the row of the table. PostgreSQL accepts it
+/// as the argument of a function that takes the table's row type, in a policy,
+/// a CHECK and an index key or filter (measured on 16 and 18; a generated
+/// expression refuses a whole-row reference itself), so the binding table gives
+/// that name a column of that type, and a valid plan is neither noted as
+/// unbindable nor refused at its statement. The same routine owned by a role
+/// nobody trusts is still refused, which shows the tree with the row in it is
+/// the one judged (review of #2705, ready round 1; DEC-2563.7).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_whole_row_reference_is_bound_as_the_table_it_names_in_every_site_postgres_accepts() {
+    let sites: [(&str, String, &str); 4] = [
+        (
+            "policy",
+            format!(
+                "{BASE}row_policies:\n  p: {{using: 'app.val(t) > 0', with_check: 'app.val(t) > 0'}}\n"
+            ),
+            "SELECT count(*)::text FROM pg_policy WHERE polrelid = 'app.t'::regclass",
+        ),
+        (
+            "check",
+            format!("{BASE}checks:\n  ck: 'app.val(t) > 0'\n"),
+            "SELECT count(*)::text FROM pg_constraint WHERE conname = 'ck' AND conrelid = 'app.t'::regclass",
+        ),
+        (
+            "key",
+            format!("{BASE}indexes:\n  ix:\n    keys:\n      - expression: 'app.val(t)'\n"),
+            "SELECT count(*)::text FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'ix'",
+        ),
+        (
+            "filter",
+            format!("{BASE}indexes:\n  ix:\n    columns: [id]\n    where: 'app.val(t) > 0'\n"),
+            "SELECT count(*)::text FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'ix'",
+        ),
+    ];
+    for (version, url) in [(16, old_server()), (18, server())] {
+        for (site, declared, present) in &sites {
+            for trusted in [true, false] {
+                let slug = format!("tx2563-row-{site}-{trusted}-{version}");
+                let own = OwnDatabase::new(&url, &slug);
+                let connection = own.connection().to_owned();
+                let d = bootstrapped_demo(&connection, &slug, BASE);
+                d.keyed(&connection);
+                let stranger = format!("pbps_tx2563r_{version}_{}_{site}", std::process::id());
+                let owner = if trusted {
+                    String::new()
+                } else {
+                    on_server(&url, &format!("CREATE ROLE {stranger}"));
+                    format!(
+                        "GRANT USAGE ON SCHEMA app TO {stranger}; \
+                         ALTER FUNCTION app.val(app.t) OWNER TO {stranger}"
+                    )
+                };
+                on_server(
+                    &connection,
+                    &format!(
+                        "CREATE FUNCTION app.val(app.t) RETURNS int LANGUAGE sql IMMUTABLE \
+                           SET search_path = pg_catalog AS 'SELECT 1'; {owner}"
+                    ),
+                );
+                d.table(declared);
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                let plan = d.dir.join("row-plan.json");
+                let planned =
+                    d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+                let label = format!("PG{version} {site} trusted={trusted}");
+                assert_eq!(code(&planned), 0, "{label}: {}", text(&planned));
+                assert!(
+                    !text(&planned).contains("judged at apply only"),
+                    "{label}: {}",
+                    text(&planned)
+                );
+                let applied = approved_apply(
+                    &d,
+                    &connection,
+                    &plan,
+                    &["--allow", "destructive,narrowing,constraint,row-security"],
+                );
+                let shown = text(&applied);
+                if trusted {
+                    assert_eq!(code(&applied), 0, "{label}: {shown}");
+                    assert_eq!(text_of(&connection, present), "1", "{label}");
+                } else {
+                    assert_ne!(code(&applied), 0, "{label}: {shown}");
+                    assert!(
+                        shown.contains("`pin_type_routines: true`"),
+                        "{label}: {shown}"
+                    );
+                    assert_eq!(text_of(&connection, present), "0", "{label}");
+                }
+            }
+        }
+    }
+}
+
+/// The negative of the above: a function that takes another composite type is
+/// not made to resolve by a row of this table, so the plan is noted as unbound
+/// and its statement refused, exactly where PostgreSQL stops on the real table.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_function_taking_another_composite_type_stays_refused_for_a_whole_row_reference() {
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let slug = format!("tx2563-otherrow-{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection().to_owned();
+        let d = bootstrapped_demo(&connection, &slug, BASE);
+        d.keyed(&connection);
+        on_server(
+            &connection,
+            // The first function is what makes the table's row type reachable, so
+            // the binding table has a column of that type for `t` to be: the
+            // second takes another type and must not resolve on it.
+            "CREATE FUNCTION app.mine(app.t) RETURNS int LANGUAGE sql IMMUTABLE \
+               SET search_path = pg_catalog AS 'SELECT 1'; \
+             CREATE FUNCTION app.other(pg_catalog.pg_class) RETURNS int LANGUAGE sql IMMUTABLE \
+               SET search_path = pg_catalog AS 'SELECT 1'",
+        );
+        d.table(&format!("{BASE}checks:\n  ck: 'app.other(t) > 0'\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("other-plan.json");
+        let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        assert!(
+            text(&planned).contains("judged at apply only"),
+            "PG{version}: {}",
+            text(&planned)
+        );
+        let applied = approved_apply(
+            &d,
+            &connection,
+            &plan,
+            &["--allow", "destructive,narrowing,constraint"],
+        );
+        assert_ne!(code(&applied), 0, "PG{version}: {}", text(&applied));
+        assert!(
+            text(&applied).contains("could not be bound just before they run"),
+            "PG{version}: {}",
+            text(&applied)
+        );
+        assert_eq!(
+            text_of(
+                &connection,
+                "SELECT count(*)::text FROM pg_constraint WHERE conname = 'ck'"
+            ),
+            "0",
+            "PG{version}"
+        );
+    }
+}
