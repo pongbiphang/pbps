@@ -73,6 +73,7 @@ pub mod class_read;
 pub mod domain_alter;
 pub mod drop_requirements;
 pub mod estimate;
+pub mod existing_expressions;
 pub mod generated;
 pub mod impact;
 pub mod input_path;

@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::admission::{self, Admission, Cause, Judgement};
+use crate::existing_expressions::{self, Kind, Site};
 use pbps_db::{Conn, DbError};
 use pbps_dialect::{RowOperation, RowWrite};
 use pbps_model::{ModuleId, ModuleKind, Schema, TableName};
@@ -24,6 +25,9 @@ const DENIED: &str = "42501";
 const INSERT: i16 = 4;
 const DELETE: i16 = 8;
 const UPDATE: i16 = 16;
+/// The event of a statement that rewrites or scans rows without writing them: no
+/// trigger bit, so nothing in the trigger catalog matches it (DEC-2563.9).
+const REWRITE: i16 = 0;
 
 /// Valid only inside the transaction that authenticated and locked the tables.
 /// Oids survive a table rename; names alone would also bless a replacement.
@@ -51,6 +55,80 @@ pub struct Dropped {
     /// Referencing table and constraint name, as `pg_constraint` spells them.
     pub foreign_keys: BTreeSet<(TableName, pbps_model::ObjectLocalName)>,
     pub tables: BTreeSet<TableName>,
+    /// The expressions of a table the plan removes before its rows are written
+    /// (`order_key` classes 0, 2 and 5 against 8 to 12), by table and name as
+    /// the catalog still spells them (DEC-2563.9). Like the rest of this
+    /// struct they are `prepare`'s allowance alone.
+    pub checks: BTreeSet<(TableName, String)>,
+    pub indexes: BTreeSet<(TableName, String)>,
+    pub policies: BTreeSet<(TableName, String)>,
+    /// Columns whose default or generated expression the plan drops or replaces.
+    pub values: BTreeSet<(TableName, String)>,
+    /// A domain's check the plan drops.
+    pub domain_checks: BTreeSet<(pbps_model::TypeRef, String)>,
+}
+
+impl Dropped {
+    /// Records the expression `change` removes or replaces, by the table and the
+    /// name the catalog still holds: a check, an index, a policy, a default or a
+    /// generated expression (a dropped or altered column), and a domain's check.
+    /// Every one is ordered ahead of the row changes and the rewrites
+    /// (`order_key` classes 0, 2, 5 and 9 against 8, 9, 11 and 12), so by the
+    /// time one runs the expression is gone (DEC-2563.9).
+    ///
+    /// `stored` maps a table, and `stored_column` a column, from the plan's
+    /// spelling to the one the catalog has before the plan's renames.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "every other change removes no expression a row statement would run"
+    )]
+    pub fn note_removed_expressions(
+        &mut self,
+        change: &pbps_model::Change,
+        stored: &dyn Fn(&TableName) -> Option<TableName>,
+        stored_column: &dyn Fn(&pbps_model::ColumnRef) -> String,
+    ) {
+        use pbps_model::Change;
+        match change {
+            Change::DropCheck { table, name } => {
+                if let Some(old) = stored(table) {
+                    self.checks.insert((old, name.raw().to_owned()));
+                }
+            }
+            Change::DropIndex { table, name } => {
+                if let Some(old) = stored(table) {
+                    self.indexes.insert((old, name.raw().to_owned()));
+                }
+            }
+            Change::DropPolicy { table, name, .. } => {
+                if let Some(old) = stored(table) {
+                    self.policies.insert((old, name.clone()));
+                }
+            }
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. } => {
+                if let Some(old) = stored(&column.table) {
+                    self.values.insert((old, stored_column(column)));
+                }
+            }
+            Change::AlterDomain {
+                name,
+                from,
+                to,
+                half: pbps_model::DomainHalf::Loosen,
+                ..
+            } => {
+                if let Some(delta) = pbps_model::DomainDelta::of(from, to) {
+                    for check in delta.drop_checks {
+                        self.domain_checks
+                            .insert((name.clone(), check.raw().to_owned()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Authenticate existing triggers before any plan statement changes names.
@@ -70,8 +148,11 @@ pub async fn prepare(
         trusted: admission.trusted().to_vec(),
         ..Guard::default()
     };
+    let mut sites = Vec::new();
     for write in writes {
-        for trigger in reachable(conn, &write, dropped, &guard.trusted).await? {
+        let reached = reachable(conn, &write, dropped, &guard.trusted).await?;
+        sites.extend(reached.sites);
+        for trigger in reached.triggers {
             let id = ModuleId::Trigger {
                 on: trigger.table.clone(),
                 name: trigger.name.clone(),
@@ -98,6 +179,11 @@ pub async fn prepare(
             }
         }
     }
+    // Every expression the writes run, judged together, so that one refusal
+    // names every routine that is not admitted (DEC-2563.9).
+    existing_expressions::judge(conn, admission, sites)
+        .await
+        .map_err(DbError::Refused)?;
     Ok(guard)
 }
 
@@ -114,8 +200,14 @@ pub async fn settle(conn: &mut Conn) -> Result<(), DbError> {
 
 /// Recheck immediately before each row statement, including on a newly created
 /// or renamed table. The lock stays held through that statement's transaction.
-pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
-    for trigger in reachable(conn, write, &Dropped::default(), &guard.trusted).await? {
+pub async fn check(
+    conn: &mut Conn,
+    admission: &Admission,
+    write: &RowWrite,
+    guard: &Guard,
+) -> Result<(), DbError> {
+    let reached = reachable(conn, write, &Dropped::default(), &guard.trusted).await?;
+    for trigger in reached.triggers {
         let approved = |oid: i64| guard.approved.get(&oid) == Some(&trigger.function_oid);
         if !(approved(trigger.oid) || trigger.parent_oid.is_some_and(approved))
             || !trigger.causes.is_empty()
@@ -123,15 +215,33 @@ pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(
             return Err(refused(&trigger, &write.table));
         }
     }
+    // The expressions as they stand now, with no allowance for what the plan
+    // meant to remove: if it is still there, the statement runs it.
+    existing_expressions::judge(conn, admission, reached.sites)
+        .await
+        .map_err(DbError::Refused)?;
     Ok(())
 }
 
 fn event(operation: &RowOperation) -> i16 {
     match operation {
-        RowOperation::Insert => INSERT,
+        RowOperation::Insert | RowOperation::Copy => INSERT,
         RowOperation::Update { .. } => UPDATE,
         RowOperation::Delete => DELETE,
+        RowOperation::Rewrite => REWRITE,
     }
+}
+
+/// Whether the operation writes through the trigger catalog at all. A rewrite
+/// and a copy into a table the plan created fire none the guard answers for.
+fn fires_triggers(operation: &RowOperation) -> bool {
+    !matches!(operation, RowOperation::Rewrite | RowOperation::Copy)
+}
+
+/// What one write reaches: the triggers it fires and the expressions it runs.
+struct Reached {
+    triggers: Vec<Trigger>,
+    sites: Vec<Site>,
 }
 
 /// What the catalog says of a trigger's function.
@@ -188,7 +298,7 @@ async fn reachable(
     write: &RowWrite,
     dropped: &Dropped,
     trusted: &[pbps_model::RoleName],
-) -> Result<Vec<Trigger>, DbError> {
+) -> Result<Reached, DbError> {
     let table = &write.table;
     // No ONLY: PostgreSQL DML can reach inheritance descendants, and locking
     // the descendants is what keeps their triggers from being replaced too.
@@ -224,7 +334,7 @@ async fn walk(
     write: &RowWrite,
     dropped: &Dropped,
     trusted: &[pbps_model::RoleName],
-) -> Result<Vec<Trigger>, DbError> {
+) -> Result<Reached, DbError> {
     let table = &write.table;
     let rows = conn
         .query(&format!(
@@ -238,7 +348,10 @@ async fn walk(
     let Some(row) = rows.first() else {
         // The lock above already succeeded, so the name resolved a moment ago;
         // a write to a table that is gone fails on its own statement.
-        return Ok(Vec::new());
+        return Ok(Reached {
+            triggers: Vec::new(),
+            sites: Vec::new(),
+        });
     };
     let named = row.try_get::<i64>("oid")?.ok_or_else(missing)?;
     let mut queue = VecDeque::from([Statement {
@@ -248,7 +361,10 @@ async fn walk(
             RowOperation::Update { columns } => {
                 columns.iter().map(|c| c.raw().to_owned()).collect()
             }
-            RowOperation::Insert | RowOperation::Delete => BTreeSet::new(),
+            RowOperation::Insert
+            | RowOperation::Delete
+            | RowOperation::Copy
+            | RowOperation::Rewrite => BTreeSet::new(),
         },
         partitions_only: false,
         rows_only: false,
@@ -256,12 +372,20 @@ async fn walk(
     let mut done = BTreeSet::new();
     let mut locked = BTreeSet::from([named]);
     let mut triggers = Vec::new();
+    let mut sites = Vec::new();
+    let fires = fires_triggers(&write.operation);
     while let Some(statement) = queue.pop_front() {
         if !done.insert(statement.clone()) {
             continue;
         }
         if locked.insert(statement.relation) {
             lock_by_oid(conn, statement.relation).await?;
+        }
+        // The expressions this statement runs, on the relation it names and on
+        // the partitions and descendants it reaches (DEC-2563.9).
+        sites.extend(read_sites(conn, &statement, statement.relation != named, dropped).await?);
+        if !fires {
+            continue;
         }
         refuse_rules(conn, &statement).await?;
         triggers.extend(
@@ -313,7 +437,7 @@ async fn walk(
             trigger.causes = causes;
         }
     }
-    Ok(triggers)
+    Ok(Reached { triggers, sites })
 }
 
 /// Lock a relation the closure found, and prove the lock landed on it.
@@ -867,6 +991,266 @@ fn gone(dropped: &Dropped) -> String {
     }
 }
 
+/// `name` is one of `pairs` for the table this statement names, or `false`.
+fn gone_named(pairs: &BTreeSet<(TableName, String)>, name: &str) -> String {
+    let clauses: Vec<String> = pairs
+        .iter()
+        .map(|(table, wanted)| {
+            format!(
+                "(root.schema_name = {} AND root.table_name = {} AND {name} = {})",
+                literal(&table.schema),
+                literal(&table.name),
+                literal(wanted)
+            )
+        })
+        .collect();
+    if clauses.is_empty() {
+        "false".to_owned()
+    } else {
+        clauses.join(" OR ")
+    }
+}
+
+/// The expressions one statement runs, as stored (DEC-2563.9).
+///
+/// Which sites a statement runs is a measured fact, not a reading of the
+/// catalog: see [`existing_expressions`]. What the plan removes before its rows
+/// are written is left out here and only here; `check` passes no removals, so
+/// what is still standing when the row statement runs is judged.
+async fn read_sites(
+    conn: &mut Conn,
+    statement: &Statement,
+    through_an_action: bool,
+    dropped: &Dropped,
+) -> Result<Vec<Site>, DbError> {
+    let (extra, arms) = site_arms(statement, through_an_action, dropped);
+    run_sites(conn, statement, dropped, &extra, &arms).await
+}
+
+/// The queries, one per kind of expression the statement runs, and the CTE the
+/// domain ones read. Pure, so the table of the module docs is a unit test.
+fn site_arms(
+    statement: &Statement,
+    through_an_action: bool,
+    dropped: &Dropped,
+) -> (String, Vec<String>) {
+    let event = statement.event;
+    let (insert, update, delete, rewrite) = (
+        event == INSERT,
+        event == UPDATE,
+        event == DELETE,
+        event == REWRITE,
+    );
+    // A movement's INSERT half evaluates no default, and a referential action
+    // is the engine's own statement, which row security does not apply to
+    // (measured on 16 and 18).
+    let defaults = (insert && !statement.rows_only) || (update && through_an_action);
+    let policies = (insert || update || delete) && !through_an_action && !statement.rows_only;
+    // An UPDATE runs the generated expressions and domain checks of the columns
+    // it sets (and of the ones those feed); an INSERT, every one.
+    let touched = if update { touched_join() } else { "" };
+    let on = "n.nspname::pg_catalog.text || '.' || c.relname::pg_catalog.text";
+    let from = "FROM relations r \
+                JOIN pg_catalog.pg_class c ON c.oid = r.oid \
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                CROSS JOIN root";
+    let mut arms: Vec<String> = Vec::new();
+    if insert || update {
+        arms.push(format!(
+            "SELECT 'check' AS kind, r.oid::int8 AS oid, {on} AS place,
+                    con.conname::pg_catalog.text AS name, con.conbin::pg_catalog.text AS tree
+             {from}
+             JOIN pg_catalog.pg_constraint con
+               ON con.conrelid = r.oid AND con.contype = 'c' AND con.conbin IS NOT NULL
+             WHERE NOT ({gone})",
+            gone = gone_named(&dropped.checks, "con.conname::pg_catalog.text")
+        ));
+    }
+    for (kind, generated, wanted) in [
+        ("default", "= ''", defaults),
+        ("generated", "<> ''", insert || update),
+    ] {
+        if wanted {
+            // A default is the INSERT's, and a referential action's own
+            // `SET DEFAULT`; the latter reads the columns the statement sets.
+            let join = touched;
+            arms.push(format!(
+                "SELECT '{kind}' AS kind, r.oid::int8 AS oid, {on} AS place,
+                        a.attname::pg_catalog.text AS name, ad.adbin::pg_catalog.text AS tree
+                 {from}
+                 JOIN pg_catalog.pg_attribute a
+                   ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+                  AND a.attgenerated {generated}
+                 JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+                 {join}
+                 WHERE NOT ({gone})",
+                gone = gone_named(&dropped.values, "a.attname::pg_catalog.text")
+            ));
+        }
+    }
+    if insert || update || rewrite {
+        for (kind, column) in [("index_key", "indexprs"), ("index_filter", "indpred")] {
+            // A clone of a partitioned parent's index goes with the parent's,
+            // under a name of its own.
+            let gone = gone_named(&dropped.indexes, "ic.relname::pg_catalog.text");
+            let gone_parent = gone_named(&dropped.indexes, "pi.relname::pg_catalog.text");
+            arms.push(format!(
+                "SELECT '{kind}' AS kind, r.oid::int8 AS oid, {on} AS place,
+                        ic.relname::pg_catalog.text AS name, i.{column}::pg_catalog.text AS tree
+                 {from}
+                 JOIN pg_catalog.pg_index i ON i.indrelid = r.oid AND i.{column} IS NOT NULL
+                 JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+                 WHERE NOT ({gone}) AND NOT EXISTS (
+                     SELECT 1 FROM pg_catalog.pg_inherits ih
+                     JOIN pg_catalog.pg_class pi ON pi.oid = ih.inhparent
+                     WHERE ih.inhrelid = ic.oid AND ({gone_parent}))"
+            ));
+        }
+    }
+    if policies {
+        // The policies that apply to the deploying role for this command, and
+        // only where row security applies to that role at all: the server's own
+        // answer, which owners, superusers and `BYPASSRLS` roles do not meet
+        // (DEC-2563.10).
+        let commands = if insert {
+            "'*', 'a'"
+        } else if update {
+            "'*', 'w', 'r'"
+        } else {
+            "'*', 'd', 'r'"
+        };
+        for (suffix, column) in [("USING", "polqual"), ("WITH CHECK", "polwithcheck")] {
+            arms.push(format!(
+                "SELECT 'policy' AS kind, r.oid::int8 AS oid, {on} AS place,
+                        p.polname::pg_catalog.text || ' {suffix}' AS name,
+                        p.{column}::pg_catalog.text AS tree
+                 {from}
+                 JOIN pg_catalog.pg_policy p ON p.polrelid = r.oid AND p.{column} IS NOT NULL
+                 WHERE pg_catalog.row_security_active(r.oid)
+                   AND p.polcmd IN ({commands})
+                   AND (0 = ANY(p.polroles) OR EXISTS (
+                        SELECT 1 FROM pg_catalog.unnest(p.polroles) AS x(rid)
+                        WHERE pg_catalog.pg_has_role(CURRENT_USER, x.rid, 'MEMBER')))
+                   AND NOT ({gone})",
+                gone = gone_named(&dropped.policies, "p.polname::pg_catalog.text")
+            ));
+        }
+    }
+    if insert || update {
+        let only_set = if update {
+            "AND EXISTS (SELECT 1 FROM touched t WHERE t.attrelid = a.attrelid AND t.attnum = a.attnum)"
+        } else {
+            ""
+        };
+        let gone_domain: Vec<String> = dropped
+            .domain_checks
+            .iter()
+            .map(|(ty, name)| {
+                format!(
+                    "(dn.nspname = {} AND dt.typname = {} AND con.conname = {})",
+                    literal(ty.schema()),
+                    literal(ty.name()),
+                    literal(name)
+                )
+            })
+            .collect();
+        let gone_domain = if gone_domain.is_empty() {
+            "false".to_owned()
+        } else {
+            gone_domain.join(" OR ")
+        };
+        // The checks of every domain on the column's chain; the DEFAULT of the
+        // declared type alone, which is all the engine ever evaluates.
+        arms.push(format!(
+            "SELECT 'domain_check' AS kind, d.typid::int8 AS oid,
+                    d.typid::pg_catalog.regtype::pg_catalog.text AS place,
+                    con.conname::pg_catalog.text AS name, con.conbin::pg_catalog.text AS tree
+             FROM domains d
+             JOIN pg_catalog.pg_type dt ON dt.oid = d.typid
+             JOIN pg_catalog.pg_namespace dn ON dn.oid = dt.typnamespace
+             JOIN pg_catalog.pg_constraint con
+               ON con.contypid = d.typid AND con.contype = 'c' AND con.conbin IS NOT NULL
+             WHERE NOT ({gone_domain})"
+        ));
+        if defaults {
+            arms.push(
+                "SELECT 'domain_default' AS kind, d.typid::int8 AS oid,
+                        d.typid::pg_catalog.regtype::pg_catalog.text AS place,
+                        ''::pg_catalog.text AS name, dt.typdefaultbin::pg_catalog.text AS tree
+                 FROM domains d
+                 JOIN pg_catalog.pg_type dt ON dt.oid = d.typid
+                 WHERE d.typid = d.declared AND dt.typdefaultbin IS NOT NULL"
+                    .to_owned(),
+            );
+        }
+        let domains = format!(
+            ", domains(attrelid, attnum, declared, typid) AS (
+                 SELECT a.attrelid, a.attnum, a.atttypid, a.atttypid
+                 FROM relations r
+                 JOIN pg_catalog.pg_attribute a
+                   ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype = 'd'
+                 WHERE true {only_set}
+                 UNION ALL
+                 SELECT d.attrelid, d.attnum, d.declared, t.typbasetype
+                 FROM domains d
+                 JOIN pg_catalog.pg_type t ON t.oid = d.typid
+                 JOIN pg_catalog.pg_type b ON b.oid = t.typbasetype
+                 WHERE b.typtype = 'd'
+             )"
+        );
+        return (domains, arms);
+    }
+    (String::new(), arms)
+}
+
+/// The columns an UPDATE sets, joined to the attribute a default belongs to.
+fn touched_join() -> &'static str {
+    "JOIN touched t ON t.attrelid = a.attrelid AND t.attnum = a.attnum"
+}
+
+async fn run_sites(
+    conn: &mut Conn,
+    statement: &Statement,
+    dropped: &Dropped,
+    extra: &str,
+    arms: &[String],
+) -> Result<Vec<Site>, DbError> {
+    if arms.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The domain arms read `domains`, which only an INSERT or an UPDATE defines.
+    let sql = format!(
+        "{ctes},
+         root(schema_name, table_name) AS (
+             SELECT n.nspname::pg_catalog.text, c.relname::pg_catalog.text
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.oid = {relation}::pg_catalog.oid
+         ){extra}
+         {arms}",
+        ctes = reached(statement, dropped),
+        relation = statement.relation,
+        arms = arms.join("\n UNION ALL\n "),
+    );
+    let rows = conn.query(&sql).await?;
+    rows.iter()
+        .map(|row| {
+            let label = row.try_get::<&str>("kind")?.ok_or_else(missing)?;
+            Ok(Site {
+                kind: Kind::from_label(label).ok_or_else(missing)?,
+                oid: row.try_get("oid")?.ok_or_else(missing)?,
+                on: row
+                    .try_get::<&str>("place")?
+                    .ok_or_else(missing)?
+                    .to_owned(),
+                name: row.try_get::<&str>("name")?.ok_or_else(missing)?.to_owned(),
+                tree: row.try_get::<&str>("tree")?.ok_or_else(missing)?.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -921,4 +1305,182 @@ fn moved(relation: i64) -> DbError {
 
 fn missing() -> DbError {
     DbError::Refused("data trigger catalog read returned a missing value".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statement(event: i16, rows_only: bool) -> Statement {
+        Statement {
+            relation: 16384,
+            event,
+            columns: BTreeSet::from(["b".to_owned()]),
+            partitions_only: false,
+            rows_only,
+        }
+    }
+
+    /// The kinds of expression `event` is judged for, by the label each query
+    /// selects.
+    fn kinds(event: i16, rows_only: bool, through_an_action: bool) -> BTreeSet<String> {
+        let (_, arms) = site_arms(
+            &statement(event, rows_only),
+            through_an_action,
+            &Dropped::default(),
+        );
+        arms.iter()
+            .map(|arm| arm.split('\'').nth(1).expect("a labelled query").to_owned())
+            .collect()
+    }
+
+    fn set(labels: &[&str]) -> BTreeSet<String> {
+        labels.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_insert_runs_every_kind_and_a_movements_insert_half_no_default() {
+        let all = [
+            "check",
+            "default",
+            "generated",
+            "index_key",
+            "index_filter",
+            "policy",
+            "domain_check",
+            "domain_default",
+        ];
+        assert_eq!(kinds(INSERT, false, false), set(&all));
+        // Measured: the INSERT half of a row movement evaluates no default,
+        // and row security is the one UPDATE's, judged there.
+        assert_eq!(
+            kinds(INSERT, true, false),
+            set(&[
+                "check",
+                "generated",
+                "index_key",
+                "index_filter",
+                "domain_check"
+            ])
+        );
+    }
+
+    #[test]
+    fn an_update_runs_no_default_unless_a_referential_action_sets_it() {
+        let own = set(&[
+            "check",
+            "generated",
+            "index_key",
+            "index_filter",
+            "policy",
+            "domain_check",
+        ]);
+        assert_eq!(kinds(UPDATE, false, false), own);
+        // The engine's own statement: `SET DEFAULT` evaluates the column's
+        // default, which a column of a domain takes from the domain, and row
+        // security does not apply (measured on 16 and 18).
+        assert_eq!(
+            kinds(UPDATE, false, true),
+            set(&[
+                "check",
+                "default",
+                "generated",
+                "index_key",
+                "index_filter",
+                "domain_check",
+                "domain_default"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_delete_runs_only_a_policy_and_a_cascaded_delete_nothing() {
+        assert_eq!(kinds(DELETE, false, false), set(&["policy"]));
+        assert_eq!(kinds(DELETE, false, true), set(&[]));
+    }
+
+    #[test]
+    fn a_rewrite_runs_the_index_expressions_and_nothing_else() {
+        assert_eq!(
+            kinds(REWRITE, false, false),
+            set(&["index_key", "index_filter"])
+        );
+    }
+
+    #[test]
+    fn every_policy_query_asks_the_server_whether_row_security_applies() {
+        for event in [INSERT, UPDATE, DELETE] {
+            let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+            let policies: Vec<_> = arms
+                .iter()
+                .filter(|arm| arm.contains("'policy' AS kind"))
+                .collect();
+            assert_eq!(policies.len(), 2, "USING and WITH CHECK for {event}");
+            for arm in policies {
+                assert!(
+                    arm.contains("pg_catalog.row_security_active(r.oid)"),
+                    "{arm}"
+                );
+                // Only the policies that name the deploying role or `public`.
+                assert!(arm.contains("pg_catalog.pg_has_role(CURRENT_USER"), "{arm}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_update_reads_only_the_generated_and_domain_columns_it_sets() {
+        let (extra, arms) = site_arms(&statement(UPDATE, false), false, &Dropped::default());
+        assert!(extra.contains("FROM touched t"), "{extra}");
+        let generated = arms
+            .iter()
+            .find(|arm| arm.contains("'generated' AS kind"))
+            .unwrap();
+        assert!(generated.contains("JOIN touched t"), "{generated}");
+        // An INSERT reads every one.
+        let (extra, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        assert!(!extra.contains("touched"), "{extra}");
+        assert!(
+            !arms
+                .iter()
+                .find(|arm| arm.contains("'generated' AS kind"))
+                .unwrap()
+                .contains("touched")
+        );
+    }
+
+    #[test]
+    fn what_the_plan_drops_is_left_out_by_the_name_the_catalog_holds() {
+        let table = TableName::new("app", "t");
+        let mut dropped = Dropped::default();
+        dropped.checks.insert((table.clone(), "ck".to_owned()));
+        dropped.indexes.insert((table.clone(), "ix".to_owned()));
+        dropped.policies.insert((table.clone(), "p".to_owned()));
+        dropped.values.insert((table, "d".to_owned()));
+        let (_, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        let all = arms.join("\n");
+        for needle in [
+            "con.conname::pg_catalog.text = E'ck'",
+            "ic.relname::pg_catalog.text = E'ix'",
+            "p.polname::pg_catalog.text = E'p'",
+            "a.attname::pg_catalog.text = E'd'",
+        ] {
+            assert!(all.contains(needle), "{needle} is not in {all}");
+        }
+        // And nothing is left out when the plan drops nothing: `check` asks so.
+        let (_, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        assert!(arms.join("\n").contains("NOT (false)"));
+    }
+
+    #[test]
+    fn the_operations_that_fire_no_trigger_are_the_ones_that_are_not_row_writes() {
+        assert!(fires_triggers(&RowOperation::Insert));
+        assert!(fires_triggers(&RowOperation::Delete));
+        assert!(fires_triggers(&RowOperation::Update {
+            columns: BTreeSet::new()
+        }));
+        assert!(!fires_triggers(&RowOperation::Rewrite));
+        assert!(!fires_triggers(&RowOperation::Copy));
+        assert_eq!(event(&RowOperation::Copy), INSERT);
+        assert_eq!(event(&RowOperation::Rewrite), REWRITE);
+    }
 }

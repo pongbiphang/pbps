@@ -4418,6 +4418,16 @@ pub async fn prepare_data_writes(
                     .and_then(|uid| baseline.ids.tables.get(uid))
                     .cloned()
             };
+            let stored_column = |column: &pbps_model::ColumnRef| {
+                planned_names
+                    .column_uid(column)
+                    .or_else(|| baseline_names.column_uid(column))
+                    .and_then(|uid| baseline.ids.columns.get(uid))
+                    .map_or_else(
+                        || column.name.raw().to_owned(),
+                        |old| old.name.raw().to_owned(),
+                    )
+            };
             for planned in &changes.changes {
                 if let Change::DropModule { id, .. } = &planned.change {
                     dropped.modules.insert(id.clone());
@@ -4434,6 +4444,23 @@ pub async fn prepare_data_writes(
                     dropped
                         .tables
                         .insert(stored(name).unwrap_or_else(|| name.clone()));
+                }
+                // The expressions the plan removes or replaces before a row is
+                // written or a table rewritten: `prepare` does not judge what
+                // will be gone by then, and `check` judges whatever is not
+                // (DEC-2563.9).
+                dropped.note_removed_expressions(&planned.change, &stored, &stored_column);
+                // A table the plan rewrites, scans or copies into runs its index
+                // expressions as the deploying role even though no row of the
+                // plan is written to it. One that did not exist has no stored
+                // name and is judged at its own statement instead.
+                if let Some(write) = pbps_pg::existing_expressions::rewrite_write(&planned.change)
+                    && let Some(old) = stored(&write.table)
+                {
+                    writes.push(RowWrite {
+                        table: old,
+                        operation: write.operation,
+                    });
                 }
                 let (table, mut operation) =
                     if let Change::InsertRow { table, .. } = &planned.change {
@@ -4507,18 +4534,24 @@ pub async fn settle_data_writes(conn: &mut Conn) -> anyhow::Result<bool> {
 
 pub async fn check_data_write(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     statement: &pbps_dialect::Statement,
     guard: &DataWriteGuard,
 ) -> anyhow::Result<()> {
-    let Some(write) = &statement.row_write else {
+    let Some(write) = statement.row_write.as_ref().or(statement.rewrites.as_ref()) else {
         return Ok(());
     };
     match conn.driver() {
         Driver::Mssql => Ok(()),
         Driver::Postgres => {
             let empty = pbps_pg::data_triggers::Guard::default();
-            pbps_pg::data_triggers::check(conn, write, guard.postgres.as_ref().unwrap_or(&empty))
-                .await?;
+            pbps_pg::data_triggers::check(
+                conn,
+                admission,
+                write,
+                guard.postgres.as_ref().unwrap_or(&empty),
+            )
+            .await?;
             Ok(())
         }
     }

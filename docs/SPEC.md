@@ -175,7 +175,13 @@ setting (DEC-2181.2). The same predicate judges the CHECK, DEFAULT and
 generated expressions a plan gives a table, the keys and filter of an index
 over an expression, the USING and WITH CHECK of a policy, and the CHECK and
 DEFAULT code of a domain it creates, rebuilds or alters, just before the
-statement that introduces them (DEC-2563.4, DEC-2563.5).
+statement that introduces them (DEC-2563.4, DEC-2563.5). The expressions that
+already stand on a table the plan writes rows to or rewrites (CHECK, defaults,
+generated columns, index keys and filters, domain code, and the policies that
+apply to the deploying role) are judged by it too, for exactly the statements
+that run them: at plan time and again just before the statement, under the
+guard's lock, with every routine that is not admitted named at once. A plan that
+only deletes runs none of them (DEC-2563.9, DEC-2563.10).
 `bootstrap --sql` refuses declarations with type references; use connected
 bootstrap or plan/apply against the target.
 

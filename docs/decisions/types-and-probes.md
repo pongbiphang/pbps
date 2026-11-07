@@ -5559,3 +5559,88 @@ Formats. The saved plan moves (a new skip-empty field an older build rejects as
 malformed rather than as a newer plan), and the state moves (a snapshot may hold a
 qualified operator an older build cannot parse). A plan with no provider class
 serialises as before.
+
+<a id="dec-2563-9"></a>
+
+**DEC-2563.9. The expressions already on a table the plan writes rows to or rewrites are judged by the one predicate, per statement (PostgreSQL).**
+
+(#2563, slice 2c; the maintainer decisions of 2026-11-03 and 2026-11-07.) A
+row the plan writes runs what the table already carries, as the deploying role:
+its CHECKs, defaults, generated columns, index keys and filters, the CHECKs and
+DEFAULT of its columns' domains, and the policies that apply to that role. Slices
+2a and 2b judged only what a plan introduces; a routine in a CHECK nobody in this
+plan touched ran unjudged on the plan's own `INSERT`. It is now judged by the
+same predicate (DEC-2563.2), from the trees as stored.
+
+Which tables. The tables the reference-data guard's closure reaches, unchanged
+(DECISIONS 445, 451): the table a row change names, the referencing tables a
+cascade, `SET NULL` or `SET DEFAULT` reaches, partitions and inheritance
+descendants, and the two halves of a cross-partition row movement. Beyond row
+changes, a column retype that rewrites the table (`estimate`: `Yes` or
+`Unknown`), an added column that fills every row, a change of persistence,
+`ANALYZE`, and the copy of a rebuild are writes of the same kind
+(`RowOperation::Rewrite` and `RowOperation::Copy`); they fire no trigger the guard
+answers for, and the walk reads their expressions only.
+
+Which expressions, per statement. Measured on 16.15 and 18.6, identically, by
+advancing a sequence from an IMMUTABLE routine at each site:
+
+| statement | runs |
+|---|---|
+| `INSERT` | CHECK, generated, every index key and filter, domain CHECKs, and DEFAULT (column and domain) |
+| `UPDATE` | CHECK, every index key and filter, the generated expressions and domain CHECKs of the columns it sets |
+| `DELETE`, `TRUNCATE`, a cascaded `DELETE` | none |
+| a referential action's `UPDATE` | as an `UPDATE`, and the DEFAULT of the column `SET DEFAULT` sets |
+| a rewrite, `REINDEX`, `ANALYZE` | index keys and filters only |
+
+So a plan that only deletes is never refused by this rule. An `UPDATE` judges
+every index, not those reading the columns it sets: PostgreSQL may skip an
+index's expression on a heap-only update, but whether it does depends on the
+data, a false refusal has a one-line remedy, and a false admission is a hole.
+The INSERT half of a row movement evaluates no default.
+
+How. The trees are read from `conbin`, `adbin`, `indexprs`, `indpred`, `polqual`,
+`polwithcheck` and a domain's `conbin` and `typdefaultbin`, and judged without
+binding by `judge_trees`, in one call for everything a plan reaches, so a refusal
+names every routine that is not admitted, each with its fix. The decoder's
+"empty unless listed" rule applies: a node it does not know is a refusal, never
+an admission.
+
+When. At plan time and at the start of apply (`prepare`), skipping what the
+plan itself removes before the row statement runs (a dropped check, index,
+policy or domain check, and a default or generated expression it drops or
+replaces; all are `order_key` classes before the rows and the rewrites), so a
+plan that drops the unfit expression and writes the rows is not refused; and
+again just before each row statement and each rewriting statement (`check`),
+under the lock the guard holds, with no allowance: whatever is still standing is
+judged. That is the same statement-moment parity DEC-2563.4 has. A table the plan
+creates has no stored name, so `prepare` finds nothing to judge and `check`
+judges what stands when its first row is written. The routines the review
+admits are recorded in `type_routines` and pinned like every other site's; there
+is no new field in the plan, and so no format number.
+
+Refused. The words are the predicate's own, with the site named as
+`the existing CHECK `ck` of app.t`, and the same three ways out: bring the
+routine into the project, list its owner in `trusted_roles`, or set
+`pin_type_routines: true`; a routine that sets no `search_path` also gets
+`ALTER FUNCTION ... SET search_path`. An existing expression the user never
+touched is refused too: it runs as the deployer on the plan's own statement, which
+is the threat a new CHECK is (maintainer, 2026-11-07).
+
+<a id="dec-2563-10"></a>
+
+**DEC-2563.10. A policy is judged only where row security applies to the deploying role (PostgreSQL).**
+
+(#2563, slice 2c.) A policy's expression runs only for a role subject to row
+security. The answer is the server's own, `pg_catalog.row_security_active`, asked
+of the deploying role for the table in the guard's transaction, so the owner
+without `FORCE`, a superuser and a `BYPASSRLS` role skip policies exactly as the
+engine does, and the owner with `FORCE` and a role that is not the owner do not.
+Only the policies that apply to the role (`public`, or one it is a member of) and
+to the command are read: `WITH CHECK` of an `INSERT`, both of an `UPDATE`, `USING`
+of a `DELETE`; a `SELECT` policy joins an `UPDATE` and a `DELETE`. A referential
+action bypasses row security (measured on 16 and 18: a policy on the table a
+cascade writes did not run, even for the owner with `FORCE`), so a table reached
+only by an action has its policies skipped. A policy with a subquery cannot be
+read by the decoder and is refused like any unreadable tree, and so is judged
+only where it can run.

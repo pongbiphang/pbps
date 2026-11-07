@@ -3904,6 +3904,15 @@ pub(crate) fn emit_in(
     {
         first.introduces = Some(Box::new(change.clone()));
     }
+    // The first statement of a change that rewrites or scans a table's rows
+    // carries the write, so the guard judges the expressions it re-evaluates
+    // just before it runs (DEC-2563.9).
+    if let Some(write) = crate::existing_expressions::rewrite_write(change)
+        && let Some(first) = statements.first_mut()
+        && first.row_write.is_none()
+    {
+        first.rewrites = Some(write);
+    }
     Ok(statements)
 }
 

@@ -317,6 +317,12 @@ pub struct Statement {
     /// Derived by the emitter, never inferred by parsing the SQL.
     pub row_write: Option<RowWrite>,
 
+    /// The table this statement rewrites or scans, whose existing expressions
+    /// it re-evaluates as the deploying role (DEC-2563.9). Unlike `row_write` it
+    /// is not a reference-data write, and a statement that carries both is a row
+    /// write first.
+    pub rewrites: Option<RowWrite>,
+
     /// An index this statement builds outside a transaction. The executor
     /// needs its identity to recover a failed build without parsing SQL.
     pub index_build: Option<IndexBuild>,
@@ -434,6 +440,17 @@ pub enum RowOperation {
         columns: std::collections::BTreeSet<pbps_model::ColumnName>,
     },
     Delete,
+    /// A statement that rewrites or scans the table's stored rows without being
+    /// a row write of the plan's: a column retype that rebuilds the table, an
+    /// `ADD COLUMN` that fills every row, `ANALYZE`. It fires no trigger; it
+    /// re-evaluates the table's index expressions as the deploying role
+    /// (#2563, DEC-2563.9).
+    Rewrite,
+    /// A bulk `INSERT … SELECT` into a table the plan created (the copy of a
+    /// rebuild). Its expressions run as a row insert's do; the triggers of a
+    /// table that did not exist before the plan are not the guard's concern
+    /// (#2563, DEC-2563.9).
+    Copy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +496,7 @@ impl Statement {
             extension: None,
             introduces: None,
             row_write: None,
+            rewrites: None,
             index_build: None,
             own_batch: false,
             transactional: true,

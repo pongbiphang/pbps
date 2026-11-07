@@ -11142,17 +11142,18 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
                 .await?;
             let result = async {
+                // The plan's own admission, so a routine its review pinned is
+                // admitted here as it was at the start (DEC-2563.9).
+                let admission = crate::pins::applying(project, plan);
                 let guard = crate::engine::prepare_data_writes(
                     conn,
-                    &pbps_pg::admission::Admission::without_review(
-                        project.config.trusted_roles.iter().cloned(),
-                    ),
+                    &admission,
                     &plan.changes,
                     &entry.snapshot,
                     &plan.ids,
                 )
                 .await?;
-                crate::engine::check_data_write(conn, stmt, &guard).await?;
+                crate::engine::check_data_write(conn, &admission, stmt, &guard).await?;
                 conn.execute(&stmt.sql).await?;
                 // A deferred trigger would otherwise run at COMMIT, after the
                 // check below, and a function replaced while an earlier one
@@ -11185,6 +11186,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             finish_transaction(conn, dialect, result).await
         } else if stmt.transactional
             && (stmt.declared_type.is_some()
+                || stmt.rewrites.is_some()
                 || stmt.introduces.is_some()
                 || stmt.extension.is_some()
                 || !written_routines.is_empty()
@@ -11207,6 +11209,21 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 .await?;
                 if let Some(extension) = &stmt.extension {
                     vet_before_extension(conn, extension, Some(plan)).await?;
+                }
+                if stmt.rewrites.is_some() {
+                    // The expressions the rewrite re-evaluates, held still by
+                    // the lock the guard takes, judged by the plan's own
+                    // admission (DEC-2563.9).
+                    let admission = crate::pins::applying(project, plan);
+                    let guard = crate::engine::prepare_data_writes(
+                        conn,
+                        &admission,
+                        &plan.changes,
+                        &entry.snapshot,
+                        &plan.ids,
+                    )
+                    .await?;
+                    crate::engine::check_data_write(conn, &admission, stmt, &guard).await?;
                 }
                 if let Some(change) = &stmt.introduces {
                     // Judged by the plan's own admission before the statement
@@ -12523,11 +12540,11 @@ async fn execute_statement(
             .await
             .context("Nothing has been applied — the transaction was rolled back.")?;
     }
-    crate::engine::check_data_write(conn, stmt, data_guard).await?;
     let admission = reviewed.map_or_else(
         || pbps_pg::admission::Admission::without_review(trusted.iter().cloned()),
         crate::pins::Approved::admission,
     );
+    crate::engine::check_data_write(conn, &admission, stmt, data_guard).await?;
     crate::engine::check_drop_requirement(conn, &admission, stmt).await?;
     // The routines a table expression calls are judged just before the statement
     // that introduces it, with what the plan created earlier in place (DEC-2563.4).

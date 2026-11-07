@@ -212,7 +212,17 @@
         "catalog_warnings1739::catalog_warnings_follow_plan_and_verify_reports_in_both_formats",
         "catalog_warnings1739::catalog_warnings_survive_a_row_read_failure_and_disappear_when_not_observed",
         "catalog_warnings1739::partition_diagnostics_are_not_permission_warnings_on_pg16",
-        "catalog_warnings1739::partition_diagnostics_are_not_permission_warnings_on_pg18"
+        "catalog_warnings1739::partition_diagnostics_are_not_permission_warnings_on_pg18",
+        "existing_expressions2563::a_column_retype_that_rewrites_the_table_is_refused_for_an_existing_index",
+        "existing_expressions2563::a_plan_that_writes_rows_is_refused_for_an_expression_it_never_touched",
+        "existing_expressions2563::a_policy_is_judged_only_where_row_security_applies_to_the_deploying_role",
+        "existing_expressions2563::a_table_the_plan_creates_has_nothing_standing_to_judge",
+        "existing_expressions2563::a_trusted_owner_with_a_fixed_path_is_admitted_and_the_review_pins_the_rest",
+        "existing_expressions2563::an_untrusted_owners_routine_is_shown_pinned_and_rechecked_at_apply",
+        "existing_expressions2563::an_update_is_refused_and_a_delete_only_plan_never_is",
+        "existing_expressions2563::each_statement_is_judged_for_exactly_the_expressions_it_runs",
+        "existing_expressions2563::what_the_plan_drops_is_not_judged_at_plan_time_and_is_at_the_statement",
+        "existing_expressions2563::without_the_review_an_untrusted_owners_routine_is_refused_with_every_way_out"
       ]
     },
     {

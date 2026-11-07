@@ -19367,7 +19367,9 @@ async fn the_trigger_guard_judges_a_triggers_function_by_the_admission_predicate
             )
             .await;
             let rechecked = match &guard {
-                Ok(guard) => pbps_pg::data_triggers::check(&mut conn, &write, guard).await,
+                Ok(guard) => {
+                    pbps_pg::data_triggers::check(&mut conn, admission, &write, guard).await
+                }
                 Err(_) => Ok(()),
             };
             conn.execute("ROLLBACK").await.unwrap();

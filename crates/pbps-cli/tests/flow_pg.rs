@@ -66,6 +66,8 @@ mod rebuild_members;
 #[path = "support/conversions2331.rs"]
 mod conversions2331;
 
+#[path = "support/existing_expressions2563.rs"]
+mod existing_expressions2563;
 #[path = "support/table_expressions2563.rs"]
 mod table_expressions2563;
 
@@ -21247,9 +21249,14 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
             )
             .await
             .unwrap();
-            pbps_pg::data_triggers::check(&mut conn, &write, &guard)
-                .await
-                .unwrap();
+            pbps_pg::data_triggers::check(
+                &mut conn,
+                &pbps_pg::admission::Admission::default(),
+                &write,
+                &guard,
+            )
+            .await
+            .unwrap();
             conn.execute("INSERT INTO app.t VALUES (1)").await.unwrap();
             conn.commit(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
                 .await
@@ -23040,7 +23047,7 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
         assert!(matches!(blocked, pbps_db::DbError::Driver { ref code, .. } if code.as_deref() == Some("55P03")), "{blocked}");
             writer.execute("ALTER TABLE app.t RENAME TO renamed").await.unwrap();
             write.table = pbps_model::TableName::new("app", "renamed");
-        pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
+        pbps_pg::data_triggers::check(&mut writer, &pbps_pg::admission::Admission::default(), &write, &guard).await.unwrap();
         writer.execute("INSERT INTO app.renamed VALUES (1)").await.unwrap();
         writer.commit(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // After release the same replacement succeeds, proving the first
@@ -23672,7 +23679,13 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
                 .execute(&grant)
                 .await
                 .unwrap();
-            let refused = pbps_pg::data_triggers::check(&mut writer, &write, &guard).await;
+            let refused = pbps_pg::data_triggers::check(
+                &mut writer,
+                &pbps_pg::admission::Admission::default(),
+                &write,
+                &guard,
+            )
+            .await;
             writer
                 .rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
                 .await
@@ -24585,7 +24598,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         let replace = "CREATE OR REPLACE TRIGGER guarded BEFORE UPDATE ON app.c FOR EACH ROW EXECUTE FUNCTION app.replacement()";
         let blocked = other.execute(replace).await.unwrap_err();
         assert!(matches!(blocked, pbps_db::DbError::Driver { ref code, .. } if code.as_deref() == Some("55P03")), "{blocked}");
-        pbps_pg::data_triggers::check(&mut writer, &write, &guard).await.unwrap();
+        pbps_pg::data_triggers::check(&mut writer, &pbps_pg::admission::Admission::default(), &write, &guard).await.unwrap();
         writer.execute("UPDATE app.p SET ukey = 'k2' WHERE code = 'first'").await.unwrap();
         writer.commit(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         // After release the same replacement succeeds, proving the first
@@ -24938,9 +24951,14 @@ fn referential_action_locks(admin: &str) {
             .expect(
                 "a SHARE lock on an unreached inheritance child must not delay the action guard",
             );
-            pbps_pg::data_triggers::check(&mut writer, &write, &guard)
-                .await
-                .unwrap();
+            pbps_pg::data_triggers::check(
+                &mut writer,
+                &pbps_pg::admission::Admission::default(),
+                &write,
+                &guard,
+            )
+            .await
+            .unwrap();
             let locks = writer
                 .query(
                     "SELECT c.relname AS name FROM pg_catalog.pg_locks l \
@@ -25212,7 +25230,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             )
             .await
             .expect("the dropped table is not followed");
-            let refused = pbps_pg::data_triggers::check(&mut conn, &write, &guard).await;
+            let refused = pbps_pg::data_triggers::check(&mut conn, &pbps_pg::admission::Admission::default(), &write, &guard).await;
             assert!(
                 refused.is_err(),
                 "a foreign key the plan promised to remove must actually be gone by the write"
