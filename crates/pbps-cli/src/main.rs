@@ -2232,13 +2232,18 @@ fn cmd_pull(
     // The identity tree is decided, and every refusal of it made, before any
     // declaration is published: a pull that cannot record its identities must
     // not leave declarations for them behind. Keep unchanged files byte-exact.
+    //
+    // Planned whether or not the mapping changed: `--force` can publish a
+    // declaration at another path than the one the project kept it at (a
+    // renamed file, a differently cased alias), and its identity file then has
+    // to move with it. A plan with nothing to do is empty and writes nothing.
     let tree_write = match &resolution {
-        Ok(res) if existing_ids.is_none() || res.ids != ids => Some(ids_store::plan(
+        Ok(res) => Some(ids_store::plan(
             project,
             &res.ids,
             &loaded.declared_paths(stage.path())?,
         )?),
-        _ => None,
+        Err(_) => None,
     };
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its

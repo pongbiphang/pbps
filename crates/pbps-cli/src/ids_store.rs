@@ -392,10 +392,33 @@ pub(crate) fn plan(
         ..Placement::default()
     };
     // A column tombstone belongs to the file that held its record, even when
-    // the table has been renamed since.
-    for uid in after.tombstones.keys() {
-        if let Some(home) = existing.column_home.get(uid) {
-            placement.owners.insert(uid.clone(), home.clone());
+    // the table has been renamed since. A partition child has no file, so the
+    // tombstones of its columns (dropped before it was attached) are kept in
+    // its parent's: a tombstone names its column in full and needs no table
+    // file of its own to say what it retired.
+    let table_named: BTreeMap<String, &Uid> = after
+        .tables
+        .iter()
+        .map(|(u, n)| (n.raw().to_string(), u))
+        .chain(
+            after
+                .tombstones
+                .iter()
+                .filter(|(u, _)| u.kind() == UidKind::Table)
+                .map(|(u, t)| (t.was.clone(), u)),
+        )
+        .collect();
+    for (uid, tomb) in &after.tombstones {
+        if uid.kind() != UidKind::Column {
+            continue;
+        }
+        let home = existing.column_home.get(uid).or_else(|| {
+            let column: pbps_model::ColumnRef = tomb.was.parse().ok()?;
+            table_named.get(&column.table.raw().to_string()).copied()
+        });
+        if let Some(home) = home {
+            let owner = placement.children.get(home).unwrap_or(home);
+            placement.owners.insert(uid.clone(), owner.clone());
         }
     }
     // The record order: what is on disk, with a new column after its YAML
@@ -423,7 +446,18 @@ pub(crate) fn plan(
             .or_insert_with(|| columns.clone());
     }
 
-    let new = ids_tree::split(after, &placement).context("cannot place the identities in files")?;
+    let new = ids_tree::split(after, &placement).map_err(|e| {
+        // Name what the user can see: a bare uid says nothing about which
+        // declaration cannot be recorded.
+        if let ids_tree::TreeError::NoPath { uid } = &e {
+            refused(format!(
+                "{} ({uid}) has no identity file to be recorded in",
+                name_of(uid)
+            ))
+        } else {
+            anyhow::Error::new(e).context("cannot place the identities in files")
+        }
+    })?;
     let removals: Vec<String> = tree
         .keys()
         .filter(|rel| !new.contains_key(*rel))

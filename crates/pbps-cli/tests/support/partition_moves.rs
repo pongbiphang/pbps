@@ -376,7 +376,7 @@ fn run_profile(
             },
         )
         .unwrap();
-        std::fs::write(path, serde_json::to_vec_pretty(&resolved.ids).unwrap()).unwrap();
+        crate::idtree::write(&path, &resolved.ids);
     }
     for command in &p.intents {
         succeeds(d.run(&command.iter().map(String::as_str).collect::<Vec<_>>()));

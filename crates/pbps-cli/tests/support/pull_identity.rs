@@ -59,8 +59,10 @@ pub fn unchanged(server: &str, pg: bool) {
         let mut ids: serde_json::Value =
             serde_json::to_value(crate::idtree::model(&ids_path)).unwrap();
         ids["tombstones"] = serde_json::json!({"t_r3t1rd": {"was": format!("{}.retired", schema(pg)), "dropped_at": "2026-01-01", "reason": "retired reference list", "operator": "test"}});
-        let bytes = serde_json::to_vec(&ids).unwrap();
-        crate::idtree::restore(&ids_path, &bytes);
+        crate::idtree::write(&ids_path, &serde_json::from_value(ids).unwrap());
+        // What a pull must leave alone is the tree as it stands, tombstones
+        // included, whatever layout the writer gives it.
+        let bytes = crate::idtree::snapshot(&ids_path);
         d.commit();
         ok(d.run(&[
             "baseline",

@@ -3037,11 +3037,7 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
                 let mut ids: pbps_model::IdsFile = crate::idtree::model(&ids_file);
                 ids.tables.clear();
                 ids.columns.clear();
-                std::fs::write(
-                    &ids_file,
-                    format!("{}\n", serde_json::to_string_pretty(&ids).unwrap()),
-                )
-                .unwrap();
+                crate::idtree::write(&ids_file, &ids);
                 d.commit();
                 let first = label_plan(&d, db, &path);
                 assert_eq!(first.changes.changes.len(), 1);

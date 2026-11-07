@@ -474,8 +474,8 @@ pub(super) fn check(server: &str, postgres: bool) {
     let column = format!("{schema}.plain.gone").parse().unwrap();
     let uid = ids.column_uid(&column).unwrap().clone();
     ids.columns.remove(&uid);
-    let before = serde_json::to_vec_pretty(&ids).unwrap();
-    std::fs::write(&path, &before).unwrap();
+    crate::idtree::write(&path, &ids);
+    let before = crate::idtree::snapshot(&path);
     let output = plain.run(&["plan", "--db", unknown_git.connection(), "--format", "json"]);
     assert_eq!(code(&output), 2, "{}{}", stdout(&output), stderr(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

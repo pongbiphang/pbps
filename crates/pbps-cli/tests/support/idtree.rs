@@ -23,6 +23,25 @@ pub fn dir(project: &Path) -> PathBuf {
     project.join(DIR)
 }
 
+/// Moves a declaration file the way a user does with `git mv`: the YAML and
+/// its identity file, which is named for the declaration's path below
+/// `schema/`. Without the second move the project no longer validates, which is
+/// the point of mirroring, and a test that only wants "the declaration lives
+/// under another name" must not trip on it.
+pub fn move_declaration(project: &Path, from: &Path, to: &Path) {
+    let schema = project.join("schema");
+    let ids_of = |yaml: &Path| {
+        let rel = yaml.strip_prefix(&schema).unwrap();
+        dir(project).join(rel.with_extension("json"))
+    };
+    std::fs::rename(from, to).unwrap();
+    let (old, new) = (ids_of(from), ids_of(to));
+    if old.exists() && old != new {
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::rename(old, new).unwrap();
+    }
+}
+
 /// Every file of the tree, by path relative to it.
 pub fn files(project: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
@@ -128,7 +147,7 @@ pub fn model(project: &Path) -> IdsFile {
 
 /// Where each declaration's YAML is, by the name it declares, relative to
 /// `schema/`: read from the files, as a person would.
-fn declared(project: &Path) -> BTreeMap<(UidKind, String), String> {
+fn declared_by_text(project: &Path) -> BTreeMap<(UidKind, String), String> {
     fn walk(root: &Path, at: &Path, out: &mut BTreeMap<(UidKind, String), String>) {
         let Ok(entries) = std::fs::read_dir(at) else {
             return;
@@ -171,6 +190,36 @@ fn declared(project: &Path) -> BTreeMap<(UidKind, String), String> {
     let mut out = BTreeMap::new();
     walk(&root, &root, &mut out);
     out
+}
+
+/// What each declaration is called and where its file is, from the loader the
+/// product uses, so a name that is quoted or escaped in the YAML (a type with a
+/// control character in it) is found under the name the mapping holds. A
+/// project the loader refuses, which a test may build on purpose, falls back
+/// to reading the first line of each file.
+fn declared(project: &Path) -> BTreeMap<(UidKind, String), String> {
+    use pbps_model::diagnostic::Declaration;
+    let schema = project.join("schema");
+    let Ok(loaded) = pbps_load::load_schema_dir(&schema) else {
+        return declared_by_text(project);
+    };
+    let Ok(paths) = loaded.declared_paths(&schema) else {
+        return declared_by_text(project);
+    };
+    paths
+        .files
+        .into_iter()
+        .map(|(declaration, file)| {
+            let key = match declaration {
+                Declaration::Table(n) => (UidKind::Table, n.raw().to_string()),
+                Declaration::Role(n) => (UidKind::Role, n.raw().to_string()),
+                Declaration::Type(n) => (UidKind::Type, n.raw().to_string()),
+                Declaration::Extension(n) => (UidKind::Extension, n.raw().to_string()),
+                Declaration::Module(_) => unreachable!("a module has no identity file"),
+            };
+            (key, file.path)
+        })
+        .collect()
 }
 
 /// Writes `ids` as a tree, each object at the path its declaration mirrors

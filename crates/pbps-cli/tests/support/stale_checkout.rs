@@ -315,7 +315,7 @@ pub fn acceptance(server: &str, pg: bool) {
     imported
         .columns
         .insert(local.column_uid(&coupon).unwrap().clone(), coupon);
-    std::fs::write(path, serde_json::to_vec_pretty(&imported).unwrap()).unwrap();
+    crate::idtree::write(&path, &imported);
     write(&d, schema, true, true, false);
     extra(&d, schema, &role.name, pg);
     offline(&d);

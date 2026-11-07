@@ -319,6 +319,36 @@ fn a_live_child_no_declaration_names_stays_in_its_parents_file() {
 }
 
 #[test]
+fn the_tombstones_of_a_table_that_becomes_a_partition_move_into_its_parents_file() {
+    // `dbo.child` once had a column, dropped; it is then attached to `dbo.customer`
+    // and has no file of its own to keep the tombstone in.
+    let alone = ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.child"},
+        "columns": {"c_aaaaa1": "dbo.customer.id"},
+        "tombstones": {
+            "c_bbbbb1": {"was": "dbo.child.extra", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }));
+    let own = declared(&[
+        ("dbo.customer", "dbo/customer.yml", &["id"]),
+        ("dbo.child", "dbo/child.yml", &[]),
+    ]);
+    let project = written("child-tombstone", &alone, &own);
+    assert!(tree(&project)["dbo/child.json"].contains("c_bbbbb1"));
+    let mut inside = declared(&[("dbo.customer", "dbo/customer.yml", &["id"])]);
+    inside.children.insert(
+        "dbo.child".parse().unwrap(),
+        "dbo.customer".parse().unwrap(),
+    );
+    let write = plan(&project, &alone, &inside).unwrap();
+    assert_eq!(write.removals, ["dbo/child.json"]);
+    write.apply().unwrap();
+    assert!(tree(&project)["dbo/customer.json"].contains("c_bbbbb1"));
+    assert_eq!(read_opt(&project).unwrap(), Some(alone));
+}
+
+#[test]
 fn a_child_that_changes_parent_moves_its_record() {
     let ids3 = ids(json!({
         "version": 1,
