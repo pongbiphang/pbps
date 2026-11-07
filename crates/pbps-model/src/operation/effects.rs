@@ -419,13 +419,19 @@ impl Cx<'_> {
             ));
             return;
         }
-        // A type this project does not manage is a package's when a package
-        // stands in the schema it names: a domain, a column or an array over it
-        // waits for the plan's create, update or move of that package, as one
-        // over a managed type waits for its create (DEC-2447.12). Asked of the
-        // final schema, so a type named in the destination of a move needs the
-        // move. Any package standing in that schema counts, which can only add
-        // an edge a package change already makes true: packages sort first.
+        self.package_input(name.schema());
+    }
+
+    /// An object this project does not manage is a package's when a package
+    /// stands in the schema it names: a domain, a column or an array over it
+    /// waits for the plan's create, update or move of that package, as one
+    /// over a managed type waits for its create (DEC-2447.12, DEC-2447.13).
+    /// Asked of the final schema, so an object named in the destination of a
+    /// move needs the move. Any package standing in that schema counts, which
+    /// can only add an edge a package change already makes true: packages sort
+    /// first. The one place a provider-owned object of any kind (a type, later
+    /// an operator class or an operator) turns a name into that edge.
+    fn package_input(&mut self, schema: &str) {
         let packages: Vec<_> = self
             .after
             .ids
@@ -436,7 +442,7 @@ impl Cx<'_> {
                     .schema
                     .extensions
                     .get(*package)
-                    .is_some_and(|e| e.schema == name.schema())
+                    .is_some_and(|e| e.schema == schema)
             })
             .map(|(uid, _)| uid.clone())
             .collect();

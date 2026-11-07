@@ -129,8 +129,8 @@ pub use name::{
 pub use partitions::Partitions;
 pub use plan::{
     DeclaredTypeBefore, DeclaredTypePin, ExtensionChangePin, ExtensionDropPin, ExtensionPin,
-    PlanBaseline, PlanMode, PlanOrigin, RoutinePin, RoutinePins, SavedPlan, TypePin, TypeProvider,
-    TypeRoutine, state_checksum, wire_fingerprint,
+    PlanBaseline, PlanMode, PlanOrigin, ProviderKind, ProviderPin, RoutinePin, RoutinePins,
+    SavedPlan, TypePin, TypeProvider, TypeRoutine, state_checksum, wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{ColumnShape, Rebuild, RebuildIdentities};

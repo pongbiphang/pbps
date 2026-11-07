@@ -6524,6 +6524,16 @@ async fn refuse_policy_dependents<D: ?Sized>(
     Ok(())
 }
 
+/// What a plan relies on that a package provides, sealed together: the type
+/// pins the saved plan carries, and the pins of the other provider-owned
+/// objects (DEC-2447.13). `providers` is empty until a kind that uses it lands,
+/// so every plan seals exactly what it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prerequisites {
+    pub types: Vec<pbps_model::TypePin>,
+    pub providers: Vec<pbps_model::ProviderPin>,
+}
+
 /// Read prerequisites before probes can rely on a referenced type.
 pub async fn seal_type_pins(
     conn: &mut Conn,
@@ -6531,14 +6541,17 @@ pub async fn seal_type_pins(
     changes: &ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
-) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+) -> anyhow::Result<Prerequisites> {
     match conn.driver() {
         Driver::Postgres => {
             let pins = pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?;
             type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
-            Ok(pins)
+            Ok(Prerequisites {
+                types: pins,
+                providers: Vec::new(),
+            })
         }
-        Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
+        Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
         Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
     }
 }
@@ -6551,15 +6564,18 @@ pub async fn seal_plan_type_pins(
     changes: &ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
-) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+) -> anyhow::Result<Prerequisites> {
     match conn.driver() {
         Driver::Postgres => {
             let pins =
                 pbps_pg::type_refs::seal_sides(conn, base, desired, changes, trusted).await?;
             type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
-            Ok(pins)
+            Ok(Prerequisites {
+                types: pins,
+                providers: Vec::new(),
+            })
         }
-        Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
+        Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
         Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
     }
 }
@@ -6677,7 +6693,7 @@ pub async fn type_input_routines(
 /// Keep bootstrap's prerequisite reads valid through execution and recording.
 pub async fn recheck_type_prerequisites(
     conn: &mut Conn,
-    expected: &[pbps_model::TypePin],
+    expected: &Prerequisites,
     changes: &ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
     inside: bool,
@@ -6689,10 +6705,10 @@ pub async fn recheck_type_prerequisites(
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
-            pbps_pg::type_refs::check(conn, within, expected, &[], changes).await?;
-            type_input_routines(conn, expected, trusted, false, inside).await?;
+            pbps_pg::type_refs::check(conn, within, &expected.types, &[], changes).await?;
+            type_input_routines(conn, &expected.types, trusted, false, inside).await?;
         }
-        Driver::Mssql if expected.is_empty() => {}
+        Driver::Mssql if expected.types.is_empty() && expected.providers.is_empty() => {}
         Driver::Mssql => anyhow::bail!("SQL Server does not support type references"),
     }
     Ok(())

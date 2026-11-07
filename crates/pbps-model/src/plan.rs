@@ -627,6 +627,29 @@ pub struct TypePin {
     pub provider: Option<TypeProvider>,
 }
 
+/// What kind of provider-owned object a [`ProviderPin`] pins. A type keeps its
+/// own [`TypePin`] (its shape is part of the saved plan and does not move);
+/// these are the kinds that arrive with it (DEC-2447.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Class,
+    Operator,
+}
+
+/// A provider-owned object that is not a type, identified by schema and name,
+/// with a digest of what it does and the package that owns it. Not part of the
+/// saved plan yet: the plan carries it when the first kind that uses it does,
+/// and that is the PR that moves the plan format (DEC-2447.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPin {
+    pub kind: ProviderKind,
+    pub schema: String,
+    pub name: String,
+    pub oid: i64,
+    pub digest: String,
+    pub provider: Option<TypeProvider>,
+}
+
 /// The package a [`TypePin`]'s type is a member of, and the version it was at.
 /// A plan approved over one version does not apply over another: the type's
 /// digest holds the support functions, and this names the package for the

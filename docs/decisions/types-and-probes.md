@@ -5464,3 +5464,49 @@ now resolve; the schema-qualified residual of DEC-2563.6 holds only for
 `CREATE TABLE`.
 
 No plan format changes.
+
+<a id="dec-2447-13"></a>
+
+**DEC-2447.13. The rules every provider-owned object shares live in one kernel; a type keeps its own pin.**
+E's type route (DEC-2447.12) is two things: how a type is read and digested
+(`user_types`), and rules about an object a package owns that do not depend on
+what the object is. The second set is in `pbps-pg/src/provider.rs`:
+
+- which package a missing object belongs to (the project declares exactly one
+  package in the schema it names; several are refused by name, none leaves the
+  object absent);
+- that the project manages the package at the installed version;
+- that a plan does not update a package beside a use of its object;
+- where a moved package's object is once the plan's move has run, and that a pin
+  read again may differ from the sealed one only by that schema;
+- the proof after the rehearsal that the sealed manifest lists the exact member
+  of the package the placeholder names.
+
+Beside it, `Cx::package_input` (the edge from a name to the package standing in
+its schema, one place for every kind) and `forward_moved` (the loop that carries
+a kind's references through a package move, with the kind's member class, parser
+and write-back as arguments), and in the cli a `Prerequisites { types, providers }`
+bundle that the seal and recheck calls carry.
+
+**Functions over a view, not a trait.** The rules read five facts about an
+object (schema, name, placeholder, package, moved-to), so they take a
+`Standing` and a `Noun` that words the refusal. A trait with associated types
+over `UserType` and a class read would be larger than the duplication it
+removes and would tie the kernel to the reader of each kind. What differs per
+kind (how one object is read and digested, which member class names it, what
+carries its references) stays with the kind and enters as an argument.
+
+**Shape A, not B.** A later kind gets its own pin beside `TypePin`
+(`ProviderPin`), not a merge of all pins into one `Vec`. B would change the
+serialised shape of every type pin: the plan number would move in the refactor,
+the saved-plan golden and every plan with a type pin would change, and an older
+executor would lose type plans as well, in exchange for one field instead of
+two. A leaves `TypePin` and `Plan.type_pins` byte for byte as they are.
+
+This entry is a refactor: no behaviour changes, and the words of every refusal
+are unchanged (the `Noun` of a type is `type` and `a column`). `ProviderPin` and
+`ProviderKind` exist in the model but are not part of the saved plan; the plan
+carries them in the PR that adds the first kind that uses them, and that PR moves
+the plan format.
+
+No plan format changes.

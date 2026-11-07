@@ -7228,7 +7228,7 @@ async fn bootstrap_type_pins(
     schema: &Schema,
     changes: &pbps_model::ChangeSet,
     project: &Project,
-) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+) -> anyhow::Result<crate::engine::Prerequisites> {
     let pins = crate::engine::seal_type_pins(
         conn,
         &[schema],
@@ -7239,7 +7239,7 @@ async fn bootstrap_type_pins(
     .await?;
     if !crate::engine::type_input_routines(
         conn,
-        &pins,
+        &pins.types,
         &project.config.trusted_roles,
         project.config.pin_type_routines,
         false,
@@ -8328,7 +8328,7 @@ async fn plan_db_selected(
         )
         .await?;
         let type_routines_need_review = !crate::engine::type_input_routines(
-            &mut conn, &initial_types, &project.config.trusted_roles,
+            &mut conn, &initial_types.types, &project.config.trusted_roles,
             project.config.pin_type_routines, false,
         ).await?.is_empty();
         let mut findings = checkout_findings;
@@ -8781,7 +8781,7 @@ async fn plan_db_selected(
             &project.config.trusted_roles, project.config.pin_type_routines,
         ).await?;
         let needs_review = !crate::engine::type_input_routines(
-            &mut conn, &prerequisite_types, &project.config.trusted_roles,
+            &mut conn, &prerequisite_types.types, &project.config.trusted_roles,
             project.config.pin_type_routines, false,
         ).await?.is_empty();
         // DEC-1515.1's three cases, decided from this ordinary plan before any
@@ -9434,7 +9434,10 @@ async fn plan_db_selected(
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
-        let type_pins = crate::engine::seal_plan_type_pins(
+        let crate::engine::Prerequisites {
+            types: type_pins,
+            providers,
+        } = crate::engine::seal_plan_type_pins(
             &mut conn,
             pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
             pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
@@ -9443,6 +9446,9 @@ async fn plan_db_selected(
             project.config.pin_type_routines,
         )
         .await?;
+        // No kind that uses provider pins has landed (DEC-2447.13): the plan has
+        // nowhere to carry one, so one sealed here would be dropped silently.
+        assert!(providers.is_empty(), "a provider pin has no place in the saved plan yet");
         let reviewed =
             crate::pins::seal_selected(&mut conn, project, target, &type_pins, &site_admission)
                 .await?;
@@ -12401,7 +12407,7 @@ async fn execute_transaction_body(
     conn: &mut Conn,
     dialect: &dyn Dialect,
     statements: &crate::emission::LoweredPlan,
-    type_pins: &[pbps_model::TypePin],
+    type_pins: &crate::engine::Prerequisites,
     changes: &pbps_model::ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<()> {

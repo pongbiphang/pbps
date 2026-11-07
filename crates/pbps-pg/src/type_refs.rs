@@ -1,6 +1,5 @@
 //! Prerequisites of columns that reference existing types (DEC-1523.1–3).
 
-pub use crate::provider::provider_proof;
 pub mod declared;
 pub mod renames;
 
@@ -15,9 +14,7 @@ use pbps_model::{
 
 use crate::admission::Admission;
 use crate::pins::Within;
-use crate::provider::{
-    check_providers, declared_packages, note_moves, refuse_update_beside_provided, same_pin,
-};
+use crate::provider::{self, Standing};
 use crate::user_types::{self, TypeRead, UserType};
 use pbps_diff::{
     Side,
@@ -382,7 +379,7 @@ async fn read_or_defer(
     references: &[TypeRef],
     schemas: &[&Schema],
 ) -> Result<(Vec<UserType>, Vec<TypePin>), DbError> {
-    let created = declared_packages(schemas);
+    let created = provider::packages_by_schema(schemas);
     let reads = user_types::read(conn, Within::OwnTransaction, references).await;
     let mut types = Vec::new();
     let mut planned = Vec::new();
@@ -390,35 +387,22 @@ async fn read_or_defer(
         match read {
             TypeRead::Present(ty) => types.push(*ty),
             TypeRead::Absent if created.contains_key(reference.schema()) => {
-                match created[reference.schema()].as_slice() {
-                    [(extension, version)] => planned.push(TypePin {
-                        schema: reference.schema().to_owned(),
-                        name: reference.name().to_owned(),
-                        oid: 0,
-                        kind: PLANNED.to_owned(),
-                        digest: String::new(),
-                        provider: Some(TypeProvider {
-                            extension: (*extension).to_owned(),
-                            version: (*version).to_owned(),
-                            moved_to: None,
-                        }),
-                    }),
-                    several => {
-                        return Err(failed(format!(
-                            "the type `{}` is not in the target database and the project declares \
-                             {} packages in schema `{}` ({}); say which provides it by declaring \
-                             them in separate schemas",
-                            reference.shown(),
-                            several.len(),
-                            Escaped(reference.schema()),
-                            several
-                                .iter()
-                                .map(|(n, _)| format!("`{}`", Escaped(n)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )));
-                    }
-                }
+                let provider = provider::defer_to_package(
+                    &created,
+                    reference.schema(),
+                    &reference.shown().to_string(),
+                    provider::TYPE,
+                )
+                .expect("the schema holds a declared package")
+                .map_err(failed)?;
+                planned.push(TypePin {
+                    schema: reference.schema().to_owned(),
+                    name: reference.name().to_owned(),
+                    oid: 0,
+                    kind: PLANNED.to_owned(),
+                    digest: String::new(),
+                    provider: Some(provider),
+                });
             }
             other @ (TypeRead::Absent
             | TypeRead::NotDefined
@@ -433,6 +417,113 @@ async fn read_or_defer(
         }
     }
     Ok((types, planned))
+}
+
+/// The packages the project declares, by the schema each is declared in.
+#[cfg(test)]
+fn declared_packages<'a>(
+    schemas: &[&'a Schema],
+) -> std::collections::BTreeMap<&'a str, Vec<(&'a str, &'a str)>> {
+    provider::packages_by_schema(schemas)
+}
+
+/// The proof after the rehearsal for each placeholder pin: the package the plan
+/// creates, or moves and updates, must list that exact type among its sealed
+/// members (class `type`, as the engine names it), so a type of the same
+/// spelling from anywhere else does not stand in for the one the order assumed
+/// (DEC-2447.12). A created package is held to its manifest, a changed one to
+/// the manifest it has after the change.
+pub fn provider_proof(
+    pins: &[TypePin],
+    created: &[pbps_model::ExtensionPin],
+    changed: &[pbps_model::ExtensionChangePin],
+) -> Result<(), String> {
+    for pin in pins.iter().filter(|p| is_planned(p)) {
+        // The engine names a type as one qualified name.
+        let reference = TypeRef::new(&pin.schema, &pin.name).map_err(|e| e.to_string())?;
+        let member = pbps_model::ProviderMember {
+            class: "type".to_owned(),
+            names: vec![reference.raw().to_string()],
+            args: Vec::new(),
+        };
+        provider::proof(
+            Standing::from(pin),
+            &member,
+            provider::TYPE,
+            created,
+            changed,
+        )?;
+    }
+    Ok(())
+}
+
+/// A provided type is usable only when the project manages its package at the
+/// version the target holds (DEC-2447.3, DEC-2447.12).
+fn check_providers(schemas: &[&Schema], types: &[UserType]) -> Result<(), String> {
+    for ty in types {
+        if let Some((extension, version)) = ty.provider() {
+            provider::check_package(
+                schemas,
+                extension,
+                version,
+                &ty.reference().shown().to_string(),
+                provider::TYPE,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A package is not updated in the plan that holds a column of one of its
+/// types (DEC-2447.12).
+fn refuse_update_beside_provided(types: &[UserType], changes: &ChangeSet) -> Result<(), String> {
+    provider::refuse_update_beside_provided(
+        |extension| {
+            types
+                .iter()
+                .find(|t| t.provider().is_some_and(|(e, _)| e == extension))
+                .map(|t| t.reference().shown().to_string())
+        },
+        changes,
+        provider::TYPE,
+    )
+}
+
+/// A pin of a type whose package this plan moves says where the type is once
+/// the move has run (DEC-2447.12).
+fn note_moves(pins: &mut [TypePin], changes: &ChangeSet) {
+    for pin in pins.iter_mut().filter(|p| !is_planned(p)) {
+        let schema = pin.schema.clone();
+        if let Some(provider) = &mut pin.provider {
+            provider.moved_to = provider::moved_to(&provider.extension, &schema, changes);
+        }
+    }
+}
+
+/// A pin read again is the pin that was sealed, except that a type its package's
+/// move carried is in the schema the plan said it would be (DEC-2447.12).
+fn same_pin(sealed: &TypePin, now: &TypePin) -> bool {
+    provider::same_pin(
+        sealed,
+        now,
+        |pin| {
+            (
+                pin.schema.clone(),
+                pin.provider.as_ref().and_then(|p| p.moved_to.clone()),
+            )
+        },
+        |pin| {
+            let mut pin = pin.clone();
+            if let Some(provider) = &mut pin.provider {
+                provider.moved_to = None;
+            }
+            pin
+        },
+        |pin, schema| TypePin {
+            schema: schema.to_owned(),
+            ..pin
+        },
+    )
 }
 
 /// A column is not retyped to or from a type a package provides (DEC-2447.12):
