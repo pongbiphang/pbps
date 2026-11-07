@@ -28,7 +28,7 @@ impl Made {
             assert_eq!(object.id, id);
             assert_eq!(object.labels.get(LABEL), Some(&self.0));
             Docker
-                .remove(&id)
+                .remove(&id, &object.volumes)
                 .await
                 .expect("remove owned swap fixture and volumes");
         }

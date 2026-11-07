@@ -179,7 +179,9 @@ pub(super) async fn remove_run(
         }
         record = next;
         let note = "removal was not confirmed".to_owned();
-        rt.remove(&found.id)
+        // Keep the evidence just persisted: another remover can erase the
+        // container before removal reads it again (DEC-1165.7).
+        rt.remove(&found.id, &found.volumes)
             .await
             .map_err(|left| fail(FailureKind::NotRemoved, left, note))?;
     }

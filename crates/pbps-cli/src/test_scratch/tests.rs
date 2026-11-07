@@ -184,7 +184,7 @@ impl Runtime for Fake {
         Ok(())
     }
 
-    async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
+    async fn remove(&self, id: &str, _: &[String]) -> Result<(), Vec<String>> {
         if let Some(left) = &self.cannot_remove {
             return Err(left.clone());
         }
@@ -1074,6 +1074,138 @@ mod live {
         Box::pin(recorded_and_finished(Driver::Postgres, &image())).await;
     }
 
+    /// A competing remover wins after listing, or after ownership and volume
+    /// evidence was read but before the shared removal path starts.
+    async fn raced_removals(d: &Dir, alive: &TestScratch<'_>, image: &str) {
+        struct Vanishing<'a> {
+            dir: &'a StateDir,
+            run_id: &'a str,
+            id: &'a str,
+            after_inspect: bool,
+            vanished: std::cell::Cell<bool>,
+        }
+        impl Vanishing<'_> {
+            async fn vanish(&self) {
+                assert!(!self.vanished.replace(true), "one competing removal");
+                docker(&["rm", "--force", "--volumes", self.id])
+                    .await
+                    .unwrap();
+                assert!(Docker.inspect(self.id).await.unwrap().is_none());
+            }
+        }
+        impl Runtime for Vanishing<'_> {
+            async fn list(&self, label: &str) -> Result<Vec<String>, Fail> {
+                let ids = Docker.list(label).await?;
+                assert_eq!(ids, [self.id]);
+                if !self.after_inspect {
+                    self.vanish().await;
+                }
+                Ok(ids)
+            }
+            async fn inspect(&self, id: &str) -> Result<Option<Inspected>, Fail> {
+                assert_eq!(id, self.id, "a live run must not be inspected");
+                let found = Docker.inspect(id).await?;
+                if self.after_inspect {
+                    assert!(found.is_some(), "the ownership read precedes removal");
+                    self.vanish().await;
+                }
+                Ok(found)
+            }
+            async fn users(&self, volume: &str) -> Result<Vec<String>, Fail> {
+                Docker.users(volume).await
+            }
+            async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
+                Docker.remove_volume(volume).await
+            }
+            async fn remove(&self, id: &str, volumes: &[String]) -> Result<(), Vec<String>> {
+                assert_eq!(id, self.id);
+                let persisted = self.dir.read(self.run_id).unwrap().unwrap();
+                assert_eq!(persisted.state, State::Removing);
+                assert_eq!(persisted.container.id.as_deref(), Some(id));
+                assert_eq!(persisted.volumes, volumes);
+                Docker.remove(id, volumes).await
+            }
+        }
+
+        let live_record = &alive.journal.record;
+        let live_bytes = std::fs::read(d.dir.file(alive.run_id(), "json")).unwrap();
+        // Both reads of a pending run, and the recorded-id path of #2744.
+        for (pending, after_inspect) in [(true, true), (true, false), (false, true)] {
+            let run_id = record::new_run_id();
+            let mut rec = record(&run_id, State::Pending, None);
+            rec.daemon = live_record.daemon.clone();
+            rec.volumes.clear();
+            let label = format!("{RUN_LABEL}={run_id}");
+            // No resolver token: other runs' sweeps cannot claim this fixture.
+            let id = docker(&[
+                "create",
+                "--pull=never",
+                "--name",
+                &rec.container.name,
+                "--label",
+                "pbps.resolver=scratch",
+                "--label",
+                &label,
+                image,
+            ])
+            .await
+            .unwrap()
+            .trim()
+            .to_owned();
+            let found = Docker.inspect(&id).await.unwrap().unwrap();
+            if !pending {
+                rec.state = State::Created;
+                rec.container.id = Some(id.clone());
+                rec.volumes.clone_from(&found.volumes);
+            }
+            d.dir.write(&rec).unwrap();
+            let rt = Vanishing {
+                dir: &d.dir,
+                run_id: &run_id,
+                id: &id,
+                after_inspect,
+                vanished: std::cell::Cell::new(false),
+            };
+            let done = reconcile(&d.dir, &rt, &live_record.daemon, soon())
+                .await
+                .unwrap();
+            assert!(rt.vanished.get(), "the competing removal happened");
+            assert_eq!(
+                done,
+                super::super::Reconciliation {
+                    removed: vec![run_id.clone()],
+                    live: vec![alive.run_id().to_owned()],
+                    failures: Vec::new(),
+                },
+                "pending={pending}, after_inspect={after_inspect}"
+            );
+            assert!(d.dir.read(&run_id).unwrap().is_none());
+            assert!(!exists(&id).await);
+            for volume in &found.volumes {
+                let why = docker(&["volume", "inspect", volume]).await.unwrap_err();
+                assert!(
+                    pbps_cli::resolver::server::scratch::container::no_such_volume(&why),
+                    "{why}"
+                );
+            }
+            // The next pass reports no removal; it still leaves the live run alone.
+            let again = recover(d).await;
+            assert_eq!(
+                again,
+                super::super::Reconciliation {
+                    live: vec![alive.run_id().to_owned()],
+                    ..Default::default()
+                }
+            );
+            assert_eq!(d.dir.runs().unwrap(), [alive.run_id()]);
+            assert_eq!(
+                std::fs::read(d.dir.file(alive.run_id(), "json")).unwrap(),
+                live_bytes
+            );
+            assert!(exists(live_record.container.id.as_deref().unwrap()).await);
+        }
+    }
+
     pub(super) async fn killed_and_live(driver: Driver, image: &str) {
         let d = Dir::new();
         let (dead, alive) = (
@@ -1093,6 +1225,7 @@ mod live {
             (vec![dead_run], vec![alive.run_id().to_owned()])
         );
         assert!(!exists(&dead_id).await && exists(&alive_id).await);
+        Box::pin(raced_removals(&d, &alive, image)).await;
         alive.finish().await.unwrap();
         assert!(d.dir.runs().unwrap().is_empty());
     }
@@ -1118,7 +1251,7 @@ mod live {
             async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
                 Docker.remove_volume(volume).await
             }
-            async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
+            async fn remove(&self, id: &str, _: &[String]) -> Result<(), Vec<String>> {
                 Err(vec![format!("the container {id}")])
             }
         }

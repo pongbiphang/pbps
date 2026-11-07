@@ -503,9 +503,10 @@ pub async fn remove_named(id: &str) -> Result<(), Vec<String>> {
     remove_with_volumes(id, volumes).await
 }
 
-// Recovery captures these names before a concurrent remover can erase the
-// container record. Absence of that record cannot prove volume cleanup.
-async fn remove_with_volumes(
+/// Removes the container and confirms it and the captured volumes absent.
+/// Recovery captures these names before a concurrent remover can erase the
+/// container record. Absence of that record cannot prove volume cleanup.
+pub async fn remove_with_volumes(
     id: &str,
     volumes: Result<Vec<String>, String>,
 ) -> Result<(), Vec<String>> {
