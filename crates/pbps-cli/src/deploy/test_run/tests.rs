@@ -1451,6 +1451,35 @@ fn d2a1165_committed_entries_survive_lock_cleanup_failure() {
     );
 }
 
+#[test]
+fn a_failed_bootstrap_carries_its_lock_cleanup_beside_the_cause() {
+    let mut phase = Phase::new("bootstrap", "base");
+    let attempt = bootstrap_attempt(Bootstrap::Failed {
+        error: anyhow::anyhow!("primary bootstrap cause"),
+        released: Err(pbps_db::DbError::BadRow("unlock cause".into())),
+    })
+    .unwrap();
+    let error = finish_attempt(&mut phase, attempt).unwrap_err();
+    assert!(error.to_string().contains("primary bootstrap cause"));
+    assert!(matches!(phase.outcome, Status::Unanswerable));
+    assert_eq!(phase.findings.len(), 1);
+    assert_eq!(phase.findings[0].id, "test.cleanup");
+    assert!(phase.findings[0].message.contains("unlock cause"));
+    assert!(phase.entry.is_none());
+    // Negative controls: a released lock adds nothing, and a script-only
+    // result is not a connected bootstrap.
+    let mut phase = Phase::new("bootstrap", "base");
+    let attempt = bootstrap_attempt(Bootstrap::Failed {
+        error: anyhow::anyhow!("primary alone"),
+        released: Ok(true),
+    })
+    .unwrap();
+    assert!(finish_attempt(&mut phase, attempt).is_err());
+    assert!(phase.findings.is_empty());
+    assert!(!matches!(phase.outcome, Status::Unanswerable));
+    assert!(bootstrap_attempt(Bootstrap::Script).is_err());
+}
+
 #[tokio::test]
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 async fn d2a1165_pg16_fixture_execute_grants_do_not_block_declared_routine_rebuilds() {

@@ -1,5 +1,5 @@
 //! The owned-only adapter to ordinary deployment services (DEC-1165.9).
-use super::services::{Attempt, Declarations, PlanResult};
+use super::services::{Attempt, Bootstrap, Declarations, PlanResult};
 pub(crate) use super::services::{Planned, Progress};
 use crate::plan_test::report::{Phase, Status};
 use crate::plan_test::revision::Assembled;
@@ -41,15 +41,15 @@ pub(crate) async fn bootstrap(
     .await;
     // Before the cleanup finding below; the caller drains again after a drop.
     collect_findings(phase, progress);
-    let built = built?.ok_or_else(|| anyhow::anyhow!("connected bootstrap produced no result"))?;
-    finish_attempt(
-        phase,
-        Attempt::Applied {
-            entry: built.entry,
-            released: built.released,
-        },
-    )?;
-    Ok(built.entry)
+    let built = built?;
+    let entry = match &built {
+        Bootstrap::Built(built) => Some(built.entry),
+        Bootstrap::Script | Bootstrap::Failed { .. } => None,
+    };
+    // A failed attempt always returns its primary error here, after the cleanup
+    // finding has been recorded.
+    finish_attempt(phase, bootstrap_attempt(built)?)?;
+    entry.ok_or_else(|| anyhow::anyhow!("bootstrap committed no ledger entry"))
 }
 /// Boxed future of the test hops. #2661: an `async fn` hands its caller the whole
 /// future by value, and a debug build reserves that slot in the caller's frame
@@ -174,6 +174,19 @@ pub(crate) fn collect_progress(phase: &mut Phase, progress: &Progress) {
 /// The findings alone, for a phase with no accepted/started facts to report.
 pub(crate) fn collect_findings(phase: &mut Phase, progress: &Progress) {
     phase.findings.extend(progress.findings.take());
+}
+
+/// A bootstrap as the apply path reports its own: the lock cleanup travels with
+/// the primary cause, so `finish_attempt` can keep both (#2547).
+fn bootstrap_attempt(result: Bootstrap) -> anyhow::Result<Attempt> {
+    match result {
+        Bootstrap::Script => anyhow::bail!("connected bootstrap produced no result"),
+        Bootstrap::Built(built) => Ok(Attempt::Applied {
+            entry: built.entry,
+            released: built.released,
+        }),
+        Bootstrap::Failed { error, released } => Ok(Attempt::Failed { error, released }),
+    }
 }
 
 fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {

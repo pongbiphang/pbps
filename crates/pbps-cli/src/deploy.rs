@@ -7424,7 +7424,7 @@ fn bootstrap(
     dialect: crate::emission::SelectedDialect,
     operator: &str,
 ) -> anyhow::Result<Option<services::Bootstrapped>> {
-    db::runtime()?.block_on(bootstrap_async(
+    match db::runtime()?.block_on(bootstrap_async(
         project,
         target,
         sql_out,
@@ -7432,7 +7432,18 @@ fn bootstrap(
         dialect,
         operator,
         CatalogWarnings::Human,
-    ))
+    ))? {
+        services::Bootstrap::Script => Ok(None),
+        services::Bootstrap::Built(built) => Ok(Some(built)),
+        services::Bootstrap::Failed { error, released } => {
+            // The command's own error is returned; the owned test run reports
+            // the same outcome as a finding instead of this warning.
+            if let Some(target) = target {
+                warn_unreleased(&target.label, &released);
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn bootstrap_async(
@@ -7443,7 +7454,7 @@ async fn bootstrap_async(
     dialect: crate::emission::SelectedDialect,
     operator: &str,
     warnings: CatalogWarnings<'_>,
-) -> anyhow::Result<Option<services::Bootstrapped>> {
+) -> anyhow::Result<services::Bootstrap> {
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
@@ -7657,7 +7668,7 @@ async fn bootstrap_async(
                 );
             }
             // No target to ask: UTC until #1918 (DEC-1916.1).
-            return write_script(&SessionZone::offline_utc()).map(|()| None);
+            return write_script(&SessionZone::offline_utc()).map(|()| services::Bootstrap::Script);
         };
 
         let statements = crate::statements(
@@ -7871,11 +7882,13 @@ async fn bootstrap_async(
             let (id, snapshot) = match result {
                 Ok(built) => built,
                 Err(error) => {
-                    warn_unreleased(&target.label, &unlocked);
-                    return Err(error);
+                    return Ok(services::Bootstrap::Failed {
+                        error,
+                        released: unlocked,
+                    });
                 }
             };
-            Ok(Some(services::Bootstrapped {
+            Ok(services::Bootstrap::Built(services::Bootstrapped {
                 entry: id,
                 tables: snapshot.schema.tables.len(),
                 target: target.label.clone(),

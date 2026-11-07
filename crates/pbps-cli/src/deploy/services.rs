@@ -56,6 +56,22 @@ pub(super) struct Bootstrapped {
     pub released: Result<bool, pbps_db::DbError>,
 }
 
+/// What a bootstrap that got past its refusals reports. A failure before the
+/// lock is the outer `Err`, as in [`Attempt`]; one under the lock carries its
+/// cleanup beside it, so no caller has to drop the lock outcome to return the
+/// primary cause.
+pub(super) enum Bootstrap {
+    /// `--sql` without a target: a script and no database.
+    Script,
+    Built(Bootstrapped),
+    /// The lock was taken and the build did not commit. Like
+    /// [`Attempt::Failed`], the cleanup must not replace the cause.
+    Failed {
+        error: anyhow::Error,
+        released: Result<bool, pbps_db::DbError>,
+    },
+}
+
 pub(crate) fn cmd_bootstrap(
     project: &Project,
     target: Option<&Target>,
