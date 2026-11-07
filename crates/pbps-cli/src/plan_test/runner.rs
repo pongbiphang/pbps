@@ -21,8 +21,8 @@ pub(super) struct Replay<'a> {
     pub driver: pbps_db::Driver,
     pub chain: &'a ReplayChain,
     pub revisions: &'a BTreeMap<CommitId, Assembled>,
-    /// Name and SQL by manifest index; an entry the chain does not name is unused.
-    pub fixtures: Vec<(&'a str, &'a str)>,
+    /// Name, SQL and path by manifest index; an entry the chain does not name is unused.
+    pub fixtures: Vec<(&'a str, &'a str, &'a str)>,
     pub side: Option<&'a str>,
     pub timeouts: Timeouts,
 }
@@ -37,7 +37,7 @@ impl Inputs {
                 .frozen
                 .fixtures
                 .iter()
-                .map(|f| (f.name.as_str(), f.text.as_str()))
+                .map(|f| (f.name.as_str(), f.text.as_str(), f.file.path.as_str()))
                 .collect(),
             side: None,
             timeouts: self.frozen.manifest.timeouts,
@@ -177,7 +177,13 @@ pub(super) async fn run_replay(
                         ms(timeouts.fixture_ms),
                         session.run_fixture(&mut conn, r.fixtures[*f].1, timeout_ms),
                     )
-                    .await;
+                    .await
+                    .map_err(|error| {
+                        error.context(format!(
+                            "fixture `{}`",
+                            pbps_model::escape::Escaped(r.fixtures[*f].2)
+                        ))
+                    });
                 data.phases[phase].record(start, "test.fixture", &result);
                 if result.is_err() {
                     return None;
