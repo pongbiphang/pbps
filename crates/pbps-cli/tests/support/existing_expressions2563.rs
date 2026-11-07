@@ -546,13 +546,12 @@ fn a_policy_is_judged_only_where_row_security_applies_to_the_deploying_role() {
                     true,
                 ),
             ] {
-                on_server(
-                    own.connection(),
-                    &format!(
-                        "ALTER TABLE app.t {} FORCE ROW LEVEL SECURITY",
-                        if forced { "" } else { "NO" }
-                    ),
-                );
+                conn.execute(&format!(
+                    "ALTER TABLE app.t {} FORCE ROW LEVEL SECURITY",
+                    if forced { "" } else { "NO" }
+                ))
+                .await
+                .unwrap();
                 for (what, operation) in [
                     ("INSERT", RowOperation::Insert),
                     ("UPDATE", update(&["b"])),
@@ -631,7 +630,7 @@ impl Site {
     }
 }
 
-const FIX: &str = "ALTER FUNCTION app.ok(text) SET search_path = pg_catalog, pg_temp";
+const FIX: &str = "ALTER FUNCTION app.ok(pg_catalog.text) SET search_path = pg_catalog, pg_temp";
 
 struct Standing {
     _own: OwnDatabase,
@@ -802,7 +801,7 @@ fn an_update_is_refused_and_a_delete_only_plan_never_is() {
         );
         // A DELETE runs neither (measured on 16 and 18): never refused.
         s.declare(&format!(
-            "{}data:\n  mode: exact\n  rows:\n    1: {{email: a}}\n",
+            "{}data:\n  mode: exact\n  rows:\n    1: {{email: a, n: 1}}\n",
             site.declared()
         ));
         let planned = s.plan_now();
