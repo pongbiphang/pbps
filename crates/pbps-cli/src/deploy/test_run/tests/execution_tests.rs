@@ -509,6 +509,49 @@ async fn cancel_plan(
     Ok(())
 }
 
+// The run record may disappear during teardown. Capture only resource names,
+// never the daemon endpoint, credentials or the adjacent fingerprint key (#2652).
+#[derive(serde::Deserialize)]
+struct CleanupResources {
+    container: CleanupContainer,
+    volumes: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CleanupContainer {
+    id: String,
+    name: String,
+}
+
+fn cleanup_resources(path: &std::path::Path) -> anyhow::Result<CleanupResources> {
+    let bytes = std::fs::read(path).context("owned resource record could not be read")?;
+    serde_json::from_slice(&bytes).context("owned resource record could not be decoded")
+}
+
+fn confirm_cleanup(
+    data: &TestData,
+    run: &str,
+    work: &anyhow::Result<()>,
+    resources: &anyhow::Result<CleanupResources>,
+) -> anyhow::Result<()> {
+    if data.cleanup_confirmed {
+        return Ok(());
+    }
+    let identity = match resources {
+        Ok(resources) => format!(
+            "container_id={}; container_name={}; volumes={:?}",
+            resources.container.id, resources.container.name, resources.volumes
+        ),
+        Err(error) => format!("resource identity unavailable: {error:#}"),
+    };
+    // A cleanup error must not hide either the work failure or the existing
+    // test.cleanup finding (including an elapsed timeout and its phase).
+    anyhow::bail!(
+        "cleanup failed at phase cleanup; run={run}; {identity}; work={work:?}; phases={}",
+        serde_json::to_string(&data.phases)?
+    )
+}
+
 async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
     let stage = crate::adopt::Stage::new("d2b1-execution")?;
     let registry = crate::test_scratch::StateDir::open(stage.path().join("runs"))?;
@@ -530,10 +573,11 @@ async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
         .await
         .ok_or_else(|| anyhow::anyhow!("owned start failed: {:?}", data.phases[0].findings))?;
     let run = scratch.run_id().to_owned();
+    let resources = cleanup_resources(&registry.path().join(format!("{run}.json")));
     let outcome =
         boxed_future(|| exercise_control(&scratch, &mut control, &mut data, send, case)).await;
     control.finish(scratch, &mut data).await;
-    ensure!(data.cleanup_confirmed, "cleanup failed");
+    confirm_cleanup(&data, &run, &outcome, &resources)?;
     ensure!(!registry.path().join(format!("{run}.key")).exists());
     ensure!(!registry.path().join(format!("{run}.json")).exists());
     outcome?;
@@ -792,4 +836,108 @@ fn d2b1_1165_pg16_cli_thread_executes_the_owned_service_boundary() {
 #[ignore = "needs docker and both pinned PostgreSQL scratch images"]
 fn d2b1_1165_pg18_cli_thread_executes_the_owned_service_boundary() {
     cli_lifecycle("PBPS_TEST_PG_SCRATCH_IMAGE");
+}
+
+fn unconfirmed_cleanup(message: &str) -> TestData {
+    let mut data = TestData::new(false);
+    let mut phase = Phase::offline("cleanup", "owned resources");
+    phase.outcome = Status::Unanswerable;
+    phase
+        .findings
+        .push(crate::output::Finding::error("test.cleanup", message));
+    data.phases.push(phase);
+    data
+}
+
+#[test]
+fn d2b1_2652_cleanup_failure_keeps_the_stage_work_and_only_owned_resource_identity() {
+    let stage = crate::adopt::Stage::new("cleanup-diagnostic").unwrap();
+    let path = stage.path().join("run.json");
+    std::fs::write(&path, serde_json::json!({
+        "container": {"id": "owned-container-2652", "name": "pbps-scratch-owned-2652", "password": "PRIVATE_CONTAINER_FIELD"},
+        "volumes": ["owned-volume-2652"],
+        "daemon": {"endpoint": "PRIVATE_DAEMON_ENDPOINT"},
+        "fingerprint_key": "PRIVATE_KEY_FIELD"
+    }).to_string()).unwrap();
+    let resources = cleanup_resources(&path);
+    // The snapshot must outlive record deletion on a partial/failed teardown.
+    std::fs::remove_file(path).unwrap();
+    let work = Err(anyhow::anyhow!("statement refused").context("candidate apply failed"));
+    let data = unconfirmed_cleanup("volume inspection failed at runtime.users");
+    let message = confirm_cleanup(&data, "run-2652", &work, &resources)
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "phase cleanup",
+        "test.cleanup",
+        "runtime.users",
+        "run-2652",
+        "owned-container-2652",
+        "pbps-scratch-owned-2652",
+        "owned-volume-2652",
+        "candidate apply failed",
+        "statement refused",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    for secret in [
+        "PRIVATE_CONTAINER_FIELD",
+        "PRIVATE_DAEMON_ENDPOINT",
+        "PRIVATE_KEY_FIELD",
+    ] {
+        assert!(
+            !message.contains(secret),
+            "unselected record fields escaped"
+        );
+    }
+}
+
+#[test]
+fn d2b1_2652_cleanup_timeout_keeps_the_existing_finding_and_successful_work_outcome() {
+    let data = unconfirmed_cleanup(
+        "owned cleanup was not confirmed: Err(Elapsed(())); run pbps test --cleanup",
+    );
+    let resources = Ok(CleanupResources {
+        container: CleanupContainer {
+            id: "container-2652".into(),
+            name: "scratch-2652".into(),
+        },
+        volumes: vec![],
+    });
+    let message = confirm_cleanup(&data, "run-2652", &Ok(()), &resources)
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "test.cleanup",
+        "Elapsed(())",
+        "pbps test --cleanup",
+        "work=Ok(())",
+        "volumes=[]",
+        "container-2652",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+}
+
+#[test]
+fn d2b1_2652_unreadable_resource_identity_is_reported_without_failing_confirmed_cleanup() {
+    let stage = crate::adopt::Stage::new("cleanup-unreadable").unwrap();
+    let path = stage.path().join("run.json");
+    let mut data = unconfirmed_cleanup("container inspection failed");
+    for bytes in [None, Some("{}"), Some("not json")] {
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let resources = cleanup_resources(&path);
+        assert!(resources.is_err());
+        let message = confirm_cleanup(&data, "run-2652", &Ok(()), &resources)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("resource identity unavailable"));
+        assert!(message.contains("container inspection failed"));
+    }
+    // A report/record observation must not change a confirmed teardown's result.
+    data.cleanup_confirmed = true;
+    let resources = cleanup_resources(&path);
+    assert!(confirm_cleanup(&data, "run-2652", &Ok(()), &resources).is_ok());
 }
