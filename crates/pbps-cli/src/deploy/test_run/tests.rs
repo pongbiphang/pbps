@@ -8,7 +8,8 @@ use pbps_diff::order::ArtifactView as _;
 use pbps_model::{IdsFile, Intent, TableName};
 use std::time::Duration;
 
-struct Fixture(crate::adopt::Stage);
+/// The stage, and the name the orders table is declared under.
+struct Fixture(crate::adopt::Stage, std::cell::Cell<&'static str>);
 impl Fixture {
     fn new() -> anyhow::Result<Self> {
         let stage = crate::adopt::Stage::new("d2a1165")?;
@@ -22,21 +23,32 @@ impl Fixture {
                 "  borrowed: {kind: server, url_env: D2A1165_MUST_NOT_BE_READ}\n"
             ),
         )?;
-        Ok(Self(stage))
+        Ok(Self(stage, std::cell::Cell::new("app.orders")))
     }
     fn input(&self, previous: &IdsFile, renamed: bool, extra: bool) -> anyhow::Result<Assembled> {
+        self.input_with(previous, renamed, extra, Vec::new())
+    }
+    /// `intents` are the recorded intents beyond the column rename `renamed` adds.
+    fn input_with(
+        &self,
+        previous: &IdsFile,
+        renamed: bool,
+        extra: bool,
+        intents: Vec<Intent>,
+    ) -> anyhow::Result<Assembled> {
         let amount = if renamed { "total" } else { "amount" };
         let note = if extra { "  note: {type: text}\n" } else { "" };
         std::fs::write(
             self.0.path().join("schema/orders.yml"),
             format!(
                 concat!(
-                    "table: app.orders\ncolumns:\n",
+                    "table: {table}\ncolumns:\n",
                     "  id: {{type: bigint, nullable: false, identity: [1, 1]}}\n",
                     "  code: {{type: text, nullable: false}}\n",
                     "  {amount}: {{type: integer, nullable: false}}\n{note}",
                     "primary_key: {{name: orders_pk, columns: [id]}}\n"
                 ),
+                table = self.1.get(),
                 amount = amount,
                 note = note
             ),
@@ -51,6 +63,7 @@ impl Fixture {
         )?;
         let project = pbps_config::Project::load(&self.0.path().join("pbps.yml"))?;
         let mut loaded = crate::load(&project, &pbps_pg::Postgres::new())?;
+        loaded.intents.extend(intents);
         if renamed {
             loaded.intents.push(Intent::RenameColumn {
                 table: TableName::new("app", "orders"),
@@ -1525,3 +1538,4 @@ async fn d2a1165_pg18_column_grants_are_effective_even_without_table_write_privi
 }
 
 mod execution_tests;
+mod prerequisite_tests;

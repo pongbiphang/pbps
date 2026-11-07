@@ -1,6 +1,8 @@
 use super::*;
 use crate::deploy::test_run::boxed_future;
-use crate::plan_test::{Revision, execution::Control, revision::Assembled, session::Session};
+use crate::plan_test::{
+    Revision, execution::Control, revision::Assembled, session::HopContext, session::Session,
+};
 use anyhow::{Context as _, ensure};
 use pbps_db::{DbError, Driver, LedgerError};
 use pbps_model::{DropGuard, DropRequirement, IdsFile, TableName};
@@ -197,7 +199,7 @@ async fn exercise(
     );
     let result = tokio::time::timeout(Duration::from_secs(25), async {
         tokio::join!(
-            boxed_future(|| control.plan(&session, &input, &mut phase)),
+            boxed_future(|| control.plan(&session, HopContext::first(&input), &mut phase)),
             terminate_blocked(&session)
         )
     })

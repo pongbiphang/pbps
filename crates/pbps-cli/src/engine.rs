@@ -3728,10 +3728,7 @@ pub async fn external_role_renames(
         }),
         Driver::Postgres => {
             let mut renames = BTreeMap::new();
-            for (uid, from) in &recorded.roles {
-                let Some(to) = declared.roles.get(uid).filter(|to| *to != from) else {
-                    continue;
-                };
+            for (from, to) in recorded.role_renames(declared) {
                 let evidence = pbps_pg::roles::rename_evidence(conn, from, to).await?;
                 if let Some(error) = pbps_pg::roles::refuse_rename(from, to, evidence) {
                     anyhow::bail!("rename_evidence (PostgreSQL): {error}");

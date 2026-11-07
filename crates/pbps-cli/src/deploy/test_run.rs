@@ -3,7 +3,7 @@ use super::services::{Attempt, Bootstrap, Declarations, PlanResult};
 pub(crate) use super::services::{Planned, Progress};
 use crate::plan_test::report::{Phase, Status};
 use crate::plan_test::revision::Assembled;
-use crate::plan_test::session::Session;
+use crate::plan_test::session::{HopContext, Session};
 
 // Reserve a large future's construction space only until it is boxed, before
 // polling it. A call-site Box::pin keeps that space in the caller's poll frame.
@@ -23,11 +23,12 @@ fn declarations(input: &Assembled) -> Declarations {
 /// a collector owned here would take its catalog findings along (#2694).
 pub(crate) async fn bootstrap(
     session: &Session<'_>,
-    input: &Assembled,
+    hop: HopContext<'_>,
     phase: &mut Phase,
     progress: &Progress,
 ) -> anyhow::Result<i64> {
-    session.prepare(&input.loaded.schema).await?;
+    let input = hop.incoming;
+    session.prepare(hop).await?;
     let project = session.project(input);
     let built = super::bootstrap_async(
         &project,
@@ -63,22 +64,23 @@ pub(crate) type HopFuture<'a, T> =
 
 pub(crate) fn plan<'a>(
     session: &'a Session<'_>,
-    input: &'a Assembled,
+    hop: HopContext<'a>,
     phase: &'a mut Phase,
     carried: &'a mut Vec<crate::output::Finding>,
     progress: &'a Progress,
 ) -> HopFuture<'a, Box<Planned>> {
-    Box::pin(plan_hop(session, input, phase, carried, progress))
+    Box::pin(plan_hop(session, hop, phase, carried, progress))
 }
 
 async fn plan_hop(
     session: &Session<'_>,
-    input: &Assembled,
+    hop: HopContext<'_>,
     phase: &mut Phase,
     carried: &mut Vec<crate::output::Finding>,
     progress: &Progress,
 ) -> anyhow::Result<Box<Planned>> {
-    session.prepare(&input.loaded.schema).await?;
+    let input = hop.incoming;
+    session.prepare(hop).await?;
     session.revoke_fixture_routines().await?;
     let project = session.project(input);
     let selected = project.config.select_resolver(None, Some("test"))?;
@@ -216,24 +218,41 @@ fn finish_attempt(phase: &mut Phase, attempt: Attempt) -> anyhow::Result<()> {
 // Gated like its callers: on another platform it would be dead code.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod whole {
-    use super::{Assembled, HopFuture, Phase, Planned, Progress, Session};
+    use super::{Assembled, HopContext, HopFuture, Phase, Planned, Progress, Session};
 
+    /// The first bootstrap, whose previous hop is explicitly absent.
     pub(crate) async fn bootstrap(
         session: &Session<'_>,
         input: &Assembled,
         phase: &mut Phase,
     ) -> anyhow::Result<i64> {
-        super::bootstrap(session, input, phase, &Progress::default()).await
+        super::bootstrap(
+            session,
+            HopContext::first(input),
+            phase,
+            &Progress::default(),
+        )
+        .await
     }
 
+    /// A plan whose previous hop is absent, so every missing name is new: for
+    /// the tests that rename no role. One that does uses [`plan_after`].
     pub(crate) fn plan<'a>(
         session: &'a Session<'_>,
         input: &'a Assembled,
         phase: &'a mut Phase,
     ) -> HopFuture<'a, Box<Planned>> {
+        plan_after(session, HopContext::first(input), phase)
+    }
+
+    pub(crate) fn plan_after<'a>(
+        session: &'a Session<'_>,
+        hop: HopContext<'a>,
+        phase: &'a mut Phase,
+    ) -> HopFuture<'a, Box<Planned>> {
         Box::pin(async move {
             let mut carried = Vec::new();
-            super::plan(session, input, phase, &mut carried, &Progress::default()).await
+            super::plan(session, hop, phase, &mut carried, &Progress::default()).await
         })
     }
 }

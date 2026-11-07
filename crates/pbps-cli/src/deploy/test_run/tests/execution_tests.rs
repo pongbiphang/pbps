@@ -92,7 +92,9 @@ async fn exercise_control(
         return cancel_plan(scratch, control, data, send, &session, &candidate).await;
     }
     let mut phase = Phase::new("candidate_plan", "candidate");
-    let planned = control.plan(&session, &candidate, &mut phase).await?;
+    let planned = control
+        .plan(&session, HopContext::first(&candidate), &mut phase)
+        .await?;
     ensure!(
         public_usage_warnings(&phase) == PLAN_READS,
         "{:?}",
@@ -285,7 +287,10 @@ async fn cancelled_before_any_warning(
     let mut control = Control::new(limits(), async { Ok(()) });
     let mut phase = Phase::new("early", "cancelled");
     let error = if plan {
-        control.plan(session, input, &mut phase).await.err()
+        control
+            .plan(session, HopContext::first(input), &mut phase)
+            .await
+            .err()
     } else {
         control.bootstrap(session, input, &mut phase).await.err()
     };
@@ -486,7 +491,7 @@ async fn cancel_plan(
         .await?;
     let mut phase = Phase::new("candidate_plan", "candidate");
     let (result, observed) = tokio::join!(
-        control.plan(session, candidate, &mut phase),
+        control.plan(session, HopContext::first(candidate), &mut phase),
         cancel_when_blocked(scratch, send)
     );
     holder.execute("ROLLBACK").await?;

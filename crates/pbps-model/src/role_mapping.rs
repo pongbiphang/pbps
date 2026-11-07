@@ -216,6 +216,27 @@ impl Change {
 }
 
 impl Schema {
+    /// Follows a role renamed outside the plan: its declaration is held under
+    /// the new name, and so are the row-security policies that apply to it.
+    /// A role's policies are bound by its oid, so the engine reads the
+    /// renamed role back as their recipient.
+    pub fn rename_role(&mut self, from: &RoleName, to: &RoleName) {
+        if let Some(role) = self.roles.remove(from) {
+            self.roles.insert(to.clone(), role);
+        }
+        for policy in self
+            .tables
+            .values_mut()
+            .flat_map(|table| table.row_policies.values_mut())
+        {
+            if let PolicyRoles::Roles(named) = &mut policy.to
+                && named.remove(from)
+            {
+                named.insert(to.clone());
+            }
+        }
+    }
+
     /// Every role the schema names: the roles it declares and the roles its
     /// row-security policies apply to.
     pub fn named_roles(&self) -> BTreeSet<RoleName> {
