@@ -92,6 +92,13 @@ impl Fixture {
             trace: Trace::new(),
             slowest: Duration::ZERO,
         };
+        // Resolution asks about retained bindings (DEC-1515.1). A newly
+        // created view alone is rebuilt by definition and needs no resolver.
+        std::fs::write(
+            fixture.d.dir.join("schema/dbo.anchor.view.yml"),
+            "view: dbo.anchor\ndefinition: SELECT id, label, amount, computed FROM ext.v\n",
+        )
+        .unwrap();
         fixture.remember_definitions();
         fixture.ok(&["plan", "--no-dev", "--out", "preview.json"]);
         fixture.d.commit();
@@ -788,11 +795,23 @@ impl Fixture {
     // applied managed view later would need separate reviewed drop intent.
     fn ordinary_outputs(&mut self) {
         self.hooks();
+        // Explicitly re-declare the only retained module in these ordinary
+        // plans, so assessment answers Rebuild rather than Resolve.
+        let anchor = self.d.dir.join("schema/dbo.anchor.view.yml");
+        let definition = "view: dbo.anchor\ndefinition: SELECT id + 0 AS id, label, amount, computed FROM ext.v\n";
+        std::fs::write(&anchor, definition).unwrap();
         let view = std::fs::read(self.view()).unwrap();
         std::fs::remove_file(self.view()).unwrap();
         let base = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: int, nullable: true}\nprimary_key: [id]\n";
         std::fs::write(self.d.dir.join("schema/dbo.base.yml"), base).unwrap();
         self.ok(&["plan", "--env", "prod", "--out", "ordinary.json"]);
+        let ordinary: serde_json::Value = serde_json::from_slice(
+            &self
+                .trace
+                .artifact(Sink::Plan, &self.d.dir.join("ordinary.json")),
+        )
+        .unwrap();
+        assert_eq!(ordinary["origin"], "database");
         let checksum = plan_checksum(&self.d.dir.join("ordinary.json"));
         self.ok(&[
             "apply",
@@ -821,10 +840,15 @@ impl Fixture {
             base.replace("  note:", "  extra: {type: int, nullable: true}\n  note:"),
         )
         .unwrap();
+        std::fs::write(&anchor, definition.replace("id + 0", "id + 0 + 0")).unwrap();
         self.ui(
             "plan",
             serde_json::json!({"environment":"prod", "out":"ui.json"}),
         );
+        let ordinary: serde_json::Value =
+            serde_json::from_slice(&self.trace.artifact(Sink::Plan, &self.d.dir.join("ui.json")))
+                .unwrap();
+        assert_eq!(ordinary["origin"], "database");
         let checksum = plan_checksum(&self.d.dir.join("ui.json"));
         self.ui("apply", serde_json::json!({"environment":"prod", "plan":"ui.json", "checksum":checksum, "allow":[], "staged":false,"resume":false}));
         std::fs::write(self.view(), view).unwrap();
