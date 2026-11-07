@@ -6080,3 +6080,94 @@ and `a_schema_bound_view_over_an_unbound_function_is_deferred_and_refused_on_451
 `mssql_two_modules_that_really_read_each_other_are_refused_by_name`; offline by
 `only_a_missing_object_class_is_retried`, `a_stated_loop_is_refused_before_anything_compiles`
 and the two `bootstrap` tests of `captured_bindings.rs`.
+
+<a id="dec-2144-1"></a>
+
+**DEC-2144.1. A resolved SQL Server plan is applied under the same sealed
+checks as a PostgreSQL one, built from plain reads compared at both ends.**
+`resolver::apply::{Keyed, Guard}` dispatch on the connection's driver, so an
+engine without an arm cannot compile. Before the lock: the key, then the
+instance's `family_guid` under its own label (`pbps/mssql-instance-identity/v1`).
+Inside the apply's transaction, before the first statement: the target's reported
+facts, the deployer's authorization and the opening manifest; after the last
+statement and before recording: the same for the closing manifest. The
+reads are `recheck_opening` and `capture_closing`, the manifest's own scope read
+again on the apply's connection and sealed under the plan's key, which the model
+compares with the seal (`opening_differences`, `closing_differences`). Apply
+starts no resolver and opens no scratch. The barrier of DEC-2143.3
+(`enforceable`, `MSSQL_APPLY_PENDING`) is gone; staged resolved apply stays the
+model's `EvidenceError::Staged` refusal.
+
+Measured on SQL Server 17.0.4075.5 (image sha256:4bab24f3…), each pinned by a
+test below:
+
+- Run as the principal that planned, the apply's own framing (`SET XACT_ABORT
+  ON; BEGIN TRANSACTION;`) reads exactly what planning sealed: user, default
+  schema, `ANSI_NULLS`, `QUOTED_IDENTIFIER`. Another principal differs.
+- A sealed scope rebuilds the exact request (`CandidateClass::of_catalog`; a
+  catalog this build does not read refuses). Apply passes the declarations the
+  plan retains (DEC-2322.1) so a module naming a declared database is not read
+  as an uncovered name; it still reads no dependency.
+- The plan's own engine-named keys, defaults and checks read equal on the
+  target and on scratch: no name special case, and a changed DEFAULT still shows.
+- No lock timeout is set. Another session's uncommitted DDL in the schema holds
+  the read: with `LOCK_TIMEOUT 1500` it failed after 1.63 s with 1222, and without
+  one it waited 4.5 s until the other session committed, then read what it
+  committed. The apply's own DDL waits on the same locks, and the deployment
+  lock already serialises pbps deployers, so only a session outside pbps can
+  hold it; an operator sees it in `sys.dm_exec_requests`. A timeout would be a
+  new knob for that case.
+- Under `XACT_ABORT ON` a failed read leaves `@@TRANCOUNT` 0 (the engine rolled
+  back) and a plain `ROLLBACK` is error 3903; the framing's `IF @@TRANCOUNT > 0
+  ROLLBACK TRANSACTION;` tolerates it, and the refusal text is formed in Rust
+  first. A deadlock victim (1205) was not forced; it takes the same path.
+- A read the engine refuses keeps its number and text: `CaptureError::Engine
+  { number, text }` replaces six `|_| CaptureError::Read` conversions in
+  `pbps-mssql`, so the refusal says 1222, a permission or a deadlock instead of
+  "could not read a required catalog". The grants measured as needed are in the
+  remedy of both permission refusals: schema `CONTROL` alone reads neither, and
+  `GRANT VIEW DEFINITION` plus `GRANT SELECT ON sys.sql_expression_dependencies`
+  reads.
+- The closing seal retains the columns of the objects the plan creates; the
+  closing read reads each with its retained object and a column whose object is
+  not retained still refuses as an identity the capture does not look up.
+
+The authorization digest is the one part apply could not recompute from the
+scope read. What planning seals (`authorization().before`) is the deployer's
+context over a question inventory that `prepare` builds: the scope read (3221
+bytes, schemas `{dbo}`) re-read in its own domain, the planned principals'
+kinds, and the permissions the staging leaves to authorization over the
+externals' owner partition, which names every system schema (INFORMATION_SCHEMA,
+`db_*`, `guest`, `sys`) and makes it 6577 bytes. Apply derives the same inventory
+from the sealed manifests: the managed set is what they prove owned by a
+surface, the externals are `ExternalInputs::of` (the one derivation of the roots,
+shared with `required_externals_declared`), `excluded()` is the managed objects
+and the externals that wait on them, and `staged_inventory` is the one function
+that builds the context, called by planning and by apply. Planning's bytes are
+unchanged by the extraction, and a plan created by an older build seals the
+same digest. Object grants and the routine identities of `Guard::routines` stay
+PostgreSQL's: SQL Server's object permissions are part of the authorization
+context (DEC-2143.1), its evidence carries no object grant, and a record that
+claims one is refused rather than read through a PostgreSQL reader.
+
+#2087 (a closing capture missing a change made after an earlier component was
+read) stays the deferred review DEC-619.1 answers; a double read is not added
+here. No format number: the manifests, the evidence and the plan are unchanged.
+
+Pinned on the engine by `the_opening_recheck_in_the_apply_transaction_finds_only_a_lasting_change`,
+`the_closing_capture_finds_another_writers_lasting_change_and_not_a_restored_one`,
+`the_unnamed_objects_a_plan_installs_compare_equal_to_scratchs`,
+`a_read_waits_for_another_sessions_uncommitted_ddl_and_then_reads`,
+`an_engine_refusal_during_the_read_keeps_its_number_and_text`,
+`a_deployer_missing_the_dependency_grants_is_refused_with_both_named` and
+`a_different_deployer_differs_at_the_opening_recheck`; through the guard by
+`mssql_a_resolved_plan_applies_without_docker`,
+`mssql_a_name_that_arrived_after_planning_refuses_before_the_first_statement`,
+`mssql_an_external_property_change_invalidates_the_plan`,
+`mssql_a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer`,
+`mssql_a_role_removed_after_planning_refuses_at_the_opening_check`,
+`mssql_another_key_or_another_instance_refuses_before_anything_is_read`,
+`mssql_a_plan_that_creates_unnamed_keys_and_defaults_applies_and_closes` and
+`mssql_the_planned_authorization_inventory_is_what_planning_sealed_before`
+(3221 and 6577); offline by `a_candidate_class_round_trips_through_its_catalog_and_an_unknown_one_is_none`
+and the `explain_resolver_mssql` tests, including the staged refusal.

@@ -1,14 +1,15 @@
 //! SQL Server resolver evidence is readable and reviewable from the file alone,
-//! and no build that cannot enforce it at apply accepts it there (#2143,
-//! DEC-2143.3).
+//! and applies under the same sealed checks as PostgreSQL's (#2143, #2144,
+//! DEC-2143.3, DEC-2144.1).
 
 use pbps_model::resolver::*;
 use pbps_model::{ChangeSet, IdsFile, PlanBaseline, PlanOrigin, SavedPlan};
 use std::collections::BTreeSet;
 use std::process::{Command, Output};
 
-const PENDING: &str =
-    "this build cannot yet enforce SQL Server resolver evidence during apply (#2144)";
+/// The wording of the build that could read SQL Server evidence and not
+/// enforce it (#2143, DEC-2143.3). It must not come back.
+const RETIRED: &str = "cannot yet enforce SQL Server resolver evidence";
 
 /// Synthetic, source-free evidence built through the public sealing
 /// constructors, as the reader sees it; not a claim of live qualification.
@@ -123,7 +124,7 @@ impl Drop for Artifact {
 }
 
 #[test]
-fn sql_server_evidence_reads_back_but_is_not_applyable() {
+fn sql_server_evidence_reads_back_and_is_applyable_with_the_ordinary_approval() {
     let plan = resolved();
     plan.validate_analysis().unwrap();
     assert_eq!(plan.origin, PlanOrigin::ResolvedDatabase);
@@ -131,16 +132,23 @@ fn sql_server_evidence_reads_back_but_is_not_applyable() {
     let json = artifact.explain("json");
     assert!(json.status.success(), "{json:?}");
     let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(value["data"]["applyable"], false, "{value}");
-    assert_eq!(value["data"]["approve_with"], "", "{value}");
+    assert_eq!(value["data"]["applyable"], true, "{value}");
+    assert!(
+        value["data"]["approve_with"]
+            .as_str()
+            .unwrap()
+            .starts_with("pbps apply --env"),
+        "{value}"
+    );
     assert_eq!(value["data"]["resolver"]["layout"], "supplied", "{value}");
     let text = artifact.explain("text");
     let text = String::from_utf8_lossy(&text.stdout);
-    assert!(text.contains(PENDING), "{text}");
-    assert!(text.contains("apply refused by this build"), "{text}");
-    // Planning again would seal the same evidence, so no such advice is given.
-    for advice in ["pbps plan", "pbps apply", "To approve and run it"] {
-        assert!(!text.contains(advice), "{advice}: {text}");
+    assert!(
+        text.contains("sealed resolver evidence — applyable"),
+        "{text}"
+    );
+    for retired in [RETIRED, "apply refused by this build", "(#2144)"] {
+        assert!(!text.contains(retired), "{retired}: {text}");
     }
 }
 
@@ -159,13 +167,17 @@ fn admitted(plan: &SavedPlan) -> anyhow::Result<bool> {
 }
 
 #[test]
-fn apply_refuses_sql_server_evidence_by_name_before_it_reads_a_key_or_connects() {
+fn apply_asks_sql_server_evidence_for_its_key_before_it_connects() {
+    // The same first check a PostgreSQL resolved plan meets: evidence sealed
+    // under one key is no evidence under another (DEC-952.1), and nothing
+    // about the engine refuses it by name any more.
     let error = admitted(&resolved()).unwrap_err().to_string();
-    assert_eq!(error, PENDING);
+    assert!(error.contains("fingerprint key"), "{error}");
+    assert!(!error.contains(RETIRED), "{error}");
 }
 
 #[test]
-fn the_barrier_leaves_other_plans_to_their_own_checks() {
+fn the_key_check_leaves_other_plans_to_their_own_checks() {
     // A resolved plan of another dialect is refused for its key, as before.
     let postgres = plan(
         "postgres",
@@ -175,12 +187,26 @@ fn the_barrier_leaves_other_plans_to_their_own_checks() {
     );
     let error = admitted(&postgres).unwrap_err().to_string();
     assert!(error.contains("fingerprint key"), "{error}");
-    assert!(!error.contains(PENDING), "{error}");
-    // An ordinary SQL Server plan has no evidence to enforce.
+    // An ordinary SQL Server plan has no evidence to key.
     let mut ordinary = resolved();
     ordinary.origin = PlanOrigin::Database;
     ordinary.analysis = PlanAnalysis::Ordinary;
     assert!(!admitted(&ordinary).unwrap());
+}
+
+#[test]
+fn a_staged_sql_server_plan_with_resolver_evidence_is_refused_by_name() {
+    // Staged resolved apply stays a refusal on every engine (#2144): the
+    // evidence describes one transaction, and a staged apply is several.
+    let mut plan = resolved();
+    plan.mode = pbps_model::PlanMode::Staged;
+    let error = plan.validate_analysis().unwrap_err();
+    assert!(error.to_string().contains("is staged"), "{error}");
+    let mut unstaged = resolved();
+    unstaged.mode = pbps_model::PlanMode::Transactional;
+    unstaged
+        .validate_analysis()
+        .expect("an unstaged plan is read as before");
 }
 
 #[test]
@@ -200,7 +226,7 @@ fn an_ordinary_sql_server_plan_is_still_applyable() {
             .starts_with("pbps apply --env"),
         "{value}"
     );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains(PENDING));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(RETIRED));
 }
 
 #[test]

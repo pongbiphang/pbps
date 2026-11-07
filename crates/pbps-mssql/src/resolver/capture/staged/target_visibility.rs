@@ -1,4 +1,5 @@
 //! Absence needs a readable DENY inventory over the lookup path (DEC-2541.3).
+use super::super::super::read_failed;
 use super::{CaptureError, ObjectIdentity, Schema, Uncovered};
 use pbps_db::{Row, transport::QueryConnection};
 use std::collections::BTreeSet;
@@ -73,7 +74,7 @@ pub(in crate::resolver::capture::staged) async fn prove(
     let rows = connection
         .query(AUTHORITY)
         .await
-        .map_err(|_| CaptureError::Read)?;
+        .map_err(|error| read_failed(&error))?;
     let [row] = rows.as_slice() else {
         return Err(CaptureError::Incomplete);
     };

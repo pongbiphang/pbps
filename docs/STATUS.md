@@ -294,7 +294,7 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**PostgreSQL resolver planning (#615) and transactional apply of a resolved plan (#616) delivered; staged resolved apply and SQL Server resolution (#619–#621) remain.**
+**PostgreSQL resolver planning (#615) and transactional apply of a resolved plan (#616) delivered, and SQL Server planning, sealing and the same apply checks (#2141–#2144, DEC-2144.1); staged resolved apply and the cross-engine acceptance matrix (#621) remain.**
 [SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal. Target planning accepts

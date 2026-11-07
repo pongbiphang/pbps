@@ -701,50 +701,32 @@ impl Scratch<'_> {
             .prerequisites()
             .into_keys()
             .collect::<BTreeSet<_>>();
-        let excluded = required
-            .managed()
-            .union(&pending)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut context = match authorization {
-            scope::Authorization::Mssql(context) => auth::reread(target_connection, context)
-                .await
-                .map_err(read)?,
-            _ => {
-                return Err(Error::Scope(
-                    "the SQL Server authorization belongs to another engine".into(),
-                ));
-            }
+        let excluded = required.excluded();
+        let planned_principals = self
+            .request
+            .planned
+            .iter()
+            .map(|g| g.principal.clone())
+            .collect::<Vec<_>>();
+        let scope::Authorization::Mssql(captured_context) = authorization else {
+            return Err(Error::Scope(
+                "the SQL Server authorization belongs to another engine".into(),
+            ));
         };
-        auth::read_planned_principals(
+        let mut context = auth::staged_inventory(
             target_connection,
-            &mut context,
-            &self
-                .request
-                .planned
-                .iter()
-                .map(|g| g.principal.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(read)?;
-        let external_scope = capture::CaptureScope {
-            retained: required.roots().clone(),
-            candidates: BTreeSet::new(),
-        };
-        let initial = capture::capture_declared(
-            target_connection,
-            &external_scope,
+            captured_context,
+            &planned_principals,
+            &required,
             binding.dependencies,
             key,
         )
         .await
-        .map_err(capture_error)?;
-        let initial_owners = auth::OwnerPartition::for_staging(&initial, &context, &excluded)
-            .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
-        auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
-            .await
-            .map_err(read)?;
+        .map_err(|error| match error {
+            auth::InventoryError::Read(error) => read(error),
+            auth::InventoryError::Capture(error) => capture_error(error),
+            auth::InventoryError::Owners(why) => Error::Externals(vec![why]),
+        })?;
         let token = self.token.clone();
         let planned = scope::mssql_planned(&self.request.planned);
         let mut map = auth::PrincipalMap::generate(&context, &planned, &token);

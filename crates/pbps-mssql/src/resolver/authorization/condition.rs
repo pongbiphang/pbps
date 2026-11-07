@@ -96,6 +96,60 @@ async fn target_context(
     Ok(got)
 }
 
+/// Why the staged question inventory could not be built.
+#[derive(Debug)]
+pub enum InventoryError {
+    Read(DbError),
+    Capture(crate::resolver::capture::CaptureError),
+    /// The partition of the externals' owners was refused (its `Debug` text).
+    Owners(String),
+}
+
+/// The deployer's question inventory over the target for a set of externals:
+/// the captured authorization re-read in its own domain, the planned
+/// principals' kinds, and the permissions on the externals the staging leaves
+/// to authorization. Planning builds it to reproduce and seal; apply builds
+/// it from the sealed manifest to recompute the seal (#2144). One derivation,
+/// so a digest planning sealed is one apply can reproduce.
+pub async fn staged_inventory(
+    target: &mut impl QueryConnection,
+    read: &AuthorizationContext,
+    planned: &[pbps_model::RoleName],
+    external: &crate::resolver::capture::ExternalInputs,
+    declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<AuthorizationContext, InventoryError> {
+    let mut context = reread(target, read).await.map_err(InventoryError::Read)?;
+    read_planned_principals(target, &mut context, planned)
+        .await
+        .map_err(InventoryError::Read)?;
+    let scope = crate::resolver::capture::CaptureScope {
+        retained: external.roots().clone(),
+        candidates: BTreeSet::new(),
+    };
+    let initial = crate::resolver::capture::capture_declared(target, &scope, declarations, key)
+        .await
+        .map_err(InventoryError::Capture)?;
+    let owners = OwnerPartition::for_staging(&initial, &context, &external.excluded())
+        .map_err(|e| InventoryError::Owners(format!("{e:?}")))?;
+    read_staged_permissions(target, &mut context, &owners)
+        .await
+        .map_err(InventoryError::Read)?;
+    Ok(context)
+}
+
+/// The deployer's authorization as the target answers it now, for the
+/// questions `read` asks: the engine-read effective permissions on top of the
+/// bracketed catalog read (#2144). A plan's sealed `before` and `after` are
+/// digests of exactly this shape, so apply asks the same questions of the
+/// target inside its transaction and compares digests.
+pub async fn answered_context(
+    target: &mut impl QueryConnection,
+    read: &AuthorizationContext,
+) -> Result<AuthorizationContext, DbError> {
+    target_context(target, read).await
+}
+
 /// The reproduction has already been verified and apply_planned has run.
 /// Capture its full after-state, translate every physical principal, and
 /// bracket it with target reads so no lasting target change supplies half a seal.

@@ -3,9 +3,10 @@
 The measured design for the SQL Server resolver: what SQL Server binds when an
 object is created, how it resolves names, what keeps a catalog read
 consistent, how scratch is told from the target and proven empty, and what
-the externals file is compared on. It enables nothing: SQL Server resolution
-stays refused by name until [#620](https://github.com/pongbiphang/pbps/issues/620)
-implements this design, and nothing here is inferred from PostgreSQL
+the externals file is compared on. It is the design [#620](https://github.com/pongbiphang/pbps/issues/620)
+implemented in four parts (capture #2141, scratch and assessment #2142 and
+#2238, planning and sealing #2143, apply #2144), and nothing here is inferred
+from PostgreSQL
 ([ADR-0016](ADR-0016-engine-assisted-planning.md#delivery-and-supersession),
 item 3).
 
@@ -88,7 +89,8 @@ Reconstruction creates only target-present schemas. Verification re-asks the
 captured questions even if scratch's default or recipe changed, and names a
 required schema's presence, owner, permissions or grant mismatch. SQL-login
 qualification does not establish Windows-group default-schema behavior (#725)
-or enable SQL Server apply of resolver evidence (#2144); planning and sealing are #2143.
+or enable SQL Server apply of resolver evidence; planning and sealing are #2143
+and apply is #2144 (DEC-2144.1).
 
 **Effective replay default (DEC-725.1).** For an existing default schema,
 the replay name comes from the deployer session's `SCHEMA_NAME()`, including
@@ -790,9 +792,9 @@ capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
 the canonical `mssql-capture-v4` shape and its sealed prerequisites, so later
 rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals, compiles the declarations as the
 reproduced deployer (§5), reads the compiled scratch and the target, plans from
-that evidence through `settle` and seals it (#2143, DEC-2143.1-.4). A build
-that reads the sealed evidence refuses to apply it until #2144 enforces it
-(DEC-2143.3).
+that evidence through `settle` and seals it (#2143, DEC-2143.1-.4). Apply
+recomputes the seal's checks inside its own transaction, with the same
+authorization inventory (#2144, DEC-2144.1).
 
 System-named keys, CHECKs, DEFAULTs, foreign keys and key-backed indexes use
 canonical declaration identities (DEC-2375.1). Private CHECK definitions stay

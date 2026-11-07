@@ -37,6 +37,9 @@ pub(super) fn request(
 /// recheck and apply key the identifier their own session reports the same
 /// way and compare digests (#1516, #616).
 pub(crate) const CLUSTER_RULE: &str = "pbps/pg-cluster-identity/v1";
+/// SQL Server's instance identity (`family_guid`), keyed under its own label so that
+/// no PostgreSQL digest equals a SQL Server one (#2144, DEC-1685.1).
+pub(crate) const MSSQL_CLUSTER_RULE: &str = "pbps/mssql-instance-identity/v1";
 
 pub(super) fn fingerprint(
     key: &EnvironmentFingerprintKey,
@@ -146,11 +149,7 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
     };
     let (channels_rule, cluster_rule, cluster_component) = match D::DRIVER {
         pbps_db::Driver::Postgres => ("pbps/pg-channels/v1", CLUSTER_RULE, "system-identifier"),
-        pbps_db::Driver::Mssql => (
-            "pbps/mssql-channels/v1",
-            "pbps/mssql-instance-identity/v1",
-            "family-guid",
-        ),
+        pbps_db::Driver::Mssql => ("pbps/mssql-channels/v1", MSSQL_CLUSTER_RULE, "family-guid"),
     };
     let qualification = Qualification {
         rule: identity.rule.into(),
