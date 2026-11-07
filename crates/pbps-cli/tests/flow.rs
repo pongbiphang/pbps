@@ -571,6 +571,89 @@ fn role_identity_changes_need_no_sql_server_resolver() {
     role_identity_mssql1527::check(&std::env::var("PBPS_TEST_DB").unwrap());
 }
 
+#[path = "support/rehearsal2379_mssql.rs"]
+mod rehearsal2379_mssql;
+
+mod rehearsal2379_mssql_cases {
+    use super::rehearsal2379_mssql::{self as cases, Kind};
+
+    fn server() -> String {
+        std::env::var("PBPS_TEST_DB").unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_converges_on_a_server_scratch() {
+        cases::converges(&server(), Kind::Server);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server and docker"]
+    fn rehearsal_mssql_converges_on_a_docker_scratch() {
+        cases::converges(&server(), Kind::Docker);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_refuses_a_rejected_statement_on_a_server_scratch() {
+        cases::refuses_a_statement_the_engine_rejects(&server(), Kind::Server);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server and docker"]
+    fn rehearsal_mssql_refuses_a_rejected_statement_on_a_docker_scratch() {
+        cases::refuses_a_statement_the_engine_rejects(&server(), Kind::Docker);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_off_switches_seal_off_on_a_server_scratch() {
+        cases::off_switches_seal_off(&server(), Kind::Server);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server and docker"]
+    fn rehearsal_mssql_off_switches_seal_off_on_a_docker_scratch() {
+        cases::off_switches_seal_off(&server(), Kind::Docker);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_killed_on_a_server_scratch_is_cleaned_up_by_the_next_run() {
+        cases::a_killed_rehearsal_is_cleaned_up_by_the_next_run(&server());
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_without_an_entry_leaves_no_record() {
+        cases::no_entry_no_record(&server());
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_builds_a_base_that_calls_its_own_function_on_a_server_scratch() {
+        cases::a_base_that_calls_its_own_function_rehearses(&server(), Kind::Server);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server and docker"]
+    fn rehearsal_mssql_builds_a_base_that_calls_its_own_function_on_a_docker_scratch() {
+        cases::a_base_that_calls_its_own_function_rehearses(&server(), Kind::Docker);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server on two instances"]
+    fn rehearsal_mssql_runs_roles_and_grants_without_a_server_principal_on_a_server_scratch() {
+        cases::authorization_is_rehearsed_and_makes_no_server_principal(&server(), Kind::Server);
+    }
+
+    #[test]
+    #[ignore = "needs live SQL Server and docker"]
+    fn rehearsal_mssql_runs_roles_and_grants_without_a_server_principal_on_a_docker_scratch() {
+        cases::authorization_is_rehearsed_and_makes_no_server_principal(&server(), Kind::Docker);
+    }
+}
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 

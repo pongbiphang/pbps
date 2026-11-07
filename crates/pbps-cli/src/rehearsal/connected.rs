@@ -23,9 +23,8 @@ use pbps_model::{AuthorizationRehearsal, Hints, IdsFile, Schema, Text};
 /// What a connected plan does about its rehearsal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Course {
-    /// Nothing, and no record: no scratch entry is selected, or the engine
-    /// has no connected rehearsal yet (SQL Server keeps today's behaviour
-    /// until it does, #2379), whatever the switch says.
+    /// Nothing, and no record: no scratch entry is selected, whatever the
+    /// switch says.
     Skip,
     /// The operator turned it off: the plan is sealed as not rehearsed.
     Off,
@@ -33,13 +32,13 @@ pub enum Course {
     Rehearse,
 }
 
-/// Decides the course from what the plan was asked and what it can do. Off
-/// needs an entry to turn off, and an engine that rehearses.
-pub fn course(driver: pbps_db::Driver, entry_selected: bool, off: bool) -> Course {
-    match (driver, entry_selected, off) {
-        (pbps_db::Driver::Postgres, true, true) => Course::Off,
-        (pbps_db::Driver::Postgres, true, false) => Course::Rehearse,
-        (pbps_db::Driver::Postgres, false, _) | (pbps_db::Driver::Mssql, _, _) => Course::Skip,
+/// Decides the course from what the plan was asked. Off needs an entry to
+/// turn off. Both engines rehearse (SQL Server since #2379 PR 3).
+pub fn course(entry_selected: bool, off: bool) -> Course {
+    match (entry_selected, off) {
+        (true, true) => Course::Off,
+        (true, false) => Course::Rehearse,
+        (false, _) => Course::Skip,
     }
 }
 
@@ -140,11 +139,18 @@ pub async fn run<D: crate::emission::Engine>(
     let named = plan.named_roles();
     // The planner refused every role it could see the target lack. A role dropped
     // since is refused in its words, before a scratch is started for it.
-    refuse_absent_roles(conn, &named).await?;
+    // (SQL Server's roles and users are the database's own, so there is no
+    // cluster to ask: DEC-2379.3.)
+    if driver == pbps_db::Driver::Postgres {
+        refuse_absent_roles(conn, &named).await?;
+    }
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
     let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.desired);
-    let bootstrap = pbps_diff::diff(
+    // As the resolver forms it (`resolution::resolve`): from nothing no module
+    // stands to be rebuilt, so the plan is not observed, and the text screen of
+    // a standing computed column has nothing standing to judge.
+    let bootstrap = pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,
@@ -157,9 +163,17 @@ pub async fn run<D: crate::emission::Engine>(
         anyhow::Error::new(crate::Unexpressible(errors))
             .context("the declarations' bootstrap cannot be formed")
     })?;
+    // PostgreSQL's scratch compiles the base's statements in the plan order.
+    // SQL Server's compiles the target's own namespace through the engine's
+    // creation trials, which take the bootstrap of the base to build (a
+    // default or computed column may call a function the base also holds).
+    let base_bootstrap = match driver {
+        pbps_db::Driver::Postgres => None,
+        pbps_db::Driver::Mssql => Some(base_bootstrap(plan)?),
+    };
     let binding = pbps_cli::resolver::server::BindingRequest {
         dependencies: plan.dependencies,
-        bootstrap: &bootstrap,
+        bootstrap: base_bootstrap.as_ref().unwrap_or(&bootstrap),
         desired: plan.desired.schema,
         base: plan.base.schema,
     };
@@ -187,10 +201,11 @@ pub async fn run<D: crate::emission::Engine>(
         open.externals.as_deref(),
         &open.provenance,
         &named,
-        async |session, roles| {
-            let lowered = lowered(plan, roles)?;
+        async |session, mut reader, roles| {
+            let lowered = lowered(plan, driver, roles)?;
             let findings = rehearse_in(
                 session,
+                reader.as_mut(),
                 lowered.base(
                     plan.base.ids,
                     Execution {
@@ -249,9 +264,32 @@ impl Lowered {
 /// the plan the caller lowered is cut down to the objects of the database.
 fn lowered<D: crate::emission::Engine>(
     plan: &Plan<'_, D>,
+    driver: pbps_db::Driver,
     roles: Roles,
 ) -> anyhow::Result<Lowered> {
     match roles {
+        // The namespace of the base is already compiled (the scratch session
+        // did it with the engine's trials); what is left of it is who may do
+        // what, which the plan's own statements then change.
+        Ok(mapping) if driver == pbps_db::Driver::Mssql => Ok(Lowered {
+            base: all_statements(&base_remainder(plan)?.0),
+            plan: all_statements(plan.statements),
+            mapping: Some(mapping),
+            authorization: AuthorizationRehearsal::Rehearsed,
+        }),
+        Err(why) if driver == pbps_db::Driver::Mssql => Ok(Lowered {
+            base: {
+                let (remainder, operations) = base_remainder(plan)?;
+                local_statements(&remainder, &operations)
+            },
+            plan: local_statements(plan.statements, plan.operations),
+            mapping: None,
+            authorization: AuthorizationRehearsal::NotRehearsed {
+                reason: Text::from(format!(
+                    "this plan's role, grant and row-security policy changes were not run: {why}"
+                )),
+            },
+        }),
         Ok(mapping) => {
             let (built, _) = lower_from_empty(
                 plan.dialect,
@@ -289,6 +327,59 @@ fn lowered<D: crate::emission::Engine>(
             })
         }
     }
+}
+
+/// The bootstrap of the base: the plan from nothing to the target's managed
+/// model, as the differ writes it. SQL Server's scratch builds the namespace
+/// from it through the engine's creation trials.
+fn base_bootstrap<D: crate::emission::Engine>(
+    plan: &Plan<'_, D>,
+) -> anyhow::Result<pbps_diff::order::DiffPlan> {
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.base);
+    pbps_diff::bootstrap(
+        pbps_diff::Side {
+            schema: &prerequisites,
+            ids: &prerequisite_ids,
+        },
+        plan.base,
+        plan.dialect.as_ref(),
+        plan.base_hints,
+    )
+    .map_err(|errors| {
+        anyhow::Error::new(crate::Unexpressible(errors))
+            .context("the target's managed state cannot be formed from nothing")
+    })
+}
+
+/// What a SQL Server base holds besides its namespace: the roles it declares,
+/// the privileges they hold, the row-security policies that name them and the
+/// rows it declares. The namespace is compiled first, so this is the plan from
+/// a model that has all of that and none of this to the model itself, and the
+/// ordinary differ and scheduler write it.
+fn base_remainder<D: crate::emission::Engine>(
+    plan: &Plan<'_, D>,
+) -> anyhow::Result<(
+    crate::emission::LoweredPlan,
+    pbps_model::operation::Operations,
+)> {
+    let mut without = plan.base.schema.clone();
+    without.roles.clear();
+    for table in without.tables.values_mut() {
+        table.row_security = Default::default();
+        table.row_policies.clear();
+        table.data = None;
+    }
+    let mut ids = plan.base.ids.clone();
+    ids.roles.clear();
+    super::lower_between(
+        plan.dialect,
+        pbps_diff::Side {
+            schema: &without,
+            ids: &ids,
+        },
+        plan.base,
+        plan.base_hints,
+    )
 }
 
 /// What the rehearsal found, as the plan's verdict.
@@ -560,31 +651,17 @@ mod tests {
         assert!(judged(Err(anyhow::anyhow!("connection reset"))).is_err());
     }
 
-    /// SQL Server keeps today's behaviour until its own rehearsal lands: no
-    /// scratch is acquired and no record is made, whatever the entry and the
-    /// switch say. A record that read "off" there would claim a choice nobody
-    /// had, and a rehearsal would claim a check nobody ran.
+    /// The course depends on the entry and the switch alone: both engines
+    /// rehearse, so no engine reads as "never rehearses" and no record is made
+    /// where there is nothing to rehearse on or to turn off.
     #[test]
-    fn sql_server_never_rehearses_and_never_records() {
-        for entry in [false, true] {
-            for off in [false, true] {
-                assert_eq!(
-                    course(Driver::Mssql, entry, off),
-                    Course::Skip,
-                    "{entry} {off}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn postgres_rehearses_by_default_when_an_entry_is_selected() {
-        assert_eq!(course(Driver::Postgres, true, false), Course::Rehearse);
-        assert_eq!(course(Driver::Postgres, true, true), Course::Off);
+    fn an_entry_decides_the_course_whatever_the_engine() {
+        assert_eq!(course(true, false), Course::Rehearse);
+        assert_eq!(course(true, true), Course::Off);
         // Negative: with no entry there is nothing to rehearse on or to turn
         // off, so there is no record either way.
-        assert_eq!(course(Driver::Postgres, false, false), Course::Skip);
-        assert_eq!(course(Driver::Postgres, false, true), Course::Skip);
+        assert_eq!(course(false, false), Course::Skip);
+        assert_eq!(course(false, true), Course::Skip);
     }
 
     #[test]

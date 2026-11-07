@@ -65,6 +65,20 @@ impl EnvironmentFingerprintKey {
         FingerprintKey::from_file(path).map(Self)
     }
 
+    /// A key that exists for one run of one process and is known to nothing
+    /// else (#2379). A rehearsal reads the target's catalog through the same
+    /// captures the resolver uses, and those fingerprint what they read; the
+    /// rehearsal compares in memory and seals nothing, so it needs no key a
+    /// person configured and must not ask for one. Evidence sealed under this
+    /// key could be checked by no other run, which is why no caller may seal
+    /// under it.
+    #[must_use]
+    pub fn for_one_run() -> Self {
+        Self(FingerprintKey {
+            bytes: rand::random::<[u8; GENERATED_KEY_BYTES]>().to_vec(),
+        })
+    }
+
     pub fn id(&self) -> KeyId {
         self.0.id()
     }
@@ -354,6 +368,27 @@ mod tests {
         assert!(!format!("{k:?}").contains(&text));
         // Two generations differ.
         assert_ne!(FingerprintKey::generate(), text);
+    }
+
+    #[test]
+    fn a_key_for_one_run_is_random_and_never_the_same_twice() {
+        let (first, second) = (
+            EnvironmentFingerprintKey::for_one_run(),
+            EnvironmentFingerprintKey::for_one_run(),
+        );
+        assert_ne!(first.id(), second.id());
+        assert_eq!(first.id().as_str().len(), 16);
+        // Negative: the same input under two such keys is not comparable, which
+        // is why nothing may seal under one.
+        assert_ne!(
+            first.fingerprint("rule", "component", b"input"),
+            second.fingerprint("rule", "component", b"input")
+        );
+        // And it keeps its own value.
+        assert_eq!(
+            first.fingerprint("rule", "component", b"input"),
+            first.fingerprint("rule", "component", b"input")
+        );
     }
 
     #[test]

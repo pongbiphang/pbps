@@ -28,13 +28,16 @@ Preview `plan --dev` shares the resolver's SQL Server server/Docker acquisition
 one configured entry; inline and legacy dev spellings remain available.
 Reports name operator-vouched separation and, when configured, externals staged
 before the baseline without comparison to any target. This remains a preview.
-A connected PostgreSQL plan with a scratch entry selected is rehearsed on that
-entry by default and sealed with the outcome (#2379, DEC-2379.2);
+A connected plan with a scratch entry selected is rehearsed on that
+entry by default and sealed with the outcome (#2379, DEC-2379.2, DEC-2379.3);
 `rehearse: false` and `plan --no-rehearse` turn it off. Its role, grant and
 row-security policy changes run under the target's real role names on the
 target's own cluster and in a container, and on roles made for the run on a
 cluster others use, where an account that cannot create roles skips them and
-the record says so. SQL Server's connected rehearsal follows #2376.
+the record says so. On SQL Server roles are database-scoped, so the scratch
+database holds the target's own role names and no principal is made on the
+instance; the base is built through the engine's creation trials, as the
+resolver builds the declarations.
 
 SQL Server projects may declare cross-database table/view shapes with
 `dependency:` files (#2322, SPEC §4.9). Connected planning compares readable
@@ -302,7 +305,7 @@ the existing SQL Server `--dev` rehearsal. Target planning accepts
 Profiles carry a trusted Docker image and pull policy (default `never`), or a
 separate scratch credential-variable reference. Selection looks up no credentials
 and acquires no resources; connected summaries report `not_acquired` outside
-the saved artifact, until a PostgreSQL plan is rehearsed on the entry (#2379). A plan that needs the selected resolver runs it (#1515)
+the saved artifact, until a plan is rehearsed on the entry (#2379). A plan that needs the selected resolver runs it (#1515)
 and publishes its plan after the ordinary connected checks and a fresh
 recheck of the target, sealed in its final order (#1516). Existing planning
 checks remain in force.

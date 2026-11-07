@@ -259,6 +259,26 @@
       "cases": ["role_identity_changes_need_no_sql_server_resolver"]
     },
     {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "rehearsal2379_mssql_cases::rehearsal_mssql_converges_on_a_server_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_converges_on_a_docker_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_refuses_a_rejected_statement_on_a_server_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_refuses_a_rejected_statement_on_a_docker_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_off_switches_seal_off_on_a_server_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_off_switches_seal_off_on_a_docker_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_killed_on_a_server_scratch_is_cleaned_up_by_the_next_run",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_without_an_entry_leaves_no_record",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_builds_a_base_that_calls_its_own_function_on_a_server_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_builds_a_base_that_calls_its_own_function_on_a_docker_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_runs_roles_and_grants_without_a_server_principal_on_a_server_scratch",
+        "rehearsal2379_mssql_cases::rehearsal_mssql_runs_roles_and_grants_without_a_server_principal_on_a_docker_scratch"
+      ]
+    },
+    {
       "target": ["pbps-cli", "bin", "pbps"],
       "owner": "pg",
       "validate_on": "linux",

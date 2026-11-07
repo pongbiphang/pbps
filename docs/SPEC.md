@@ -2664,8 +2664,7 @@ drops them; a role that cannot be dropped is named.
 It is on by default. `rehearse: false` under an environment and
 `plan --no-rehearse` turn it off, and the plan is sealed `off`, never as
 rehearsed. With no entry selected the plan carries no record. `apply` only
-displays the record and never acquires a scratch. SQL Server keeps its present
-behaviour until it has a connected rehearsal.
+displays the record and never acquires a scratch.
 
 What it does not reproduce, stated rather than implied:
 
@@ -2707,6 +2706,47 @@ Three stances govern this preview rehearsal:
   rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
   on edition-dependent risk).
 
+
+#### The connected rehearsal (SQL Server)
+
+A connected SQL Server plan is rehearsed the same way, with the same switch,
+record, refusals and `apply` behaviour (#2379, DEC-2379.3). Three things differ.
+
+1. **The base is built as the resolver builds the declarations.** The target's
+   current managed model is created on the scratch through the engine's creation
+   trials (§9.3.2, DEC-2143.9), not in the plan's statement order. A table
+   default, check or computed column that calls a function the target also holds
+   has no order the plain bootstrap can write (the table is created first and
+   the engine refuses it, error 342), and the trials find one. What the
+   namespace does not carry, the roles, their grants, the row-security policies
+   and the declared rows, is created after it by the ordinary differ and
+   scheduler. A target whose declarations the planner cannot form from nothing
+   (a computed column calling a function created in the same plan, for
+   example) is refused as for the resolver, naming the switch.
+2. **The scratch session is the deployer the scratch reproduces,** as an apply's
+   is, so a statement the target's deployer may not run fails here too. The
+   scratch is read back on a second connection bounded to the scratch database,
+   which may see what the deployer cannot.
+3. **No principal is mapped or made on the instance.** Roles and users are
+   database-scoped on SQL Server, so the scratch database holds the target's own
+   role names whatever instance it is on, and dropping it takes them
+   (measured on 17.0: a login that may only create databases makes the same
+   names in two databases at once, and the instance's server principals are the
+   same before and after). pbps declares roles and the grants to them; users and
+   logins stay with the environment (ADR-0005) and no statement it writes names
+   one, so a rehearsal never creates, alters or names a login. A plan that did
+   name a principal the declarations do not hold is not rehearsed for
+   authorization, and the record says why. A user `FOR LOGIN` and one `WITHOUT
+   LOGIN` carry the same permissions, ownership and memberships in the database
+   (measured), which is why the resolver reproduces the deployer's users without
+   logins. No planned grant is replayed before the base is created: the plan's
+   own statements make every change, grants included, so a plan that changes a
+   role's identity, which the resolver's authorization cannot project, is still
+   one the rehearsal runs.
+
+The rehearsal reads no key anyone configured: the captures it reuses fingerprint
+what they read, and it compares in memory and seals nothing, so it uses a key of
+its own that lives for the run.
 #### 9.3.2 Engine-assisted planning (PostgreSQL planning and apply delivered)
 
 Delivered for PostgreSQL (#1514–#1517, #616): `plan` publishes the resolver's
@@ -3013,7 +3053,7 @@ the resolver owns — no fingerprint key, Docker socket or scratch connection �
 and its connected summary reports `resolver_selection` with status
 `not_acquired` and `resolver_assessment` with `need: not_needed`, outside the
 saved plan and its checksum. (The connected rehearsal of 9.3.1 is a separate
-use of the same entry, on by default for PostgreSQL; `--no-rehearse` leaves a
+use of the same entry, on by default; `--no-rehearse` leaves a
 plan that needs no resolver opening nothing at all.) A plan that requires the
 resolver reads the key
 first, then runs it, and publishes its answer (DEC-1516.1):
