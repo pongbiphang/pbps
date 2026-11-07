@@ -359,8 +359,9 @@ impl Scratch<'_> {
         }
     }
 
-    /// See `postgres::Scratch::naming`. SQL Server has no connected rehearsal
-    /// yet.
+    /// See `postgres::Scratch::naming`. SQL Server has no cluster role to
+    /// name: its roles are the scratch database's own and a rehearsal asks
+    /// `scratch::rehearse::principals` instead (DEC-2379.3).
     pub(super) fn naming(&self) -> Result<Naming, Error> {
         match self {
             Self::Postgres(scratch) => Ok(scratch.naming()),
@@ -444,6 +445,26 @@ impl Prepared {
         match self {
             Self::Postgres(prepared) => prepared.session(admin),
             Self::Mssql(_) => admin,
+        }
+    }
+
+    /// The session a rehearsal's statements run in: the reproduced deployer's,
+    /// as an apply's are, where the scratch has one (SQL Server), and the
+    /// checked connection otherwise.
+    pub(super) fn deployer<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        match self {
+            Self::Postgres(prepared) => prepared.session(admin),
+            Self::Mssql(prepared) => &mut prepared.compile,
+        }
+    }
+
+    /// A connection that reads the scratch database as a whole, for the
+    /// comparison after the plan ran: the deployer's cannot leave its context
+    /// and may lack `VIEW DEFINITION`. `None` where the session reads it itself.
+    pub(super) async fn reader(&self) -> Result<Option<Conn>, Error> {
+        match self {
+            Self::Postgres(_) => Ok(None),
+            Self::Mssql(prepared) => prepared.reach().open().await.map(Some),
         }
     }
     pub(super) fn differences(&self) -> &[String] {

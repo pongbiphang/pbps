@@ -9,11 +9,12 @@
 //! is reached; the scratch is the operator's choice, and a rehearsal on
 //! another build proves syntax and convergence, never the build's behaviour.
 
-use super::super::producer::request;
+use super::super::producer::{request, request_as_it_stands};
 use super::super::{BindingRequest, Error, ProduceError, engine};
 use super::{Provenance, Tokens};
 use crate::resolver::scope;
 use pbps_db::{Conn, Driver};
+use pbps_model::resolver::OutsideWrites;
 use pbps_model::resolver::ScratchLayout;
 use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Hints, RoleName};
@@ -50,11 +51,16 @@ pub async fn with_session<T, E>(
     externals: Option<&str>,
     provenance: &Provenance,
     named: &BTreeSet<RoleName>,
-    run: impl AsyncFnOnce(&mut Conn, Roles) -> Result<T, E>,
+    run: impl AsyncFnOnce(&mut Conn, Option<Conn>, Roles) -> Result<T, E>,
 ) -> Result<(ScratchLayout, Result<T, E>), ProduceError> {
     // The write path's extras are the dialect's, and the CLI's PostgreSQL
     // dialect configures none, as for the resolver.
-    let request = request(driver, base, desired, hints, &[]).map_err(ProduceError::Run)?;
+    let request = match driver {
+        Driver::Postgres => {
+            request(driver, base, desired, hints, &[]).map_err(ProduceError::Run)?
+        }
+        Driver::Mssql => request_as_it_stands(base, desired, &[]),
+    };
     let standard = standard.into();
     // Every connection of the run opens the one endpoint found here
     // (DEC-2271.2), as for the resolver.
@@ -107,6 +113,10 @@ pub async fn with_session<T, E>(
                 ambiguous.join("; ")
             )));
         }
+        // SQL Server's captures fingerprint what they read, and a rehearsal
+        // compares in memory and seals nothing: the key is the run's own.
+        let key = (driver == Driver::Mssql)
+            .then(pbps_db::fingerprint::EnvironmentFingerprintKey::for_one_run);
         let mut prepared = state
             .prepare(
                 provisioning,
@@ -117,7 +127,7 @@ pub async fn with_session<T, E>(
                 &scope_schemas,
                 binding,
                 &request.write_path_extras,
-                None,
+                key.as_ref(),
             )
             .await?;
         // The externals the base and the plan read are the target's, as for
@@ -125,7 +135,37 @@ pub async fn with_session<T, E>(
         // plan on a state the target does not hold. The comparison needs the
         // resolver's reconstruction, which says which target objects are
         // managed, so a rehearsal with nothing staged never builds it.
-        if externals.is_some() || prepared.has_filled() {
+        if driver == Driver::Mssql {
+            // The base is the target's own managed namespace, compiled the way
+            // the resolver compiles the declarations: through the engine's
+            // creation trials, because a default or computed column that calls
+            // a function the base also holds has no order the plain bootstrap
+            // can write (DEC-2379.3). Its externals were staged and compared
+            // with the target by `prepare`.
+            let mut built = state
+                .reconstruction(
+                    &mut target,
+                    binding,
+                    base.ids,
+                    &hints.module_deps,
+                    &mut prepared,
+                )
+                .await?;
+            let mut staged = prepared.completed_staged().ok_or_else(|| {
+                Error::Scope("the prepared scratch holds no staged inventory".into())
+            })?;
+            built
+                .compile(
+                    &mut prepared,
+                    &mut admin,
+                    &mut target,
+                    &[],
+                    None,
+                    OutsideWrites::Refused,
+                    &mut staged,
+                )
+                .await?;
+        } else if externals.is_some() || prepared.has_filled() {
             let mut reconstruction = state
                 .reconstruction(
                     &mut target,
@@ -154,14 +194,22 @@ pub async fn with_session<T, E>(
                 )
                 .await?;
         }
-        let roles = roles(&mut state, &mut admin, named, &tokens).await?;
-        let layout = if prepared.supplied() {
-            ScratchLayout::Supplied
+        let reader = prepared.reader().await?;
+        let roles = if driver == Driver::Mssql {
+            principals(named, base.schema, desired.schema)
         } else {
-            ScratchLayout::RunOwned
+            roles(&mut state, &mut admin, named, &tokens).await?
         };
-        let session = prepared.session(&mut admin);
-        Ok((layout, run(session, roles).await))
+        // PostgreSQL's prepared scratch knows it holds a supplied database;
+        // SQL Server's layout is the provisioning the acquisition chose, as for
+        // the resolver's evidence.
+        let layout = match provisioning {
+            super::Provisioning::Supplied => ScratchLayout::Supplied,
+            super::Provisioning::RunOwned if prepared.supplied() => ScratchLayout::Supplied,
+            super::Provisioning::RunOwned => ScratchLayout::RunOwned,
+        };
+        let session = prepared.deployer(&mut admin);
+        Ok((layout, run(session, reader, roles).await))
     }
     .await;
     let released = state.release(&mut admin).await;
@@ -203,4 +251,117 @@ async fn roles(
             Err(why) => Err(why),
         },
     )
+}
+
+/// The principals a SQL Server rehearsal's statements name, as the scratch
+/// can hold them: every one is a role the declarations hold (the base creates
+/// it) or one every database holds.
+///
+/// pbps declares roles and the grants to them; users and logins stay with the
+/// environment (ADR-0005), and no statement it writes names one. Roles and
+/// users are database-scoped, so the scratch database holds the target's own
+/// role names whatever instance it is on, and nothing is made on the instance
+/// (measured: a confined login makes the same names in two databases at once,
+/// and dropping the database leaves the server's principals as they were).
+/// A login is a server principal; a rehearsal never creates, alters or names
+/// one (DEC-2379.3). A statement that did name a principal the declarations do
+/// not hold would run against a user or login the scratch does not have and
+/// fail for a reason that says nothing about the plan, so such a plan is not
+/// rehearsed for authorization and the record says why.
+fn principals(
+    named: &BTreeSet<RoleName>,
+    base: &pbps_model::Schema,
+    desired: &pbps_model::Schema,
+) -> Roles {
+    let missing = undeclared(named, base, desired);
+    if missing.is_empty() {
+        Ok(RoleMapping::default())
+    } else {
+        Err(format!(
+            "the plan names {}, which the declarations do not hold: a user or login belongs to \
+             the environment, and a rehearsal makes none",
+            missing
+                .iter()
+                .map(|name| format!("`{}`", name.shown()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+/// The principals `named` that are neither declared in `base` or `desired` nor
+/// built into every database.
+fn undeclared<'a>(
+    named: &'a BTreeSet<RoleName>,
+    base: &pbps_model::Schema,
+    desired: &pbps_model::Schema,
+) -> Vec<&'a RoleName> {
+    named
+        .iter()
+        .filter(|name| {
+            !base.roles.contains_key(*name)
+                && !desired.roles.contains_key(*name)
+                && !builtin(name.raw())
+        })
+        .collect()
+}
+
+/// A principal every database holds: it is never made, and never mapped.
+fn builtin(name: &str) -> bool {
+    name.starts_with("db_")
+        || ["dbo", "public", "guest", "sys", "INFORMATION_SCHEMA"]
+            .iter()
+            .any(|own| own.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod principals_tests {
+    use super::*;
+
+    fn role(name: &str) -> RoleName {
+        name.into()
+    }
+
+    fn holding(roles: &[&str]) -> pbps_model::Schema {
+        let mut schema = pbps_model::Schema::default();
+        for name in roles {
+            schema
+                .roles
+                .insert(role(name), pbps_model::role::Role::default());
+        }
+        schema
+    }
+
+    #[test]
+    fn declared_and_built_in_principals_are_held_and_a_user_is_not() {
+        let named: BTreeSet<_> = [
+            "reader",
+            "later",
+            "dbo",
+            "PUBLIC",
+            "db_datareader",
+            "app_user",
+        ]
+        .map(role)
+        .into();
+        let missing = undeclared(&named, &holding(&["reader"]), &holding(&["later"]));
+        assert_eq!(missing, vec![&role("app_user")]);
+        assert!(principals(&named, &holding(&["reader"]), &holding(&["later"])).is_err());
+    }
+
+    #[test]
+    fn nothing_to_hold_is_a_rehearsal_under_the_targets_own_names() {
+        let named: BTreeSet<_> = ["reader", "dbo"].map(role).into();
+        assert!(principals(&named, &holding(&["reader"]), &holding(&[])).is_ok());
+        assert!(principals(&BTreeSet::new(), &holding(&[]), &holding(&[])).is_ok());
+    }
+
+    /// The names are compared as the engine compares a principal, so a name
+    /// that differs only in case from a built-in is the built-in's, and a
+    /// declared role is not one.
+    #[test]
+    fn a_name_that_only_looks_built_in_is_not() {
+        assert!(builtin("DBO") && builtin("db_owner") && builtin("Guest"));
+        assert!(!builtin("dbo_reader") && !builtin("database_user") && !builtin("sysadmin"));
+    }
 }
