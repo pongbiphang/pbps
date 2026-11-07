@@ -397,11 +397,41 @@ mod tests {
             super::super::introspect(&mut conn).await
         }
         .await;
+        // The same pull by an ordinary role. A deployer, and the rehearsal's
+        // confined account, are not superusers. A census that reads a
+        // superuser-only catalog (pg_user_mapping holds secret options) would
+        // fail every non-superuser pull and plan.
+        let reader = format!("pbps_s168_reader_{}", std::process::id());
+        admin
+            .execute(&format!(
+                "CREATE ROLE {reader} LOGIN PASSWORD 'reader' NOSUPERUSER"
+            ))
+            .await
+            .unwrap();
+        let ordinary = async {
+            let mut conn = Conn::connect(
+                Driver::Postgres,
+                &format!("{server} dbname={database} user={reader} password=reader"),
+            )
+            .await?;
+            super::super::introspect(&mut conn).await
+        }
+        .await;
         admin
             .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
             .await
             .unwrap();
+        admin.execute(&format!("DROP ROLE {reader}")).await.unwrap();
         let pulled = outcome.unwrap();
+        let ordinary =
+            ordinary.unwrap_or_else(|e| panic!("{variable}: an ordinary role cannot pull: {e:?}"));
+        let ordinary_notices = ordinary.catalog_notices.join("\n");
+        for needle in ["foreign server `s9_srv`", "user mapping `"] {
+            assert!(
+                ordinary_notices.contains(needle),
+                "{variable}: an ordinary role's pull misses `{needle}` in\n{ordinary_notices}"
+            );
+        }
         let notices = pulled.catalog_notices.join("\n");
         for &(_, notice, table) in cases {
             assert!(
