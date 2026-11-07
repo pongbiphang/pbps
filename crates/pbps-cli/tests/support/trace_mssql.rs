@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 mod collector;
 use collector::*;
 
-const BASE: &str =
-    "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n";
+const BASE: &str = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: base_pk, columns: [id]}\n";
 const UNAVAILABLE_SCRATCH: &str =
     "Server=127.0.0.1,1;User Id=sa;Password=not-used;Database=master;TrustServerCertificate=true";
 // Keep the ordinary external shape in pull's declaration form (SPEC §5).
@@ -929,7 +928,7 @@ impl Fixture {
         std::fs::write(&anchor, definition).unwrap();
         let view = std::fs::read(self.view()).unwrap();
         std::fs::remove_file(self.view()).unwrap();
-        let base = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: int, nullable: true}\nprimary_key: [id]\n";
+        let base = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: int, nullable: true}\nprimary_key: {name: base_pk, columns: [id]}\n";
         std::fs::write(self.d.dir.join("schema/dbo.base.yml"), base).unwrap();
         self.ok(&["plan", "--env", "prod", "--out", "ordinary.json"]);
         let ordinary: serde_json::Value = serde_json::from_slice(
