@@ -205,7 +205,13 @@ impl Fixture {
 
     fn ok(&mut self, args: &[&str]) -> Output {
         let result = self.run(args);
-        assert_eq!(code(&result), 0, "{args:?}: {}", stderr(&result));
+        assert_eq!(
+            code(&result),
+            0,
+            "{args:?}: stderr={} stdout={}",
+            stderr(&result),
+            stdout(&result)
+        );
         result
     }
 
