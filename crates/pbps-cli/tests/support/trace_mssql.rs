@@ -9,6 +9,8 @@ use collector::*;
 
 const BASE: &str =
     "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n";
+const UNAVAILABLE_SCRATCH: &str =
+    "Server=127.0.0.1,1;User Id=sa;Password=not-used;Database=master;TrustServerCertificate=true";
 const EXTERNALS: &str = "CREATE SCHEMA ext;\nGO\n\
     CREATE TABLE ext.t(id int, computed int);\nGO\n\
     CREATE FUNCTION ext.f() RETURNS int AS BEGIN RETURN 1; END;\nGO\n\
@@ -116,6 +118,7 @@ impl Fixture {
             .arg(directory)
             .args(args)
             .env_remove("PBPS_TRACE_KEY")
+            .env_remove("PBPS_TRACE_SCRATCH")
             .envs(self.env.iter().map(|(k, v)| (k, v)));
         command
     }
@@ -197,8 +200,10 @@ impl Fixture {
         }
     }
 
-    fn draft(&mut self) {
-        self.ok(&[
+    fn draft_refusal(&mut self) {
+        // Drafting still reads PostgreSQL bindings; the SQL Server refusal is
+        // itself an output surface whose bytes must pass the trace collector.
+        let result = self.run(&[
             "resolver",
             "externals",
             "--env",
@@ -208,8 +213,14 @@ impl Fixture {
             "--out",
             "draft.sql",
         ]);
-        let draft = std::fs::read_to_string(self.d.dir.join("draft.sql")).unwrap();
-        assert!(draft.contains("ext") && !draft.contains(SOURCES[0]));
+        assert_ne!(code(&result), 0);
+        assert!(
+            stderr(&result).contains("reads a PostgreSQL target")
+                && stderr(&result).contains("SQL Server has no binding adapter"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(!self.d.dir.join("draft.sql").try_exists().unwrap());
     }
 
     fn offline(&mut self, file: &str) {
@@ -246,6 +257,13 @@ impl Fixture {
             }
             if format == "json" {
                 let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(report["data"]["applyable"], true);
+                assert!(
+                    report["data"]["approve_with"]
+                        .as_str()
+                        .unwrap()
+                        .contains("apply")
+                );
                 let detail = &report["data"]["resolver"];
                 assert_eq!(detail["entry"], "scratch");
                 assert!(!detail["prerequisites"].as_array().unwrap().is_empty());
@@ -370,6 +388,7 @@ impl Fixture {
                 self.target.connection(),
                 &function().replace("RETURN LEN(", "RETURN 1 + LEN("),
             );
+            self.remember_definitions();
         } else if child.try_wait().unwrap().is_none() {
             child.kill().unwrap();
         }
@@ -396,23 +415,162 @@ impl Fixture {
         );
     }
 
-    fn apply_refusal(&mut self) {
-        let checksum = plan_checksum(&self.d.dir.join("second.json"));
-        let result = self.run(&[
+    fn apply_plan(&mut self, file: &str) -> Output {
+        let checksum = plan_checksum(&self.d.dir.join(file));
+        self.run(&[
             "apply",
             "--env",
             "prod",
             "--plan",
-            "second.json",
+            file,
             "--checksum",
             &checksum,
+            "--allow",
+            "rename,destructive,constraint",
             "--format",
             "json",
-        ]);
-        assert_ne!(code(&result), 0);
-        // This build's explicit #2144 barrier is a real output consumer too.
-        // Replace this cell with keyed/stale and successful apply after merge.
-        assert!(stdout(&result).contains("cannot yet enforce SQL Server resolver evidence"));
+        ])
+    }
+
+    fn latest_state_id(&self) -> String {
+        let id = text(
+            self.target.connection(),
+            "SELECT CONVERT(nvarchar(20), MAX(id)) FROM dbo.__pbps_state;",
+        );
+        id.parse::<u64>().unwrap();
+        id
+    }
+
+    fn resolved_outputs(&mut self) -> (String, String) {
+        self.d.commit();
+        self.plan("resolved-cli.json");
+        let checksum = plan_checksum(&self.d.dir.join("resolved-cli.json"));
+        let plan_bytes = std::fs::read(self.d.dir.join("resolved-cli.json")).unwrap();
+        let before = self.ledger_rows();
+        let configured = self.env.clone();
+        self.env
+            .iter_mut()
+            .find(|(name, _)| name == "PBPS_TRACE_KEY")
+            .unwrap()
+            .1 = key(11);
+        let wrong_key = self.apply_plan("resolved-cli.json");
+        let ui_wrong_key = self.ui_result(
+            "apply",
+            serde_json::json!({
+                "environment":"prod", "plan":"resolved-cli.json", "checksum":checksum,
+                "allow":["rename","destructive","constraint"], "staged":false,"resume":false
+            }),
+        );
+        self.env = configured;
+        assert_ne!(code(&wrong_key), 0);
+        assert!(stdout(&wrong_key).contains("fingerprint key"));
+        assert_ne!(ui_wrong_key["code"].as_i64().unwrap(), 0);
+        assert!(
+            serde_json::to_string(&ui_wrong_key)
+                .unwrap()
+                .contains("fingerprint key")
+        );
+        assert_eq!(self.ledger_rows(), before);
+        self.ledger();
+
+        on_server(
+            self.target.connection(),
+            &function().replace("RETURN LEN(", "RETURN 1 + LEN("),
+        );
+        self.remember_definitions();
+        let stale = self.apply_plan("resolved-cli.json");
+        on_server(self.target.connection(), &function());
+        assert_ne!(code(&stale), 0);
+        assert!(stdout(&stale).contains("before its first statement"));
+        assert_eq!(self.ledger_rows(), before);
+        assert_eq!(
+            text(
+                self.target.connection(),
+                "SELECT CONVERT(nvarchar(10), COUNT(*)) FROM sys.views WHERE object_id=OBJECT_ID(N'dbo.managed');"
+            ),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read(self.d.dir.join("resolved-cli.json")).unwrap(),
+            plan_bytes
+        );
+        self.ledger();
+
+        // Sealed apply reads the target alone (DEC-2144.1). An unavailable
+        // scratch URL and Docker daemon must not be consulted to record it.
+        let configured = self.env.clone();
+        self.env
+            .iter_mut()
+            .find(|(name, _)| name == "PBPS_TRACE_SCRATCH")
+            .unwrap()
+            .1 = UNAVAILABLE_SCRATCH.into();
+        self.env.push((
+            "DOCKER_HOST".into(),
+            "unix:///pbps-trace2488-no-socket".into(),
+        ));
+        let applied = self.apply_plan("resolved-cli.json");
+        self.env = configured;
+        assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+        assert_eq!(self.hook("on_apply_attempt")["outcome"], "success");
+        assert!(self.hook("on_apply")["analysis"]["evidence"].is_object());
+        let cli_id = self.latest_state_id();
+        self.ledger();
+        on_server(
+            self.target.connection(),
+            "INSERT INTO ext.t(id) VALUES (7);",
+        );
+        assert_eq!(
+            text(
+                self.target.connection(),
+                "SELECT CONVERT(nvarchar(20), id) FROM dbo.managed;"
+            ),
+            "7"
+        );
+
+        std::fs::write(self.view(), "view: dbo.managed\ndefinition: SELECT id + 1 AS id, label, amount, computed FROM ext.v\n").unwrap();
+        self.d.commit();
+        self.ui(
+            "plan",
+            serde_json::json!({"environment":"prod", "out":"resolved-ui.json"}),
+        );
+        let bytes = self
+            .trace
+            .artifact(Sink::Plan, &self.d.dir.join("resolved-ui.json"));
+        let plan: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(plan["origin"], "resolved_database");
+        assert!(!plan["changes"]["changes"].as_array().unwrap().is_empty());
+        let checksum = plan_checksum(&self.d.dir.join("resolved-ui.json"));
+        let configured = self.env.clone();
+        self.env
+            .iter_mut()
+            .find(|(name, _)| name == "PBPS_TRACE_SCRATCH")
+            .unwrap()
+            .1 = UNAVAILABLE_SCRATCH.into();
+        self.env.push((
+            "DOCKER_HOST".into(),
+            "unix:///pbps-trace2488-no-socket".into(),
+        ));
+        self.ui(
+            "apply",
+            serde_json::json!({
+                "environment":"prod", "plan":"resolved-ui.json", "checksum":checksum,
+                "allow":["rename","destructive","constraint"], "staged":false,"resume":false
+            }),
+        );
+        self.env = configured;
+        assert_eq!(
+            text(
+                self.target.connection(),
+                "SELECT CONVERT(nvarchar(20), id) FROM dbo.managed;"
+            ),
+            "8"
+        );
+        assert_eq!(self.hook("on_apply_attempt")["outcome"], "success");
+        assert!(self.hook("on_apply")["analysis"]["evidence"].is_object());
+        let ui_id = self.latest_state_id();
+        assert_ne!(cli_id, ui_id);
+        self.ledger();
+        (cli_id, ui_id)
     }
 
     fn render_failure(&mut self) {
@@ -508,11 +666,15 @@ impl Fixture {
         assert!(stdout(&result).contains("cleanup was not confirmed"));
     }
 
-    fn ledger(&mut self) {
-        let rows = text(
+    fn ledger_rows(&self) -> String {
+        text(
             self.target.connection(),
-            "SELECT * FROM dbo.__pbps_state FOR JSON PATH;",
-        );
+            "SELECT * FROM dbo.__pbps_state ORDER BY id FOR JSON PATH;",
+        )
+    }
+
+    fn ledger(&mut self) {
+        let rows = self.ledger_rows();
         self.trace.rows(&rows);
     }
 
@@ -527,7 +689,7 @@ impl Fixture {
         std::fs::write(path, config).unwrap();
     }
 
-    fn hook(&mut self, name: &str) {
+    fn hook(&mut self, name: &str) -> serde_json::Value {
         let stem = self.d.dir.join(format!("hook-records/{name}"));
         for (sink, extension) in [
             (Sink::HookArgv, "argv"),
@@ -542,6 +704,7 @@ impl Fixture {
         let payload: serde_json::Value =
             serde_json::from_slice(&std::fs::read(stem.with_extension("stdin")).unwrap()).unwrap();
         assert!(payload.is_object());
+        payload
     }
 
     fn launcher(&self) -> PathBuf {
@@ -549,6 +712,10 @@ impl Fixture {
     }
 
     fn ui(&mut self, action: &str, body: serde_json::Value) {
+        assert_eq!(self.ui_result(action, body)["code"].as_i64().unwrap(), 0);
+    }
+
+    fn ui_result(&mut self, action: &str, body: serde_json::Value) -> serde_json::Value {
         let mut ui = Ui::new(self.launcher(), self.d.dir.clone());
         self.trace
             .ui(&ui.answer(action, &serde_json::to_vec(&body).unwrap()));
@@ -556,26 +723,26 @@ impl Fixture {
         loop {
             let response = ui.answer("runs", b"{}");
             self.trace.ui(&response);
-            let runs: Vec<serde_json::Value> = serde_json::from_slice(&response).unwrap();
+            let mut runs: Vec<serde_json::Value> = serde_json::from_slice(&response).unwrap();
             assert_eq!(runs.len(), 1);
             if runs[0]["ended"] == true {
                 self.trace.files(&self.d.dir);
-                assert_eq!(runs[0]["code"], 0);
-                break;
+                return runs.remove(0);
             }
             ui_child_wait(self.slowest, started.elapsed(), action, &runs[0]);
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    fn readers(&mut self) {
+    fn readers(&mut self, cli_id: &str, ui_id: &str) {
         for format in ["human", "json"] {
             for args in [
                 vec!["status", "--format", format],
                 vec!["state", "list", "--env", "prod", "--format", format],
-                vec!["state", "show", "1", "--env", "prod", "--format", format],
+                vec!["state", "show", cli_id, "--env", "prod", "--format", format],
+                vec!["state", "show", ui_id, "--env", "prod", "--format", format],
                 vec![
-                    "state", "diff", "1", "2", "--env", "prod", "--format", format,
+                    "state", "diff", cli_id, ui_id, "--env", "prod", "--format", format,
                 ],
             ] {
                 self.ok(&args);
@@ -589,7 +756,7 @@ impl Fixture {
         for view in [
             View::Status,
             View::Drift("prod".into()),
-            View::Plan("second.json".into()),
+            View::Plan("resolved-ui.json".into()),
             View::Timeline("prod".into()),
             View::Docs,
         ] {
@@ -605,7 +772,9 @@ impl Fixture {
         let result = self
             .command(
                 &exported,
-                &["state", "export", "2", "--env", "prod", "--format", "json"],
+                &[
+                    "state", "export", ui_id, "--env", "prod", "--format", "json",
+                ],
             )
             .output()
             .unwrap();
@@ -615,9 +784,8 @@ impl Fixture {
         self.ledger();
     }
 
-    // Ordinary application exercises hook/history/UI collection while #2144
-    // still guards resolved SQL Server application. The resolved-success cell
-    // is added only after that prerequisite merges, before this PR is opened.
+    // Run ordinary changes before installing the resolved view: removing an
+    // applied managed view later would need separate reviewed drop intent.
     fn ordinary_outputs(&mut self) {
         self.hooks();
         let view = std::fs::read(self.view()).unwrap();
@@ -767,7 +935,7 @@ fn docker_connection(pid: u32, prior: &[String]) -> Option<String> {
 
 fn check(docker: bool) {
     let mut fixture = Fixture::new(docker);
-    fixture.draft();
+    fixture.draft_refusal();
     let first = fixture.plan("first.json");
     fixture.offline("first.json");
     fixture
@@ -778,7 +946,6 @@ fn check(docker: bool) {
         .1 = key(10);
     let second = fixture.plan("second.json");
     keyed_records_differ(&first, &second);
-    fixture.apply_refusal();
     fixture.publication_refusal(docker);
     fixture.render_failure();
     fixture.refusals();
@@ -788,7 +955,8 @@ fn check(docker: bool) {
         fixture.server_cleanup_failure();
     }
     fixture.ordinary_outputs();
-    fixture.readers();
+    let (cli_id, ui_id) = fixture.resolved_outputs();
+    fixture.readers(&cli_id, &ui_id);
     fixture.trace.complete();
 }
 
