@@ -52,7 +52,7 @@ impl Fixture {
         on_server(
             target.connection(),
             &format!(
-                "CREATE VIEW ext.v AS SELECT id, CAST(N'{}' + N'{}' AS nvarchar(100)) AS label, ext.f() AS amount, computed FROM ext.t;",
+                "CREATE VIEW ext.v AS SELECT id, CASE WHEN id IS NULL THEN CAST(NULL AS nvarchar(100)) ELSE CAST(N'{}' + N'{}' AS nvarchar(100)) END AS label, ext.f() AS amount, computed FROM ext.t;",
                 SOURCES[0], DICTIONARY[2]
             ),
         );
@@ -90,6 +90,7 @@ impl Fixture {
             trace: Trace::new(),
             slowest: Duration::ZERO,
         };
+        fixture.remember_definitions();
         fixture.ok(&["plan", "--no-dev", "--out", "preview.json"]);
         fixture.d.commit();
         fixture.ok(&["bootstrap", "--env", "prod"]);
@@ -114,6 +115,7 @@ impl Fixture {
             .arg("--project")
             .arg(directory)
             .args(args)
+            .env_remove("PBPS_TRACE_KEY")
             .envs(self.env.iter().map(|(k, v)| (k, v)));
         command
     }
@@ -169,19 +171,7 @@ impl Fixture {
         plan
     }
 
-    fn definitions(&mut self) {
-        self.ok(&[
-            "resolver",
-            "externals",
-            "--env",
-            "prod",
-            "--schema",
-            "ext",
-            "--out",
-            "draft.sql",
-        ]);
-        let draft = std::fs::read_to_string(self.d.dir.join("draft.sql")).unwrap();
-        assert!(draft.contains("ext") && !draft.contains(SOURCES[0]));
+    fn remember_definitions(&mut self) {
         // Register the engine's complete spelling as well as literal sentinels:
         // a bare digest of the whole definition must not escape either.
         for query in [
@@ -205,6 +195,21 @@ impl Fixture {
                 }
             }
         }
+    }
+
+    fn draft(&mut self) {
+        self.ok(&[
+            "resolver",
+            "externals",
+            "--env",
+            "prod",
+            "--schema",
+            "ext",
+            "--out",
+            "draft.sql",
+        ]);
+        let draft = std::fs::read_to_string(self.d.dir.join("draft.sql")).unwrap();
+        assert!(draft.contains("ext") && !draft.contains(SOURCES[0]));
     }
 
     fn offline(&mut self, file: &str) {
@@ -289,10 +294,14 @@ impl Fixture {
         self.refused(&[], "resolver.key");
         self.env = configured;
         // The target itself is never an acceptable scratch, even with an alias.
+        let before_alias = self.env.clone();
+        self.env
+            .push(("PBPS_TRACE_ALIAS".into(), self.target.connection().into()));
         let configured = std::fs::read(self.d.dir.join("pbps.yml")).unwrap();
         std::fs::write(self.d.dir.join("pbps.yml"),
-            "dialect: mssql\nresolvers:\n  scratch: {kind: server, url_env: PBPS_TRACE_TARGET, externals: externals.sql}\nenvironments:\n  prod: {url_env: PBPS_TRACE_TARGET, fingerprint_key_env: PBPS_TRACE_KEY, resolve_with: scratch}\n").unwrap();
-        self.refused(&[], "resolver.identity");
+            "dialect: mssql\nresolvers:\n  scratch: {kind: server, url_env: PBPS_TRACE_ALIAS, externals: externals.sql}\nenvironments:\n  prod: {url_env: PBPS_TRACE_TARGET, fingerprint_key_env: PBPS_TRACE_KEY, resolve_with: scratch}\n").unwrap();
+        self.refused(&[], "target database");
+        self.env = before_alias;
         std::fs::write(self.d.dir.join("pbps.yml"), configured).unwrap();
         std::fs::write(
             self.d.dir.join("externals.sql"),
@@ -385,6 +394,25 @@ impl Fixture {
             std::fs::read(self.d.dir.join("second.json")).unwrap(),
             before
         );
+    }
+
+    fn apply_refusal(&mut self) {
+        let checksum = plan_checksum(&self.d.dir.join("second.json"));
+        let result = self.run(&[
+            "apply",
+            "--env",
+            "prod",
+            "--plan",
+            "second.json",
+            "--checksum",
+            &checksum,
+            "--format",
+            "json",
+        ]);
+        assert_ne!(code(&result), 0);
+        // This build's explicit #2144 barrier is a real output consumer too.
+        // Replace this cell with keyed/stale and successful apply after merge.
+        assert!(stdout(&result).contains("cannot yet enforce SQL Server resolver evidence"));
     }
 
     fn render_failure(&mut self) {
@@ -739,7 +767,7 @@ fn docker_connection(pid: u32, prior: &[String]) -> Option<String> {
 
 fn check(docker: bool) {
     let mut fixture = Fixture::new(docker);
-    fixture.definitions();
+    fixture.draft();
     let first = fixture.plan("first.json");
     fixture.offline("first.json");
     fixture
@@ -750,6 +778,7 @@ fn check(docker: bool) {
         .1 = key(10);
     let second = fixture.plan("second.json");
     keyed_records_differ(&first, &second);
+    fixture.apply_refusal();
     fixture.publication_refusal(docker);
     fixture.render_failure();
     fixture.refusals();
