@@ -154,6 +154,8 @@ mod extensions2447_update;
 mod index_brin2449;
 #[path = "support/index_gist2448.rs"]
 mod index_gist2448;
+#[path = "support/partition_trigger1811.rs"]
+mod partition_trigger1811;
 
 #[path = "support/grant_advisories2446.rs"]
 mod grant_advisories2446;
