@@ -5593,7 +5593,9 @@ advancing a sequence from an IMMUTABLE routine at each site:
 | a referential action's `UPDATE` | as an `UPDATE`, and the DEFAULT of the column `SET DEFAULT` sets |
 | a rewrite, `REINDEX`, `ANALYZE` | index keys and filters only |
 
-So a plan that only deletes is never refused by this rule. An `UPDATE` judges
+So a plan that only deletes is never refused for a CHECK, default, generated
+expression or index; the one thing a `DELETE` can run is a policy that applies to
+the deploying role (DEC-2563.10). An `UPDATE` judges
 every index, not those reading the columns it sets: PostgreSQL may skip an
 index's expression on a heap-only update, but whether it does depends on the
 data, a false refusal has a one-line remedy, and a false admission is a hole.
@@ -5644,3 +5646,14 @@ cascade writes did not run, even for the owner with `FORCE`), so a table reached
 only by an action has its policies skipped. A policy with a subquery cannot be
 read by the decoder and is refused like any unreadable tree, and so is judged
 only where it can run.
+
+Measured on 16.15 and 18.6, identically (2026-11-07): `row_security_active` is
+false for a superuser, for the owner without `FORCE`, for a `BYPASSRLS` role and
+for a member of the owner without `FORCE`; it is true for a role that is not the
+owner, and for the owner and its members with `FORCE`. The guard's tests assert
+exactly that table. What the lock does not settle: under `ROW EXCLUSIVE`,
+adding or dropping a CHECK, a default, an index or a policy, enabling row
+security and tightening a domain wait for the writer, but `ALTER DOMAIN ... SET
+DEFAULT`, `ALTER DOMAIN ... DROP CONSTRAINT` and a routine's body do not. The
+domain's default is re-read immediately before each row statement (`check`), and
+a routine's change is the pins check's, as for every other site.
