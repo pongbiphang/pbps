@@ -108,16 +108,17 @@ static TABLES: &[(&str, Rows)] = &[
     ("pg_collation", Rows::All(Named("collation objects are named by the census; a column's own collation is named per column"))),
     ("pg_constraint", Rows::Each(&[
         (&["conname", "contype", "conrelid", "contypid", "conindid", "conparentid", "confrelid", "confupdtype", "confdeltype", "conkey", "confkey", "conbin"], Held(None)),
+        // An exclusion constraint is held since C1a (DEC-2448.3): its operators and its timing are read
+        // whole. `condeferrable` and `condeferred` of a key or a foreign key still draw their own note.
+        (&["conexclop", "condeferrable", "condeferred"], Held(None)),
         (&["oid"], IDENTITY),
         (&["connamespace"], Irrelevant("a constraint lives in its table's schema")),
-        (&["condeferrable", "condeferred"], Named("DEFERRABLE keys are named")),
         (&["convalidated"], Named("NOT VALID checks and foreign keys are named")),
         (&["conenforced"], Named("NOT ENFORCED checks are named")),
         (&["connoinherit"], Named("NO INHERIT checks are named")),
         (&["confmatchtype"], Named("MATCH FULL is named")),
         (&["confdelsetcols"], Named("SET NULL / SET DEFAULT with a column list is named")),
         (&["conperiod"], Named("WITHOUT OVERLAPS keys are named")),
-        (&["conexclop"], Named("EXCLUDE constraints are named")),
         (&["conislocal", "coninhcount"], Named("table inheritance is named")),
         (&["conpfeqop", "conppeqop", "conffeqop"], Irrelevant("the comparison operators, derived from the key columns' types")),
     ])),
@@ -144,8 +145,7 @@ static TABLES: &[(&str, Rows)] = &[
     ("pg_foreign_server", Rows::All(Named("foreign servers: census notice (S9)"))),
     ("pg_foreign_table", Rows::All(Named("foreign tables are named and left out"))),
     ("pg_index", Rows::Each(&[
-        (&["indexrelid", "indrelid", "indnkeyatts", "indisunique", "indnullsnotdistinct", "indisprimary", "indisvalid", "indisreplident", "indkey", "indcollation", "indclass", "indoption", "indexprs", "indpred"], Held(None)),
-        (&["indisexclusion"], Named("EXCLUDE constraints are named")),
+        (&["indexrelid", "indrelid", "indnkeyatts", "indisexclusion", "indisunique", "indnullsnotdistinct", "indisprimary", "indisvalid", "indisreplident", "indkey", "indcollation", "indclass", "indoption", "indexprs", "indpred"], Held(None)),
         (&["indimmediate"], Named("DEFERRABLE keys are named")),
         (&["indisclustered"], Named("the index CLUSTER follows: unheld-property notice (S2)")),
         (&["indnatts"], Irrelevant("the key count plus the INCLUDE count: derived from indkey")),
@@ -165,7 +165,12 @@ static TABLES: &[(&str, Rows)] = &[
         (&["nspowner"], OWNER),
     ])),
     ("pg_opclass", Rows::All(Named("operator classes are named by the census"))),
-    ("pg_operator", Rows::All(Named("user-defined operators are named by the census"))),
+    ("pg_operator", Rows::Each(&[
+        // An exclusion constraint names its operators by schema and symbol (DEC-2448.3).
+        (&["oprname", "oprnamespace"], Held(None)),
+        (&["oid"], IDENTITY),
+        (&["oprowner", "oprkind", "oprcanmerge", "oprcanhash", "oprleft", "oprright", "oprresult", "oprcom", "oprnegate", "oprcode", "oprrest", "oprjoin"], Named("a user-defined operator is named by the census")),
+    ])),
     ("pg_opfamily", Rows::All(Named("operator families belong to an operator class, which the census names"))),
     ("pg_parameter_acl", Rows::Each(&[
         (&["parname", "paracl"], Held(None)),
