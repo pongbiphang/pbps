@@ -70,7 +70,12 @@ pub struct Explanation {
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
-    /// one it is is [`Explanation::applyable`].
+    /// one it is is [`Explanation::applyable`]. Empty when this build cannot
+    /// enforce the plan's resolver evidence at apply, which no new plan changes.
+    // That last sentence describes SQL Server evidence before #2144 and no
+    // build leaves `approve_with` empty now. It stays because a doc comment is
+    // the published envelope schema's description (`schemas/envelope.schema.json`):
+    // rewording it is a new schema-set number for a sentence no consumer reads.
     pub approve_with: String,
 
     /// Set only when the plan path could not be spelled safely for every shell
