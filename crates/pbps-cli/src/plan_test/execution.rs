@@ -4,7 +4,7 @@
 use super::{
     report::{Phase, TestData},
     revision::Assembled,
-    session::Session,
+    session::{HopContext, Session},
 };
 use crate::{deploy::test_run, test_scratch};
 use anyhow::Context as _;
@@ -155,7 +155,9 @@ impl Control {
         let result = self
             .bounded(
                 ms(self.timeouts.step_ms),
-                test_run::boxed_future(|| test_run::bootstrap(session, input, phase, &progress)),
+                test_run::boxed_future(|| {
+                    test_run::bootstrap(session, HopContext::first(input), phase, &progress)
+                }),
             )
             .await;
         test_run::collect_findings(phase, &progress);
@@ -165,7 +167,7 @@ impl Control {
     pub(crate) async fn plan(
         &mut self,
         session: &Session<'_>,
-        input: &Assembled,
+        hop: HopContext<'_>,
         phase: &mut Phase,
     ) -> anyhow::Result<Box<test_run::Planned>> {
         let started = Instant::now();
@@ -176,7 +178,7 @@ impl Control {
             .bounded(
                 ms(self.timeouts.step_ms),
                 test_run::boxed_future(|| {
-                    test_run::plan(session, input, phase, &mut carried, &progress)
+                    test_run::plan(session, hop, phase, &mut carried, &progress)
                 }),
             )
             .await;

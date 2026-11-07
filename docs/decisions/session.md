@@ -1100,3 +1100,27 @@ ledger entry, and only then returns the primary error (ADR-0019 §9). The owned
 run therefore no longer prints that warning on stderr for a bootstrap, as it
 already did not for an apply: the finding is its report. No format version
 changes.
+
+<a id="dec-2552-1"></a>
+
+**DEC-2552.1. Owned prerequisites follow the recorded identities of the two hops they sit between.**
+Preparation takes the previous hop (absent at the first bootstrap, stated, not
+defaulted) and the incoming one, and asks their recorded identity mappings
+before the catalog. A recorded role rename is the same uid under two names, one
+rule (`IdsFile::role_renames`) shared with the ordinary cluster-role evidence
+check. Inside the owned scratch only, a rename whose old name is present and
+new name absent is completed with `ALTER ROLE ... RENAME TO`, so the principal
+keeps its oid, attributes, memberships, ownership, grants and policy
+recipients. Every other state is left to the ordinary check: an occupied
+destination (`BothPresent`), a vanished source (`NeitherPresent`) and an
+unreadable catalog refuse as they do outside the owned cluster, and a spelling
+resemblance never supplies identity intent. Roles are created only when the
+incoming hop names them and the previous hop did not and no rename accounts for
+them; a retained name the catalog lacks is the ordinary presence check's to
+refuse, not preparation's to recreate. A rename chain inside one hop (a->b with
+b->c) is not completed and keeps the ordinary refusal; across hops it is.
+The recorded baseline follows a renamed role into the row-security policies
+that apply to it (`Schema::rename_role`), as the engine binds a policy by oid;
+without it the drift check read the renamed recipient as a change, for the
+ordinary plan as well as the owned one. No format version changes, and SQL
+Server, whose roles move through the typed plan, is untouched.

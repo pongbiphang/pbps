@@ -87,6 +87,10 @@ ALLOWED = {
         1,
         "builds a GRANT signature from normalized routine arguments in the owned session (#1165)",
     ),
+    "crates/pbps-cli/src/plan_test/session/prerequisites.rs": (
+        2,
+        "builds ALTER ROLE ... RENAME from quoted recorded role names in the owned session (#2552)",
+    ),
     "crates/pbps-dialect/src/predicate/render.rs": (
         1,
         "renders validated raw type arguments as SQL, not diagnostic prose (#2400)",

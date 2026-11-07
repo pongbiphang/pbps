@@ -298,7 +298,25 @@
         "deploy::test_run::tests::d2a1165_pg16_later_revisions_prepare_only_their_role_and_namespace_prerequisites",
         "deploy::test_run::tests::d2a1165_pg16_policy_recipient_prerequisites_use_the_schema_named_role_inventory",
         "deploy::test_run::tests::d2a1165_pg18_later_revisions_prepare_only_their_role_and_namespace_prerequisites",
-        "deploy::test_run::tests::d2a1165_pg18_policy_recipient_prerequisites_use_the_schema_named_role_inventory"
+        "deploy::test_run::tests::d2a1165_pg18_policy_recipient_prerequisites_use_the_schema_named_role_inventory",
+        "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_keeps_the_principal_across_hops::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_keeps_the_principal_across_hops::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_under_strict_unmanaged_still_refuses_a_lookalike::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_under_strict_unmanaged_still_refuses_a_lookalike::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_lookalike_without_a_recorded_rename_is_a_new_principal::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_lookalike_without_a_recorded_rename_is_a_new_principal::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::an_occupied_rename_destination_is_refused_and_both_principals_stay::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::an_occupied_rename_destination_is_refused_and_both_principals_stay::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_rename_with_neither_name_present_creates_nothing::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_rename_with_neither_name_present_creates_nothing::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::unreadable_role_evidence_changes_nothing::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::unreadable_role_evidence_changes_nothing::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_dropped_role_leaves_nothing_for_the_next_plan_to_refuse::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_dropped_role_leaves_nothing_for_the_next_plan_to_refuse::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_later_namespace_created_ahead_is_not_unmanaged::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_later_namespace_created_ahead_is_not_unmanaged::d2a1165_pg18",
+        "deploy::test_run::tests::prerequisite_tests::a_table_renamed_while_the_run_grants_stand_on_it_is_planned_and_used::d2a1165_pg16",
+        "deploy::test_run::tests::prerequisite_tests::a_table_renamed_while_the_run_grants_stand_on_it_is_planned_and_used::d2a1165_pg18"
       ]
     },
     {
