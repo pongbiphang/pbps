@@ -207,7 +207,6 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
     crate::emission::LoweredPlan,
     pbps_model::operation::Operations,
 )> {
-    let dialect = selected.as_ref();
     // A type whose identity is recorded and whose declaration the base lacks
     // is a type the target does not hold yet (a declared type is recorded when
     // it is planned, not when it exists), and an empty apply may not claim an
@@ -221,13 +220,32 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
     let ids = &ids.without_types(&absent);
     let (prerequisites, prerequisite_ids) =
         pbps_diff::bootstrap_base(pbps_diff::Side { schema, ids });
-    let build = pbps_diff::diff(
+    lower_between(
+        selected,
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,
         },
         pbps_diff::Side { schema, ids },
-        dialect,
+        hints,
+    )
+}
+
+/// The statements that take `before` to `after`, scheduled and ordered as a
+/// bootstrap's are. [`lower_from_empty`] is this from the packages alone.
+pub fn lower_between<D: crate::emission::Engine>(
+    selected: &D,
+    before: pbps_diff::Side<'_>,
+    after: pbps_diff::Side<'_>,
+    hints: &pbps_model::Hints,
+) -> anyhow::Result<(
+    crate::emission::LoweredPlan,
+    pbps_model::operation::Operations,
+)> {
+    let dialect = selected.as_ref();
+    let (schema, ids) = (after.schema, after.ids);
+    let build = pbps_diff::diff(
+        before, after, dialect,
         // The base's own hints, from the revision it came from. The
         // strategies in them are irrelevant here (nothing has rows yet), but
         // `depends_on:` is the edge the identifier scan could not find — drop it
@@ -249,13 +267,7 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
         build,
         &crate::dependents::schedule::Declarations {
             schema,
-            sources: crate::dependents::Sources {
-                before: pbps_diff::Side {
-                    schema: &prerequisites,
-                    ids: &prerequisite_ids,
-                },
-                after: ids,
-            },
+            sources: crate::dependents::Sources { before, after: ids },
             module_deps: &hints.module_deps,
         },
         &crate::dependents::schedule::Facts::default(),
@@ -301,6 +313,7 @@ impl Findings {
 #[allow(clippy::too_many_arguments)]
 pub async fn rehearse_in(
     conn: &mut Conn,
+    reader: Option<&mut Conn>,
     base: Base<'_>,
     plan: &[Statement],
     declared: &Schema,
@@ -429,6 +442,12 @@ pub async fn rehearse_in(
     )
     .await?;
 
+    // The statements ran as the deployer the scratch reproduces; the engine is
+    // read back through `reader` where that session cannot see all of it.
+    let conn = match reader {
+        Some(reader) => reader,
+        None => conn,
+    };
     // Read before anything else touches the scratch: it is what the engine
     // holds for the package after the plan's own statements, not a guess.
     let extensions = if created.is_empty() && changed.is_empty() {

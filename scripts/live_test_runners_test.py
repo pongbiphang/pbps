@@ -252,23 +252,27 @@ else:
         self.assertIn("require audited receipts", result.stderr)
         self.assertEqual(calls, [])
 
-    def test_resolver_matrix_retains_all_seven_selections_and_required_union_audit(self):
+    def test_resolver_matrix_retains_all_eight_selections_and_required_union_audit(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         runs = list(inventory.workflow_runs(workflow, "resolver-mssql"))
         commands = [c for run in runs for c in inventory.shell_commands(run)]
         selections = [inventory.cargo_selection(c) for c in commands]
         selections = [s for s in selections if s is not None]
-        self.assertEqual(len(selections), 21)
+        self.assertEqual(len(selections), 24)
         expected_filters = {"scratch2236", "deployer2267", "staged2268", "externals2269",
-                            "mssql_live_tests", "engine::mssql_live_tests", "recovery2410::"}
+                            "mssql_live_tests", "engine::mssql_live_tests", "recovery2410::",
+                            "rehearsal2379_mssql_cases::"}
         for index in range(3):
             selected = [c for c in commands if f"{index}/3" in c]
             self.assertEqual({next(f for f in c if f in expected_filters) for c in selected},
                              expected_filters)
-            self.assertEqual(len(selected), 7)
+            self.assertEqual(len(selected), 8)
             kill = [c for c in selected if "recovery2410::" in c]
             self.assertEqual(len(kill), 1)
             self.assertEqual(kill[0][kill[0].index("--expected-tests") + 1], "6")
+            rehearsal = [c for c in selected if "rehearsal2379_mssql_cases::" in c]
+            self.assertEqual(len(rehearsal), 1)
+            self.assertEqual(rehearsal[0][rehearsal[0].index("--expected-tests") + 1], "12")
         body = workflow.split("  resolver-mssql:\n")[1].split("  resolver-localdb:\n")[0]
         self.assertIn("source scripts/resolver-mssql-fixtures.sh", body)
         self.assertIn("fail-fast: false", body)
@@ -277,7 +281,7 @@ else:
         gate = workflow.split("  gate:\n")[1]
         self.assertRegex(gate, r"needs: \[[^\]]*resolver-mssql")
         self.assertIn("merge-multiple: true", gate)
-        self.assertIn("audit .resolver-mssql 3 --expected-invocations 7", gate)
+        self.assertIn("audit .resolver-mssql 3 --expected-invocations 8", gate)
 
     def test_assertion_census_runs_alone_one_test_at_a_time_and_before_the_parallel_run(self):
         # The census reads the whole instance, so a sibling's database, msdb grant

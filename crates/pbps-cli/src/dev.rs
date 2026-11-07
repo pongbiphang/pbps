@@ -168,6 +168,7 @@ pub fn rehearse<D: crate::emission::Engine>(
             preview::with_server(connection, externals, &mut cancellation, async |conn| {
                 let mut report = crate::rehearsal::rehearse_in(
                     conn,
+                    None,
                     crate::rehearsal::Base::Baseline {
                         statements: &build,
                         ids: baseline_ids,

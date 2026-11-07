@@ -9558,10 +9558,8 @@ async fn plan_db_selected(
         let domain_validation =
             crate::engine::check_domain_alterations(&mut conn, &cs, &recorded_ids).await?;
         // The rehearsal, last: it runs the plan as it will be written, on the
-        // scratch the resolver used or would have used. SQL Server keeps
-        // today's behaviour until its own rehearsal lands (#2379).
+        // scratch the resolver used or would have used (#2379).
         let course = crate::rehearsal::connected::course(
-            conn.driver(),
             // An unavailable advisory scratch must not become a fatal retry
             // through the independent rehearsal (DEC-2309.1).
             scratch.is_some() && !domain_vet_unavailable,

@@ -6171,3 +6171,82 @@ Pinned on the engine by `the_opening_recheck_in_the_apply_transaction_finds_only
 `mssql_the_planned_authorization_inventory_is_what_planning_sealed_before`
 (3221 and 6577); offline by `a_candidate_class_round_trips_through_its_catalog_and_an_unknown_one_is_none`
 and the `explain_resolver_mssql` tests, including the staged refusal.
+
+<a id="dec-2379-3"></a>
+
+**DEC-2379.3. A connected SQL Server plan is rehearsed on the entry's scratch,
+with the base built by the resolver's creation trials and no principal made on
+the instance (#2379 PR 3).** The maintainer decided, as for PostgreSQL
+(DEC-2379.2): on by default when an entry is selected, an off switch sealed as
+`off`, one scratch, a failed rehearsal refuses the plan, apply only displays the
+record. SQL Server follows PostgreSQL where a measurement does not say
+otherwise (leon, 2026-10-16). There is no format number: the record's fields
+(`entry`, `scratch`, `layout`, `authorization`) already say everything this
+engine needs. Measured on SQL Server 17.0.4075.5 (image `sha256:4bab24f3…`).
+
+*The base.* `lower_from_empty` is not a compile order here. A table whose
+default or check calls a function the target also holds is created before the
+function and the engine refuses it (342); a computed column calling one is
+refused by the planner itself (`ComputedFunctionChanged`). The rehearsal builds
+the target's managed namespace as the resolver builds the declarations: the
+bootstrap of the base goes to `Reconstruction`, and the engine's creation
+trials (DEC-2143.9) pick the order, so no second ordering exists
+(`Binding::compile`, on the deployer's session). What the namespace leaves out,
+the roles, their grants, the row-security policies and the declared rows, is
+the plan from the base without them to the base, written by the ordinary differ
+and scheduler and run after the namespace. A target the planner cannot form
+from nothing is refused as the resolver refuses it, and the message names
+`rehearse: false` and `--no-rehearse`.
+
+*Sessions.* The statements run as the deployer the scratch reproduces
+(`Prepared.compile`), as an apply's do, so what the deployer may not run fails
+here too. The comparison reads the scratch on a second connection bounded to
+the scratch database (`Reach::open`), because the deployer's cannot leave its
+context and may lack `VIEW DEFINITION`. `rehearse_in` takes that reader as an
+optional argument; PostgreSQL passes none.
+
+*Principals.* A role and a user are database-scoped on SQL Server. Measured as
+a login that may only create databases: it makes the same role and user names
+in two databases at the same time, and after `DROP DATABASE` the instance's
+server principals are as many as before (32 and 32). So there is no mapping,
+no `CREATEROLE` downgrade and nothing to sweep: the scratch database holds the
+target's own names and goes with the run. pbps declares roles and the grants to
+roles (ADR-0005) and the emitter writes no server-scope statement (no
+`CREATE LOGIN`, `ALTER SERVER ROLE` or server-scope `GRANT`), so no statement
+of a plan names a login. Logins and server roles, asked about for both kinds of
+scratch, come to the same: on `kind: server` the target's logins exist on the
+instance and on `kind: docker` they do not, and neither matters, because a user
+`FOR LOGIN` and one `WITHOUT LOGIN` carry identical rows in `sys.database_permissions`
+(connect, object and schema grants, `WITH GRANT OPTION`), the same schema owner
+and the same role memberships (measured, both on one instance), which is the
+resolver's own reproduction of the deployer. `CREATE USER ... FOR LOGIN <absent>`
+fails (15007) and a server-scope `GRANT` is refused outside `master` (4621), so
+a rehearsal never creates, alters or names a login. If a plan did name a
+principal that is neither declared nor built into every database, the
+rehearsal runs without authorization and the record says
+`not_rehearsed { reason }` naming it, as PostgreSQL does for a scratch that
+cannot hold roles.
+
+*Scope.* The scope request of a SQL Server rehearsal names the schemas the base
+and the declarations name and **no planned grant**. The resolver replays planned
+grants into the scratch so the declarations bind under them; the rehearsal's
+scratch stands for the target as it is and the plan's own statements make the
+change, so replaying them first would run them twice and would refuse a plan
+that changes a role's identity (the resolver's authorization cannot project
+one: "persistent resolver authorization cannot project role identity changes").
+
+*The key.* The captures the scratch preparation reuses fingerprint what they
+read and take an `EnvironmentFingerprintKey`. A rehearsal compares in memory and
+seals nothing, and a plan that needs no resolver must not start asking for a
+configured key because it is now rehearsed, so it uses
+`EnvironmentFingerprintKey::for_one_run()`: random, never written, known to
+nothing else. Evidence sealed under it could be checked by no other run, so no
+caller may seal under it; the resolver and apply still take only a configured
+key.
+
+*Cost (measured).* A Docker scratch is up for its first query in 4.8 s (image
+local); a two-table base builds in 0.7 s. The supplied layout is the
+acquisition's own choice (`Provisioning`), recorded as for the resolver.
+
+*Not done.* The cross-check of the rehearsal's end state against the
+reconstruction's capture stays deferred (maintainer decision 4 on #2379).

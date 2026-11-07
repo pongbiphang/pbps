@@ -936,6 +936,19 @@ Fixture names are the tests #620 adds.
 | 23 | The compatibility comparison on reported facts (§9). | #620 (b) |
 | 24 | `mssql_schema_bound_dependents_are_torn_down_and_rebuilt_around_their_target` (§5), through `settle`. | #620 (a), (c) |
 
+## 10. The connected rehearsal (#2379, DEC-2379.3)
+
+A connected plan is also rehearsed on the entry's scratch, by default (SPEC
+§9.3.1). Its base is the target's managed namespace built by the reconstruction
+of §5, so a table default, check or computed column that calls a function the
+target also holds is created in the order the engine accepts. The roles, their
+grants, the row-security policies and the declared rows follow it. The
+statements run as the reproduced deployer; the scratch is read back on a
+second bounded connection. Roles and users are database-scoped, so the scratch
+holds the target's own role names and the rehearsal makes, alters and names no
+login or other server principal. It reads no configured key and seals only the
+plan-level record.
+
 ## #620's four sub-issues
 
 - **(a) Capture and ownership.**

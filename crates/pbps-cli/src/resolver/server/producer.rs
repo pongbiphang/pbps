@@ -19,6 +19,29 @@ pub(super) fn request(
     // grants sealed at the end could describe two different plans.
     let ordinary = engine::ordinary(driver, base, desired, hints, extras)?;
     let planned = scope::planned_schema_grants(&ordinary).map_err(Error::Scope)?;
+    Ok(scope_of(base, desired, planned, extras))
+}
+
+/// The scope of a rehearsal on SQL Server: the schemas the base and the
+/// declarations name, and no planned grant. The scratch stands for the target
+/// as it is now and the plan's own statements make every change to it,
+/// grants included, so nothing is replayed into it beforehand (and a plan that
+/// changes a role's identity, which the resolver's authorization cannot
+/// project, is still one the rehearsal can run). DEC-2379.3.
+pub(super) fn request_as_it_stands(
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    extras: &[String],
+) -> ScopeRequest {
+    scope_of(base, desired, Vec::new(), extras)
+}
+
+fn scope_of(
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    planned: Vec<super::PlannedGrant>,
+    extras: &[String],
+) -> ScopeRequest {
     let mut schemas = BTreeSet::new();
     for schema in [base.schema, desired.schema] {
         schemas.extend(schema.tables.keys().map(|name| name.schema.clone()));
@@ -26,11 +49,11 @@ pub(super) fn request(
         schemas.extend(schema.types.keys().map(|name| name.schema().to_owned()));
     }
     schemas.extend(planned.iter().map(|grant| grant.schema.clone()));
-    Ok(ScopeRequest {
+    ScopeRequest {
         schemas: schemas.into_iter().collect(),
         write_path_extras: extras.to_vec(),
         planned,
-    })
+    }
 }
 
 /// The domain the sealed cluster identity is keyed under. The publication
