@@ -11,11 +11,74 @@ const BASE: &str =
     "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n";
 const UNAVAILABLE_SCRATCH: &str =
     "Server=127.0.0.1,1;User Id=sa;Password=not-used;Database=master;TrustServerCertificate=true";
-const EXTERNALS: &str = "CREATE SCHEMA ext;\nGO\n\
-    CREATE TABLE ext.t(id int, computed int);\nGO\n\
-    CREATE FUNCTION ext.f() RETURNS int AS BEGIN RETURN 1; END;\nGO\n\
-    CREATE VIEW ext.v AS SELECT id, CAST(NULL AS nvarchar(100)) AS label, \
-      ext.f() AS amount, computed FROM ext.t;\nGO\n";
+// Keep the ordinary external shape in pull's declaration form (SPEC §5).
+// Computed text is compared by staged admission, so this public expression is
+// identical on both engines; the private computed-text refusal is separate.
+const EXTERNAL_TABLE: &str = r#"table: ext.t
+columns:
+  id: {type: int, nullable: true}
+computed:
+  computed: {expression: "[id]+(1)"}
+"#;
+
+fn external_table_sql() -> String {
+    let loaded = pbps_load::load_table_str(Path::new("ext.t.yml"), EXTERNAL_TABLE).unwrap();
+    pbps_mssql::Mssql
+        .fixture_emit(
+            &pbps_model::Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: loaded.name,
+                table: Box::new(loaded.table),
+                beside_default: None,
+                moves_at_most: None,
+            },
+            pbps_model::Strategy::default(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|statement| statement.sql)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn externals() -> String {
+    // The sandbox's creator is not its dbo. Explicit schema ownership keeps
+    // object/schema equality the same as on the target, without owner repair.
+    format!(
+        "CREATE SCHEMA ext AUTHORIZATION dbo;\nGO\n{}\nGO\n\
+         CREATE FUNCTION ext.f() RETURNS int AS BEGIN RETURN 1; END;\nGO\n\
+         CREATE VIEW ext.v AS SELECT id, CAST(NULL AS nvarchar(100)) AS label, \
+         ext.f() AS amount, computed FROM ext.t;\nGO\n",
+        external_table_sql()
+    )
+}
+
+#[test]
+fn external_shape_uses_a_real_computed_column_and_contains_no_private_definition() {
+    let loaded = pbps_load::load_table_str(Path::new("ext.t.yml"), EXTERNAL_TABLE).unwrap();
+    assert!(!loaded.table.columns.contains_key("computed"));
+    assert_eq!(loaded.table.computed["computed"].expression, "[id]+(1)");
+    let canonical = pbps_load::render(&loaded.name, &loaded.table, &[], None);
+    assert_eq!(
+        pbps_load::load_table_str(Path::new("ext.t.yml"), &canonical)
+            .unwrap()
+            .table,
+        loaded.table
+    );
+    let sql = externals();
+    let compact: String = sql.split_whitespace().collect();
+    assert!(compact.contains("[computed]AS([id]+(1))"), "{sql}");
+    assert!(sql.contains("CREATE SCHEMA ext AUTHORIZATION dbo;"));
+    Trace::new().check(Sink::Artifact, sql.as_bytes()).unwrap();
+    // An ordinary column with an expression is not another accepted spelling.
+    assert!(
+        pbps_load::load_table_str(
+            Path::new("ext.t.yml"),
+            "table: ext.t\ncolumns:\n  computed: {type: int, expression: '[id]+(1)'}\n",
+        )
+        .is_err()
+    );
+}
 
 struct Fixture {
     d: Demo,
@@ -33,13 +96,14 @@ impl Fixture {
         let scratch = (!docker)
             .then(|| OwnDatabase::new(&std::env::var("PBPS_TEST_MSSQL_SCRATCH_DB").unwrap(), slug));
         let d = Demo::new(slug);
-        on_server(target.connection(), "CREATE SCHEMA ext;");
+        on_server(target.connection(), "CREATE SCHEMA ext AUTHORIZATION dbo;");
+        on_server(target.connection(), &external_table_sql());
         on_server(
             target.connection(),
             &format!(
-                "CREATE TABLE ext.t(id int CONSTRAINT private_default DEFAULT LEN(N'{}'), \
-             computed AS (id + LEN(N'{}')), CONSTRAINT private_check CHECK (id <> LEN(N'{}')));",
-                SOURCES[4], SOURCES[5], SOURCES[3]
+                "ALTER TABLE ext.t ADD CONSTRAINT private_default DEFAULT LEN(N'{}') FOR id; \
+                 ALTER TABLE ext.t ADD CONSTRAINT private_check CHECK (id <> LEN(N'{}'));",
+                SOURCES[4], SOURCES[3]
             ),
         );
         on_server(target.connection(), &function());
@@ -69,7 +133,7 @@ impl Fixture {
         std::fs::write(d.dir.join("pbps.yml"), format!(
             "dialect: mssql\nresolvers:\n  scratch:\n    {profile}\n    externals: externals.sql\n\
              environments:\n  prod:\n    url_env: PBPS_TRACE_TARGET\n    fingerprint_key_env: PBPS_TRACE_KEY\n    resolve_with: scratch\n")).unwrap();
-        std::fs::write(d.dir.join("externals.sql"), EXTERNALS).unwrap();
+        std::fs::write(d.dir.join("externals.sql"), externals()).unwrap();
         std::fs::write(d.dir.join("schema/dbo.base.yml"), BASE).unwrap();
         let temporary = d.dir.join("child-tmp");
         std::fs::create_dir(&temporary).unwrap();
@@ -190,7 +254,6 @@ impl Fixture {
             "SELECT definition FROM sys.sql_modules WHERE object_id=OBJECT_ID(N'ext.private_trigger');",
             "SELECT definition FROM sys.check_constraints WHERE name=N'private_check';",
             "SELECT definition FROM sys.default_constraints WHERE name=N'private_default';",
-            "SELECT definition FROM sys.computed_columns WHERE object_id=OBJECT_ID(N'ext.t') AND name=N'computed';",
         ] {
             let definition = text(self.target.connection(), query);
             assert!(
@@ -312,6 +375,7 @@ impl Fixture {
     }
 
     fn refusals(&mut self) {
+        let external = externals();
         self.refused(&["--resolve-with", "absent"], "resolver.selection");
         self.refused(&["--staged"], "resolver.unresolved");
         let configured = self.env.clone();
@@ -330,18 +394,74 @@ impl Fixture {
         std::fs::write(self.d.dir.join("pbps.yml"), configured).unwrap();
         std::fs::write(
             self.d.dir.join("externals.sql"),
-            format!("{EXTERNALS}\nTHROW 51088, N'trace2488 compilation refused', 1;\n"),
+            format!("{external}\nTHROW 51088, N'trace2488 compilation refused', 1;\n"),
         )
         .unwrap();
         self.refused(&[], "trace2488 compilation refused");
-        std::fs::write(self.d.dir.join("externals.sql"), EXTERNALS).unwrap();
+        std::fs::write(self.d.dir.join("externals.sql"), externals()).unwrap();
+    }
+
+    fn computed_refusal(&mut self) {
+        // Unlike module bodies and skipped guards, computed expressions are
+        // compared shapes. Exercise target-only private text on this refusal,
+        // then restore before checking the result. This is the last planner
+        // call: drop/add changes the column's physical position on the target.
+        let base = self.d.dir.join("schema/dbo.base.yml");
+        let declaration = std::fs::read_to_string(&base).unwrap();
+        std::fs::write(
+            &base,
+            declaration.replace(
+                "  id:",
+                "  trace_arrival: {type: int, nullable: true}\n  id:",
+            ),
+        )
+        .unwrap();
+        let prior = std::fs::read(self.d.dir.join("second.json")).unwrap();
+        on_server(
+            self.target.connection(),
+            &format!(
+                "ALTER TABLE ext.t DROP COLUMN computed; ALTER TABLE ext.t ADD computed AS (id + LEN(N'{}'));",
+                SOURCES[5],
+            ),
+        );
+        let definition = text(
+            self.target.connection(),
+            "SELECT definition FROM sys.computed_columns WHERE object_id=OBJECT_ID(N'ext.t') AND name=N'computed';",
+        );
+        assert!(definition.contains(SOURCES[5]));
+        self.trace.candidate(definition.as_bytes());
+        let result = self.run(&[
+            "plan",
+            "--env",
+            "prod",
+            "--out",
+            "second.json",
+            "--format",
+            "json",
+        ]);
+        on_server(
+            self.target.connection(),
+            "ALTER TABLE ext.t DROP COLUMN computed; ALTER TABLE ext.t ADD computed AS ([id]+(1));",
+        );
+        std::fs::write(base, declaration).unwrap();
+        assert_ne!(code(&result), 0);
+        assert!(
+            stdout(&result).contains("sys.computed_columns"),
+            "{}",
+            stdout(&result)
+        );
+        assert_eq!(
+            std::fs::read(self.d.dir.join("second.json")).unwrap(),
+            prior
+        );
     }
 
     fn publication_refusal(&mut self, docker: bool) {
+        let external = externals();
         let before = std::fs::read(self.d.dir.join("second.json")).unwrap();
         std::fs::write(
             self.d.dir.join("externals.sql"),
-            format!("{EXTERNALS}\n/*trace2488_publication_wait*/ WAITFOR DELAY '00:00:15';\n"),
+            format!("{external}\n/*trace2488_publication_wait*/ WAITFOR DELAY '00:00:15';\n"),
         )
         .unwrap();
         let prior = if docker {
@@ -402,7 +522,7 @@ impl Fixture {
         let result = child.wait_with_output().unwrap();
         // Restore the engine state before inspecting a refusal or private bytes.
         on_server(self.target.connection(), &function());
-        std::fs::write(self.d.dir.join("externals.sql"), EXTERNALS).unwrap();
+        std::fs::write(self.d.dir.join("externals.sql"), externals()).unwrap();
         self.trace.output(&result);
         self.trace.files(&self.d.dir);
         assert!(
@@ -602,11 +722,12 @@ impl Fixture {
     }
 
     fn server_cleanup_failure(&mut self) {
+        let external = externals();
         let scratch = self.scratch.as_ref().unwrap().connection().to_owned();
         std::fs::write(
             self.d.dir.join("externals.sql"),
             format!(
-                "{EXTERNALS}\n\
+                "{external}\n\
             CREATE TABLE ext.cleanup_refusal(i int); CREATE INDEX ix ON ext.cleanup_refusal(i);\n\
             EXEC sys.sp_addextendedproperty @name=N'cleanup_property', @value=N'held', \
             @level0type=N'SCHEMA',@level0name=N'ext',@level1type=N'TABLE', \
@@ -624,7 +745,7 @@ impl Fixture {
             &scratch,
             "IF OBJECT_ID(N'ext.cleanup_refusal') IS NOT NULL DROP TABLE ext.cleanup_refusal;",
         );
-        std::fs::write(self.d.dir.join("externals.sql"), EXTERNALS).unwrap();
+        std::fs::write(self.d.dir.join("externals.sql"), externals()).unwrap();
         self.trace.output(&result);
         self.trace.files(&self.d.dir);
         assert_ne!(code(&result), 0);
@@ -981,6 +1102,7 @@ fn check(docker: bool) {
     fixture.ordinary_outputs();
     let (cli_id, ui_id) = fixture.resolved_outputs();
     fixture.readers(&cli_id, &ui_id);
+    fixture.computed_refusal();
     fixture.trace.complete();
 }
 

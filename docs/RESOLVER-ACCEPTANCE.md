@@ -186,7 +186,10 @@ DEC-952.1. One collector scans command stdout/stderr, regular artifacts, saved
 plan/SQL, complete ledger rows and decoded snapshots, hook argv/environment/stdin,
 and UI payloads and full subprocess streams before UI truncation. Definitions
 are target-only: view queries, routine and trigger bodies, CHECK/DEFAULT
-expressions, and SQL Server computed-column text. Drafted identifiers and shapes
+expressions, and SQL Server computed-column text. Computed expressions are
+compared staged shapes: successful runs use the same public computed expression;
+a target-only private expression exercises the shape-refusal output.
+Drafted identifiers and shapes
 remain ordinary reviewed content. Each engine's actual definition spelling and
 small-dictionary alternatives join the plaintext and unkeyed SHA-256 checks
 (lower/upper hex and base64).
