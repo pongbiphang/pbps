@@ -1,12 +1,12 @@
 //! The container runtime, as far as reconciling a run and finishing one needs
 //! it: list by label, inspect by id, remove and confirm. The resolver's own
-//! Docker commands do the work (`container::docker`, `remove_named`), so the
+//! Docker commands do the work (`container::docker`, `remove_with_volumes`), so the
 //! removal and its confirmation are the shared scratch path.
 
 use std::collections::BTreeMap;
 
 use pbps_cli::resolver::server::scratch::container::{
-    docker, no_such_container, no_such_volume, remove_named,
+    docker, no_such_container, no_such_volume, remove_with_volumes,
 };
 
 use super::record::Daemon;
@@ -61,9 +61,9 @@ pub(super) trait Runtime {
     /// Removes a volume the run recorded, if the runtime still has it; the
     /// names still there when it cannot confirm it gone.
     async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>>;
-    /// Removes the container with its volumes and confirms both gone; the
-    /// names still there when it cannot.
-    async fn remove(&self, id: &str) -> Result<(), Vec<String>>;
+    /// Removes the container with the volumes already inspected and recorded,
+    /// and confirms both gone; the names still there when it cannot.
+    async fn remove(&self, id: &str, volumes: &[String]) -> Result<(), Vec<String>>;
 }
 
 pub(super) struct Docker;
@@ -136,8 +136,8 @@ impl Runtime for Docker {
         Ok(listing.split_whitespace().map(str::to_owned).collect())
     }
 
-    async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
-        remove_named(id).await
+    async fn remove(&self, id: &str, volumes: &[String]) -> Result<(), Vec<String>> {
+        remove_with_volumes(id, Ok(volumes.to_vec())).await
     }
 
     async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
