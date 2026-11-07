@@ -1085,3 +1085,18 @@ administrator: a table can carry a computed column or a trigger, which is user
 code. PostgreSQL's re-pin keeps reading as the administrator. No report or
 manifest field is added and no format version changes. The cause of a failed
 scratch start is no longer lost in the lifecycle test (#2683).
+
+<a id="dec-2547-1"></a>
+
+**DEC-2547.1. A failed owned bootstrap carries its lock release beside its cause.**
+The shared bootstrap service returns the outcome of the deployment-lock release
+with a failure taken under the lock, as `apply` does with `Attempt::Failed`
+(`Bootstrap::Failed`); a refusal before the lock stays an ordinary error, since
+there is no lock to release. The command prints its existing "lock was not
+released" warning from the wrapper, so its stderr and exit codes do not change.
+The owned adapter hands the same outcome to the shared `finish_attempt`, which
+records `test.cleanup`, marks the phase unanswerable and keeps a committed
+ledger entry, and only then returns the primary error (ADR-0019 §9). The owned
+run therefore no longer prints that warning on stderr for a bootstrap, as it
+already did not for an apply: the finding is its report. No format version
+changes.

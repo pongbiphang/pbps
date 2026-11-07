@@ -15,6 +15,12 @@ enum Case {
     CancelApply,
     CancelBootstrap,
     CancelPlan,
+    /// The build fails and the lock cannot be released (#2547).
+    BootstrapBoth,
+    /// The same build failure with a working release: the negative control.
+    BootstrapPrimary,
+    /// The build commits and only the release fails.
+    BootstrapCleanup,
 }
 
 fn limits() -> pbps_config::test_manifest::Timeouts {
@@ -56,6 +62,12 @@ async fn exercise_control(
     let session = control.provision(scratch, data, 0).await?;
     if matches!(case, Case::CancelBootstrap) {
         return cancel_bootstrap(scratch, control, data, send, &session, &base).await;
+    }
+    if matches!(
+        case,
+        Case::BootstrapBoth | Case::BootstrapPrimary | Case::BootstrapCleanup
+    ) {
+        return bootstrap_cleanup(scratch, control, data, &session, &base, case).await;
     }
     let mut phase = Phase::new("bootstrap", "base");
     control.bootstrap(&session, &base, &mut phase).await?;
@@ -232,7 +244,12 @@ async fn exercise_control(
             data.assertions.push(assertion);
             data.phases.push(phase);
         }
-        Case::CancelProvision | Case::CancelBootstrap | Case::CancelPlan => unreachable!(),
+        Case::CancelProvision
+        | Case::CancelBootstrap
+        | Case::CancelPlan
+        | Case::BootstrapBoth
+        | Case::BootstrapPrimary
+        | Case::BootstrapCleanup => unreachable!(),
     }
     ensure!(
         fixture.bytes()? == before,
@@ -285,12 +302,9 @@ async fn cancelled_before_any_warning(
     Ok(())
 }
 
-/// Sends the cancellation once the owned apply role waits on a lock: the
-/// service has then made every catalog read that precedes the blocked work.
-async fn cancel_when_blocked(
-    scratch: &crate::test_scratch::TestScratch<'_>,
-    send: tokio::sync::oneshot::Sender<()>,
-) -> anyhow::Result<()> {
+/// Returns once the owned apply role waits on a lock: the service has then made
+/// every catalog read that precedes the blocked work.
+async fn apply_role_waits(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<()> {
     let mut monitor = admin(scratch).await?;
     let until = tokio::time::Instant::now() + Duration::from_secs(25);
     let sql = format!(
@@ -299,7 +313,6 @@ async fn cancel_when_blocked(
     );
     loop {
         if !monitor.query(&sql).await?.is_empty() {
-            send.send(()).unwrap();
             return Ok(());
         }
         ensure!(
@@ -308,6 +321,16 @@ async fn cancel_when_blocked(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Sends the cancellation once the owned apply role waits on a lock.
+async fn cancel_when_blocked(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+    send: tokio::sync::oneshot::Sender<()>,
+) -> anyhow::Result<()> {
+    apply_role_waits(scratch).await?;
+    send.send(()).unwrap();
+    Ok(())
 }
 
 async fn cancel_bootstrap(
@@ -348,6 +371,100 @@ async fn cancel_bootstrap(
         phase.findings
     );
     ensure!(matches!(phase.outcome, Status::Unanswerable));
+    data.phases.push(phase);
+    Ok(())
+}
+
+const CAUSE_2547: &str = "bootstrap cause 2547";
+
+/// The build fails at its first table and/or the deployment lock cannot be
+/// released. The release is made to fail by taking DELETE on the lock table
+/// from its owner while the build waits on a lock this test holds: a trigger or
+/// rule on that table would be refused as an untrusted ledger before the
+/// release, and the owner's privilege is not part of that check.
+async fn bootstrap_cleanup(
+    scratch: &crate::test_scratch::TestScratch<'_>,
+    control: &mut Control,
+    data: &mut TestData,
+    session: &Session<'_>,
+    base: &Assembled,
+    case: Case,
+) -> anyhow::Result<()> {
+    let fails = !matches!(case, Case::BootstrapCleanup);
+    let blocks_release = !matches!(case, Case::BootstrapPrimary);
+    let mut holder = admin(scratch).await?;
+    if blocks_release {
+        holder.execute("SELECT pg_advisory_lock(2547)").await?;
+    }
+    let mut ddl = admin(scratch).await?;
+    ddl.execute(&format!(
+        concat!(
+            "CREATE FUNCTION public.fault_2547() RETURNS event_trigger LANGUAGE plpgsql AS $$ ",
+            "BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() ",
+            "WHERE object_identity = 'app.orders') THEN {hold}{raise} END IF; END $$; ",
+            "CREATE EVENT TRIGGER fault_2547 ON ddl_command_end WHEN TAG IN ('CREATE TABLE') ",
+            "EXECUTE FUNCTION public.fault_2547()"
+        ),
+        hold = if blocks_release {
+            "PERFORM pg_advisory_xact_lock(2547); "
+        } else {
+            ""
+        },
+        raise = if fails {
+            format!("RAISE EXCEPTION '{CAUSE_2547}'; ")
+        } else {
+            String::new()
+        },
+    ))
+    .await?;
+    let revoke = format!(
+        "REVOKE DELETE ON public.__pbps_lock FROM pbps_test_apply_{}",
+        scratch.run_id()
+    );
+    let release = async {
+        if blocks_release {
+            // The lock table exists once the build waits; the apply role cannot
+            // delete its row afterwards.
+            apply_role_waits(scratch).await.context("waiting")?;
+            ddl.execute(&revoke).await.context("revoke")?;
+            holder
+                .execute("SELECT pg_advisory_unlock(2547)")
+                .await
+                .context("unlock")?;
+        }
+        anyhow::Ok(())
+    };
+    let mut phase = Phase::new("bootstrap", "base");
+    let (result, observed) = tokio::join!(control.bootstrap(session, base, &mut phase), release);
+    observed.context("releasing the held build")?;
+    let error = format!(
+        "{:#}",
+        result.err().context("the failed bootstrap succeeded")?
+    );
+    let ids = |id: &str| phase.findings.iter().filter(|f| f.id == id).count();
+    if matches!(case, Case::BootstrapCleanup) {
+        ensure!(phase.entry.is_some(), "the committed entry was lost");
+        // The release error is the phase's error: nothing else failed.
+        ensure!(error.contains("permission denied"), "{error}");
+    } else {
+        ensure!(phase.entry.is_none());
+        ensure!(error.contains(CAUSE_2547), "{error}");
+        ensure!(
+            phase
+                .findings
+                .iter()
+                .any(|f| f.message.contains(CAUSE_2547)),
+            "the original cause left the report: {:?}",
+            phase.findings
+        );
+    }
+    if blocks_release {
+        ensure!(ids("test.cleanup") == 1, "{:?}", phase.findings);
+        ensure!(matches!(phase.outcome, Status::Unanswerable));
+    } else {
+        ensure!(ids("test.cleanup") == 0, "{:?}", phase.findings);
+        ensure!(matches!(phase.outcome, Status::Failed));
+    }
     data.phases.push(phase);
     Ok(())
 }
@@ -424,9 +541,13 @@ async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
     let expected = match case {
         Case::Preservation | Case::Budgets => crate::output::Outcome::Ok,
         Case::Violation | Case::Refusals => crate::output::Outcome::Findings,
-        Case::CancelProvision | Case::CancelApply | Case::CancelBootstrap | Case::CancelPlan => {
-            crate::output::Outcome::Unanswerable
-        }
+        Case::CancelProvision
+        | Case::CancelApply
+        | Case::CancelBootstrap
+        | Case::CancelPlan
+        | Case::BootstrapBoth
+        | Case::BootstrapCleanup => crate::output::Outcome::Unanswerable,
+        Case::BootstrapPrimary => crate::output::Outcome::Findings,
     };
     ensure!(
         report.result == expected,
@@ -440,6 +561,34 @@ async fn lifecycle(variable: &str, case: Case) -> anyhow::Result<()> {
     ensure!(jsonschema::validator_for(&schema)?.is_valid(&json));
     if !matches!(case, Case::Preservation | Case::Budgets) {
         ensure!(!crate::output::human(&report.findings).is_empty());
+    }
+    if matches!(
+        case,
+        Case::BootstrapBoth | Case::BootstrapPrimary | Case::BootstrapCleanup
+    ) {
+        let human = crate::output::human(&report.findings);
+        let wire = json["findings"].to_string();
+        let wants_cause = !matches!(case, Case::BootstrapCleanup);
+        let wants_cleanup = !matches!(case, Case::BootstrapPrimary);
+        for (what, text) in [("human", human), ("json", wire)] {
+            ensure!(
+                text.contains(CAUSE_2547) == wants_cause,
+                "{what} cause: {text}"
+            );
+            ensure!(
+                text.contains("deployment lock release failed") == wants_cleanup,
+                "{what} cleanup: {text}"
+            );
+        }
+        ensure!(
+            json["findings"]
+                .as_array()
+                .context("findings")?
+                .iter()
+                .any(|f| f["id"] == "test.cleanup")
+                == wants_cleanup,
+            "the cleanup finding id: {json}"
+        );
     }
     Ok(())
 }
@@ -553,6 +702,36 @@ async fn d2694_pg18_cancelled_plan_keeps_its_catalog_warning_once() {
     Box::pin(lifecycle("PBPS_TEST_PG_SCRATCH_IMAGE", Case::CancelPlan))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and a pinned PostgreSQL scratch image"]
+async fn bootstrap_failure_and_unlock_failure_both_survive_in_the_report() {
+    Box::pin(lifecycle("PBPS_TEST_PG_SCRATCH_IMAGE", Case::BootstrapBoth))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and a pinned PostgreSQL scratch image"]
+async fn a_bootstrap_failure_alone_reports_no_cleanup_finding() {
+    Box::pin(lifecycle(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Case::BootstrapPrimary,
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and a pinned PostgreSQL scratch image"]
+async fn a_committed_bootstrap_entry_survives_a_failed_lock_release() {
+    Box::pin(lifecycle(
+        "PBPS_TEST_PG_SCRATCH_IMAGE",
+        Case::BootstrapCleanup,
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
