@@ -10615,9 +10615,7 @@ fn rename_snapshot_roles(
 ) {
     for (from, to) in renames {
         snapshot.ids.rename_role(from, to);
-        if let Some(role) = snapshot.schema.roles.remove(from) {
-            snapshot.schema.roles.insert(to.clone(), role);
-        }
+        snapshot.schema.rename_role(from, to);
     }
 }
 
