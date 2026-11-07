@@ -2931,6 +2931,55 @@ fn sqlstate(e: &DbError) -> &str {
     }
 }
 
+/// An operator class parameter is stored in the index column's `attoptions`
+/// and nothing else shows it: the class reads the same with and without
+/// `siglen`, so a pull that ignored it would record a plain index and a later
+/// plan would call the real one drift (#2447 PR F). Measured on both majors:
+/// the parameterised index is left out and named, and the same class without a
+/// parameter beside it is not touched, which is the negative.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_index_key_with_opclass_parameters_is_left_out_not_read_as_the_plain_class() {
+    let s = emit_schema("attopt2447");
+    let doc = TableName::new(&s, "doc");
+    let mut db = TestDb::create("attopt2447").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "CREATE TABLE {s}.doc (id integer PRIMARY KEY, body text, note text);
+         CREATE INDEX ix_plain ON {s}.doc (body);
+         CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA {s};
+         CREATE INDEX ix_param ON {s}.doc USING gist (note {s}.gist_trgm_ops (siglen=32));"
+    ))
+    .await
+    .expect("the indexes");
+    let options = text(
+        &mut db,
+        &format!(
+            "SELECT a.attoptions::text FROM pg_attribute a \
+              WHERE a.attrelid = '{s}.ix_param'::regclass AND a.attnum = 1"
+        ),
+    )
+    .await;
+    assert_eq!(
+        options, "{siglen=32}",
+        "the parameter is where the plan says"
+    );
+    let read = pull(&mut db).await;
+    let pulled = ours_only(&read, &s);
+    // The database is this test's own: dropping it takes the package with it.
+    db.drop().await;
+    let indexes = &pulled.tables[&doc].indexes;
+    assert!(indexes.contains_key("ix_plain"), "{:?}", indexes.keys());
+    assert!(!indexes.contains_key("ix_param"), "{:?}", indexes.keys());
+    assert!(
+        read.warnings
+            .iter()
+            .any(|w| w.contains("ix_param") && w.contains("operator class parameters")),
+        "{:?}",
+        read.warnings
+    );
+}
+
 /// GIN over `jsonb` is read from DDL written by hand, rebuilt from that read
 /// in another database, read back the same, and changed as a typed plan: a
 /// class change replaces the index, a removal drops it, and each converges to
