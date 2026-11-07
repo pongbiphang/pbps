@@ -3501,6 +3501,16 @@
         "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_cannot_compare_a_rowversion_and_names_it_without_writing",
         "plan_test1165_mssql::repin1165_mssql::repin1165_mssql_cannot_establish_an_exhausted_identity_column_and_names_it"
       ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "trace2488::mssql_server_keeps_definition_sources_out_of_every_sink",
+        "trace2488::mssql_docker_keeps_definition_sources_out_of_every_sink"
+      ]
     }
   ]
 }

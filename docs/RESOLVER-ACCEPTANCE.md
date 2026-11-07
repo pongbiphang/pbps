@@ -42,15 +42,15 @@ Each test row carries its build, scratch kind, platform and delivering PR.
 | 7 | tests | am-28, reader, am-25, apply-opening, connected-checks | Evidence/publication components; final negative-control audit [#2489](https://github.com/pongbiphang/pbps/issues/2489) | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
 | 8 | tests | apply, approval, apply-closing | PostgreSQL apply (#616) and SQL Server apply ([#2144](https://github.com/pongbiphang/pbps/issues/2144), DEC-2144.1) | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
 | 9 | tests | snapshot, sql-observation | Engine-specific observation bounds, SPEC 7.6; no after-last-read guarantee | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
-| 10 | measured profiles only, retired by #1636 | - | [ADR amendment](ADR-0016-engine-assisted-planning.md#amendment-the-resolver-1528-1636); plaintext trace replacement remains [#2488](https://github.com/pongbiphang/pbps/issues/2488) | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
+| 10 | measured profiles only, retired by #1636 | trace-pg16-server, trace-pg18-server, trace-pg16-docker, trace-pg18-docker, trace-mssql-server, trace-mssql-docker | [ADR amendment](ADR-0016-engine-assisted-planning.md#amendment-the-resolver-1528-1636); plaintext trace controls are mapped in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 11 | measured profiles only, retired by #1636 | am-01, am-04 | [SPEC 9.3.2](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered): separation replaces the old same-instance ban | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 12 | measured profiles only, retired by #1636 | - | SPEC 9.3.2: the operator vouches for logging | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 13 | measured profiles only, retired by #1636 | - | SPEC 9.3.2: the operator vouches for containment | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 14 | tests | backend | Compatibility inputs only; SPEC 9.3.2 invalidates a changed backend rather than resuming its partial run | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
 | 15 | tests | am-25, am-24, apply-opening | Stale external inputs refuse; complete engine/property controls remain in the closing audit | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
 | 16 | tests | am-22, am-05 | PostgreSQL reproduction; SQL Server integration remains [#2143](https://github.com/pongbiphang/pbps/issues/2143) | Per-test rows below; other combinations unqualified | Per-test rows below; no cross-kind inference | Per-test rows below |
-| 17 | superseded by DEC-952.1 | - | [DEC-952.1](decisions/ledger.md#dec-952-1); keyed evidence; trace obligation [#2488](https://github.com/pongbiphang/pbps/issues/2488) remains open | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
-| 18 | superseded by DEC-952.1 | approval | [DEC-952.1](decisions/ledger.md#dec-952-1); ordinary approval; trace obligation [#2488](https://github.com/pongbiphang/pbps/issues/2488) remains open | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
+| 17 | superseded by DEC-952.1 | trace-pg16-server, trace-pg18-server, trace-pg16-docker, trace-pg18-docker, trace-mssql-server, trace-mssql-docker | [DEC-952.1](decisions/ledger.md#dec-952-1); keyed evidence; trace controls [#2488](https://github.com/pongbiphang/pbps/issues/2488) remains open | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
+| 18 | superseded by DEC-952.1 | approval, trace-pg16-server, trace-pg18-server, trace-pg16-docker, trace-pg18-docker, trace-mssql-server, trace-mssql-docker | [DEC-952.1](decisions/ledger.md#dec-952-1); ordinary approval; trace controls [#2488](https://github.com/pongbiphang/pbps/issues/2488) remains open | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 19 | measured profiles only, retired by #1636 | - | SPEC 9.3.2: the operator vouches for channels; ordinary connection TLS tests are not measured-profile qualification | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 20 | measured profiles only, retired by #1636 | - | SPEC 9.3.2: the operator vouches for channels | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
 | 21 | measured profiles only, retired by #1636 | - | SPEC 9.3.2: in-place scratch mutation/exclusion is operator-vouched | Retired requirement; replacement coordinates below | Operator-vouched where SPEC says so | No measured-profile platform qualification |
@@ -117,6 +117,12 @@ the separate B trace obligation still needs execution evidence.
 | reported-facts | resolver_tests::scope610::the_rule_refuses_version_and_collation_differences_between_real_servers_and_verifies_a_matching_side | crates/pbps-pg/tests/support/resolver.rs | pbps-pg/test/live | pg | live-pg | linux | PG 16.15; PG 18.6 | engine fixture; runtime kinds not inferred | Receipt in [#2487](https://github.com/pongbiphang/pbps/issues/2487); final CI audit [#2489](https://github.com/pongbiphang/pbps/issues/2489) | [PR #688](https://github.com/pongbiphang/pbps/pull/688) |
 | selection | resolver::tests::explicit_selection_overrides_environment_then_project_without_credentials | crates/pbps-config/src/resolver.rs | pbps-config/lib/pbps_config | quick | quick | linux | offline model; no engine/build qualification | no resolver | Receipt in [#2487](https://github.com/pongbiphang/pbps/issues/2487); final CI audit [#2489](https://github.com/pongbiphang/pbps/issues/2489) | [PR #622](https://github.com/pongbiphang/pbps/pull/622) |
 | lazy | resolution::tests::without_a_selection_the_plan_is_never_assessed | crates/pbps-cli/src/resolution.rs | pbps-cli/bin/pbps | quick | quick | linux | offline model; no engine/build qualification | no resolver | Receipt in [#2487](https://github.com/pongbiphang/pbps/issues/2487); final CI audit [#2489](https://github.com/pongbiphang/pbps/issues/2489) | [PR #1526](https://github.com/pongbiphang/pbps/pull/1526) |
+| trace-pg16-server | trace::pg16_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 16.15 | server | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
+| trace-pg16-docker | trace::pg16_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 16.15 | docker | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
+| trace-pg18-server | trace::pg18_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 18.6 | server | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
+| trace-pg18-docker | trace::pg18_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 18.6 | docker | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
+| trace-mssql-server | trace2488::mssql_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | server | Execution pending in [#2488](https://github.com/pongbiphang/pbps/issues/2488); resolved-apply success requires #2144 | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
+| trace-mssql-docker | trace2488::mssql_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | docker | Execution pending in [#2488](https://github.com/pongbiphang/pbps/issues/2488); resolved-apply success requires #2144 | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
 
 ## Engine, scratch and platform boundaries
 
@@ -171,6 +177,33 @@ planning/apply qualification.
 [macOS qualification, #2492](https://github.com/pongbiphang/pbps/issues/2492)
 coordinates with #626's ordinary TLS work. Both are unclaimed platform follow-ups,
 as approved by #621's P-C decision; neither is a passing matrix cell.
+
+
+## Definition trace controls (T2)
+
+The trace rows preserve cases 10, 17 and 18's output obligations under
+DEC-952.1. One collector scans command stdout/stderr, regular artifacts, saved
+plan/SQL, complete ledger rows and decoded snapshots, hook argv/environment/stdin,
+and UI payloads and full subprocess streams before UI truncation. Definitions
+are target-only: view queries, routine and trigger bodies, CHECK/DEFAULT
+expressions, and SQL Server computed-column text. Drafted identifiers and shapes
+remain ordinary reviewed content. Each engine's actual definition spelling and
+small-dictionary alternatives join the plaintext and unkeyed SHA-256 checks
+(lower/upper hex and base64).
+
+The planted-leak controls exercise each collection adapter; unreadable artifacts
+and unobserved sinks fail. Offline explanation gets only a saved artifact, with
+no project, key, target, scratch or Docker endpoint. Live cells separately cover
+success and relevant refusal, compilation, publication-recheck, cleanup and
+rendering failures. Ordinary output and keyed evidence remain readable: no new
+history field, confidential ledger or mutation framework is introduced.
+
+A delivering PR records the named failures after independently removing keyed
+fingerprinting, private-property nonserialization and identity-only explanation,
+then restores the exact production bytes and reruns the normal flow. These
+one-time controls are distinct from the always-on per-sink planted leaks. C's
+final audit still reads the merge-group receipts; a listed test alone proves no
+execution or other platform/build/scratch combination.
 
 ## Closing audit
 
