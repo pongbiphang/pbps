@@ -1066,7 +1066,7 @@ jobs:
           merge-multiple: true
       - name: Audit the resolver shard union
         if: github.event_name != 'pull_request'
-        run: python3 scripts/live-shards.py audit .resolver-mssql 3 --expected-invocations 8
+        run: python3 scripts/live-shards.py audit .resolver-mssql 3 --expected-invocations 9
       # Through the environment, not `${{ }}` inside `run:`: interpolation
       # would splice the value into the program text.
       #

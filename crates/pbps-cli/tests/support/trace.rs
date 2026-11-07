@@ -655,16 +655,7 @@ impl Fixture {
     }
 
     fn launcher(&self) -> PathBuf {
-        let path = self.d.dir.join("ui-launcher.sh");
-        let mut script = String::from("#!/bin/sh\nset -eu\n");
-        for (key, value) in &self.env {
-            script.push_str(&format!("export {key}={}\n", quoted(value)));
-        }
-        // Client deliberately drops stderr; preserve both real streams before
-        // it does. Trigger's bounded browser payload cannot hide a late leak.
-        script.push_str(&format!("set +e\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(BIN)));
-        executable(&path, &script);
-        path
+        capture_launcher(&self.d.dir, Path::new(BIN), &self.env)
     }
 
     fn ui_plan(&mut self, file: &str, apply: bool) {
@@ -714,9 +705,7 @@ impl Fixture {
             View::Timeline("prod".into()),
             View::Docs,
         ] {
-            let payload = client.read(&view).unwrap();
-            self.trace.ui(&payload);
-            self.trace.files(&self.d.dir);
+            read_ui(&mut self.trace, &client, &self.d.dir, &view);
         }
     }
 

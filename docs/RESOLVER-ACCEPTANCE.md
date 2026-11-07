@@ -201,7 +201,10 @@ history field, confidential ledger or mutation framework is introduced.
 A delivering PR records the named failures after independently removing keyed
 fingerprinting, private-property nonserialization and identity-only explanation,
 then restores the exact production bytes and reruns the normal flow. These
-one-time controls are distinct from the always-on per-sink planted leaks. C's
+one-time controls are distinct from the always-on per-sink planted leaks.
+The UI-reader control keeps its source-bearing stand-in outside the scanned
+project, discards probe output, and requires the privacy scanner's diagnostic;
+a child that never started cannot satisfy it. C's
 final audit still reads the merge-group receipts; a listed test alone proves no
 execution or other platform/build/scratch combination.
 

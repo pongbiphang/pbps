@@ -52,7 +52,7 @@ impl Fixture {
         on_server(
             target.connection(),
             &format!(
-                "CREATE VIEW ext.v AS SELECT id, N'{}' + N'{}' AS label, ext.f() AS amount, computed FROM ext.t;",
+                "CREATE VIEW ext.v AS SELECT id, CAST(N'{}' + N'{}' AS nvarchar(100)) AS label, ext.f() AS amount, computed FROM ext.t;",
                 SOURCES[0], DICTIONARY[2]
             ),
         );
@@ -517,14 +517,7 @@ impl Fixture {
     }
 
     fn launcher(&self) -> PathBuf {
-        let launcher = self.d.dir.join("ui-launcher.sh");
-        let mut script = String::from("#!/bin/sh\nset -eu\n");
-        for (key, value) in &self.env {
-            script.push_str(&format!("export {key}={}\n", quoted(value)));
-        }
-        script.push_str(&format!("set +e\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(BIN)));
-        executable(&launcher, &script);
-        launcher
+        capture_launcher(&self.d.dir, Path::new(BIN), &self.env)
     }
 
     fn ui(&mut self, action: &str, body: serde_json::Value) {
@@ -538,8 +531,8 @@ impl Fixture {
             let runs: Vec<serde_json::Value> = serde_json::from_slice(&response).unwrap();
             assert_eq!(runs.len(), 1);
             if runs[0]["ended"] == true {
-                assert_eq!(runs[0]["code"], 0);
                 self.trace.files(&self.d.dir);
+                assert_eq!(runs[0]["code"], 0);
                 break;
             }
             ui_child_wait(self.slowest, started.elapsed(), action, &runs[0]);
@@ -572,8 +565,7 @@ impl Fixture {
             View::Timeline("prod".into()),
             View::Docs,
         ] {
-            let result = client.read(&view).unwrap();
-            self.trace.ui(&result);
+            read_ui(&mut self.trace, &client, &self.d.dir, &view);
         }
         let exported = self.d.dir.join("exported");
         std::fs::create_dir(&exported).unwrap();

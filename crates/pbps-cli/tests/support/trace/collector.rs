@@ -340,3 +340,99 @@ pub(super) fn keyed_records_differ(first: &serde_json::Value, second: &serde_jso
         );
     }
 }
+
+/// Preserve both streams before the UI drops stderr or truncates a run payload.
+pub(super) fn capture_launcher(
+    root: &Path,
+    binary: &Path,
+    environment: &[(String, String)],
+) -> PathBuf {
+    let path = root.join("ui-launcher.sh");
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    for (key, value) in environment {
+        script.push_str(&format!("export {key}={}\n", quoted(value)));
+    }
+    script.push_str(&format!("cd {}\nset +e\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(&root.display().to_string()), quoted(&binary.display().to_string())));
+    executable(&path, &script);
+    path
+}
+
+pub(super) fn read_ui(
+    trace: &mut Trace,
+    client: &pbps_ui::client::Client,
+    root: &Path,
+    view: &pbps_ui::client::View,
+) {
+    let result = client.read(view);
+    // Read the raw streams even if the UI rejected its typed stdout contract.
+    trace.files(root);
+    trace.ui(&result.unwrap());
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_reader_cannot_discard_private_terminal_stderr() {
+        let project = crate::Demo::new("trace2488-ui-stderr");
+        // The source-bearing stand-in is outside the scanned project: finding
+        // its script would not prove that a UI reader preserved stderr.
+        let external = OfflineExport(project.dir.with_extension("terminal-source"));
+        std::fs::create_dir(&external.0).unwrap();
+        let binary = external.0.join("fake-pbps.sh");
+        executable(
+            &binary,
+            &format!(
+                "#!/bin/sh\nprintf '<p>public schema</p>'\nprintf '%s' '{}' >&2\n",
+                SOURCES[0]
+            ),
+        );
+        let source =
+            crate::stand_in::retry_exec(|| std::process::Command::new(&binary).output()).unwrap();
+        assert!(source.status.success());
+        assert_eq!(source.stderr, SOURCES[0].as_bytes());
+        let launcher = capture_launcher(&project.dir, &binary, &[]);
+        let probe = crate::stand_in::retry_exec(|| {
+            std::process::Command::new(&launcher)
+                .current_dir(&project.dir)
+                .output()
+        })
+        .unwrap();
+        assert!(probe.status.success());
+        // Successful probes settle inherited write descriptors. Their output
+        // must not supply the leak that the actual UI-read control observes.
+        for entry in std::fs::read_dir(&project.dir).unwrap() {
+            let path = entry.unwrap().path();
+            if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("stdout" | "stderr")
+            ) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        Trace::new().files(&project.dir);
+        let client = pbps_ui::client::Client {
+            executable: launcher,
+            project: project.dir.clone(),
+        };
+        let rejected = std::panic::catch_unwind(|| {
+            read_ui(
+                &mut Trace::new(),
+                &client,
+                &project.dir,
+                &pbps_ui::client::View::Docs,
+            );
+        })
+        .expect_err("the UI discarded private stderr without scanning it");
+        let message = rejected
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| rejected.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(
+            message.contains("private definition or unkeyed verifier reached"),
+            "the control failed before scanning private stderr"
+        );
+    }
+}
