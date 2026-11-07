@@ -503,6 +503,32 @@ column-used types are excluded. An unreadable catalog is an error.
 | Transforms | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Large objects | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Tablespaces beyond the two defaults | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Text search configurations and dictionaries | [#2728](https://github.com/pongbiphang/pbps/issues/2728) |
+| Text search parsers and templates | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| Conversions | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| Foreign data wrappers, foreign servers and user mappings | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| User-created procedural languages | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+
+### Named properties of objects the pull holds
+
+Pull names these in the same report-only notices (DEC-168.1). The object is
+pulled all the same, and the property is not part of the declarations: no plan
+sets or resets it, and a plan never refuses a table for it.
+
+| Property | Tracking |
+|---|---|
+| A column's or an index column's statistics target | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| The index `CLUSTER` follows | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| Column options such as `n_distinct` | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| A column-owned sequence set `UNLOGGED` (reset after a crash) | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| `DEPENDS ON EXTENSION` | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+| Comments, by object type | [#2729](https://github.com/pongbiphang/pbps/issues/2729) |
+| Security labels, by object type | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+
+A live test per supported major lists every column of every `pg_catalog` table
+and fails on one that `pbps_pg::pull_coverage` has no disposition for (held,
+named or irrelevant), so a property a new major adds is decided before that
+major is supported.
 
 ### Named, no support planned yet
 
