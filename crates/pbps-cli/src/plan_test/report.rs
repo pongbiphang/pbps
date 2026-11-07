@@ -93,17 +93,33 @@ impl Phase {
     }
 }
 /// Whether a failure says the run could not look, rather than what it found.
-/// A database error without a server code (transport, deadline, refusal) never
-/// answered. With a code, the engine decides: PostgreSQL SQLSTATE classes 08,
-/// 53, 58 and XX and a cancelled statement are the server or its host failing;
-/// on SQL Server only the listed engine faults are. An error whose engine is
-/// unknown (a phase with no database) is never read as a fault by its number.
+/// A tool-authored refusal answered; an uncoded transport or deadline failure
+/// did not. With a code, the engine decides. A phase with no database never
+/// reads a coded error as a fault by its number (ADR-0019 §9).
 pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Error) -> bool {
-    if let Some(db) = error.downcast_ref::<pbps_db::DbError>() {
-        return db.server_error_code().is_none_or(|c| match engine {
-            Some(driver) => fault_code(driver, &c),
-            None => false,
-        });
+    use pbps_db::{DbError, LedgerError};
+    // A transparent ledger error skips the DbError in source(); a rows-read
+    // source downcasts to Box<DbError>. Recover both shapes, as ledger_safe_reason
+    // does, without replacing the error whose original cause the report keeps.
+    let db = error.chain().find_map(|frame| {
+        frame
+            .downcast_ref::<DbError>()
+            .or_else(|| frame.downcast_ref::<Box<DbError>>().map(AsRef::as_ref))
+            .or_else(|| match frame.downcast_ref::<LedgerError>() {
+                Some(LedgerError::Db(inner)) => Some(inner),
+                _ => None,
+            })
+    });
+    if let Some(mut db) = db {
+        // Context has no verdict of its own, including around a code-free refusal.
+        while let DbError::Context { source, .. } = db {
+            db = source;
+        }
+        return !matches!(db, DbError::Refused(_))
+            && db.server_error_code().is_none_or(|c| match engine {
+                Some(driver) => fault_code(driver, &c),
+                None => false,
+            });
     }
     error
         .chain()
@@ -114,7 +130,10 @@ pub(super) fn unanswerable(engine: Option<pbps_db::Driver>, error: &anyhow::Erro
 fn fault_code(driver: pbps_db::Driver, code: &str) -> bool {
     match driver {
         pbps_db::Driver::Postgres => {
-            ["08", "53", "58", "XX"].iter().any(|p| code.starts_with(p)) || code == "57014"
+            ["08", "53", "57", "58", "XX"]
+                .iter()
+                .any(|p| code.starts_with(p))
+                || matches!(code, "25P03" | "25P04")
         }
         pbps_db::Driver::Mssql => pbps_mssql::test_scratch::infrastructure_fault(code),
     }
@@ -629,3 +648,9 @@ impl Repin {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests;

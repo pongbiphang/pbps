@@ -170,8 +170,7 @@ fn a_number_that_is_a_postgres_class_is_only_a_fault_on_postgres() {
 }
 
 #[test]
-fn an_uncoded_database_error_never_answered_on_either_engine_and_an_offline_phase_reads_no_number()
-{
+fn an_uncoded_deadline_never_answered_on_either_engine_and_an_offline_phase_reads_no_number() {
     use pbps_db::Driver::{Mssql, Postgres};
     for engine in [Postgres, Mssql] {
         let timed_out = pbps_db::DbError::DeadlineExceeded("deadline").into();
