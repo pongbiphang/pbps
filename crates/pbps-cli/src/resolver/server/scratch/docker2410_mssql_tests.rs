@@ -4,6 +4,7 @@
 //! hand with the names and labels a run gives it.
 
 use super::super::container::{Keeper, seen, swept};
+use super::super::recovery::{self, Report};
 use super::*;
 use crate::resolver::server::engine;
 use pbps_db::resolver::Kept;
@@ -87,6 +88,30 @@ async fn start() -> (Made, String, String, String) {
     (made, name, token, connection)
 }
 
+// Readiness cannot prevent a later TLS handshake from failing. The production
+// sweep correctly keeps an unreadable server (DEC-2410.3); this test gets at
+// most three cleanup observations, retaining the last diagnostic (#2689).
+async fn retry_unreadable_cleanup<F: std::future::Future<Output = Report>>(
+    name: &str,
+    mut sweep: impl FnMut() -> F,
+) -> Report {
+    let mut report = sweep().await;
+    for _ in 0..2 {
+        let unreadable = report.groups.iter().any(|group| {
+            group.kept.iter().any(|kept| {
+                kept.resource.names == [name]
+                    && kept.why.starts_with("its server could not be read: ")
+            })
+        });
+        if !unreadable {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        report = sweep().await;
+    }
+    report
+}
+
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
 async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone() {
@@ -119,7 +144,7 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
     // Gone, and the mark that it was there stays: that, not the age, is what
     // makes the container the dead run's however young it is.
     let after = seen(Driver::Mssql, &connection, &token_of_run, &token).await;
-    let dead = swept(&token_of_run).await;
+    let dead = retry_unreadable_cleanup(&name, || swept(&token_of_run)).await;
     let removed = !exists(&name);
     drop(made);
     // Other runs on the daemon are in the same reports: only this container
@@ -211,4 +236,117 @@ async fn a_sql_server_keeper_that_connects_between_the_two_reads_is_alive_and_no
     };
     assert_eq!(seen.unwrap(), Some(kept));
     drop(keeper);
+}
+
+mod cleanup_retry_tests {
+    use super::*;
+
+    const NAME: &str = "pbps-scratch-0123456789abcdef0123456789abcdef";
+    const EOF: &str = "its server could not be read: tls handshake eof";
+
+    fn kept(name: &str, why: &str) -> Report {
+        Report {
+            groups: vec![recovery::Group {
+                token: "owner".into(),
+                kept: vec![recovery::Kept {
+                    resource: recovery::Resource::one("docker container", name),
+                    why: why.into(),
+                    statement: format!("docker rm --force --volumes {name}"),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn removed() -> Report {
+        Report {
+            groups: vec![recovery::Group {
+                token: "owner".into(),
+                removed: vec![recovery::Resource::one("docker container", NAME)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_server_read_failure_is_retried_until_removal_is_observed() {
+        let mut reports = [kept(NAME, EOF), removed()].into_iter();
+        let report = retry_unreadable_cleanup(NAME, || {
+            std::future::ready(reports.next().expect("only the failed read is retried"))
+        })
+        .await;
+        assert_eq!(report, removed());
+        assert!(reports.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_server_is_kept_after_three_attempts_with_the_last_diagnostic() {
+        let mut attempts = 0;
+        let report = retry_unreadable_cleanup(NAME, || {
+            attempts += 1;
+            std::future::ready(kept(
+                NAME,
+                &format!("its server could not be read: failure {attempts}"),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            report,
+            kept(NAME, "its server could not be read: failure 3")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_keeper_ends_retries_without_removing_its_container() {
+        let live = || Report {
+            live: vec!["owner".into()],
+            ..Default::default()
+        };
+        let mut reports = [kept(NAME, EOF), live()].into_iter();
+        let report = retry_unreadable_cleanup(NAME, || {
+            std::future::ready(reports.next().expect("a live keeper ends retries"))
+        })
+        .await;
+        assert_eq!(report, live());
+        assert!(reports.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn other_failures_and_other_containers_are_not_retried() {
+        for (name, why) in [
+            (NAME, "its volumes could not be read"),
+            (NAME, "its server was not read"),
+            ("another-container", EOF),
+        ] {
+            let mut attempts = 0;
+            let report = retry_unreadable_cleanup(NAME, || {
+                attempts += 1;
+                std::future::ready(kept(name, why))
+            })
+            .await;
+            assert_eq!(attempts, 1, "{name}: {why}");
+            assert_eq!(report, kept(name, why));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_listing_is_not_retried() {
+        let mut attempts = 0;
+        let report = retry_unreadable_cleanup(NAME, || {
+            attempts += 1;
+            std::future::ready(Report {
+                unread: Some("the daemon could not be read".into()),
+                ..Default::default()
+            })
+        })
+        .await;
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            report.unread.as_deref(),
+            Some("the daemon could not be read")
+        );
+    }
 }
