@@ -395,6 +395,10 @@ pub struct RawIndex {
     /// (`pg_catalog.C`). Computed in the query from `indcollation`, because the
     /// per-key text the catalog renders leaves the collation out.
     pub key_collations: Vec<String>,
+    /// Each key's operator class parameters (`pg_attribute.attoptions` of the
+    /// index, as text): `""` where it has none. The model holds none, so a key
+    /// with some leaves the index out (#2447 PR F).
+    pub key_options: Vec<String>,
     /// The index's `reloptions`, each `name=value` as the engine keeps it
     /// (#1442).
     pub reloptions: Vec<String>,
@@ -4013,6 +4017,36 @@ fn key_class(
             ),
         );
     };
+    // Operator class parameters (`gist_trgm_ops (siglen=32)`) are stored per
+    // index column and nothing read them: the key would come back as the plain
+    // class, a different index. The model holds none until a later part
+    // declares them (#2447 R2), so the index is left out and named, whatever
+    // its class (measured on 16.15 and 18.6: the class itself reads the same).
+    match raw.key_options.get(position) {
+        Some(options) if options.is_empty() => {}
+        Some(options) => {
+            left_out(
+                pulled,
+                format!(
+                    "indexes `{column}` with operator class parameters `{}`, which this model \
+                     does not hold yet (per-key opclass parameters are the next part of #2449)",
+                    pbps_model::escape::Escaped(options)
+                ),
+            );
+            return None;
+        }
+        // Absent is not empty: a key the query did not describe may have some.
+        None => {
+            left_out(
+                pulled,
+                format!(
+                    "indexes `{column}`, and the catalog did not say whether its operator class \
+                     has parameters"
+                ),
+            );
+            return None;
+        }
+    }
     let policy = method.policy();
     let in_table = table.columns.get(column);
     // A key type the method does not hold is named before its class: the class
@@ -6111,6 +6145,7 @@ mod tests {
             key_classes: vec![String::new()],
             key_texts: vec![String::new()],
             key_collations: vec![String::new()],
+            key_options: vec![String::new()],
             attached: false,
             reloptions: Vec::new(),
         }
@@ -6372,6 +6407,7 @@ mod tests {
         // `INCLUDE` payload, which has no order.
         ix.key_classes = vec![String::new(), String::new()];
         ix.key_collations = vec![String::new(), String::new()];
+        ix.key_options = vec![String::new(), String::new()];
         ix.filter = Some("(c IS NOT NULL)".to_owned());
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
@@ -7888,6 +7924,43 @@ mod tests {
         assert!(pulled.warnings[0].contains("operator class"));
     }
 
+    /// An operator class parameter lives in the index column's `attoptions`,
+    /// and the class reads the same with or without it, so an index that has
+    /// one is left out and says so; the same index with none is held. The
+    /// negative is the point: the parameterless key must keep reading.
+    #[test]
+    fn an_index_key_with_class_parameters_is_left_out_by_name() {
+        let pulled_with = |options: &str| {
+            let mut ix = index(50, 1, "t_ix");
+            ix.key_options = vec![options.to_owned()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "text")],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        let plain = pulled_with("");
+        assert_eq!(only(&plain).indexes.len(), 1, "{:?}", plain.warnings);
+        let parameterised = pulled_with("{siglen=32}");
+        assert!(only(&parameterised).indexes.is_empty());
+        let note = &parameterised.warnings[0];
+        assert!(note.contains("operator class parameters"), "{note}");
+        assert!(note.contains("siglen=32"), "{note}");
+        // A short row is a key the query did not describe, which is not the
+        // same as one with no parameters.
+        let mut ix = index(50, 1, "t_ix");
+        ix.key_options = Vec::new();
+        let absent = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "text")],
+            indexes: vec![ix],
+            ..RawCatalog::default()
+        });
+        assert!(only(&absent).indexes.is_empty());
+        assert!(absent.warnings[0].contains("did not say whether"));
+    }
+
     /// A B-tree's expression key is read back as an expression, in its
     /// place among the keys and with its direction, never as a column; a
     /// column key beside it stays a column (DEC-1169.2).
@@ -7900,6 +7973,7 @@ mod tests {
         ix.options = vec![3, 0];
         ix.key_classes = vec![String::new(), String::new()];
         ix.key_collations = vec![String::new(), String::new()];
+        ix.key_options = vec![String::new(), String::new()];
         ix.key_texts = vec!["(a + 1)".to_owned(), String::new()];
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
