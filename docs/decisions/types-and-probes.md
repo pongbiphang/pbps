@@ -5621,6 +5621,16 @@ judges what stands when its first row is written. The routines the review
 admits are recorded in `type_routines` and pinned like every other site's; there
 is no new field in the plan, and so no format number.
 
+What a removal excuses is matched on the relation that owns the expression, not
+on the table the statement names (#2748): a statement on a parent reaches its
+inheritance children and partitions, and a plan that drops an unfit CHECK, index
+or policy on a child has dropped exactly the expression that child's site reads.
+What goes with an object the plan drops is excused with it: a CHECK or a column
+a descendant inherits (not one it also declares itself, which stays), the
+clones of a partitioned parent's index, and every expression of a table the plan
+drops and of the partitions that go with it. A name alone excuses nothing: it
+must be the owner's.
+
 Refused. The words are the predicate's own, with the site named as
 `the existing CHECK `ck` of app.t`, and the same three ways out: bring the
 routine into the project, list its owner in `trusted_roles`, or set
@@ -5646,6 +5656,25 @@ cascade writes did not run, even for the owner with `FORCE`), so a table reached
 only by an action has its policies skipped. A policy with a subquery cannot be
 read by the decoder and is refused like any unreadable tree, and so is judged
 only where it can run.
+
+Which expression of a policy each command runs was measured the same way
+(2026-11-08, 16.15 and 18.6, identically), by advancing a separate sequence
+from the `USING` and from the `WITH CHECK` of one policy and running each
+command as a role the policy applies to:
+
+| command | `USING` runs | `WITH CHECK` runs |
+|---|---|---|
+| `INSERT` | only for a policy that has no `WITH CHECK` (it is used instead) | yes |
+| `UPDATE` | yes, for the row it finds | yes, for the row it writes; without one, the `USING` again |
+| `DELETE` | yes | no |
+
+A `FOR ALL` or `SELECT` policy's `USING` also runs for the read an `UPDATE` or a
+`DELETE` does first, and so a `SELECT` policy joins both, as above. So a command
+judges only the expression it runs: `FOR ALL USING (true) WITH CHECK (f)` is
+never refused for a `DELETE`, and an `INSERT` of a policy that has its own
+`WITH CHECK` does not judge its `USING`. `INSERT ... ON CONFLICT` runs both
+expressions and `RETURNING` adds none, but the plan emits neither. A policy
+without a `WITH CHECK` still falls back to its `USING` for an `INSERT`.
 
 Measured on 16.15 and 18.6, identically (2026-11-07): `row_security_active` is
 false for a superuser, for the owner without `FORCE`, for a `BYPASSRLS` role and

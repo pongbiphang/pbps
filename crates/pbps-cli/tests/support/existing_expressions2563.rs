@@ -598,6 +598,396 @@ fn a_policy_is_judged_only_where_row_security_applies_to_the_deploying_role() {
 }
 
 // ---------------------------------------------------------------------------
+// Draft round 1 (#2748): the policy expression each command runs, and the
+// relation that owns what the plan drops.
+// ---------------------------------------------------------------------------
+
+/// What `prepare` alone says to `operation` on `table`: the plan-time
+/// judgement, which allows what `dropped` names. `Ok` or the refusal's text.
+async fn plan_time(
+    conn: &mut pbps_db::Conn,
+    table: &str,
+    operation: RowOperation,
+    dropped: &Dropped,
+    as_role: Option<&str>,
+) -> Result<(), String> {
+    let baseline = pbps_pg::catalog::introspect(conn).await.unwrap().schema;
+    let write = RowWrite {
+        table: table.parse().unwrap(),
+        operation,
+    };
+    let framing = pbps_pg::Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.unwrap();
+    if let Some(role) = as_role {
+        conn.execute(&format!("SET LOCAL ROLE {role}"))
+            .await
+            .unwrap();
+    }
+    let result = data_triggers::prepare(
+        conn,
+        &Admission::default(),
+        std::slice::from_ref(&write),
+        &baseline,
+        dropped,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("{e:?}"));
+    conn.rollback(&framing).await.unwrap();
+    result
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_command_is_judged_for_the_policy_expression_it_runs_and_not_the_other() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-pol-{version}"));
+        let role = format!("ee2748_x_{version}_{}", std::process::id());
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+        on_server(url, &format!("CREATE ROLE {role}"));
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE SCHEMA app;
+                 CREATE FUNCTION app.f_pol(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN true; END$$;
+                 CREATE TABLE app.t (id integer PRIMARY KEY);
+                 ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;
+                 GRANT USAGE ON SCHEMA app TO {role}; GRANT ALL ON app.t TO {role}"
+            ),
+        );
+        // (the policy, then whether an INSERT, an UPDATE and a DELETE run the
+        // routine it calls). Measured on 16 and 18 (DEC-2563.10): a command runs
+        // a policy's WITH CHECK (an INSERT, an UPDATE's new row) or its USING
+        // (an UPDATE's old row, a DELETE), and a policy without a WITH CHECK
+        // uses its USING for the check.
+        let shapes: [(&str, [bool; 3]); 9] = [
+            // A `FOR ALL` policy whose WITH CHECK is the routine: a DELETE
+            // never runs a WITH CHECK, so it is not judged for it.
+            (
+                "FOR ALL USING (true) WITH CHECK (app.f_pol(id))",
+                [true, true, false],
+            ),
+            // The routine in the USING only: an INSERT checks the WITH CHECK.
+            (
+                "FOR ALL USING (app.f_pol(id)) WITH CHECK (true)",
+                [false, true, true],
+            ),
+            // No WITH CHECK: the USING is used for it.
+            ("FOR ALL USING (app.f_pol(id))", [true, true, true]),
+            (
+                "FOR INSERT WITH CHECK (app.f_pol(id))",
+                [true, false, false],
+            ),
+            (
+                "FOR UPDATE USING (true) WITH CHECK (app.f_pol(id))",
+                [false, true, false],
+            ),
+            (
+                "FOR UPDATE USING (app.f_pol(id)) WITH CHECK (true)",
+                [false, true, false],
+            ),
+            ("FOR UPDATE USING (app.f_pol(id))", [false, true, false]),
+            ("FOR DELETE USING (app.f_pol(id))", [false, false, true]),
+            // A SELECT policy is read by an UPDATE and a DELETE, which find the
+            // row first.
+            ("FOR SELECT USING (app.f_pol(id))", [false, true, true]),
+        ];
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            for (policy, expected) in shapes {
+                conn.execute("DROP POLICY IF EXISTS shape ON app.t")
+                    .await
+                    .unwrap();
+                conn.execute(&format!("CREATE POLICY shape ON app.t {policy}"))
+                    .await
+                    .unwrap();
+                for ((what, operation), expect) in [
+                    ("INSERT", RowOperation::Insert),
+                    ("UPDATE", update(&["id"])),
+                    ("DELETE", RowOperation::Delete),
+                ]
+                .into_iter()
+                .zip(expected)
+                {
+                    let result = prepared(
+                        &mut conn,
+                        &Admission::default(),
+                        "app.t",
+                        operation,
+                        &Dropped::default(),
+                        Some(&role),
+                    )
+                    .await;
+                    let judged = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|t| t.contains("app.f_pol(integer)"));
+                    assert_eq!(
+                        judged, expect,
+                        "PG{version}: {what} on a policy {policy}: {result:?}"
+                    );
+                }
+            }
+        });
+        drop(own);
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+    });
+}
+
+/// What `check` says to an INSERT on `table`, which allows nothing the plan
+/// dropped.
+async fn at_the_statement(conn: &mut pbps_db::Conn, table: &str) -> Result<(), String> {
+    let write = RowWrite {
+        table: table.parse().unwrap(),
+        operation: RowOperation::Insert,
+    };
+    let framing = pbps_pg::Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.unwrap();
+    let result = data_triggers::check(
+        conn,
+        &Admission::default(),
+        &write,
+        &data_triggers::Guard::default(),
+    )
+    .await
+    .map_err(|e| format!("{e:?}"));
+    conn.rollback(&framing).await.unwrap();
+    result
+}
+
+/// What `result` names of the routines, or none for `Ok`.
+fn names(result: &Result<(), String>) -> BTreeSet<&'static str> {
+    result.as_ref().err().map(|t| named(t)).unwrap_or_default()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn what_an_inheritance_child_drops_is_excused_by_the_child_that_owns_it() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-inh-{version}"));
+        let role = format!("ee2748_i_{version}_{}", std::process::id());
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+        on_server(url, &format!("CREATE ROLE {role}"));
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE SCHEMA app;
+                 CREATE FUNCTION app.f_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN true; END$$;
+                 CREATE FUNCTION app.f_cchk(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN true; END$$;
+                 CREATE FUNCTION app.f_ckey(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN 1; END$$;
+                 CREATE FUNCTION app.f_pol(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN true; END$$;
+                 CREATE TABLE app.p (id integer PRIMARY KEY, b integer,
+                     CONSTRAINT pck CHECK (app.f_check(b)));
+                 CREATE TABLE app.c (CONSTRAINT cck CHECK (app.f_cchk(id))) INHERITS (app.p);
+                 CREATE INDEX cx ON app.c ((app.f_ckey(id)));
+                 ALTER TABLE app.c ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY cpol ON app.c USING (app.f_pol(id));
+                 GRANT USAGE ON SCHEMA app TO {role}; GRANT ALL ON app.p, app.c TO {role}"
+            ),
+        );
+        let t = |name: &str| -> pbps_model::TableName { format!("app.{name}").parse().unwrap() };
+        let all = BTreeSet::from([
+            "app.f_check(integer)",
+            "app.f_cchk(integer)",
+            "app.f_ckey(integer)",
+            "app.f_pol(integer)",
+        ]);
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            // An UPDATE through the parent reaches the child and all it carries.
+            macro_rules! ask {
+                ($dropped:expr) => {
+                    plan_time(&mut conn, "app.p", update(&["b"]), &$dropped, Some(&role)).await
+                };
+            }
+            // Nothing dropped: every routine is named.
+            assert_eq!(names(&ask!(Dropped::default())), all, "PG{version}");
+            // The child's own CHECK, dropped by name on the child.
+            let mut d = Dropped::default();
+            d.checks.insert((t("c"), "cck".to_owned()));
+            let mut left = all.clone();
+            left.remove("app.f_cchk(integer)");
+            assert_eq!(names(&ask!(d)), left, "PG{version}: child CHECK");
+            // The child's index, and its policy.
+            let mut d = Dropped::default();
+            d.indexes.insert((t("c"), "cx".to_owned()));
+            let mut left = all.clone();
+            left.remove("app.f_ckey(integer)");
+            assert_eq!(names(&ask!(d)), left, "PG{version}: child index");
+            let mut d = Dropped::default();
+            d.policies.insert((t("c"), "cpol".to_owned()));
+            let mut left = all.clone();
+            left.remove("app.f_pol(integer)");
+            assert_eq!(names(&ask!(d)), left, "PG{version}: child policy");
+            // Dropping the parent's CHECK takes the child's inherited copy with
+            // it: the routine is named by neither.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p"), "pck".to_owned()));
+            let mut left = all.clone();
+            left.remove("app.f_check(integer)");
+            assert_eq!(names(&ask!(d)), left, "PG{version}: inherited CHECK");
+            // Everything dropped: nothing is refused at plan time.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p"), "pck".to_owned()));
+            d.checks.insert((t("c"), "cck".to_owned()));
+            d.indexes.insert((t("c"), "cx".to_owned()));
+            d.policies.insert((t("c"), "cpol".to_owned()));
+            assert_eq!(ask!(d), Ok(()), "PG{version}: all dropped");
+            // The name alone excuses nothing: it must be the owner's.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p"), "cck".to_owned()));
+            d.indexes.insert((t("p"), "cx".to_owned()));
+            d.policies.insert((t("p"), "cpol".to_owned()));
+            assert_eq!(names(&ask!(d)), all, "PG{version}: the wrong owner");
+            // A child that also declares the CHECK itself keeps it when the
+            // parent's goes, so it stays judged.
+            conn.execute(
+                "CREATE TABLE app.c2 (CONSTRAINT pck CHECK (app.f_check(b))) INHERITS (app.p)",
+            )
+            .await
+            .unwrap();
+            let mut d = Dropped::default();
+            d.checks.insert((t("p"), "pck".to_owned()));
+            d.checks.insert((t("c"), "cck".to_owned()));
+            d.indexes.insert((t("c"), "cx".to_owned()));
+            d.policies.insert((t("c"), "cpol".to_owned()));
+            assert_eq!(
+                names(&ask!(d)),
+                BTreeSet::from(["app.f_check(integer)"]),
+                "PG{version}: a child's own copy of the CHECK"
+            );
+            // A table the plan drops carries nothing to judge.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p"), "pck".to_owned()));
+            d.tables.insert(t("c2"));
+            d.tables.insert(t("c"));
+            assert_eq!(ask!(d), Ok(()), "PG{version}: dropped children");
+        });
+        drop(own);
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn what_a_partition_or_its_parent_drops_is_excused_across_the_tree() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-part-{version}"));
+        on_server(
+            own.connection(),
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_default() RETURNS integer LANGUAGE plpgsql
+                 AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_key(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_cchk(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE TABLE app.pp (id integer, b integer DEFAULT app.f_default(),
+                 CONSTRAINT ppck CHECK (app.f_check(b))) PARTITION BY RANGE (id);
+             CREATE INDEX ppx ON app.pp ((app.f_key(id)));
+             CREATE TABLE app.p1 PARTITION OF app.pp FOR VALUES FROM (0) TO (10);
+             CREATE TABLE app.p2 PARTITION OF app.pp FOR VALUES FROM (10) TO (20)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.p2a PARTITION OF app.p2 FOR VALUES FROM (10) TO (20);
+             ALTER TABLE app.p2a ADD CONSTRAINT leaf_ck CHECK (app.f_cchk(id))",
+        );
+        let t = |name: &str| -> pbps_model::TableName { format!("app.{name}").parse().unwrap() };
+        let all = BTreeSet::from([
+            "app.f_check(integer)",
+            "app.f_default()",
+            "app.f_key(integer)",
+            "app.f_cchk(integer)",
+        ]);
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            macro_rules! ask {
+                ($dropped:expr) => {
+                    plan_time(&mut conn, "app.pp", RowOperation::Insert, &$dropped, None).await
+                };
+            }
+            let without = |gone: &[&'static str]| -> BTreeSet<&'static str> {
+                all.iter().copied().filter(|r| !gone.contains(r)).collect()
+            };
+            assert_eq!(names(&ask!(Dropped::default())), all, "PG{version}");
+            // The parent's CHECK, default and index take their copies on every
+            // partition with them.
+            let mut d = Dropped::default();
+            d.checks.insert((t("pp"), "ppck".to_owned()));
+            assert_eq!(
+                names(&ask!(d)),
+                without(&["app.f_check(integer)"]),
+                "PG{version}: the parent's CHECK"
+            );
+            let mut d = Dropped::default();
+            d.values.insert((t("pp"), "b".to_owned()));
+            assert_eq!(
+                names(&ask!(d)),
+                without(&["app.f_default()"]),
+                "PG{version}: the parent's default"
+            );
+            let mut d = Dropped::default();
+            d.indexes.insert((t("pp"), "ppx".to_owned()));
+            assert_eq!(
+                names(&ask!(d)),
+                without(&["app.f_key(integer)"]),
+                "PG{version}: the parent's index"
+            );
+            // A leaf's own CHECK, dropped on the leaf, with the write on the root.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p2a"), "leaf_ck".to_owned()));
+            assert_eq!(
+                names(&ask!(d)),
+                without(&["app.f_cchk(integer)"]),
+                "PG{version}: the leaf's CHECK"
+            );
+            // A partition dropped with its own partitions takes theirs along.
+            let mut d = Dropped::default();
+            d.tables.insert(t("p2"));
+            assert_eq!(
+                names(&ask!(d)),
+                without(&["app.f_cchk(integer)"]),
+                "PG{version}: a dropped sub-partitioned partition"
+            );
+            // All of it: nothing is left to refuse at plan time.
+            let mut d = Dropped::default();
+            d.checks.insert((t("pp"), "ppck".to_owned()));
+            d.values.insert((t("pp"), "b".to_owned()));
+            d.indexes.insert((t("pp"), "ppx".to_owned()));
+            d.checks.insert((t("p2a"), "leaf_ck".to_owned()));
+            assert_eq!(ask!(d), Ok(()), "PG{version}: all dropped");
+            // The right name on the wrong table excuses only that table's copy:
+            // the parent's own is still judged.
+            let mut d = Dropped::default();
+            d.checks.insert((t("p1"), "ppck".to_owned()));
+            d.values.insert((t("p1"), "b".to_owned()));
+            d.indexes.insert((t("p1"), "ppx".to_owned()));
+            d.checks.insert((t("pp"), "leaf_ck".to_owned()));
+            assert_eq!(names(&ask!(d)), all, "PG{version}: the wrong owner");
+            // At the statement nothing is excused: the whole tree is judged.
+            let at_the_statement = at_the_statement(&mut conn, "app.pp").await;
+            assert_eq!(
+                names(&at_the_statement),
+                all,
+                "PG{version}: at the statement"
+            );
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Whole plans: a table that already carries an expression, then a plan that
 // writes rows to it, or rewrites it.
 // ---------------------------------------------------------------------------

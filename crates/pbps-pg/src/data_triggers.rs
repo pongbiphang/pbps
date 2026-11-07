@@ -991,16 +991,75 @@ fn gone(dropped: &Dropped) -> String {
     }
 }
 
-/// `name` is one of `pairs` for the table this statement names, or `false`.
-fn gone_named(pairs: &BTreeSet<(TableName, String)>, name: &str) -> String {
+/// The descendants of a table, by the catalog's own inheritance and partition
+/// links: every table that inherits from it or is a partition of it, at any
+/// depth.
+fn descendants_of(table: &TableName) -> String {
+    format!(
+        "(WITH RECURSIVE kids(oid) AS (
+              SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+              WHERE i.inhparent = (SELECT pc.oid FROM pg_catalog.pg_class pc
+                                   JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+                                   WHERE pn.nspname = {} AND pc.relname = {})
+              UNION
+              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN kids k ON k.oid = i.inhparent
+          ) SELECT oid FROM kids)",
+        literal(&table.schema),
+        literal(&table.name)
+    )
+}
+
+/// `name` is one of `pairs` on the relation that owns the expression (`n` and
+/// `c`, the namespace and class a site query joins), or `false`.
+///
+/// The owner, not the table the statement names: a statement on a parent
+/// reaches its inheritance children and partitions, and a plan that drops an
+/// unfit CHECK on a child has dropped exactly the expression that child's site
+/// reads (#2748). `inherited` is the extra condition under which the same
+/// object on a descendant goes with the one the plan names: a CHECK that is not
+/// the child's own, a default or a column the child takes from the parent.
+fn gone_owned(
+    pairs: &BTreeSet<(TableName, String)>,
+    name: &str,
+    inherited: Option<&str>,
+) -> String {
+    let clauses: Vec<String> = pairs
+        .iter()
+        .map(|(table, wanted)| {
+            let own = format!(
+                "(n.nspname = {} AND c.relname = {})",
+                literal(&table.schema),
+                literal(&table.name)
+            );
+            let owner = match inherited {
+                Some(condition) => format!(
+                    "({own} OR ({condition} AND c.oid IN {}))",
+                    descendants_of(table)
+                ),
+                None => own,
+            };
+            format!("({name} = {} AND {owner})", literal(wanted))
+        })
+        .collect();
+    if clauses.is_empty() {
+        "false".to_owned()
+    } else {
+        clauses.join(" OR ")
+    }
+}
+
+/// A partitioned parent's index the plan drops, as a filter on the parent
+/// index `pi`, its table `pt` and that table's namespace `pn`: its clones on the
+/// partitions go with it, under names of their own.
+fn gone_parent_index(pairs: &BTreeSet<(TableName, String)>) -> String {
     let clauses: Vec<String> = pairs
         .iter()
         .map(|(table, wanted)| {
             format!(
-                "(root.schema_name = {} AND root.table_name = {} AND {name} = {})",
+                "(pi.relname::pg_catalog.text = {} AND pn.nspname = {} AND pt.relname = {})",
+                literal(wanted),
                 literal(&table.schema),
-                literal(&table.name),
-                literal(wanted)
+                literal(&table.name)
             )
         })
         .collect();
@@ -1009,6 +1068,26 @@ fn gone_named(pairs: &BTreeSet<(TableName, String)>, name: &str) -> String {
     } else {
         clauses.join(" OR ")
     }
+}
+
+/// The relations this plan drops before the row statement, and the partitions
+/// that go with each; `false` when there are none.
+fn gone_tables(dropped: &Dropped) -> String {
+    let clauses: Vec<String> = dropped
+        .tables
+        .iter()
+        .map(|table| {
+            format!(
+                "(gn.nspname = {} AND gc.relname = {})",
+                literal(&table.schema),
+                literal(&table.name)
+            )
+        })
+        .collect();
+    if clauses.is_empty() {
+        return "false".to_owned();
+    }
+    clauses.join(" OR ")
 }
 
 /// The expressions one statement runs, as stored (DEC-2563.9).
@@ -1050,6 +1129,9 @@ fn site_arms(
     // it sets (and of the ones those feed); an INSERT, every one.
     let touched = if update { touched_join() } else { "" };
     let on = "n.nspname::pg_catalog.text || '.' || c.relname::pg_catalog.text";
+    // A relation the plan drops, and the partitions that go with it, runs
+    // nothing: it is gone before the row statement.
+    let alive = "r.oid NOT IN (SELECT oid FROM gone_tables)";
     let from = "FROM relations r \
                 JOIN pg_catalog.pg_class c ON c.oid = r.oid \
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -1062,8 +1144,12 @@ fn site_arms(
              {from}
              JOIN pg_catalog.pg_constraint con
                ON con.conrelid = r.oid AND con.contype = 'c' AND con.conbin IS NOT NULL
-             WHERE NOT ({gone})",
-            gone = gone_named(&dropped.checks, "con.conname::pg_catalog.text")
+             WHERE NOT ({gone}) AND {alive}",
+            gone = gone_owned(
+                &dropped.checks,
+                "con.conname::pg_catalog.text",
+                Some("NOT con.conislocal")
+            )
         ));
     }
     for (kind, generated, wanted) in [
@@ -1083,27 +1169,41 @@ fn site_arms(
                   AND a.attgenerated {generated}
                  JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
                  {join}
-                 WHERE NOT ({gone})",
-                gone = gone_named(&dropped.values, "a.attname::pg_catalog.text")
+                 WHERE NOT ({gone}) AND {alive}",
+                gone = gone_owned(
+                    &dropped.values,
+                    "a.attname::pg_catalog.text",
+                    Some("a.attinhcount > 0")
+                )
             ));
         }
     }
     if insert || update || rewrite {
         for (kind, column) in [("index_key", "indexprs"), ("index_filter", "indpred")] {
             // A clone of a partitioned parent's index goes with the parent's,
-            // under a name of its own.
-            let gone = gone_named(&dropped.indexes, "ic.relname::pg_catalog.text");
-            let gone_parent = gone_named(&dropped.indexes, "pi.relname::pg_catalog.text");
+            // under a name of its own, at any depth of the partition tree.
+            let gone = gone_owned(&dropped.indexes, "ic.relname::pg_catalog.text", None);
+            let gone_parent = gone_parent_index(&dropped.indexes);
             arms.push(format!(
                 "SELECT '{kind}' AS kind, r.oid::int8 AS oid, {on} AS place,
                         ic.relname::pg_catalog.text AS name, i.{column}::pg_catalog.text AS tree
                  {from}
                  JOIN pg_catalog.pg_index i ON i.indrelid = r.oid AND i.{column} IS NOT NULL
                  JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
-                 WHERE NOT ({gone}) AND NOT EXISTS (
-                     SELECT 1 FROM pg_catalog.pg_inherits ih
-                     JOIN pg_catalog.pg_class pi ON pi.oid = ih.inhparent
-                     WHERE ih.inhrelid = ic.oid AND ({gone_parent}))"
+                 WHERE NOT ({gone}) AND {alive} AND NOT EXISTS (
+                     WITH RECURSIVE up(oid) AS (
+                         SELECT ih.inhparent FROM pg_catalog.pg_inherits ih
+                         WHERE ih.inhrelid = ic.oid
+                         UNION
+                         SELECT ih.inhparent FROM pg_catalog.pg_inherits ih
+                         JOIN up ON up.oid = ih.inhrelid
+                     )
+                     SELECT 1 FROM up
+                     JOIN pg_catalog.pg_class pi ON pi.oid = up.oid
+                     JOIN pg_catalog.pg_index pii ON pii.indexrelid = pi.oid
+                     JOIN pg_catalog.pg_class pt ON pt.oid = pii.indrelid
+                     JOIN pg_catalog.pg_namespace pn ON pn.oid = pt.relnamespace
+                     WHERE ({gone_parent}))"
             ));
         }
     }
@@ -1111,28 +1211,39 @@ fn site_arms(
         // The policies that apply to the deploying role for this command, and
         // only where row security applies to that role at all: the server's own
         // answer, which owners, superusers and `BYPASSRLS` roles do not meet
-        // (DEC-2563.10).
-        let commands = if insert {
-            "'*', 'a'"
+        // (DEC-2563.10). Per command, only the expression the engine runs: an
+        // INSERT its WITH CHECK (a policy without one uses its USING), an
+        // UPDATE the USING of the row it finds and the WITH CHECK of the row it
+        // writes, a DELETE the USING of the row it removes; a SELECT policy's
+        // USING joins an UPDATE and a DELETE, which read the row first.
+        let expressions: &[(&str, &str, &str)] = if insert {
+            &[(
+                "WITH CHECK",
+                "COALESCE(p.polwithcheck, p.polqual)",
+                "'*', 'a'",
+            )]
         } else if update {
-            "'*', 'w', 'r'"
+            &[
+                ("USING", "p.polqual", "'*', 'w', 'r'"),
+                ("WITH CHECK", "p.polwithcheck", "'*', 'w'"),
+            ]
         } else {
-            "'*', 'd', 'r'"
+            &[("USING", "p.polqual", "'*', 'd', 'r'")]
         };
-        for (suffix, column) in [("USING", "polqual"), ("WITH CHECK", "polwithcheck")] {
+        for (suffix, column, commands) in expressions {
             arms.push(format!(
                 "SELECT 'policy' AS kind, r.oid::int8 AS oid, {on} AS place,
                         p.polname::pg_catalog.text || ' {suffix}' AS name,
-                        p.{column}::pg_catalog.text AS tree
+                        {column}::pg_catalog.text AS tree
                  {from}
-                 JOIN pg_catalog.pg_policy p ON p.polrelid = r.oid AND p.{column} IS NOT NULL
+                 JOIN pg_catalog.pg_policy p ON p.polrelid = r.oid AND {column} IS NOT NULL
                  WHERE pg_catalog.row_security_active(r.oid)
                    AND p.polcmd IN ({commands})
                    AND (0 = ANY(p.polroles) OR EXISTS (
                         SELECT 1 FROM pg_catalog.unnest(p.polroles) AS x(rid)
                         WHERE pg_catalog.pg_has_role(CURRENT_USER, x.rid, 'MEMBER')))
-                   AND NOT ({gone})",
-                gone = gone_named(&dropped.policies, "p.polname::pg_catalog.text")
+                   AND NOT ({gone}) AND {alive}",
+                gone = gone_owned(&dropped.policies, "p.polname::pg_catalog.text", None)
             ));
         }
     }
@@ -1190,7 +1301,7 @@ fn site_arms(
                  JOIN pg_catalog.pg_attribute a
                    ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
                  JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype = 'd'
-                 WHERE true {only_set}
+                 WHERE r.oid NOT IN (SELECT oid FROM gone_tables) {only_set}
                  UNION ALL
                  SELECT d.attrelid, d.attnum, d.declared, t.typbasetype
                  FROM domains d
@@ -1227,8 +1338,19 @@ async fn run_sites(
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.oid = {relation}::pg_catalog.oid
+         ),
+         gone_tables(oid) AS (
+             SELECT gc.oid FROM pg_catalog.pg_class gc
+             JOIN pg_catalog.pg_namespace gn ON gn.oid = gc.relnamespace
+             WHERE {gone_tables}
+             UNION
+             SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+             JOIN gone_tables g ON g.oid = i.inhparent
+             JOIN pg_catalog.pg_class p ON p.oid = i.inhparent
+             WHERE p.relkind = 'p'
          ){extra}
          {arms}",
+        gone_tables = gone_tables(dropped),
         ctes = reached(statement, dropped),
         relation = statement.relation,
         arms = arms.join("\n UNION ALL\n "),
@@ -1415,7 +1537,9 @@ mod tests {
                 .iter()
                 .filter(|arm| arm.contains("'policy' AS kind"))
                 .collect();
-            assert_eq!(policies.len(), 2, "USING and WITH CHECK for {event}");
+            // An INSERT runs a WITH CHECK, a DELETE a USING, an UPDATE both.
+            let expected = if event == UPDATE { 2 } else { 1 };
+            assert_eq!(policies.len(), expected, "the expressions {event} runs");
             for arm in policies {
                 assert!(
                     arm.contains("pg_catalog.row_security_active(r.oid)"),
@@ -1445,6 +1569,86 @@ mod tests {
                 .find(|arm| arm.contains("'generated' AS kind"))
                 .unwrap()
                 .contains("touched")
+        );
+    }
+
+    /// The expression columns the policy arms of `event` read.
+    fn policy_columns(event: i16) -> Vec<String> {
+        let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+        arms.iter()
+            .filter(|arm| arm.contains("'policy' AS kind"))
+            .map(|arm| {
+                [
+                    "COALESCE(p.polwithcheck, p.polqual)",
+                    "p.polwithcheck",
+                    "p.polqual",
+                ]
+                .into_iter()
+                .find(|c| arm.contains(&format!("{c}::pg_catalog.text AS tree")))
+                .unwrap_or("?")
+                .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_command_judges_only_the_policy_expressions_it_runs() {
+        // INSERT: the WITH CHECK, which a policy without one takes from its USING.
+        assert_eq!(
+            policy_columns(INSERT),
+            ["COALESCE(p.polwithcheck, p.polqual)"]
+        );
+        // UPDATE: the USING of the row found, the WITH CHECK of the row written.
+        assert_eq!(policy_columns(UPDATE), ["p.polqual", "p.polwithcheck"]);
+        // DELETE: the USING alone; a WITH CHECK is never run by a DELETE.
+        assert_eq!(policy_columns(DELETE), ["p.polqual"]);
+        // And the commands a policy is for: a SELECT policy joins what reads a row.
+        let (_, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        let insert = arms
+            .iter()
+            .find(|a| a.contains("'policy' AS kind"))
+            .unwrap();
+        assert!(insert.contains("p.polcmd IN ('*', 'a')"), "{insert}");
+        let (_, arms) = site_arms(&statement(DELETE, false), false, &Dropped::default());
+        let delete = arms
+            .iter()
+            .find(|a| a.contains("'policy' AS kind"))
+            .unwrap();
+        assert!(delete.contains("p.polcmd IN ('*', 'd', 'r')"), "{delete}");
+    }
+
+    #[test]
+    fn what_the_plan_drops_is_matched_on_the_relation_that_owns_the_expression() {
+        let parent = TableName::new("app", "parent");
+        let mut dropped = Dropped::default();
+        dropped.checks.insert((parent.clone(), "ck".to_owned()));
+        dropped.values.insert((parent.clone(), "d".to_owned()));
+        dropped.indexes.insert((parent.clone(), "ix".to_owned()));
+        dropped.policies.insert((parent.clone(), "p".to_owned()));
+        dropped.tables.insert(TableName::new("app", "gone"));
+        let (_, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        let all = arms.join("\n");
+        // The owner is the joined relation, never the table the statement names.
+        assert!(!all.contains("root.table_name"), "{all}");
+        assert!(
+            all.contains("(n.nspname = E'app' AND c.relname = E'parent')"),
+            "{all}"
+        );
+        // An inherited CHECK and an inherited column of a descendant go with it.
+        assert!(all.contains("NOT con.conislocal AND c.oid IN"), "{all}");
+        assert!(all.contains("a.attinhcount > 0 AND c.oid IN"), "{all}");
+        // A policy and an index are not inherited, but a partitioned parent's
+        // index has clones under names of their own.
+        assert!(!all.contains("p.polname::pg_catalog.text = E'p' AND ((n.nspname = E'app' AND c.relname = E'parent') OR"), "{all}");
+        assert!(all.contains("pi.relname::pg_catalog.text = E'ix' AND pn.nspname = E'app' AND pt.relname = E'parent'"), "{all}");
+        // Every query leaves out a table the plan drops, and its partitions.
+        let (extra, _) = site_arms(&statement(INSERT, false), false, &dropped);
+        assert!(extra.contains("gone_tables"), "{extra}");
+        assert!(
+            arms.iter()
+                .filter(|a| a.contains("FROM relations r"))
+                .all(|a| a.contains("gone_tables")),
+            "{all}"
         );
     }
 
