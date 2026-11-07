@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 mod collector;
 use collector::*;
 
+#[path = "trace/recheck.rs"]
+mod recheck;
+use recheck::RecheckTarget;
+
 const BASE: &str = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: base_pk, columns: [id]}\n";
 const UNAVAILABLE_SCRATCH: &str =
     "Server=127.0.0.1,1;User Id=sa;Password=not-used;Database=master;TrustServerCertificate=true";
@@ -462,19 +466,27 @@ impl Fixture {
     }
 
     fn publication_refusal(&mut self, docker: bool) {
-        let external = externals();
-        let before = std::fs::read(self.d.dir.join("second.json")).unwrap();
-        std::fs::write(
-            self.d.dir.join("externals.sql"),
-            format!("{external}\n/*trace2488_publication_wait*/ WAITFOR DELAY '00:00:15';\n"),
-        )
-        .unwrap();
-        let prior = if docker {
-            docker_subjects()
-        } else {
-            Vec::new()
-        };
-        let mut child = self
+        use std::sync::atomic::Ordering;
+        // Reuse the existing PG wire fixture (DEC-1685.1), not a delay in the
+        // externals file: that file runs before the opening target capture.
+        // The normal plan measures how many sessions this backend/kind opens;
+        // only its final, fresh publication recheck reaches the other engine.
+        let alternate = docker.then(|| {
+            OwnDatabase::new(
+                &std::env::var("PBPS_TEST_MSSQL_SCRATCH_DB").unwrap(),
+                "trace2488d",
+            )
+        });
+        let other = alternate.as_ref().or(self.scratch.as_ref()).unwrap();
+        assert_eq!(self.target.name(), other.name());
+        let primary_endpoint = local_fixture_endpoint(self.target.connection());
+        let alternate_endpoint = local_fixture_endpoint(other.connection());
+        let probe = RecheckTarget::new(
+            primary_endpoint.clone(),
+            alternate_endpoint.clone(),
+            usize::MAX,
+        );
+        let result = self
             .command(
                 &self.d.dir,
                 &[
@@ -487,58 +499,53 @@ impl Fixture {
                     "json",
                 ],
             )
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .env(
+                "PBPS_TRACE_TARGET",
+                recheck_connection(self.target.connection(), &probe),
+            )
+            .output()
             .unwrap();
-        let started = Instant::now();
-        let observed = loop {
-            if child.try_wait().unwrap().is_some() {
-                break false;
-            }
-            let scratch = if docker {
-                docker_connection(child.id(), &prior)
-            } else {
-                Some(self.scratch.as_ref().unwrap().connection().to_owned())
-            };
-            if let Some(scratch) = scratch {
-                let waiting = try_text(
-                    &scratch,
-                    "SELECT CONVERT(nvarchar(10),COUNT(*)) FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE r.session_id<>@@SPID AND r.command=N'WAITFOR' AND t.text LIKE N'%trace2488_publication_wait%';",
-                );
-                if waiting.is_ok_and(|n| n != "0") {
-                    break true;
-                }
-            }
-            if started.elapsed() >= Duration::from_secs(120) {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        if observed {
-            on_server(
-                self.target.connection(),
-                &function().replace("RETURN LEN(", "RETURN 1 + LEN("),
-            );
-            self.remember_definitions();
-        } else if child.try_wait().unwrap().is_none() {
-            child.kill().unwrap();
-        }
-        let result = child.wait_with_output().unwrap();
-        // Restore the engine state before inspecting a refusal or private bytes.
-        on_server(self.target.connection(), &function());
-        std::fs::write(self.d.dir.join("externals.sql"), externals()).unwrap();
         self.trace.output(&result);
         self.trace.files(&self.d.dir);
-        assert!(
-            observed,
-            "publication barrier was never observed: {}",
-            stderr(&result)
-        );
-        assert_ne!(code(&result), 0);
+        assert_eq!(code(&result), 0, "{} {}", stderr(&result), stdout(&result));
+        let plan: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.d.dir.join("second.json")).unwrap())
+                .unwrap();
+        assert_eq!(plan["origin"], "resolved_database");
+        let sessions = probe.count.load(Ordering::Acquire);
+        assert!(sessions >= 2, "no fresh publication session");
+        drop(probe);
+        let before = std::fs::read(self.d.dir.join("second.json")).unwrap();
+        let proxy = RecheckTarget::new(primary_endpoint, alternate_endpoint, sessions - 1);
+        let result = self
+            .command(
+                &self.d.dir,
+                &[
+                    "plan",
+                    "--env",
+                    "prod",
+                    "--out",
+                    "second.json",
+                    "--format",
+                    "json",
+                ],
+            )
+            .env(
+                "PBPS_TRACE_TARGET",
+                recheck_connection(self.target.connection(), &proxy),
+            )
+            .output()
+            .unwrap();
+        self.trace.output(&result);
+        self.trace.files(&self.d.dir);
+        assert_eq!(proxy.count.load(Ordering::Acquire), sessions);
+        drop(proxy);
+        drop(alternate);
+        assert_ne!(code(&result), 0, "{} {}", stderr(&result), stdout(&result));
         assert!(
             stdout(&result).contains("resolver.recheck"),
-            "{}",
+            "{} {}",
+            stderr(&result),
             stdout(&result)
         );
         assert_eq!(
@@ -1016,71 +1023,23 @@ fn try_text(connection: &str, sql: &str) -> Result<String, pbps_db::DbError> {
         })
 }
 
-/// Only the live planner child's process label authorizes inspecting its
-/// disposable engine. Never guess another run's endpoint or credentials.
-fn docker_subjects() -> Vec<String> {
-    let listed = Command::new("docker")
-        .args([
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--filter",
-            "label=pbps.resolver.process",
-            "--format",
-            r#"{{.ID}} {{.Label "pbps.resolver.process"}}"#,
-        ])
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    String::from_utf8(listed.stdout)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect()
+/// Read only the canonical owned fixture's actual port; never guess another
+/// run's endpoint or parse arbitrary user connection strings here.
+fn recheck_connection(original: &str, proxy: &RecheckTarget) -> String {
+    // The canonical fixture puts Server first; retain all other bytes,
+    // including quoted credentials, without introducing duplicate ADO keys.
+    let _ = local_fixture_endpoint(original);
+    let (_, rest) = original.split_once(';').unwrap();
+    format!("Server=127.0.0.1,{};{rest}", proxy.address.port())
 }
 
-fn docker_connection(pid: u32, prior: &[String]) -> Option<String> {
-    let mut found = None;
-    for subject in docker_subjects() {
-        if prior.contains(&subject) {
-            continue;
-        }
-        let (id, label) = subject.split_once(' ').unwrap();
-        if label
-            .split_once('-')
-            .and_then(|(owner, _)| owner.parse::<u32>().ok())
-            != Some(pid)
-        {
-            continue;
-        }
-        let inspected = Command::new("docker")
-            .args(["inspect", id])
-            .output()
-            .unwrap();
-        assert!(
-            inspected.status.success(),
-            "owned runtime inspection failed"
-        );
-        let values: Vec<serde_json::Value> = serde_json::from_slice(&inspected.stdout).unwrap();
-        let value = &values[0];
-        assert_eq!(value["Id"], id);
-        assert_eq!(value["Config"]["Labels"]["pbps.resolver.process"], label);
-        let Some(port) = value["NetworkSettings"]["Ports"]["1433/tcp"][0]["HostPort"].as_str()
-        else {
-            continue;
-        };
-        let environment = value["Config"]["Env"].as_array().unwrap();
-        let password = environment
-            .iter()
-            .filter_map(|v| v.as_str())
-            .find_map(|v| v.strip_prefix("MSSQL_SA_PASSWORD="))
-            .unwrap();
-        assert!(found.is_none(), "planner acquired two scratch engines");
-        found = Some(format!(
-            "Server=127.0.0.1,{port};User Id=sa;Password={password};Database=master;TrustServerCertificate=true"
-        ));
-    }
-    found
+fn local_fixture_endpoint(connection: &str) -> (String, u16) {
+    let tail = connection
+        .strip_prefix("Server=localhost,")
+        .or_else(|| connection.strip_prefix("Server=127.0.0.1,"))
+        .expect("trace needs the canonical local SQL Server fixtures");
+    let (port, _) = tail.split_once(';').unwrap();
+    ("127.0.0.1".into(), port.parse().unwrap())
 }
 
 fn check(docker: bool) {

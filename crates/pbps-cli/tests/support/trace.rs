@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 mod collector;
 use collector::*;
 
+#[path = "trace/recheck.rs"]
+mod recheck;
+use recheck::RecheckTarget;
+
 #[test]
 fn every_sink_rejects_planted_plaintext_and_all_dictionary_verifiers() {
     let d = Demo::new("trace2488-planted");
@@ -592,7 +596,8 @@ impl Fixture {
         // lineage is checked before any catalog or ledger is trusted there.
         let other = OwnDatabase::new(&alternate, &self.slug);
         let primary_sessions = if docker { 3 } else { 2 };
-        let proxy = RecheckTarget::new(self.own.connection(), other.connection(), primary_sessions);
+        let proxy =
+            RecheckTarget::from_pg(self.own.connection(), other.connection(), primary_sessions);
         let before = self.env.clone();
         self.env
             .iter_mut()
@@ -842,22 +847,8 @@ fn ui_child_timeout_reports_the_last_state_without_captured_text() {
     assert!(!message.contains(SOURCES[0]) && !message.contains(DICTIONARY[0]));
 }
 
-/// Route only the publication session to another real cluster (DEC-1685.1).
-/// The planner and resolver each open a target session first; Docker acquisition
-/// also binds its target before the resolver runs. The following session is
-/// the fresh publication recheck. Bytes are forwarded unchanged in both
-/// directions: a manufactured protocol reply would not test this boundary.
-struct RecheckTarget {
-    address: std::net::SocketAddr,
-    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
 impl RecheckTarget {
-    fn new(primary: &str, alternate: &str, primary_sessions: usize) -> Self {
-        use std::net::{Shutdown, TcpListener, TcpStream};
-        use std::sync::atomic::Ordering;
+    fn from_pg(primary: &str, alternate: &str, primary_sessions: usize) -> Self {
         let endpoint = |connection: &str| {
             let field = |prefix: &str| {
                 connection
@@ -870,48 +861,7 @@ impl RecheckTarget {
         };
         let primary = endpoint(primary);
         let alternate = endpoint(alternate);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen = count.clone();
-        let stopped = stop.clone();
-        let thread = std::thread::spawn(move || {
-            let mut copies = Vec::new();
-            for client in listener.incoming() {
-                let mut client = client.unwrap();
-                if stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let index = seen.fetch_add(1, Ordering::AcqRel);
-                let destination = if index < primary_sessions {
-                    &primary
-                } else {
-                    &alternate
-                };
-                let mut server =
-                    TcpStream::connect((destination.0.as_str(), destination.1)).unwrap();
-                let mut client_read = client.try_clone().unwrap();
-                let mut server_write = server.try_clone().unwrap();
-                copies.push(std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut client_read, &mut server_write);
-                    let _ = server_write.shutdown(Shutdown::Write);
-                }));
-                copies.push(std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut server, &mut client);
-                    let _ = client.shutdown(Shutdown::Write);
-                }));
-            }
-            for copy in copies {
-                copy.join().unwrap();
-            }
-        });
-        Self {
-            address,
-            count,
-            stop,
-            thread: Some(thread),
-        }
+        Self::new(primary, alternate, primary_sessions)
     }
 
     fn connection(&self, original: &str) -> String {
@@ -921,17 +871,6 @@ impl RecheckTarget {
             .collect::<Vec<_>>()
             .join(" ");
         format!("host=127.0.0.1 port={} {retained}", self.address.port())
-    }
-}
-
-impl Drop for RecheckTarget {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        let _ = std::net::TcpStream::connect(self.address);
-        let result = self.thread.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
     }
 }
 

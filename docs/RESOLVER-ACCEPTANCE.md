@@ -198,7 +198,10 @@ The planted-leak controls exercise each collection adapter; unreadable artifacts
 and unobserved sinks fail. Offline explanation gets only a saved artifact, with
 no project, key, target, scratch or Docker endpoint. Live cells separately cover
 success and relevant refusal, compilation, publication-recheck, cleanup and
-rendering failures. Ordinary output and keyed evidence remain readable: no new
+rendering failures. Publication recheck uses the existing transparent PG TCP
+fixture on both engines; MSSQL first measures the normal session count and
+routes only the final fresh recheck to another real instance.
+Ordinary output and keyed evidence remain readable: no new
 history field, confidential ledger or mutation framework is introduced.
 
 A delivering PR records the named failures after independently removing keyed
