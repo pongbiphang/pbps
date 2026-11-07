@@ -3,7 +3,7 @@ use super::{
     Assembled, Inputs, Outcome, ReplayChain,
     execution::{Control, elapsed, ms},
     report::{Assertion, Phase, Status, TestData},
-    session::Session,
+    session::{HopContext, Session},
 };
 use crate::{deploy::test_run, test_scratch};
 use pbps_config::test_manifest::{CommitId, Timeouts};
@@ -127,7 +127,17 @@ pub(super) async fn run_replay(
             phase += 1;
         } else {
             let start = Instant::now();
-            let passed = hop(session, input, data, phase, control, false).await;
+            // The catalog stands at the previous group's revision (#2552).
+            let previous = &r.revisions[&r.chain.groups[index - 1].commit];
+            let passed = hop(
+                session,
+                HopContext::after(previous, input),
+                data,
+                phase,
+                control,
+                false,
+            )
+            .await;
             data.replay_hops += 1;
             data.replay_ms += elapsed(start);
             if !passed {
@@ -191,7 +201,17 @@ async fn work(inputs: &Inputs, session: &Session<'_>, data: &mut TestData, contr
     else {
         return;
     };
-    if !hop(session, &inputs.candidate, data, phase, control, true).await {
+    // The replay left the catalog at its last group, the base. A chain always
+    // holds the base, so the absent branch is a chain no run reaches.
+    let last = replay
+        .chain
+        .groups
+        .last()
+        .map(|group| &replay.revisions[&group.commit]);
+    let candidate = last.map_or(HopContext::first(&inputs.candidate), |previous| {
+        HopContext::after(previous, &inputs.candidate)
+    });
+    if !hop(session, candidate, data, phase, control, true).await {
         return;
     }
     phase += 2;
@@ -305,13 +325,17 @@ fn judge(driver: pbps_db::Driver, result: pbps_db::query::AssertionResult) -> Ju
 }
 async fn hop(
     session: &Session<'_>,
-    input: &super::Assembled,
+    context: HopContext<'_>,
     data: &mut TestData,
     phase: usize,
     control: &mut Control,
     candidate: bool,
 ) -> bool {
-    let Ok(planned) = control.plan(session, input, &mut data.phases[phase]).await else {
+    let input = context.incoming;
+    let Ok(planned) = control
+        .plan(session, context, &mut data.phases[phase])
+        .await
+    else {
         return false;
     };
     let checksum = planned.artifact.checksum();

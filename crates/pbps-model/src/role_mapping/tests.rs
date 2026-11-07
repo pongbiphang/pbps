@@ -218,3 +218,29 @@ fn an_unchanged_mapping_is_the_identity_and_lists_what_to_make() {
     // Negative: the default mapping makes nothing.
     assert!(RoleMapping::default().created().is_empty());
 }
+
+#[test]
+fn a_renamed_role_keeps_its_declaration_and_its_policy_recipient_slot() {
+    let mut schema = Schema::default();
+    schema.roles.insert(name("old"), Role::default());
+    let mut t = Table::default();
+    t.row_policies.insert("p".into(), policy(&["old", "other"]));
+    t.row_policies
+        .insert("everyone".into(), RowPolicy::default());
+    schema.tables.insert(table(), t);
+    schema.rename_role(&name("old"), &name("new"));
+    assert!(schema.roles.contains_key(&name("new")));
+    assert!(!schema.roles.contains_key(&name("old")));
+    assert_eq!(
+        schema.named_roles(),
+        [name("new"), name("other")].into_iter().collect()
+    );
+    // Negative: a policy for everyone names no role, and a name that is not
+    // the renamed one is left alone.
+    assert_eq!(
+        schema.tables[&table()].row_policies["everyone"].to,
+        PolicyRoles::Public
+    );
+    schema.rename_role(&name("absent"), &name("elsewhere"));
+    assert_eq!(schema.named_roles().len(), 2);
+}

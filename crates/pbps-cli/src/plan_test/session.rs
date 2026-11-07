@@ -4,6 +4,8 @@
 //! and each method hands a SQL Server run to [`mssql`], whose SQL lives in
 //! `pbps_mssql::test_scratch`. Callers name no engine (DEC-1165.14).
 mod mssql;
+pub(crate) mod prerequisites;
+pub(crate) use prerequisites::HopContext;
 
 use super::revision::Assembled;
 use crate::{db::Target, test_scratch::TestScratch};
@@ -144,9 +146,11 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
-    // Prepare only the current revision, before its capture/plan. Preparing a
-    // future union would make those future roles unmanaged in an earlier hop.
-    pub async fn prepare(&self, schema: &Schema) -> anyhow::Result<()> {
+    // Prepare only the incoming hop, before its capture/plan, from the pair of
+    // hops: preparing a future union would make those future roles unmanaged in
+    // an earlier hop, and a name alone cannot say a role is new (#2552).
+    pub async fn prepare(&self, hop: HopContext<'_>) -> anyhow::Result<()> {
+        let schema = &hop.incoming.loaded.schema;
         if self.driver == Driver::Mssql {
             return mssql::namespaces(self, schema).await;
         }
@@ -154,14 +158,9 @@ impl<'a> Session<'a> {
         // Ordinary bootstrap requires cluster roles to exist (ADR-0010 §3).
         // Only this owned cluster's administrator supplies those prerequisites;
         // roles keep their ordinary scope and existing image roles stay untouched.
-        let roles = schema.named_roles();
-        for name in pbps_pg::roles::missing_roles(&mut conn, &roles.iter().collect()).await? {
-            let role = quoted(name.raw())?;
-            conn.execute(&format!(
-                "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-            ))
-            .await?;
-        }
+        let roles = prerequisites::roles(hop);
+        prerequisites::complete_renames(&mut conn, &roles.renames).await?;
+        prerequisites::create_missing(&mut conn, &roles.introduced).await?;
         self.namespaces(schema).await
     }
     pub async fn namespaces(&self, schema: &Schema) -> anyhow::Result<()> {

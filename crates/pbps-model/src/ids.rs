@@ -241,6 +241,23 @@ pub struct DropGuard {
 }
 
 impl IdsFile {
+    /// The roles whose recorded name `declared` spells differently: `(from, to)`
+    /// for every uid both files hold under two names. The one rule for a role
+    /// rename's identity, shared by the cluster evidence check and the owned
+    /// test session; a name that merely resembles another never counts.
+    pub fn role_renames<'a>(
+        &'a self,
+        declared: &'a IdsFile,
+    ) -> impl Iterator<Item = (&'a crate::RoleName, &'a crate::RoleName)> {
+        self.roles.iter().filter_map(|(uid, from)| {
+            declared
+                .roles
+                .get(uid)
+                .filter(|to| *to != from)
+                .map(|to| (from, to))
+        })
+    }
+
     pub fn validated(self) -> Result<ValidIds, IdsError> {
         self.validate()?;
         Ok(ValidIds(self))
@@ -757,6 +774,35 @@ mod tests {
 
     fn uid(s: &str) -> Uid {
         s.parse().unwrap()
+    }
+
+    fn roles(pairs: &[(&str, &str)]) -> IdsFile {
+        let mut f = IdsFile::default();
+        for (u, name) in pairs {
+            f.roles.insert(uid(u), (*name).into());
+        }
+        f
+    }
+
+    #[test]
+    fn a_role_rename_is_the_same_uid_under_another_name() {
+        let recorded = roles(&[("r_aaaaaa", "old"), ("r_bbbbbb", "kept")]);
+        let declared = roles(&[("r_aaaaaa", "new"), ("r_bbbbbb", "kept")]);
+        let found: Vec<_> = recorded.role_renames(&declared).collect();
+        assert_eq!(found, [(&"old".into(), &"new".into())]);
+    }
+
+    /// Negative cases: a spelling resemblance, a new uid, a dropped uid and an
+    /// unchanged name all supply no rename.
+    #[test]
+    fn only_a_retained_uid_under_a_new_name_is_a_role_rename() {
+        let recorded = roles(&[("r_aaaaaa", "old"), ("r_cccccc", "gone")]);
+        // `old_` resembles `old` but carries a different uid.
+        let declared = roles(&[("r_dddddd", "old_"), ("r_eeeeee", "fresh")]);
+        assert_eq!(recorded.role_renames(&declared).count(), 0);
+        assert_eq!(recorded.role_renames(&recorded).count(), 0);
+        assert_eq!(IdsFile::default().role_renames(&declared).count(), 0);
+        assert_eq!(recorded.role_renames(&IdsFile::default()).count(), 0);
     }
     fn col(s: &str) -> ColumnRef {
         s.parse().unwrap()
