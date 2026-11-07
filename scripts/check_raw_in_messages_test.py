@@ -471,6 +471,7 @@ class TheAllowlist(unittest.TestCase):
             'crates/pbps-cli/src/engine.rs',
             'crates/pbps-cli/src/object_order.rs',
             'crates/pbps-cli/src/plan_test/session.rs',
+            'crates/pbps-cli/src/plan_test/session/prerequisites.rs',
             'crates/pbps-cli/src/report.rs',
             'crates/pbps-cli/src/resolver/scope.rs',
             'crates/pbps-cli/src/status.rs',
