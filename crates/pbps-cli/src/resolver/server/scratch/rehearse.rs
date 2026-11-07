@@ -306,12 +306,28 @@ fn undeclared<'a>(
         .collect()
 }
 
+/// The fixed database roles, which every database holds.
+const FIXED_ROLES: [&str; 9] = [
+    "db_owner",
+    "db_accessadmin",
+    "db_securityadmin",
+    "db_ddladmin",
+    "db_backupoperator",
+    "db_datareader",
+    "db_datawriter",
+    "db_denydatareader",
+    "db_denydatawriter",
+];
+
 /// A principal every database holds: it is never made, and never mapped.
+/// Compared as the engine compares a principal, ignoring case, and by the whole
+/// name: a `db_` prefix is not the fixed roles (a user may name a role
+/// `db_app_reader`, which a scratch does not have).
 fn builtin(name: &str) -> bool {
-    name.starts_with("db_")
-        || ["dbo", "public", "guest", "sys", "INFORMATION_SCHEMA"]
-            .iter()
-            .any(|own| own.eq_ignore_ascii_case(name))
+    ["dbo", "public", "guest", "sys", "INFORMATION_SCHEMA"]
+        .iter()
+        .chain(FIXED_ROLES.iter())
+        .any(|own| own.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
@@ -357,11 +373,18 @@ mod principals_tests {
     }
 
     /// The names are compared as the engine compares a principal, so a name
-    /// that differs only in case from a built-in is the built-in's, and a
-    /// declared role is not one.
+    /// that differs only in case from a built-in is the built-in's. Only the
+    /// fixed roles are built in, not everything that starts with `db_`.
     #[test]
     fn a_name_that_only_looks_built_in_is_not() {
         assert!(builtin("DBO") && builtin("db_owner") && builtin("Guest"));
+        assert!(builtin("DB_DATAREADER") && builtin("Db_DenyDataWriter"));
         assert!(!builtin("dbo_reader") && !builtin("database_user") && !builtin("sysadmin"));
+        assert!(!builtin("db_app_reader") && !builtin("db_") && !builtin("db_owner2"));
+        let named: BTreeSet<_> = ["db_app_reader", "DB_DATAREADER"].map(role).into();
+        assert_eq!(
+            undeclared(&named, &holding(&[]), &holding(&[])),
+            vec![&role("db_app_reader")]
+        );
     }
 }
