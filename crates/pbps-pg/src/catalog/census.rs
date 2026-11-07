@@ -16,16 +16,9 @@ use serde_json::Value;
 // DEC-2558.1 can read the loss as catalog movement (DEC-2681.1). A cast has no
 // schema, so membership follows dependencies and not a namespace column.
 pub(super) const QUERY: &str = concat!(
-    r#"
-WITH RECURSIVE session_owned(classid, objid) AS (
-    SELECT d.classid, d.objid FROM pg_catalog.pg_depend d
-      JOIN pg_catalog.pg_namespace s ON s.oid = d.refobjid
-     WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass AND d.deptype = 'n'
-       AND (s.oid = pg_catalog.pg_my_temp_schema() OR pg_catalog.pg_is_other_temp_schema(s.oid))
-    UNION
-    SELECT d.classid, d.objid FROM session_owned o JOIN pg_catalog.pg_depend d
-      ON d.refclassid = o.classid AND d.refobjid = o.objid AND d.deptype IN ('n', 'a', 'i')
-), used_types(oid) AS (
+    "\nWITH RECURSIVE ",
+    session_owned_cte!(),
+    r#", used_types(oid) AS (
     SELECT atttypid FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped
     UNION
     SELECT d.refobjid FROM used_types u JOIN pg_catalog.pg_depend d

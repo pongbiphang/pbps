@@ -16,10 +16,19 @@ use std::collections::BTreeMap;
 ///
 /// What is not reported: system objects (`oid < 16384`), temporary and TOAST
 /// schemas, and the members of an extension (the package owns them, which the
-/// census already names). The member closure is the census's, restated here
-/// because the two statements are separate parts of the batch.
-pub(super) const QUERY: &str = r#"
-WITH RECURSIVE extension_members(classid, objid) AS (
+/// census already names), and whatever a session's temporary schema owns.
+///
+/// That last rule matters for comments on types and constraints: their class
+/// is not `pg_class`, so the relation filter does not see them. Such an
+/// object vanishes when its session's backend exits. If the exit falls
+/// between this scan and `pg_identify_object`, the row would lose its
+/// identity and `notices` would refuse the whole pull (DEC-2681.1). The member
+/// closure is the census's, restated here because the two statements are
+/// separate parts of the batch.
+pub(super) const QUERY: &str = concat!(
+    "\nWITH RECURSIVE ",
+    session_owned_cte!(),
+    r#", extension_members(classid, objid) AS (
     SELECT classid, objid FROM pg_catalog.pg_depend WHERE deptype = 'e'
     UNION
     SELECT d.classid, d.objid FROM extension_members e JOIN pg_catalog.pg_depend d
@@ -81,9 +90,11 @@ WITH RECURSIVE extension_members(classid, objid) AS (
 SELECT f.kind, i.type, i.identity, f.detail
   FROM found f CROSS JOIN LATERAL pg_catalog.pg_identify_object(f.classid, f.objid, f.objsubid) i
  WHERE NOT EXISTS (SELECT 1 FROM extension_members e WHERE e.classid = f.classid AND e.objid = f.objid)
+   AND NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = f.classid AND s.objid = f.objid)
    AND NOT (f.classid = 'pg_catalog.pg_class'::regclass AND f.kind IN ('comment', 'security label')
             AND NOT EXISTS (SELECT 1 FROM relations r WHERE r.oid = f.objid))
-"#;
+"#
+);
 
 /// How many examples a grouped notice names before it counts the rest.
 const EXAMPLES: usize = 3;
@@ -458,5 +469,97 @@ mod tests {
             "{:?}",
             pulled.warnings
         );
+    }
+
+    // Comments on objects another session's temporary schema owns, and on the
+    // reader's own (DEC-2681.1). A type's or constraint's comment row is not
+    // in `pg_class`, so only the session-owned rule keeps it out. Without that
+    // rule, a session ending mid-read would refuse the whole pull.
+    const TEMPORARY_COMMENTS: &str = "\
+        CREATE TYPE pg_temp.p2681_en AS ENUM ('a'); \
+        COMMENT ON TYPE pg_temp.p2681_en IS 'temporary enum'; \
+        CREATE TYPE pg_temp.p2681_comp AS (a int); \
+        COMMENT ON TYPE pg_temp.p2681_comp IS 'temporary composite'; \
+        CREATE TEMP TABLE p2681_t (id int CONSTRAINT p2681_ck CHECK (id > 0), \
+                                   CONSTRAINT p2681_pk PRIMARY KEY (id)); \
+        COMMENT ON CONSTRAINT p2681_ck ON p2681_t IS 'temporary check'; \
+        COMMENT ON CONSTRAINT p2681_pk ON p2681_t IS 'temporary key'; \
+        COMMENT ON COLUMN p2681_t.id IS 'temporary column'";
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+    async fn p2681_temporary_objects_draw_no_property_notice_on_pg16() {
+        temporary_comments("PBPS_TEST_PG_OLD_DB").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+    async fn p2681_temporary_objects_draw_no_property_notice_on_pg18() {
+        temporary_comments("PBPS_TEST_PG_DB").await;
+    }
+
+    async fn read_properties(conn: &mut pbps_db::Conn) -> Vec<Value> {
+        let rows = conn
+            .query(&format!(
+                "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(r) \
+                 ORDER BY kind, identity), '[]'::jsonb)::text AS payload FROM ({QUERY}) r"
+            ))
+            .await
+            .unwrap();
+        serde_json::from_str(&super::super::text(&rows[0], "payload").unwrap()).unwrap()
+    }
+
+    async fn temporary_comments(variable: &str) {
+        use pbps_db::{Conn, Driver};
+
+        let server = std::env::var(variable).expect("the pinned PostgreSQL fixture");
+        let mut reader = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let mut other = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let schema = format!("p2681_{}", std::process::id());
+        // The control: the same kinds of comment on persistent objects are named.
+        reader
+            .execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                 CREATE TYPE {schema}.kept AS ENUM ('a'); \
+                 COMMENT ON TYPE {schema}.kept IS 'persistent enum'; \
+                 CREATE TABLE {schema}.kt (id int CONSTRAINT kept_ck CHECK (id > 0)); \
+                 COMMENT ON CONSTRAINT kept_ck ON {schema}.kt IS 'persistent check'"
+            ))
+            .await
+            .unwrap();
+        other.execute(TEMPORARY_COMMENTS).await.unwrap();
+        reader.execute(TEMPORARY_COMMENTS).await.unwrap();
+        let rows = read_properties(&mut reader).await;
+        // The temporary objects must really exist while the query reads.
+        let held = reader
+            .query(
+                "SELECT count(*)::int8 AS n FROM pg_catalog.pg_description d \
+                 JOIN pg_catalog.pg_type t ON d.classoid = 'pg_catalog.pg_type'::regclass \
+                  AND t.oid = d.objoid WHERE t.typname = 'p2681_en'",
+            )
+            .await
+            .unwrap();
+        let held = super::super::number(&held[0], "n").unwrap();
+        drop(other);
+        reader
+            .execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert_eq!(held, 2, "both sessions' temporary enums carry a comment");
+        let identities: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["kind"] == "comment")
+            .map(|r| r["identity"].as_str().unwrap_or("<null>"))
+            .collect();
+        assert!(
+            identities.iter().all(|i| !i.contains("pg_temp")),
+            "a temporary object's comment drew a notice: {identities:?}"
+        );
+        for kept in [format!("{schema}.kept"), format!("kept_ck on {schema}.kt")] {
+            assert!(
+                identities.contains(&kept.as_str()),
+                "the persistent `{kept}` comment must still be named: {identities:?}"
+            );
+        }
     }
 }

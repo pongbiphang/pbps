@@ -24,6 +24,29 @@
 //! pin the empty path — the one value that does not move with the project's
 //! shape — and put back whatever the session had.
 
+/// The objects one session's temporary schema owns, as a recursive CTE body.
+///
+/// It covers what is recorded in the reading session's temporary schema or
+/// another session's, plus their dependents. This is what PostgreSQL deletes
+/// when it cleans a temporary schema (DEC-2681.1).
+///
+/// Every report-only statement that resolves identities late must omit these
+/// rows. The census and the property notices are separate statements of one
+/// batch, so they share the text rather than restating it.
+macro_rules! session_owned_cte {
+    () => {
+        r#"session_owned(classid, objid) AS (
+    SELECT d.classid, d.objid FROM pg_catalog.pg_depend d
+      JOIN pg_catalog.pg_namespace s ON s.oid = d.refobjid
+     WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass AND d.deptype = 'n'
+       AND (s.oid = pg_catalog.pg_my_temp_schema() OR pg_catalog.pg_is_other_temp_schema(s.oid))
+    UNION
+    SELECT d.classid, d.objid FROM session_owned o JOIN pg_catalog.pg_depend d
+      ON d.refclassid = o.classid AND d.refobjid = o.objid AND d.deptype IN ('n', 'a', 'i')
+)"#
+    };
+}
+
 mod census;
 mod properties;
 
