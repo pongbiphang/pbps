@@ -93,7 +93,11 @@ WITH RECURSIVE session_owned(classid, objid) AS (
     UNION ALL
     SELECT 'pg_catalog.pg_foreign_server'::regclass, oid, 'foreign server', false FROM pg_catalog.pg_foreign_server
     UNION ALL
-    SELECT 'pg_catalog.pg_user_mapping'::regclass, oid, 'user mapping', false FROM pg_catalog.pg_user_mapping
+    -- Only a superuser may read the pg_user_mapping table, because it holds
+    -- the mappings' secret options. Every other deployer, and the
+    -- rehearsal's confined account, reads the pg_user_mappings view instead.
+    -- The view exposes the same row identity (umid) to every role.
+    SELECT 'pg_catalog.pg_user_mapping'::regclass, umid, 'user mapping', false FROM pg_catalog.pg_user_mappings
     UNION ALL
     SELECT 'pg_catalog.pg_language'::regclass, oid, 'procedural language', false FROM pg_catalog.pg_language
 )
