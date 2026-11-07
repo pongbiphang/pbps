@@ -1153,15 +1153,55 @@ indexes:
         }
     }
 
-    /// GiST loads as a method; the methods that belong to #2449 are still refused
-    /// at load, naming what was written.
+    /// BRIN loads as a method with its two options in their canonical spelling,
+    /// and a key's `opclass_parameters:` (the next part of #2449) is refused by
+    /// name; an option the method does not have, and one out of the engine's
+    /// bounds, are refused at load.
     #[test]
-    fn gist_loads_and_brin_spgist_and_hash_are_refused_by_name() {
+    fn brin_loads_with_its_options_and_a_key_s_class_parameters_are_refused_by_name() {
+        let t = load(
+            "table: app.t\ncolumns:\n  a: {type: integer}\nindexes:\n  ix:\n    method: brin\n    \
+             columns: [a]\n    storage_parameters: {pages_per_range: 32, autosummarize: yes}\n",
+        );
+        let ix = &t.table.indexes["ix"];
+        assert_eq!(ix.method, pbps_model::IndexMethod::Brin);
+        assert_eq!(ix.storage_parameters["pages_per_range"], "32");
+        assert_eq!(ix.storage_parameters["autosummarize"], "true");
+        let e = errors(
+            "table: app.t\ncolumns:\n  a: {type: integer}\nindexes:\n  ix:\n    method: brin\n    \
+             keys:\n      - {column: a, opclass_parameters: {values_per_range: 8}}\n",
+        );
+        assert!(
+            render(&e).contains("opclass_parameters") && render(&e).contains("#2449"),
+            "{}",
+            render(&e)
+        );
+        for (parameter, value) in [
+            ("fillfactor", "70"),
+            ("pages_per_range", "0"),
+            ("pages_per_range", "131073"),
+        ] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  a: {{type: integer}}\nindexes:\n  ix:\n    method: brin\n    \
+                 columns: [a]\n    storage_parameters: {{{parameter}: {value}}}\n"
+            ));
+            assert!(
+                render(&e).contains(parameter),
+                "{parameter}={value}: {}",
+                render(&e)
+            );
+        }
+    }
+
+    /// GiST loads as a method; the methods that belong to later parts of #2449 are
+    /// still refused at load, naming what was written.
+    #[test]
+    fn gist_loads_and_spgist_and_hash_are_refused_by_name() {
         let t = load(
             "table: app.t\ncolumns:\n  a: {type: tsvector}\nindexes:\n  ix:\n    method: gist\n    columns: [a]\n",
         );
         assert_eq!(t.table.indexes["ix"].method, pbps_model::IndexMethod::Gist);
-        for method in ["brin", "spgist", "hash"] {
+        for method in ["spgist", "hash"] {
             let e = errors(&format!(
                 "table: app.t\ncolumns:\n  a: {{type: text}}\nindexes:\n  ix:\n    method: {method}\n    columns: [a]\n"
             ));

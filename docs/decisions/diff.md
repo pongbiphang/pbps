@@ -9530,3 +9530,52 @@ Formats: plan 68 (an older build would drop `exclude` from a table in a
 payload), state 39, published schema set 94 (the declaration schema gains
 `exclude:`). The ids file and its tree are untouched. A table with no exclusion
 serialises exactly as before.
+
+<a id="dec-2449-1"></a>
+
+**DEC-2449.1. BRIN indexes, and the rule for an option change on a partitioned parent (#2449 PR R1, #2709).**
+`method: brin` is one more row in the policy table (DEC-2448.1) and goes through
+`AddIndex`, `DropIndex` and `SetIndexStorageParameters`: no new change kind, no
+ordering class, no identity, and dropping one needs only `--allow destructive`.
+Measured on 16.15 and 18.6, identical: BRIN is not unique, has no order, takes no
+`INCLUDE`, and may be over an expression. A column key is held over the types of
+the model's catalogue that have a default class (the minmax ones, and `inet` and
+`cidr` through the inclusion default); `boolean`, `json`, `jsonb`, `tsvector`,
+`xml`, arrays and a user type have none (`42704`), so they are indexed through an
+expression such as `(flag::integer)`, and validation refuses the column with that
+advice. The catalog prints a class only when it is not the default, so spelling
+one is refused (one index, one spelling). The engine's own `minmax_multi` and
+`bloom` classes, a key's `opclass_parameters:` and the options that go with them
+are the next part of #2449 and are refused by name (a pull leaves such an index
+out and names it); a key collation is refused.
+
+Two options, `pages_per_range` (1 to 131072, validated offline) and
+`autosummarize` (a boolean word, read back as `true`/`false`). `autosummarize` is
+a runtime flag and is altered in place. **`pages_per_range` is a rebuild**: an
+`ALTER INDEX SET` records the value in `reloptions` and leaves the metapage at
+the granularity the index was built with until a `REINDEX`, and `RESET` keeps the
+physical one (measured with `pageinspect`: built 16, `SET 4`, metapage 16;
+`REINDEX`, 4; `RESET`, still 4; `REINDEX`, 128), so only a rebuild makes the
+declared value the one in use. Either option takes `AccessExclusive` on the
+index (a B-tree's `fillfactor` takes `ShareUpdateExclusive`); `CREATE INDEX`
+takes `ShareLock` on the table. Summarisation state is runtime state of the
+index, never read and never planned.
+
+An index altered natively without a `REINDEX` reads as its catalog value and
+not as the metapage's, which needs `pageinspect`, an extension this tool does not
+require: a limit, not modelled.
+
+**A partitioned parent's index takes no `ALTER INDEX SET`/`RESET` of any method**
+(`42809`, measured for B-tree, GIN, GiST and BRIN, #2709), and its leaves are
+created from the parent's options. So the differ turns every in-place verdict
+into a rebuild on a table that is partitioned: the parent's index is dropped and
+built again with the declared options, and its leaves with it. A leaf's own
+native options are lost to that rebuild; a leaf index declared by its partition
+is its own part and is altered or rebuilt by its own verdict.
+
+Formats: plan 69 (an older build would read `brin` as an unknown value), state
+40, published schema set 96 (the declaration schema's `method` enum gains `brin`;
+`opclass_parameters` is read to be refused and is not in the schema). No field is
+added: both options are in the existing `storage_parameters` map, and a btree,
+GIN or GiST index keeps its bytes.
+

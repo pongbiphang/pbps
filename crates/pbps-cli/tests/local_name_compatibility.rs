@@ -333,8 +333,8 @@ where
             }
         }
     }
-    // #2448 adds a key's `collation:` and the `gist` method (schema set 91);
-    // the captured index branches predate both.
+    // #2448 adds a key's `collation:` and the `gist` method (schema set 91), and #2449
+    // the `brin` method (93); the captured index branches predate them.
     declaration_schema["$defs"]["IndexKeyDto"]["properties"]
         .as_object_mut()
         .unwrap()
@@ -342,7 +342,7 @@ where
     declaration_schema["$defs"]["IndexMethod"]["oneOf"]
         .as_array_mut()
         .unwrap()
-        .retain(|variant| variant["const"] != "gist");
+        .retain(|variant| variant["const"] != "gist" && variant["const"] != "brin");
     // #2448 PR C1 adds a table's `exclude:` (schema set 94); the captured table
     // branch predates it.
     for definition in ["ExclusionDto", "ExclusionKeyDto", "InitiallyDto"] {

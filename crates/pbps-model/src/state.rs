@@ -151,7 +151,9 @@ use schemars::JsonSchema;
 /// every older snapshot truthfully holds neither.
 /// Version 39 records exclusion constraints (DEC-2448.3); every older snapshot truthfully
 /// holds none.
-pub const CURRENT_VERSION: u32 = 39;
+/// Version 40 records the BRIN index method (DEC-2449.1); every older snapshot
+/// truthfully holds none.
+pub const CURRENT_VERSION: u32 = 40;
 
 /// The oldest snapshot version this build reads as its own.
 ///

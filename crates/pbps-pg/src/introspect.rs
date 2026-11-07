@@ -8156,7 +8156,7 @@ mod tests {
     /// the ones it does read from the policy table (DEC-2448.1).
     #[test]
     fn an_access_method_outside_the_policy_table_is_named_and_left_out() {
-        for method in ["brin", "spgist", "hash", "bloom"] {
+        for method in ["spgist", "hash", "bloom"] {
             let mut ix = index(50, 1, "t_ix");
             ix.method = method.to_owned();
             let pulled = assemble(&RawCatalog {
@@ -8169,10 +8169,53 @@ mod tests {
             let note = &pulled.warnings[0];
             assert!(
                 note.contains(&format!("`{method}` method"))
-                    && note.contains("only `btree`, `gin` and `gist`"),
+                    && note.contains("only `btree`, `gin`, `gist` and `brin`"),
                 "{method}: {note}"
             );
         }
+    }
+
+    /// A BRIN index is pulled through the policy: its options in their
+    /// canonical spelling (`autosummarize=yes` reads `true`), a default class
+    /// and an `inet` key included; what this part does not hold (a minmax-multi
+    /// or Bloom class, an option the method does not have here) is left out and
+    /// named, never read back weaker (DEC-2449.1).
+    #[test]
+    fn a_brin_index_is_pulled_with_its_options_and_a_later_class_is_left_out() {
+        let build = |ty: &str, class: &str, options: &[&str]| {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = "brin".to_owned();
+            ix.key_classes = vec![class.to_owned()];
+            ix.reloptions = options.iter().map(|o| (*o).to_owned()).collect();
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", ty)],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            })
+        };
+        for ty in ["integer", "inet", "text"] {
+            let pulled = build(ty, "", &["pages_per_range=32", "autosummarize=yes"]);
+            let held = only(&pulled).indexes.values().next().expect(ty);
+            assert_eq!(held.method, IndexMethod::Brin, "{ty}");
+            assert_eq!(held.storage_parameters["pages_per_range"], "32");
+            assert_eq!(held.storage_parameters["autosummarize"], "true");
+            assert!(pulled.warnings.is_empty(), "{ty}: {:?}", pulled.warnings);
+        }
+        // Negative: a class this part does not hold, and an option it does not.
+        let multi = build("integer", "pg_catalog.int4_minmax_multi_ops", &[]);
+        assert!(only(&multi).indexes.is_empty());
+        assert!(!multi.warnings.is_empty());
+        let other = build("integer", "", &["fillfactor=50"]);
+        assert!(
+            only(&other)
+                .indexes
+                .values()
+                .all(|ix| !ix.storage_parameters.contains_key("fillfactor")),
+            "{:?}",
+            other.warnings
+        );
+        assert!(!other.warnings.is_empty());
     }
 
     /// A class a schema owns is refused whole, on a B-tree and on GIN, and the

@@ -25,6 +25,9 @@ pub enum Kind {
     Bool,
     /// `strtol(…, 0)`: decimal, `0x` hexadecimal, leading-zero octal.
     Int,
+    /// [`Kind::Int`] within the inclusive bounds the engine states for the
+    /// parameter (BRIN's `pages_per_range`: 1 to 131072, `22023` outside).
+    IntBetween(i64, i64),
     /// `strtod`.
     Real,
     /// `vacuum_index_cleanup`: `auto`, or a whole boolean word.
@@ -220,6 +223,22 @@ const fn param_locked(name: &'static str, kind: Kind, lock: IndexLock) -> IndexP
     }
 }
 
+/// [`param`] whose change the engine cannot make in place, or not so that the
+/// index uses it, and which takes `lock` where it is altered.
+const fn param_verdict(
+    name: &'static str,
+    kind: Kind,
+    change: ParameterChange,
+    lock: IndexLock,
+) -> IndexParameter {
+    IndexParameter {
+        name,
+        kind,
+        change,
+        lock: Some(lock),
+    }
+}
+
 static BTREE: MethodPolicy = MethodPolicy {
     method: IndexMethod::Btree,
     unique: true,
@@ -292,8 +311,63 @@ static GIST: MethodPolicy = MethodPolicy {
     ],
 };
 
+/// BRIN (DEC-2449.1), measured on 16.15 and 18.6. No unique, no `INCLUDE`, no
+/// order. Held over a column of a type the model declares and the engine gives a
+/// default class (the minmax ones and `inet`/`cidr`'s inclusion), or over an
+/// expression; the default class is the only one held (the multi and Bloom
+/// classes are the next part). `pages_per_range` is `Rebuild`: `ALTER … SET`
+/// records the value and leaves the metapage at the old granularity until a
+/// `REINDEX`, and `RESET` keeps the physical one, so only a rebuild makes the
+/// declared value the one in use. `autosummarize` is a runtime flag and changes
+/// in place. Both take `AccessExclusive` on the index.
+static BRIN: MethodPolicy = MethodPolicy {
+    method: IndexMethod::Brin,
+    unique: false,
+    include: false,
+    ordered: false,
+    expression_keys: true,
+    exclusion: false,
+    key_type: None,
+    classes: &[],
+    default_class: None,
+    collation: false,
+    typed_columns: &[
+        ("smallint", None),
+        ("integer", None),
+        ("bigint", None),
+        ("numeric", None),
+        ("real", None),
+        ("double precision", None),
+        ("character", None),
+        ("character varying", None),
+        ("text", None),
+        ("bytea", None),
+        ("date", None),
+        ("time without time zone", None),
+        ("time with time zone", None),
+        ("timestamp without time zone", None),
+        ("timestamp with time zone", None),
+        ("interval", None),
+        ("uuid", None),
+        ("macaddr", None),
+        ("inet", None),
+        ("cidr", None),
+    ],
+    lock: IndexLock::AccessExclusive,
+    parameters: &[
+        param_verdict(
+            "pages_per_range",
+            Kind::IntBetween(1, 131072),
+            ParameterChange::Rebuild,
+            IndexLock::AccessExclusive,
+        ),
+        param_locked("autosummarize", Kind::Bool, IndexLock::AccessExclusive),
+    ],
+};
+
 pub(crate) fn policy_of(method: IndexMethod) -> &'static MethodPolicy {
     match method {
+        IndexMethod::Brin => &BRIN,
         IndexMethod::Gist => &GIST,
         IndexMethod::Btree => &BTREE,
         IndexMethod::Gin => &GIN,
@@ -322,6 +396,9 @@ fn spelled(kind: Kind, name: &str, value: &str) -> Result<String, String> {
     let read = match kind {
         Kind::Bool => parse_bool(value).map(|b| b.to_string()),
         Kind::Int => parse_int(value).map(|i| i.to_string()),
+        Kind::IntBetween(lo, hi) => parse_int(value)
+            .filter(|i| (lo..=hi).contains(i))
+            .map(|i| i.to_string()),
         // `+ 0.0` turns a negative zero into zero, which `to_string` would
         // otherwise spell `-0` (#1477 review).
         Kind::Real => parse_real(value).map(|r| (r + 0.0).to_string()),
@@ -481,12 +558,13 @@ mod tests {
         assert_eq!(names(g), ["fastupdate", "gin_pending_list_limit"]);
         for method in IndexMethod::ALL {
             let policy = method.policy();
+            // BRIN's `pages_per_range` is the one parameter that is not altered.
             assert!(
-                policy
-                    .parameters
-                    .iter()
-                    .all(|p| p.change == ParameterChange::Alter),
-                "nothing is rebuilt or refused yet: {}",
+                policy.parameters.iter().all(|p| {
+                    p.change == ParameterChange::Alter
+                        || (method == IndexMethod::Brin && p.name == "pages_per_range")
+                }),
+                "nothing else is rebuilt or refused yet: {}",
                 method.as_str()
             );
             assert_eq!(IndexMethod::from_am_name(method.as_str()), Some(method));
@@ -531,6 +609,96 @@ mod tests {
         assert!(!IndexMethod::Gin.policy().collation);
     }
 
+    /// BRIN's row, measured on 16.15 and 18.6 (DEC-2449.1): what the engine
+    /// reports for the method, `pages_per_range` rebuilt (a native `ALTER`
+    /// leaves the metapage at the old granularity until a `REINDEX`) and
+    /// `autosummarize` altered, both under `AccessExclusive`, and the column
+    /// types that have a default class.
+    #[test]
+    fn the_brin_policy_row_is_what_the_engine_reports() {
+        let b = IndexMethod::Brin.policy();
+        assert_eq!(b.method, IndexMethod::Brin);
+        assert!(!b.unique && !b.include && !b.ordered && b.expression_keys && !b.collation);
+        assert_eq!((b.classes, b.default_class), (&[][..], None));
+        assert_eq!(b.lock, IndexLock::AccessExclusive);
+        assert_eq!(
+            b.change_of(["pages_per_range"]),
+            (ParameterChange::Rebuild, Some("pages_per_range"))
+        );
+        assert_eq!(b.change_of(["autosummarize"]).0, ParameterChange::Alter);
+        // The strongest verdict of a change wins.
+        assert_eq!(
+            b.change_of(["autosummarize", "pages_per_range"]).0,
+            ParameterChange::Rebuild
+        );
+        assert_eq!(
+            b.lock_of(["autosummarize", "pages_per_range"]),
+            IndexLock::AccessExclusive
+        );
+        let typed: Vec<_> = b.typed_columns.iter().map(|(t, _)| *t).collect();
+        // The measured defaults: `inet` and `cidr` through inclusion, the rest
+        // minmax; no class is ever required of a column.
+        for held in [
+            "integer",
+            "text",
+            "timestamp with time zone",
+            "inet",
+            "cidr",
+            "uuid",
+        ] {
+            assert!(typed.contains(&held), "{held}");
+        }
+        assert!(b.typed_columns.iter().all(|(_, class)| class.is_none()));
+        // Negative: the types the engine gives no BRIN class are not held.
+        for none in ["boolean", "json", "jsonb", "tsvector", "xml"] {
+            assert!(!typed.contains(&none), "{none}");
+        }
+    }
+
+    /// `pages_per_range` is a whole number from 1 to 131072 (the engine's
+    /// `22023` outside), in the engine's `strtol` spellings; `autosummarize` is a
+    /// boolean word kept as its one canonical spelling (`yes` reads `true`).
+    #[test]
+    fn a_brin_pages_per_range_is_bounded_and_autosummarize_is_a_boolean() {
+        for (given, canonical) in [
+            ("1", "1"),
+            ("128", "128"),
+            ("0x20", "32"),
+            ("131072", "131072"),
+            ("1.5", "2"),
+        ] {
+            assert_eq!(
+                canonical_index(IndexMethod::Brin, "pages_per_range", given).unwrap(),
+                canonical
+            );
+        }
+        for bad in ["0", "-1", "131073", "x", "", "0.4"] {
+            assert!(
+                canonical_index(IndexMethod::Brin, "pages_per_range", bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        for (given, canonical) in [
+            ("on", "true"),
+            ("yes", "true"),
+            ("off", "false"),
+            ("0", "false"),
+        ] {
+            assert_eq!(
+                canonical_index(IndexMethod::Brin, "autosummarize", given).unwrap(),
+                canonical
+            );
+        }
+        assert!(canonical_index(IndexMethod::Brin, "autosummarize", "maybe").is_err());
+        // Negative: another method's parameters, and R2's, are not BRIN's here.
+        for other in ["fillfactor", "values_per_range", "n_distinct_per_range"] {
+            assert!(
+                canonical_index(IndexMethod::Brin, other, "1").is_err(),
+                "{other}"
+            );
+        }
+    }
+
     /// `buffering` is `on`, `off` or `auto` in any case, and nothing else:
     /// the engine stores `ON` as `on` and refuses `true` and ` on`.
     #[test]
@@ -563,7 +731,8 @@ mod tests {
         assert!(IndexMethod::Gin.policy().parameter("fillfactor").is_none());
         assert!(canonical_index(IndexMethod::Gin, "fillfactor", "70").is_err());
         assert_eq!(IndexMethod::from_am_name("gist"), Some(IndexMethod::Gist));
-        assert_eq!(IndexMethod::from_am_name("brin"), None);
+        assert_eq!(IndexMethod::from_am_name("brin"), Some(IndexMethod::Brin));
+        assert_eq!(IndexMethod::from_am_name("hash"), None);
         assert!(IndexMethod::Gist.policy().parameter("fastupdate").is_none());
         assert!(canonical_index(IndexMethod::Gist, "fastupdate", "on").is_err());
         assert_eq!(IndexMethod::from_am_name("BTREE"), None);

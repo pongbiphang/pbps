@@ -524,7 +524,12 @@ indexes:
   columns, over `inet`/`cidr` with `opclass: inet_ops`, and over any expression
   (`int4range(a, b)`); a column key may carry `collation:`, the name of a
   `pg_catalog` collation, for a column the engine can collate (DEC-2448.2).
-  `method: brin` is refused by name until its own part.
+  `method: brin` is held over a column of a type with a default class (the
+  numeric, string, date and time types, `uuid`, `macaddr`, `inet`, `cidr`) or an
+  expression, with `pages_per_range` (a change rebuilds the index) and
+  `autosummarize` (altered in place); an option change on a partitioned parent's
+  index rebuilds it for every method (DEC-2449.1). BRIN's minmax-multi and Bloom
+  classes and `exclude:` are refused by name until their own parts.
 - **A PostgreSQL exclusion constraint is an `exclude:` entry** with a required
   `method:` (`btree` or `gist`), `keys:` that each name a column or an expression and
   the `operator:` (a `pg_catalog` symbol such as `&&` or `=`) it is excluded with,

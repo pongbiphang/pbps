@@ -137,7 +137,7 @@ async fn the_policy_capabilities_are_the_engines_own() {
         }
         // Negative: a method the table does not hold has no row, and the
         // engine's own list has it (so the absence is the model's choice).
-        for other in ["brin", "spgist", "hash"] {
+        for other in ["spgist", "hash"] {
             assert_eq!(IndexMethod::from_am_name(other), None);
             assert!(
                 truth(
@@ -165,6 +165,7 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
     let value = |name: &str| match name {
         "fillfactor" => "70",
         "gin_pending_list_limit" => "1024",
+        "pages_per_range" => "4",
         _ => "off",
     };
     for variable in SERVERS {
@@ -206,12 +207,38 @@ async fn every_parameter_verdict_and_lock_is_what_the_engine_does() {
                 db.run(&format!("ALTER INDEX ix RESET ({})", parameter.name))
                     .await;
                 let in_place = before == file(db.conn()).await;
-                assert_eq!(
-                    in_place,
-                    parameter.change == ParameterChange::Alter,
-                    "{am} {}: unchanged relation file means `Alter`",
-                    parameter.name
-                );
+                if parameter.change == ParameterChange::Rebuild {
+                    // BRIN's `pages_per_range` (DEC-2449.1): the native `ALTER`
+                    // keeps the relation file and the metapage granularity, so
+                    // the file proves nothing and the metapage is what is read.
+                    assert!(in_place, "{am} {}: ALTER keeps the file", parameter.name);
+                    db.run("CREATE EXTENSION IF NOT EXISTS pageinspect").await;
+                    db.run(&format!(
+                        "ALTER INDEX ix SET ({} = {})",
+                        parameter.name,
+                        value(parameter.name)
+                    ))
+                    .await;
+                    let physical = text(
+                        db.conn(),
+                        "SELECT (brin_metapage_info(get_raw_page('ix', 0))).pagesperrange::text",
+                    )
+                    .await;
+                    assert_ne!(
+                        physical,
+                        value(parameter.name),
+                        "{am} {}: the index still uses the old granularity",
+                        parameter.name
+                    );
+                    db.run(&format!("ALTER INDEX ix RESET ({})", parameter.name))
+                        .await;
+                } else {
+                    assert!(
+                        in_place,
+                        "{am} {}: unchanged relation file means `Alter`",
+                        parameter.name
+                    );
+                }
             }
             // Negative: the other method's parameter is refused by the engine.
             let other = IndexMethod::ALL.into_iter().find(|m| *m != method).unwrap();
@@ -365,7 +392,9 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
              CREATE COLLATION ext.mine (provider = libc, locale = 'C');
              CREATE INDEX ix_user_collation ON t (c COLLATE ext.mine);
              CREATE INDEX ix_gist ON t USING gist (r inet_ops);
-             CREATE INDEX ix_brin ON t USING brin (id);
+             CREATE INDEX ix_brin ON t USING brin (id) WITH (pages_per_range = 8, autosummarize = on);
+             CREATE INDEX ix_hash ON t USING hash (id);
+             CREATE INDEX ix_brin_multi ON t USING brin (id int4_minmax_multi_ops);
              CREATE INDEX ix_pattern ON t (e text_pattern_ops);
              CREATE INDEX ix_ext ON t (c ext.text_ops2);
              CREATE INDEX ix_ext_gin ON t USING gin (body);
@@ -377,7 +406,7 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
         let held: Vec<&str> = table.indexes.keys().map(|n| n.raw()).collect();
         assert_eq!(
             held,
-            ["ix_collated", "ix_ext_gin", "ix_gist", "ix_ok"],
+            ["ix_brin", "ix_collated", "ix_ext_gin", "ix_gist", "ix_ok"],
             "only the held shapes are read: {:?}",
             pulled.warnings
         );
@@ -392,12 +421,18 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
             table.indexes[&pbps_model::ObjectLocalName::from("ix_gist")].method,
             IndexMethod::Gist
         );
+        // Part R1 holds BRIN with its two options, read back as declared.
+        let brin = &table.indexes[&pbps_model::ObjectLocalName::from("ix_brin")];
+        assert_eq!(brin.method, IndexMethod::Brin);
+        assert_eq!(brin.storage_parameters["pages_per_range"], "8");
+        assert_eq!(brin.storage_parameters["autosummarize"], "true");
         for (what, expected) in [
             ("ix_user_collation", "collation this model does not hold"),
             (
-                "ix_brin",
-                "`brin` method, and this model holds only `btree`, `gin` and `gist`",
+                "ix_hash",
+                "`hash` method, and this model holds only `btree`, `gin`, `gist` and `brin`",
             ),
+            ("ix_brin_multi", "int4_minmax_multi_ops"),
             ("ix_pattern", "B-tree key's default class"),
             ("ix_ext", "#2447 PR F"),
         ] {
@@ -414,14 +449,14 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
         assert_eq!(held.method, IndexMethod::Gist);
         assert_eq!(held.keys.len(), 1);
         assert_eq!(held.keys[0].operator.raw().to_string(), "&&");
-        // The notes about this table are these four and no other; the two about
+        // The notes about this table are these five and no other; the two about
         // the fixture's superuser and `PUBLIC` are the cluster's, not the table's.
         let own = pulled
             .warnings
             .iter()
             .filter(|w| w.contains("`app.t`"))
             .count();
-        assert_eq!(own, 4, "{:#?}", pulled.warnings);
+        assert_eq!(own, 5, "{:#?}", pulled.warnings);
         db.finish().await;
     }
 }

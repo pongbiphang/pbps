@@ -5122,23 +5122,36 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
     let drifted = ours_only(&pull(&mut target).await, &s);
     assert!(!plan(&drifted, &ids, &redefined, &ids).is_empty());
 
-    // Every parameter of a B-tree, a GIN and a GiST index is declarable; an
-    // index of a method the model does not hold, parameters and all, is named
-    // (BRIN, #2449).
+    // Every parameter of a B-tree, a GIN, a GiST and a BRIN index is
+    // declarable; an index of a method the model does not hold, parameters and
+    // all, is named.
     target
         .execute(&format!(
             "CREATE TABLE {s}.g (id integer PRIMARY KEY);
+             CREATE INDEX g_hash ON {s}.g USING hash (id) WITH (fillfactor = 60);
              CREATE INDEX g_brin ON {s}.g USING brin (id) WITH (pages_per_range = 8);"
         ))
         .await
-        .expect("a BRIN index");
+        .expect("a hash and a BRIN index");
     let read = pull(&mut target).await;
     let limitations = ours_limitations(&read, &s);
     assert!(
         limitations
             .iter()
-            .any(|l| format!("{l:?}").contains("g_brin")),
+            .any(|l| format!("{l:?}").contains("g_hash")),
         "{limitations:?}"
+    );
+    assert!(
+        !limitations
+            .iter()
+            .any(|l| format!("{l:?}").contains("g_brin")),
+        "BRIN is held: {limitations:?}"
+    );
+    let ours = ours_only(&read, &s);
+    let g = TableName::new(&s, "g");
+    assert_eq!(
+        params(&ours.tables[&g].indexes["g_brin"].storage_parameters),
+        pairs(&[("pages_per_range", "8")])
     );
     drop_schema(&mut target, &s).await;
     target.drop().await;
