@@ -2202,6 +2202,7 @@
         "a_generated_columns_inputs_leave_out_its_own_column",
         "a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it",
         "a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan",
+        "an_index_key_with_opclass_parameters_is_left_out_not_read_as_the_plain_class",
         "a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant",
         "a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost",
         "a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded",

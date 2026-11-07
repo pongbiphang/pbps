@@ -1000,7 +1000,10 @@ fn constraints_query() -> String {
 /// model holds and name every other one (DEC-1169.1). `key_collations` holds
 /// one entry per key, `''` for the column's own and `schema.name` otherwise
 /// (DEC-2448.2); the per-key text carries no collation, so only `indcollation`
-/// says it.
+/// says it. `key_options` holds one entry per key, `''` for a key with no
+/// operator class parameters and `pg_attribute.attoptions` as text otherwise
+/// (`{siglen=32}`, #2447 PR F): nothing else reads them, so an index with one
+/// would otherwise be pulled as the plain class.
 ///
 /// `indkey` and `indoption` are `int2vector`s, which no driver here reads.
 /// Rendered as text they are space-separated, so they arrive as a list this
@@ -1093,7 +1096,14 @@ fn indexes_query() -> String {
                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
                LEFT JOIN pg_catalog.pg_collation cc ON cc.oid = i.indcollation[k.n - 1]
                LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.collnamespace
-            ) AS key_collations
+            ) AS key_collations,
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      COALESCE(a.attoptions::pg_catalog.text, '') ORDER BY k.n),
+                      '[]'::pg_catalog.json)
+               FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+               JOIN pg_catalog.pg_attribute a
+                 ON a.attrelid = i.indexrelid AND a.attnum = k.n
+            ) AS key_options
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -1831,6 +1841,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             key_classes: strings(row, "key_classes")?,
             key_texts: strings(row, "key_texts")?,
             key_collations: strings(row, "key_collations")?,
+            key_options: strings(row, "key_options")?,
             attached: flag(row, "attached")?,
             reloptions: strings(row, "reloptions")?,
         });
