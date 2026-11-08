@@ -387,6 +387,96 @@ fn a_pin_rewrite_changes_only_the_selected_pin_in_block_and_flow_style() {
 }
 
 #[test]
+fn an_escaped_pin_is_replaced_whole_without_changing_the_rest_of_the_manifest() {
+    let to = CommitId::parse(NEW).unwrap();
+    for scalar in [
+        format!(r#""{}\x39{}""#, &BASE[..9], &BASE[10..]),
+        format!(r#""\x30{}""#, &BASE[1..]),
+        format!(r#""\u0030{}""#, &BASE[1..]),
+        format!(r#""\U00000030{}""#, BASE[1..].to_ascii_uppercase()),
+        format!("\"{}\\\n      {}\"", &BASE[..20], &BASE[20..]),
+        format!("\"\\\n      {BASE}\""),
+    ] {
+        for flow in [false, true] {
+            let entries = |pin: &str| {
+                if flow {
+                    format!(
+                        "\n  - {{name: x, file: x.sql, at: {pin}}} # café\n  - {{name: y, file: y.sql, at: {BASE}}}"
+                    )
+                } else {
+                    format!(
+                        "\n  - name: x # café\n    file: x.sql\n    at: {pin} # keep\n  - name: y\n    file: y.sql\n    at: {BASE}"
+                    )
+                }
+            };
+            let text = pinned(&entries(&scalar));
+            let mut expected = TestManifest::parse(&text).unwrap();
+            let edited = expected.with_pin(&text, 0, &to).unwrap();
+            assert_eq!(edited, pinned(&entries(NEW)), "{scalar}");
+            expected.fixtures[0].at = to.clone();
+            assert_eq!(TestManifest::parse(&edited).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn a_block_pin_is_replaced_whole_without_consuming_the_following_entry() {
+    let to = CommitId::parse(NEW).unwrap();
+    for style in [">-", "|-", ">2-", "|2-"] {
+        for gap in ["", "\n"] {
+            let entries = |pin: &str| {
+                format!(
+                    "\n  - name: x # café\n    file: x.sql\n    at: {pin}\n{gap}  - name: y\n    file: y.sql\n    at: {BASE}"
+                )
+            };
+            let scalar = format!("{style}\n      {BASE}");
+            let text = pinned(&entries(&scalar));
+            let mut expected = TestManifest::parse(&text).unwrap();
+            let edited = expected.with_pin(&text, 0, &to).unwrap();
+            assert_eq!(
+                edited,
+                pinned(&entries(&format!("{style}\n      {NEW}"))),
+                "{style}"
+            );
+            expected.fixtures[0].at = to.clone();
+            assert_eq!(TestManifest::parse(&edited).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn a_pin_rewrite_preserves_plain_and_simply_quoted_spelling() {
+    let to = CommitId::parse(NEW).unwrap();
+    for old in [BASE.to_owned(), BASE.to_ascii_uppercase()] {
+        for quote in ["", "'", "\""] {
+            let entries = |pin: &str| {
+                format!(
+                    "\n  - {{name: x, file: x.sql, at: {quote}{pin}{quote}}} # keep\n  - {{name: y, file: y.sql, at: {BASE}}}"
+                )
+            };
+            let text = pinned(&entries(&old));
+            let manifest = TestManifest::parse(&text).unwrap();
+            assert_eq!(
+                manifest.with_pin(&text, 0, &to).unwrap(),
+                pinned(&entries(NEW))
+            );
+        }
+    }
+}
+
+#[test]
+fn an_escaped_pin_rewrite_refuses_changes_to_other_manifest_fields() {
+    let scalar = format!(r#""\x30{}""#, &BASE[1..]);
+    let text = pinned(&format!("\n  - name: x\n    file: x.sql\n    at: {scalar}"));
+    let manifest = TestManifest::parse(&text).unwrap();
+    let changed = text.replace("file: x.sql", "file: other.sql");
+    let reason = manifest
+        .with_pin(&changed, 0, &CommitId::parse(NEW).unwrap())
+        .unwrap_err();
+    assert!(reason.contains("only that pin changed"), "{reason}");
+}
+
+#[test]
 fn a_pin_equal_to_the_base_is_not_confused_with_the_base() {
     let text = pinned(&format!("\n  - name: x\n    file: x.sql\n    at: {BASE}"));
     let manifest = TestManifest::parse(&text).unwrap();
