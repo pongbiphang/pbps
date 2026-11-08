@@ -5590,7 +5590,7 @@ advancing a sequence from an IMMUTABLE routine at each site:
 | `INSERT` | CHECK, generated, every index key and filter, domain CHECKs, and the DEFAULT (column and domain) of a column the statement leaves out |
 | `UPDATE` | CHECK, every index key and filter, the generated expressions and domain CHECKs of the columns it sets |
 | `DELETE`, `TRUNCATE`, a cascaded `DELETE` | none |
-| a referential action's `UPDATE` | as an `UPDATE`, and the DEFAULT of the column `SET DEFAULT` sets |
+| a referential action's `UPDATE` | as an `UPDATE` of the columns it sets, and only for `SET DEFAULT` the DEFAULT of those columns (see below) |
 | a rewrite, `REINDEX`, `ANALYZE` | index keys and filters only |
 
 So a plan that only deletes is never refused for a CHECK, default, generated
@@ -5642,6 +5642,48 @@ a descendant inherits (not one it also declares itself, which stays), the
 clones of a partitioned parent's index, and every expression of a table the plan
 drops and of the partitions that go with it. A name alone excuses nothing: it
 must be the owner's.
+
+Referential actions, measured on 16.15 and 18.6, identically (2026-11-08), with
+a referencing table carrying a column DEFAULT, a CHECK, a generated column over
+the key, an index expression, a second column's DEFAULT, and a second
+referencing table whose key column is a domain with a CHECK and a DEFAULT:
+
+| action (ON UPDATE or ON DELETE) | writes | DEFAULT of the set columns | CHECK, generated, index, domain CHECK | domain DEFAULT |
+|---|---|---|---|---|
+| `CASCADE` | UPDATE (ON UPDATE); DELETE (ON DELETE) | no | yes (ON UPDATE); none (ON DELETE) | no |
+| `SET NULL` | UPDATE | no | yes | no |
+| `SET NULL (cols)`, `SET DEFAULT (cols)` | UPDATE of `cols` only | `SET DEFAULT` only, `cols` only | yes | `SET DEFAULT` only |
+| `SET DEFAULT` | UPDATE | yes | yes | yes |
+| `RESTRICT`, `NO ACTION` | nothing | no | none | no |
+
+The DEFAULT of a column the action does not set never runs. So the action kind
+is kept from the catalog (`confupdtype`, `confdeltype`) onto the statement, and
+the DEFAULT and the domain DEFAULT are judged only for `SET DEFAULT`, for the
+columns it sets (#2748). The same measurement of a partitioned table: an
+`INSERT`, and an `UPDATE` that moves no row, run the CHECKs and indexes of the
+one partition the row is in; a row that moves runs the destination's and
+nothing of the source's. Which partition is a fact of the row's values, which
+the plan's write does not carry, so every partition is judged: the one place
+a statement is judged for more than it runs, kept because the alternative is
+to admit what a different row would run.
+
+The arms of the site queries, against what each statement runs (#2748; every
+cell judged is a cell measured to run, except where a note says why not):
+
+| arm | `INSERT` | `UPDATE` | referential `UPDATE` | `DELETE` | rewrite |
+|---|---|---|---|---|---|
+| CHECK | all | all | all | none | none |
+| column DEFAULT | the columns left out | none | `SET DEFAULT`'s set columns | none | none |
+| generated | all | those of the set columns | those of the set columns | none | none |
+| index key, filter | all | all (see above) | all | none | all |
+| policy | `WITH CHECK` of the named table | `USING` and `WITH CHECK` of the named table | none | `USING` of the named table | none |
+| domain CHECK | all columns | the set columns | the set columns | none | none |
+| domain DEFAULT | left out, no DEFAULT of its own | none | `SET DEFAULT`'s set columns | none | none |
+
+The same holds for the copy of a rebuild, which lists its columns as an
+`INSERT` does. Partitions are judged whole (above), and the indexes of an
+`UPDATE` are all judged because a heap-only update may skip them depending on
+the data: both are conservative by design and say so.
 
 Every site kind has a step that removes it, and each is excused (#2748, a sweep
 of the plan's changes against the sites; all of them run before the rows, in

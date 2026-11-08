@@ -166,7 +166,14 @@ pub fn rewrite_write(change: &Change) -> Option<pbps_dialect::RowWrite> {
     match change {
         Change::CopyTableRows(copy) => Some(RowWrite {
             table: copy.target.name.clone(),
-            operation: RowOperation::Copy,
+            operation: RowOperation::Copy {
+                // The columns its `INSERT ... SELECT` lists.
+                columns: copy
+                    .columns
+                    .iter()
+                    .map(|column| column.target.name.clone())
+                    .collect(),
+            },
         }),
         Change::AnalyzeTableTree(tree) => Some(RowWrite {
             table: tree.parent.name.clone(),

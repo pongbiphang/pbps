@@ -102,3 +102,21 @@ fn the_shared_emission_entry_refuses_unbalanced_rebuild_conversions() {
     payload.columns[0].stages[0].using = Some(format!("({expression_name})"));
     assert!(emit(&pg, &copy, Strategy::default()).is_ok());
 }
+
+#[test]
+fn the_copy_names_the_columns_it_lists_so_the_guard_judges_the_defaults_of_the_rest() {
+    let pg = Postgres::new();
+    let mut changes = fixture::changes();
+    let _analyze = changes.pop().unwrap();
+    let copy = changes.pop().unwrap();
+    let statements = emit(&pg, &copy, Strategy::default()).unwrap();
+    let write = statements[0]
+        .rewrites
+        .as_ref()
+        .expect("the copy is a row write");
+    let listed: std::collections::BTreeSet<_> = [pbps_model::ColumnName::new("k")].into();
+    assert_eq!(
+        write.operation,
+        pbps_dialect::RowOperation::Copy { columns: listed }
+    );
+}

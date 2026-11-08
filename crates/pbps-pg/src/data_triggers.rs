@@ -256,7 +256,7 @@ pub async fn check(
 
 fn event(operation: &RowOperation) -> i16 {
     match operation {
-        RowOperation::Insert { .. } | RowOperation::Copy => INSERT,
+        RowOperation::Insert { .. } | RowOperation::Copy { .. } => INSERT,
         RowOperation::Update { .. } => UPDATE,
         RowOperation::Delete => DELETE,
         RowOperation::Rewrite => REWRITE,
@@ -266,7 +266,7 @@ fn event(operation: &RowOperation) -> i16 {
 /// Whether the operation writes through the trigger catalog at all. A rewrite
 /// and a copy into a table the plan created fire none the guard answers for.
 fn fires_triggers(operation: &RowOperation) -> bool {
-    !matches!(operation, RowOperation::Rewrite | RowOperation::Copy)
+    !matches!(operation, RowOperation::Rewrite | RowOperation::Copy { .. })
 }
 
 /// What one write reaches: the triggers it fires and the expressions it runs.
@@ -314,6 +314,10 @@ struct Statement {
     /// 16.15 and 18.6, #2748). Empty when the list is not known, which judges
     /// every DEFAULT, the conservative answer.
     supplied: BTreeSet<String>,
+    /// A referential action that is `SET DEFAULT`: the only action whose UPDATE
+    /// runs the DEFAULT of the columns it sets. `CASCADE` writes the new key and
+    /// `SET NULL` a NULL (#2748).
+    sets_default: bool,
     /// A referential action carries ONLY, and an INSERT has no descendants to
     /// reach but its partitions. Measured on PostgreSQL 18.6: a cascade updates
     /// and deletes partitions of the referencing table but never a plain
@@ -399,18 +403,20 @@ async fn walk(
             }
             RowOperation::Insert { .. }
             | RowOperation::Delete
-            | RowOperation::Copy
+            | RowOperation::Copy { .. }
             | RowOperation::Rewrite => BTreeSet::new(),
         },
         supplied: match &write.operation {
             RowOperation::Insert { columns } => {
                 columns.iter().map(|c| c.raw().to_owned()).collect()
             }
-            RowOperation::Update { .. }
-            | RowOperation::Delete
-            | RowOperation::Copy
-            | RowOperation::Rewrite => BTreeSet::new(),
+            // `INSERT ... SELECT` lists its columns as well.
+            RowOperation::Copy { columns } => columns.iter().map(|c| c.raw().to_owned()).collect(),
+            RowOperation::Update { .. } | RowOperation::Delete | RowOperation::Rewrite => {
+                BTreeSet::new()
+            }
         },
+        sets_default: false,
         partitions_only: false,
         rows_only: false,
     }]);
@@ -462,6 +468,7 @@ async fn walk(
                 columns: BTreeSet::new(),
                 // The INSERT half of a movement evaluates no default at all.
                 supplied: BTreeSet::new(),
+                sets_default: false,
                 partitions_only: statement.partitions_only,
                 rows_only: true,
             }));
@@ -881,12 +888,13 @@ async fn read_actions(
                  JOIN pg_catalog.pg_constraint declared ON declared.oid = a.above
                  WHERE declared.conparentid = 0
              ),
-             edges(constraint_oid, referencing, declared_on, cascades, written) AS (
+             edges(constraint_oid, referencing, declared_on, cascades, written, sets_default) AS (
                  SELECT con.oid, con.conrelid, declared.conrelid,
                         {events} = {delete} AND con.confdeltype = 'c',
                         CASE WHEN {events} = {delete} AND con.confdelsetcols IS NOT NULL
                                   AND con.confdelsetcols <> '{{}}'::pg_catalog.int2[]
-                             THEN con.confdelsetcols ELSE con.conkey END
+                             THEN con.confdelsetcols ELSE con.conkey END,
+                        (CASE WHEN {events} = {delete} THEN con.confdeltype ELSE con.confupdtype END) = 'd'
                  FROM pg_catalog.pg_constraint con
                  JOIN relations r ON r.oid = con.confrelid
                  JOIN tops ON tops.copy = con.oid
@@ -967,6 +975,7 @@ async fn read_actions(
              SELECT DISTINCT e.constraint_oid::int8 AS constraint_oid,
                     e.declared_on::int8 AS relation,
                     (CASE WHEN e.cascades THEN {delete} ELSE {update} END)::int2 AS event,
+                    e.sets_default AS sets_default,
                     a.attname AS column_name
              FROM edges e
              LEFT JOIN pg_catalog.pg_attribute a
@@ -982,28 +991,32 @@ async fn read_actions(
         .await?;
     // One statement per constraint: merging two constraints' column sets would
     // authenticate each against columns only the other one writes.
-    let mut derived: BTreeMap<(i64, i64, i16), BTreeSet<String>> = BTreeMap::new();
+    let mut derived: BTreeMap<(i64, i64, i16), (bool, BTreeSet<String>)> = BTreeMap::new();
     for row in &rows {
         let key = (
             row.try_get::<i64>("constraint_oid")?.ok_or_else(missing)?,
             row.try_get::<i64>("relation")?.ok_or_else(missing)?,
             row.try_get::<i16>("event")?.ok_or_else(missing)?,
         );
-        let columns = derived.entry(key).or_default();
+        let (sets_default, columns) = derived.entry(key).or_default();
+        *sets_default = row.try_get::<bool>("sets_default")?.ok_or_else(missing)?;
         if let Some(column) = row.try_get::<&str>("column_name")? {
             columns.insert(column.to_owned());
         }
     }
     Ok(derived
         .into_iter()
-        .map(|((_, relation, event), columns)| Statement {
-            relation,
-            event,
-            columns,
-            supplied: BTreeSet::new(),
-            partitions_only: true,
-            rows_only: false,
-        })
+        .map(
+            |((_, relation, event), (sets_default, columns))| Statement {
+                relation,
+                event,
+                columns,
+                supplied: BTreeSet::new(),
+                sets_default,
+                partitions_only: true,
+                rows_only: false,
+            },
+        )
         .collect())
 }
 
@@ -1175,7 +1188,8 @@ fn site_arms(
     // A movement's INSERT half evaluates no default, and a referential action
     // is the engine's own statement, which row security does not apply to
     // (measured on 16 and 18).
-    let defaults = (insert && !statement.rows_only) || (update && through_an_action);
+    let defaults =
+        (insert && !statement.rows_only) || (update && through_an_action && statement.sets_default);
     let policies = (insert || update || delete) && !through_an_action && !statement.rows_only;
     // An UPDATE runs the generated expressions and domain checks of the columns
     // it sets (and of the ones those feed); an INSERT, every one.
@@ -1567,6 +1581,7 @@ mod tests {
             event,
             columns: BTreeSet::from(["b".to_owned()]),
             supplied: BTreeSet::new(),
+            sets_default: false,
             partitions_only: false,
             rows_only,
         }
@@ -1616,6 +1631,16 @@ mod tests {
         );
     }
 
+    /// The kinds a referential action's UPDATE is judged for.
+    fn action_kinds(sets_default: bool) -> BTreeSet<String> {
+        let mut action = statement(UPDATE, false);
+        action.sets_default = sets_default;
+        let (_, arms) = site_arms(&action, true, &Dropped::default());
+        arms.iter()
+            .map(|arm| arm.split('\'').nth(1).expect("a labelled query").to_owned())
+            .collect()
+    }
+
     #[test]
     fn an_update_runs_no_default_unless_a_referential_action_sets_it() {
         let own = set(&[
@@ -1627,21 +1652,21 @@ mod tests {
             "domain_check",
         ]);
         assert_eq!(kinds(UPDATE, false, false), own);
-        // The engine's own statement: `SET DEFAULT` evaluates the column's
-        // default, which a column of a domain takes from the domain, and row
-        // security does not apply (measured on 16 and 18).
-        assert_eq!(
-            kinds(UPDATE, false, true),
-            set(&[
-                "check",
-                "default",
-                "generated",
-                "index_key",
-                "index_filter",
-                "domain_check",
-                "domain_default"
-            ])
-        );
+        // The engine's own statement, and row security does not apply to it
+        // (measured on 16 and 18). Only `SET DEFAULT` evaluates the default of
+        // the columns it sets, which a column of a domain takes from the domain;
+        // `CASCADE` writes the new key and `SET NULL` a NULL (#2748).
+        let without = set(&[
+            "check",
+            "generated",
+            "index_key",
+            "index_filter",
+            "domain_check",
+        ]);
+        assert_eq!(action_kinds(false), without);
+        let mut with = without.clone();
+        with.extend(set(&["default", "domain_default"]));
+        assert_eq!(action_kinds(true), with);
     }
 
     #[test]
@@ -2020,8 +2045,11 @@ mod tests {
             columns: BTreeSet::new()
         }));
         assert!(!fires_triggers(&RowOperation::Rewrite));
-        assert!(!fires_triggers(&RowOperation::Copy));
-        assert_eq!(event(&RowOperation::Copy), INSERT);
+        let copy = RowOperation::Copy {
+            columns: BTreeSet::new(),
+        };
+        assert!(!fires_triggers(&copy));
+        assert_eq!(event(&copy), INSERT);
         assert_eq!(event(&RowOperation::Rewrite), REWRITE);
     }
 }

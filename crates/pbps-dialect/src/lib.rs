@@ -455,8 +455,11 @@ pub enum RowOperation {
     /// A bulk `INSERT … SELECT` into a table the plan created (the copy of a
     /// rebuild). Its expressions run as a row insert's do; the triggers of a
     /// table that did not exist before the plan are not the guard's concern
-    /// (#2563, DEC-2563.9).
-    Copy,
+    /// (#2563, DEC-2563.9). It names the columns it copies, and a column it
+    /// supplies runs no DEFAULT, exactly as for an `Insert` (#2748).
+    Copy {
+        columns: std::collections::BTreeSet<pbps_model::ColumnName>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

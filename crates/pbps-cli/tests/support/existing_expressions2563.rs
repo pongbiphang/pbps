@@ -182,7 +182,9 @@ fn each_statement_is_judged_for_exactly_the_expressions_it_runs() {
             ),
             (
                 "a bulk copy into a table runs what an INSERT runs",
-                RowOperation::Copy,
+                RowOperation::Copy {
+                    columns: Default::default(),
+                },
                 vec![
                     "app.f_check(integer)",
                     "app.f_default()",
@@ -1127,6 +1129,27 @@ fn an_insert_judges_the_default_only_of_a_column_it_leaves_out() {
                 set(&[defa, defb]),
                 "PG{version}: unknown"
             );
+            // The copy of a rebuild lists its columns as an INSERT does.
+            let copied = |columns: &[&str]| RowOperation::Copy {
+                columns: columns.iter().map(|c| (*c).into()).collect(),
+            };
+            for (columns, expected) in [
+                (&["id", "a", "b"][..], set(&[])),
+                (&["id", "a"][..], set(&[defb])),
+                (&[][..], set(&[defa, defb])),
+            ] {
+                let got = names(
+                    &plan_time(
+                        &mut conn,
+                        "app.t",
+                        copied(columns),
+                        &Dropped::default(),
+                        None,
+                    )
+                    .await,
+                );
+                assert_eq!(got, expected, "PG{version}: a copy of {columns:?}");
+            }
             // The domain's DEFAULT is for a column with none of its own that the
             // statement leaves out.
             assert_eq!(ask!("app.u", &["id"]), set(&[defx, dom]), "PG{version}");
@@ -1559,6 +1582,145 @@ fn a_dropped_inherited_column_or_a_detached_partition_excuses_what_it_carried() 
             // The recheck allows no detach: all of it is still reached.
             let at = names(&at_the_statement(&mut conn, "app.pt").await);
             assert_eq!(at, set(&[check, cchk]), "PG{version}: at the statement");
+        });
+    });
+}
+
+/// What a referential action's UPDATE runs on the referencing table (#2748).
+/// Measured on 16 and 18 (DEC-2563.9): the CHECKs, the indexes and the generated
+/// and domain CHECKs of the columns it sets run for `CASCADE`, `SET NULL` and
+/// `SET DEFAULT`; the DEFAULT of those columns, and the DEFAULT their domain
+/// gives one without its own, only for `SET DEFAULT`; a cascaded DELETE runs
+/// nothing; `RESTRICT` and `NO ACTION` write nothing.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_referential_action_judges_the_default_only_when_it_sets_the_default() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-fk-{version}"));
+        let actions = [
+            ("cascade", "CASCADE"),
+            ("setnull", "SET NULL"),
+            ("setdefault", "SET DEFAULT"),
+            ("restrict", "RESTRICT"),
+            ("noaction", "NO ACTION"),
+        ];
+        let mut sql = String::from(
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_dom(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_defa() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 2; END$$;
+             CREATE FUNCTION app.f_defb() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 2; END$$;
+             CREATE FUNCTION app.f_domdef() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 2; END$$;
+             CREATE DOMAIN app.dm AS integer DEFAULT app.f_domdef() CONSTRAINT dmc CHECK (app.f_dom(VALUE));",
+        );
+        for (key, action) in actions {
+            sql.push_str(&format!(
+                "CREATE TABLE app.p_{key} (id integer PRIMARY KEY);
+                 CREATE TABLE app.c_{key} (id integer PRIMARY KEY, pid integer DEFAULT app.f_defa(),
+                     CONSTRAINT ck_{key} CHECK (app.f_check(pid)),
+                     FOREIGN KEY (pid) REFERENCES app.p_{key} (id)
+                         ON UPDATE {action} ON DELETE {action});
+                 CREATE TABLE app.d_{key} (id integer PRIMARY KEY, pid app.dm,
+                     FOREIGN KEY (pid) REFERENCES app.p_{key} (id)
+                         ON UPDATE {action} ON DELETE {action});"
+            ));
+        }
+        // A column list (PostgreSQL 15 and later): only `b` is set, `a` keeps its value.
+        for (key, action) in [("lnull", "SET NULL"), ("ldefault", "SET DEFAULT")] {
+            sql.push_str(&format!(
+                "CREATE TABLE app.p_{key} (a integer, b integer, PRIMARY KEY (a, b));
+                 CREATE TABLE app.c_{key} (id integer PRIMARY KEY,
+                     a integer DEFAULT app.f_defb(), b integer DEFAULT app.f_defa(),
+                     CONSTRAINT ck_{key} CHECK (app.f_check(a)),
+                     FOREIGN KEY (a, b) REFERENCES app.p_{key} (a, b) ON DELETE {action} (b));"
+            ));
+        }
+        on_server(own.connection(), &sql);
+        let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+            routines.iter().copied().collect()
+        };
+        let (check, dom, defa, defb, domdef) = (
+            "app.f_check(integer)",
+            "app.f_dom(integer)",
+            "app.f_defa()",
+            "app.f_defb()",
+            "app.f_domdef()",
+        );
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            // (action, what an UPDATE of the referenced key runs, what a DELETE runs)
+            let expected = [
+                ("cascade", set(&[check, dom]), set(&[])),
+                ("setnull", set(&[check, dom]), set(&[check, dom])),
+                (
+                    "setdefault",
+                    set(&[check, dom, defa, domdef]),
+                    set(&[check, dom, defa, domdef]),
+                ),
+                ("restrict", set(&[]), set(&[])),
+                ("noaction", set(&[]), set(&[])),
+            ];
+            for (key, on_update, on_delete) in expected {
+                let table = format!("app.p_{key}");
+                let updated = names(
+                    &plan_time(
+                        &mut conn,
+                        &table,
+                        update(&["id"]),
+                        &Dropped::default(),
+                        None,
+                    )
+                    .await,
+                );
+                assert_eq!(updated, on_update, "PG{version}: ON UPDATE {key}");
+                let deleted = names(
+                    &plan_time(
+                        &mut conn,
+                        &table,
+                        RowOperation::Delete,
+                        &Dropped::default(),
+                        None,
+                    )
+                    .await,
+                );
+                assert_eq!(deleted, on_delete, "PG{version}: ON DELETE {key}");
+            }
+            // The column list: `a` is not set, so its default is not run.
+            for (key, expected) in [("lnull", set(&[check])), ("ldefault", set(&[check, defa]))] {
+                let deleted = names(
+                    &plan_time(
+                        &mut conn,
+                        &format!("app.p_{key}"),
+                        RowOperation::Delete,
+                        &Dropped::default(),
+                        None,
+                    )
+                    .await,
+                );
+                assert_eq!(deleted, expected, "PG{version}: column list {key}");
+                assert!(
+                    !deleted.contains(defb),
+                    "PG{version}: {key} judged a default it does not run"
+                );
+            }
+            // The recheck just before the statement judges the same.
+            let at = names(&at_the_statement_of(&mut conn, "app.p_cascade", update(&["id"])).await);
+            assert_eq!(
+                at,
+                set(&[check, dom]),
+                "PG{version}: cascade at the statement"
+            );
+            let at =
+                names(&at_the_statement_of(&mut conn, "app.p_setdefault", update(&["id"])).await);
+            assert_eq!(
+                at,
+                set(&[check, dom, defa, domdef]),
+                "PG{version}: set default at the statement"
+            );
         });
     });
 }
