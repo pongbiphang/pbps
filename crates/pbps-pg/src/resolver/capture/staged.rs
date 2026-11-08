@@ -135,60 +135,10 @@ pub async fn compare(
     managed: &[&Managed],
     filled: &BTreeSet<String>,
 ) -> Result<Staged, StageError> {
-    let mut resolved: BTreeMap<ObjectIdentity, String> = BTreeMap::new();
-    let mut refused = Vec::new();
-    let staged = read(scratch, |catalog| {
-        for object in &created.roots {
-            match comparable(catalog, object) {
-                Some(identity) => {
-                    resolved.insert(identity, object.described.clone());
-                }
-                None if filled.contains(&object.described) => refused.push(format!(
-                    "fill created {}, which the comparison with the target does not cover; \
-                     select no resolver and keep ADR-0013's conservative rebuild",
-                    object.described
-                )),
-                None => refused.push(format!(
-                    "the externals file created {}, which the comparison with the target does not \
-                     cover; leave it out of the externals file",
-                    object.described
-                )),
-            }
-        }
-        // An extension's members are one closure: a plan that reads the
-        // extension seals every member, and the capture refuses a member it
-        // has no identity for rather than leave it out (the foreign-data
-        // wrapper `postgres_fdw` brings). Named here, where the remedy is
-        // known, rather than as a capture failure later.
-        for object in &created.members {
-            match comparable(catalog, object) {
-                Some(identity) => {
-                    resolved.insert(identity, object.described.clone());
-                }
-                None if filled.contains(&object.described) => refused.push(format!(
-                    "fill created {}, an extension's member the comparison with the target \
-                     cannot read, so no plan can seal its extension; select no resolver and \
-                     keep ADR-0013's conservative rebuild",
-                    object.described
-                )),
-                None => refused.push(format!(
-                    "the externals file created {}, an extension's member the comparison with the \
-                     target cannot read, so no plan can seal its extension; leave the \
-                     extension out of the externals file, or select no resolver",
-                    object.described
-                )),
-            }
-        }
-        // A refusal stands without reading further: the read follows each
-        // retained extension's members, and fails on the one just named.
-        if refused.is_empty() {
-            resolved.keys().cloned().collect()
-        } else {
-            BTreeSet::new()
-        }
-    })
-    .await
-    .map_err(StageError::Capture)?;
+    let (staged, (resolved, mut refused)) =
+        read(scratch, |catalog| resolve_created(catalog, created, filled))
+            .await
+            .map_err(StageError::Capture)?;
     for (identity, described) in &resolved {
         if managed.iter().any(|m| m.names(identity)) {
             refused.push(format!(
@@ -200,20 +150,9 @@ pub async fn compare(
     if !refused.is_empty() {
         return Err(StageError::Refused(refused));
     }
-    let mut absent = Vec::new();
-    let on_target = read(target, |catalog| {
-        let mut present = BTreeSet::new();
-        for identity in resolved.keys() {
-            if exists(catalog, identity) {
-                present.insert(identity.clone());
-            } else {
-                absent.push(identity.clone());
-            }
-        }
-        present
-    })
-    .await
-    .map_err(StageError::Capture)?;
+    let (on_target, absent) = read(target, |catalog| presence(catalog, &resolved))
+        .await
+        .map_err(StageError::Capture)?;
     let mut findings: Vec<String> = absent
         .iter()
         .map(|identity| {
@@ -258,31 +197,110 @@ pub async fn compare(
     }
 }
 
+/// What the externals file created, as one catalog snapshot names it: the
+/// identities to retain, with the roots and members it could resolve and the
+/// refusals for those it could not. Facts of this snapshot only (a fresh pair
+/// per call), which [`read`] hands back for the accepted attempt alone.
+type Resolved = (BTreeMap<ObjectIdentity, String>, Vec<String>);
+
+fn resolve_created(
+    catalog: &Catalog,
+    created: &Created,
+    filled: &BTreeSet<String>,
+) -> (BTreeSet<ObjectIdentity>, Resolved) {
+    let mut resolved: BTreeMap<ObjectIdentity, String> = BTreeMap::new();
+    let mut refused = Vec::new();
+    for object in &created.roots {
+        match comparable(catalog, object) {
+            Some(identity) => {
+                resolved.insert(identity, object.described.clone());
+            }
+            None if filled.contains(&object.described) => refused.push(format!(
+                "fill created {}, which the comparison with the target does not cover; \
+                 select no resolver and keep ADR-0013's conservative rebuild",
+                object.described
+            )),
+            None => refused.push(format!(
+                "the externals file created {}, which the comparison with the target does not \
+                 cover; leave it out of the externals file",
+                object.described
+            )),
+        }
+    }
+    // An extension's members are one closure: a plan that reads the
+    // extension seals every member, and the capture refuses a member it
+    // has no identity for rather than leave it out (the foreign-data
+    // wrapper `postgres_fdw` brings). Named here, where the remedy is
+    // known, rather than as a capture failure later.
+    for object in &created.members {
+        match comparable(catalog, object) {
+            Some(identity) => {
+                resolved.insert(identity, object.described.clone());
+            }
+            None if filled.contains(&object.described) => refused.push(format!(
+                "fill created {}, an extension's member the comparison with the target \
+                 cannot read, so no plan can seal its extension; select no resolver and \
+                 keep ADR-0013's conservative rebuild",
+                object.described
+            )),
+            None => refused.push(format!(
+                "the externals file created {}, an extension's member the comparison with the \
+                 target cannot read, so no plan can seal its extension; leave the \
+                 extension out of the externals file, or select no resolver",
+                object.described
+            )),
+        }
+    }
+    // A refusal stands without reading further: the read follows each
+    // retained extension's members, and fails on the one just named.
+    let retained = if refused.is_empty() {
+        resolved.keys().cloned().collect()
+    } else {
+        BTreeSet::new()
+    };
+    (retained, (resolved, refused))
+}
+
+/// Which of the resolved objects one target snapshot holds, and which it does
+/// not (the second list). Again facts of this snapshot only.
+fn presence(
+    catalog: &Catalog,
+    resolved: &BTreeMap<ObjectIdentity, String>,
+) -> (BTreeSet<ObjectIdentity>, Vec<ObjectIdentity>) {
+    let mut present = BTreeSet::new();
+    let mut absent = Vec::new();
+    for identity in resolved.keys() {
+        if exists(catalog, identity) {
+            present.insert(identity.clone());
+        } else {
+            absent.push(identity.clone());
+        }
+    }
+    (present, absent)
+}
+
 /// One owned snapshot of `retained`, as `choose` picks it from the catalog.
-async fn read(
+/// `choose` returns, with the identities it retains, the facts it found in
+/// that same catalog; only the accepted attempt's come back, so nothing it
+/// found in a snapshot the capture rejected can reach the comparison.
+async fn read<T>(
     conn: &mut impl QueryConnection,
-    choose: impl FnOnce(&Catalog) -> BTreeSet<ObjectIdentity>,
-) -> Result<CapturedInputs, CaptureError> {
-    let mut prepared = None;
-    let mut chosen = None;
-    let read = super::read::owned(conn, &BTreeSet::new(), |catalog, major| {
-        let scope = CaptureScope {
-            retained: choose(catalog),
-            candidates: BTreeSet::new(),
-        };
-        let mut result = super::scope::prepare(catalog, major, &scope)?;
-        let selection = std::mem::take(&mut result.render);
-        prepared = Some(result);
-        chosen = Some(scope);
-        Ok(selection)
-    })
-    .await?;
-    super::manifest::finish(
-        read,
-        prepared.ok_or(CaptureError::Incomplete)?,
-        chosen.ok_or(CaptureError::Incomplete)?,
-    )
-    .map_err(CaptureError::Coverage)
+    mut choose: impl FnMut(&Catalog) -> (BTreeSet<ObjectIdentity>, T),
+) -> Result<(CapturedInputs, T), CaptureError> {
+    let (read, (prepared, chosen, facts)) =
+        super::read::owned_with(conn, &BTreeSet::new(), |catalog, major| {
+            let (retained, facts) = choose(catalog);
+            let scope = CaptureScope {
+                retained,
+                candidates: BTreeSet::new(),
+            };
+            let mut result = super::scope::prepare(catalog, major, &scope)?;
+            let selection = std::mem::take(&mut result.render);
+            Ok((selection, (result, scope, facts)))
+        })
+        .await?;
+    let inputs = super::manifest::finish(read, prepared, chosen).map_err(CaptureError::Coverage)?;
+    Ok((inputs, facts))
 }
 
 /// The identity of a created object the comparison can read, or `None`: a
@@ -942,5 +960,168 @@ mod tests {
             shapes(&labels([(1.0, "a"), (2.0, "b")]), &roots),
             shapes(&labels([(2.0, "a"), (1.0, "b")]), &roots)
         );
+    }
+
+    /// Runs `sql` on a second session, which commits it, and returns the
+    /// OID of the table it names. The qualify hook is synchronous and runs
+    /// between the first catalog read and the closing witness, so this places
+    /// a real commit in the window without any sleep deciding the order.
+    fn arrives(connection: &str, sql: &str, table: &str) -> u32 {
+        let (connection, sql, table) = (connection.to_owned(), sql.to_owned(), table.to_owned());
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut writer = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+                        .await
+                        .unwrap();
+                    writer.execute(&sql).await.unwrap();
+                    let rows = writer
+                        .query(&format!("SELECT '{table}'::regclass::oid::text AS oid"))
+                        .await
+                        .unwrap();
+                    rows[0]
+                        .try_get::<&str>("oid")
+                        .unwrap()
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// #2715 round 1. An object that arrives between the first read and the
+    /// closing witness makes the first attempt `Changed`; the retry reads it,
+    /// and the comparison must then be made on the retry's facts alone. With
+    /// facts left behind by the rejected snapshot, `absent` named an object the
+    /// target now has, and `refused` an object the scratch now resolves, and a
+    /// valid plan was refused.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_target_object_that_arrives_mid_read_leaves_no_stale_absent_behind() {
+        arrival(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn a_scratch_object_that_arrives_mid_read_leaves_no_stale_refusal_behind() {
+        arrival(false).await;
+    }
+
+    async fn arrival(target_side: bool) {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let name = format!(
+                "pbps_stage2715_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let mut admin = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .unwrap();
+            let task =
+                tokio::spawn(arrival_cases(format!("{base} dbname={name}"), target_side)).await;
+            admin
+                .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .await
+                .unwrap();
+            task.expect("arrival fixture failed after cleanup");
+        }
+    }
+
+    async fn arrival_cases(connection: String, target_side: bool) {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        conn.execute("CREATE SCHEMA app").await.unwrap();
+
+        if target_side {
+            // Target side: the table is missing from the first snapshot and exists
+            // in the second, so the accepted facts name nothing absent.
+            let wanted =
+                BTreeMap::from([(id("pg_class", &["app", "late"], vec![]), "table".into())]);
+            let mut calls = 0;
+            let (_, absent) = read(&mut conn, |catalog| {
+                calls += 1;
+                if calls == 1 {
+                    arrives(&connection, "CREATE TABLE app.late (id int)", "app.late");
+                }
+                presence(catalog, &wanted)
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls, 2, "the arrival is a change, read again");
+            assert!(
+                absent.is_empty(),
+                "stale absent from the rejected read: {absent:?}"
+            );
+
+            // Negative: an object that never arrives is still named absent, once.
+            let never =
+                BTreeMap::from([(id("pg_class", &["app", "never"], vec![]), "table".into())]);
+            let (_, absent) = read(&mut conn, |catalog| presence(catalog, &never))
+                .await
+                .unwrap();
+            assert_eq!(absent.len(), 1, "{absent:?}");
+
+            return;
+        }
+        // Scratch side: the created object is unknown to the first snapshot
+        // (`comparable` is `None`, so it would be refused) and resolved in the
+        // second.
+        let mut calls = 0;
+        let mut oid = None;
+        let (_, (resolved, refused)) = read(&mut conn, |catalog| {
+            calls += 1;
+            if calls == 1 {
+                oid = Some(arrives(
+                    &connection,
+                    "CREATE TABLE app.made (id int)",
+                    "app.made",
+                ));
+            }
+            let created = Created {
+                roots: BTreeSet::from([Object {
+                    catalog: "pg_class".into(),
+                    oid: oid.unwrap(),
+                    described: "table app.made".into(),
+                }]),
+                ..Created::default()
+            };
+            resolve_created(catalog, &created, &BTreeSet::new())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(
+            refused.is_empty(),
+            "stale refusal from the rejected read: {refused:?}"
+        );
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+
+        // Negative: a root the snapshot cannot resolve is still refused by
+        // name when nothing arrives.
+        let (_, (resolved, refused)) = read(&mut conn, |catalog| {
+            let created = Created {
+                roots: BTreeSet::from([Object {
+                    catalog: "pg_class".into(),
+                    oid: 4_000_000_000,
+                    described: "table app.nowhere".into(),
+                }]),
+                ..Created::default()
+            };
+            resolve_created(catalog, &created, &BTreeSet::new())
+        })
+        .await
+        .unwrap();
+        assert!(resolved.is_empty());
+        assert_eq!(refused.len(), 1, "{refused:?}");
     }
 }

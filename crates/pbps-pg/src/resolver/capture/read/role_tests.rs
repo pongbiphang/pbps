@@ -4,7 +4,7 @@
 use super::*;
 use pbps_db::{Conn, Driver};
 
-fn committed(connection: &str, sql: String) -> Result<(), Failure> {
+pub(super) fn committed(connection: &str, sql: String) -> Result<(), Failure> {
     let connection = connection.to_owned();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -189,7 +189,7 @@ async fn exercise(
             format!("REVOKE {subject} FROM {member}"),
         ),
     ] {
-        let observed = owned(
+        let observed = owned_once(
             &mut conn,
             &std::collections::BTreeSet::new(),
             |catalog, _| {
@@ -213,7 +213,7 @@ async fn exercise(
     // Membership removal has its own physical witness, even when both public
     // role records retain the same identity and properties.
     committed(&connection, format!("GRANT {subject} TO {member}")).unwrap();
-    let revoked = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
+    let revoked = owned_once(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(&connection, format!("REVOKE {subject} FROM {member}"))?;
         Ok(Selection::default())
     })
@@ -225,7 +225,7 @@ async fn exercise(
 
     // Equality of safe public values is not a history/ABA detector. Do not
     // acquire password-verifier access to claim a stronger interval boundary.
-    let restored = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
+    let restored = owned_once(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(
             &connection,
             format!("ALTER ROLE {subject} NOINHERIT; ALTER ROLE {subject} INHERIT"),
@@ -237,7 +237,7 @@ async fn exercise(
         restored.is_ok(),
         "restored public values are an explicit observation limit"
     );
-    let unreadable = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
+    let unreadable = owned_once(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(
             &connection,
             "REVOKE SELECT ON pg_catalog.pg_roles FROM PUBLIC".into(),

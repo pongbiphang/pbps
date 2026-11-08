@@ -296,7 +296,7 @@ async fn exercise(connection: String, (owner, group, reader): (String, String, S
     // A committed change between the raw snapshot and rendering cannot use
     // live catalog caches to qualify a different recipe than we captured.
     let writer = connection.clone();
-    let result = super::super::read::owned(
+    let result = super::super::read::owned_once(
         &mut conn,
         &std::collections::BTreeSet::new(),
         |catalog, major| {
