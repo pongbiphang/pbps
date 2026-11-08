@@ -592,7 +592,7 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     }
 }
 
-fn compare(
+pub(super) fn compare(
     data: &mut TestData,
     rows: usize,
     original: &snapshot::Snapshot,
@@ -606,7 +606,7 @@ fn compare(
             format!(
                 "`{}` differs: original {} rows, proposed {} rows, {} differing row(s) shown{}; \
                  the edited fixture does not leave the original data",
-                t.table,
+                Escaped(&t.table),
                 t.original_rows,
                 t.proposed_rows,
                 t.differences.len(),
@@ -622,8 +622,8 @@ fn compare(
             format!(
                 "sequence `{}` (used by {}) hands out {} next in the original and {} in the \
                  proposed; a later fixture would get different values",
-                a.sequence,
-                a.used_by.as_deref().unwrap_or("no table"),
+                Escaped(&a.sequence),
+                Escaped(a.used_by.as_deref().unwrap_or("no table")),
                 a.original_next.as_deref().unwrap_or("nothing"),
                 a.proposed_next.as_deref().unwrap_or("nothing")
             ),

@@ -82,7 +82,7 @@ pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Resu
             let count = row.try_get::<&str>("n")?.context("a row has no count")?;
             rows.insert(cells, count.parse::<u64>()?);
         }
-        tables.insert(name.shown().to_string(), Rows { columns, rows });
+        tables.insert(name.raw().to_string(), Rows { columns, rows });
     }
     // The ledger's own tables are not managed: their allocator differs between
     // a replay and a bootstrap by construction. Every other user sequence is
@@ -141,7 +141,7 @@ pub(super) async fn read(session: &Session<'_>, schema: &Schema) -> anyhow::Resu
         insert(
             &mut allocators,
             Allocator {
-                name: shown,
+                name: name.raw().to_string(),
                 used_by,
                 next,
             },
@@ -169,7 +169,7 @@ async fn read_mssql(session: &Session<'_>, schema: &Schema) -> anyhow::Result<Sn
     for name in schema.tables.keys() {
         let read = sql::read_table(&mut conn, &name.schema, &name.name).await?;
         tables.insert(
-            name.shown().to_string(),
+            name.raw().to_string(),
             Rows {
                 columns: read.columns,
                 rows: read.rows,

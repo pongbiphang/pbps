@@ -826,8 +826,8 @@ jobs:
                   --ignored --test-threads=1 plan_test::session::mssql_tests \
                   test_scratch::tests::live_mssql 2>&1)
           echo "$out"
-          echo "$out" | grep -qE '^test result: ok\. 7 passed' || {
-            echo "expected the seven owned SQL Server tests to run and pass" >&2
+          echo "$out" | grep -qE '^test result: ok\. 8 passed' || {
+            echo "expected the eight owned SQL Server tests to run and pass" >&2
             exit 1
           }
       # The public command on the same owned SQL Server (#1165 F2, F3), asserted too.
