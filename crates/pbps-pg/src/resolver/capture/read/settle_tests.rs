@@ -139,7 +139,11 @@ async fn exercise(connection: String, name: String) {
         "the older seal must still refuse the changed role"
     );
 
-    // Churn on every attempt: refused by name after exactly the bound.
+    // Churn on every attempt: refused by name within the bound. On a slow
+    // server the time budget can end the loop before the attempt bound does,
+    // which is equally correct, so this asserts that the refusal names the
+    // reads actually made rather than a fixed five. The exact attempt bound
+    // and the time bound are pinned without a server by the unit test above.
     let mut calls = 0;
     let started = Instant::now();
     let refused = owned(&mut conn, &none, |_, _| {
@@ -148,12 +152,19 @@ async fn exercise(connection: String, name: String) {
         Ok(Selection::default())
     })
     .await;
-    assert_eq!(calls, 5, "exactly the bound");
+    assert!((1..=ATTEMPTS).contains(&calls), "within the bound: {calls}");
     let message = match refused {
-        Err(error @ Failure::Unsettled { .. }) => error.to_string(),
+        Err(error @ Failure::Unsettled { attempts, seconds }) => {
+            assert_eq!(attempts, calls, "the refusal names the reads made");
+            assert_eq!(seconds, BUDGET.as_secs());
+            error.to_string()
+        }
         other => panic!("endless churn must be Unsettled, got {:?}", other.err()),
     };
-    assert!(message.contains("5 reads over 10 s"), "{message}");
+    assert!(
+        message.contains(&format!("{calls} reads over {} s", BUDGET.as_secs())),
+        "{message}"
+    );
     assert!(started.elapsed() < BUDGET + Duration::from_secs(5));
 
     // Anything but a changed catalog is returned after one attempt.
