@@ -934,6 +934,11 @@ mod tests {
 }
 
 #[cfg(test)]
+mod test_support {
+    include!("../tests/support/refused_endpoint.rs");
+}
+
+#[cfg(test)]
 mod socket_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1012,13 +1017,8 @@ mod socket_tests {
     #[tokio::test]
     async fn a_refusal_outranks_the_clock_and_only_silence_is_a_timeout() {
         let (dead, _listener, _queued) = black_hole().await;
-        // Bound and dropped: nothing is listening, so the port refuses.
-        let refused: SocketAddr = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("a listener");
-            listener.local_addr().expect("the bound address")
-        };
+        let socket = crate::test_support::refused_endpoint();
+        let refused = socket.local_addr().expect("the reserved address");
 
         let error = connect_any("name:0", vec![dead, refused], Duration::from_millis(600))
             .await
