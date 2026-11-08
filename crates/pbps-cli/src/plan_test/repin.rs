@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use pbps_config::test_manifest::{CommitId, ManifestError};
+use pbps_model::escape::Escaped;
 use sha2::{Digest as _, Sha256};
 
 use super::execution::{Control, elapsed, ms};
@@ -78,7 +79,7 @@ fn baseline(
     .chain(inputs.frozen.fixtures.iter().enumerate().map(|(i, f)| {
         let same = (i != index).then_some(f.text.as_bytes());
         (
-            format!("fixture `{}`", f.name),
+            format!("fixture `{}`", Escaped(&f.name)),
             f.file.path.as_str(),
             Role::Fixture,
             same,
@@ -97,9 +98,11 @@ fn baseline(
         let declared = declared_path(dir, &declared.file);
         if declared != f.file.path {
             refusals.extend(refuse(format!(
-                "fixture `{}` is declared at `{declared}` but resolves to `{}`; a re-pin needs \
+                "fixture `{}` is declared at `{}` but resolves to `{}`; a re-pin needs \
                  a plain file there, not a link",
-                f.name, f.file.path
+                Escaped(&f.name),
+                Escaped(&declared),
+                Escaped(&f.file.path)
             )));
         }
     }
@@ -113,20 +116,24 @@ fn baseline(
             })?;
         match committed {
             None => refusals.extend(refuse(format!(
-                "{what} (`{path}`) is not committed at HEAD; commit the original first"
+                "{what} (`{}`) is not committed at HEAD; commit the original first",
+                Escaped(path)
             ))),
             Some((bytes, _)) if same.is_some_and(|w| w != bytes) => {
                 refusals.extend(refuse(format!(
-                    "{what} (`{path}`) has uncommitted changes; a re-pin edits one pin and one \
-                 fixture, so commit or revert them first"
+                    "{what} (`{}`) has uncommitted changes; a re-pin edits one pin and one \
+                 fixture, so commit or revert them first",
+                    Escaped(path)
                 )))
             }
             Some((bytes, file)) => {
                 if same.is_none() {
                     match String::from_utf8(bytes) {
                         Ok(text) => old_sql = text,
-                        Err(_) => refusals
-                            .extend(refuse(format!("the committed `{path}` is not valid UTF-8"))),
+                        Err(_) => refusals.extend(refuse(format!(
+                            "the committed `{}` is not valid UTF-8",
+                            Escaped(path)
+                        ))),
                     }
                 }
                 files.push(file);
@@ -162,7 +169,8 @@ fn advance(root: &Path, name: &str, from: &CommitId, to: &CommitId) -> Result<()
     git::present(root, to).map_err(|p| vec![git_refusal("the --at revision", p)])?;
     if to == from {
         return Err(refuse(format!(
-            "fixture `{name}` is already pinned at {to}"
+            "fixture `{}` is already pinned at {to}",
+            Escaped(name)
         )));
     }
     match git::is_ancestor(root, from, to) {
@@ -217,10 +225,11 @@ fn validate(
             let known: Vec<_> = manifest
                 .fixtures
                 .iter()
-                .map(|f| format!("`{}`", f.name))
+                .map(|f| format!("`{}`", Escaped(&f.name)))
                 .collect();
             refuse(format!(
-                "the manifest has no fixture named `{name}`; it has {}",
+                "the manifest has no fixture named `{}`; it has {}",
+                Escaped(name),
                 if known.is_empty() {
                     "none".to_owned()
                 } else {

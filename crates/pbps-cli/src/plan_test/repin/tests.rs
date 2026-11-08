@@ -211,3 +211,330 @@ fn a_directory_that_cannot_be_opened_refuses_before_anything_is_replaced() {
     assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
     assert!(dir.leftovers().is_empty());
 }
+
+const FIXTURE_SPELLINGS: &[(&str, &str)] = &[
+    ("orders", "orders"),
+    ("orders\n\u{1b}[31m", "orders\\n\\u{1b}[31m"),
+    (r"orders\n", r"orders\\n"),
+];
+
+impl Dir {
+    fn write(&self, path: &str, bytes: impl AsRef<[u8]>) {
+        let path = self.0.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.0)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit(&self) -> CommitId {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
+        CommitId::parse(&self.git(&["rev-parse", "HEAD"])).unwrap()
+    }
+}
+
+struct RepinRepo {
+    dir: Dir,
+    pin: CommitId,
+    base: CommitId,
+}
+
+impl RepinRepo {
+    fn new() -> Self {
+        let dir = Dir::new();
+        dir.git(&["init", "-q"]);
+        dir.write("pbps.yml", "dialect: postgres\n");
+        // Keep the empty declarations directory in both committed revisions.
+        dir.write("schema/keep", "");
+        let pin = dir.commit();
+        let base = dir.commit();
+        Self { dir, pin, base }
+    }
+
+    fn manifest(&self, stem: &str, fixtures: &[(&str, &str)]) -> std::path::PathBuf {
+        let fixtures = fixtures
+            .iter()
+            .map(|(name, file)| {
+                self.dir.write(&format!("tests/{file}"), "SELECT 1;\n");
+                format!(
+                    "\n  - {{name: {}, file: {}, at: {}}}",
+                    serde_json::to_string(name).unwrap(),
+                    serde_json::to_string(file).unwrap(),
+                    self.pin
+                )
+            })
+            .collect::<String>();
+        self.dir
+            .write("tests/assert.sql", "SELECT 1 WHERE false;\n");
+        let path = format!("tests/{stem}.yml");
+        self.dir.write(
+            &path,
+            format!(
+                "version: 1\ndialect: postgres\nbase: {}\nengine:\n  image: \
+                 postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280\n\
+                 fixtures: {}\nassertions:\n  - {{name: a, file: assert.sql}}\n",
+                self.base,
+                if fixtures.is_empty() { "[]" } else { &fixtures }
+            ),
+        );
+        self.dir.0.join(path)
+    }
+
+    fn baseline_refusals(&self, manifest: &Path) -> Vec<Refusal> {
+        let inputs = super::super::validate_inputs(&self.dir.0, manifest)
+            .unwrap_or_else(|r| panic!("invalid test inputs: {r:?}"));
+        let head = CommitId::parse(&self.dir.git(&["rev-parse", "HEAD"])).unwrap();
+        baseline(&inputs, &head, 0, &std::fs::read(manifest).unwrap())
+            .expect_err("expected baseline refusals")
+    }
+}
+
+fn assert_repin_refusals(found: Vec<Refusal>, expected: &[String]) {
+    assert_eq!(
+        found,
+        expected
+            .iter()
+            .cloned()
+            .map(Refusal::Repin)
+            .collect::<Vec<_>>()
+    );
+    for refusal in found {
+        let message = refusal.to_string();
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+    }
+}
+
+#[test]
+fn unknown_fixture_refusals_escape_the_requested_name_and_every_known_name() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        let repo = RepinRepo::new();
+        let manifest = repo.manifest("manifest", &[(name, "f.sql"), ("other", "other.sql")]);
+        let requested = format!("missing-{name}");
+        let found = validate(
+            &repo.dir.0,
+            &manifest,
+            &requested,
+            repo.base.as_str(),
+            &mut TestData::for_repin(),
+        )
+        .err()
+        .expect("expected an unknown fixture");
+        assert_repin_refusals(
+            found,
+            &[format!(
+                "the manifest has no fixture named `missing-{shown}`; it has `{shown}`, `other`"
+            )],
+        );
+
+        let manifest = repo.manifest("manifest", &[]);
+        let found = validate(
+            &repo.dir.0,
+            &manifest,
+            &requested,
+            repo.base.as_str(),
+            &mut TestData::for_repin(),
+        )
+        .err()
+        .expect("expected an empty fixture list");
+        assert_repin_refusals(
+            found,
+            &[format!(
+                "the manifest has no fixture named `missing-{shown}`; it has none"
+            )],
+        );
+    }
+}
+
+#[test]
+fn already_pinned_refusals_escape_the_fixture_name() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        let repo = RepinRepo::new();
+        let manifest = repo.manifest("manifest", &[(name, "f.sql")]);
+        repo.dir.commit();
+        let found = validate(
+            &repo.dir.0,
+            &manifest,
+            name,
+            repo.pin.as_str(),
+            &mut TestData::for_repin(),
+        )
+        .err()
+        .expect("expected an unchanged pin");
+        assert_repin_refusals(
+            found,
+            &[format!(
+                "fixture `{shown}` is already pinned at {}",
+                repo.pin
+            )],
+        );
+    }
+}
+
+#[test]
+fn baseline_refusals_escape_fixture_labels_and_fixture_and_manifest_paths() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        // Windows file names cannot hold the controls, but fixture names can.
+        let (stem, shown_stem) = if cfg!(unix) {
+            (name, shown)
+        } else {
+            ("f", "f")
+        };
+        let repo = RepinRepo::new();
+        let file = format!("{stem}.sql");
+        let manifest = repo.manifest(stem, &[("selected", "selected.sql"), (name, &file)]);
+        let labels = [
+            format!("the manifest (`tests/{shown_stem}.yml`)"),
+            "fixture `selected` (`tests/selected.sql`)".into(),
+            format!("fixture `{shown}` (`tests/{shown_stem}.sql`)"),
+        ];
+        assert_repin_refusals(
+            repo.baseline_refusals(&manifest),
+            &labels
+                .iter()
+                .map(|label| format!("{label} is not committed at HEAD; commit the original first"))
+                .collect::<Vec<_>>(),
+        );
+
+        repo.dir.commit();
+        repo.dir.write(&format!("tests/{file}"), "SELECT 2;\n");
+        let mut bytes = std::fs::read(&manifest).unwrap();
+        bytes.extend_from_slice(b"# edited\n");
+        std::fs::write(&manifest, bytes).unwrap();
+        assert_repin_refusals(
+            repo.baseline_refusals(&manifest),
+            &[&labels[0], &labels[2]]
+                .into_iter()
+                .map(|label| {
+                    format!(
+                        "{label} has uncommitted changes; a re-pin edits one pin and one \
+                 fixture, so commit or revert them first"
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn invalid_utf8_baseline_refusals_escape_the_committed_fixture_path() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        let (stem, shown_stem) = if cfg!(unix) {
+            (name, shown)
+        } else {
+            ("f", "f")
+        };
+        let repo = RepinRepo::new();
+        let file = format!("{stem}.sql");
+        let manifest = repo.manifest("manifest", &[(name, &file)]);
+        repo.dir.write(&format!("tests/{file}"), [0xff]);
+        repo.dir.commit();
+        repo.dir.write(&format!("tests/{file}"), "SELECT 1;\n");
+        assert_repin_refusals(
+            repo.baseline_refusals(&manifest),
+            &[format!(
+                "the committed `tests/{shown_stem}.sql` is not valid UTF-8"
+            )],
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_fixture_refusals_escape_the_name_and_both_paths() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        let repo = RepinRepo::new();
+        let declared = format!("declared-{name}.sql");
+        let resolved = format!("resolved-{name}.sql");
+        let manifest = repo.manifest("manifest", &[(name, &declared)]);
+        repo.dir.write(&format!("tests/{resolved}"), "SELECT 1;\n");
+        let link = repo.dir.0.join("tests").join(&declared);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&resolved, &link).unwrap();
+        repo.dir.commit();
+        assert_repin_refusals(
+            repo.baseline_refusals(&manifest),
+            &[format!(
+                "fixture `{shown}` is declared at `tests/declared-{shown}.sql` but resolves to \
+                 `tests/resolved-{shown}.sql`; a re-pin needs a plain file there, not a link"
+            )],
+        );
+    }
+}
+
+#[test]
+fn repin_machine_identities_keep_raw_names_and_paths_while_human_messages_escape_them() {
+    for &(name, shown) in FIXTURE_SPELLINGS {
+        let (stem, shown_stem) = if cfg!(unix) {
+            (name, shown)
+        } else {
+            ("f", "f")
+        };
+        let repo = RepinRepo::new();
+        let file = format!("{stem}.sql");
+        let manifest = repo.manifest(stem, &[(name, &file)]);
+        repo.dir.commit();
+        let mut data = TestData::for_repin();
+        let plan = validate(&repo.dir.0, &manifest, name, repo.base.as_str(), &mut data)
+            .unwrap_or_else(|r| panic!("valid re-pin refused: {r:?}"));
+        data.input = Some(plan.inputs.identity.clone());
+        let report = data.finish();
+        let data = report.data.as_ref().unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["data"]["repin"]["fixture"], name);
+        assert_eq!(json["data"]["repin"]["path"], format!("tests/{file}"));
+        assert_eq!(json["data"]["input"]["pins"][0]["fixture"], name);
+        assert_eq!(
+            json["data"]["input"]["manifest"]["path"],
+            format!("tests/{stem}.yml")
+        );
+        for side in ["original_inputs", "proposed_inputs"] {
+            assert!(
+                json["data"]["repin"][side]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| { f["role"] == "fixture" && f["path"] == format!("tests/{file}") })
+            );
+        }
+        let summary = data.summary(true);
+        assert_eq!(
+            summary
+                .iter()
+                .find(|f| f.id == "test.repin")
+                .unwrap()
+                .message,
+            format!(
+                "fixture `{shown}` (tests/{shown_stem}.sql): {} -> {}",
+                repo.pin, repo.base
+            )
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|f| !f.message.chars().any(char::is_control))
+        );
+        assert_eq!(serde_json::to_value(&report).unwrap(), json);
+    }
+}
