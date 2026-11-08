@@ -5076,7 +5076,12 @@ fn emit_statements(
         } => row_statement(
             pg,
             table,
-            pbps_dialect::RowOperation::Insert,
+            pbps_dialect::RowOperation::Insert {
+                // The key and each cell the row sets, as `insert_row` lists them.
+                columns: std::iter::once(key_column.clone())
+                    .chain(row.columns().map(|(column, _)| column.clone()))
+                    .collect(),
+            },
             atomically(&insert_row(
                 table,
                 key_column.raw(),

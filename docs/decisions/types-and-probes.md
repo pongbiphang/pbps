@@ -5587,7 +5587,7 @@ advancing a sequence from an IMMUTABLE routine at each site:
 
 | statement | runs |
 |---|---|
-| `INSERT` | CHECK, generated, every index key and filter, domain CHECKs, and DEFAULT (column and domain) |
+| `INSERT` | CHECK, generated, every index key and filter, domain CHECKs, and the DEFAULT (column and domain) of a column the statement leaves out |
 | `UPDATE` | CHECK, every index key and filter, the generated expressions and domain CHECKs of the columns it sets |
 | `DELETE`, `TRUNCATE`, a cascaded `DELETE` | none |
 | a referential action's `UPDATE` | as an `UPDATE`, and the DEFAULT of the column `SET DEFAULT` sets |
@@ -5600,6 +5600,18 @@ every index, not those reading the columns it sets: PostgreSQL may skip an
 index's expression on a heap-only update, but whether it does depends on the
 data, a false refusal has a one-line remedy, and a false admission is a hole.
 The INSERT half of a row movement evaluates no default.
+
+An `INSERT` runs the DEFAULT of the columns its column list leaves out and of no
+column it supplies. Measured on 16.15 and 18.6, identically (2026-11-08), by
+advancing a sequence from each default: a column the statement names runs
+neither its own DEFAULT nor its domain's; a column left out with a DEFAULT of its
+own runs that and not the domain's; a column left out with none runs the domain's;
+a generated column left out runs no domain DEFAULT. So the write carries the
+columns its statement names (`RowOperation::Insert` holds them, derived from the
+statement the plan emits, the key and each cell the row sets), and only a
+default of a column left out is judged, a domain's only when the column has no
+default or generated expression of its own. Where the list is not known
+(empty), every default is judged: the conservative answer.
 
 How. The trees are read from `conbin`, `adbin`, `indexprs`, `indpred`, `polqual`,
 `polwithcheck` and a domain's `conbin` and `typdefaultbin`, and judged without
@@ -5675,6 +5687,18 @@ never refused for a `DELETE`, and an `INSERT` of a policy that has its own
 `WITH CHECK` does not judge its `USING`. `INSERT ... ON CONFLICT` runs both
 expressions and `RETURNING` adds none, but the plan emits neither. A policy
 without a `WITH CHECK` still falls back to its `USING` for an `INSERT`.
+
+Whose policies. The policies of the table the SQL names, and no other.
+Measured on 16.15 and 18.6, identically (2026-11-08), for an inheritance parent
+with a child and a partitioned parent with a partition, each table carrying a
+policy that advances a sequence of its own, as a role the policies apply to: an
+`UPDATE`, a `DELETE` and an `INSERT` through the parent run the parent's policy
+and never the child's or the partition's (an `INSERT` routed to a partition
+included), and the same three written directly to the child or partition run its
+own and not the parent's. It follows that a parent without row security
+enabled applies no policy to a write through it even when the child has one (the
+guard's live test asserts it). So the policy query is limited to the relation the statement names, while the other
+kinds of expression keep the descendants and partitions the statement reaches.
 
 Measured on 16.15 and 18.6, identically (2026-11-07): `row_security_active` is
 false for a superuser, for the owner without `FORCE`, for a `BYPASSRLS` role and

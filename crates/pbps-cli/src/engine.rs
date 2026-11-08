@@ -4462,28 +4462,45 @@ pub async fn prepare_data_writes(
                         operation: write.operation,
                     });
                 }
-                let (table, mut operation) =
-                    if let Change::InsertRow { table, .. } = &planned.change {
-                        (table, RowOperation::Insert)
-                    } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
-                        (
-                            table,
-                            RowOperation::Update {
-                                columns: columns.keys().cloned().collect(),
-                            },
-                        )
-                    } else if let Change::DeleteRow { table, .. } = &planned.change {
-                        (table, RowOperation::Delete)
-                    } else {
-                        continue;
-                    };
+                let (table, mut operation) = if let Change::InsertRow {
+                    table,
+                    key_column,
+                    row,
+                    ..
+                } = &planned.change
+                {
+                    // The columns the INSERT names: the guard judges the
+                    // DEFAULT of no other (#2748).
+                    (
+                        table,
+                        RowOperation::Insert {
+                            columns: std::iter::once(key_column.clone())
+                                .chain(row.columns().map(|(column, _)| column.clone()))
+                                .collect(),
+                        },
+                    )
+                } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
+                    (
+                        table,
+                        RowOperation::Update {
+                            columns: columns.keys().cloned().collect(),
+                        },
+                    )
+                } else if let Change::DeleteRow { table, .. } = &planned.change {
+                    (table, RowOperation::Delete)
+                } else {
+                    continue;
+                };
                 // The logical target has the plan's final spelling; locks are
                 // acquired before any rename, through the stable table uid.
                 // New tables receive no existing-trigger allowance.
                 if let Some(old) = stored(table).as_ref() {
-                    // Like the table, an updated column may still carry its
-                    // pre-plan name while the guard authenticates triggers.
-                    if let RowOperation::Update { columns } = &mut operation {
+                    // Like the table, an updated or inserted column may still
+                    // carry its pre-plan name while the guard authenticates
+                    // triggers.
+                    if let RowOperation::Update { columns } | RowOperation::Insert { columns } =
+                        &mut operation
+                    {
                         *columns = columns
                             .iter()
                             .map(|name| {

@@ -19355,7 +19355,9 @@ async fn the_trigger_guard_judges_a_triggers_function_by_the_admission_predicate
         for (admission, expected) in [(&trusting_nobody, alone), (&trusting_stranger, declared)] {
             let write = pbps_dialect::RowWrite {
                 table: TableName::new(&s, table),
-                operation: pbps_dialect::RowOperation::Insert,
+                operation: pbps_dialect::RowOperation::Insert {
+                    columns: Default::default(),
+                },
             };
             conn.execute("BEGIN").await.unwrap();
             let guard = pbps_pg::data_triggers::prepare(

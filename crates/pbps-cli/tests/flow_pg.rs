@@ -21235,7 +21235,9 @@ fn constraint_trigger_guards_accept_only_the_recorded_managed_definition() {
             let pg = pbps_pg::Postgres::new();
             let write = RowWrite {
                 table: "app.t".parse().unwrap(),
-                operation: RowOperation::Insert,
+                operation: RowOperation::Insert {
+                    columns: Default::default(),
+                },
             };
             conn.begin(&pg.transaction_framing(&pbps_model::SessionZone::utc()))
                 .await
@@ -22895,7 +22897,7 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
                     let dialect = pbps_pg::Postgres::new();
                     conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
                     let refused = pbps_pg::data_triggers::prepare(&mut conn, &pbps_pg::admission::Admission::default(), &[pbps_dialect::RowWrite {
-                        table: pbps_model::TableName::new("app", "t"), operation: pbps_dialect::RowOperation::Insert,
+                        table: pbps_model::TableName::new("app", "t"), operation: pbps_dialect::RowOperation::Insert { columns: Default::default() },
                     }], &recorded, &Default::default()).await;
                     assert!(refused.is_err(), "recording a lower-privileged owner's invoker trigger must not authorize it");
                     conn.rollback(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
@@ -23038,7 +23040,7 @@ fn a_trigger_guard_holds_off_replacement_until_the_write_finishes() {
         let mut other = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection).await.unwrap();
         let baseline = pbps_pg::catalog::introspect(&mut writer).await.unwrap().schema;
         let dialect = pbps_pg::Postgres::new();
-        let mut write = RowWrite { table: pbps_model::TableName::new("app", "t"), operation: RowOperation::Insert };
+        let mut write = RowWrite { table: pbps_model::TableName::new("app", "t"), operation: RowOperation::Insert { columns: Default::default() } };
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let guard = pbps_pg::data_triggers::prepare(&mut writer, &pbps_pg::admission::Admission::default(), std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
         other.execute("SET lock_timeout = '100ms'").await.unwrap();
@@ -23590,7 +23592,9 @@ fn effective_ownership_decides_trust(admin: &str, slug: &str) {
                     &pbps_pg::admission::Admission::default(),
                     &[pbps_dialect::RowWrite {
                         table: pbps_model::TableName::new("app", "t"),
-                        operation: pbps_dialect::RowOperation::Insert,
+                        operation: pbps_dialect::RowOperation::Insert {
+                            columns: Default::default(),
+                        },
                     }],
                     &recorded,
                     &Default::default(),
@@ -23656,7 +23660,9 @@ fn a_membership_granted_after_planning_is_refused_before_the_row_write() {
             let dialect = pbps_pg::Postgres::new();
             let write = pbps_dialect::RowWrite {
                 table: pbps_model::TableName::new("app", "t"),
-                operation: pbps_dialect::RowOperation::Insert,
+                operation: pbps_dialect::RowOperation::Insert {
+                    columns: Default::default(),
+                },
             };
             writer
                 .begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
@@ -24255,7 +24261,7 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
                 "{head}CREATE TABLE {{s}}.c(id int PRIMARY KEY, ukey text REFERENCES {{s}}.p(ukey) ON UPDATE CASCADE ON DELETE CASCADE); \
                     CREATE TRIGGER hook AFTER UPDATE ON {{s}}.c FOR EACH ROW EXECUTE FUNCTION public.hook()"
             ),
-            RowOperation::Insert,
+            RowOperation::Insert { columns: Default::default() },
             false,
         ),
         (

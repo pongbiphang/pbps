@@ -434,7 +434,13 @@ pub enum ScanCheckStep {
 /// The reference-data operation performed by a guarded statement.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowOperation {
-    Insert,
+    /// Exactly the columns named in the emitted column list, which is how the
+    /// guard knows which DEFAULTs the statement runs: a column the statement
+    /// supplies does not run its DEFAULT. Empty when the list is not known, in
+    /// which case every DEFAULT is judged (#2748).
+    Insert {
+        columns: std::collections::BTreeSet<pbps_model::ColumnName>,
+    },
     /// Exactly the columns named in the emitted SET list.
     Update {
         columns: std::collections::BTreeSet<pbps_model::ColumnName>,

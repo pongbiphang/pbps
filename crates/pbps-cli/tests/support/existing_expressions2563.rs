@@ -29,6 +29,10 @@ const ROUTINES: [&str; 11] = [
     "app.f_other(integer)",
 ];
 
+/// The routines of the tests that build a schema of their own: a refusal names
+/// them too, but the shared fixture has none of them to alter.
+const OWN_ROUTINES: [&str; 3] = ["app.f_defa()", "app.f_defb()", "app.f_defx()"];
+
 /// A table with every kind of expression, each calling a routine of its own, and
 /// a child table whose foreign key cascades.
 fn fixture(owner: &str) -> String {
@@ -141,6 +145,7 @@ fn update(columns: &[&str]) -> RowOperation {
 fn named(text: &str) -> BTreeSet<&'static str> {
     ROUTINES
         .iter()
+        .chain(OWN_ROUTINES.iter())
         .copied()
         .filter(|routine| text.contains(routine))
         .collect()
@@ -161,7 +166,9 @@ fn each_statement_is_judged_for_exactly_the_expressions_it_runs() {
         let cases: Vec<(&str, RowOperation, Vec<&str>)> = vec![
             (
                 "an INSERT runs the check, the generated expression, every index, the domain and the defaults",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 vec![
                     "app.f_check(integer)",
                     "app.f_default()",
@@ -283,7 +290,9 @@ fn each_statement_is_judged_for_exactly_the_expressions_it_runs() {
                 &mut conn,
                 &Admission::default(),
                 "app.u",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 None,
             )
@@ -323,7 +332,9 @@ fn what_the_plan_drops_is_not_judged_at_plan_time_and_is_at_the_statement() {
                 .schema;
             let write = RowWrite {
                 table: table.clone(),
-                operation: RowOperation::Insert,
+                operation: RowOperation::Insert {
+                    columns: Default::default(),
+                },
             };
             let framing =
                 pbps_pg::Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
@@ -401,7 +412,9 @@ fn a_trusted_owner_with_a_fixed_path_is_admitted_and_the_review_pins_the_rest() 
                 &mut conn,
                 &Admission::default(),
                 "app.t",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 None,
             )
@@ -423,7 +436,9 @@ fn a_trusted_owner_with_a_fixed_path_is_admitted_and_the_review_pins_the_rest() 
                 &mut conn,
                 &trusting,
                 "app.t",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 None,
             )
@@ -435,7 +450,9 @@ fn a_trusted_owner_with_a_fixed_path_is_admitted_and_the_review_pins_the_rest() 
                 &mut conn,
                 &reviewing,
                 "app.t",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 None,
             )
@@ -448,7 +465,9 @@ fn a_trusted_owner_with_a_fixed_path_is_admitted_and_the_review_pins_the_rest() 
                 &mut conn,
                 &approving,
                 "app.t",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 None,
             )
@@ -553,7 +572,12 @@ fn a_policy_is_judged_only_where_row_security_applies_to_the_deploying_role() {
                 .await
                 .unwrap();
                 for (what, operation) in [
-                    ("INSERT", RowOperation::Insert),
+                    (
+                        "INSERT",
+                        RowOperation::Insert {
+                            columns: Default::default(),
+                        },
+                    ),
                     ("UPDATE", update(&["b"])),
                     ("DELETE", RowOperation::Delete),
                 ] {
@@ -579,7 +603,9 @@ fn a_policy_is_judged_only_where_row_security_applies_to_the_deploying_role() {
                 &mut conn,
                 &Admission::default(),
                 "app.t",
-                RowOperation::Insert,
+                RowOperation::Insert {
+                    columns: Default::default(),
+                },
                 &Dropped::default(),
                 Some(&other),
             )
@@ -705,7 +731,12 @@ fn a_command_is_judged_for_the_policy_expression_it_runs_and_not_the_other() {
                     .await
                     .unwrap();
                 for ((what, operation), expect) in [
-                    ("INSERT", RowOperation::Insert),
+                    (
+                        "INSERT",
+                        RowOperation::Insert {
+                            columns: Default::default(),
+                        },
+                    ),
                     ("UPDATE", update(&["id"])),
                     ("DELETE", RowOperation::Delete),
                 ]
@@ -740,9 +771,25 @@ fn a_command_is_judged_for_the_policy_expression_it_runs_and_not_the_other() {
 /// What `check` says to an INSERT on `table`, which allows nothing the plan
 /// dropped.
 async fn at_the_statement(conn: &mut pbps_db::Conn, table: &str) -> Result<(), String> {
+    at_the_statement_of(
+        conn,
+        table,
+        RowOperation::Insert {
+            columns: Default::default(),
+        },
+    )
+    .await
+}
+
+/// The same for the statement `operation` names.
+async fn at_the_statement_of(
+    conn: &mut pbps_db::Conn,
+    table: &str,
+    operation: RowOperation,
+) -> Result<(), String> {
     let write = RowWrite {
         table: table.parse().unwrap(),
-        operation: RowOperation::Insert,
+        operation,
     };
     let framing = pbps_pg::Postgres::new().transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.unwrap();
@@ -793,17 +840,20 @@ fn what_an_inheritance_child_drops_is_excused_by_the_child_that_owns_it() {
             ),
         );
         let t = |name: &str| -> pbps_model::TableName { format!("app.{name}").parse().unwrap() };
+        // The child's policy is not among them: row security is the named
+        // table's, so an UPDATE through the parent runs the parent's policies
+        // and not the child's (DEC-2563.10).
         let all = BTreeSet::from([
             "app.f_check(integer)",
             "app.f_cchk(integer)",
             "app.f_ckey(integer)",
-            "app.f_pol(integer)",
         ]);
         runtime().block_on(async {
             let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
                 .await
                 .unwrap();
-            // An UPDATE through the parent reaches the child and all it carries.
+            // An UPDATE through the parent reaches the child and the CHECKs and
+            // indexes it carries.
             macro_rules! ask {
                 ($dropped:expr) => {
                     plan_time(&mut conn, "app.p", update(&["b"]), &$dropped, Some(&role)).await
@@ -817,17 +867,35 @@ fn what_an_inheritance_child_drops_is_excused_by_the_child_that_owns_it() {
             let mut left = all.clone();
             left.remove("app.f_cchk(integer)");
             assert_eq!(names(&ask!(d)), left, "PG{version}: child CHECK");
-            // The child's index, and its policy.
+            // The child's index.
             let mut d = Dropped::default();
             d.indexes.insert((t("c"), "cx".to_owned()));
             let mut left = all.clone();
             left.remove("app.f_ckey(integer)");
             assert_eq!(names(&ask!(d)), left, "PG{version}: child index");
+            // The child's policy is judged where the child is the table named,
+            // and the plan that drops it there excuses it; the same name on the
+            // parent excuses nothing.
+            macro_rules! ask_child {
+                ($dropped:expr) => {
+                    plan_time(&mut conn, "app.c", update(&["b"]), &$dropped, Some(&role)).await
+                };
+            }
+            let on_child: BTreeSet<&'static str> =
+                all.iter().copied().chain(["app.f_pol(integer)"]).collect();
+            assert_eq!(
+                names(&ask_child!(Dropped::default())),
+                on_child,
+                "PG{version}: written directly"
+            );
             let mut d = Dropped::default();
             d.policies.insert((t("c"), "cpol".to_owned()));
-            let mut left = all.clone();
+            let mut left = on_child.clone();
             left.remove("app.f_pol(integer)");
-            assert_eq!(names(&ask!(d)), left, "PG{version}: child policy");
+            assert_eq!(names(&ask_child!(d)), left, "PG{version}: child policy");
+            let mut d = Dropped::default();
+            d.policies.insert((t("p"), "cpol".to_owned()));
+            assert_eq!(names(&ask_child!(d)), on_child, "PG{version}: wrong owner");
             // Dropping the parent's CHECK takes the child's inherited copy with
             // it: the routine is named by neither.
             let mut d = Dropped::default();
@@ -915,7 +983,16 @@ fn what_a_partition_or_its_parent_drops_is_excused_across_the_tree() {
                 .unwrap();
             macro_rules! ask {
                 ($dropped:expr) => {
-                    plan_time(&mut conn, "app.pp", RowOperation::Insert, &$dropped, None).await
+                    plan_time(
+                        &mut conn,
+                        "app.pp",
+                        RowOperation::Insert {
+                            columns: Default::default(),
+                        },
+                        &$dropped,
+                        None,
+                    )
+                    .await
                 };
             }
             let without = |gone: &[&'static str]| -> BTreeSet<&'static str> {
@@ -984,6 +1061,194 @@ fn what_a_partition_or_its_parent_drops_is_excused_across_the_tree() {
                 "PG{version}: at the statement"
             );
         });
+    });
+}
+
+fn insert(columns: &[&str]) -> RowOperation {
+    RowOperation::Insert {
+        columns: columns.iter().map(|c| (*c).into()).collect(),
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_insert_judges_the_default_only_of_a_column_it_leaves_out() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-def-{version}"));
+        on_server(
+            own.connection(),
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_defa() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_defb() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_defx() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_domdef() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE DOMAIN app.dm AS integer DEFAULT app.f_domdef();
+             CREATE TABLE app.t (id integer PRIMARY KEY,
+                 a integer DEFAULT app.f_defa(), b integer DEFAULT app.f_defb());
+             CREATE TABLE app.u (id integer, x app.dm DEFAULT app.f_defx(), y app.dm);
+             CREATE TABLE app.v (id integer, x app.dm DEFAULT app.f_defx());
+             CREATE TABLE app.w (id integer, g app.dm GENERATED ALWAYS AS (id) STORED)",
+        );
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            macro_rules! ask {
+                ($table:expr, $columns:expr) => {
+                    names(
+                        &plan_time(
+                            &mut conn,
+                            $table,
+                            insert($columns),
+                            &Dropped::default(),
+                            None,
+                        )
+                        .await,
+                    )
+                };
+            }
+            let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+                routines.iter().copied().collect()
+            };
+            let (defa, defb, defx, dom) = (
+                "app.f_defa()",
+                "app.f_defb()",
+                "app.f_defx()",
+                "app.f_domdef()",
+            );
+            // A column the statement supplies runs no DEFAULT.
+            assert_eq!(ask!("app.t", &["id", "a", "b"]), set(&[]), "PG{version}");
+            assert_eq!(ask!("app.t", &["id", "a"]), set(&[defb]), "PG{version}");
+            assert_eq!(ask!("app.t", &["id", "b"]), set(&[defa]), "PG{version}");
+            assert_eq!(ask!("app.t", &["id"]), set(&[defa, defb]), "PG{version}");
+            // A column list that is not known judges every DEFAULT.
+            assert_eq!(
+                ask!("app.t", &[]),
+                set(&[defa, defb]),
+                "PG{version}: unknown"
+            );
+            // The domain's DEFAULT is for a column with none of its own that the
+            // statement leaves out.
+            assert_eq!(ask!("app.u", &["id"]), set(&[defx, dom]), "PG{version}");
+            assert_eq!(ask!("app.u", &["id", "y"]), set(&[defx]), "PG{version}");
+            assert_eq!(ask!("app.u", &["id", "x"]), set(&[dom]), "PG{version}");
+            assert_eq!(ask!("app.u", &["id", "x", "y"]), set(&[]), "PG{version}");
+            // A column DEFAULT overrides the domain's.
+            assert_eq!(ask!("app.v", &["id"]), set(&[defx]), "PG{version}");
+            assert_eq!(ask!("app.v", &["id", "x"]), set(&[]), "PG{version}");
+            // A generated column never takes the domain's DEFAULT.
+            assert_eq!(ask!("app.w", &["id"]), set(&[]), "PG{version}");
+            // And the recheck just before the statement is judged the same way.
+            let at = |columns: &[&str]| insert(columns);
+            let rechecked = at_the_statement_of(&mut conn, "app.t", at(&["id", "a"])).await;
+            assert_eq!(
+                names(&rechecked),
+                set(&[defb]),
+                "PG{version}: at the statement"
+            );
+            let rechecked = at_the_statement_of(&mut conn, "app.u", at(&["id", "x"])).await;
+            assert_eq!(
+                names(&rechecked),
+                set(&[dom]),
+                "PG{version}: at the statement"
+            );
+        });
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_policy_is_judged_only_on_the_relation_a_statement_names() {
+    each_server(|version, url| {
+        for (kind, parent_rls) in [("inh", true), ("part", true), ("inh", false)] {
+            let tag = format!("{kind}{}", if parent_rls { "" } else { "-norls" });
+            let own = OwnDatabase::new(url, &format!("ee2748-rls-{tag}-{version}"));
+            let role = format!("ee2748_r_{kind}_{version}_{}", std::process::id());
+            on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+            on_server(url, &format!("CREATE ROLE {role}"));
+            let (parent, child) = if kind == "inh" {
+                (
+                    "CREATE TABLE app.par (id integer, v integer)",
+                    "CREATE TABLE app.chi () INHERITS (app.par)",
+                )
+            } else {
+                (
+                    "CREATE TABLE app.par (id integer, v integer) PARTITION BY RANGE (id)",
+                    "CREATE TABLE app.chi PARTITION OF app.par FOR VALUES FROM (0) TO (100)",
+                )
+            };
+            let parent_policy = if parent_rls {
+                "ALTER TABLE app.par ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY ppol ON app.par USING (app.f_pol(id)) WITH CHECK (app.f_pol(id));"
+            } else {
+                ""
+            };
+            on_server(
+                own.connection(),
+                &format!(
+                    "CREATE SCHEMA app;
+                     CREATE FUNCTION app.f_pol(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                         AS $$BEGIN RETURN true; END$$;
+                     CREATE FUNCTION app.f_other(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                         AS $$BEGIN RETURN true; END$$;
+                     {parent}; {child};
+                     {parent_policy}
+                     ALTER TABLE app.chi ENABLE ROW LEVEL SECURITY;
+                     CREATE POLICY cpol ON app.chi USING (app.f_other(id)) WITH CHECK (app.f_other(id));
+                     GRANT USAGE ON SCHEMA app TO {role}; GRANT ALL ON app.par, app.chi TO {role}"
+                ),
+            );
+            let wrote = [
+                ("UPDATE", update(&["v"])),
+                ("DELETE", RowOperation::Delete),
+                ("INSERT", insert(&["id", "v"])),
+            ];
+            runtime().block_on(async {
+                let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                    .await
+                    .unwrap();
+                for (command, operation) in wrote {
+                    // Through the parent: the parent's policy and not the child's.
+                    let through = names(
+                        &plan_time(
+                            &mut conn,
+                            "app.par",
+                            operation.clone(),
+                            &Dropped::default(),
+                            Some(&role),
+                        )
+                        .await,
+                    );
+                    let expected: BTreeSet<&'static str> = if parent_rls {
+                        BTreeSet::from(["app.f_pol(integer)"])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    assert_eq!(
+                        through, expected,
+                        "PG{version} {tag}: {command} through the parent"
+                    );
+                    // Directly: the child's own.
+                    let direct = names(
+                        &plan_time(
+                            &mut conn,
+                            "app.chi",
+                            operation,
+                            &Dropped::default(),
+                            Some(&role),
+                        )
+                        .await,
+                    );
+                    assert_eq!(
+                        direct,
+                        BTreeSet::from(["app.f_other(integer)"]),
+                        "PG{version} {tag}: {command} directly on the child"
+                    );
+                }
+            });
+            drop(own);
+            on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+        }
     });
 }
 
@@ -1167,6 +1432,71 @@ fn a_plan_that_writes_rows_is_refused_for_an_expression_it_never_touched() {
         );
         assert_eq!(s.rows(), 1, "PG{version} {site:?}");
     });
+}
+
+/// A deployed table whose column `n` defaults to `app.okd()`, which is then made
+/// one the predicate refuses: it sets no `search_path`.
+fn standing_default(version: i32, url: &str) -> Standing {
+    let slug = format!("ee2748-plan-default-{version}");
+    let own = OwnDatabase::new(url, &slug);
+    let connection = own.connection().to_owned();
+    let d = bootstrapped_demo(&connection, &slug, BASE);
+    d.keyed(&connection);
+    on_server(
+        &connection,
+        "CREATE FUNCTION app.okd() RETURNS integer LANGUAGE plpgsql \
+         SET search_path = pg_catalog AS $$BEGIN RETURN 7; END$$",
+    );
+    d.table(&BASE.replace(
+        "n: {type: integer}",
+        "n: {type: integer, default: 'app.okd()'}",
+    ));
+    let standing = Standing {
+        plan: d.dir.join("ee-plan.json"),
+        _own: own,
+        d,
+        connection,
+        site: Site::Check,
+    };
+    let planned = standing.plan_now();
+    assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+    let applied = standing.apply();
+    assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
+    on_server(
+        &standing.connection,
+        "ALTER FUNCTION app.okd() RESET search_path",
+    );
+    standing
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_row_that_supplies_a_column_is_not_refused_for_its_default() {
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let s = standing_default(version, &url);
+        let declared = BASE.replace(
+            "n: {type: integer}",
+            "n: {type: integer, default: 'app.okd()'}",
+        );
+        let with_rows = |rows: &str| format!("{declared}data:\n  mode: ensure\n  rows:\n{rows}");
+        // The row names `n`, so its DEFAULT never runs: planned and applied.
+        s.declare(&with_rows("    1: {email: a, n: 5}\n"));
+        let planned = s.plan_now();
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        let applied = s.apply();
+        assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
+        assert_eq!(s.rows(), 1, "PG{version}");
+        // A row that leaves `n` out runs it, and the existing DEFAULT is refused.
+        s.declare(&with_rows("    1: {email: a, n: 5}\n    2: {email: b}\n"));
+        let planned = s.plan_now();
+        let shown = text(&planned);
+        assert_ne!(code(&planned), 0, "PG{version}: {shown}");
+        assert!(
+            shown.contains("the existing DEFAULT of the column `n` of app.t"),
+            "PG{version}: {shown}"
+        );
+        assert_eq!(s.rows(), 1, "PG{version}");
+    }
 }
 
 #[test]

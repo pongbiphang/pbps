@@ -225,7 +225,7 @@ pub async fn check(
 
 fn event(operation: &RowOperation) -> i16 {
     match operation {
-        RowOperation::Insert | RowOperation::Copy => INSERT,
+        RowOperation::Insert { .. } | RowOperation::Copy => INSERT,
         RowOperation::Update { .. } => UPDATE,
         RowOperation::Delete => DELETE,
         RowOperation::Rewrite => REWRITE,
@@ -278,6 +278,11 @@ struct Statement {
     relation: i64,
     event: i16,
     columns: BTreeSet<String>,
+    /// For an INSERT, the columns its column list names: a column it supplies
+    /// does not run its DEFAULT, and neither does its domain's (measured on
+    /// 16.15 and 18.6, #2748). Empty when the list is not known, which judges
+    /// every DEFAULT, the conservative answer.
+    supplied: BTreeSet<String>,
     /// A referential action carries ONLY, and an INSERT has no descendants to
     /// reach but its partitions. Measured on PostgreSQL 18.6: a cascade updates
     /// and deletes partitions of the referencing table but never a plain
@@ -361,7 +366,16 @@ async fn walk(
             RowOperation::Update { columns } => {
                 columns.iter().map(|c| c.raw().to_owned()).collect()
             }
-            RowOperation::Insert
+            RowOperation::Insert { .. }
+            | RowOperation::Delete
+            | RowOperation::Copy
+            | RowOperation::Rewrite => BTreeSet::new(),
+        },
+        supplied: match &write.operation {
+            RowOperation::Insert { columns } => {
+                columns.iter().map(|c| c.raw().to_owned()).collect()
+            }
+            RowOperation::Update { .. }
             | RowOperation::Delete
             | RowOperation::Copy
             | RowOperation::Rewrite => BTreeSet::new(),
@@ -415,6 +429,8 @@ async fn walk(
                 relation: statement.relation,
                 event,
                 columns: BTreeSet::new(),
+                // The INSERT half of a movement evaluates no default at all.
+                supplied: BTreeSet::new(),
                 partitions_only: statement.partitions_only,
                 rows_only: true,
             }));
@@ -953,6 +969,7 @@ async fn read_actions(
             relation,
             event,
             columns,
+            supplied: BTreeSet::new(),
             partitions_only: true,
             rows_only: false,
         })
@@ -1152,11 +1169,26 @@ fn site_arms(
             )
         ));
     }
+    // An INSERT runs the DEFAULT of the columns it leaves out and of no column it
+    // supplies (measured on 16.15 and 18.6, #2748). Where the statement's column
+    // list is not known `supplied` is empty and every DEFAULT is judged.
+    let supplied = statement
+        .supplied
+        .iter()
+        .map(|name| literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted_only = if insert && !statement.supplied.is_empty() {
+        format!("AND a.attname::pg_catalog.text <> ALL (ARRAY[{supplied}]::pg_catalog.text[])")
+    } else {
+        String::new()
+    };
     for (kind, generated, wanted) in [
         ("default", "= ''", defaults),
         ("generated", "<> ''", insert || update),
     ] {
         if wanted {
+            let omitted_only = if kind == "default" { &omitted_only } else { "" };
             // A default is the INSERT's, and a referential action's own
             // `SET DEFAULT`; the latter reads the columns the statement sets.
             let join = touched;
@@ -1169,7 +1201,7 @@ fn site_arms(
                   AND a.attgenerated {generated}
                  JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
                  {join}
-                 WHERE NOT ({gone}) AND {alive}",
+                 WHERE NOT ({gone}) AND {alive} {omitted_only}",
                 gone = gone_owned(
                     &dropped.values,
                     "a.attname::pg_catalog.text",
@@ -1237,13 +1269,15 @@ fn site_arms(
                         {column}::pg_catalog.text AS tree
                  {from}
                  JOIN pg_catalog.pg_policy p ON p.polrelid = r.oid AND {column} IS NOT NULL
-                 WHERE pg_catalog.row_security_active(r.oid)
+                 WHERE r.oid = {relation}::pg_catalog.oid
+                   AND pg_catalog.row_security_active(r.oid)
                    AND p.polcmd IN ({commands})
                    AND (0 = ANY(p.polroles) OR EXISTS (
                         SELECT 1 FROM pg_catalog.unnest(p.polroles) AS x(rid)
                         WHERE pg_catalog.pg_has_role(CURRENT_USER, x.rid, 'MEMBER')))
                    AND NOT ({gone}) AND {alive}",
-                gone = gone_owned(&dropped.policies, "p.polname::pg_catalog.text", None)
+                gone = gone_owned(&dropped.policies, "p.polname::pg_catalog.text", None),
+                relation = statement.relation
             ));
         }
     }
@@ -1284,15 +1318,30 @@ fn site_arms(
              WHERE NOT ({gone_domain})"
         ));
         if defaults {
-            arms.push(
+            // The domain's DEFAULT is what a column with no DEFAULT of its own
+            // gets when the statement leaves it out. A column DEFAULT overrides
+            // it, a generated column never uses it, and a column the INSERT
+            // supplies needs neither (measured on 16.15 and 18.6, #2748).
+            let supplied_column = if insert && !statement.supplied.is_empty() {
+                format!(
+                    "OR a.attname::pg_catalog.text = ANY (ARRAY[{supplied}]::pg_catalog.text[])"
+                )
+            } else {
+                String::new()
+            };
+            arms.push(format!(
                 "SELECT 'domain_default' AS kind, d.typid::int8 AS oid,
                         d.typid::pg_catalog.regtype::pg_catalog.text AS place,
                         ''::pg_catalog.text AS name, dt.typdefaultbin::pg_catalog.text AS tree
                  FROM domains d
                  JOIN pg_catalog.pg_type dt ON dt.oid = d.typid
-                 WHERE d.typid = d.declared AND dt.typdefaultbin IS NOT NULL"
-                    .to_owned(),
-            );
+                 WHERE d.typid = d.declared AND dt.typdefaultbin IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_attribute a
+                       WHERE a.attrelid = d.attrelid AND a.attnum = d.attnum
+                         AND (a.atthasdef {supplied_column})
+                   )"
+            ));
         }
         let domains = format!(
             ", domains(attrelid, attnum, declared, typid) AS (
@@ -1438,6 +1487,7 @@ mod tests {
             relation: 16384,
             event,
             columns: BTreeSet::from(["b".to_owned()]),
+            supplied: BTreeSet::new(),
             partitions_only: false,
             rows_only,
         }
@@ -1618,6 +1668,56 @@ mod tests {
     }
 
     #[test]
+    fn an_insert_judges_the_default_of_the_columns_it_leaves_out() {
+        let arm = |statement: &Statement, label: &str| -> String {
+            let (_, arms) = site_arms(statement, false, &Dropped::default());
+            arms.into_iter()
+                .find(|a| a.contains(&format!("'{label}' AS kind")))
+                .unwrap_or_else(|| panic!("no {label} query"))
+        };
+        // A column list that is known: only the columns it leaves out.
+        let mut known = statement(INSERT, false);
+        known.supplied = BTreeSet::from(["id".to_owned(), "b".to_owned()]);
+        let default = arm(&known, "default");
+        assert!(
+            default.contains("a.attname::pg_catalog.text <> ALL (ARRAY[E'b', E'id']"),
+            "{default}"
+        );
+        // A generated column is never supplied, and its expression always runs.
+        assert!(!arm(&known, "generated").contains("<> ALL"));
+        // The domain's DEFAULT is for a column with none of its own that the
+        // statement leaves out.
+        let domain = arm(&known, "domain_default");
+        assert!(domain.contains("a.atthasdef OR a.attname"), "{domain}");
+        assert!(domain.contains("ANY (ARRAY[E'b', E'id']"), "{domain}");
+        // A column list that is not known judges every DEFAULT.
+        let unknown = statement(INSERT, false);
+        assert!(!arm(&unknown, "default").contains("<> ALL"));
+        let domain = arm(&unknown, "domain_default");
+        assert!(domain.contains("(a.atthasdef )"), "{domain}");
+        assert!(!domain.contains("ANY (ARRAY["), "{domain}");
+    }
+
+    #[test]
+    fn a_policy_is_read_on_the_relation_the_statement_names_and_no_other() {
+        for event in [INSERT, UPDATE, DELETE] {
+            let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+            let policies: Vec<_> = arms
+                .iter()
+                .filter(|a| a.contains("'policy' AS kind"))
+                .collect();
+            assert!(!policies.is_empty());
+            for arm in policies {
+                assert!(arm.contains("r.oid = 16384::pg_catalog.oid"), "{arm}");
+            }
+            // Every other kind keeps the closure the statement reaches.
+            for arm in arms.iter().filter(|a| a.contains("'check' AS kind")) {
+                assert!(!arm.contains("r.oid = 16384"), "{arm}");
+            }
+        }
+    }
+
+    #[test]
     fn what_the_plan_drops_is_matched_on_the_relation_that_owns_the_expression() {
         let parent = TableName::new("app", "parent");
         let mut dropped = Dropped::default();
@@ -1677,7 +1777,9 @@ mod tests {
 
     #[test]
     fn the_operations_that_fire_no_trigger_are_the_ones_that_are_not_row_writes() {
-        assert!(fires_triggers(&RowOperation::Insert));
+        assert!(fires_triggers(&RowOperation::Insert {
+            columns: BTreeSet::new()
+        }));
         assert!(fires_triggers(&RowOperation::Delete));
         assert!(fires_triggers(&RowOperation::Update {
             columns: BTreeSet::new()
