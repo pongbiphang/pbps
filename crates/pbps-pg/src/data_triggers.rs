@@ -66,6 +66,16 @@ pub struct Dropped {
     pub values: BTreeSet<(TableName, String)>,
     /// A domain's check the plan drops.
     pub domain_checks: BTreeSet<(pbps_model::TypeRef, String)>,
+    /// Columns the plan drops or retypes before its rows are written (`order_key`
+    /// classes 5 and 9 against 11): they no longer carry the domain they have
+    /// now, so neither its CHECKs nor its DEFAULT run for them (#2748).
+    pub columns: BTreeSet<(TableName, String)>,
+    /// A domain whose default the plan sets or drops: the one it has now is gone
+    /// before the rows (`order_key` classes 2 and 7); the new one is the plan's.
+    pub domain_defaults: BTreeSet<pbps_model::TypeRef>,
+    /// Partitions the plan detaches (class 6): a write through the parent no
+    /// longer reaches them or what they carry.
+    pub detached: BTreeSet<TableName>,
 }
 
 impl Dropped {
@@ -109,7 +119,24 @@ impl Dropped {
             | Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnExpression { column, .. } => {
                 if let Some(old) = stored(&column.table) {
-                    self.values.insert((old, stored_column(column)));
+                    self.values.insert((old.clone(), stored_column(column)));
+                    // A dropped column takes its domain with it; a column whose
+                    // default or expression changes keeps the domain's checks.
+                    if matches!(change, Change::DropColumn { .. }) {
+                        self.columns.insert((old, stored_column(column)));
+                    }
+                }
+            }
+            // Retyped, a column is no longer the domain it is now; its own
+            // default and expressions stay (re-cast), and so are not excused.
+            Change::AlterColumnType { column, .. } => {
+                if let Some(old) = stored(&column.table) {
+                    self.columns.insert((old, stored_column(column)));
+                }
+            }
+            Change::DetachPartition { table, .. } => {
+                if let Some(old) = stored(table) {
+                    self.detached.insert(old);
                 }
             }
             Change::AlterDomain {
@@ -123,6 +150,10 @@ impl Dropped {
                     for check in delta.drop_checks {
                         self.domain_checks
                             .insert((name.clone(), check.raw().to_owned()));
+                    }
+                    // `Loosen` sets or drops the default.
+                    if delta.default.is_some() {
+                        self.domain_defaults.insert(name.clone());
                     }
                 }
             }
@@ -1090,8 +1121,12 @@ fn gone_parent_index(pairs: &BTreeSet<(TableName, String)>) -> String {
 /// The relations this plan drops before the row statement, and the partitions
 /// that go with each; `false` when there are none.
 fn gone_tables(dropped: &Dropped) -> String {
-    let clauses: Vec<String> = dropped
-        .tables
+    table_filter(&dropped.tables)
+}
+
+/// A filter on a class `gc` and its namespace `gn`: one of `tables`, or `false`.
+fn table_filter(tables: &BTreeSet<TableName>) -> String {
+    let clauses: Vec<String> = tables
         .iter()
         .map(|table| {
             format!(
@@ -1148,7 +1183,13 @@ fn site_arms(
     let on = "n.nspname::pg_catalog.text || '.' || c.relname::pg_catalog.text";
     // A relation the plan drops, and the partitions that go with it, runs
     // nothing: it is gone before the row statement.
-    let alive = "r.oid NOT IN (SELECT oid FROM gone_tables)";
+    // A partition the plan detaches is reached by a write through its parent no
+    // more, but it still is by a write that names it (or what it holds).
+    let alive = format!(
+        "(r.oid NOT IN (SELECT oid FROM gone_tables) AND (r.oid NOT IN (SELECT oid FROM detached) \
+         OR {relation}::pg_catalog.oid IN (SELECT oid FROM detached)))",
+        relation = statement.relation
+    );
     let from = "FROM relations r \
                 JOIN pg_catalog.pg_class c ON c.oid = r.oid \
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -1322,6 +1363,22 @@ fn site_arms(
             // gets when the statement leaves it out. A column DEFAULT overrides
             // it, a generated column never uses it, and a column the INSERT
             // supplies needs neither (measured on 16.15 and 18.6, #2748).
+            let gone_default = if dropped.domain_defaults.is_empty() {
+                "false".to_owned()
+            } else {
+                dropped
+                    .domain_defaults
+                    .iter()
+                    .map(|ty| {
+                        format!(
+                            "(dn.nspname = {} AND dt.typname = {})",
+                            literal(ty.schema()),
+                            literal(ty.name())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
             let supplied_column = if insert && !statement.supplied.is_empty() {
                 format!(
                     "OR a.attname::pg_catalog.text = ANY (ARRAY[{supplied}]::pg_catalog.text[])"
@@ -1335,7 +1392,9 @@ fn site_arms(
                         ''::pg_catalog.text AS name, dt.typdefaultbin::pg_catalog.text AS tree
                  FROM domains d
                  JOIN pg_catalog.pg_type dt ON dt.oid = d.typid
+                 JOIN pg_catalog.pg_namespace dn ON dn.oid = dt.typnamespace
                  WHERE d.typid = d.declared AND dt.typdefaultbin IS NOT NULL
+                   AND NOT ({gone_default})
                    AND NOT EXISTS (
                        SELECT 1 FROM pg_catalog.pg_attribute a
                        WHERE a.attrelid = d.attrelid AND a.attnum = d.attnum
@@ -1343,14 +1402,23 @@ fn site_arms(
                    )"
             ));
         }
+        // A column the plan drops or retypes no longer has the domain it has now,
+        // and a column a parent's drop or retype takes along goes with it.
+        let gone_columns = gone_owned(
+            &dropped.columns,
+            "a.attname::pg_catalog.text",
+            Some("a.attinhcount > 0"),
+        );
         let domains = format!(
             ", domains(attrelid, attnum, declared, typid) AS (
                  SELECT a.attrelid, a.attnum, a.atttypid, a.atttypid
                  FROM relations r
+                 JOIN pg_catalog.pg_class c ON c.oid = r.oid
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                  JOIN pg_catalog.pg_attribute a
                    ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
                  JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype = 'd'
-                 WHERE r.oid NOT IN (SELECT oid FROM gone_tables) {only_set}
+                 WHERE {alive} AND NOT ({gone_columns}) {only_set}
                  UNION ALL
                  SELECT d.attrelid, d.attnum, d.declared, t.typbasetype
                  FROM domains d
@@ -1397,9 +1465,20 @@ async fn run_sites(
              JOIN gone_tables g ON g.oid = i.inhparent
              JOIN pg_catalog.pg_class p ON p.oid = i.inhparent
              WHERE p.relkind = 'p'
+         ),
+         detached(oid) AS (
+             SELECT gc.oid FROM pg_catalog.pg_class gc
+             JOIN pg_catalog.pg_namespace gn ON gn.oid = gc.relnamespace
+             WHERE {detached}
+             UNION
+             SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+             JOIN detached g ON g.oid = i.inhparent
+             JOIN pg_catalog.pg_class p ON p.oid = i.inhparent
+             WHERE p.relkind = 'p'
          ){extra}
          {arms}",
         gone_tables = gone_tables(dropped),
+        detached = table_filter(&dropped.detached),
         ctes = reached(statement, dropped),
         relation = statement.relation,
         arms = arms.join("\n UNION ALL\n "),
@@ -1665,6 +1744,162 @@ mod tests {
             .find(|a| a.contains("'policy' AS kind"))
             .unwrap();
         assert!(delete.contains("p.polcmd IN ('*', 'd', 'r')"), "{delete}");
+    }
+
+    fn domain(default: Option<&str>, checks: &[(&str, &str)]) -> pbps_model::ManagedType {
+        pbps_model::ManagedType::Domain {
+            base: "integer".parse().unwrap(),
+            not_null: false,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(n, t)| (pbps_model::ObjectLocalName::from(*n), (*t).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    /// What `change` leaves in a fresh `Dropped`, with the names unchanged.
+    fn noted(change: &pbps_model::Change) -> Dropped {
+        let mut dropped = Dropped::default();
+        dropped.note_removed_expressions(change, &|table| Some(table.clone()), &|column| {
+            column.name.raw().to_owned()
+        });
+        dropped
+    }
+
+    #[test]
+    fn every_step_that_removes_an_expression_is_noted_under_the_name_the_catalog_holds() {
+        use pbps_model::{Change, DomainHalf};
+        let column: pbps_model::ColumnRef = "app.t.v".parse().unwrap();
+        let table = TableName::new("app", "t");
+        let uid: pbps_model::Uid = "c_aaaaaa".parse().unwrap();
+        let held = BTreeSet::from([(table.clone(), "v".to_owned())]);
+        // A dropped column loses its default or generated expression and the
+        // domain it has now.
+        let gone = noted(&Change::DropColumn {
+            uid: uid.clone(),
+            column: column.clone(),
+        });
+        assert_eq!((&gone.values, &gone.columns), (&held, &held));
+        // A retyped column keeps its default and expressions (re-cast) and
+        // loses the domain; a changed default or expression keeps the domain.
+        let retyped = noted(&Change::AlterColumnType {
+            uid: uid.clone(),
+            column: column.clone(),
+            from: "app.dm".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: None,
+        });
+        assert_eq!((retyped.values.len(), &retyped.columns), (0, &held));
+        for change in [
+            Change::AlterColumnDefault {
+                uid: uid.clone(),
+                column: column.clone(),
+                from: Some("1".into()),
+                to: None,
+            },
+            Change::AlterColumnExpression {
+                uid: uid.clone(),
+                column: column.clone(),
+                from: "a".into(),
+                to: "b".into(),
+            },
+        ] {
+            let noted = noted(&change);
+            assert_eq!((&noted.values, noted.columns.len()), (&held, 0));
+        }
+        // A domain's default is gone when the loosening half sets or drops it;
+        // its checks when that half drops them; the tightening half drops none.
+        let name: pbps_model::TypeRef = "app.dm".parse().unwrap();
+        let alter = |from, to, half| Change::AlterDomain {
+            uid: uid.clone(),
+            name: name.clone(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        let set = noted(&alter(
+            domain(None, &[]),
+            domain(Some("1"), &[]),
+            DomainHalf::Loosen,
+        ));
+        assert_eq!((set.domain_defaults.len(), set.domain_checks.len()), (1, 0));
+        let dropped_default = noted(&alter(
+            domain(Some("1"), &[]),
+            domain(None, &[]),
+            DomainHalf::Loosen,
+        ));
+        assert_eq!(dropped_default.domain_defaults.len(), 1);
+        let check_only = noted(&alter(
+            domain(Some("1"), &[("dc", "VALUE > 0")]),
+            domain(Some("1"), &[]),
+            DomainHalf::Loosen,
+        ));
+        assert_eq!(
+            (
+                check_only.domain_defaults.len(),
+                check_only.domain_checks.len()
+            ),
+            (0, 1)
+        );
+        let tightened = noted(&alter(
+            domain(None, &[]),
+            domain(Some("1"), &[("dc", "VALUE > 0")]),
+            DomainHalf::Tighten,
+        ));
+        assert!(tightened.domain_defaults.is_empty() && tightened.domain_checks.is_empty());
+        // A detached partition is no longer reached through its parent.
+        let detached = noted(&Change::DetachPartition {
+            uid,
+            table: table.clone(),
+            parent: TableName::new("app", "parent"),
+            names: Vec::new(),
+            shape: Box::default(),
+        });
+        assert_eq!(detached.detached, BTreeSet::from([table]));
+    }
+
+    #[test]
+    fn the_domain_scan_and_every_site_leave_out_what_the_plan_removes() {
+        let table = TableName::new("app", "t");
+        let mut dropped = Dropped::default();
+        dropped.columns.insert((table.clone(), "x".to_owned()));
+        dropped.domain_defaults.insert("app.dm".parse().unwrap());
+        dropped.detached.insert(TableName::new("app", "p1"));
+        let (extra, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        // The columns come out of the domain scan, with the ones a parent's
+        // drop takes along.
+        assert!(
+            extra.contains(
+                "a.attname::pg_catalog.text = E'x' AND ((n.nspname = E'app' AND c.relname = E't')"
+            ),
+            "{extra}"
+        );
+        assert!(extra.contains("a.attinhcount > 0 AND c.oid IN"), "{extra}");
+        // The domain's default is left out by the domain's name.
+        let default = arms
+            .iter()
+            .find(|a| a.contains("'domain_default' AS kind"))
+            .unwrap();
+        assert!(
+            default.contains("dn.nspname = E'app' AND dt.typname = E'dm'"),
+            "{default}"
+        );
+        // And every query that reads the relations leaves out a detached
+        // partition, unless it is the table the statement names.
+        for arm in arms.iter().filter(|a| a.contains("FROM relations r")) {
+            assert!(arm.contains("SELECT oid FROM detached"), "{arm}");
+        }
+        assert!(extra.contains("SELECT oid FROM detached"), "{extra}");
+        // Nothing dropped, nothing left out of the domain scan.
+        let (extra, _) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        assert!(extra.contains("NOT (false)"), "{extra}");
     }
 
     #[test]

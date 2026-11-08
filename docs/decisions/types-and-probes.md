@@ -5643,6 +5643,31 @@ clones of a partitioned parent's index, and every expression of a table the plan
 drops and of the partitions that go with it. A name alone excuses nothing: it
 must be the owner's.
 
+Every site kind has a step that removes it, and each is excused (#2748, a sweep
+of the plan's changes against the sites; all of them run before the rows, in
+`order_key` classes 0 to 9 against 11):
+
+| site | removed, before the rows, by | noted as |
+|---|---|---|
+| CHECK | `DropCheck`; `DropTable` | `checks`; `tables` |
+| index key, filter | `DropIndex`; `DropTable` | `indexes`; `tables` |
+| column DEFAULT, generated | `DropColumn`; `AlterColumnDefault`, `AlterColumnExpression`; `DropTable` | `values`; `tables` |
+| policy | `DropPolicy`; `DropTable` | `policies`; `tables` |
+| domain CHECK | `AlterDomain` dropping it; `DropColumn` or `AlterColumnType` of every column that has the domain; `DropTable` | `domain_checks`; `columns`; `tables` |
+| domain DEFAULT | `AlterDomain` setting or dropping it; the same column steps; `DropTable` | `domain_defaults`; `columns`; `tables` |
+| any, on a partition | `DetachPartition`: a write through the parent no longer reaches it | `detached` |
+
+A column the plan retypes keeps its own default and expressions (they are
+re-cast), so only the domain is excused; a column whose default or expression
+changes keeps its domain, so only the default or expression is. `DropType` of a
+domain runs after the rows (class 18) but cannot until no column has it, so the
+column steps above are what excuse it. A detached partition is excused only for
+a write that does not name it: a write to the partition itself, or to its own
+partitions, still runs what it holds. Not excused, because it is not a removal:
+`SetRowSecurity` and `AttachPartition`. A partition attached by the plan is
+judged when the statement runs, not before (`check` reads the catalog as it
+stands).
+
 Refused. The words are the predicate's own, with the site named as
 `the existing CHECK `ck` of app.t`, and the same three ways out: bring the
 routine into the project, list its owner in `trusted_roles`, or set

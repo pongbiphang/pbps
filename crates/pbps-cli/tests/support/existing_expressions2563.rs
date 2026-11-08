@@ -1252,6 +1252,317 @@ fn a_policy_is_judged_only_on_the_relation_a_statement_names() {
     });
 }
 
+fn table_named(name: &str) -> pbps_model::TableName {
+    format!("app.{name}").parse().unwrap()
+}
+
+fn domain_named(name: &str) -> pbps_model::TypeRef {
+    format!("app.{name}").parse().unwrap()
+}
+
+/// The routines the fixture's `app.t` runs for an `INSERT`: every kind of site.
+const INSERT_SET: [&str; 8] = [
+    "app.f_check(integer)",
+    "app.f_default()",
+    "app.f_gen(integer)",
+    "app.f_key(integer)",
+    "app.f_filter(integer)",
+    "app.f_other(integer)",
+    "app.f_dom(integer)",
+    "app.f_domdef()",
+];
+
+/// The sweep of what `prepare` excuses (#2748): for each kind of site on the
+/// fixture's table, each step of a plan that removes it before the rows, and the
+/// same step aimed at something else, which excuses nothing.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn every_site_kind_is_excused_by_each_step_that_removes_it_and_by_no_other() {
+    type Step = fn(&mut Dropped);
+    let cases: [(&str, Step, &[&str]); 16] = [
+        (
+            "CHECK: DropCheck",
+            |d| {
+                d.checks.insert((table_named("t"), "ck".to_owned()));
+            },
+            &["app.f_check(integer)"],
+        ),
+        (
+            "CHECK: the same name dropped on another table",
+            |d| {
+                d.checks.insert((table_named("u"), "ck".to_owned()));
+            },
+            &[],
+        ),
+        (
+            "index key: DropIndex",
+            |d| {
+                d.indexes.insert((table_named("t"), "ix_key".to_owned()));
+            },
+            &["app.f_key(integer)"],
+        ),
+        (
+            "index filter: DropIndex",
+            |d| {
+                d.indexes.insert((table_named("t"), "ix_filter".to_owned()));
+            },
+            &["app.f_filter(integer)", "app.f_other(integer)"],
+        ),
+        (
+            "DEFAULT: DropColumn or AlterColumnDefault",
+            |d| {
+                d.values.insert((table_named("t"), "d".to_owned()));
+            },
+            &["app.f_default()"],
+        ),
+        (
+            "generated: DropColumn or AlterColumnExpression",
+            |d| {
+                d.values.insert((table_named("t"), "g".to_owned()));
+            },
+            &["app.f_gen(integer)"],
+        ),
+        (
+            "domain: a changed default of the domain-typed column keeps the domain",
+            |d| {
+                d.values.insert((table_named("t"), "c".to_owned()));
+            },
+            &[],
+        ),
+        (
+            "domain CHECK and DEFAULT: DropColumn or AlterColumnType of the column",
+            |d| {
+                d.columns.insert((table_named("t"), "c".to_owned()));
+            },
+            &["app.f_dom(integer)", "app.f_domdef()"],
+        ),
+        (
+            "domain: another column dropped",
+            |d| {
+                d.columns.insert((table_named("t"), "a".to_owned()));
+            },
+            &[],
+        ),
+        (
+            "domain: the same column of another table dropped",
+            |d| {
+                d.columns.insert((table_named("u"), "c".to_owned()));
+            },
+            &[],
+        ),
+        (
+            "domain CHECK: AlterDomain drops the check",
+            |d| {
+                d.domain_checks.insert((domain_named("d"), "dc".to_owned()));
+            },
+            &["app.f_dom(integer)"],
+        ),
+        (
+            "domain CHECK: another domain's check dropped",
+            |d| {
+                d.domain_checks
+                    .insert((domain_named("other"), "dc".to_owned()));
+            },
+            &[],
+        ),
+        (
+            "domain DEFAULT: AlterDomain sets or drops the default",
+            |d| {
+                d.domain_defaults.insert(domain_named("d"));
+            },
+            &["app.f_domdef()"],
+        ),
+        (
+            "domain DEFAULT: another domain's default",
+            |d| {
+                d.domain_defaults.insert(domain_named("other"));
+            },
+            &[],
+        ),
+        (
+            "every kind: DropTable",
+            |d| {
+                d.tables.insert(table_named("t"));
+            },
+            &INSERT_SET,
+        ),
+        (
+            "every kind: DropTable of another table",
+            |d| {
+                d.tables.insert(table_named("u"));
+            },
+            &[],
+        ),
+    ];
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-sweep-{version}"));
+        on_server(own.connection(), &fixture(""));
+        let all: BTreeSet<&'static str> = INSERT_SET.into_iter().collect();
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            let mut everything = Dropped::default();
+            for (label, step, gone) in &cases {
+                let mut dropped = Dropped::default();
+                step(&mut dropped);
+                let expected: BTreeSet<&'static str> =
+                    all.iter().copied().filter(|r| !gone.contains(r)).collect();
+                let got = names(&plan_time(&mut conn, "app.t", insert(&[]), &dropped, None).await);
+                assert_eq!(got, expected, "PG{version}: {label}");
+                if !gone.is_empty() {
+                    step(&mut everything);
+                }
+            }
+            // Every removing step together leaves nothing to refuse at plan time
+            // (the table's own drop would do it alone, so leave that one out)...
+            everything.tables.clear();
+            let got = names(&plan_time(&mut conn, "app.t", insert(&[]), &everything, None).await);
+            assert!(got.is_empty(), "PG{version}: {got:?}");
+            // ...and the recheck just before the statement allows none of it.
+            let at = names(&at_the_statement(&mut conn, "app.t").await);
+            assert_eq!(at, all, "PG{version}: at the statement");
+        });
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_dropped_inherited_column_or_a_detached_partition_excuses_what_it_carried() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-tree-{version}"));
+        on_server(
+            own.connection(),
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_cchk(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_dom(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE DOMAIN app.dx AS integer CONSTRAINT dxc CHECK (app.f_dom(VALUE));
+             CREATE DOMAIN app.dz AS integer CONSTRAINT dzc CHECK (app.f_cchk(VALUE));
+             CREATE TABLE app.pp (id integer, x app.dx);
+             CREATE TABLE app.cc (z app.dz) INHERITS (app.pp);
+             CREATE TABLE app.pt (id integer, b integer) PARTITION BY RANGE (id);
+             CREATE TABLE app.p1 PARTITION OF app.pt FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.p1 ADD CONSTRAINT p1ck CHECK (app.f_check(b));
+             CREATE TABLE app.p2 PARTITION OF app.pt FOR VALUES FROM (10) TO (20)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.p2a PARTITION OF app.p2 FOR VALUES FROM (10) TO (20);
+             ALTER TABLE app.p2a ADD CONSTRAINT p2ack CHECK (app.f_cchk(b))",
+        );
+        let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+            routines.iter().copied().collect()
+        };
+        let (dom, cchk, check) = (
+            "app.f_dom(integer)",
+            "app.f_cchk(integer)",
+            "app.f_check(integer)",
+        );
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            // An UPDATE of `x` and `z` through the parent reaches the child's
+            // inherited `x` and its own `z`.
+            macro_rules! through_the_parent {
+                ($dropped:expr) => {
+                    names(
+                        &plan_time(&mut conn, "app.pp", update(&["x", "z"]), &$dropped, None).await,
+                    )
+                };
+            }
+            assert_eq!(
+                through_the_parent!(Dropped::default()),
+                set(&[dom, cchk]),
+                "PG{version}"
+            );
+            // The parent's column goes, and the child's copy of it with it.
+            let mut d = Dropped::default();
+            d.columns.insert((table_named("pp"), "x".to_owned()));
+            assert_eq!(
+                through_the_parent!(d),
+                set(&[cchk]),
+                "PG{version}: the parent's column"
+            );
+            // The child's own column goes alone.
+            let mut d = Dropped::default();
+            d.columns.insert((table_named("cc"), "z".to_owned()));
+            assert_eq!(
+                through_the_parent!(d),
+                set(&[dom]),
+                "PG{version}: the child's column"
+            );
+            // Named on the child alone, `x` is the parent's still.
+            let mut d = Dropped::default();
+            d.columns.insert((table_named("cc"), "x".to_owned()));
+            assert_eq!(
+                through_the_parent!(d),
+                set(&[dom, cchk]),
+                "PG{version}: the parent's x stays"
+            );
+            let mut d = Dropped::default();
+            d.columns.insert((table_named("pp"), "x".to_owned()));
+            d.columns.insert((table_named("cc"), "z".to_owned()));
+            assert_eq!(through_the_parent!(d), set(&[]), "PG{version}: both");
+
+            // An INSERT through the partitioned parent reaches both leaves' checks.
+            macro_rules! into_the_tree {
+                ($table:expr, $detached:expr) => {{
+                    let mut d = Dropped::default();
+                    for name in $detached {
+                        d.detached.insert(table_named(name));
+                    }
+                    names(&plan_time(&mut conn, $table, insert(&[]), &d, None).await)
+                }};
+            }
+            let none: [&str; 0] = [];
+            assert_eq!(
+                into_the_tree!("app.pt", none),
+                set(&[check, cchk]),
+                "PG{version}"
+            );
+            assert_eq!(
+                into_the_tree!("app.pt", ["p1"]),
+                set(&[cchk]),
+                "PG{version}: p1 detached"
+            );
+            // A detached partition takes its own partitions with it.
+            assert_eq!(
+                into_the_tree!("app.pt", ["p2"]),
+                set(&[check]),
+                "PG{version}: p2 detached"
+            );
+            assert_eq!(
+                into_the_tree!("app.pt", ["p1", "p2"]),
+                set(&[]),
+                "PG{version}: both"
+            );
+            // A table that is no partition of it excuses nothing.
+            assert_eq!(
+                into_the_tree!("app.pt", ["pp"]),
+                set(&[check, cchk]),
+                "PG{version}: not a partition"
+            );
+            // A write that names the detached partition still runs what it holds.
+            assert_eq!(
+                into_the_tree!("app.p1", ["p1"]),
+                set(&[check]),
+                "PG{version}: written directly"
+            );
+            assert_eq!(
+                into_the_tree!("app.p2", ["p2"]),
+                set(&[cchk]),
+                "PG{version}: its partitions, written directly"
+            );
+            // The recheck allows no detach: all of it is still reached.
+            let at = names(&at_the_statement(&mut conn, "app.pt").await);
+            assert_eq!(at, set(&[check, cchk]), "PG{version}: at the statement");
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Whole plans: a table that already carries an expression, then a plan that
 // writes rows to it, or rewrites it.
