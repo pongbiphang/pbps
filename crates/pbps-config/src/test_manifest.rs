@@ -491,8 +491,14 @@ impl TestManifest {
         // the anchor it points at would move every alias of it, which the
         // reparse below refuses.
         let old = self.fixtures[index].at.as_str();
-        let (from, until) = if scalar.starts_with('*') {
-            (start, end)
+        let (from, until) = if scalar.starts_with('*') || scalar.contains(['\\', '\r', '\n']) {
+            // Escapes and folding need not spell out the decoded id. Replace
+            // the whole span. Block spans start at the content and can end in
+            // the next key's indentation, so keep their trailing whitespace.
+            (
+                start,
+                start + scalar.trim_end_matches([' ', '\t', '\r', '\n']).len(),
+            )
         } else {
             // Lowercasing ASCII keeps every byte position, so a pin typed in
             // capitals is found and replaced in place.
