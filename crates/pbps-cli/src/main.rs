@@ -5202,9 +5202,12 @@ fn cmd_plan(
         // Stale is the tree not being what the mapping and the declarations say
         // (design §3.5): a changed mapping, but also a declaration that moved or
         // bytes that are not canonical when the mapping is unchanged. A plan that
-        // cannot be made is stale too, and `plan` reports why.
-        let stale =
-            res.ids != ids || ids_store::is_stale(project, &res.ids, &loaded).unwrap_or(true);
+        // cannot be made is refused by name, as `plan` refuses it, rather than
+        // reported as stale: running `pbps plan` would not help.
+        // The tree is judged first: a layout that cannot exist must be named even
+        // when the mapping also changed.
+        let tree_stale = ids_store::is_stale(project, &res.ids, &loaded)?;
+        let stale = res.ids != ids || tree_stale;
         if stale && check {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",

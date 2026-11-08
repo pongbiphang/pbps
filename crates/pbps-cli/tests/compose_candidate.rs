@@ -470,6 +470,23 @@ fn deleting_the_last_declaration_keeps_the_snapshot_input_directory() {
 }
 
 #[test]
+fn a_dropped_table_replaced_at_its_yaml_path_previews_with_its_identity_set_aside() {
+    let repo = Repository::new("drop-replaced", "");
+    // Another table is declared where the dropped one was: its identity file
+    // takes the mirrored path and the old one goes to `<name>.<uid>.json`.
+    repo.table("table: dbo.u\ncolumns:\n  id: {type: int}\n");
+    let mut action = request();
+    action.intent = Intent::DropTable {
+        table: "dbo.t".into(),
+        reason: "Replaced".into(),
+    };
+    let preview = repo.store().preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("Replaced"), "{}", preview.diff);
+    // The real project is untouched.
+    assert!(!repo.project.join(".pbps/ids").join("dbo.t.json").exists());
+}
+
+#[test]
 fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
     for (directory_first, foreign) in [(false, false), (true, false), (true, true)] {
         let repo = Repository::new(&format!("replacement-{directory_first}-{foreign}"), "");

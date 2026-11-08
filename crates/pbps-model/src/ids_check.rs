@@ -405,6 +405,27 @@ impl Run<'_> {
                 "rename one",
             );
         }
+        // A path cannot be both a file and the directory of another: `a.yml`
+        // and `a.json/b.yml` map to `a.json` and `a.json/b.json`.
+        for (rel, yamls) in &by_ids {
+            let prefix = format!("{rel}/");
+            if let Some((inner, inner_yamls)) = by_ids.range(prefix.clone()..).next()
+                && inner.starts_with(&prefix)
+            {
+                self.add(
+                    Code::PathCollision,
+                    yamls[0].to_owned(),
+                    format!(
+                        "{} maps to {} and {} to {} below it: a file cannot also be a directory",
+                        yamls[0],
+                        self.shown(rel),
+                        inner_yamls[0],
+                        self.shown(inner)
+                    ),
+                    "rename one",
+                );
+            }
+        }
         // Fold the ids paths, not the YAML paths: `a.yml` and `A.yaml` differ in
         // case and extension, yet map to `a.json` and `A.json`, which cannot
         // coexist on a case-insensitive checkout. The YAML tree is covered

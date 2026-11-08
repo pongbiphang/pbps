@@ -556,3 +556,62 @@ fn an_old_file_nothing_removes_is_kept_aside_and_named() {
         "other"
     );
 }
+
+fn two_tables() -> IdsFile {
+    ids(json!({
+        "version": 1,
+        "tables": {T: "dbo.customer", "t_bbbbbb": "dbo.other"},
+        "columns": {"c_aaaaa1": "dbo.customer.id", "c_aaaaa2": "dbo.customer.name"},
+    }))
+}
+
+#[test]
+fn a_file_and_a_directory_at_one_identity_path_are_refused_by_name_before_any_write() {
+    let project = written("file-and-dir", &customer(), &customer_declared());
+    // `a.yml` mirrors to `a.json`; `a.json/b.yml` mirrors to `a.json/b.json`.
+    let paths = declared(&[
+        ("dbo.customer", "a.yml", &["id", "name"]),
+        ("dbo.other", "a.json/b.yml", &[]),
+    ]);
+    let before = tree(&project);
+    let error = format!("{:#}", plan(&project, &two_tables(), &paths).unwrap_err());
+    for needle in [
+        "dbo.customer",
+        "dbo.other",
+        "a.json",
+        "a.json/b.json",
+        "rename one",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    assert!(error.contains("nothing was written"), "{error}");
+    assert_eq!(tree(&project), before);
+    // Siblings that merely share a prefix are fine: `a.json` and `a.json2/b.json`.
+    let fine = declared(&[
+        ("dbo.customer", "a.yml", &["id", "name"]),
+        ("dbo.other", "a.json2/b.yml", &[]),
+    ]);
+    plan(&project, &two_tables(), &fine).unwrap();
+}
+
+#[test]
+fn a_dropped_file_in_the_way_of_a_directory_goes_aside_instead_of_refusing() {
+    let flat = declared(&[("dbo.customer", "a.yml", &["id", "name"])]);
+    let project = written("dropped-ancestor", &customer(), &flat);
+    // `dbo.customer` is dropped (its file stays at `a.json`); `dbo.other` is
+    // declared below that path.
+    let after = ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other"},
+        "tombstones": {
+            T: {"was": "dbo.customer", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa1": {"was": "dbo.customer.id", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa2": {"was": "dbo.customer.name", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }));
+    let paths = declared(&[("dbo.other", "a.json/b.yml", &[])]);
+    plan(&project, &after, &paths).unwrap().apply().unwrap();
+    let names: Vec<_> = tree(&project).into_keys().collect();
+    assert_eq!(names, ["a.json/b.json", "dbo.customer.t_aaaaaa.json"]);
+    assert_eq!(read_opt(&project).unwrap().unwrap().tables.len(), 1);
+}

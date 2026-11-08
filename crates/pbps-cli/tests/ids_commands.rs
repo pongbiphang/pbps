@@ -859,3 +859,30 @@ fn plan_relocates_an_identity_file_into_a_directory_named_like_it() {
     assert_eq!(p.read(".pbps/ids/dbo/customer.json"), uid_before);
     assert!(p.0.join(".pbps/ids/dbo/customer.json").is_file());
 }
+
+#[test]
+fn a_file_and_a_directory_at_one_identity_path_are_named_before_anything_is_written() {
+    let p = migrated();
+    // `a.yml` mirrors to `a.json`; `a.json/b.yml` to `a.json/b.json`.
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.yml"),
+        p.0.join("schema/a.yml"),
+    )
+    .unwrap();
+    p.write(
+        "schema/a.json/b.yml",
+        "table: dbo.extra\ncolumns:\n  id: {type: int}\n",
+    );
+    let before = tree_of(&p);
+    for args in [&["plan"][..], &["plan", "--check"][..], &["validate"][..]] {
+        let out = p.pbps(args);
+        assert!(!out.status.success(), "{args:?}: {}", text(&out));
+        let shown = text(&out);
+        for needle in ["a.json", "a.json/b.json"] {
+            assert!(shown.contains(needle), "{args:?} {needle}: {shown}");
+        }
+    }
+    assert_eq!(tree_of(&p), before, "nothing was written");
+    // No aside is left behind.
+    assert!(!p.0.join(".pbps/ids/.a.json.aside").exists());
+}

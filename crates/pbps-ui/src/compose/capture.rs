@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use super::cli::{Cli, Paths};
+use super::cli::{Cli, Intent, Paths};
 use super::files::{self, FileBytes, MAX_BYTES, MAX_FILES, Root};
 use super::git::{Git, text};
 use super::{
@@ -69,6 +69,47 @@ impl Workspace {
         }
         self.resources.discard_preview(&self.operation)
     }
+}
+
+/// Where `pbps` puts the identity file of the table a `DropTable` intent drops
+/// when another declaration takes its mirrored path: `<name>.<uid>.json` in the
+/// identity directory (`pbps-cli`'s `ids_cmd::aside`, design §3.4 step 5). This
+/// crate may not depend on the model (ADR-0015), so the rule is repeated here;
+/// the compose test `a_dropped_table_replaced_at_its_yaml_path_...` runs the real
+/// CLI against it, so the two cannot drift apart unnoticed. The uid comes from
+/// the table's own identity file, found by its recorded name.
+fn dropped_table_aside<'a>(
+    intent: &Intent,
+    ids: &str,
+    files: impl Iterator<Item = (&'a String, &'a FileBytes)>,
+) -> Option<String> {
+    let Intent::DropTable { table, .. } = intent else {
+        return None;
+    };
+    for (name, file) in files {
+        if !name.starts_with(&format!("{ids}/")) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file.bytes) else {
+            continue;
+        };
+        if value.get("table").and_then(|t| t.as_str()) != Some(table.as_str()) {
+            continue;
+        }
+        let uid = value.get("uid")?.as_str()?;
+        let safe: String = table
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        return Some(format!("{ids}/{safe}.{uid}.json"));
+    }
+    None
 }
 
 fn known_path(known: &mut BTreeSet<String>, name: &str) {
@@ -1087,6 +1128,14 @@ pub(super) fn capture(
             known_path(&mut known, &format!("repository/{ids}/{stem}.json"));
         }
     }
+    // A dropped table whose YAML path another declaration now holds keeps its
+    // identity file under the aside name, which the CLI writes; admit that one
+    // name and no other.
+    if let Some(name) =
+        dropped_table_aside(&request.intent, &ids, live.iter().chain(recorded.iter()))
+    {
+        known_path(&mut known, &format!("repository/{name}"));
+    }
     known_git(&mut known, "attribute-view");
     known_path(&mut known, "attribute-view/.git/info/attributes");
     for (index, _) in &attribute_view.indexes {
@@ -1251,4 +1300,72 @@ pub(super) fn capture(
         workspace,
         repository_identity,
     })
+}
+
+#[cfg(test)]
+mod aside_tests {
+    use super::*;
+
+    fn tree() -> BTreeMap<String, FileBytes> {
+        let file = |text: &str| FileBytes {
+            bytes: text.as_bytes().to_vec(),
+            mode: 0o644,
+        };
+        BTreeMap::from([
+            (
+                ".pbps/ids/t.json".to_owned(),
+                file(r#"{"uid":"t_aaaaaa","table":"dbo.t"}"#),
+            ),
+            (
+                ".pbps/ids/u.json".to_owned(),
+                file(r#"{"uid":"t_bbbbbb","table":"dbo.u"}"#),
+            ),
+            ("schema/t.yml".to_owned(), file("table: dbo.t\n")),
+        ])
+    }
+
+    fn drop_table(table: &str) -> Intent {
+        Intent::DropTable {
+            table: table.into(),
+            reason: "r".into(),
+        }
+    }
+
+    #[test]
+    fn only_the_dropped_tables_own_aside_name_is_admitted() {
+        let files = tree();
+        assert_eq!(
+            dropped_table_aside(&drop_table("dbo.t"), ".pbps/ids", files.iter()),
+            Some(".pbps/ids/dbo.t.t_aaaaaa.json".to_owned())
+        );
+        // Another table's aside, an unknown table and other intents admit nothing.
+        assert_eq!(
+            dropped_table_aside(&drop_table("dbo.missing"), ".pbps/ids", files.iter()),
+            None
+        );
+        assert_eq!(
+            dropped_table_aside(&Intent::Declarations, ".pbps/ids", files.iter()),
+            None
+        );
+        // A name outside the identity directory is not an identity file.
+        assert_eq!(
+            dropped_table_aside(&drop_table("dbo.t"), "other/ids", files.iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_with_unsafe_characters_is_sanitised_as_the_cli_does() {
+        let files = BTreeMap::from([(
+            ".pbps/ids/x.json".to_owned(),
+            FileBytes {
+                bytes: br#"{"uid":"t_cccccc","table":"my schema.t/x"}"#.to_vec(),
+                mode: 0o644,
+            },
+        )]);
+        assert_eq!(
+            dropped_table_aside(&drop_table("my schema.t/x"), ".pbps/ids", files.iter()),
+            Some(".pbps/ids/my_schema.t_x.t_cccccc.json".to_owned())
+        );
+    }
 }

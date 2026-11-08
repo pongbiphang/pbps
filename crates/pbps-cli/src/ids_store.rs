@@ -456,6 +456,35 @@ pub(crate) fn plan(
             want.insert(uid.clone(), aside_of(after, &uid));
         }
     }
+    // A path that is a file cannot also be the directory of another: no
+    // destination may be a proper ancestor of another. A live pair is two
+    // declarations whose mirrored paths cannot both exist on disk; a dropped
+    // file in the way goes aside, as in step 5. (Old-vs-new transitions are the
+    // write's business: `TreeWrite::apply` makes room for them.)
+    let snapshot: Vec<(Uid, String)> = want.iter().map(|(u, p)| (u.clone(), p.clone())).collect();
+    for (uid, path) in &snapshot {
+        let below = |p: &str| {
+            p.strip_prefix(path.as_str())
+                .is_some_and(|r| r.starts_with('/'))
+        };
+        for (inner, inner_path) in snapshot.iter().filter(|(_, p)| below(p)) {
+            let dead = |u: &Uid| after.tombstones.contains_key(u);
+            if dead(uid) {
+                want.insert(uid.clone(), aside_of(after, uid));
+            } else if dead(inner) {
+                want.insert(inner.clone(), aside_of(after, inner));
+            } else {
+                return Err(refused(format!(
+                    "{} is declared at `{}` and {} below it at `{}`; a file cannot also be a \
+                     directory, so rename one of the two YAML files",
+                    name_of(uid),
+                    shown(&dirs, path),
+                    name_of(inner),
+                    shown(&dirs, inner_path)
+                )));
+            }
+        }
+    }
     let mut placement = Placement {
         paths: want,
         children,
