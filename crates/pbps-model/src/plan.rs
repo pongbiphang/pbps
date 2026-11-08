@@ -295,6 +295,7 @@ use crate::zone::SessionZone;
 // value.
 // 71 adds the pins of the operator classes a package provides (DEC-2447.14): an older build
 // would reject the field as malformed rather than as a newer plan; 70 belongs to another change.
+// 71 also carries the indexes a package's drop releases (`DropExtension.index_releases`).
 pub const CURRENT_VERSION: u32 = 71;
 
 /// Where a plan came from. Database provenance permits apply in principle;
@@ -1584,6 +1585,7 @@ mod tests {
             },
             requirers: Default::default(),
             releases: Default::default(),
+            index_releases: Default::default(),
         })
         .unwrap();
         let payload = change.get("drop_extension").unwrap_or(&change);

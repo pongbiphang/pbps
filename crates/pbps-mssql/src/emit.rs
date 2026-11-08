@@ -2429,6 +2429,7 @@ mod tests {
                 definition: definition.clone(),
                 requirers: Default::default(),
                 releases: Default::default(),
+                index_releases: Default::default(),
             },
             Change::UpdateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),

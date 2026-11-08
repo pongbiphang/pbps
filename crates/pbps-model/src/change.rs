@@ -360,6 +360,11 @@ pub enum Change {
         /// member function): the drop waits for each.
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         releases: BTreeSet<crate::ModuleId>,
+        /// The indexes of tables this plan keeps that it also drops and that the
+        /// package's removal would be blocked by (an index under one of its
+        /// operator classes, DEC-2447.14): the drop waits for each.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        index_releases: BTreeSet<(TableName, ObjectLocalName)>,
     },
     /// `ALTER EXTENSION name UPDATE TO 'version'` of a package the declarations
     /// hold at a version other than the target's, in the same schema

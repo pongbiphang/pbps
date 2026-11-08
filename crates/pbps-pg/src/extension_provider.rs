@@ -1370,6 +1370,7 @@ mod tests {
             definition: wanted("ext\"s", "1.0"),
             requirers: Default::default(),
             releases: Default::default(),
+            index_releases: Default::default(),
         };
         let statements = crate::emit::emit(&pg, &drop, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);

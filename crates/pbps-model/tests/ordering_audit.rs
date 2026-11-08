@@ -1006,6 +1006,7 @@ mod effects_of_each_kind {
                     },
                     requirers: [uid(UidKind::Extension, "cube")].into(),
                     releases: Default::default(),
+                    index_releases: Default::default(),
                 },
             ),
             (

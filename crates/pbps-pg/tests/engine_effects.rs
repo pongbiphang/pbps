@@ -394,3 +394,108 @@ fn an_index_key_naming_a_package_class_requires_the_package_and_an_engine_class_
         "gin_trgm_ops"
     )));
 }
+
+/// A package's drop waits for an index the plan drops that would block it: the effect is the
+/// index's absence, so the order puts `DROP INDEX` first and the check sees it (DEC-2447.14).
+#[test]
+fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
+    use pbps_model::operation::{ObjectKey, PartKey, Requirement};
+    use pbps_model::{Extension, Index, IndexColumn, IndexKey, IndexMethod};
+    let name = TableName::new("app", "docs");
+    let table = |indexed: bool| {
+        let mut t = Table {
+            columns: [("body".into(), Column::new("text".parse().unwrap()))].into(),
+            ..Default::default()
+        };
+        if indexed {
+            t.indexes.insert(
+                "docs_ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: IndexKey::Column("body".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Btree,
+                    storage_parameters: Default::default(),
+                },
+            );
+        }
+        t
+    };
+    let package = Extension {
+        schema: "ext".into(),
+        version: "1.6".into(),
+    };
+    let base = Schema {
+        tables: [(name.clone(), table(true))].into(),
+        extensions: [("pg_trgm".into(), package.clone())].into(),
+        ..Default::default()
+    };
+    let desired = Schema {
+        tables: [(name.clone(), table(false))].into(),
+        ..Default::default()
+    };
+    let ctx = pbps_diff::Context {
+        operator: "test".into(),
+        today: "2026-11-08".into(),
+    };
+    let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &ctx)
+        .unwrap()
+        .ids;
+    let ids = pbps_diff::resolve(&desired, &base_ids, &[], &ctx)
+        .unwrap()
+        .ids;
+    let uid = base_ids
+        .extensions
+        .keys()
+        .next()
+        .expect("the package is identified")
+        .clone();
+    let released =
+        |releases: std::collections::BTreeSet<(TableName, pbps_model::ObjectLocalName)>| {
+            let changes = vec![
+                PlannedChange::new(Change::DropIndex {
+                    table: name.clone(),
+                    name: "docs_ix".into(),
+                }),
+                PlannedChange::new(Change::DropExtension {
+                    uid: uid.clone(),
+                    name: "pg_trgm".into(),
+                    definition: package.clone(),
+                    requirers: Default::default(),
+                    releases: Default::default(),
+                    index_releases: releases,
+                }),
+            ];
+            let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+            let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &base_ids, &ids);
+            let (before, after) = (
+                Snapshot {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Snapshot {
+                    schema: &desired,
+                    ids: &ids,
+                },
+            );
+            let effects = analyse(&ops, &owners, before, after, &Postgres::new()).effects;
+            effects[1].requires.iter().any(|r| {
+                matches!(
+                    r,
+                    Requirement::Absent(ObjectKey::Part {
+                        part: PartKey::Index(_),
+                        ..
+                    })
+                )
+            })
+        };
+    assert!(released([(name.clone(), "docs_ix".into())].into()));
+    // Negative: with nothing released the drop waits for no index.
+    assert!(!released(Default::default()));
+}

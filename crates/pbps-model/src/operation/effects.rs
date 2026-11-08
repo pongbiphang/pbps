@@ -1516,6 +1516,7 @@ impl Cx<'_> {
                 uid,
                 requirers,
                 releases,
+                index_releases,
                 ..
             } => {
                 self.exists(ObjectKey::Extension(Recorded(uid.clone())));
@@ -1526,6 +1527,14 @@ impl Cx<'_> {
                 }
                 for id in releases {
                     self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
+                }
+                // An index that blocks the removal is dropped first (DEC-2447.14).
+                for (table, name) in index_releases {
+                    let owner = self.table(table)?;
+                    self.requires(Requirement::Absent(Self::part(
+                        &owner,
+                        PartKey::Index(name.clone()),
+                    )));
                 }
             }
             Change::RenameRole { uid, .. } => {

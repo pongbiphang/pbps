@@ -131,6 +131,23 @@ pub fn drops(
         .keys()
         .filter(|id| !desired.schema.modules.contains_key(*id))
         .collect();
+    // The indexes of tables the plan keeps that it drops (an index under a class of the
+    // package blocks its removal): released the way a module is (DEC-2447.14).
+    let removed_indexes: Vec<(pbps_model::TableName, pbps_model::ObjectLocalName)> = base
+        .schema
+        .tables
+        .iter()
+        .filter_map(|(table, was)| {
+            let now = desired.schema.tables.get(table)?;
+            Some(
+                was.indexes
+                    .keys()
+                    .filter(|n| !now.indexes.contains_key(*n))
+                    .map(|n| (table.clone(), n.clone())),
+            )
+        })
+        .flatten()
+        .collect();
     let (mut changes, mut errors) = (Vec::new(), Vec::new());
     for (name, (uid, definition)) in &dropped {
         let Some(facts) = facts.get(*name) else {
@@ -141,10 +158,14 @@ pub fn drops(
         };
         let (mut requirers, mut releases, mut found) =
             (BTreeSet::new(), BTreeSet::new(), Vec::new());
+        let mut index_releases = BTreeSet::new();
         for member in &facts.outside {
             match member.module(removed.iter().copied()) {
                 Some(id) => {
                     releases.insert(id.clone());
+                }
+                None if member.index(&removed_indexes).is_some() => {
+                    index_releases.extend(member.index(&removed_indexes).cloned());
                 }
                 None => found.push(format!(
                     "`{member}` depends on the package, so the engine would delete it too, and this plan does not drop it"
@@ -166,6 +187,8 @@ pub fn drops(
                 }
             } else if let Some(id) = member.module(removed.iter().copied()) {
                 releases.insert(id.clone());
+            } else if let Some(index) = member.index(&removed_indexes) {
+                index_releases.insert(index.clone());
             } else {
                 found.push(format!(
                     "`{member}` depends on the package and this plan does not remove it, so the engine would refuse"
@@ -185,6 +208,7 @@ pub fn drops(
             definition: (*definition).clone(),
             requirers,
             releases,
+            index_releases,
         });
     }
     (changes, errors)
@@ -1289,6 +1313,7 @@ mod tests {
                 definition,
                 requirers,
                 releases,
+                index_releases: _,
             },
         ] = changes.as_slice()
         else {
@@ -1424,6 +1449,67 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
             matches!(changes.as_slice(), [pbps_model::Change::DropExtension { releases, .. }] if releases.len() == 1)
+        );
+    }
+
+    /// An index of a table the plan keeps that it also drops, and that blocks the package's
+    /// removal, is carried and waited for; one the declarations keep, or one of a table
+    /// the plan does not hold, is refused by name (DEC-2447.14).
+    #[test]
+    fn an_index_the_plan_drops_is_carried_and_one_it_keeps_is_refused() {
+        use pbps_model::{Index, IndexMethod, Table};
+        let index = || Index {
+            columns: Vec::new(),
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: IndexMethod::Gin,
+            storage_parameters: Default::default(),
+        };
+        let table = "app.docs".parse::<pbps_model::TableName>().unwrap();
+        let blocker = member("index", &["app", "docs_trgm"]);
+        let mut w = world(&["pg_trgm"], &["pg_trgm"], &[]);
+        let mut with_index = Table::default();
+        with_index.indexes.insert("docs_trgm".into(), index());
+        w.base.tables.insert(table.clone(), with_index);
+        // Dropped: the table stays, the index goes.
+        w.desired.tables.insert(table.clone(), Table::default());
+        let (changes, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(errors.is_empty(), "{errors:?}");
+        let [pbps_model::Change::DropExtension { index_releases, .. }] = changes.as_slice() else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(
+            index_releases.iter().collect::<Vec<_>>(),
+            [&(table.clone(), "docs_trgm".into())]
+        );
+        // The same index when the declarations keep it: refused, and named.
+        let mut kept = Table::default();
+        kept.indexes.insert("docs_trgm".into(), index());
+        w.desired.tables.insert(table.clone(), kept);
+        let (changes, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(changes.is_empty());
+        assert!(
+            errors[0].to_string().contains("index app.docs_trgm"),
+            "{errors:?}"
+        );
+        // Another schema's index of the same name is not it, and neither is a table
+        // the plan no longer holds (its index goes with the table, which this does not model).
+        w.desired.tables.insert(table.clone(), Table::default());
+        let (_, errors) = w.drops(&facts(
+            "pg_trgm",
+            &[],
+            &[member("index", &["other", "docs_trgm"])],
+        ));
+        assert!(
+            errors[0].to_string().contains("index other.docs_trgm"),
+            "{errors:?}"
+        );
+        w.desired.tables.clear();
+        let (_, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(
+            errors[0].to_string().contains("index app.docs_trgm"),
+            "{errors:?}"
         );
     }
 

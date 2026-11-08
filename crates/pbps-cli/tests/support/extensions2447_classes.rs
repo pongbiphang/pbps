@@ -474,11 +474,32 @@ fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
             "{}",
             said(&out)
         );
-        // The index is removed by the same plan: the declaration no longer holds it.
+        // The declaration no longer holds either index (the table file is back to its base,
+        // which has none), so the same plan removes both, and the package after them.
         std::fs::write(table_path(&f), &base).unwrap();
         f.d.commit();
         let out = f.plan(&[]);
         assert_eq!(code(&out), 0, "{}", said(&out));
+        let kinds: Vec<String> = saved(&f)
+            .changes
+            .changes
+            .iter()
+            .map(|c| format!("{:?}", c.change))
+            .collect();
+        let at = |needle: &str| {
+            kinds
+                .iter()
+                .position(|k| k.starts_with("DropIndex") && k.contains(needle))
+                .unwrap_or_else(|| panic!("no DropIndex of {needle} in {kinds:#?}"))
+        };
+        let package = kinds
+            .iter()
+            .position(|k| k.starts_with("DropExtension"))
+            .unwrap_or_else(|| panic!("no DropExtension in {kinds:#?}"));
+        assert!(
+            at("docs_trgm") < package && at("docs_expr") < package,
+            "both indexes go before the package: {kinds:#?}"
+        );
         succeeds(f.apply("destructive"));
         assert_eq!(
             scalar(

@@ -500,6 +500,7 @@ mod tests {
             definition: definition.clone(),
             requirers: BTreeSet::new(),
             releases: BTreeSet::new(),
+            index_releases: Default::default(),
         };
         let found = with(&base, vec![drop]);
         assert!(!found.requires_resolution(), "{found:?}");
@@ -517,6 +518,7 @@ mod tests {
             definition,
             requirers: BTreeSet::new(),
             releases: BTreeSet::new(),
+            index_releases: Default::default(),
         };
         assert!(with(&base, vec![drop, table]).requires_resolution());
     }

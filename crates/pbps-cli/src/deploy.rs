@@ -26669,6 +26669,7 @@ mod extension_guard_tests {
                     definition: pinned.clone(),
                     requirers: Default::default(),
                     releases: Default::default(),
+                    index_releases: Default::default(),
                 },
             )],
         };
