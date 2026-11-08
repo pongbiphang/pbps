@@ -138,9 +138,8 @@ async fn measure() {
         // A copy is its result: the catalog keeps no trace of `COPY`.
         db.run("CREATE TEXT SEARCH CONFIGURATION copied (COPY = pg_catalog.english)")
             .await;
-        assert_eq!(
-            db.one("SELECT (SELECT count(*) FROM pg_ts_config_map WHERE mapcfg = 'app.copied'::regconfig) = (SELECT count(*) FROM pg_ts_config_map WHERE mapcfg = 'pg_catalog.english'::regconfig)").await,
-            "true"
+        assert!(
+            truth(db.conn(), "SELECT (SELECT count(*) FROM pg_ts_config_map WHERE mapcfg = 'app.copied'::regconfig) = (SELECT count(*) FROM pg_ts_config_map WHERE mapcfg = 'pg_catalog.english'::regconfig)").await
         );
         // One name, three namespaces.
         db.run("CREATE TEXT SEARCH CONFIGURATION russian (PARSER = default); CREATE TEXT SEARCH DICTIONARY russian (TEMPLATE = simple); CREATE DOMAIN russian AS text").await;
@@ -224,7 +223,8 @@ async fn the_pull_reads_what_a_user_made_and_nothing_else() {
         let SearchObject::Config { parser, mappings } = &held[&config("c1")] else {
             panic!("a configuration")
         };
-        assert_eq!(parser.raw().to_string(), "pg_catalog.\"default\"");
+        // The canonical spelling quotes nothing it need not: `default` is a name here.
+        assert_eq!(parser.raw().to_string(), "pg_catalog.default");
         let listed = |name: &str| -> Vec<String> {
             let SearchObject::Config { mappings, .. } = &held[&config("usesunaccent")] else {
                 panic!("a configuration")

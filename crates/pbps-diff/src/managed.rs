@@ -126,6 +126,10 @@ pub fn scope(
             .filter(|(name, _)| ids.extension_uid(name).is_some())
             .map(|(n, d)| (n.clone(), d.clone()))
             .collect(),
+        // Text search objects have no identity until the part that creates them, so
+        // every one the database holds is kept; the plan compares only the ones the
+        // declarations name (DEC-2728.1).
+        search: schema.search.clone(),
         ..Default::default()
     };
     let mut unmanaged_types = Vec::new();
@@ -605,6 +609,37 @@ mod tests {
             ids.tables.insert(uid.parse::<Uid>().unwrap(), t(name));
         }
         ids
+    }
+
+    /// A text search object the database holds is in the scoped read, so that the plan can
+    /// compare it with the declaration and the recorded state can hold it (DEC-2728.1).
+    #[test]
+    fn the_text_search_objects_of_the_database_are_kept_in_scope() {
+        use pbps_model::{SearchKind, SearchObject, SearchRef};
+        let mut live = schema(&["dbo.customer"]);
+        let key = SearchRef::new(SearchKind::Dictionary, "app.d".parse().unwrap());
+        live.search.insert(
+            key.clone(),
+            SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let scoped = scope(
+            &live,
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(scoped.schema.search.keys().collect::<Vec<_>>(), [&key]);
+        // Negative: a database with none scopes to none.
+        let none = scope(
+            &schema(&["dbo.customer"]),
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(none.schema.search.is_empty());
     }
 
     #[test]

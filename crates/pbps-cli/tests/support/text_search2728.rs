@@ -87,7 +87,7 @@ fn a_database_with_text_search_objects_pulls_and_pulls_again_with_no_difference(
         );
         let docs = &files["app.docs.textsearch-config.yml"];
         assert!(
-            docs.contains("parser: pg_catalog.\"default\"")
+            docs.contains("parser: pg_catalog.default")
                 && docs.contains("asciiword: [app.english_nostop]")
                 && docs.contains("email: [pg_catalog.simple]"),
             "{docs}"
