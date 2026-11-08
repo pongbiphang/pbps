@@ -1157,3 +1157,53 @@ temporary table alive, and a bounded load of sessions ending during full pulls
 on both versions. That last test is statistical, because the overlap cannot be
 paused inside the production statement; the invariance test is the pin. The
 runner's own session handling (`drop(conn)`) is unchanged.
+
+<a id="dec-168-1"></a>
+
+**DEC-168.1. The pull's coverage of the catalog is a closed set, decided per
+column, and what it does not hold is named, not dropped.** #168 asked that
+nothing the engine knows about an object be left behind silently. Comparing
+deparsed definitions cannot prove that (a changed `fillfactor`, `attstorage` or
+trigger enforcement leaves every `pg_get_*` text equal; there is no
+`pg_get_tabledef`; a catalog read is read-only, DECISIONS 250 and 418; building
+a probe index runs user code, ADR-0013). The reachable closed set is the
+engine's own catalog structure: `pbps_pg::pull_coverage` gives every column of
+every `pg_catalog` table one disposition, **held** (read into the model, or
+kept whole in an engine rendering), **named** (a non-default value prints a
+notice, or the object is refused by name) or **irrelevant** (with the reason).
+A table the pull does not read takes one row for the whole table; a table it
+reads takes a row per column, so no new column inherits a default. One live
+test per supported major (16 and 18) lists the columns from `pg_attribute` and
+fails on any table or column without a disposition, listed but absent (stale),
+or `Named`/`Irrelevant` without a reason, so a property a new major adds must
+be decided before that major is supported. A lint requires every held column
+(or the `pg_get_*` function that renders it) to occur in the pull's sources.
+
+It is not the resolver capture's classification
+(`resolver/capture/properties.rs`): that one says what a sealed capture must
+witness (its `attstattarget` is "physical"), this one what a column means to
+the schema, and its `RULE` string is part of every sealed fingerprint. The two
+share only `pbps_db::resolver::capture::rules::{Coverage, unclassified}`.
+
+Deciding the columns found twelve properties pull said nothing about (measured
+on 16.15 and 18.6, each created and pulled): a column's and an index column's
+statistics target, the index `CLUSTER` follows, column options such as
+`n_distinct`, a column-owned `UNLOGGED` sequence, `DEPENDS ON EXTENSION`, text
+search configurations, dictionaries, parsers and templates, conversions,
+foreign data wrappers, servers and user mappings, user-created procedural
+languages, comments and security labels. Each now prints a notice through the
+report-only `catalog_notices` of DEC-2444.1, and **none leaves its object out
+and none is a managed-set limitation**: a tuned database commonly sets these,
+`pbps` never resets them on an existing database, and refusing such a table
+would block adoption for a property no plan would change. An unlogged sequence
+states its consequence (its position is reset after a crash, and one created
+from the declarations keeps it); a text search configuration or dictionary
+states that a declaration naming it cannot be created until they are supported
+(#2728, an expression index or generated column can name one); comments point
+at #2729. Comments and security labels are counted per object type with a few
+examples, because a documented database has thousands. Holding the properties
+would change the declaration format for a planner or maintenance setting, so
+they stay notices until a need appears.
+
+Formats: none. The notices are report-only strings, not part of a plan, state,
+schema set or evidence, and `plan.unheld-object` carries its message as text.

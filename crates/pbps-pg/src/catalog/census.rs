@@ -16,16 +16,9 @@ use serde_json::Value;
 // DEC-2558.1 can read the loss as catalog movement (DEC-2681.1). A cast has no
 // schema, so membership follows dependencies and not a namespace column.
 pub(super) const QUERY: &str = concat!(
-    r#"
-WITH RECURSIVE session_owned(classid, objid) AS (
-    SELECT d.classid, d.objid FROM pg_catalog.pg_depend d
-      JOIN pg_catalog.pg_namespace s ON s.oid = d.refobjid
-     WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass AND d.deptype = 'n'
-       AND (s.oid = pg_catalog.pg_my_temp_schema() OR pg_catalog.pg_is_other_temp_schema(s.oid))
-    UNION
-    SELECT d.classid, d.objid FROM session_owned o JOIN pg_catalog.pg_depend d
-      ON d.refclassid = o.classid AND d.refobjid = o.objid AND d.deptype IN ('n', 'a', 'i')
-), used_types(oid) AS (
+    "\nWITH RECURSIVE ",
+    session_owned_cte!(),
+    r#", used_types(oid) AS (
     SELECT atttypid FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped
     UNION
     SELECT d.refobjid FROM used_types u JOIN pg_catalog.pg_depend d
@@ -78,6 +71,28 @@ WITH RECURSIVE session_owned(classid, objid) AS (
     SELECT 'pg_catalog.pg_largeobject'::regclass, oid, 'large object', false FROM pg_catalog.pg_largeobject_metadata
     UNION ALL
     SELECT 'pg_catalog.pg_tablespace'::regclass, oid, 'tablespace', false FROM pg_catalog.pg_tablespace
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_config'::regclass, oid, 'text search configuration', false FROM pg_catalog.pg_ts_config
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_dict'::regclass, oid, 'text search dictionary', false FROM pg_catalog.pg_ts_dict
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_parser'::regclass, oid, 'text search parser', false FROM pg_catalog.pg_ts_parser
+    UNION ALL
+    SELECT 'pg_catalog.pg_ts_template'::regclass, oid, 'text search template', false FROM pg_catalog.pg_ts_template
+    UNION ALL
+    SELECT 'pg_catalog.pg_conversion'::regclass, oid, 'conversion', false FROM pg_catalog.pg_conversion
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_data_wrapper'::regclass, oid, 'foreign data wrapper', false FROM pg_catalog.pg_foreign_data_wrapper
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_server'::regclass, oid, 'foreign server', false FROM pg_catalog.pg_foreign_server
+    UNION ALL
+    -- Only a superuser may read the pg_user_mapping table, because it holds
+    -- the mappings' secret options. Every other deployer, and the
+    -- rehearsal's confined account, reads the pg_user_mappings view instead.
+    -- The view exposes the same row identity (umid) to every role.
+    SELECT 'pg_catalog.pg_user_mapping'::regclass, umid, 'user mapping', false FROM pg_catalog.pg_user_mappings
+    UNION ALL
+    SELECT 'pg_catalog.pg_language'::regclass, oid, 'procedural language', false FROM pg_catalog.pg_language
 )
 SELECT o.kind, i.identity,
        CASE WHEN o.classid = 'pg_extension'::regclass AND o.kind = 'extension' THEN
@@ -89,6 +104,19 @@ SELECT o.kind, i.identity,
  WHERE NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = o.classid AND s.objid = o.oid)
 "#
 );
+
+/// What else a census object costs, where it is more than being absent.
+/// An expression index or a generated column can name a text search
+/// configuration, and the declarations pulled from here then fail in an empty
+/// database (#168).
+fn consequence(kind: &str) -> &'static str {
+    match kind {
+        "text search configuration" | "text search dictionary" => {
+            "; a declaration that names it cannot be created until they are supported (#2728)"
+        }
+        _ => "",
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct Notices {
@@ -128,8 +156,9 @@ pub(super) fn notices(rows: &[Value]) -> Result<Notices, DbError> {
         };
         if !system && !extension && !owned {
             let message = format!(
-                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison",
+                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison{}",
                 pbps_model::escape::Escaped(&identity),
+                consequence(&kind),
             );
             if let Some(name) = name {
                 out.extensions.insert(name.into(), message);
