@@ -823,6 +823,12 @@ pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
     for table in canonical.tables.values_mut() {
         table.columns.sort_unstable_keys();
     }
+    // Text search objects have no identity yet, so none of them can be the project's by
+    // being recorded: one the database holds that the recorded state does not would read
+    // as drift, on every database that had any before the objects were held (DEC-2728.1).
+    // The plan still compares the declarations with the target; the objects join this
+    // fingerprint with the identities that say which of them are managed.
+    canonical.search.clear();
     #[derive(serde::Serialize)]
     struct Fingerprint<'a> {
         schema: &'a Schema,
@@ -963,6 +969,34 @@ mod tests {
     /// did not made a hand-made drop-and-re-add of one column — which comes
     /// back last — into drift the differ could not name and no plan could
     /// resolve (DECISIONS 238).
+    /// A text search object does not move the state checksum (DEC-2728.1): they have no
+    /// identity yet, so the ones a database holds are not the recorded state's to answer
+    /// for, and a database with some would otherwise read as drifted. A change to anything
+    /// else still does.
+    #[test]
+    fn text_search_objects_do_not_move_the_state_checksum_and_a_table_still_does() {
+        use crate::{SearchKind, SearchObject, SearchRef};
+        let bare = schema_with("nvarchar(255)");
+        let mut with_search = bare.clone();
+        with_search.search.insert(
+            SearchRef::new(SearchKind::Dictionary, "app.d".parse().unwrap()),
+            SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let ids = IdsFile::default();
+        assert_eq!(
+            state_checksum(&bare, &ids),
+            state_checksum(&with_search, &ids)
+        );
+        // Negative: a column change under the same objects still moves it.
+        assert_ne!(
+            state_checksum(&schema_with("nvarchar(100)"), &ids),
+            state_checksum(&with_search, &ids)
+        );
+    }
+
     #[test]
     fn column_order_does_not_change_the_state_checksum() {
         let ids = ids_with("t_a1b2c3");

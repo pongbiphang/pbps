@@ -1243,10 +1243,13 @@ and dropping arrive in the parts that follow (#2728).
   declared object the target lacks, or holds differently, is refused as arriving with a
   later part. There is no `Change` and no plan bump. An object the target has and the
   declarations do not is left alone.
-- **Known gap.** The objects have no identity until the part that creates them, so the
-  scoped read keeps every held object the database has: one created outside the
-  declarations after a baseline reads as drift in `verify` and `status`, where an
-  unmanaged table would not. The identities arrive with creation.
+- **No identity yet, so no drift.** The objects have no identity until the part that creates
+  them, so the scoped read keeps every one the database holds, and the **state checksum
+  leaves them out**: one the recorded state does not hold would otherwise read as drift in
+  `verify`, `status` and `plan --db`, on every database that had a text search object before
+  they were held, until it was re-baselined. The plan still compares the declarations with the
+  target (above), and the snapshot records the objects (state 42). The drift of these objects
+  is therefore not reported until the identities arrive and the checksum takes them in.
 - **Coverage (#168).** `pg_ts_config`, `pg_ts_config_map` and `pg_ts_dict` are held per
   column; the parser and template names are held and their functions stay named. The
   S7 notices for configurations and dictionaries, and their "cannot be created until

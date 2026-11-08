@@ -25,7 +25,10 @@ fn fixture(server: &str, slug: &str) -> Fixture {
 
 /// What a user made: a dictionary, a configuration over it and the built-in one, a copied
 /// configuration, a configuration and a dictionary of one name beside a domain of it, and
-/// the objects that name a configuration by a string literal.
+/// the objects that name a configuration by a string literal: a stored generated `tsvector`
+/// column and a CHECK. An expression index over `to_tsvector('app.x', body)` is not here:
+/// the model does not hold a GIN index over an expression (it is left out of a pull) until
+/// the key types of #2448 arrive, so the index case waits for them.
 const MADE: &str = "\
     CREATE TEXT SEARCH DICTIONARY app.english_nostop (TEMPLATE = snowball, Language = english); \
     CREATE TEXT SEARCH CONFIGURATION app.docs (PARSER = pg_catalog.\"default\"); \
@@ -36,8 +39,8 @@ const MADE: &str = "\
     CREATE TEXT SEARCH DICTIONARY app.russian (TEMPLATE = pg_catalog.simple); \
     CREATE DOMAIN app.russian AS text; \
     CREATE TABLE app.articles (id integer PRIMARY KEY, body text, \
-      tsv tsvector GENERATED ALWAYS AS (to_tsvector('app.docs', body)) STORED); \
-    CREATE INDEX articles_fts ON app.articles USING gin (to_tsvector('app.docs', body))";
+      tsv tsvector GENERATED ALWAYS AS (to_tsvector('app.docs', body)) STORED, \
+      CONSTRAINT articles_indexable CHECK (to_tsvector('app.docs', body) IS NOT NULL OR body IS NULL))";
 
 /// The text search files under `schema/`, by name, with their text.
 fn search_files(f: &Fixture) -> BTreeMap<String, String> {
@@ -108,7 +111,6 @@ fn a_database_with_text_search_objects_pulls_and_pulls_again_with_no_difference(
         pull(&f);
         assert_eq!(search_files(&f), files);
         f.d.commit();
-        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         succeeds(f.d.run(&[
             "baseline",
             "--db",
@@ -116,7 +118,16 @@ fn a_database_with_text_search_objects_pulls_and_pulls_again_with_no_difference(
             "--reason",
             "adopt the text search objects",
         ]));
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         succeeds(f.d.run(&["verify", "--db", f.target()]));
+        // A text search object made outside the declarations after the baseline is not
+        // drift (they have no identity yet, DEC-2728.1): verify and the plan are as before.
+        on_server(
+            f.target(),
+            "CREATE TEXT SEARCH DICTIONARY app.made_later (TEMPLATE = pg_catalog.simple)",
+        );
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
     });
 }
 
@@ -180,6 +191,13 @@ fn every_difference_is_refused_by_name_and_an_undeclared_object_is_left_alone() 
         on_server(f.target(), MADE);
         pull(&f);
         f.d.commit();
+        succeeds(f.d.run(&[
+            "baseline",
+            "--db",
+            f.target(),
+            "--reason",
+            "adopt the text search objects",
+        ]));
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         let dir = f.d.dir.join("schema");
         // An object the target lacks: refused as arriving with a later part.
