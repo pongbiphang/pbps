@@ -15,7 +15,7 @@ use super::runtime::{Fail, Inspected, Runtime};
 use super::{CleanupFailure, Error, FailureKind};
 
 /// The label that says a container belongs to a test run.
-pub(super) const RUN_LABEL: &str = "pbps.test.run";
+pub(super) use pbps_cli::resolver::server::scratch::container::journal::RUN_LABEL;
 
 pub(super) fn failure(
     dir: &StateDir,

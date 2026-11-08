@@ -11,6 +11,7 @@
 
 use super::super::{Error, ProduceError, engine};
 
+pub mod journal;
 mod recovery;
 #[cfg(test)]
 pub(super) use recovery::{

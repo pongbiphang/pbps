@@ -36,7 +36,7 @@ use pbps_db::{Conn, Driver};
 use super::super::super::engine;
 use super::super::recovery::{self, Adapter, Failed, Liveness, Resource};
 use super::READY;
-use super::{docker, remove_with_volumes, wait_removed, wait_until};
+use super::{docker, journal, remove_with_volumes, wait_removed, wait_until};
 
 /// The label carrying the run's token.
 pub(super) const TOKEN: &str = "pbps.resolver.token";
@@ -137,6 +137,7 @@ struct State {
     started: String,
     created: String,
     driver: Option<Driver>,
+    journal: Option<String>,
 }
 
 /// What the observations say of a candidate's owner. `age` is how old the
@@ -193,6 +194,17 @@ fn state_from_json(text: &str, token: &str) -> Result<State, String> {
             .ok_or("unreadable container metadata")
     };
     let labels = &value["Config"]["Labels"];
+    let journal = if labels.get(journal::RUN_LABEL).is_some() {
+        if labels[journal::RUN_LABEL] != token {
+            return Err("its test run and resolver token do not agree".into());
+        }
+        Some(
+            text(&labels[journal::LOCATION_LABEL])
+                .map_err(|_| "its test run's journal location is unknown")?,
+        )
+    } else {
+        None
+    };
     // Docker reports the name with a leading slash and Podman without one
     // (SPEC supports both); only that one optional slash is tolerated.
     let name = value["Name"]
@@ -224,6 +236,7 @@ fn state_from_json(text: &str, token: &str) -> Result<State, String> {
     }
     Ok(State {
         id,
+        journal,
         volumes,
         status: text(&value["State"]["Status"])?,
         started: text(&value["State"]["StartedAt"])?,
@@ -334,6 +347,16 @@ impl<'a> Containers<'a> {
                 );
             }
         };
+        // The journal precedes creation and its atomic replacements never
+        // disappear. Its owner records the volumes before removing anything;
+        // this sweep must not erase that evidence first (DEC-2471.1).
+        if let Some(location) = &listed.journal {
+            match journal::record_exists(location, token) {
+                Ok(true) => return Liveness::Alive,
+                Err(why) => return Liveness::Unprovable(why),
+                Ok(false) => {}
+            }
+        }
         let state = match observed {
             Err(why) if super::no_such_container(&why) => return Liveness::Dead,
             Err(why) => return Liveness::Unprovable(why),
@@ -676,6 +699,48 @@ mod tests {
         bad["Config"]["Labels"][TOKEN] = "another".into();
         assert!(state_from_json(&bad.to_string(), T).is_err());
         assert!(state_from_json("permission denied", T).is_err());
+        let mut test = valid.clone();
+        test["Config"]["Labels"][journal::RUN_LABEL] = T.into();
+        assert!(
+            state_from_json(&test.to_string(), T).is_err(),
+            "no location is unknown"
+        );
+        test["Config"]["Labels"][journal::LOCATION_LABEL] = "location".into();
+        assert_eq!(
+            state_from_json(&test.to_string(), T)
+                .unwrap()
+                .journal
+                .as_deref(),
+            Some("location")
+        );
+        test["Config"]["Labels"][journal::RUN_LABEL] = "another".into();
+        assert!(state_from_json(&test.to_string(), T).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_test_journal_defers_even_an_exited_or_already_removed_container() {
+        let directory =
+            std::env::temp_dir().join(format!("pbps-defer-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut candidate = state("exited");
+        candidate.journal = Some(journal::location(&directory).unwrap());
+        let mut containers = Containers::new("reader");
+        containers.listed.insert(T.into(), Ok(candidate.clone()));
+        std::fs::write(directory.join(format!("{T}.json")), "unreadable record").unwrap();
+        for observed in [Ok(candidate.clone()), Err("No such container".into())] {
+            assert_eq!(containers.classify(T, observed).await, Liveness::Alive);
+        }
+        std::fs::remove_file(directory.join(format!("{T}.json"))).unwrap();
+        assert_eq!(
+            containers.classify(T, Ok(candidate.clone())).await,
+            Liveness::Dead
+        );
+        std::fs::remove_dir(directory).unwrap();
+        assert!(matches!(
+            containers.classify(T, Ok(candidate)).await,
+            Liveness::Unprovable(_)
+        ));
     }
 
     #[tokio::test]
@@ -765,6 +830,7 @@ mod tests {
             started: String::new(),
             created: String::new(),
             driver: Some(Driver::Postgres),
+            journal: None,
         }
     }
 

@@ -6250,3 +6250,37 @@ acquisition's own choice (`Provisioning`), recorded as for the resolver.
 
 *Not done.* The cross-check of the rehearsal's end state against the
 reconstruction's capture stays deferred (maintainer decision 4 on #2379).
+
+<a id="dec-2471-1"></a>
+
+**DEC-2471.1. The resolver leaves a test container to its journal while its record exists.**
+A pending test record precedes `docker run` and has neither the returned id nor
+the volumes yet (DEC-1165.7). A resolver sweep that removes the container first
+can lose a volume it could not remove: the later test recovery finds no labelled
+container and reads the pending run as never created. The resolver therefore
+checks for that run's record before judging or removing a test container. An
+existing record defers cleanup to test recovery, which persists the id and
+volumes before removal and fails rather than forgetting unconfirmed cleanup.
+The resolver reads existence only; record serialization, locks and removal stay
+in `test_scratch`.
+
+The runtime-only `pbps.test.journal` label identifies the creating client's
+canonical journal directory, encoded without losing non-UTF-8 path bytes,
+together with its boot identity and the directory's device and inode. The
+resolver's current `HOME` or `XDG_STATE_HOME` may name another registry, and a
+shared container daemon does not imply a shared client filesystem. Only an
+absent record in the identified directory permits the ordinary keeper/grace
+sweep. That preserves recovery of a residual-window container created after
+test recovery deleted its empty pending record. An existing entry is kept even
+if its contents are unreadable or invalid; an inaccessible, missing, redirected
+or replaced directory, a different boot, or an unreadable location is unknown
+and kept with the ordinary recovery warning. A test-labelled container without
+the location label is also unknown and kept; there is no legacy fallback to the
+current client's registry. A later test, re-pin or `test --cleanup` still removes
+recorded dead runs through journal-aware recovery; a location that remains
+unknown requires the reported manual cleanup. Ordinary resolver containers keep
+their existing sweep. This adds no field or version to any persisted format;
+the new label is not added to the versioned run record's labels mapping.
+A residual-window container whose record was already deleted and which no
+resolver swept before a reboot is kept as unprovable after it and needs manual
+`docker rm`.
