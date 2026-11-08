@@ -409,7 +409,7 @@ async fn side(
             } else {
                 f.text.as_str()
             };
-            (f.name.as_str(), text)
+            (f.name.as_str(), text, f.file.path.as_str())
         })
         .collect();
     let driver = crate::db::driver_for(plan.inputs.identity.dialect);

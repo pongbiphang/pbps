@@ -576,6 +576,101 @@ fn assertions(old: bool) {
         p.settled();
     }
 }
+fn fixture_transaction_boundaries(old: bool) {
+    let p = Project::new();
+    let base = p.commit();
+    // Without the fixture check this preservation assertion passes vacuously
+    // after closing the connection rolls back the only row.
+    p.manifest(
+        &image(old),
+        &base,
+        &[("f", &base)],
+        "SELECT id FROM app.t WHERE amount <> 7",
+    );
+    for sql in [
+        "BEGIN; INSERT INTO app.t(id,amount) VALUES(1,7);",
+        "BEGIN;",
+        "BEGIN READ ONLY; SELECT id FROM app.t;",
+    ] {
+        p.write("tests/f.sql", sql);
+        let v = p.run(2);
+        engine(&v, old);
+        assert!(
+            v["findings"].as_array().unwrap().iter().any(|f| {
+                f["id"] == "test.fixture"
+                    && f["message"].as_str().unwrap().contains("tests/f.sql")
+                    && f["message"].as_str().unwrap().contains("transaction open")
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("COMMIT or ROLLBACK")
+            }),
+            "{v}"
+        );
+        assert_eq!(phase(&v, "fixture")["outcome"], "failed");
+        for skipped in ["candidate_plan", "candidate_apply", "assertion"] {
+            assert_eq!(phase(&v, skipped)["outcome"], "skipped");
+        }
+        assert_eq!(v["data"]["cleanup_confirmed"], true);
+        p.settled();
+    }
+
+    // Check each file, before a later file can commit the first one's writes.
+    p.write(
+        "tests/f.sql",
+        "BEGIN; INSERT INTO app.t(id,amount) VALUES(1,7);",
+    );
+    p.write("tests/next.sql", "COMMIT;");
+    p.manifest(
+        &image(old),
+        &base,
+        &[("f", &base), ("next", &base)],
+        "SELECT id FROM app.t WHERE amount <> 7",
+    );
+    let v = p.run(2);
+    let next = v["data"]["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "fixture" && p["identity"] == "next")
+        .unwrap();
+    assert_eq!(next["outcome"], "skipped");
+    assert_eq!(v["data"]["cleanup_confirmed"], true);
+    p.settled();
+
+    // Passing files must actually preserve their rows across the session close.
+    p.write(
+        "tests/next.sql",
+        "INSERT INTO app.t(id,amount) VALUES(2,9);",
+    );
+    p.manifest(
+        &image(old),
+        &base,
+        &[("f", &base), ("next", &base)],
+        "SELECT 1 FROM app.t HAVING count(*) <> 2 OR sum(amount) IS DISTINCT FROM 16",
+    );
+    for sql in [
+        "INSERT INTO app.t(id,amount) VALUES(1,7);",
+        "BEGIN; INSERT INTO app.t(id,amount) VALUES(1,7); COMMIT;",
+        concat!(
+            "BEGIN; SAVEPOINT s; INSERT INTO app.t(id,amount) VALUES(1,99); ",
+            "ROLLBACK TO s; INSERT INTO app.t(id,amount) VALUES(1,7); RELEASE s; COMMIT;"
+        ),
+        concat!(
+            "SET pbps.in_a_transaction='yes'; ",
+            "INSERT INTO app.t(id,amount) VALUES(1,7);"
+        ),
+    ] {
+        p.write("tests/f.sql", sql);
+        let v = p.run(0);
+        engine(&v, old);
+        assert_eq!(phase(&v, "fixture")["outcome"], "passed");
+        assert_eq!(phase(&v, "assertion")["outcome"], "passed");
+        assert_eq!(v["data"]["cleanup_confirmed"], true);
+        p.settled();
+    }
+}
+
 fn fixture_timeout_limits(old: bool) {
     for (fixture_ms, run_ms, comparison) in [
         (i32::MAX as u32 + 1, 600000, ">= 600000"),
@@ -864,3 +959,15 @@ fn d2b2_1165_pg18_fixture_timeouts_use_the_server_limit_and_remaining_run_budget
 
 #[path = "repin1165.rs"]
 mod repin1165;
+
+#[test]
+#[ignore = "needs docker and the pinned PostgreSQL 16 scratch image"]
+fn p2670_pg16_fixture_transactions_are_closed_before_replay_continues() {
+    fixture_transaction_boundaries(true);
+}
+
+#[test]
+#[ignore = "needs docker and the pinned PostgreSQL 18 scratch image"]
+fn p2670_pg18_fixture_transactions_are_closed_before_replay_continues() {
+    fixture_transaction_boundaries(false);
+}

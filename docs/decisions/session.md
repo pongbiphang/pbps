@@ -1124,3 +1124,21 @@ that apply to it (`Schema::rename_role`), as the engine binds a policy by oid;
 without it the drift check read the renamed recipient as a change, for the
 ordinary plan as well as the owned one. No format version changes, and SQL
 Server, whose roles move through the typed plan, is untouched.
+
+<a id="dec-2670-1"></a>
+
+**DEC-2670.1. PostgreSQL fixtures use the existing transaction probe before their session can close.**
+After each fixture file, on its own connection and within its fixture deadline,
+`Session::run_fixture` calls `pbps_pg::catalog::in_transaction` and refuses an
+open transaction as `test.fixture`, as SQL Server already does (DEC-1165.14).
+The replay carries the file path into that finding and stops before any later
+fixture, capture, apply or assertion could treat discarded rows as empty input.
+The probe reuses the per-call token and transaction-local setting of decision
+312; it adds no SQL or probe mechanism to the CLI. Measured through
+`pbps_db::Conn` on PostgreSQL 16.15 and 18.6: timestamp inequality reports true
+even after autocommit and COMMIT because the extended protocol starts its
+implicit transaction before Execute, while both transaction-ID probes return
+NULL for an empty or read-only open transaction. The existing probe correctly
+distinguishes all of those cases, committed savepoints and ROLLBACK, including
+a session that already holds `pbps.in_a_transaction = 'yes'`. No format version
+changes.

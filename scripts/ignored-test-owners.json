@@ -223,6 +223,8 @@
       "cases": [
         "domain_defaults2537::copied_defaults_bootstrap_and_keep_their_creation_values_after_base_edits",
         "domain_defaults2537::explicit_defaults_equal_to_a_copy_are_written_and_can_be_removed",
+        "plan_test1165::p2670_pg16_fixture_transactions_are_closed_before_replay_continues",
+        "plan_test1165::p2670_pg18_fixture_transactions_are_closed_before_replay_continues",
         "table_expressions2563::a_check_that_cannot_be_bound_is_not_evaluated_by_the_preflight_probe",
         "table_expressions2563::a_check_with_a_sublink_is_not_admitted_by_the_view_that_binds_it",
         "table_expressions2563::a_column_named_like_a_binder_helper_does_not_refuse_an_unrelated_expression_change",

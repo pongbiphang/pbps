@@ -408,6 +408,13 @@ impl<'a> Session<'a> {
                 conn.execute(&format!("SET statement_timeout = '{timeout_ms}ms'"))
                     .await?;
                 conn.execute(sql).await?;
+                // A successful file can still lose its writes when the fixture
+                // connection closes. Reuse the driver-safe probe (DEC-2670.1).
+                anyhow::ensure!(
+                    !pbps_pg::catalog::in_transaction(conn).await?,
+                    "the fixture left a transaction open; COMMIT or ROLLBACK inside it, because \
+                     closing its session would discard the writes silently"
+                );
                 Ok(())
             }
             Driver::Mssql => Box::pin(mssql::fixture(conn, sql)).await,
