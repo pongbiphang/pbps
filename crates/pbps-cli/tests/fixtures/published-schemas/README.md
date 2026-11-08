@@ -84,3 +84,4 @@ DECISIONS 465).
 - `94/` adds the `exclude:` block of a table: an exclusion constraint's method, keys with their operators, payload, predicate, storage parameters and timing (#2448 PR C1).
 - `96/` adds the `brin` index method (#2449 PR R1).
 - `100/` adds the `text_search_config:` and `text_search_dictionary:` declaration files: a text search configuration (parser and per-token mappings) and a dictionary (template and options) (#2728 PR A).
+- `102/` words the `opclass:` of an index key and the `operator:` of an exclusion key for the class and operator of a managed package, qualified by the package's schema (#2447 PR G2). It also holds #2728's text search file kinds (`100/`).

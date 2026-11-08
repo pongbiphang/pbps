@@ -294,7 +294,7 @@ where
             .unwrap()
             .shift_remove(definition);
     }
-    // #2447 PR G2 words the `opclass:` of a key for a package's class (schema set 99);
+    // #2447 PR G2 words the `opclass:` of a key for a package's class (schema set 102);
     // the captured text predates it.
     declaration_schema["$defs"]["IndexKeyDto"]["properties"]["opclass"]["description"] =
         serde_json::json!("The operator class, where it is not the key's default.");
