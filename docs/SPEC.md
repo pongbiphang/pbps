@@ -517,8 +517,10 @@ indexes:
   `jsonb_path_ops`. SQL Server has only the default method and no classes, so
   it refuses `method: gin` and any class (DEC-1169.1). A class is written bare
   (the engine's own, `pg_catalog`'s: `pg_catalog.x` is the bare `x`) or
-  qualified by its schema; a qualified class parses and is refused by name
-  until a pinned provider vouches for it. What each method may do and what
+  qualified by its schema; a qualified class is held when the project manages
+  the package that provides it, declares that package in the class's schema, and
+  the plan pins the class against the package (DEC-2447.14); BRIN holds none.
+  What each method may do and what
   changing one of its parameters costs is one table per method, not a rule per
   dialect (DEC-2448.1). `method: gist` is held over `tsvector`/`tsquery`
   columns, over `inet`/`cidr` with `opclass: inet_ops`, and over any expression

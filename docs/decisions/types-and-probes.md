@@ -5510,3 +5510,52 @@ carries them in the PR that adds the first kind that uses them, and that PR move
 the plan format.
 
 No plan format changes.
+
+<a id="dec-2447-14"></a>
+
+**DEC-2447.14. An operator class a package provides is held, pinned and carried through a move by the kernel of DEC-2447.13; an operator is read and carried, and its pin waits for the plan to be able to create an exclusion.**
+A key naming a class of a managed package (`ext.gin_trgm_ops`) was refused as
+"a class a schema owns" until a provider could vouch for it. The route is E's
+(DEC-2447.12) over the kernel, with what only a class has:
+
+- **Identity.** A class is `(method, schema, name)` to the engine, and whether it
+  is a package's is the class row's own `e` dependency on an extension, and its
+  family's, never its schema or name (measured on 16.15 and 18.6: a lookalike in
+  the package's schema has none). A class whose family another package owns is
+  refused.
+- **The pin** (`ProviderPin`, kind `class`, in `Plan.provider_pins`) holds the
+  method, the OID, the package and a digest over the family's `amop` and `amproc`
+  rows with each support function's owner, source and library: those rows carry no
+  dependency on the package, and an update that adds one moves the class under the
+  plan that approved it (`pg_trgm` 1.3 to 1.6). The digest is by OID, so a move,
+  which renames the schema and replaces nothing, keeps it.
+- **Refused at plan, by name:** a lookalike; a class of a package the project does
+  not manage (offline: no declared package in its schema); a class for another
+  type; the method's default class spelled out (the catalog prints a default and
+  its omission alike, so an accepted spelling would re-plan forever); an update of
+  the package in the plan that uses its class; and under a method that holds none
+  a package provides (BRIN).
+- **The gates.** The method's key-type gate (GIN holds `jsonb`, GiST its
+  `typed_columns`) is for the engine's own classes. A key naming a provider's class
+  is held over what the class is for, which the pin proves; every other key keeps
+  its gate. A provided type under its default class is not here: it needs the
+  package's default classes for the gate, which is #2448 PR F's seam.
+- **The pull** holds a class when a package the project manages owns it and it
+  stands in that package's schema, and otherwise leaves the index out naming the
+  package and `pbps pull --extension`. It never adopts a package.
+- **A move forwards without a rebuild.** The class keeps its OID and its family and
+  every index keeps its `indclass` (measured), so the recorded key is spelled in the
+  destination before the keys are compared (`forward_moved_classes`), and the
+  apply's read-back carries it the same way as a column's type.
+- **Operators.** `OperatorRef` carries an optional schema (`ext.%`; `pg_catalog.&&`
+  and `&&` stay one operator). An exclusion's operator is held when a managed
+  package owns it and it stands in that package's schema, and is carried through a
+  move. **The pin of an operator is not here:** the model cannot yet create or
+  change an exclusion (the emit and the plan change are #2448's C1b), so no plan
+  names an operator for a pin to guard. It lands with C1b, which also writes
+  `OPERATOR(schema.symbol)` with the operator's own schema.
+
+Formats. The saved plan moves (a new skip-empty field an older build rejects as
+malformed rather than as a newer plan), and the state moves (a snapshot may hold a
+qualified operator an older build cannot parse). A plan with no provider class
+serialises as before.

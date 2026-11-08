@@ -725,6 +725,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             },
             requirers: Default::default(),
             releases: Default::default(),
+            index_releases: Default::default(),
         },
         vec![],
         vec![],

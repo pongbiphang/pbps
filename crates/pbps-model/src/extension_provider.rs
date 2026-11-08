@@ -101,6 +101,23 @@ impl ProviderMember {
         }
     }
 
+    /// The index of a table this plan keeps that this member names, among `removed`
+    /// (the indexes the plan drops, by table and name). The engine names an index by
+    /// its schema and its own name, and an index name is unique in its schema, so the
+    /// first match is the one. `None` is any other object, which a caller must treat
+    /// as not one the plan removes (DEC-2447.8, DEC-2447.14).
+    pub fn index<'a>(
+        &self,
+        removed: impl IntoIterator<Item = &'a (crate::TableName, crate::ObjectLocalName)>,
+    ) -> Option<&'a (crate::TableName, crate::ObjectLocalName)> {
+        let ("index", [schema, name]) = (self.class.as_str(), self.names.as_slice()) else {
+            return None;
+        };
+        removed
+            .into_iter()
+            .find(|(table, index)| table.schema == *schema && index.raw() == name)
+    }
+
     /// The module of `ids` this object is, where it is one a plan manages: a
     /// routine by its full signature, a view or materialized view by name, a
     /// trigger by its table and name, and a view's rule as the view it makes

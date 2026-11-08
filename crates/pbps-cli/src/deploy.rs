@@ -9475,7 +9475,7 @@ async fn plan_db_selected(
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
         let crate::engine::Prerequisites {
             types: type_pins,
-            providers,
+            providers: provider_pins,
         } = crate::engine::seal_plan_type_pins(
             &mut conn,
             pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
@@ -9485,9 +9485,6 @@ async fn plan_db_selected(
             project.config.pin_type_routines,
         )
         .await?;
-        // No kind that uses provider pins has landed (DEC-2447.13): the plan has
-        // nowhere to carry one, so one sealed here would be dropped silently.
-        assert!(providers.is_empty(), "a provider pin has no place in the saved plan yet");
         let reviewed =
             crate::pins::seal_selected(&mut conn, project, target, &type_pins, &site_admission)
                 .await?;
@@ -9699,6 +9696,7 @@ async fn plan_db_selected(
             cost,
             routine_pins,
             type_pins,
+            provider_pins,
             declared_type_pins,
             reviewed,
             resolver_assessment,
@@ -9715,6 +9713,7 @@ async fn plan_db_selected(
             cost,
             routine_pins,
             type_pins,
+            provider_pins,
             declared_type_pins,
             reviewed,
             resolver_assessment,
@@ -9873,6 +9872,7 @@ async fn plan_db_selected(
         plan.routine_pins = routine_pins;
         plan.declared_type_pins = declared_type_pins;
         plan.type_pins = type_pins;
+        plan.provider_pins = provider_pins;
         plan.pin_type_routines = project.config.pin_type_routines;
         (plan.type_routines, plan.type_routine_pins) = reviewed;
         if !json {
@@ -9888,6 +9888,12 @@ async fn plan_db_selected(
         // rehearsal found in that package (DEC-2447.12).
         pbps_pg::type_refs::provider_proof(
             &plan.type_pins,
+            &plan.extension_pins,
+            &plan.extension_changes,
+        )
+        .map_err(anyhow::Error::msg)?;
+        pbps_pg::class_pins::proof(
+            &plan.provider_pins,
             &plan.extension_pins,
             &plan.extension_changes,
         )
@@ -10217,6 +10223,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         if !pinned_managed.references.is_empty()
             || !pinned_managed.declared_types.is_empty()
             || !plan.type_pins.is_empty()
+            || !plan.provider_pins.is_empty()
             || !plan.declared_type_pins.is_empty()
         {
             crate::pins::check(
@@ -11182,6 +11189,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 || stmt.extension.is_some()
                 || !written_routines.is_empty()
                 || !plan.type_pins.is_empty()
+                || !plan.provider_pins.is_empty()
                 || !plan.declared_type_pins.is_empty())
         {
             // A step of a plan that writes routines runs in a transaction of
@@ -18571,6 +18579,7 @@ mod tests {
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
             provided_types: BTreeMap::new(),
+            provided_classes: BTreeMap::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -24664,6 +24673,7 @@ mod tests {
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
             provided_types: BTreeMap::new(),
+            provided_classes: BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![
@@ -26659,6 +26669,7 @@ mod extension_guard_tests {
                     definition: pinned.clone(),
                     requirers: Default::default(),
                     releases: Default::default(),
+                    index_releases: Default::default(),
                 },
             )],
         };

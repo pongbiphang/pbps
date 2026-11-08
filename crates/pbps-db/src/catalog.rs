@@ -52,6 +52,15 @@ pub struct Pulled {
     /// package is not one of them (DEC-2447.12).
     pub provided_types:
         std::collections::BTreeMap<pbps_model::TypeRef, pbps_model::ObjectLocalName>,
+    /// The packages behind an index (or exclusion constraint) held under operator classes
+    /// or operators they provide, by table and name. A SET: a multi-key index can use the
+    /// classes of several packages, and each one must be managed. The caller that selects
+    /// which packages are managed leaves out an index when ANY of them is not one of them
+    /// (DEC-2447.14).
+    pub provided_classes: std::collections::BTreeMap<
+        (pbps_model::TableName, pbps_model::ObjectLocalName),
+        std::collections::BTreeSet<pbps_model::ObjectLocalName>,
+    >,
     /// Permissions the model cannot hold and a drift check must not call
     /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
     /// permission outside the closed set, a grant on an object the model does

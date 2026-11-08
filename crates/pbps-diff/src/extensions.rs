@@ -131,6 +131,23 @@ pub fn drops(
         .keys()
         .filter(|id| !desired.schema.modules.contains_key(*id))
         .collect();
+    // The indexes of tables the plan keeps that it drops (an index under a class of the
+    // package blocks its removal): released the way a module is (DEC-2447.14).
+    let removed_indexes: Vec<(pbps_model::TableName, pbps_model::ObjectLocalName)> = base
+        .schema
+        .tables
+        .iter()
+        .filter_map(|(table, was)| {
+            let now = desired.schema.tables.get(table)?;
+            Some(
+                was.indexes
+                    .keys()
+                    .filter(|n| !now.indexes.contains_key(*n))
+                    .map(|n| (table.clone(), n.clone())),
+            )
+        })
+        .flatten()
+        .collect();
     let (mut changes, mut errors) = (Vec::new(), Vec::new());
     for (name, (uid, definition)) in &dropped {
         let Some(facts) = facts.get(*name) else {
@@ -141,10 +158,14 @@ pub fn drops(
         };
         let (mut requirers, mut releases, mut found) =
             (BTreeSet::new(), BTreeSet::new(), Vec::new());
+        let mut index_releases = BTreeSet::new();
         for member in &facts.outside {
             match member.module(removed.iter().copied()) {
                 Some(id) => {
                     releases.insert(id.clone());
+                }
+                None if member.index(&removed_indexes).is_some() => {
+                    index_releases.extend(member.index(&removed_indexes).cloned());
                 }
                 None => found.push(format!(
                     "`{member}` depends on the package, so the engine would delete it too, and this plan does not drop it"
@@ -166,6 +187,8 @@ pub fn drops(
                 }
             } else if let Some(id) = member.module(removed.iter().copied()) {
                 releases.insert(id.clone());
+            } else if let Some(index) = member.index(&removed_indexes) {
+                index_releases.insert(index.clone());
             } else {
                 found.push(format!(
                     "`{member}` depends on the package and this plan does not remove it, so the engine would refuse"
@@ -185,6 +208,7 @@ pub fn drops(
             definition: (*definition).clone(),
             requirers,
             releases,
+            index_releases,
         });
     }
     (changes, errors)
@@ -396,6 +420,116 @@ pub fn forward_moved_types<'a>(
     )
 }
 
+/// The classes a moved package provides, carried the same way as its types
+/// (DEC-2447.14): an index or exclusion key naming `ext.gin_trgm_ops` is spelled
+/// where the package moves to before the keys are compared, so the index is not
+/// rebuilt (measured: the class keeps its OID and family, and every index keeps
+/// its `indclass`). The engine names a class as `{method, schema, name}`.
+pub fn forward_moved_classes<'a>(
+    comparison: std::borrow::Cow<'a, pbps_model::Schema>,
+    base: Side<'_>,
+    desired: Side<'_>,
+    facts: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        std::collections::BTreeSet<pbps_model::ProviderMember>,
+    >,
+) -> std::borrow::Cow<'a, pbps_model::Schema> {
+    type Class = (String, String, String);
+    let parse = |names: &[String]| {
+        let [method, schema, name] = names else {
+            return None;
+        };
+        Some((
+            schema.clone(),
+            (method.clone(), schema.clone(), name.clone()),
+        ))
+    };
+    let carry = |keys: &mut [pbps_model::IndexColumn],
+                 method: &str,
+                 moved: &std::collections::BTreeMap<Class, Class>| {
+        for key in keys {
+            let Some(class) = &key.opclass else { continue };
+            let Some(schema) = class.schema() else {
+                continue;
+            };
+            let was = (
+                method.to_owned(),
+                schema.to_owned(),
+                class.name().to_owned(),
+            );
+            if let Some((_, to, name)) = moved.get(&was) {
+                key.opclass = Some(pbps_model::OpClassRef::in_schema(to, name));
+            }
+        }
+    };
+    forward_moved(
+        comparison,
+        base,
+        desired,
+        facts,
+        "operator class",
+        parse,
+        |schema, moved| {
+            for table in schema.tables.values_mut() {
+                for index in table.indexes.values_mut() {
+                    let method = index.method.as_str();
+                    carry(&mut index.columns, method, moved);
+                }
+                for constraint in table.exclude.values_mut() {
+                    let method = constraint.method.as_str();
+                    for key in &mut constraint.keys {
+                        carry(std::slice::from_mut(&mut key.key), method, moved);
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The operators a moved package provides, carried the same way: an exclusion
+/// key excluded `WITH ext.%` is spelled where the package moves to before the
+/// constraints are compared (DEC-2447.14). The engine names an operator as
+/// `{schema, symbol}` with its argument types; the model holds schema and symbol.
+pub fn forward_moved_operators<'a>(
+    comparison: std::borrow::Cow<'a, pbps_model::Schema>,
+    base: Side<'_>,
+    desired: Side<'_>,
+    facts: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        std::collections::BTreeSet<pbps_model::ProviderMember>,
+    >,
+) -> std::borrow::Cow<'a, pbps_model::Schema> {
+    let parse = |names: &[String]| {
+        let [schema, symbol] = names else { return None };
+        Some((schema.clone(), (schema.clone(), symbol.clone())))
+    };
+    forward_moved(
+        comparison,
+        base,
+        desired,
+        facts,
+        "operator",
+        parse,
+        |schema, moved| {
+            for table in schema.tables.values_mut() {
+                for constraint in table.exclude.values_mut() {
+                    for key in &mut constraint.keys {
+                        let Some(from) = key.operator.schema() else {
+                            continue;
+                        };
+                        let was = (from.to_owned(), key.operator.as_symbol().to_owned());
+                        if let Some((to, symbol)) = moved.get(&was)
+                            && let Some(operator) = pbps_model::OperatorRef::in_schema(to, symbol)
+                        {
+                            key.operator = operator;
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 /// The comparison schema with every reference to a member of one class of a
 /// moved package spelled where the package moves to (DEC-2447.12, DEC-2447.13).
 ///
@@ -508,6 +642,43 @@ pub fn forward_schema_moves(
             && let Some(ty) = carried_through(&column.ty, &read.ty, moves)
         {
             column.ty = ty;
+        }
+    }
+    // The classes and operators of a moved package move the same way (DEC-2447.14):
+    // the index keeps its class, which now stands in the destination.
+    let moved = |was: Option<&str>, is: Option<&str>| {
+        was.zip(is)
+            .is_some_and(|(w, i)| moves.iter().any(|(from, to)| *from == w && *to == i))
+    };
+    let carry = |keys: &mut [pbps_model::IndexColumn], read: &[pbps_model::IndexColumn]| {
+        for (key, read) in keys.iter_mut().zip(read) {
+            if let (Some(was), Some(is)) = (&key.opclass, &read.opclass)
+                && was.name() == is.name()
+                && moved(was.schema(), is.schema())
+            {
+                key.opclass.clone_from(&read.opclass);
+            }
+        }
+    };
+    for (name, index) in &mut table.indexes {
+        if let Some(read) = now.indexes.get(name) {
+            carry(&mut index.columns, &read.columns);
+        }
+    }
+    for (name, constraint) in &mut table.exclude {
+        let Some(read) = now.exclude.get(name) else {
+            continue;
+        };
+        for (key, read) in constraint.keys.iter_mut().zip(&read.keys) {
+            carry(
+                std::slice::from_mut(&mut key.key),
+                std::slice::from_ref(&read.key),
+            );
+            if key.operator.as_symbol() == read.operator.as_symbol()
+                && moved(key.operator.schema(), read.operator.schema())
+            {
+                key.operator = read.operator.clone();
+            }
         }
     }
 }
@@ -1142,6 +1313,7 @@ mod tests {
                 definition,
                 requirers,
                 releases,
+                index_releases: _,
             },
         ] = changes.as_slice()
         else {
@@ -1277,6 +1449,67 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
             matches!(changes.as_slice(), [pbps_model::Change::DropExtension { releases, .. }] if releases.len() == 1)
+        );
+    }
+
+    /// An index of a table the plan keeps that it also drops, and that blocks the package's
+    /// removal, is carried and waited for; one the declarations keep, or one of a table
+    /// the plan does not hold, is refused by name (DEC-2447.14).
+    #[test]
+    fn an_index_the_plan_drops_is_carried_and_one_it_keeps_is_refused() {
+        use pbps_model::{Index, IndexMethod, Table};
+        let index = || Index {
+            columns: Vec::new(),
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: IndexMethod::Gin,
+            storage_parameters: Default::default(),
+        };
+        let table = "app.docs".parse::<pbps_model::TableName>().unwrap();
+        let blocker = member("index", &["app", "docs_trgm"]);
+        let mut w = world(&["pg_trgm"], &["pg_trgm"], &[]);
+        let mut with_index = Table::default();
+        with_index.indexes.insert("docs_trgm".into(), index());
+        w.base.tables.insert(table.clone(), with_index);
+        // Dropped: the table stays, the index goes.
+        w.desired.tables.insert(table.clone(), Table::default());
+        let (changes, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(errors.is_empty(), "{errors:?}");
+        let [pbps_model::Change::DropExtension { index_releases, .. }] = changes.as_slice() else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(
+            index_releases.iter().collect::<Vec<_>>(),
+            [&(table.clone(), "docs_trgm".into())]
+        );
+        // The same index when the declarations keep it: refused, and named.
+        let mut kept = Table::default();
+        kept.indexes.insert("docs_trgm".into(), index());
+        w.desired.tables.insert(table.clone(), kept);
+        let (changes, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(changes.is_empty());
+        assert!(
+            errors[0].to_string().contains("index app.docs_trgm"),
+            "{errors:?}"
+        );
+        // Another schema's index of the same name is not it, and neither is a table
+        // the plan no longer holds (its index goes with the table, which this does not model).
+        w.desired.tables.insert(table.clone(), Table::default());
+        let (_, errors) = w.drops(&facts(
+            "pg_trgm",
+            &[],
+            &[member("index", &["other", "docs_trgm"])],
+        ));
+        assert!(
+            errors[0].to_string().contains("index other.docs_trgm"),
+            "{errors:?}"
+        );
+        w.desired.tables.clear();
+        let (_, errors) = w.drops(&facts("pg_trgm", &[], std::slice::from_ref(&blocker)));
+        assert!(
+            errors[0].to_string().contains("index app.docs_trgm"),
+            "{errors:?}"
         );
     }
 
@@ -1885,6 +2118,268 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(&base, &desired, &other, &facts), base);
+    }
+
+    /// The apply's read-back carries a moved package's class and operator the same
+    /// way as a column's type: only where the database shows the name kept and the
+    /// schema moved along one of the plan's moves (DEC-2447.14).
+    #[test]
+    fn a_read_back_class_and_operator_are_carried_only_where_they_show_the_move() {
+        use pbps_model::{
+            ExclusionConstraint, ExclusionKey, Index, IndexColumn, IndexKey, IndexMethod,
+            OpClassRef, OperatorRef, Table,
+        };
+        let key = |class: &str| IndexColumn {
+            key: IndexKey::Column("body".into()),
+            descending: false,
+            opclass: Some(class.parse::<OpClassRef>().unwrap()),
+            collation: None,
+        };
+        let table = |class: &str, operator: &str| {
+            let mut t = Table::default();
+            t.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![key(class)],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Gin,
+                    storage_parameters: Default::default(),
+                },
+            );
+            t.exclude.insert(
+                "ex".into(),
+                ExclusionConstraint {
+                    method: IndexMethod::Gist,
+                    keys: vec![ExclusionKey {
+                        key: key(class),
+                        operator: operator.parse::<OperatorRef>().unwrap(),
+                    }],
+                    include: Vec::new(),
+                    filter: None,
+                    storage_parameters: Default::default(),
+                    timing: Default::default(),
+                },
+            );
+            t
+        };
+        let shown = |t: &Table| {
+            (
+                t.indexes["ix"].columns[0]
+                    .opclass
+                    .as_ref()
+                    .unwrap()
+                    .raw()
+                    .to_string(),
+                t.exclude["ex"].keys[0].operator.raw().to_string(),
+            )
+        };
+        let moves = [("ext", "moved")];
+        let mut carried = table("ext.gin_trgm_ops", "ext.%");
+        forward_schema_moves(
+            &mut carried,
+            &table("moved.gin_trgm_ops", "moved.%"),
+            &moves,
+        );
+        assert_eq!(
+            shown(&carried),
+            ("moved.gin_trgm_ops".into(), "moved.%".into())
+        );
+        // Negative: the name changed, the schema is not one the plan moves, or the
+        // database shows it where it was.
+        for (read_class, read_operator) in [
+            ("moved.other_ops", "moved.<->"),
+            ("elsewhere.gin_trgm_ops", "elsewhere.%"),
+            ("ext.gin_trgm_ops", "ext.%"),
+        ] {
+            let mut same = table("ext.gin_trgm_ops", "ext.%");
+            forward_schema_moves(&mut same, &table(read_class, read_operator), &moves);
+            assert_eq!(
+                shown(&same),
+                ("ext.gin_trgm_ops".into(), "ext.%".into()),
+                "{read_class}"
+            );
+        }
+    }
+
+    /// A moved package's operator classes and operators are carried the same way
+    /// as its types (DEC-2447.14): the index key and the exclusion operator are
+    /// spelled where the package moves to, so the index is not rebuilt. A class of
+    /// another method, another schema or another package's, an engine class and a
+    /// package that does not move are left as they are.
+    #[test]
+    fn a_moved_packages_classes_and_operators_are_carried_and_nothing_else_is() {
+        use pbps_model::{
+            ExclusionConstraint, ExclusionKey, Index, IndexColumn, IndexKey, IndexMethod,
+            OpClassRef, OperatorRef, Table,
+        };
+        let at = |schema: &str| Extension {
+            schema: schema.into(),
+            version: "1.6".into(),
+        };
+        let key = |class: Option<OpClassRef>| IndexColumn {
+            key: IndexKey::Column("body".into()),
+            descending: false,
+            opclass: class,
+            collation: None,
+        };
+        let index = |method: IndexMethod, class: Option<OpClassRef>| Index {
+            columns: vec![key(class)],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method,
+            storage_parameters: Default::default(),
+        };
+        let class = |schema: &str, name: &str| Some(OpClassRef::in_schema(schema, name));
+        let mut table = Table::default();
+        for (name, ix) in [
+            (
+                "moves",
+                index(IndexMethod::Gin, class("ext", "gin_trgm_ops")),
+            ),
+            (
+                "other_method",
+                index(IndexMethod::Gist, class("ext", "gin_trgm_ops")),
+            ),
+            (
+                "not_listed",
+                index(IndexMethod::Gin, class("ext", "other_ops")),
+            ),
+            (
+                "elsewhere",
+                index(IndexMethod::Gin, class("app", "gin_trgm_ops")),
+            ),
+            (
+                "engine",
+                index(IndexMethod::Gin, Some(OpClassRef::bare("jsonb_path_ops"))),
+            ),
+        ] {
+            table.indexes.insert(name.into(), ix);
+        }
+        let operator = |schema: &str, symbol: &str| OperatorRef::in_schema(schema, symbol).unwrap();
+        table.exclude.insert(
+            "ex".into(),
+            ExclusionConstraint {
+                method: IndexMethod::Gist,
+                keys: vec![
+                    ExclusionKey {
+                        key: key(class("ext", "gist_trgm_ops")),
+                        operator: operator("ext", "%"),
+                    },
+                    ExclusionKey {
+                        key: key(None),
+                        operator: operator("pg_catalog", "="),
+                    },
+                    ExclusionKey {
+                        key: key(None),
+                        operator: operator("ext", "<->"),
+                    },
+                ],
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: Default::default(),
+            },
+        );
+        let name = pbps_model::TableName::new("app", "docs");
+        let base = Schema {
+            extensions: [("pg_trgm".into(), at("ext"))].into(),
+            tables: [(name.clone(), table)].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            extensions: [("pg_trgm".into(), at("moved"))].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [(uid("pg_trgm"), "pg_trgm".into())].into(),
+            ..Default::default()
+        };
+        let member = |class: &str, names: &[&str]| pbps_model::ProviderMember {
+            class: class.into(),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+            args: Vec::new(),
+        };
+        let facts: std::collections::BTreeMap<_, _> = [(
+            "pg_trgm".into(),
+            [
+                member("operator class", &["gin", "moved", "gin_trgm_ops"]),
+                member("operator class", &["gist", "moved", "gist_trgm_ops"]),
+                member("operator", &["moved", "%"]),
+            ]
+            .into(),
+        )]
+        .into();
+        let run = |desired: &Schema, facts: &_, forward: bool| {
+            let (b, d) = (
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: desired,
+                    ids: &ids,
+                },
+            );
+            let cow = std::borrow::Cow::Borrowed(&base);
+            if forward {
+                forward_moved_operators(forward_moved_classes(cow, b, d, facts), b, d, facts)
+            } else {
+                forward_moved_classes(cow, b, d, facts)
+            }
+            .into_owned()
+        };
+        let carried = run(&desired, &facts, true);
+        let t = &carried.tables[&name];
+        let shown = |ix: &str| {
+            t.indexes[ix].columns[0]
+                .opclass
+                .as_ref()
+                .unwrap()
+                .raw()
+                .to_string()
+        };
+        assert_eq!(shown("moves"), "moved.gin_trgm_ops");
+        // Negative: the method is part of the class's identity, a class the package
+        // does not list stays, another schema's namesake stays, an engine class stays.
+        assert_eq!(shown("other_method"), "ext.gin_trgm_ops");
+        assert_eq!(shown("not_listed"), "ext.other_ops");
+        assert_eq!(shown("elsewhere"), "app.gin_trgm_ops");
+        assert_eq!(shown("engine"), "jsonb_path_ops");
+        let ops: Vec<_> = t.exclude["ex"]
+            .keys
+            .iter()
+            .map(|k| k.operator.raw().to_string())
+            .collect();
+        assert_eq!(
+            t.exclude["ex"].keys[0]
+                .key
+                .opclass
+                .as_ref()
+                .unwrap()
+                .raw()
+                .to_string(),
+            "moved.gist_trgm_ops"
+        );
+        // The listed operator is carried; the unlisted one and `pg_catalog`'s stay.
+        assert_eq!(ops, ["moved.%", "=", "ext.<->"]);
+        // Negative: the classes alone leave the operators; a package that does not
+        // move, has no facts, or is another identity forwards nothing.
+        assert_eq!(
+            run(&desired, &facts, false).tables[&name].exclude["ex"].keys[0]
+                .operator
+                .raw()
+                .to_string(),
+            "ext.%"
+        );
+        let stays = Schema {
+            extensions: [("pg_trgm".into(), at("ext"))].into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stays, &facts, true), base);
+        assert_eq!(run(&desired, &Default::default(), true), base);
     }
 
     /// A schema change under one recorded identity is a move that starts from the

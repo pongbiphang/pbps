@@ -6543,9 +6543,10 @@ pub async fn seal_type_pins(
         Driver::Postgres => {
             let pins = pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?;
             type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
+            let providers = pbps_pg::class_pins::seal(conn, schemas, changes).await?;
             Ok(Prerequisites {
                 types: pins,
-                providers: Vec::new(),
+                providers,
             })
         }
         Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
@@ -6567,9 +6568,11 @@ pub async fn seal_plan_type_pins(
             let pins =
                 pbps_pg::type_refs::seal_sides(conn, base, desired, changes, trusted).await?;
             type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
+            let providers =
+                pbps_pg::class_pins::seal(conn, &[base.schema, desired.schema], changes).await?;
             Ok(Prerequisites {
                 types: pins,
-                providers: Vec::new(),
+                providers,
             })
         }
         Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
@@ -6650,8 +6653,11 @@ pub async fn check_type_pins(
                 &plan.changes,
             )
             .await?;
+            pbps_pg::class_pins::check(conn, within, &plan.provider_pins, &plan.changes).await?;
         }
-        Driver::Mssql if plan.type_pins.is_empty() && trusted.is_empty() => {}
+        Driver::Mssql
+            if plan.type_pins.is_empty() && plan.provider_pins.is_empty() && trusted.is_empty() => {
+        }
         Driver::Mssql => {
             anyhow::bail!("this SQL Server plan carries PostgreSQL type prerequisites")
         }
@@ -6703,6 +6709,7 @@ pub async fn recheck_type_prerequisites(
                 pbps_pg::pins::Within::OwnTransaction
             };
             pbps_pg::type_refs::check(conn, within, &expected.types, &[], changes).await?;
+            pbps_pg::class_pins::check(conn, within, &expected.providers, changes).await?;
             type_input_routines(conn, &expected.types, trusted, false, inside).await?;
         }
         Driver::Mssql if expected.types.is_empty() && expected.providers.is_empty() => {}

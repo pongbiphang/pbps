@@ -1168,6 +1168,7 @@ mod tests {
             catalog_notices: Vec::new(),
             extension_notices: std::collections::BTreeMap::new(),
             provided_types: std::collections::BTreeMap::new(),
+            provided_classes: std::collections::BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: Vec::new(),

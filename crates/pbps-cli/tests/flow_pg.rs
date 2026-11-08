@@ -142,6 +142,8 @@ mod census2444;
 mod exclude2448;
 #[path = "support/extensions2447.rs"]
 mod extensions2447;
+#[path = "support/extensions2447_classes.rs"]
+mod extensions2447_classes;
 #[path = "support/extensions2447_create.rs"]
 mod extensions2447_create;
 #[path = "support/extensions2447_drop.rs"]

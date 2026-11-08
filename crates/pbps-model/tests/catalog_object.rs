@@ -64,6 +64,7 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                 },
                 requirers: Default::default(),
                 releases: Default::default(),
+                index_releases: Default::default(),
             },
             CatalogObject::Extension,
         ),

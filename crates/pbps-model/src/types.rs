@@ -549,8 +549,8 @@ impl<'de> serde::Deserialize<'de> for CollationName {
 /// the two spellings are one class. Any other schema is parsed by the same
 /// qualified-name reader a [`TypeRef`] uses (a quoted dot survives) and held,
 /// but the model only holds it: whether a class outside `pg_catalog` is
-/// admitted is the dialect's question, and PostgreSQL refuses it until a
-/// provider vouches for it (#2447 PR F).
+/// admitted is the dialect's question, and PostgreSQL admits it when a package
+/// the project manages provides it and the plan's pin proves it (DEC-2447.14).
 ///
 /// Rendering requires an explicit choice between canonical data and human text.
 ///
@@ -687,14 +687,17 @@ impl<'de> serde::Deserialize<'de> for OpClassRef {
 // All three cross JSON as one string with a hand-written codec (DEC-2412.1).
 string_json_schema!(TypeRef, CollationName, OpClassRef);
 
-/// The operator of an exclusion key (DEC-2448.3): the symbol of an operator in
-/// `pg_catalog`, which is the only schema this model holds. `&&` and
-/// `pg_catalog.&&` are one operator and both read as the bare symbol; the
-/// emitter always writes `OPERATOR(pg_catalog.&&)`, so a symbol is never
-/// interpolated into SQL as text. A symbol is the engine's operator characters
-/// and nothing else, so no other token can ride in one.
+/// The operator of an exclusion key (DEC-2448.3): an operator by its symbol, in
+/// `pg_catalog` (the bare form, and `pg_catalog.&&` reads as `&&`) or in the
+/// schema of a package that provides it (`ext.%`, DEC-2447.14). The emitter
+/// writes `OPERATOR(schema.symbol)`, so a symbol is never interpolated into SQL
+/// as text. A symbol is the engine's operator characters and nothing else, so no
+/// other token can ride in one.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OperatorRef(String);
+pub struct OperatorRef {
+    schema: Option<String>,
+    symbol: String,
+}
 
 impl OperatorRef {
     /// The characters PostgreSQL allows in an operator name.
@@ -710,13 +713,37 @@ impl OperatorRef {
             // The engine reads `--` and `/*` as comments, never as an operator.
             && !text.contains("--")
             && !text.contains("/*");
-        ok.then(|| Self(text.to_owned()))
+        ok.then(|| Self {
+            schema: None,
+            symbol: text.to_owned(),
+        })
+    }
+
+    /// An operator by schema and symbol exactly as the catalog keeps them. The
+    /// engine's `pg_catalog` is the bare form, as it is for [`OpClassRef`].
+    #[must_use]
+    pub fn in_schema(schema: &str, symbol: &str) -> Option<Self> {
+        let bare = Self::symbol(symbol)?;
+        if schema == "pg_catalog" {
+            return Some(bare);
+        }
+        TypeRef::new(schema, "x").ok()?;
+        Some(Self {
+            schema: Some(schema.to_owned()),
+            ..bare
+        })
+    }
+
+    /// The schema, or `None` for `pg_catalog` (the bare form).
+    #[must_use]
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
     }
 
     /// The symbol, as the catalog's `oprname` keeps it.
     #[must_use]
     pub fn as_symbol(&self) -> &str {
-        &self.0
+        &self.symbol
     }
 
     /// The canonical spelling for SQL, serialization and identity comparisons.
@@ -740,36 +767,57 @@ struct ShownOperator<'a>(&'a OperatorRef);
 
 impl fmt::Display for RawOperator<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.0)
+        if let Some(schema) = &self.0.schema {
+            // The schema is spelled as a type's is, quoting included; a symbol has
+            // nothing to quote.
+            let spelled = TypeRef::unchecked(schema.clone(), "x".to_owned())
+                .raw()
+                .to_string();
+            write!(f, "{}.", spelled.strip_suffix(".x").unwrap_or(&spelled))?;
+        }
+        f.write_str(&self.0.symbol)
     }
 }
 
 impl fmt::Display for ShownOperator<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", crate::escape::Escaped(&self.0.0))
+        match &self.0.schema {
+            Some(schema) => write!(
+                f,
+                "{}.{}",
+                crate::escape::Escaped(schema),
+                crate::escape::Escaped(&self.0.symbol)
+            ),
+            None => write!(f, "{}", crate::escape::Escaped(&self.0.symbol)),
+        }
     }
 }
 
 impl FromStr for OperatorRef {
     type Err = TypeParseError;
 
-    /// The bare symbol, or the same symbol qualified by `pg_catalog`. Any other
-    /// schema is an operator this model does not hold yet (#2447 PR F).
+    /// A symbol, bare or qualified by `pg_catalog`, or a symbol qualified by the
+    /// schema of a package. A symbol holds no `.`, so the last one splits.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let text = text.trim();
-        let bare = text.strip_prefix("pg_catalog.").unwrap_or(text);
-        Self::symbol(bare).ok_or_else(|| {
+        let bad = || {
             bad_reference(
                 text,
-                "expected an operator symbol such as `&&` or `=`; only operators of pg_catalog are held",
+                "expected an operator symbol such as `&&` or `=`, optionally qualified by its schema",
             )
-        })
+        };
+        let Some((schema, symbol)) = text.rsplit_once('.') else {
+            return Self::symbol(text).ok_or_else(bad);
+        };
+        // The schema is spelled as a type's is: reuse its parser for the quoting.
+        let parsed: TypeRef = format!("{schema}.x").parse().map_err(|_| bad())?;
+        Self::in_schema(parsed.schema(), symbol).ok_or_else(bad)
     }
 }
 
 impl serde::Serialize for OperatorRef {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serializer.collect_str(&self.raw())
     }
 }
 
@@ -1674,11 +1722,10 @@ mod collation_name_tests {
             "&&".parse::<OperatorRef>().unwrap(),
             "pg_catalog.&&".parse().unwrap()
         );
-        // Negative: another schema, empty, a comment opener, letters, a space,
-        // a statement, a quote, and more than the engine's 63 bytes.
+        // Negative: empty, a comment opener, letters, a space, a statement, a quote,
+        // a schema with no symbol, and more than the engine's 63 bytes.
         let long = "+".repeat(64);
         for text in [
-            "ext.&&",
             "",
             "--",
             "/*",
@@ -1692,6 +1739,56 @@ mod collation_name_tests {
         ] {
             assert!(text.parse::<OperatorRef>().is_err(), "{text:?}");
         }
-        assert!(serde_json::from_str::<OperatorRef>("\"ext.&&\"").is_err());
+        assert!(serde_json::from_str::<OperatorRef>("\"ext.\"").is_err());
+    }
+
+    /// A package's operator is held with its schema (DEC-2447.14): `ext.%` is not
+    /// `%`, a quoted schema survives with its dot, `pg_catalog` stays the bare
+    /// form, and the canonical spelling parses back to the same operator.
+    #[test]
+    fn a_packages_operator_keeps_its_schema_and_round_trips() {
+        for (text, schema, symbol) in [
+            ("ext.%", "ext", "%"),
+            ("EXT.<->", "ext", "<->"),
+            ("\"My B\".%>>", "My B", "%>>"),
+            ("\"a.b\".@>", "a.b", "@>"),
+        ] {
+            let held: OperatorRef = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(
+                (held.schema(), held.as_symbol()),
+                (Some(schema), symbol),
+                "{text}"
+            );
+            let json = serde_json::to_string(&held).unwrap();
+            assert_eq!(
+                serde_json::from_str::<OperatorRef>(&json).unwrap(),
+                held,
+                "{text}"
+            );
+            assert_eq!(held.raw().to_string().parse::<OperatorRef>().unwrap(), held);
+        }
+        assert_ne!(
+            "ext.%".parse::<OperatorRef>().unwrap(),
+            "%".parse::<OperatorRef>().unwrap()
+        );
+        assert_ne!(
+            "ext.%".parse::<OperatorRef>().unwrap(),
+            "other.%".parse::<OperatorRef>().unwrap()
+        );
+        assert_eq!(
+            OperatorRef::in_schema("pg_catalog", "&&"),
+            OperatorRef::symbol("&&")
+        );
+        assert_eq!(OperatorRef::in_schema("ext", "and"), None);
+        // The bare form keeps its old bytes, so a plan or a state without a
+        // qualified operator is unchanged.
+        assert_eq!(
+            serde_json::to_string(&OperatorRef::symbol("&&").unwrap()).unwrap(),
+            "\"&&\""
+        );
+        // Negative: a schema that cannot name an object, and a symbol that is not one.
+        for text in ["\"\".%", "ext.a&", "ext..%", ".%"] {
+            assert!(text.parse::<OperatorRef>().is_err(), "{text:?}");
+        }
     }
 }

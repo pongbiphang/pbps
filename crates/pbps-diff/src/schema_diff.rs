@@ -915,6 +915,18 @@ pub(crate) fn diff_partial_rebuilding(
     let comparison = crate::retained::comparison(base, declared, hints, &mut label_changes);
     let comparison =
         crate::extensions::forward_moved_types(comparison, base, declared, &hints.extension_moves);
+    let comparison = crate::extensions::forward_moved_classes(
+        comparison,
+        base,
+        declared,
+        &hints.extension_moves,
+    );
+    let comparison = crate::extensions::forward_moved_operators(
+        comparison,
+        base,
+        declared,
+        &hints.extension_moves,
+    );
     let base = Side {
         schema: &comparison,
         ids: base.ids,
@@ -9987,6 +9999,75 @@ mod tests {
         }
     }
 
+    /// An index key naming an operator class of a package waits for the plan's
+    /// create of that package, as a column of its type does, whatever the
+    /// identities the run happened to mint (DEC-2447.14). Each key of a new
+    /// table is the same, and a key naming an engine class draws no such edge.
+    #[test]
+    fn an_index_naming_a_package_class_waits_for_the_packages_create_every_time() {
+        use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, OpClassRef};
+        let indexed = |class: OpClassRef| {
+            let mut t = table(&[("body", Column::new(ty("text")))]);
+            t.indexes.insert(
+                "docs_trgm".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: IndexKey::Column("body".into()),
+                        descending: false,
+                        opclass: Some(class),
+                        collation: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Gin,
+                    storage_parameters: Default::default(),
+                },
+            );
+            t
+        };
+        let base = schema_of("app.docs", table(&[("body", Column::new(ty("text")))]));
+        let mut declared = schema_of(
+            "app.docs",
+            indexed(OpClassRef::in_schema("ext", "gin_trgm_ops")),
+        );
+        declared.extensions.insert(
+            "pg_trgm".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        );
+        for _ in 0..40 {
+            let plan = run_with(&Postgres, &base, &declared, &[]);
+            let position = |wanted: fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            let package = position(|c| matches!(c, Change::CreateExtension { .. }));
+            let index = position(|c| matches!(c, Change::AddIndex { .. }));
+            assert!(package < index, "{:#?}", plan.changes);
+        }
+        // Negative: the same index over an engine class asks nothing of a package,
+        // so the plan holds no package change and the index is still added.
+        let mut engine = schema_of("app.docs", indexed(OpClassRef::bare("jsonb_path_ops")));
+        engine.extensions = Default::default();
+        let plan = run_with(&Postgres, &base, &engine, &[]);
+        assert!(
+            plan.changes
+                .iter()
+                .any(|p| matches!(p.change, Change::AddIndex { .. }))
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::CreateExtension { .. }))
+        );
+    }
+
     /// A reference to a type a package provides waits for the plan's create or
     /// move of that package, through the same requirement a managed type's
     /// create gives, so it holds for a domain over it, a new table's column and
@@ -10808,6 +10889,7 @@ mod tests {
             default_class: None,
             collation: true,
             exclusion: true,
+            provider_classes: true,
             typed_columns: &[],
             lock: IndexLock::AccessExclusive,
             parameters: &[

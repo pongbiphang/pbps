@@ -1301,9 +1301,9 @@ indexes:
                 "operator",
             ),
             (
-                "  x:\n    method: btree\n    keys:\n      - {column: a, operator: \"ext.=\"}\n"
+                "  x:\n    method: btree\n    keys:\n      - {column: a, operator: \"ext.and\"}\n"
                     .to_owned(),
-                "pg_catalog",
+                "operator symbol",
             ),
             (
                 "  x:\n    method: btree\n    keys:\n      - {column: a, operator: \"= ; DROP\"}\n"

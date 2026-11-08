@@ -151,6 +151,10 @@ pub struct MethodPolicy {
     /// exclusion constraint (DEC-2448.3). Measured: B-tree and GiST can; GIN
     /// and BRIN refuse ("does not support exclusion constraints").
     pub exclusion: bool,
+    /// Whether a key may name an operator class a managed package provides
+    /// (`ext.gin_trgm_ops`), pinned like a provider's type (DEC-2447.14).
+    /// Measured: no package provides a BRIN class, so BRIN holds none.
+    pub provider_classes: bool,
     /// For a method held over a few column types only: each admitted base type
     /// and the engine class its key must name (`None`: the type's default
     /// class, so none is written). Empty where the method is not held by type
@@ -250,6 +254,7 @@ static BTREE: MethodPolicy = MethodPolicy {
     default_class: None,
     collation: true,
     exclusion: true,
+    provider_classes: true,
     typed_columns: &[],
     lock: IndexLock::ShareUpdateExclusive,
     parameters: &[
@@ -269,6 +274,7 @@ static GIN: MethodPolicy = MethodPolicy {
     default_class: Some("jsonb_ops"),
     collation: false,
     exclusion: false,
+    provider_classes: true,
     typed_columns: &[],
     lock: IndexLock::AccessExclusive,
     parameters: &[
@@ -298,6 +304,7 @@ static GIST: MethodPolicy = MethodPolicy {
     default_class: None,
     collation: true,
     exclusion: true,
+    provider_classes: true,
     typed_columns: &[
         ("tsvector", None),
         ("tsquery", None),
@@ -327,6 +334,7 @@ static BRIN: MethodPolicy = MethodPolicy {
     ordered: false,
     expression_keys: true,
     exclusion: false,
+    provider_classes: false,
     key_type: None,
     classes: &[],
     default_class: None,

@@ -294,6 +294,10 @@ where
             .unwrap()
             .shift_remove(definition);
     }
+    // #2447 PR G2 words the `opclass:` of a key for a package's class (schema set 102);
+    // the captured text predates it.
+    declaration_schema["$defs"]["IndexKeyDto"]["properties"]["opclass"]["description"] =
+        serde_json::json!("The operator class, where it is not the key's default.");
     // #2448 PR C1 adds a table's `exclude:` (schema set 94); the captured table
     // branch predates it.
     for definition in ["ExclusionDto", "ExclusionKeyDto", "InitiallyDto"] {

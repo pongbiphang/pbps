@@ -772,7 +772,7 @@
           "default": null
         },
         "opclass": {
-          "description": "The operator class, where it is not the key's default.",
+          "description": "The operator class, where it is not the key's default: the engine's own\n(`jsonb_path_ops`), or a class of a package the project manages written as\nthe engine names it (`ext.gin_trgm_ops`, DEC-2447.14).",
           "type": [
             "string",
             "null"
@@ -895,7 +895,7 @@
       ]
     },
     "ExclusionKeyDto": {
-      "description": "One key of an `exclude:` entry: an index key (`column:` or `expression:`,\nwith the optional `opclass:`, `collation:` and `order:` of an index key) and\nthe `operator:` it is excluded with, a symbol of `pg_catalog` such as `&&`\nor `=`.",
+      "description": "One key of an `exclude:` entry: an index key (`column:` or `expression:`,\nwith the optional `opclass:`, `collation:` and `order:` of an index key) and\nthe `operator:` it is excluded with, a symbol of `pg_catalog` such as `&&`\nor `=`, or a symbol qualified by the schema of a package the project manages\nthat provides it, such as `ext.%` (DEC-2447.14).",
       "type": "object",
       "properties": {
         "column": {
@@ -2063,6 +2063,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 100,
+  "x-pbps-schema-version": 102,
   "x-pbps-tool-version": "0.0.0"
 }

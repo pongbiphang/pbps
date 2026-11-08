@@ -373,6 +373,7 @@ fn drop_plan() -> SavedPlan {
             definition: definition.clone(),
             requirers: Default::default(),
             releases: Default::default(),
+            index_releases: Default::default(),
         }),
         PlannedChange::new(Change::DropExtension {
             uid: "e_000001".parse().unwrap(),
@@ -380,6 +381,7 @@ fn drop_plan() -> SavedPlan {
             definition: definition.clone(),
             requirers: ["e_000002".parse().unwrap()].into(),
             releases: Default::default(),
+            index_releases: Default::default(),
         }),
     ];
     plan.ids.tombstones = [("e_000001", "cube"), ("e_000002", "earthdistance")]

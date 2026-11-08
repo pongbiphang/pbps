@@ -745,10 +745,12 @@ type's default (DEC-2449.1), a GIN index off `jsonb` or under a class other than
 a GIN index over an expression or an expression key under a non-default class
 or collation (a B-tree expression index is held, DEC-1169.2), a key collation
 that is not a `pg_catalog` collation of a column key (DEC-2448.2), a class a
-schema owns (refused by name until the provider work of #2447, DEC-2448.1), a
+schema owns that no managed package provides (a package's class is held and
+pinned, DEC-2447.14), a
 null ordering that is not its direction's default, a `NOT VALID`
 check, and an exclusion constraint of a method other than `btree` and `gist`, over
-a key class the method does not hold, of a non-`pg_catalog` operator, or on a
+a key class the method does not hold, of an operator no managed package provides,
+or on a
 partitioned table (DEC-2448.3). A foreign key whose action is `RESTRICT` is held as `restrict`, never as
 `NO ACTION` (DEC-1633.1). Such a key used to be left out of the pull and named.
 A project that declared it as `no_action` now gets a plan that drops the key and

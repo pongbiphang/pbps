@@ -348,6 +348,8 @@ pub struct RawConstraint {
     /// joined to `pg_operator`). Empty for every other kind.
     pub exclusion_op_schemas: Vec<String>,
     pub exclusion_op_names: Vec<String>,
+    /// The extension that owns each operator, `""` for one no package owns.
+    pub exclusion_op_extensions: Vec<String>,
     /// `array_length(conexclop)`, which the two lists above must match: a join
     /// that dropped an operator would otherwise read as a weaker constraint.
     pub exclusion_op_count: usize,
@@ -397,8 +399,11 @@ pub struct RawIndex {
     pub key_collations: Vec<String>,
     /// Each key's operator class parameters (`pg_attribute.attoptions` of the
     /// index, as text): `""` where it has none. The model holds none, so a key
-    /// with some leaves the index out (#2447 PR F).
+    /// with some leaves the index out (#2447).
     pub key_options: Vec<String>,
+    /// Each key's operator class's owning extension, `""` for a class no package
+    /// owns (the class row's own `e` dependency).
+    pub key_class_extensions: Vec<String>,
     /// The index's `reloptions`, each `name=value` as the engine keeps it
     /// (#1442).
     pub reloptions: Vec<String>,
@@ -3428,6 +3433,7 @@ fn add_exclusion(
     if raw.exclusion_op_count != keys
         || raw.exclusion_op_names.len() != keys
         || raw.exclusion_op_schemas.len() != keys
+        || raw.exclusion_op_extensions.len() != keys
     {
         return left_out(
             pulled,
@@ -3439,26 +3445,61 @@ fn add_exclusion(
         );
     }
     let mut excluded = Vec::with_capacity(keys);
-    for ((schema, name), key) in raw
+    for (((schema, name), owner), key) in raw
         .exclusion_op_schemas
         .iter()
         .zip(&raw.exclusion_op_names)
+        .zip(&raw.exclusion_op_extensions)
         .zip(read.columns)
     {
-        let held = (schema == "pg_catalog")
-            .then(|| pbps_model::OperatorRef::symbol(name))
-            .flatten();
+        // `pg_catalog` is the engine's own. Any other operator is held when a
+        // package this project manages owns it (its `e` edge, never its name) and
+        // it stands in that package's schema (DEC-2447.14).
+        let managed = pulled
+            .schema
+            .extensions
+            .iter()
+            .any(|(package, e)| package.raw() == owner.as_str() && e.schema == *schema);
+        let held = if schema == "pg_catalog" || (!owner.is_empty() && managed) {
+            pbps_model::OperatorRef::in_schema(schema, name)
+        } else {
+            None
+        };
         let Some(operator) = held else {
+            let why = if owner.is_empty() {
+                "which no package owns".to_owned()
+            } else {
+                format!(
+                    "which the extension `{0}` provides; this project does not manage it in \
+                     schema `{1}`. Opt it in with `pbps pull --extension {0}` and record it \
+                     with `pbps baseline`",
+                    pbps_model::escape::Escaped(owner),
+                    pbps_model::escape::Escaped(schema)
+                )
+            };
             return left_out(
                 pulled,
                 format!(
-                    "excludes with the operator `{}.{}`, and this model holds only the operators \
-                     of `pg_catalog` until a pinned provider vouches for another (#2447 PR F)",
+                    "excludes with the operator `{}.{}`, {why}",
                     pbps_model::escape::Escaped(schema),
                     pbps_model::escape::Escaped(name)
                 ),
             );
         };
+        if !owner.is_empty()
+            && let Some((package, _)) = pulled
+                .schema
+                .extensions
+                .iter()
+                .find(|(package, _)| package.raw() == owner.as_str())
+        {
+            let package = package.clone();
+            pulled
+                .provided_classes
+                .entry((parts.name.clone(), raw.name.clone()))
+                .or_default()
+                .insert(package);
+        }
         excluded.push(pbps_model::ExclusionKey { key, operator });
     }
     let timing = match (raw.deferrable, raw.deferred) {
@@ -3768,22 +3809,6 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
         );
         return None;
     };
-    // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
-    // `jsonb` columns (DEC-1169.1). Each method's policy says which.
-    if !method.policy().expression_keys && (raw.has_expressions || raw.columns.contains(&0)) {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "index `{}` on `{}` is a {} index over an expression, which this model does not \
-                 hold. It is left out of the pull, so a plan cannot see it.",
-                raw.name.shown(),
-                parts.name.shown(),
-                method.as_str().to_ascii_uppercase(),
-            ),
-        );
-        return None;
-    }
     // A failed `CREATE INDEX CONCURRENTLY` leaves a row behind that the
     // planner will not use. Read back as an index, a declaration of the same
     // shape compares clean — and the index the operator believes they have
@@ -3837,6 +3862,28 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
     let mut keys = Vec::with_capacity(key_attnums.len());
     for (position, attnum) in key_attnums.iter().enumerate() {
         if *attnum == 0 {
+            // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
+            // `jsonb` columns (DEC-1169.1), or over an expression under a class a
+            // package provides (DEC-2447.14). The method's policy says which, and
+            // the declaration asks the same question.
+            let provider = raw
+                .key_classes
+                .get(position)
+                .is_some_and(|c| crate::index_policy::provider_class_text(method.policy(), c));
+            if !crate::index_policy::holds_expression_key(method.policy(), provider) {
+                note(
+                    pulled,
+                    &parts.name,
+                    format!(
+                        "index `{}` on `{}` is a {} index over an expression, which this model \
+                         does not hold. It is left out of the pull, so a plan cannot see it.",
+                        raw.name.shown(),
+                        parts.name.shown(),
+                        method.as_str().to_ascii_uppercase(),
+                    ),
+                );
+                return None;
+            }
             let Some(text) = raw.key_texts.get(position).filter(|t| !t.is_empty()) else {
                 note(
                     pulled,
@@ -4054,7 +4101,11 @@ fn key_class(
     let in_table = table.columns.get(column);
     // A key type the method does not hold is named before its class: the class
     // of a key the model cannot read back is no part of the answer.
-    if policy.key_type.is_some() && !in_table.is_some_and(|c| holds_key_type(policy, c)) {
+    let provided = crate::index_policy::provider_class_text(policy, class);
+    if !provided
+        && policy.key_type.is_some()
+        && !in_table.is_some_and(|c| holds_key_type(policy, c))
+    {
         left_out(
             pulled,
             format!(
@@ -4069,18 +4120,24 @@ fn key_class(
         return Some(None);
     }
     // The catalog's `schema.name` is not split: a name may hold a dot. Only
-    // `pg_catalog.` is the engine's own, and any other schema is refused
-    // whole, as a class a provider has not vouched for (#2447 PR F).
+    // `pg_catalog.` is the engine's own. Any other is held when a package this
+    // project manages owns the class row (its `e` edge, never its schema or
+    // name) and the class stands in that package's schema; the plan pins it
+    // (DEC-2447.14).
     let Some(name) = class.strip_prefix("pg_catalog.") else {
-        left_out(
-            pulled,
-            format!(
-                "indexes `{column}` with operator class `{class}`, which a schema owns; this \
-                 model holds only the engine's own classes until a pinned provider vouches for \
-                 one (#2447 PR F)"
-            ),
-        );
-        return None;
+        if !policy.provider_classes {
+            left_out(
+                pulled,
+                format!(
+                    "indexes `{column}` with operator class `{class}`, which a schema owns; a \
+                     {} index holds only the engine's own classes, because no package provides \
+                     one for it",
+                    method.as_str().to_ascii_uppercase()
+                ),
+            );
+            return None;
+        }
+        return provider_class(raw, parts, position, column, class, pulled, left_out);
     };
     let held = OpClassRef::bare(name);
     match class_problem(policy, &held) {
@@ -4109,6 +4166,84 @@ fn key_class(
             None
         }
     }
+}
+
+/// A key's class when a package owns it: held if the project manages the package
+/// and the class stands in its schema, else the index is left out naming the
+/// package and the command that adopts it.
+fn provider_class(
+    raw: &RawIndex,
+    parts: &Parts,
+    position: usize,
+    column: &str,
+    class: &str,
+    pulled: &mut Pulled,
+    left_out: impl Fn(&mut Pulled, String),
+) -> Option<Option<OpClassRef>> {
+    let Some(owner) = raw.key_class_extensions.get(position) else {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class `{class}`, and the catalog did not say \
+                 which package owns it"
+            ),
+        );
+        return None;
+    };
+    if owner.is_empty() {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class `{class}`, which no package owns; a \
+                 class that only shares a package's name is not the package's, and nothing \
+                 vouches for what it does"
+            ),
+        );
+        return None;
+    }
+    let managed = pulled
+        .schema
+        .extensions
+        .iter()
+        .find(|(name, _)| name.raw() == owner.as_str());
+    let Some((_, package)) = managed else {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class `{class}`, which belongs to the \
+                 extension `{0}`; this project does not manage it. Opt it in with `pbps pull \
+                 --extension {0}` and record it with `pbps baseline`",
+                pbps_model::escape::Escaped(owner)
+            ),
+        );
+        return None;
+    };
+    let schema = package.schema.clone();
+    let Some(name) = class
+        .strip_prefix(schema.as_str())
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        left_out(
+            pulled,
+            format!(
+                "indexes `{column}` with operator class `{class}`, which the extension `{}` owns \
+                 outside its schema `{}`",
+                pbps_model::escape::Escaped(owner),
+                pbps_model::escape::Escaped(&schema)
+            ),
+        );
+        return None;
+    };
+    // Which packages the run manages is the caller's to say (`pull --extension`): it
+    // leaves out an index whose package it does not manage (DEC-2447.14).
+    if let Some((package, _)) = managed {
+        pulled
+            .provided_classes
+            .entry((parts.name.clone(), raw.name.clone()))
+            .or_default()
+            .insert(package.clone());
+    }
+    Some(Some(OpClassRef::in_schema(&schema, name)))
 }
 
 /// An attnum with no live column behind it.
@@ -6125,6 +6260,7 @@ mod tests {
             inherited: false,
             exclusion_op_schemas: Vec::new(),
             exclusion_op_names: Vec::new(),
+            exclusion_op_extensions: Vec::new(),
             exclusion_op_count: 0,
         }
     }
@@ -6149,6 +6285,7 @@ mod tests {
             key_texts: vec![String::new()],
             key_collations: vec![String::new()],
             key_options: vec![String::new()],
+            key_class_extensions: vec![String::new()],
             attached: false,
             reloptions: Vec::new(),
         }
@@ -8103,6 +8240,7 @@ mod tests {
             x.index_oid = Some(50);
             x.exclusion_op_schemas = vec!["pg_catalog".into()];
             x.exclusion_op_names = vec!["&&".into()];
+            x.exclusion_op_extensions = vec![String::new()];
             x.exclusion_op_count = 1;
             x.definition = "EXCLUDE USING gist (...)".into();
             let mut ix = index(50, 1, "t_x");
@@ -8140,7 +8278,7 @@ mod tests {
         assert!(held.warnings.is_empty(), "{:?}", held.warnings);
         // Negatives: each is left out with a note, and is not an index either.
         type Tweak<'a> = &'a dyn Fn(&mut RawConstraint, &mut RawIndex);
-        let cases: [(&str, Tweak<'_>, &str); 7] = [
+        let cases: [(&str, Tweak<'_>, &str); 8] = [
             (
                 "one operator short",
                 &|x, _| x.exclusion_op_count = 0,
@@ -8152,9 +8290,17 @@ mod tests {
                 "operator(s) for 1 key",
             ),
             (
-                "an operator of another schema",
+                "an operator of another schema that no package owns",
                 &|x, _| x.exclusion_op_schemas = vec!["ext".into()],
-                "only the operators of `pg_catalog`",
+                "which no package owns",
+            ),
+            (
+                "an operator of a package the project does not manage",
+                &|x, _| {
+                    x.exclusion_op_schemas = vec!["ext".into()];
+                    x.exclusion_op_extensions = vec!["pg_trgm".into()];
+                },
+                "pbps pull --extension pg_trgm",
             ),
             (
                 "not validated",
@@ -8197,6 +8343,235 @@ mod tests {
                 x.deferred = deferred;
             });
             assert_eq!(only(&pulled).exclude["t_x"].timing, expected);
+        }
+    }
+
+    /// A key's operator class that a package owns is held when the project
+    /// manages the package and the class stands in its schema (DEC-2447.14);
+    /// every doubt leaves the index out and names it, the package and the command
+    /// that opts it in, and never reads it as the engine's own class.
+    #[test]
+    fn a_package_class_is_held_when_the_package_is_managed_and_left_out_by_name_otherwise() {
+        let managed: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension> = [(
+            "pg_trgm".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        )]
+        .into();
+        let build = |extensions: &BTreeMap<_, _>, tweak: &dyn Fn(&mut RawIndex)| {
+            let mut ix = index(50, 1, "t_trgm");
+            ix.method = "gin".to_owned();
+            ix.columns = vec![2];
+            ix.key_count = 1;
+            ix.options = vec![0];
+            ix.key_classes = vec!["ext.gin_trgm_ops".to_owned()];
+            ix.key_texts = vec![String::new()];
+            ix.key_collations = vec![String::new()];
+            ix.key_options = vec![String::new()];
+            ix.key_class_extensions = vec!["pg_trgm".to_owned()];
+            tweak(&mut ix);
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "id", "integer"), col(1, 2, "body", "text")],
+                indexes: vec![ix],
+                extensions: extensions.clone(),
+                ..RawCatalog::default()
+            })
+        };
+        // Held: a `text` column under GIN, which the method holds over `jsonb` only.
+        let held = build(&managed, &|_| {});
+        let ix = &only(&held).indexes["t_trgm"];
+        assert_eq!(
+            ix.columns[0].opclass,
+            Some(OpClassRef::in_schema("ext", "gin_trgm_ops"))
+        );
+        assert!(held.warnings.is_empty(), "{:?}", held.warnings);
+        // Negatives, each left out with a note that names why.
+        type Tweak<'a> = &'a dyn Fn(&mut RawIndex);
+        let cases: [(&str, Option<&BTreeMap<_, _>>, Tweak<'_>, &str); 6] = [
+            (
+                "a package the project does not manage",
+                Some(&BTreeMap::new()),
+                &|_| {},
+                "pbps pull --extension pg_trgm",
+            ),
+            (
+                "a class no package owns",
+                None,
+                &|ix| ix.key_class_extensions = vec![String::new()],
+                "which no package owns",
+            ),
+            (
+                "a class outside its package's schema",
+                None,
+                &|ix| ix.key_classes = vec!["other.gin_trgm_ops".to_owned()],
+                "outside its schema",
+            ),
+            (
+                "a catalog that did not say who owns it",
+                None,
+                &|ix| ix.key_class_extensions.clear(),
+                "did not say which package",
+            ),
+            (
+                "a class with parameters",
+                None,
+                &|ix| ix.key_options = vec!["{siglen=32}".to_owned()],
+                "operator class parameters",
+            ),
+            (
+                "a method that holds no provider class",
+                None,
+                &|ix| ix.method = "brin".to_owned(),
+                "no package provides",
+            ),
+        ];
+        for (what, extensions, tweak, expected) in cases {
+            let pulled = build(extensions.unwrap_or(&managed), tweak);
+            assert!(only(&pulled).indexes.is_empty(), "{what}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{what}: {:?}",
+                pulled.warnings
+            );
+        }
+    }
+
+    /// A GIN expression key is held exactly when it names a class a managed package
+    /// provides: the declaration accepts the same keys, so an accepted index is one the
+    /// pull reads back (a wrong recording otherwise: the next plan would create it
+    /// again). A GIN expression under no class, or under the engine's, stays out.
+    #[test]
+    fn a_gin_expression_key_is_read_back_only_under_a_package_class() {
+        let managed: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension> = [(
+            "pg_trgm".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        )]
+        .into();
+        let build = |class: &str, owner: &str| {
+            let mut ix = index(50, 1, "t_expr");
+            ix.method = "gin".to_owned();
+            ix.columns = vec![0];
+            ix.has_expressions = true;
+            ix.key_count = 1;
+            ix.options = vec![0];
+            ix.key_classes = vec![class.to_owned()];
+            ix.key_texts = vec!["lower(body)".to_owned()];
+            ix.key_collations = vec![String::new()];
+            ix.key_options = vec![String::new()];
+            ix.key_class_extensions = vec![owner.to_owned()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "body", "text")],
+                indexes: vec![ix],
+                extensions: managed.clone(),
+                ..RawCatalog::default()
+            })
+        };
+        let held = build("ext.gin_trgm_ops", "pg_trgm");
+        let key = &only(&held).indexes["t_expr"].columns[0];
+        assert_eq!(key.key.text(), "lower(body)", "{:?}", held.warnings);
+        assert_eq!(
+            key.opclass,
+            Some(OpClassRef::in_schema("ext", "gin_trgm_ops"))
+        );
+        // Negatives: no class, and the engine's class, are the expression the model
+        // does not hold under GIN; a class no package owns is left out by its owner.
+        for (class, owner, expected) in [
+            ("", "", "over an expression, which this model does not hold"),
+            (
+                "pg_catalog.jsonb_path_ops",
+                "",
+                "over an expression, which this model does not hold",
+            ),
+            ("ext.fake_ops", "", "which no package owns"),
+        ] {
+            let pulled = build(class, owner);
+            assert!(only(&pulled).indexes.is_empty(), "{class}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{class}: {:?}",
+                pulled.warnings
+            );
+        }
+    }
+
+    /// An exclusion's operator of a package is held with its schema when the
+    /// project manages the package, and left out by name otherwise (DEC-2447.14).
+    #[test]
+    fn an_exclusion_operator_of_a_managed_package_is_held_with_its_schema() {
+        let build = |managed: bool, owner: &str, schema: &str| {
+            let mut x = constraint(1, "t_x", 'x');
+            x.index_oid = Some(50);
+            x.exclusion_op_schemas = vec![schema.to_owned()];
+            x.exclusion_op_names = vec!["%".to_owned()];
+            x.exclusion_op_extensions = vec![owner.to_owned()];
+            x.exclusion_op_count = 1;
+            let mut ix = index(50, 1, "t_x");
+            ix.exclusion = true;
+            ix.method = "gist".to_owned();
+            ix.columns = vec![2];
+            ix.key_count = 1;
+            ix.options = vec![0];
+            ix.key_classes = vec![String::new()];
+            ix.key_texts = vec![String::new()];
+            ix.key_collations = vec![String::new()];
+            ix.key_options = vec![String::new()];
+            ix.key_class_extensions = vec![String::new()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "id", "integer"), col(1, 2, "name", "text")],
+                constraints: vec![x],
+                indexes: vec![ix],
+                extensions: if managed {
+                    [(
+                        "pg_trgm".into(),
+                        pbps_model::Extension {
+                            schema: "ext".into(),
+                            version: "1.6".into(),
+                        },
+                    )]
+                    .into()
+                } else {
+                    BTreeMap::new()
+                },
+                ..RawCatalog::default()
+            })
+        };
+        let held = build(true, "pg_trgm", "ext");
+        assert_eq!(
+            only(&held).exclude["t_x"].keys[0]
+                .operator
+                .raw()
+                .to_string(),
+            "ext.%",
+            "{:?}",
+            held.warnings
+        );
+        // Negatives: unmanaged, owned by no package, or standing outside the
+        // package's schema; each leaves the constraint out and says why.
+        for (managed, owner, schema, expected) in [
+            (false, "pg_trgm", "ext", "pbps pull --extension pg_trgm"),
+            (true, "", "ext", "which no package owns"),
+            (
+                true,
+                "pg_trgm",
+                "other",
+                "this project does not manage it in schema `other`",
+            ),
+        ] {
+            let pulled = build(managed, owner, schema);
+            assert!(only(&pulled).exclude.is_empty(), "{owner}/{schema}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{owner}/{schema}: {:?}",
+                pulled.warnings
+            );
         }
     }
 
@@ -8295,11 +8670,12 @@ mod tests {
         assert!(!other.warnings.is_empty());
     }
 
-    /// A class a schema owns is refused whole, on a B-tree and on GIN, and the
-    /// note names where it will be admitted (#2447 PR F); the engine's own
-    /// non-default class keeps its own wording.
+    /// A class a schema owns, with nothing in the catalog that says a package
+    /// owns it, is left out whole on a B-tree and on GIN, and the note says that
+    /// nothing vouches for it (DEC-2447.14); the engine's own non-default class
+    /// keeps its own wording.
     #[test]
-    fn a_class_a_schema_owns_is_left_out_and_names_its_part() {
+    fn a_class_no_package_owns_is_left_out_and_says_so() {
         for (method, ty, class) in [
             ("btree", "text", "ext.my_ops"),
             ("gin", "jsonb", "ext.my_ops"),
@@ -8307,6 +8683,7 @@ mod tests {
             let mut ix = index(50, 1, "t_ix");
             ix.method = method.to_owned();
             ix.key_classes = vec![class.to_owned()];
+            ix.key_class_extensions = vec![String::new()];
             let pulled = assemble(&RawCatalog {
                 tables: vec![table(1, "t")],
                 columns: vec![col(1, 1, "a", ty)],
@@ -8316,7 +8693,7 @@ mod tests {
             assert!(only(&pulled).indexes.is_empty(), "{method}");
             let note = &pulled.warnings[0];
             assert!(
-                note.contains("ext.my_ops") && note.contains("#2447 PR F"),
+                note.contains("ext.my_ops") && note.contains("which no package owns"),
                 "{method}: {note}"
             );
         }
