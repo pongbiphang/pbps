@@ -243,9 +243,18 @@ impl Control {
         result
     }
     pub(crate) async fn finish(&self, scratch: test_scratch::TestScratch<'_>, data: &mut TestData) {
+        self.finish_within(scratch.finish(), data).await;
+    }
+    /// [`Control::finish`] for any removal, so that the allowance it gives the
+    /// cleanup is tested without a daemon (#2652).
+    pub(crate) async fn finish_within(
+        &self,
+        cleanup: impl Future<Output = Result<(), test_scratch::CleanupFailure>>,
+        data: &mut TestData,
+    ) {
         let mut phase = Phase::offline("cleanup", "owned resources");
         let started = Instant::now();
-        match tokio::time::timeout(ms(self.timeouts.cleanup_ms), scratch.finish()).await {
+        match tokio::time::timeout(ms(self.timeouts.cleanup_ms), cleanup).await {
             Ok(Ok(())) => {
                 data.cleanup_confirmed = true;
                 phase.outcome = super::report::Status::Passed;
