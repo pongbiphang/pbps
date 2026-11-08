@@ -233,6 +233,60 @@ fn index_shape(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
 /// may stand. Whether an operator is commutative, is a member of the key's
 /// operator family or returns a boolean is the engine's to say, as which key
 /// types a method takes is: it refuses with its own message at the rehearsal.
+/// A qualified operator class is held only where the project declares a package in
+/// the class's schema (DEC-2447.14): with none there is nothing to vouch for what the
+/// class is. Which of several declared packages owns it, and whether it is theirs
+/// at all, is the plan's pin to prove against the engine.
+pub(crate) fn provider_classes(
+    name: &pbps_model::TableName,
+    table: &Table,
+    schema: &pbps_model::Schema,
+) -> Vec<DialectError> {
+    let mut uses = Vec::new();
+    crate::class_pins::uses_in_table(table, &mut uses);
+    let mut found = Vec::new();
+    for used in uses {
+        if schema
+            .extensions
+            .values()
+            .any(|e| e.schema == used.wanted.schema)
+        {
+            continue;
+        }
+        found.push(invalid(format!(
+            "`{}` indexes with operator class `{}`, and the project declares no extension in \
+             schema `{}`; opt the package in with `pbps pull --extension NAME` and record it \
+             with `pbps baseline`",
+            name.shown(),
+            used.shown,
+            pbps_model::escape::Escaped(&used.wanted.schema),
+        )));
+    }
+    for (exclusion, x) in &table.exclude {
+        for key in &x.keys {
+            let Some(operator_schema) = key.operator.schema() else {
+                continue;
+            };
+            if !schema
+                .extensions
+                .values()
+                .any(|e| e.schema == operator_schema)
+            {
+                found.push(invalid(format!(
+                    "exclusion constraint `{}` on `{}` excludes with the operator `{}`, and the \
+                     project declares no extension in schema `{}`; opt the package in with \
+                     `pbps pull --extension NAME` and record it with `pbps baseline`",
+                    exclusion.shown(),
+                    name.shown(),
+                    key.operator.shown(),
+                    pbps_model::escape::Escaped(operator_schema),
+                )));
+            }
+        }
+    }
+    found
+}
+
 fn exclusion(
     name: &pbps_model::ObjectLocalName,
     x: &pbps_model::ExclusionConstraint,
@@ -286,7 +340,7 @@ fn exclusion(
 /// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
     use crate::index_policy::{
-        ClassProblem, class_problem, holds_key_type, key_scope, later_class, offered,
+        ClassProblem, class_problem, holds_key_type, key_scope, later_class, offered, provider_key,
     };
     let policy = index.method.policy();
     let method = index.method.as_str().to_ascii_uppercase();
@@ -308,9 +362,13 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                 "{what} orders `{shown}` descending, and a {method} index has no order"
             )));
         }
+        // A key naming a class a package provides is held over what the class is for,
+        // which the pin proves at plan (DEC-2447.14): the method's own key-type gates
+        // are for the engine's classes.
+        let provided = provider_key(policy, key);
         let column = match key.key.column() {
             Some(column) => Some(column),
-            None if !policy.expression_keys => {
+            None if !policy.expression_keys && !provided => {
                 found.push(invalid(format!(
                     "{what} is a {method} index over the expression `{shown}`, and this model \
                      holds {method} only over {}",
@@ -322,10 +380,11 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
         };
         if let Some(column) = column {
             // A missing column is already named by `key_columns`.
-            if table
-                .columns
-                .get(column)
-                .is_some_and(|c| !holds_key_type(policy, c))
+            if !provided
+                && table
+                    .columns
+                    .get(column)
+                    .is_some_and(|c| !holds_key_type(policy, c))
             {
                 found.push(invalid(format!(
                     "{what} is a {method} index over `{column}`, and this model holds {method} \
@@ -337,7 +396,7 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
         }
         found.extend(key_collation(what, policy, &method, key, table));
         let mut spoke = false;
-        if let (Some(column), false) = (column, policy.typed_columns.is_empty()) {
+        if let (Some(column), false, false) = (column, policy.typed_columns.is_empty(), provided) {
             let typed = typed_column(what, policy, &method, key, column, table);
             spoke = typed.is_some();
             found.extend(typed);
@@ -389,9 +448,9 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                 policy.default_class.unwrap_or("its default"),
             ),
             Some(ClassProblem::Outside) => format!(
-                "{what} indexes {at} with operator class `{named}`, which a schema owns; this \
-                 model holds only the engine's own classes ({}) until a pinned provider vouches \
-                 for one (#2447 PR F)",
+                "{what} indexes {at} with operator class `{named}`, which a schema owns; a {method} \
+                 index here holds only the engine's own classes ({}), because no package \
+                 provides one for it",
                 if policy.classes.is_empty() && policy.default_class.is_none() {
                     "none, for a B-tree".to_owned()
                 } else {
@@ -1292,8 +1351,9 @@ mod tests {
         assert!(on_default.contains("leave the class out"), "{on_default}");
         let spelled = said(&[("int4range(n, n)", Some("range_ops"), None)]);
         assert!(spelled.contains("`range_ops`"), "{spelled}");
-        let outside = said(&[("ip", Some("ext.inet_ops"), None)]);
-        assert!(outside.contains("a schema owns"), "{outside}");
+        // A class of a schema is a package's to prove at plan (DEC-2447.14), so the
+        // gate that names the engine's classes does not answer for it.
+        assert_eq!(said(&[("ip", Some("ext.inet_ops"), None)]), "");
         // GiST is never unique, ordered, or INCLUDEs an expression's payload.
         let mut unique = gist_table(Gist, &[("doc", None, None)]);
         unique.indexes.get_mut("ix").unwrap().unique = true;
@@ -1553,12 +1613,13 @@ mod tests {
         );
     }
 
-    /// A class a schema owns is parsed by the loader and refused here, by
-    /// name, on every method and key shape, until a pinned provider vouches
-    /// for it (#2447 PR F); the engine's own spelling `pg_catalog.x` is the
-    /// bare class and gets the bare class's verdict (DEC-2448.1).
+    /// A class a schema owns is parsed by the loader and held here for a method
+    /// that takes a package's classes, whose pin proves what it is (DEC-2447.14);
+    /// a method that holds none refuses it by name. The engine's own spelling
+    /// `pg_catalog.x` is the bare class and gets the bare class's verdict
+    /// (DEC-2448.1).
     #[test]
-    fn a_class_a_schema_owns_is_refused_by_name_and_pg_catalog_is_not_one() {
+    fn a_class_a_schema_owns_is_held_where_a_package_can_provide_it_and_pg_catalog_is_not_one() {
         let refused = |table: Table, expected: &[&str]| {
             let found = structure(&table);
             assert!(
@@ -1566,16 +1627,22 @@ mod tests {
                 "expected {expected:?} in {found:?}"
             );
         };
+        // Held on a B-tree and on GIN, on a `text` column the method's own gate
+        // would refuse: the pin proves the class, not the column's type.
+        for method in [IndexMethod::Btree, IndexMethod::Gin, IndexMethod::Gist] {
+            assert!(
+                structure(&indexed(
+                    method,
+                    &[("body", Some("ext.gin_trgm_ops"), false)]
+                ))
+                .is_empty(),
+                "{method:?}"
+            );
+        }
+        // Negative: BRIN holds no class a package provides.
         refused(
-            indexed(IndexMethod::Btree, &[("n", Some("ext.int4_ops"), false)]),
-            &["`ext.int4_ops`", "a schema owns", "#2447 PR F"],
-        );
-        refused(
-            indexed(
-                IndexMethod::Gin,
-                &[("body", Some("ext.jsonb_path_ops"), false)],
-            ),
-            &["`ext.jsonb_path_ops`", "#2447 PR F", "`jsonb_ops`"],
+            indexed(IndexMethod::Brin, &[("n", Some("ext.int4_ops"), false)]),
+            &["`ext.int4_ops`", "a schema owns", "no package provides one"],
         );
         // The same name in `pg_catalog` is the bare class, and held.
         assert!(
@@ -1585,13 +1652,84 @@ mod tests {
             ))
             .is_empty()
         );
-        // Negative: the bare btree class stays refused, with its own wording.
+        // Negative: the bare btree class stays refused, with its own wording, and
+        // the gates stay for a key that names no package class.
         refused(
             indexed(
                 IndexMethod::Btree,
                 &[("n", Some("pg_catalog.int4_ops"), false)],
             ),
             &["takes only its type's default class"],
+        );
+        refused(
+            indexed(IndexMethod::Gin, &[("n", None, false)]),
+            &["only over `jsonb` columns"],
+        );
+    }
+
+    /// A qualified class is held only where the project declares a package in
+    /// its schema, and an exclusion's qualified operator likewise (DEC-2447.14).
+    #[test]
+    fn a_qualified_class_or_operator_needs_a_package_declared_in_its_schema() {
+        let name: pbps_model::TableName = "app.docs".parse().unwrap();
+        let mut table = indexed(
+            IndexMethod::Gin,
+            &[("body", Some("ext.gin_trgm_ops"), false)],
+        );
+        let with = |schema: &str| {
+            let mut s = pbps_model::Schema::default();
+            s.extensions.insert(
+                "pg_trgm".into(),
+                pbps_model::Extension {
+                    schema: schema.into(),
+                    version: "1.6".into(),
+                },
+            );
+            s
+        };
+        assert!(provider_classes(&name, &table, &with("ext")).is_empty());
+        let found = provider_classes(&name, &table, &with("other"));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.to_string().contains("declares no extension in schema")),
+            "{found:?}"
+        );
+        assert_eq!(
+            provider_classes(&name, &table, &pbps_model::Schema::default()).len(),
+            1
+        );
+        // The engine's own class asks nothing of a package.
+        table = indexed(
+            IndexMethod::Gin,
+            &[("body", Some("pg_catalog.jsonb_path_ops"), false)],
+        );
+        assert!(provider_classes(&name, &table, &pbps_model::Schema::default()).is_empty());
+        // An exclusion over `ext.%` needs the same.
+        let mut table = Table::default();
+        table.exclude.insert(
+            "ex".into(),
+            pbps_model::ExclusionConstraint {
+                method: IndexMethod::Gist,
+                keys: vec![pbps_model::ExclusionKey {
+                    key: pbps_model::IndexColumn {
+                        key: pbps_model::IndexKey::Column("body".into()),
+                        descending: false,
+                        opclass: None,
+                        collation: None,
+                    },
+                    operator: "ext.%".parse().unwrap(),
+                }],
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: Default::default(),
+            },
+        );
+        assert!(provider_classes(&name, &table, &with("ext")).is_empty());
+        assert_eq!(
+            provider_classes(&name, &table, &pbps_model::Schema::default()).len(),
+            1
         );
     }
 

@@ -155,6 +155,9 @@ use schemars::JsonSchema;
 /// truthfully holds none.
 /// Version 42 records text search configurations and dictionaries (#2728); every older
 /// snapshot truthfully holds none. 41 belongs to another change.
+/// Version 41 records an exclusion key's operator qualified by the schema of the package
+/// that provides it (DEC-2447.14); an older build would refuse the snapshot, and every older
+/// snapshot truthfully holds only operators of `pg_catalog`.
 pub const CURRENT_VERSION: u32 = 42;
 
 /// The oldest snapshot version this build reads as its own.

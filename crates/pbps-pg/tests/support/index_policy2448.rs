@@ -434,7 +434,7 @@ async fn each_index_shape_of_a_later_part_is_left_out_of_the_pull_with_a_named_n
             ),
             ("ix_brin_multi", "int4_minmax_multi_ops"),
             ("ix_pattern", "B-tree key's default class"),
-            ("ix_ext", "#2447 PR F"),
+            ("ix_ext", "which no package owns"),
         ] {
             let note = pulled
                 .warnings

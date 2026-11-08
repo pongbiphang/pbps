@@ -43,6 +43,7 @@ pub enum SchemaKind {
 /// acceptance criterion 6, DECISIONS 465).
 pub const SCHEMA_VERSION: u32 = 100;
 // 100: the `text_search_config:` and `text_search_dictionary:` files in declarations, and `search` in state (#2728 PR A); 97 to 99 belong to other changes.
+// 99: an `opclass:` of a managed package and a qualified exclusion `operator:` in declarations (#2447 PR G2); 97 and 98 belong to other changes.
 // 96: the `brin` index method in declarations, plans and state (#2449 PR R1); 95 is reserved for #2600 PR 5a.
 // 94: the `exclude:` block of a table (#2448 PR C1a).
 // 92: the `ids_dir` key of `pbps.yml`, where the identity tree lives (#2600 PR 3).

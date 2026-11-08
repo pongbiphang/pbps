@@ -1441,7 +1441,9 @@ pub struct IndexKeyDto {
     /// An expression over the table's columns, kept verbatim.
     #[serde(default)]
     pub expression: Option<String>,
-    /// The operator class, where it is not the key's default.
+    /// The operator class, where it is not the key's default: the engine's own
+    /// (`jsonb_path_ops`), or a class of a package the project manages written as
+    /// the engine names it (`ext.gin_trgm_ops`, DEC-2447.14).
     #[serde(default)]
     pub opclass: Option<String>,
     /// A PostgreSQL key collation of a column key: the name of a `pg_catalog`
@@ -1498,7 +1500,8 @@ pub enum InitiallyDto {
 /// One key of an `exclude:` entry: an index key (`column:` or `expression:`,
 /// with the optional `opclass:`, `collation:` and `order:` of an index key) and
 /// the `operator:` it is excluded with, a symbol of `pg_catalog` such as `&&`
-/// or `=`.
+/// or `=`, or a symbol qualified by the schema of a package the project manages
+/// that provides it, such as `ext.%` (DEC-2447.14).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExclusionKeyDto {

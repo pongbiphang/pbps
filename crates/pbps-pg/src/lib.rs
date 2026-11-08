@@ -68,6 +68,8 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     reserved: types::is_reserved,
     unicode_identifiers: true,
 };
+pub mod class_pins;
+pub mod class_read;
 pub mod domain_alter;
 pub mod drop_requirements;
 pub mod estimate;
@@ -2021,6 +2023,7 @@ impl Dialect for Postgres {
             found.extend(validate::table_structure(table));
         }
         found.extend(validate::table_exclusions(table));
+        found.extend(validate::provider_classes(name, table, schema));
         // An exclusion constraint's expression or predicate that may call a
         // function this project declares is refused for now: the plan's
         // ordering of such a constraint against the function it calls is the

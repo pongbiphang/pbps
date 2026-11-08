@@ -454,6 +454,18 @@ impl Cx<'_> {
         }
     }
 
+    /// An index or exclusion key naming an operator class of a package waits for
+    /// the plan's create, update or move of that package, as a column of its type
+    /// does (DEC-2447.14). The class is named by its schema, as a type is.
+    fn class_inputs(&mut self, keys: &[crate::IndexColumn]) {
+        for schema in keys
+            .iter()
+            .filter_map(|k| k.opclass.as_ref()?.schema().map(str::to_owned))
+        {
+            self.package_input(&schema);
+        }
+    }
+
     // Only operations that introduce a typed input consume this requirement.
     #[allow(clippy::wildcard_enum_match_arm)]
     fn type_inputs(&mut self) {
@@ -488,7 +500,15 @@ impl Cx<'_> {
                 for column in table.columns.values() {
                     self.type_input(&column.ty);
                 }
+                for index in table.indexes.values() {
+                    self.class_inputs(&index.columns);
+                }
+                for constraint in table.exclude.values() {
+                    let keys: Vec<_> = constraint.keys.iter().map(|k| k.key.clone()).collect();
+                    self.class_inputs(&keys);
+                }
             }
+            Change::AddIndex { index, .. } => self.class_inputs(&index.columns),
             Change::AddColumn { column, .. } => self.type_input(&column.ty),
             Change::AlterColumnType { to, .. } => self.type_input(to),
             _ => {}

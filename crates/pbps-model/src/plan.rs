@@ -293,7 +293,9 @@ use crate::zone::SessionZone;
 // `exclude` from a payload it carries.
 // 69 adds the BRIN index method (DEC-2449.1): an older build would read `brin` as an unknown
 // value.
-pub const CURRENT_VERSION: u32 = 69;
+// 71 adds the pins of the operator classes a package provides (DEC-2447.14): an older build
+// would reject the field as malformed rather than as a newer plan; 70 belongs to another change.
+pub const CURRENT_VERSION: u32 = 71;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -481,6 +483,10 @@ pub struct SavedPlan {
     /// Declared type evidence follows identity through renames (DEC-1635.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_type_pins: Vec<DeclaredTypePin>,
+    /// The operator classes a package provides that this plan's indexes name
+    /// (DEC-2447.14). A plan with none serialises as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_pins: Vec<ProviderPin>,
     /// The packages this plan installs, each with the member closure the
     /// rehearsal read. The apply vets what the engine holds after the
     /// statement against it and rolls back on any difference (DEC-2447.6).
@@ -629,24 +635,36 @@ pub struct TypePin {
 
 /// What kind of provider-owned object a [`ProviderPin`] pins. A type keeps its
 /// own [`TypePin`] (its shape is part of the saved plan and does not move);
-/// these are the kinds that arrive with it (DEC-2447.13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// these are the kinds that arrive with it (DEC-2447.13, DEC-2447.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Class,
     Operator,
 }
 
 /// A provider-owned object that is not a type, identified by schema and name,
-/// with a digest of what it does and the package that owns it. Not part of the
-/// saved plan yet: the plan carries it when the first kind that uses it does,
-/// and that is the PR that moves the plan format (DEC-2447.13).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// with a digest of what it does and the package that owns it (DEC-2447.14).
+/// An operator class is `(method, schema, name)` in the engine; its method is
+/// in `method`, and the digest holds what the class can do (its family's
+/// operators and support functions), so an update that adds members moves it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderPin {
     pub kind: ProviderKind,
     pub schema: String,
     pub name: String,
+    /// The access method of a class (`gin`); empty for a kind with none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
     pub oid: i64,
     pub digest: String,
+    /// A placeholder for an object of a package this plan creates or moves:
+    /// nothing to read, and the sealed manifest must list it after the
+    /// rehearsal (DEC-2447.12).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<TypeProvider>,
 }
 
@@ -725,6 +743,7 @@ impl SavedPlan {
             routine_pins: None,
             type_pins: Vec::new(),
             declared_type_pins: Vec::new(),
+            provider_pins: Vec::new(),
             extension_pins: Vec::new(),
             extension_drops: Vec::new(),
             extension_changes: Vec::new(),
@@ -1462,6 +1481,53 @@ mod tests {
         );
     }
 
+    /// A provider pin is covered by the approved checksum, and a plan without
+    /// one writes none of it, so it keeps its bytes; an older build rejects the
+    /// field (the version moved with it, DEC-2447.14). A placeholder says so.
+    #[test]
+    fn provider_pins_are_checksummed_and_a_plan_without_one_keeps_its_bytes() {
+        let mut plan = plan_over(ChangeSet::default());
+        let bare = serde_json::to_value(&plan).unwrap();
+        assert!(bare.get("provider_pins").is_none(), "{bare}");
+        let unpinned = plan.wire_fingerprint();
+        plan.provider_pins.push(ProviderPin {
+            kind: ProviderKind::Class,
+            schema: "ext".into(),
+            name: "gin_trgm_ops".into(),
+            method: "gin".into(),
+            oid: 16500,
+            digest: "ab".repeat(32),
+            planned: false,
+            provider: Some(TypeProvider {
+                extension: "pg_trgm".into(),
+                version: "1.6".into(),
+                moved_to: None,
+            }),
+        });
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("\"planned\""), "{json}");
+        assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
+        assert_ne!(plan.wire_fingerprint(), unpinned);
+        for edit in [
+            |p: &mut ProviderPin| p.oid += 1,
+            |p: &mut ProviderPin| p.digest.push('0'),
+            |p: &mut ProviderPin| p.method = "gist".into(),
+            |p: &mut ProviderPin| p.planned = true,
+        ] {
+            let before = plan.wire_fingerprint();
+            let mut changed = plan.clone();
+            edit(&mut changed.provider_pins[0]);
+            assert_ne!(changed.wire_fingerprint(), before);
+        }
+        // Negative: an unknown field, and an unknown kind, are refused.
+        for bad in [
+            json.replace("\"oid\":16500", "\"oid\":16500,\"invented\":true"),
+            json.replace("\"kind\":\"class\"", "\"kind\":\"type\""),
+        ] {
+            assert!(serde_json::from_str::<SavedPlan>(&bad).is_err(), "{bad}");
+        }
+    }
+
     /// The drop evidence is new, so a plan without a drop writes none of it and
     /// keeps its bytes; one with a drop carries its pin, and an older reader
     /// refuses the field (the version moved with it, DEC-2447.8).
@@ -1480,7 +1546,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 69);
+        assert_eq!(plan.version, 71);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

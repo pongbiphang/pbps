@@ -21,15 +21,17 @@ pub(crate) enum ClassProblem {
     DefaultSpelledOut,
     /// A class of the engine's own that this model does not hold here.
     NotHeld,
-    /// A class a schema owns. Only a provider can vouch for what it is, and
-    /// none does yet (#2447 PR F), so it is refused rather than guessed.
+    /// A class a schema owns, under a method that holds none a package
+    /// provides (BRIN: no package does, DEC-2447.14).
     Outside,
 }
 
 /// `None` where `class` is a class this model holds for `policy`'s method.
 pub(crate) fn class_problem(policy: &MethodPolicy, class: &OpClassRef) -> Option<ClassProblem> {
     let Some(name) = class.as_bare() else {
-        return Some(ClassProblem::Outside);
+        // A qualified class is held when a managed package provides it; whether
+        // one does is the plan's pin to prove (DEC-2447.14), not the policy's.
+        return (!policy.provider_classes).then_some(ClassProblem::Outside);
     };
     if policy.classes.is_empty() && policy.default_class.is_none() {
         return Some(ClassProblem::DefaultOnly);
@@ -38,6 +40,13 @@ pub(crate) fn class_problem(policy: &MethodPolicy, class: &OpClassRef) -> Option
         return Some(ClassProblem::DefaultSpelledOut);
     }
     (!policy.classes.contains(&name)).then_some(ClassProblem::NotHeld)
+}
+
+/// Whether `key` names a class a managed package provides, which lifts the
+/// method's key-type gate: the class, pinned against the package, is what says
+/// the key is one the engine takes (`gin_trgm_ops` over `text`), not the type.
+pub(crate) fn provider_key(policy: &MethodPolicy, key: &pbps_model::IndexColumn) -> bool {
+    policy.provider_classes && key.opclass.as_ref().is_some_and(|c| c.schema().is_some())
 }
 
 /// Whether `class` is one of the engine's own that a later part of the same
@@ -100,8 +109,10 @@ mod tests {
                 "{text}"
             );
         }
+        // A provider's class is the pin's to prove under a method that holds one.
+        assert_eq!(class_problem(policy, &class("ext.int4_ops")), None);
         assert_eq!(
-            class_problem(policy, &class("ext.int4_ops")),
+            class_problem(IndexMethod::Brin.policy(), &class("ext.int4_ops")),
             Some(ClassProblem::Outside)
         );
     }
@@ -124,10 +135,9 @@ mod tests {
             class_problem(policy, &class("array_ops")),
             Some(ClassProblem::NotHeld)
         );
-        assert_eq!(
-            class_problem(policy, &class("app.jsonb_path_ops")),
-            Some(ClassProblem::Outside)
-        );
+        // A namesake of an engine class in another schema is a provider's class
+        // to be proved, never the engine's.
+        assert_eq!(class_problem(policy, &class("app.jsonb_path_ops")), None);
     }
 
     /// The key type is the method's, and an array of it is not it.

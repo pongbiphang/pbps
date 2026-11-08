@@ -978,6 +978,19 @@ fn constraints_query() -> String {
                FROM pg_catalog.unnest(con.conexclop) WITH ORDINALITY AS u(op, n)
                JOIN pg_catalog.pg_operator o ON o.oid = u.op
             ) AS exclusion_op_names,
+            -- The extension that owns each operator (its own `e` dependency), `''`
+            -- for one no package owns (DEC-2447.14).
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      COALESCE((SELECT e.extname::pg_catalog.text
+                                  FROM pg_catalog.pg_depend d
+                                  JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+                                 WHERE d.classid = 'pg_catalog.pg_operator'::pg_catalog.regclass
+                                   AND d.objid = u.op
+                                   AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                                   AND d.deptype = 'e' LIMIT 1), '')
+                      ORDER BY u.n), '[]'::pg_catalog.json)
+               FROM pg_catalog.unnest(con.conexclop) WITH ORDINALITY AS u(op, n)
+            ) AS exclusion_op_extensions,
             COALESCE(pg_catalog.array_length(con.conexclop, 1), 0) AS exclusion_op_count
        FROM pg_catalog.pg_constraint con
        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
@@ -1127,7 +1140,18 @@ fn indexes_query() -> String {
                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
                JOIN pg_catalog.pg_attribute a
                  ON a.attrelid = i.indexrelid AND a.attnum = k.n
-            ) AS key_options
+            ) AS key_options,
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      COALESCE((SELECT e.extname::pg_catalog.text
+                                  FROM pg_catalog.pg_depend d
+                                  JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+                                 WHERE d.classid = 'pg_catalog.pg_opclass'::pg_catalog.regclass
+                                   AND d.objid = i.indclass[k.n - 1]
+                                   AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                                   AND d.deptype = 'e' LIMIT 1), '')
+                      ORDER BY k.n), '[]'::pg_catalog.json)
+               FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+            ) AS key_class_extensions
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -1855,6 +1879,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             inherited: flag(row, "inherited")?,
             exclusion_op_schemas: strings(row, "exclusion_op_schemas")?,
             exclusion_op_names: strings(row, "exclusion_op_names")?,
+            exclusion_op_extensions: strings(row, "exclusion_op_extensions")?,
             exclusion_op_count: small(row, "exclusion_op_count")?.max(0) as usize,
         });
     }
@@ -1878,6 +1903,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             key_texts: strings(row, "key_texts")?,
             key_collations: strings(row, "key_collations")?,
             key_options: strings(row, "key_options")?,
+            key_class_extensions: strings(row, "key_class_extensions")?,
             attached: flag(row, "attached")?,
             reloptions: strings(row, "reloptions")?,
         });
