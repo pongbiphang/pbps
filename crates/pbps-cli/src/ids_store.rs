@@ -191,6 +191,9 @@ impl TreeWrite {
     pub(crate) fn apply(&self) -> anyhow::Result<()> {
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut asides: Vec<(PathBuf, PathBuf)> = Vec::new();
+        // Every directory this write creates, outermost first: only those are
+        // taken away again on a failure.
+        let mut created: Vec<PathBuf> = Vec::new();
         let result = (|| -> anyhow::Result<()> {
             for (rel, text) in &self.files {
                 let path = self.dir.join(rel);
@@ -207,6 +210,13 @@ impl TreeWrite {
                         set_aside(&ancestor, &mut asides)?;
                     }
                 }
+                let mut missing: Vec<PathBuf> = parent
+                    .ancestors()
+                    .take_while(|d| d.starts_with(&self.dir) && !d.exists())
+                    .map(Path::to_path_buf)
+                    .collect();
+                missing.reverse();
+                created.extend(missing);
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -218,22 +228,38 @@ impl TreeWrite {
             Ok(())
         })();
         if let Err(e) = result {
-            for (tmp, _) in &staged {
-                let _ = std::fs::remove_file(tmp);
-            }
-            for (orig, aside) in asides.iter().rev() {
-                let _ = std::fs::rename(aside, orig);
-            }
-            return Err(e);
+            // Back to the tree as it was: the temp files, then the directories
+            // this write created (they are empty by then), then the asides.
+            return Err(match roll_back(&staged, &created, &asides) {
+                Ok(()) => e,
+                Err(left) => e.context(left),
+            });
         }
         for (tmp, path) in &staged {
             // A directory the new file takes the place of (a move the other
             // way round).
+            let mut displaced = None;
             if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
                 set_aside(path, &mut asides)?;
+                displaced = asides.last().cloned();
             }
-            std::fs::rename(tmp, path)
-                .with_context(|| format!("cannot replace `{}`", path.display()))?;
+            if let Err(e) = std::fs::rename(tmp, path) {
+                let e =
+                    anyhow::Error::new(e).context(format!("cannot replace `{}`", path.display()));
+                // The files placed so far stay (both copies of what moved, as
+                // after a crash); the rest of the temp files go, and the
+                // directory this file was to replace is put back.
+                let pending: Vec<_> = staged
+                    .iter()
+                    .skip_while(|(t, _)| t != tmp)
+                    .cloned()
+                    .collect();
+                let back: Vec<_> = displaced.into_iter().collect();
+                return Err(match roll_back(&pending, &[], &back) {
+                    Ok(()) => e,
+                    Err(left) => e.context(left),
+                });
+            }
         }
         for rel in &self.removals {
             let mut path = self.dir.join(rel);
@@ -273,6 +299,49 @@ impl TreeWrite {
             write_atomic(path, text)?;
         }
         Ok(())
+    }
+}
+
+/// Undoes a write that failed part-way: removes the temp files and the
+/// directories the write created (innermost first, and only if empty), then
+/// renames each aside back. A step that cannot be undone is not ignored: the
+/// error says what is left where, which is what the next read's refusal names.
+fn roll_back(
+    staged: &[(PathBuf, PathBuf)],
+    created: &[PathBuf],
+    asides: &[(PathBuf, PathBuf)],
+) -> Result<(), String> {
+    let mut left = Vec::new();
+    for (tmp, _) in staged {
+        if let Err(e) = std::fs::remove_file(tmp)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            left.push(format!("could not remove `{}`: {e}", tmp.display()));
+        }
+    }
+    for dir in created.iter().rev() {
+        if let Err(e) = std::fs::remove_dir(dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            left.push(format!("could not remove `{}`: {e}", dir.display()));
+        }
+    }
+    for (orig, aside) in asides.iter().rev() {
+        if let Err(e) = std::fs::rename(aside, orig) {
+            left.push(format!(
+                "`{}` is still at `{}` ({e}); rename it back",
+                orig.display(),
+                aside.display()
+            ));
+        }
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the write could not be undone: {}",
+            left.join("; ")
+        ))
     }
 }
 

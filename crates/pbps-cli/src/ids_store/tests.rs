@@ -615,3 +615,129 @@ fn a_dropped_file_in_the_way_of_a_directory_goes_aside_instead_of_refusing() {
     assert_eq!(names, ["a.json/b.json", "dbo.customer.t_aaaaaa.json"]);
     assert_eq!(read_opt(&project).unwrap().unwrap().tables.len(), 1);
 }
+
+/// A directory the write cannot create files in, so that a later staged write
+/// fails after the earlier ones succeeded. `None` when the account ignores
+/// permissions (root), where the fault cannot be injected.
+fn unwritable(dir: &Path) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join(".probe");
+    if std::fs::write(&probe, "x").is_ok() {
+        let _ = std::fs::remove_file(probe);
+        return None;
+    }
+    Some(())
+}
+
+fn writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// What is on disk under `dir`, empty directories included.
+fn listing(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(at).unwrap().flatten() {
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string();
+            if entry.path().is_dir() {
+                out.push(format!("{rel}/"));
+                walk(root, &entry.path(), out);
+            } else {
+                out.push(format!(
+                    "{rel}={}",
+                    std::fs::read_to_string(entry.path()).unwrap()
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn a_failed_staging_write_leaves_the_tree_as_it_was_when_a_file_became_a_directory() {
+    let project = project("rollback-file-to-dir");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.json"), "old").unwrap();
+    if unwritable(&dir.join("zz")).is_none() {
+        return;
+    }
+    let before = listing(&dir);
+    // `a.json` becomes a directory (first), then a write into `zz` fails.
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json/a.json".to_owned(), "new".to_owned()),
+            ("zz/n.json".to_owned(), "n".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    let error = write.apply().unwrap_err();
+    writable(&dir.join("zz"));
+    assert!(format!("{error:#}").contains("cannot write"), "{error:#}");
+    assert_eq!(listing(&dir), before);
+    assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "old");
+}
+
+#[test]
+fn a_failed_staging_write_leaves_the_tree_as_it_was_when_a_directory_became_a_file() {
+    let project = project("rollback-dir-to-file");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    std::fs::write(dir.join("a.json/a.json"), "old").unwrap();
+    if unwritable(&dir.join("zz")).is_none() {
+        return;
+    }
+    let before = listing(&dir);
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json".to_owned(), "new".to_owned()),
+            ("zz/n.json".to_owned(), "n".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json/a.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    write.apply().unwrap_err();
+    writable(&dir.join("zz"));
+    assert_eq!(listing(&dir), before);
+}
+
+#[test]
+fn a_rollback_that_cannot_restore_an_aside_says_where_it_is() {
+    let project = project("rollback-stuck");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    // The original path is occupied by a directory that is not empty, so the
+    // aside cannot be renamed back onto it.
+    std::fs::write(dir.join("a.json/foreign"), "x").unwrap();
+    std::fs::write(dir.join(".a.json.aside"), "old").unwrap();
+    let left = roll_back(
+        &[],
+        &[dir.join("a.json")],
+        &[(dir.join("a.json"), dir.join(".a.json.aside"))],
+    )
+    .unwrap_err();
+    assert!(left.contains(".a.json.aside"), "{left}");
+    assert!(left.contains("rename it back"), "{left}");
+    assert!(left.contains("could not remove"), "{left}");
+    // Nothing was deleted on the way.
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".a.json.aside")).unwrap(),
+        "old"
+    );
+    assert!(dir.join("a.json/foreign").exists());
+}
