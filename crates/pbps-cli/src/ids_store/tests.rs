@@ -741,3 +741,86 @@ fn a_rollback_that_cannot_restore_an_aside_says_where_it_is() {
     );
     assert!(dir.join("a.json/foreign").exists());
 }
+
+#[test]
+fn a_removal_that_names_a_file_this_write_placed_is_kept_and_a_different_old_file_is_removed() {
+    let project = project("same-file");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("new.json"), "old bytes").unwrap();
+    std::fs::write(dir.join("gone.json"), "old").unwrap();
+    // `sub/../new.json` is `new.json` by another spelling, which stands in for
+    // `Customer.json` and `customer.json` on a case-insensitive filesystem.
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [("new.json".to_owned(), "new bytes".to_owned())].into(),
+        removals: vec!["sub/../new.json".to_owned(), "gone.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    write.apply().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("new.json")).unwrap(),
+        "new bytes"
+    );
+    assert!(!dir.join("gone.json").exists(), "a different old file goes");
+    assert!(
+        dir.join("sub").is_dir(),
+        "the placed file's directory tree is untouched"
+    );
+}
+
+/// Whether the temp directory folds case: create `A`, look for `a`.
+fn case_insensitive(dir: &Path) -> bool {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("CaseProbe"), "x").unwrap();
+    let folds = dir.join("caseprobe").exists();
+    let _ = std::fs::remove_file(dir.join("CaseProbe"));
+    folds
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_case_only_rename_loses_nothing_on_a_case_insensitive_filesystem() {
+    let probe = project("case-probe");
+    if !case_insensitive(&probe.ids_dir()) {
+        eprintln!(
+            "skipped: the temp directory is case-sensitive, so a case-only rename cannot collide"
+        );
+        return;
+    }
+    // A file: `Customer.yml` -> `customer.yml`.
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("case-file", &customer(), &before);
+    assert_eq!(names_in(&project.ids_dir()), ["Customer.json"]);
+    let after = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
+    plan(&project, &customer(), &after)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&project.ids_dir()), ["customer.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(plan(&project, &customer(), &after).unwrap().is_empty());
+    // A directory: `Sales/` -> `sales/`.
+    let before = declared(&[("dbo.customer", "Sales/customer.yml", &["id", "name"])]);
+    let project = written("case-dir", &customer(), &before);
+    let after = declared(&[("dbo.customer", "sales/customer.yml", &["id", "name"])]);
+    plan(&project, &customer(), &after)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&project.ids_dir()), ["sales"]);
+    assert_eq!(
+        names_in(&project.ids_dir().join("sales")),
+        ["customer.json"]
+    );
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(plan(&project, &customer(), &after).unwrap().is_empty());
+}

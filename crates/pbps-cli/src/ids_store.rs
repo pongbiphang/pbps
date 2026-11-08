@@ -261,6 +261,7 @@ impl TreeWrite {
                 });
             }
         }
+        let placed: Vec<&PathBuf> = staged.iter().map(|(_, path)| path).collect();
         for rel in &self.removals {
             let mut path = self.dir.join(rel);
             // What was set aside is removed where it went.
@@ -273,10 +274,19 @@ impl TreeWrite {
                     aside.join(rest)
                 };
             }
+            // A path that is the very file this write just placed is not an old
+            // copy: on a case-insensitive filesystem `Customer.json` and
+            // `customer.json` are one file, and the rename above already
+            // replaced it. Asked of the filesystem, not of a case-folding rule.
+            if placed.iter().any(|new| same_file(&path, new)) {
+                continue;
+            }
             std::fs::remove_file(&path)
                 .with_context(|| format!("cannot remove `{}`", path.display()))?;
             // A directory a move emptied goes too; one that still holds
-            // something stays.
+            // something stays. That covers a case-only directory rename
+            // (`Sales/` to `sales/`, one directory on a case-insensitive
+            // filesystem): the placed files are in it, so `remove_dir` refuses.
             let mut parent = path.parent();
             while let Some(dir) = parent.filter(|d| *d != self.dir && d.starts_with(&self.dir)) {
                 if std::fs::remove_dir(dir).is_err() {
@@ -299,6 +309,28 @@ impl TreeWrite {
             write_atomic(path, text)?;
         }
         Ok(())
+    }
+}
+
+/// Whether two paths name one file or directory on disk, decided by the
+/// filesystem (device and inode on Unix, the final path the system resolves
+/// elsewhere), so a case-insensitive filesystem or a `..` in the path cannot
+/// make a file look like two. A path that does not exist is nobody's twin.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
     }
 }
 
