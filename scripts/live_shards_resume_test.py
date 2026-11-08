@@ -30,6 +30,11 @@ GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 CARGO = ["test", "-p", "demo", "--lib", "--"]
 A_NAMES = [f"a{i:02}" for i in range(12)]
 B_NAMES = [f"b{i:02}" for i in range(6)]
+CURRENT_IMAGE = "example/current@sha256:" + "1" * 64
+OLD_IMAGE = "example/old@sha256:" + "2" * 64
+RUNNER_IMAGES = {"PBPS_TEST_PG_OLD_SCRATCH_IMAGE": OLD_IMAGE,
+                 "PBPS_TEST_PG_SCRATCH_IMAGE": CURRENT_IMAGE,
+                 "PBPS_TEST_DEV_IMAGE": CURRENT_IMAGE}
 
 FAKE_CARGO = '''#!{python}
 import json, os, signal, sys, time
@@ -59,6 +64,10 @@ if "--list" in args:
     print("\\n".join(n + ": test" for n in names))
     print(f"\\n{{len(names)}} tests, 0 benchmarks")
     sys.exit(0)
+if os.environ.get("FAKE_STARTED"):
+    Path(os.environ["FAKE_STARTED"]).touch()
+for name, expected in json.loads(os.environ.get("FAKE_REQUIRE_IMAGES", "{{}}")).items():
+    assert os.environ.get(name) == expected, (name, os.environ.get(name), expected)
 ran = args[args.index("--color=never") + 1:]
 fail = set(json.loads(os.environ.get("FAKE_FAIL", "[]")))
 die = os.environ.get("FAKE_DIE")
@@ -107,9 +116,14 @@ set -euo pipefail
 if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
     exec python3 scripts/live-shards.py shard pg "$@"
 fi
+IMAGE=CURRENT_PIN
+OLD_IMAGE=OLD_PIN
+export PBPS_TEST_PG_SCRATCH_IMAGE=${PBPS_TEST_PG_SCRATCH_IMAGE:-$IMAGE}
+export PBPS_TEST_PG_OLD_SCRATCH_IMAGE=${PBPS_TEST_PG_OLD_SCRATCH_IMAGE:-$OLD_IMAGE}
+export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
 cargo test -p demo --lib -- --ignored "$@"
 cargo test -p demo --test second -- --ignored "$@"
-'''
+'''.replace("CURRENT_PIN", CURRENT_IMAGE).replace("OLD_PIN", OLD_IMAGE)
 
 
 # The real runners run the TLS helper after the sharded suites, on shard zero only.
@@ -673,6 +687,131 @@ class IndependentFailures(Harness):
         result = subprocess.run(command, env=dict(env, FAKE_FAIL='["a05"]'), text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(failed.read_text())["status"], "FAILED")
+
+    def image_proof(self, *, worktree=None, env=None):
+        type(self).counter += 1
+        path = self.runs / f"image-proof-{self.counter}.json"
+        process_env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(("PBPS_LIVE_", "PBPS_TEST_"))}
+        process_env.update(PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                           FAKE_A=json.dumps(A_NAMES), FAKE_B=json.dumps(B_NAMES),
+                           FAKE_REQUIRE_IMAGES=json.dumps(RUNNER_IMAGES))
+        process_env.update(env or {})
+        result = subprocess.run([sys.executable, str(self.repo / "scripts/live-shards.py"), "proof",
+            "--worktree", str(worktree or self.repo), "--output", str(path), "--name", "a05", *CARGO,
+            "--ignored"], env=process_env, text=True, capture_output=True, timeout=30)
+        return result, path
+
+    def test_runner_dependent_proofs_match_gate_inputs_and_qualify_for_resume(self):
+        expected = {"FAKE_REQUIRE_IMAGES": json.dumps(RUNNER_IMAGES)}
+        _, before = self.drive(fail=["a05"], shards=1, env=expected, check=1)
+        manifest = json.loads((before / "manifest.json").read_text())
+        self.assertTrue(set(RUNNER_IMAGES).isdisjoint(manifest["inputs_env"]))
+        evidence = self.evidence(before)
+        data = json.loads(evidence.read_text())
+        master_tree = self.runs / f"master-images-{self.counter}"
+        git(self.repo, "worktree", "add", "--detach", str(master_tree), self.master)
+        for label, worktree in (("master", master_tree), ("head", self.repo)):
+            result, path = self.image_proof(worktree=worktree)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            proof = json.loads(path.read_text())
+            self.assertEqual(proof["inputs"], manifest["inputs"])
+            self.assertEqual(proof["status"], "ok")
+            data["names"][0][label + "_pass"] = str(path)
+        evidence.write_text(json.dumps(data))
+        _, after = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence),
+                              shards=1, env=expected, check=0)
+        self.assertEqual(self.summary(after)["pg"]["union"], "exact")
+        self.assertEqual(self.summary(after)["run"]["targeted"][0]["test"], "a05")
+
+    def test_proof_defaults_come_from_the_proved_worktree_instead_of_shell_pin_variables(self):
+        other = self.runs / f"other-images-{self.counter}"
+        git(self.repo, "worktree", "add", "--detach", str(other), self.master)
+        image = "example/another-tree@sha256:" + "3" * 64
+        runner = other / "scripts/live-tests-pg.sh"
+        runner.write_text(runner.read_text().replace(OLD_IMAGE, image))
+        git(other, "commit", "-q", "-am", "different tree pin")
+        result, path = self.image_proof(worktree=other, env={
+            "OLD_IMAGE": "caller value", "IMAGE": "caller value",
+            "FAKE_REQUIRE_IMAGES": json.dumps(dict(RUNNER_IMAGES, PBPS_TEST_PG_OLD_SCRATCH_IMAGE=image))})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())["tree"], git(other, "rev-parse", "HEAD^{tree}"))
+
+    def test_explicit_image_overrides_match_the_runner_and_remain_caller_inputs(self):
+        for value in ("example/override@sha256:" + "4" * 64, ""):
+            with self.subTest(value=value):
+                overrides = dict.fromkeys(RUNNER_IMAGES, value)
+                expected = overrides if value else RUNNER_IMAGES
+                env = dict(overrides, FAKE_REQUIRE_IMAGES=json.dumps(expected))
+                _, before = self.drive(shards=1, env=env, check=0)
+                result, path = self.image_proof(env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads((before / "manifest.json").read_text())
+                self.assertEqual(json.loads(path.read_text())["inputs"], manifest["inputs"])
+                self.assertTrue(set(RUNNER_IMAGES).issubset(manifest["inputs_env"]))
+
+    def test_a_proof_with_an_extra_caller_pbps_input_cannot_qualify_for_the_gate(self):
+        _, before = self.drive(fail=["a05"], shards=1, check=1)
+        result, path = self.image_proof(env={"PBPS_SOMETHING_NEW": "changed verdict"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(json.loads(path.read_text())["inputs"],
+                            json.loads((before / "manifest.json").read_text())["inputs"])
+        evidence = self.evidence(before)
+        data = json.loads(evidence.read_text())
+        data["names"][0]["head_pass"] = str(path)
+        evidence.write_text(json.dumps(data))
+        result, refused = self.drive("--resume", str(before), "--rerun-unregistered", str(evidence),
+                                     shards=1, check=1)
+        self.assertIn("pass proof does not prove this exact isolated check", result.stderr)
+        self.assertFalse(refused.exists())
+
+    def test_an_unreadable_or_unrecognized_runner_default_refuses_before_the_proof_child(self):
+        for name, script, pin in (("PBPS_TEST_PG_SCRATCH_IMAGE", "live-tests-pg.sh", "IMAGE"),
+                                  ("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", "live-tests-pg.sh", "OLD_IMAGE"),
+                                  ("PBPS_TEST_DEV_IMAGE", "live-tests.sh", "IMAGE")):
+            runner = self.repo / "scripts" / script
+            original = runner.read_text()
+            export = next(line for line in original.splitlines() if line.startswith(f"export {name}="))
+            assignment = next(line for line in original.splitlines() if line.startswith(pin + "="))
+            changes = {"missing script": None, "non-UTF8 script": b"\xff",
+                       "ignored runner": original,
+                       "missing pin": original.replace(assignment, ""),
+                       "floating pin": original.replace(assignment, pin + "=floating:latest"),
+                       "missing export": original.replace(export, ""),
+                       "unknown default": original.replace(export, f"export {name}=${{{name}:-caller-default}}"),
+                       "duplicate pin": original + assignment + "\n", "duplicate export": original + export + "\n"}
+            if pin == "IMAGE":
+                changes["symlink runner"] = original
+            for kind, change in changes.items():
+                with self.subTest(name=name, kind=kind):
+                    head = git(self.repo, "rev-parse", "HEAD")
+                    try:
+                        if kind == "ignored runner":
+                            with (self.repo / ".gitignore").open("a") as ignore:
+                                ignore.write(f"scripts/{script}\n")
+                            git(self.repo, "rm", "--cached", f"scripts/{script}")
+                        elif kind == "symlink runner":
+                            external = self.runs / f"external-runner-{self.counter}"
+                            external.write_text(original)
+                            runner.unlink()
+                            runner.symlink_to(external)
+                        elif change is None:
+                            runner.unlink()
+                        elif isinstance(change, bytes):
+                            runner.write_bytes(change)
+                        else:
+                            runner.write_text(change)
+                        git(self.repo, "add", "-A")
+                        git(self.repo, "commit", "-q", "-m", "unrecognized runner default")
+                        started = self.runs / f"unexpected-child-{self.counter}"
+                        result, path = self.image_proof(env={name: "explicit override", "FAKE_STARTED": str(started)})
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(name, result.stderr)
+                        self.assertIn(script, result.stderr)
+                        self.assertFalse(path.exists())
+                        self.assertFalse(started.exists())
+                    finally:
+                        git(self.repo, "reset", "--hard", head)
 
     def test_the_check_scope_and_tracking_evidence_are_required(self):
         _, before = self.drive(fail=["a05"], shards=1, check=1)
@@ -1818,7 +1957,8 @@ class Identity(unittest.TestCase):
     def test_the_inputs_digest_follows_what_changes_a_verdict(self):
         reference = self.digest()
         self.assertEqual(self.digest(), reference)
-        for name in ("PBPS_TEST_DEV_IMAGE", "PBPS_TEST_PG_SCRATCH_IMAGE", "RUSTFLAGS", "INSTA_UPDATE",
+        for name in ("PBPS_TEST_DEV_IMAGE", "PBPS_TEST_PG_SCRATCH_IMAGE", "PBPS_TEST_PG_OLD_SCRATCH_IMAGE",
+                     "RUSTFLAGS", "INSTA_UPDATE",
                      "CARGO_PROFILE_DEV_DEBUG", "PBPS_SOMETHING_NEW", "EVENT", "BASE_SHA",
                      "ProgramFiles", "PROGRAMFILES", "CARGO_BUILD_RUSTFLAGS", "RUSTC_WRAPPER", "NODE_OPTIONS",
                      "GIT_CONFIG_NOSYSTEM", "LC_ALL", "TZ", "TMPDIR", "TMP", "TEMP"):
