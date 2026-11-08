@@ -229,6 +229,11 @@ impl Fixture {
         self.trace.artifact(Sink::Sql, &self.d.dir.join("plan.sql"));
         let plan: serde_json::Value = serde_json::from_slice(&plan).unwrap();
         assert_eq!(plan["origin"], "resolved_database");
+        assert!(
+            plan["rehearsal"]["converged"].is_object(),
+            "normal trace plan did not run its rehearsal: {}",
+            plan["rehearsal"]
+        );
         let prerequisites = plan["analysis"]["evidence"]["before"]["prerequisites"]
             .as_array()
             .unwrap();
@@ -472,10 +477,11 @@ impl Fixture {
 
     fn publication_refusal(&mut self, docker: bool) {
         use std::sync::atomic::Ordering;
-        // Reuse the existing PG wire fixture (DEC-1685.1), not a delay in the
-        // externals file: that file runs before the opening target capture.
-        // The normal plan measures how many sessions this backend/kind opens;
-        // only its final, fresh publication recheck reaches the other engine.
+        // Make publication the last target session in this control. The
+        // independent rehearsal opens the target again afterwards (DEC-2379.3),
+        // so counting its sessions would switch too late. Ordinary successful
+        // plans retain their rehearsal; only this publication pair turns it off.
+        // The proxy preserves the real wire exchange (DEC-1685.1).
         let alternate = docker.then(|| {
             OwnDatabase::new(
                 &std::env::var("PBPS_TEST_MSSQL_SCRATCH_DB").unwrap(),
@@ -496,6 +502,7 @@ impl Fixture {
                 &self.d.dir,
                 &[
                     "plan",
+                    "--no-rehearse",
                     "--env",
                     "prod",
                     "--out",
@@ -517,6 +524,7 @@ impl Fixture {
             serde_json::from_slice(&std::fs::read(self.d.dir.join("second.json")).unwrap())
                 .unwrap();
         assert_eq!(plan["origin"], "resolved_database");
+        assert_eq!(plan["rehearsal"], "off");
         let sessions = probe.count.load(Ordering::Acquire);
         assert!(sessions >= 2, "no fresh publication session");
         drop(probe);
@@ -527,6 +535,7 @@ impl Fixture {
                 &self.d.dir,
                 &[
                     "plan",
+                    "--no-rehearse",
                     "--env",
                     "prod",
                     "--out",
