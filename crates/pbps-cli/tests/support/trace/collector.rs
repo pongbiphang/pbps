@@ -257,6 +257,13 @@ if [ "$1" = run ]; then
   "$PBPS_TRACE_DOCKER_REAL" "$@" > "$PBPS_TRACE_CREATED"
   pbps_trace_status=$?
   set -e
+  if [ "$pbps_trace_status" = 0 ]; then
+    # Keep the volume identities before this deliberate cleanup failure can
+    # leave the container to another run's recovery sweep (#2652).
+    pbps_trace_id=$(cat "$PBPS_TRACE_CREATED")
+    "$PBPS_TRACE_DOCKER_REAL" container inspect --format '{{range .Mounts}}{{.Name}} {{end}}' "$pbps_trace_id" > "$PBPS_TRACE_CREATED.volumes.pending"
+    mv "$PBPS_TRACE_CREATED.volumes.pending" "$PBPS_TRACE_CREATED.volumes"
+  fi
   cat "$PBPS_TRACE_CREATED"
   exit "$pbps_trace_status"
 fi

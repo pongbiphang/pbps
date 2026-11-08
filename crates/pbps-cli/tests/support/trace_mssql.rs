@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 mod collector;
 use collector::*;
 
+#[path = "trace/left_container.rs"]
+mod left_container;
+
 #[path = "trace/recheck.rs"]
 mod recheck;
 use recheck::RecheckTarget;
@@ -821,14 +824,10 @@ impl Fixture {
             .env("PBPS_TRACE_CREATED", &created)
             .env("PBPS_TRACE_ATTEMPTED", &attempted);
         let result = command.output().unwrap();
-        let id = std::fs::read_to_string(created).unwrap();
+        let id = std::fs::read_to_string(&created).unwrap();
         let id = id.trim();
         assert!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
-        let removed = Command::new(&real)
-            .args(["rm", "--force", "--volumes", id])
-            .output()
-            .unwrap();
-        assert!(removed.status.success());
+        left_container::remove_captured_container(&real, id, &created);
         assert_disposal_attempts(&std::fs::read_to_string(attempted).unwrap(), id);
         self.trace.output(&result);
         self.trace.files(&self.d.dir);

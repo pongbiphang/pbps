@@ -352,6 +352,10 @@ fn after_connection(server: &str, concurrent: bool) {
     for volume in &volumes {
         assert_absent("volume", volume);
     }
+    // The cleanup a test does itself for a container it left on purpose must
+    // accept one the next run's sweep has removed (#2652): the sweep took it
+    // first, so `docker rm` has nothing to remove.
+    super::trace::left_container::remove_left_container("docker", &id, &volumes);
     let report: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
     for finding in report["findings"]
         .as_array()

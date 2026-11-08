@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 mod collector;
 use collector::*;
 
+#[path = "trace/left_container.rs"]
+pub mod left_container;
+
 #[path = "trace/recheck.rs"]
 mod recheck;
 use recheck::RecheckTarget;
@@ -567,18 +570,13 @@ impl Fixture {
             .output()
             .unwrap();
         self.env = before;
-        let id = std::fs::read_to_string(created).unwrap();
+        let id = std::fs::read_to_string(&created).unwrap();
         let id = id.trim();
         assert!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_disposal_attempts(&std::fs::read_to_string(attempted).unwrap(), id);
-        assert!(
-            Command::new(&real)
-                .args(["rm", "--force", "--volumes", id])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        // A later run's recovery sweep may have removed it first (#2652): what
+        // matters is that it and its volumes are gone.
+        left_container::remove_captured_container(&real, id, &created);
         self.trace.output(&output);
         self.trace.files(&self.d.dir);
         assert_ne!(code(&output), 0);
