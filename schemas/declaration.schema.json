@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pbps declaration",
-  "description": "One pbps declaration file: a table, module, role, enum or domain.\nThe leading key is both the kind and the name.",
+  "description": "One pbps declaration file: a table, module, role, enum, domain, or a text search\nconfiguration or dictionary.\nThe leading key is both the kind and the name.",
   "anyOf": [
     {
       "$ref": "#/$defs/ExtensionDto"
@@ -23,6 +23,12 @@
     },
     {
       "$ref": "#/$defs/DomainTypeDto"
+    },
+    {
+      "$ref": "#/$defs/SearchConfigDto"
+    },
+    {
+      "$ref": "#/$defs/SearchDictionaryDto"
     }
   ],
   "$defs": {
@@ -2000,8 +2006,63 @@
         "domain",
         "type"
       ]
+    },
+    "SearchConfigDto": {
+      "description": "A PostgreSQL text search configuration: a parser and, per token type of that\nparser, the dictionaries tried in order (#2728). The leading key names it,\nqualified by its schema. It lives in its own namespace, so it may share a name with a\ndictionary or a domain.",
+      "type": "object",
+      "properties": {
+        "text_search_config": {
+          "type": "string"
+        },
+        "parser": {
+          "description": "The parser, qualified by its schema. Only the built-in one,\n`pg_catalog.\"default\"`, is held.",
+          "type": "string"
+        },
+        "mappings": {
+          "description": "Token type alias (`asciiword`) to the dictionaries tried for it, in order,\neach qualified by its schema.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "text_search_config",
+        "parser"
+      ]
+    },
+    "SearchDictionaryDto": {
+      "description": "A PostgreSQL text search dictionary: a template and its options (#2728).",
+      "type": "object",
+      "properties": {
+        "text_search_dictionary": {
+          "type": "string"
+        },
+        "template": {
+          "description": "The template, qualified by its schema. Only the built-in ones are held.",
+          "type": "string"
+        },
+        "options": {
+          "description": "The template's options, verbatim. A file-backed dictionary's file name is\none of them; the file itself is not held.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "text_search_dictionary",
+        "template"
+      ]
     }
   },
-  "x-pbps-schema-version": 96,
+  "x-pbps-schema-version": 100,
   "x-pbps-tool-version": "0.0.0"
 }

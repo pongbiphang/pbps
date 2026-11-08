@@ -83,3 +83,4 @@ DECISIONS 465).
 - `92/` adds the `ids_dir` key of `pbps.yml`, the directory of per-declaration identity files (#2600 PR 3).
 - `94/` adds the `exclude:` block of a table: an exclusion constraint's method, keys with their operators, payload, predicate, storage parameters and timing (#2448 PR C1).
 - `96/` adds the `brin` index method (#2449 PR R1).
+- `100/` adds the `text_search_config:` and `text_search_dictionary:` declaration files: a text search configuration (parser and per-token mappings) and a dictionary (template and options) (#2728 PR A).
