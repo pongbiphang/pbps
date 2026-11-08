@@ -22,10 +22,10 @@ use std::process::{Command, Output};
 #[path = "support/catalog_warnings1739.rs"]
 mod catalog_warnings1739;
 
-#[cfg(unix)]
 #[path = "support/idtree.rs"]
 mod idtree;
 
+#[cfg(unix)]
 #[path = "support/unix_socket.rs"]
 mod unix_socket;
 

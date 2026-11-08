@@ -169,7 +169,7 @@ class Consumer:
         return result.returncode, json.loads(result.stdout)
 
     def commit(self):
-        self.exec("git", "add", "schema", "schema.ids.json", "pbps.yml")
+        self.exec("git", "add", "schema", ".pbps", "pbps.yml")
         self.exec("git", "commit", "-qm", "Record release qualification declaration")
 
 

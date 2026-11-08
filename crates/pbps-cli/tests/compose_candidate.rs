@@ -13,10 +13,10 @@ use std::time::{Duration, SystemTime};
 
 use pbps_ui::compose::{Candidates, CaptureBoundary, Config, Intent, Request};
 
-#[cfg(unix)]
 #[path = "support/idtree.rs"]
 mod idtree;
 
+#[cfg(unix)]
 #[path = "support/unix_socket.rs"]
 mod unix_socket;
 
