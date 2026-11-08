@@ -2,6 +2,27 @@ use super::*;
 use pbps_load::DeclaredFile;
 use pbps_model::diagnostic::Declaration as Source;
 use serde_json::json;
+use std::cell::Cell;
+
+thread_local! {
+    /// Counts staged writes down; the one that reaches 1 creates its file and fails.
+    static WRITES_UNTIL_FAULT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Makes the `n`th staged write of this thread create its file and then fail.
+fn fail_write_number(n: usize) {
+    WRITES_UNTIL_FAULT.with(|c| c.set(n));
+}
+
+pub(super) fn fault_now() -> bool {
+    WRITES_UNTIL_FAULT.with(|c| match c.get() {
+        0 => false,
+        n => {
+            c.set(n - 1);
+            n == 1
+        }
+    })
+}
 
 fn project(tag: &str) -> Project {
     let root = std::env::temp_dir().join(format!("pbps-ids-store-{tag}-{}", std::process::id()));
@@ -823,4 +844,70 @@ fn a_case_only_rename_loses_nothing_on_a_case_insensitive_filesystem() {
     );
     assert_eq!(read_opt(&project).unwrap(), Some(customer()));
     assert!(plan(&project, &customer(), &after).unwrap().is_empty());
+}
+
+#[test]
+fn a_staged_write_that_fails_after_creating_its_file_leaves_no_temp_file_when_a_file_became_a_directory()
+ {
+    let project = project("partial-file-to-dir");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.json"), "old").unwrap();
+    let before = listing(&dir);
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json/a.json".to_owned(), "new".to_owned()),
+            ("a.json/b.json".to_owned(), "new too".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    // The second write creates `a.json/.b.json.tmp` half-way and fails.
+    fail_write_number(2);
+    let error = write.apply().unwrap_err();
+    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    assert_eq!(listing(&dir), before);
+    assert_eq!(read_ids_tree(&dir).unwrap().len(), 1);
+    // Negative: the same write, unarmed, goes through.
+    write.apply().unwrap();
+    assert!(dir.join("a.json/b.json").is_file());
+}
+
+#[test]
+fn a_staged_write_that_fails_after_creating_its_file_leaves_no_temp_file_when_a_directory_became_a_file()
+ {
+    let project = project("partial-dir-to-file");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    std::fs::write(dir.join("a.json/a.json"), "old").unwrap();
+    let before = listing(&dir);
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json".to_owned(), "new".to_owned()),
+            ("b.json".to_owned(), "new too".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json/a.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    fail_write_number(2);
+    write.apply().unwrap_err();
+    assert_eq!(listing(&dir), before);
+    write.apply().unwrap();
+    assert!(dir.join("a.json").is_file());
+}
+
+#[test]
+fn a_config_write_that_fails_leaves_no_temp_file() {
+    let project = project("config-tmp");
+    let dir = project.ids_dir();
+    // The target is a non-empty directory, so the final rename fails.
+    std::fs::create_dir_all(dir.join("pbps.yml")).unwrap();
+    std::fs::write(dir.join("pbps.yml/keep"), "x").unwrap();
+    let before = listing(&dir);
+    write_atomic(&dir.join("pbps.yml"), "ids_dir: x\n").unwrap_err();
+    assert_eq!(listing(&dir), before);
 }

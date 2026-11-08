@@ -221,9 +221,12 @@ impl TreeWrite {
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 let tmp = parent.join(format!(".{name}.tmp"));
-                std::fs::write(&tmp, text)
+                // Recorded before the write: `write` can create the file and
+                // then fail (no space, an I/O error), and the rollback must
+                // find what the call may have left.
+                staged.push((tmp.clone(), path));
+                write_staged(&tmp, text)
                     .with_context(|| format!("cannot write `{}`", tmp.display()))?;
-                staged.push((tmp, path));
             }
             Ok(())
         })();
@@ -310,6 +313,17 @@ impl TreeWrite {
         }
         Ok(())
     }
+}
+
+/// Writes one temp file. Under test a fault can be armed (`tests::fail_write_number`)
+/// that creates the file and then fails, as a full disk does part-way.
+fn write_staged(tmp: &Path, text: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::fault_now() {
+        std::fs::write(tmp, &text[..text.len() / 2])?;
+        return Err(std::io::Error::other("injected: no space left on device"));
+    }
+    std::fs::write(tmp, text)
 }
 
 /// Whether two paths name one file or directory on disk, decided by the

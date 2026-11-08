@@ -116,8 +116,22 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write `{}`", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace `{}`", path.display()))
+    // A temp file this call made is not left behind when it fails: the reader
+    // refuses a stray entry in the tree.
+    let result = std::fs::write(&tmp, text)
+        .with_context(|| format!("cannot write `{}`", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("cannot replace `{}`", path.display()))
+        });
+    if let Err(e) = result {
+        return Err(match std::fs::remove_file(&tmp) {
+            Ok(()) => e,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => e,
+            Err(left) => e.context(format!("and could not remove `{}`: {left}", tmp.display())),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn shown(dirs: &Dirs, rel: &str) -> String {
