@@ -632,7 +632,20 @@ impl Fixture {
             stdout(&stale),
             stderr(&stale)
         );
-        assert_eq!(self.ledger_rows(), before);
+        // A refusal under the apply lock records its failed attempt (SPEC
+        // 7.6); it preserves every previous row and applies no managed DDL.
+        let previous: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
+        let after: Vec<serde_json::Value> = serde_json::from_str(&self.ledger_rows()).unwrap();
+        assert_eq!(after.len(), previous.len() + 1);
+        assert_eq!(&after[..previous.len()], previous.as_slice());
+        let failed = after.last().unwrap();
+        assert_eq!(failed["kind"], "failed");
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("before its first statement")
+        );
         assert_eq!(
             text(
                 self.target.connection(),
