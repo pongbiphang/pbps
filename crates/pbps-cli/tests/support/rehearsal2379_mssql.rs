@@ -10,6 +10,44 @@ use super::*;
 const TARGET: &str = "PBPS_REH_TARGET";
 const SCRATCH: &str = "PBPS_REH_SCRATCH";
 
+/// Set where `pbps key generate --out` cannot be used: a key file's owner-only
+/// mode cannot be proved on Windows, so the command refuses there and the
+/// `resolver-localdb` job (scripts/localdb_qualify.py) names this variable
+/// instead (#2491). Unset, the fixture writes a key file as it always did.
+const KEY_ENV: &str = "PBPS_TEST_FINGERPRINT_KEY";
+
+/// Set where the scratch is reached by a `(localdb)` selector, which only pbps
+/// resolves; the harness's own connection to it is the pipe string in
+/// `PBPS_TEST_MSSQL_SCRATCH_DB`. Unset, both are the same string.
+const SCRATCH_SELECTOR_ENV: &str = "PBPS_TEST_LOCALDB_SCRATCH";
+
+/// The `pbps.yml` line that names the fingerprint key.
+fn key_line() -> &'static str {
+    if std::env::var_os(KEY_ENV).is_some() {
+        "    fingerprint_key_env: PBPS_TEST_FINGERPRINT_KEY\n"
+    } else {
+        "    fingerprint_key_file: key\n"
+    }
+}
+
+/// Writes the key file the project names, unless the key comes from the
+/// environment.
+fn generate_key(d: &Demo) {
+    if std::env::var_os(KEY_ENV).is_none() {
+        succeeds(d.run(&[
+            "key",
+            "generate",
+            "--out",
+            d.dir.join("key").to_str().unwrap(),
+        ]));
+    }
+}
+
+/// What pbps is told the scratch is.
+fn scratch_url(harness: &str) -> String {
+    std::env::var(SCRATCH_SELECTOR_ENV).unwrap_or_else(|_| harness.to_owned())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// A login that may create databases, on an instance of its own: the run
@@ -88,12 +126,7 @@ impl Fixture {
             scratch_server,
         };
         fixture.configure(options);
-        succeeds(fixture.d.run(&[
-            "key",
-            "generate",
-            "--out",
-            fixture.d.dir.join("key").to_str().unwrap(),
-        ]));
+        generate_key(&fixture.d);
         fixture
     }
 
@@ -129,12 +162,7 @@ impl Fixture {
                 .expect("PBPS_TEST_MSSQL_SCRATCH_DB is not set; see scripts/live-tests.sh"),
         };
         fixture.configure(&Options::default());
-        succeeds(fixture.d.run(&[
-            "key",
-            "generate",
-            "--out",
-            fixture.d.dir.join("key").to_str().unwrap(),
-        ]));
+        generate_key(&fixture.d);
         fixture
     }
 
@@ -155,7 +183,8 @@ impl Fixture {
             self.d.dir.join("pbps.yml"),
             format!(
                 "dialect: mssql\nresolvers:\n  scratch:\n{entry}environments:\n  prod:\n    \
-                 url_env: {TARGET}\n{selected}    fingerprint_key_file: key\n{}",
+                 url_env: {TARGET}\n{selected}{}{}",
+                key_line(),
                 options.environment
             ),
         )
@@ -212,7 +241,7 @@ impl Fixture {
             .env(TARGET, self.target())
             .env_remove(SCRATCH);
         if scratch && self.kind == Kind::Server {
-            cmd.env(SCRATCH, &self.scratch_server);
+            cmd.env(SCRATCH, scratch_url(&self.scratch_server));
         }
         cmd
     }
@@ -447,10 +476,7 @@ pub fn off_switches_seal_off(server: &str, kind: Kind) {
     let configured = std::fs::read_to_string(f.d.dir.join("pbps.yml")).unwrap();
     std::fs::write(
         f.d.dir.join("pbps.yml"),
-        configured.replace(
-            "    fingerprint_key_file: key\n",
-            "    fingerprint_key_file: key\n    rehearse: false\n",
-        ),
+        configured.replace(key_line(), &format!("{}    rehearse: false\n", key_line())),
     )
     .unwrap();
     let off = f.built("plan", &[], false).output().unwrap();

@@ -657,6 +657,11 @@ mod rehearsal2379_mssql_cases {
     }
 }
 
+// The same cases on Windows LocalDB, run by the `resolver-localdb` job (#2491).
+#[cfg(windows)]
+#[path = "support/localdb2491.rs"]
+mod localdb2491;
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 

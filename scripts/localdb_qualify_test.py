@@ -178,6 +178,16 @@ class Plan(unittest.TestCase):
         self.assertTrue(run)
         self.assertEqual(run, defined, "a defined case the job never runs, or a run case that is gone")
 
+    def test_every_flow_case_the_script_runs_is_defined_and_none_is_left_out(self):
+        tests = (Path(__file__).resolve().parents[1]
+                 / "crates/pbps-cli/tests/support/localdb2491.rs").read_text(encoding="utf-8")
+        defined = set(re.findall(r"\nfn (localdb_\w+)\(\) \{", tests))
+        run = set(re.findall(r'run_case\(flow, "localdb2491::(\w+)"[,)]', self.source()))
+        self.assertTrue(run)
+        self.assertEqual(run, defined, "a defined flow case the job never runs, or a run case that is gone")
+        # The Docker kind cannot run on hosted Windows, and no case may ask for it.
+        self.assertNotIn("Kind::Docker", tests)
+
     def test_every_shared_case_exists_and_none_uses_a_sql_login_or_docker(self):
         tests = (Path(__file__).resolve().parents[1]
                  / "crates/pbps-cli/src/resolver/server/scratch/mssql_live_tests.rs").read_text(encoding="utf-8")

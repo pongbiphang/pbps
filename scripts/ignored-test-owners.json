@@ -3174,6 +3174,22 @@
       ]
     },
     {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "localdb",
+      "validate_on": "win32",
+      "ignored_on": ["win32"],
+      "cases": [
+        "localdb2491::localdb_rehearsal_converges_on_a_server_scratch",
+        "localdb2491::localdb_rehearsal_refuses_a_rejected_statement_on_a_server_scratch",
+        "localdb2491::localdb_rehearsal_off_switches_seal_off_on_a_server_scratch",
+        "localdb2491::localdb_rehearsal_killed_on_a_server_scratch_is_cleaned_up_by_the_next_run",
+        "localdb2491::localdb_rehearsal_without_an_entry_leaves_no_record",
+        "localdb2491::localdb_rehearsal_builds_a_base_that_calls_its_own_function_on_a_server_scratch",
+        "localdb2491::localdb_rehearsal_runs_roles_and_grants_without_a_server_principal_on_a_server_scratch",
+        "localdb2491::localdb_raised_guard_messages_are_shown_once_on_every_apply_path"
+      ]
+    },
+    {
       "target": ["pbps-mssql", "test", "live"],
       "owner": "mssql",
       "validate_on": "linux",
