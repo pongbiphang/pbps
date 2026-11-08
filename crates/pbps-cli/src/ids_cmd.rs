@@ -113,15 +113,22 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
 /// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
 /// `reserved`, the planned destinations and their ancestors, which a later step
 /// of the same write may still create. The pick is added to `reserved`.
-pub(crate) fn unused_sibling(path: &Path, kind: &str, reserved: &mut BTreeSet<PathBuf>) -> PathBuf {
+pub(crate) fn unused_sibling(
+    path: &Path,
+    kind: &str,
+    reserved: &mut BTreeSet<String>,
+    key: crate::ids_store::PathKey,
+) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut n = 0;
     loop {
         let suffix = if n == 0 { String::new() } else { n.to_string() };
         let candidate = parent.join(format!(".{name}.{kind}{suffix}"));
-        if !reserved.contains(&candidate) && std::fs::symlink_metadata(&candidate).is_err() {
-            reserved.insert(candidate.clone());
+        if !reserved.contains(&key.path(&candidate))
+            && std::fs::symlink_metadata(&candidate).is_err()
+        {
+            reserved.insert(key.path(&candidate));
             return candidate;
         }
         n += 1;
@@ -133,7 +140,7 @@ pub(crate) fn unused_sibling(path: &Path, kind: &str, reserved: &mut BTreeSet<Pa
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let tmp = unused_sibling(path, "tmp", &mut BTreeSet::new());
+    let tmp = unused_sibling(path, "tmp", &mut BTreeSet::new(), Default::default());
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
     let result = std::fs::write(&tmp, text)

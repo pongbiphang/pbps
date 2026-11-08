@@ -844,6 +844,15 @@ fn a_case_only_rename_loses_nothing_on_a_case_insensitive_filesystem() {
     );
     assert_eq!(read_opt(&project).unwrap(), Some(customer()));
     assert!(plan(&project, &customer(), &after).unwrap().is_empty());
+    // A dropped object's `Customer.json` and a new object's `customer.json`:
+    // the old identity and its tombstones must survive in the aside file.
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("case-dropped", &customer(), &before);
+    let replaced = dropped_customer_replaced();
+    let paths = declared(&[("dbo.other", "customer.yml", &["id"])]);
+    plan(&project, &replaced, &paths).unwrap().apply().unwrap();
+    assert_eq!(read_opt(&project).unwrap(), Some(replaced.clone()));
+    assert!(plan(&project, &replaced, &paths).unwrap().is_empty());
 }
 
 #[test]
@@ -976,9 +985,190 @@ fn a_destination_named_like_an_aside_does_not_collide_with_it() {
 fn ordinary_moves_keep_the_plain_temp_and_aside_names() {
     let mut reserved = BTreeSet::new();
     let path = Path::new("/ids/a.json");
-    let first = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved);
+    let key = PathKey::default();
+    let first = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved, key);
     assert_eq!(first, Path::new("/ids/.a.json.tmp"));
     // The same name twice in one write gets the next one.
-    let second = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved);
+    let second = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved, key);
     assert_eq!(second, Path::new("/ids/.a.json.tmp1"));
+}
+
+// ------------------------------------------------ the path key (#2770) ----
+
+/// `dbo.customer` is dropped; `dbo.other` is declared where it was, spelled
+/// with other case.
+fn dropped_customer_replaced() -> IdsFile {
+    ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other"},
+        "columns": {"c_bbbbb1": "dbo.other.id"},
+        "tombstones": {
+            T: {"was": "dbo.customer", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa1": {"was": "dbo.customer.id", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa2": {"was": "dbo.customer.name", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }))
+}
+
+#[test]
+fn a_dropped_object_and_a_new_one_that_differ_only_in_case_do_not_share_a_file_when_case_folds() {
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("fold-dropped", &customer(), &before);
+    let after = dropped_customer_replaced();
+    let paths = declared(&[("dbo.other", "customer.yml", &["id"])]);
+    // Case folds: the new object takes `customer.json`, the old file's path, so
+    // the dropped one goes aside instead of being overwritten.
+    let write = plan_keyed(&project, &after, &paths, PathKey::folding()).unwrap();
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["customer.json", "dbo.customer.t_aaaaaa.json"]
+    );
+    assert!(write.files["dbo.customer.t_aaaaaa.json"].contains("\"dropped\""));
+    assert_eq!(write.removals, ["Customer.json"]);
+    // Case is significant: two files, no aside, nothing renamed.
+    let write = plan_keyed(&project, &after, &paths, PathKey::default()).unwrap();
+    // (`Customer.json` is rewritten in place, as dropped; nothing is set aside.)
+    assert_eq!(
+        write.files.keys().collect::<Vec<_>>(),
+        ["Customer.json", "customer.json"]
+    );
+    assert!(
+        write.removals.is_empty(),
+        "the dropped file keeps its path: {:?}",
+        write.removals
+    );
+}
+
+#[test]
+fn two_declarations_differing_only_in_case_are_one_file_when_case_folds() {
+    let project = project("fold-two-live");
+    let paths = declared(&[
+        ("dbo.customer", "Customer.yml", &["id", "name"]),
+        ("dbo.other", "customer.yml", &[]),
+    ]);
+    let error = format!(
+        "{:#}",
+        plan_keyed(&project, &two_tables(), &paths, PathKey::folding()).unwrap_err()
+    );
+    for needle in [
+        "dbo.customer",
+        "dbo.other",
+        "Customer.json",
+        "customer.json",
+        "nothing was written",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    plan_keyed(&project, &two_tables(), &paths, PathKey::default()).unwrap();
+}
+
+#[test]
+fn a_file_and_a_directory_differing_only_in_case_are_refused_when_case_folds() {
+    let project = project("fold-file-dir");
+    let paths = declared(&[
+        ("dbo.customer", "A.yml", &["id", "name"]),
+        ("dbo.other", "a.json/b.yml", &[]),
+    ]);
+    let error = format!(
+        "{:#}",
+        plan_keyed(&project, &two_tables(), &paths, PathKey::folding()).unwrap_err()
+    );
+    assert!(
+        error.contains("a file cannot also be a directory"),
+        "{error}"
+    );
+    plan_keyed(&project, &two_tables(), &paths, PathKey::default()).unwrap();
+}
+
+#[test]
+fn a_case_only_rename_is_planned_as_one_file_and_proved_when_case_folds() {
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("fold-rename", &customer(), &before);
+    let after = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
+    let write = plan_keyed(&project, &customer(), &after, PathKey::folding()).unwrap();
+    assert_eq!(write.files.keys().collect::<Vec<_>>(), ["customer.json"]);
+    assert_eq!(write.removals, ["Customer.json"]);
+    // The removal names a file the write placed: with the key it is skipped,
+    // with case significant it is the old file and goes.
+    let dir = project.ids_dir();
+    write.apply().unwrap();
+    assert!(
+        dir.join("Customer.json").exists(),
+        "skipped as the placed file"
+    );
+    std::fs::remove_file(dir.join("customer.json")).unwrap();
+    let write = plan_keyed(&project, &customer(), &after, PathKey::default()).unwrap();
+    write.apply().unwrap();
+    assert_eq!(names_in(&dir), ["customer.json"]);
+}
+
+#[test]
+fn generated_names_avoid_a_planned_path_that_differs_only_in_case_when_case_folds() {
+    // The write plans `<dest>` as a directory; its file `<file>` stages a temp
+    // file that would take the directory's name in another case.
+    for (file, dest) in [
+        ("-a.json", ".-A.json.tmp/b.json"),
+        ("-A.json", ".-a.json.tmp/b.json"),
+    ] {
+        for (key, expect) in [(PathKey::folding(), "tmp1"), (PathKey::default(), "tmp")] {
+            let write = TreeWrite {
+                dir: PathBuf::from("/ids"),
+                files: [
+                    (file.to_owned(), String::new()),
+                    (dest.to_owned(), String::new()),
+                ]
+                .into(),
+                key,
+                ..TreeWrite::default()
+            };
+            let mut reserved = write.reserved_names();
+            let tmp = crate::ids_cmd::unused_sibling(
+                &Path::new("/ids").join(file),
+                "tmp",
+                &mut reserved,
+                key,
+            );
+            assert_eq!(
+                tmp.file_name().unwrap().to_string_lossy(),
+                format!(".{file}.{expect}"),
+                "{file} {dest} {key:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_probe_agrees_with_the_filesystem_with_or_without_an_entry_to_look_at() {
+    let project = project("probe");
+    let dir = project.ids_dir();
+    // A directory that does not exist yet probes its nearest ancestor.
+    let folds = PathKey::probe(&dir).unwrap();
+    assert_eq!(
+        folds == PathKey::folding(),
+        case_insensitive(&project.ids_dir())
+    );
+    // And with a lettered entry in it (no file needs to be created).
+    std::fs::write(dir.join("Entry.json"), "x").unwrap();
+    assert_eq!(PathKey::probe(&dir).unwrap(), folds);
+    assert_eq!(
+        names_in(&dir),
+        ["Entry.json"],
+        "the probe left nothing behind"
+    );
+}
+
+#[test]
+fn a_probe_that_cannot_read_is_an_error_not_case_sensitive() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = project("probe-unreadable");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&dir).is_ok();
+    let result = PathKey::probe(&dir);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return; // an account that ignores permissions
+    }
+    assert!(result.is_err(), "{result:?}");
 }

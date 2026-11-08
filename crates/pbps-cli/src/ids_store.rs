@@ -151,6 +151,83 @@ fn refused(detail: String) -> anyhow::Error {
     anyhow::anyhow!("cannot write the identity tree: {detail}; nothing was written")
 }
 
+/// How the filesystem the tree lives on tells paths apart (#2770). Every
+/// collision decision of a write (the planner's, the read-back proof's, the
+/// removal check's, the generated names') compares `of(path)`, never the raw
+/// path: on a case-insensitive filesystem `Customer.json` and `customer.json`
+/// are one file, and a comparison that calls them two loses one of them.
+/// Where case is significant the key is the path itself.
+///
+/// Folding is lower-casing, which is not every filesystem's table (NTFS has its
+/// own up-case table, APFS also normalises Unicode); `same_file` at removal time
+/// still asks the filesystem about aliases this key does not model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PathKey {
+    fold: bool,
+}
+
+impl PathKey {
+    pub(crate) fn of(self, path: &str) -> String {
+        if self.fold {
+            path.to_lowercase()
+        } else {
+            path.to_owned()
+        }
+    }
+
+    pub(crate) fn path(self, path: &Path) -> String {
+        self.of(&path.to_string_lossy())
+    }
+
+    /// The key of the filesystem under `dir` (or the nearest ancestor that
+    /// exists, when the tree is not there yet). An answer that cannot be had is
+    /// an error, never "case-sensitive": that guess is the one that loses files.
+    pub(crate) fn probe(dir: &Path) -> std::io::Result<Self> {
+        let base = dir
+            .ancestors()
+            .find(|d| d.is_dir())
+            .unwrap_or(Path::new("."));
+        // Looked at without writing when an entry with a letter in its name is
+        // there: `plan --check` must work on a read-only checkout.
+        for entry in std::fs::read_dir(base)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let twin = if name.to_uppercase() != name {
+                name.to_uppercase()
+            } else {
+                name.to_lowercase()
+            };
+            if twin == name {
+                continue;
+            }
+            return match std::fs::symlink_metadata(base.join(&twin)) {
+                Ok(_) => Ok(Self {
+                    fold: same_file(&entry.path(), &base.join(&twin)),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { fold: false }),
+                Err(e) => Err(e),
+            };
+        }
+        // Nothing to look at: make an entry, look for its twin, take it away.
+        let probe = base.join(format!(".PbpsCaseProbe{}", std::process::id()));
+        std::fs::write(&probe, b"")?;
+        let found =
+            std::fs::symlink_metadata(base.join(format!(".pbpscaseprobe{}", std::process::id())));
+        std::fs::remove_file(&probe)?;
+        match found {
+            Ok(_) => Ok(Self { fold: true }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { fold: false }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A key that folds case whatever the disk says, for tests on Linux.
+    #[cfg(test)]
+    pub(crate) fn folding() -> Self {
+        Self { fold: true }
+    }
+}
+
 /// What one write changes, decided and checked, not yet written.
 #[derive(Debug, Default)]
 pub(crate) struct TreeWrite {
@@ -163,9 +240,22 @@ pub(crate) struct TreeWrite {
     removals: Vec<String>,
     /// `pbps.yml` with `ids_dir` named, when this write creates the tree.
     config: Option<(PathBuf, String)>,
+    /// Whether the filesystem holding the tree folds case, as the plan decided.
+    key: PathKey,
 }
 
 impl TreeWrite {
+    /// The names a temp file or an aside must not take: every planned
+    /// destination and each of its ancestors (a declaration may be called
+    /// `.a.json.tmp/b.yml`), by key, on top of what already exists on disk.
+    fn reserved_names(&self) -> BTreeSet<String> {
+        self.files
+            .keys()
+            .flat_map(|rel| Path::new(rel).ancestors())
+            .map(|a| self.key.path(&self.dir.join(a)))
+            .collect()
+    }
+
     /// Nothing to write, move or remove: the tree is what the mapping and the
     /// declarations say it should be.
     pub(crate) fn is_empty(&self) -> bool {
@@ -197,11 +287,8 @@ impl TreeWrite {
         // Names a temp file or an aside must not take: every planned
         // destination and each of its ancestors (a declaration may be called
         // `.a.json.tmp/b.yml`), on top of what already exists on disk.
-        let mut reserved: BTreeSet<PathBuf> = self
-            .files
-            .keys()
-            .flat_map(|rel| Path::new(rel).ancestors().map(|a| self.dir.join(a)))
-            .collect();
+        let key = self.key;
+        let mut reserved = self.reserved_names();
         let result = (|| -> anyhow::Result<()> {
             for (rel, text) in &self.files {
                 let path = self.dir.join(rel);
@@ -215,7 +302,7 @@ impl TreeWrite {
                 {
                     ancestor.push(part);
                     if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| !m.is_dir()) {
-                        set_aside(&ancestor, &mut asides, &mut reserved)?;
+                        set_aside(&ancestor, &mut asides, &mut reserved, key)?;
                     }
                 }
                 let mut missing: Vec<PathBuf> = parent
@@ -227,7 +314,7 @@ impl TreeWrite {
                 created.extend(missing);
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
-                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", &mut reserved);
+                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", &mut reserved, key);
                 // Recorded before the write: `write` can create the file and
                 // then fail (no space, an I/O error), and the rollback must
                 // find what the call may have left.
@@ -250,7 +337,7 @@ impl TreeWrite {
             // way round).
             let mut displaced = None;
             if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-                set_aside(path, &mut asides, &mut reserved)?;
+                set_aside(path, &mut asides, &mut reserved, key)?;
                 displaced = asides.last().cloned();
             }
             if let Err(e) = std::fs::rename(tmp, path) {
@@ -272,6 +359,7 @@ impl TreeWrite {
             }
         }
         let placed: Vec<&PathBuf> = staged.iter().map(|(_, path)| path).collect();
+        let placed_keys: BTreeSet<String> = placed.iter().map(|p| key.path(p)).collect();
         for rel in &self.removals {
             let mut path = self.dir.join(rel);
             // What was set aside is removed where it went.
@@ -288,7 +376,9 @@ impl TreeWrite {
             // copy: on a case-insensitive filesystem `Customer.json` and
             // `customer.json` are one file, and the rename above already
             // replaced it. Asked of the filesystem, not of a case-folding rule.
-            if placed.iter().any(|new| same_file(&path, new)) {
+            if placed_keys.contains(&key.path(&path))
+                || placed.iter().any(|new| same_file(&path, new))
+            {
                 continue;
             }
             std::fs::remove_file(&path)
@@ -402,9 +492,10 @@ fn roll_back(
 fn set_aside(
     path: &Path,
     asides: &mut Vec<(PathBuf, PathBuf)>,
-    reserved: &mut BTreeSet<PathBuf>,
+    reserved: &mut BTreeSet<String>,
+    key: PathKey,
 ) -> anyhow::Result<()> {
-    let aside = crate::ids_cmd::unused_sibling(path, "aside", reserved);
+    let aside = crate::ids_cmd::unused_sibling(path, "aside", reserved, key);
     std::fs::rename(path, &aside).with_context(|| {
         format!(
             "cannot move `{}` aside to make room for the identity file that takes its place",
@@ -459,6 +550,22 @@ pub(crate) fn plan(
     project: &Project,
     after: &IdsFile,
     declared: &DeclaredPaths,
+) -> anyhow::Result<TreeWrite> {
+    let key = PathKey::probe(&project.ids_dir()).with_context(|| {
+        format!(
+            "cannot tell whether `{}` is case-sensitive",
+            project.ids_dir().display()
+        )
+    })?;
+    plan_keyed(project, after, declared, key)
+}
+
+/// [`plan`] with the path key given, so every case can run on any filesystem.
+pub(crate) fn plan_keyed(
+    project: &Project,
+    after: &IdsFile,
+    declared: &DeclaredPaths,
+    key: PathKey,
 ) -> anyhow::Result<TreeWrite> {
     after
         .validate()
@@ -555,18 +662,19 @@ pub(crate) fn plan(
     // which the loader already refuses.
     let mut holders: BTreeMap<String, Vec<Uid>> = BTreeMap::new();
     for (uid, path) in &want {
-        holders.entry(path.clone()).or_default().push(uid.clone());
+        holders.entry(key.of(path)).or_default().push(uid.clone());
     }
-    for (path, uids) in holders.into_iter().filter(|(_, u)| u.len() > 1) {
+    for (_, uids) in holders.into_iter().filter(|(_, u)| u.len() > 1) {
         let (dead, live): (Vec<_>, Vec<_>) = uids
             .into_iter()
             .partition(|u| after.tombstones.contains_key(u));
         if live.len() > 1 {
             return Err(refused(format!(
-                "{} and {} are both declared at `{}`",
+                "{} and {} are both declared at `{}` and `{}`, which are one file here",
                 name_of(&live[0]),
                 name_of(&live[1]),
-                shown(&dirs, &path)
+                shown(&dirs, &want[&live[0]]),
+                shown(&dirs, &want[&live[1]])
             )));
         }
         // At most one dropped file kept this path, but a dropped object with no
@@ -582,8 +690,10 @@ pub(crate) fn plan(
     // write's business: `TreeWrite::apply` makes room for them.)
     let snapshot: Vec<(Uid, String)> = want.iter().map(|(u, p)| (u.clone(), p.clone())).collect();
     for (uid, path) in &snapshot {
+        let folded = key.of(path);
         let below = |p: &str| {
-            p.strip_prefix(path.as_str())
+            key.of(p)
+                .strip_prefix(folded.as_str())
                 .is_some_and(|r| r.starts_with('/'))
         };
         for (inner, inner_path) in snapshot.iter().filter(|(_, p)| below(p)) {
@@ -687,11 +797,22 @@ pub(crate) fn plan(
         .collect();
     // The proof: what is on disk after the write reads back to what was asked
     // for. A tree that does not is never written.
-    let mut merged = tree.clone();
-    merged.extend(files.clone());
-    for rel in &removals {
-        merged.remove(rel);
+    // What the disk holds afterwards, by key: a placed file replaces the file
+    // it is the same as, and a removal of a file the write placed is skipped.
+    let placed: BTreeSet<String> = files.keys().map(|rel| key.of(rel)).collect();
+    let mut merged: BTreeMap<String, (String, String)> = tree
+        .iter()
+        .map(|(rel, text)| (key.of(rel), (rel.clone(), text.clone())))
+        .collect();
+    for (rel, text) in &files {
+        merged.insert(key.of(rel), (rel.clone(), text.clone()));
     }
+    for rel in &removals {
+        if !placed.contains(&key.of(rel)) {
+            merged.remove(&key.of(rel));
+        }
+    }
+    let merged: BTreeMap<String, String> = merged.into_values().collect();
     let back = ids_tree::assemble(&merged).context("the new tree does not read back")?;
     if &back != after {
         bail!("the new tree reads back to a different mapping; nothing was written");
@@ -708,6 +829,7 @@ pub(crate) fn plan(
         files,
         removals,
         config,
+        key,
     })
 }
 
