@@ -116,6 +116,8 @@ fn soon() -> Instant {
 /// What the runtime holds, and how it fails.
 #[derive(Default)]
 struct Fake {
+    /// Replies to `info --format`, keyed by the requested template.
+    info: BTreeMap<String, Result<String, String>>,
     containers: Vec<Inspected>,
     list_fails: Option<Fail>,
     inspect_fails: Option<Fail>,
@@ -125,9 +127,18 @@ struct Fake {
     orphans: Vec<String>,
     cannot_remove_volume: bool,
     removed: RefCell<Vec<String>>,
+    queried: RefCell<Vec<String>>,
 }
 
 impl Fake {
+    fn info(&self, args: &[&str]) -> Result<String, String> {
+        assert_eq!(&args[..2], &["info", "--format"]);
+        self.info
+            .get(args[2])
+            .expect("the runtime info template must be scripted")
+            .clone()
+    }
+
     fn holding(container: &Inspected) -> Self {
         Self {
             containers: vec![container.clone()],
@@ -151,6 +162,7 @@ fn container(run_id: &str, cid: &str) -> Inspected {
 
 impl Runtime for Fake {
     async fn list(&self, label: &str) -> Result<Vec<String>, Fail> {
+        self.queried.borrow_mut().push(format!("list {label}"));
         if let Some(fail) = &self.list_fails {
             return Err(fail.clone());
         }
@@ -164,6 +176,7 @@ impl Runtime for Fake {
     }
 
     async fn inspect(&self, id: &str) -> Result<Option<Inspected>, Fail> {
+        self.queried.borrow_mut().push(format!("inspect {id}"));
         if let Some(fail) = &self.inspect_fails {
             return Err(fail.clone());
         }
@@ -171,6 +184,7 @@ impl Runtime for Fake {
     }
 
     async fn users(&self, volume: &str) -> Result<Vec<String>, Fail> {
+        self.queried.borrow_mut().push(format!("users {volume}"));
         Ok(self.volume_users.get(volume).cloned().unwrap_or_default())
     }
 
@@ -210,6 +224,241 @@ fn recovery_locks_released(done: &super::Reconciliation, mut release: impl FnMut
 
 fn kept(dir: &Dir, run_id: &str) -> bool {
     dir.dir.runs().unwrap().contains(&run_id.to_owned())
+}
+
+mod daemon2459 {
+    use super::*;
+    use crate::test_scratch::runtime::current_with;
+
+    const DOCKER_HOST: &str = "unix:///run/podman/podman.sock";
+    const GRAPH_ROOT: &str = "/var/lib/containers/storage";
+
+    fn info(hostname: &str, socket: &str, graph_root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host": {"hostname": hostname, "remoteSocket": {"path": socket}},
+            "store": {"graphRoot": graph_root},
+        })
+    }
+
+    fn podman(reply: Result<String, String>) -> Fake {
+        Fake {
+            info: BTreeMap::from([
+                (
+                    "{{.ID}}|{{.DockerRootDir}}".into(),
+                    Err("can't evaluate field ID in type system.infoReport".into()),
+                ),
+                ("{{json .}}".into(), reply),
+            ]),
+            ..Fake::default()
+        }
+    }
+
+    async fn identity(rt: &Fake) -> Result<Daemon, Fail> {
+        current_with(async |args| rt.info(args), DOCKER_HOST.into()).await
+    }
+
+    async fn recover(
+        dir: &Dir,
+        rt: &Fake,
+    ) -> Result<super::super::Reconciliation, super::super::Error> {
+        let deadline = soon();
+        let daemon = super::super::discovered(deadline, identity(rt)).await?;
+        let done = reconcile(&dir.dir, rt, &daemon, deadline).await?;
+        recovery_locks_released(&done, |run_id| released(&dir.dir, run_id));
+        Ok(done)
+    }
+
+    #[tokio::test]
+    async fn docker_keeps_its_id_root_and_selected_endpoint_without_a_podman_query() {
+        let rt = Fake {
+            info: BTreeMap::from([(
+                "{{.ID}}|{{.DockerRootDir}}".into(),
+                Ok("daemon-id|/var/lib/docker\n".into()),
+            )]),
+            ..Fake::default()
+        };
+        for endpoint in ["default", "ssh://docker-host"] {
+            let found = current_with(async |args| rt.info(args), endpoint.into())
+                .await
+                .unwrap();
+            assert_eq!(found.endpoint, endpoint);
+            assert_eq!(found.identity, "daemon-id|/var/lib/docker");
+        }
+        // A successful but empty Docker answer remains unreadable, and does
+        // not trigger a second command that could invent an identity.
+        for text in ["", " \n", "|", " |\n"] {
+            let rt = Fake {
+                info: BTreeMap::from([("{{.ID}}|{{.DockerRootDir}}".into(), Ok(text.into()))]),
+                ..Fake::default()
+            };
+            assert!(matches!(identity(&rt).await, Err(Fail::Unreadable(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_graph_roots_on_different_podman_endpoints_never_judge_each_others_records() {
+        let first = podman(Ok(info("node", "unix:///socket-a", GRAPH_ROOT).to_string()));
+        let here = identity(&first).await.unwrap();
+        for (state, cid) in [(State::Pending, None), (State::Created, Some(id('b')))] {
+            let d = Dir::new();
+            let mut rec = record(&run('a'), state, cid.as_deref());
+            rec.daemon = here.clone();
+            d.dir.write(&rec).unwrap();
+            let before = std::fs::read(d.dir.file(&rec.run_id, "json")).unwrap();
+            let second = podman(Ok(info("node", "unix:///socket-b", GRAPH_ROOT).to_string()));
+            let done = recover(&d, &second).await.unwrap();
+            assert!(
+                done.removed.is_empty(),
+                "another endpoint forgot the record"
+            );
+            assert_eq!(done.failures.len(), 1);
+            assert_eq!(done.failures[0].kind, FailureKind::Unprovable);
+            assert!(second.queried.borrow().is_empty());
+            assert!(second.removed.borrow().is_empty());
+            assert_eq!(
+                std::fs::read(d.dir.file(&rec.run_id, "json")).unwrap(),
+                before
+            );
+
+            // The original endpoint can still discover its pending create,
+            // or inspect its recorded id, and remove exactly its resources.
+            let mut original = podman(Ok(info("node", "unix:///socket-a", GRAPH_ROOT).to_string()));
+            original.containers.push(container(&rec.run_id, &id('b')));
+            let done = recover(&d, &original).await.unwrap();
+            assert!(done.failures.is_empty(), "{done:?}");
+            assert_eq!(done.removed, [rec.run_id.clone()]);
+            assert_eq!(*original.removed.borrow(), [id('b')]);
+            assert!(!kept(&d, &rec.run_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn podman_identity_keeps_hostname_socket_and_graph_root_but_ignores_other_info() {
+        let base = info("node", DOCKER_HOST, GRAPH_ROOT);
+        let here = identity(&podman(Ok(base.to_string()))).await.unwrap();
+        assert_eq!(here.endpoint, DOCKER_HOST);
+        assert_eq!(
+            here.identity,
+            r#"["podman","node","/var/lib/containers/storage"]"#
+        );
+        for changed in [
+            info("another-node", DOCKER_HOST, GRAPH_ROOT),
+            info("node", "unix:///another-socket", GRAPH_ROOT),
+            info("node", DOCKER_HOST, "/another-graph-root"),
+        ] {
+            assert_ne!(
+                identity(&podman(Ok(changed.to_string()))).await.unwrap(),
+                here
+            );
+        }
+        let mut changed = base;
+        changed["host"]["uptime"] = "another minute".into();
+        changed["host"]["remoteSocket"]["exists"] = false.into();
+        changed["store"]["containerStore"] = serde_json::json!({"number": 42});
+        assert_eq!(
+            identity(&podman(Ok(changed.to_string()))).await.unwrap(),
+            here
+        );
+    }
+
+    #[tokio::test]
+    async fn podman_identity_parts_cannot_collide_on_a_delimiter() {
+        let first = info("node|/first", DOCKER_HOST, "/second");
+        let second = info("node", DOCKER_HOST, "/first|/second");
+        assert_ne!(
+            identity(&podman(Ok(first.to_string()))).await.unwrap(),
+            identity(&podman(Ok(second.to_string()))).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_malformed_podman_identity_refuses_and_keeps_the_record() {
+        let d = Dir::new();
+        let mut rec = record(&run('a'), State::Created, Some(&id('b')));
+        rec.daemon = identity(&podman(Ok(
+            info("node", DOCKER_HOST, GRAPH_ROOT).to_string()
+        )))
+        .await
+        .unwrap();
+        d.dir.write(&rec).unwrap();
+        let path = d.dir.file(&rec.run_id, "json");
+        let before = std::fs::read(&path).unwrap();
+        let mut replies: Vec<String> = ["", " \n", "{", "null", "[]", "\"a string\"", "{}"]
+            .map(str::to_owned)
+            .into();
+        for (parent, field) in [
+            ("/host", "hostname"),
+            ("/host/remoteSocket", "path"),
+            ("/store", "graphRoot"),
+        ] {
+            let mut missing = info("node", DOCKER_HOST, GRAPH_ROOT);
+            missing
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            replies.push(missing.to_string());
+            for bad in serde_json::json!([null, true, 7, [], {}, "", " \t\n"])
+                .as_array()
+                .unwrap()
+            {
+                let mut malformed = info("node", DOCKER_HOST, GRAPH_ROOT);
+                malformed.pointer_mut(parent).unwrap()[field] = bad.clone();
+                replies.push(malformed.to_string());
+            }
+        }
+        for reply in replies {
+            let rt = podman(Ok(reply.clone()));
+            let error = recover(&d, &rt).await.unwrap_err();
+            assert!(
+                matches!(error, super::super::Error::Runtime(_)),
+                "{reply:?}: {error}"
+            );
+            assert!(error.to_string().contains("unreadable"), "{error}");
+            assert!(rt.queried.borrow().is_empty());
+            assert!(rt.removed.borrow().is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_timed_out_podman_info_is_not_a_matching_identity() {
+        let d = Dir::new();
+        let rec = record(&run('a'), State::Pending, None);
+        d.dir.write(&rec).unwrap();
+        for (why, kind) in [
+            ("permission denied", "unreadable"),
+            ("docker info did not finish in 30s", "timed out"),
+        ] {
+            let rt = podman(Err(why.into()));
+            let error = recover(&d, &rt).await.unwrap_err();
+            assert!(error.to_string().contains(kind), "{error}");
+            assert!(error.to_string().contains(why), "{error}");
+            assert!(rt.queried.borrow().is_empty());
+            assert!(rt.removed.borrow().is_empty());
+            assert_eq!(d.dir.read(&rec.run_id).unwrap(), Some(rec.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn older_graph_root_only_podman_records_are_kept_for_manual_recovery() {
+        let d = Dir::new();
+        let mut rec = record(&run('a'), State::Created, Some(&id('b')));
+        rec.daemon = Daemon {
+            endpoint: DOCKER_HOST.into(),
+            identity: GRAPH_ROOT.into(),
+        };
+        d.dir.write(&rec).unwrap();
+        let rt = podman(Ok(info("node", DOCKER_HOST, GRAPH_ROOT).to_string()));
+        let done = recover(&d, &rt).await.unwrap();
+        assert!(done.removed.is_empty());
+        assert_eq!(done.failures.len(), 1);
+        assert_eq!(done.failures[0].kind, FailureKind::Unprovable);
+        assert!(rt.queried.borrow().is_empty());
+        assert!(rt.removed.borrow().is_empty());
+        assert_eq!(d.dir.read(&rec.run_id).unwrap(), Some(rec));
+    }
 }
 
 mod identity {

@@ -36,8 +36,9 @@ pub(super) enum State {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Daemon {
-    /// `DOCKER_HOST`, or `default`.
+    /// Docker's `DOCKER_HOST` (or `default`), or Podman's reported socket.
     pub endpoint: String,
+    /// Docker's id/root, or Podman's tagged hostname/graph-root tuple (DEC-2459.1).
     pub identity: String,
 }
 

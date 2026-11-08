@@ -1142,3 +1142,34 @@ NULL for an empty or read-only open transaction. The existing probe correctly
 distinguishes all of those cases, committed savepoints and ROLLBACK, including
 a session that already holds `pbps.in_a_transaction = 'yes'`. No format version
 changes.
+
+<a id="dec-2459-1"></a>
+
+**DEC-2459.1. A Podman test-run identity includes the hostname, reported socket and graph root.**
+The Docker path stays `DOCKER_HOST` (or `default`) plus the daemon's id and root.
+Podman 5.7 rejects that id template, and its graph root alone is a path another
+host can share. `CONTAINER_HOST`, `CONTAINER_CONNECTION` and the configured
+remote default can all change the runtime without changing `DOCKER_HOST`.
+The fallback therefore reads `docker info --format '{{json .}}'`: the reported
+`host.remoteSocket.path` is the endpoint, and a tagged JSON array of
+`host.hostname` and `store.graphRoot` is the identity. JSON keeps values that
+contain delimiters distinct. Every part must be a nonempty string; a missing,
+empty, wrongly typed or unreadable answer refuses discovery before recovery
+can inspect resources or delete a record. No graph-root-only fallback remains.
+
+Measured on this host's rootless Podman 5.7.0 (`docker` executes Podman): the
+unmodified connection list was `[]`, the hostname was `leonx1`, the graph root
+was `/home/lll86789/.local/share/containers/storage`, and no host UUID was
+reported. Two temporary API services on different private Unix sockets shared
+that hostname and graph root, while `host.remoteSocket.path` distinguished
+their endpoints for explicit hosts, named connections and the remote default.
+The eight successful info probes also confirmed that equivalent selections
+report the same socket, that a configured default alone does not enable remote
+mode, and that a named connection takes precedence over `CONTAINER_HOST`.
+The isolated connection file and probe sockets did not change the user's
+connection configuration; both service processes were stopped.
+
+The record's two opaque strings and `VERSION = 1` stay unchanged in shape.
+There are no users yet, so conservatively refusing older Podman records that
+hold only a graph root is acceptable: recovery keeps them for manual inspection
+instead of inferring their runtime. Existing Docker records still match.
