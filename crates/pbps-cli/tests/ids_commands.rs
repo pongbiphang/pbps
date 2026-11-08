@@ -816,3 +816,46 @@ fn migrate_refuses_a_partial_tree_with_an_extra_or_a_differing_file_and_writes_n
         assert!(files.len() <= 2, "{:?}", files.keys().collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn plan_relocates_an_identity_file_into_a_directory_named_like_it() {
+    // `dbo/customer.json` is a file; the declaration moves to
+    // `dbo/customer.json/customer.yml`, whose identity file is
+    // `dbo/customer.json/customer.json`: the old file must make room.
+    let p = migrated();
+    p.git_ok(&["init", "-q", "-b", "main"]);
+    p.git_ok(&["add", "-A"]);
+    p.git_ok(&["commit", "-q", "-m", "migrated"]);
+    let before = p.read("schema/dbo/customer.yml");
+    std::fs::create_dir_all(p.0.join("schema/dbo/customer.json")).unwrap();
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.yml"),
+        p.0.join("schema/dbo/customer.json/customer.yml"),
+    )
+    .unwrap();
+    let uid_before = p.read(".pbps/ids/dbo/customer.json");
+    assert_ok(&p.pbps(&["plan", "--no-dev", "--since", "HEAD"]));
+    assert_eq!(
+        p.read(".pbps/ids/dbo/customer.json/customer.json"),
+        uid_before
+    );
+    assert!(p.0.join(".pbps/ids/dbo/customer.json").is_dir());
+    assert_eq!(p.read("schema/dbo/customer.json/customer.yml"), before);
+    // Nothing was left beside the tree, and the next plan has nothing to move.
+    let leftovers: Vec<_> = std::fs::read_dir(p.0.join(".pbps/ids/dbo"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(leftovers, ["customer.json"]);
+    assert_ok(&p.pbps(&["plan", "--no-dev", "--since", "HEAD", "--check"]));
+    // And back again.
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.json/customer.yml"),
+        p.0.join("schema/dbo/customer.yml"),
+    )
+    .unwrap();
+    std::fs::remove_dir(p.0.join("schema/dbo/customer.json")).unwrap();
+    assert_ok(&p.pbps(&["plan", "--no-dev", "--since", "HEAD"]));
+    assert_eq!(p.read(".pbps/ids/dbo/customer.json"), uid_before);
+    assert!(p.0.join(".pbps/ids/dbo/customer.json").is_file());
+}

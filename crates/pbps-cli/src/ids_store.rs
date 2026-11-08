@@ -179,12 +179,34 @@ impl TreeWrite {
     /// duplicate (`ids.duplicate-uid`, remedy: delete the old file). `pbps.yml`
     /// goes last: it is what tells an old pbps not to read the project as
     /// having no identities.
+    ///
+    /// A move can turn a file into a directory (`a.json` becomes
+    /// `a.json/a.json`) or back. The old path then blocks the new one, so it
+    /// is first renamed to a sibling `.<name>.aside`, which is not a `.json`
+    /// file: a crash with an aside left makes the next read refuse and name
+    /// that entry, which holds the only copy of the old file and is renamed
+    /// back by hand. A crash before the aside leaves the tree as it was; after
+    /// the new files are in place it leaves both copies; the aside is deleted
+    /// together with the removals, last.
     pub(crate) fn apply(&self) -> anyhow::Result<()> {
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut asides: Vec<(PathBuf, PathBuf)> = Vec::new();
         let result = (|| -> anyhow::Result<()> {
             for (rel, text) in &self.files {
                 let path = self.dir.join(rel);
                 let parent = path.parent().unwrap_or(Path::new("."));
+                // An ancestor that is a file today is about to be a directory.
+                let mut ancestor = self.dir.clone();
+                for part in Path::new(rel)
+                    .parent()
+                    .into_iter()
+                    .flat_map(Path::components)
+                {
+                    ancestor.push(part);
+                    if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| !m.is_dir()) {
+                        set_aside(&ancestor, &mut asides)?;
+                    }
+                }
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -199,14 +221,32 @@ impl TreeWrite {
             for (tmp, _) in &staged {
                 let _ = std::fs::remove_file(tmp);
             }
+            for (orig, aside) in asides.iter().rev() {
+                let _ = std::fs::rename(aside, orig);
+            }
             return Err(e);
         }
         for (tmp, path) in &staged {
+            // A directory the new file takes the place of (a move the other
+            // way round).
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                set_aside(path, &mut asides)?;
+            }
             std::fs::rename(tmp, path)
                 .with_context(|| format!("cannot replace `{}`", path.display()))?;
         }
         for rel in &self.removals {
-            let path = self.dir.join(rel);
+            let mut path = self.dir.join(rel);
+            // What was set aside is removed where it went.
+            if let Some((orig, aside)) = asides.iter().find(|(o, _)| path.starts_with(o)) {
+                // `join("")` would add a trailing slash and make the file a directory.
+                let rest = path.strip_prefix(orig).unwrap_or(Path::new(""));
+                path = if rest.as_os_str().is_empty() {
+                    aside.clone()
+                } else {
+                    aside.join(rest)
+                };
+            }
             std::fs::remove_file(&path)
                 .with_context(|| format!("cannot remove `{}`", path.display()))?;
             // A directory a move emptied goes too; one that still holds
@@ -219,11 +259,41 @@ impl TreeWrite {
                 parent = dir.parent();
             }
         }
+        // An aside nothing removed holds a file the write did not account for:
+        // keep it, and say where it is.
+        if let Some((orig, aside)) = asides.iter().find(|(_, a)| a.exists()) {
+            bail!(
+                "`{}` was moved aside to `{}` and holds something this write did not remove; \
+                 check it and delete or restore it",
+                orig.display(),
+                aside.display()
+            );
+        }
         if let Some((path, text)) = &self.config {
             write_atomic(path, text)?;
         }
         Ok(())
     }
+}
+
+/// Renames `path` to an unused `.<name>.aside` sibling and records the pair.
+fn set_aside(path: &Path, asides: &mut Vec<(PathBuf, PathBuf)>) -> anyhow::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut aside = parent.join(format!(".{name}.aside"));
+    let mut n = 1;
+    while std::fs::symlink_metadata(&aside).is_ok() {
+        aside = parent.join(format!(".{name}.aside{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &aside).with_context(|| {
+        format!(
+            "cannot move `{}` aside to make room for the identity file that takes its place",
+            path.display()
+        )
+    })?;
+    asides.push((path.to_owned(), aside));
+    Ok(())
 }
 
 /// What the tree on disk holds, by uid.

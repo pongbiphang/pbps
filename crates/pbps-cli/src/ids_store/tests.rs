@@ -478,3 +478,81 @@ fn what_is_applied_reads_back_whatever_the_directory_depth() {
     );
     assert_eq!(read_opt(&project).unwrap(), Some(deep));
 }
+
+#[test]
+fn a_move_that_turns_an_identity_file_into_a_directory_is_applied() {
+    let flat = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
+    let project = written("file-to-dir", &customer(), &flat);
+    assert_eq!(tree(&project).keys().collect::<Vec<_>>(), ["customer.json"]);
+    let nested = declared(&[(
+        "dbo.customer",
+        "customer.json/customer.yml",
+        &["id", "name"],
+    )]);
+    let write = plan(&project, &customer(), &nested).unwrap();
+    assert_eq!(write.removals, ["customer.json"]);
+    write.apply().unwrap();
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        ["customer.json/customer.json"]
+    );
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    // Nothing of the move is left beside the tree.
+    let names: Vec<_> = std::fs::read_dir(project.ids_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["customer.json"]);
+    assert!(plan(&project, &customer(), &nested).unwrap().is_empty());
+}
+
+#[test]
+fn a_move_that_turns_an_identity_directory_into_a_file_is_applied() {
+    let nested = declared(&[(
+        "dbo.customer",
+        "customer.json/customer.yml",
+        &["id", "name"],
+    )]);
+    let project = written("dir-to-file", &customer(), &nested);
+    let flat = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
+    let write = plan(&project, &customer(), &flat).unwrap();
+    assert_eq!(write.removals, ["customer.json/customer.json"]);
+    write.apply().unwrap();
+    assert_eq!(tree(&project).keys().collect::<Vec<_>>(), ["customer.json"]);
+    assert!(project.ids_dir().join("customer.json").is_file());
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    let names: Vec<_> = std::fs::read_dir(project.ids_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["customer.json"]);
+}
+
+#[test]
+fn an_old_file_nothing_removes_is_kept_aside_and_named() {
+    let project = project("aside-kept");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.json"), "old").unwrap();
+    // An unrelated file already has the aside's name: it must not be replaced.
+    std::fs::write(dir.join(".a.json.aside"), "other").unwrap();
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [("a.json/a.json".to_owned(), "new".to_owned())].into(),
+        ..TreeWrite::default()
+    };
+    let e = write.apply().unwrap_err().to_string();
+    assert!(e.contains(".a.json.aside1"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.json/a.json")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".a.json.aside1")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".a.json.aside")).unwrap(),
+        "other"
+    );
+}
