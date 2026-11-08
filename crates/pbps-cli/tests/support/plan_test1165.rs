@@ -74,7 +74,7 @@ impl Project {
                     "engine:\n  image: {image}\nfixtures: {groups}\n",
                     "assertions:\n  - {{name: a, file: a.sql}}\ntimeouts:\n",
                     "  startup_ms: 120000\n  step_ms: 120000\n  fixture_ms: 30000\n",
-                    "  assertion_ms: 10000\n  run_ms: 600000\n  cleanup_ms: 30000\n"
+                    "  assertion_ms: 10000\n  run_ms: 600000\n  cleanup_ms: 120000\n"
                 ),
                 base = base,
                 image = image,

@@ -69,7 +69,9 @@ pbps-model.workspace = true
 # PostgreSQL resolver tests count requests without timing shared-host load.
 pbps-db = { workspace = true, features = ["test-request-count"] }
 pbps-mssql.workspace = true
-tokio = { workspace = true, features = ["macros", "io-util"] }
+# Paused time, so that a cleanup that takes longer than its allowance is
+# tested at its real length without waiting for it (#2652).
+tokio = { workspace = true, features = ["macros", "io-util", "test-util"] }
 jsonschema.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]

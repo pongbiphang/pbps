@@ -30,8 +30,30 @@ fn limits() -> pbps_config::test_manifest::Timeouts {
         fixture_ms: 30000.try_into().unwrap(),
         assertion_ms: 10000.try_into().unwrap(),
         run_ms: 180000.try_into().unwrap(),
-        cleanup_ms: 30000.try_into().unwrap(),
+        // The longest a single docker command may take (container.rs COMMAND).
+        // A removal is several commands, and under load the daemon has stalled
+        // a kill for 10 s or more (#2652); the product default stays 30 s.
+        cleanup_ms: 120000.try_into().unwrap(),
     }
+}
+
+/// The family's cleanup allowance outlasts a daemon stall: a removal that takes
+/// 35 s of the clock is confirmed under the limits every live case here runs
+/// with, where the product default of 30 s is not (see the plan_test tests).
+#[tokio::test(start_paused = true)]
+async fn d2b1_1165_cleanup_allowance_outlasts_a_35_second_removal() {
+    let control = Control::new(limits(), std::future::pending());
+    let mut data = TestData::default();
+    control
+        .finish_within(
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+                Ok(())
+            },
+            &mut data,
+        )
+        .await;
+    assert!(data.cleanup_confirmed);
 }
 
 async fn exercise_control(

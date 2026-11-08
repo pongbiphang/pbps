@@ -277,3 +277,50 @@ fn d2b1_1165_owned_execution_future_frames_are_bounded() {
         );
     }
 }
+
+/// A removal that takes 35 s of the clock, run at its real length on paused time.
+async fn cleanup_of_35_seconds(cleanup_ms: std::num::NonZeroU32) -> TestData {
+    let mut limits = timeouts();
+    limits.cleanup_ms = cleanup_ms;
+    let control = Control::new(limits, std::future::pending());
+    let mut data = TestData::default();
+    control
+        .finish_within(
+            async {
+                tokio::time::sleep(Duration::from_secs(35)).await;
+                Ok(())
+            },
+            &mut data,
+        )
+        .await;
+    data
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_products_default_cleanup_allowance_does_not_confirm_a_35_second_removal() {
+    // The product default stays 30 s (#2652): a removal that takes 35 s is
+    // reported as not confirmed, with the allowance spent named.
+    let default = pbps_config::test_manifest::Timeouts::default().cleanup_ms;
+    assert_eq!(default.get(), 30_000);
+    let data = cleanup_of_35_seconds(default).await;
+    assert!(!data.cleanup_confirmed);
+    let phase = data.phases.last().unwrap();
+    assert!(matches!(phase.outcome, Status::Unanswerable));
+    assert!(
+        phase.findings[0]
+            .message
+            .contains("owned cleanup was not confirmed: Err(Elapsed(()))"),
+        "{:?}",
+        phase.findings
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cleanup_allowance_of_120_seconds_confirms_a_35_second_removal() {
+    let data = cleanup_of_35_seconds(120_000.try_into().unwrap()).await;
+    assert!(data.cleanup_confirmed);
+    assert!(matches!(
+        data.phases.last().unwrap().outcome,
+        Status::Passed
+    ));
+}
