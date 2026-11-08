@@ -215,6 +215,7 @@
         "catalog_warnings1739::partition_diagnostics_are_not_permission_warnings_on_pg18",
         "existing_expressions2563::a_column_retype_that_rewrites_the_table_is_refused_for_an_existing_index",
         "existing_expressions2563::a_command_is_judged_for_the_policy_expression_it_runs_and_not_the_other",
+        "existing_expressions2563::a_default_is_the_one_of_the_relation_a_statement_names_and_no_other",
         "existing_expressions2563::a_dropped_inherited_column_or_a_detached_partition_excuses_what_it_carried",
         "existing_expressions2563::a_plan_that_writes_rows_is_refused_for_an_expression_it_never_touched",
         "existing_expressions2563::a_policy_is_judged_only_on_the_relation_a_statement_names",

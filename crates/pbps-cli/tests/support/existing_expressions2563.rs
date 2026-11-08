@@ -1725,6 +1725,178 @@ fn a_referential_action_judges_the_default_only_when_it_sets_the_default() {
     });
 }
 
+/// Which relation's DEFAULT runs (#2748). Measured on 16 and 18 (DEC-2563.9):
+/// an INSERT through a partitioned parent fills the columns it leaves out from
+/// the parent's DEFAULT before it routes the row, a `SET DEFAULT` action on a
+/// partitioned referencing table sets the parent's, and a default a partition or
+/// a child sets of its own runs only for a write that names it. The DEFAULT of
+/// the domain applies to a column with none of its own, of the relation named.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_default_is_the_one_of_the_relation_a_statement_names_and_no_other() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-rel-{version}"));
+        on_server(
+            own.connection(),
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_defa() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_defb() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_defx() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_domdef() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE DOMAIN app.dm AS integer DEFAULT app.f_domdef();
+             -- a harmless parent default and an unsafe override on the partition
+             CREATE TABLE app.tp (id integer, v integer DEFAULT 1, x app.dm) PARTITION BY RANGE (id);
+             CREATE TABLE app.tpa PARTITION OF app.tp FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.tpa ALTER COLUMN v SET DEFAULT app.f_defx();
+             ALTER TABLE app.tpa ALTER COLUMN x SET DEFAULT app.f_defb();
+             -- the same with inheritance
+             CREATE TABLE app.ti (id integer, v integer DEFAULT 1, x app.dm);
+             CREATE TABLE app.tic () INHERITS (app.ti);
+             ALTER TABLE app.tic ALTER COLUMN v SET DEFAULT app.f_defx();
+             ALTER TABLE app.tic ALTER COLUMN x SET DEFAULT app.f_defb();
+             -- the reverse: an unsafe parent default and a harmless override
+             CREATE TABLE app.tq (id integer, v integer DEFAULT app.f_defa()) PARTITION BY RANGE (id);
+             CREATE TABLE app.tqa PARTITION OF app.tq FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.tqa ALTER COLUMN v SET DEFAULT 1;
+             -- SET DEFAULT on a partitioned referencing table
+             CREATE TABLE app.pr (id integer PRIMARY KEY);
+             CREATE TABLE app.rc (id integer, pid integer DEFAULT 1,
+                 FOREIGN KEY (pid) REFERENCES app.pr (id) ON DELETE SET DEFAULT)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.rca PARTITION OF app.rc FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.rca ALTER COLUMN pid SET DEFAULT app.f_defx();
+             CREATE TABLE app.pr2 (id integer PRIMARY KEY);
+             CREATE TABLE app.rd (id integer, pid integer DEFAULT app.f_defa(),
+                 FOREIGN KEY (pid) REFERENCES app.pr2 (id) ON DELETE SET DEFAULT)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.rda PARTITION OF app.rd FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.rda ALTER COLUMN pid SET DEFAULT 1;
+             -- a parent column with a DEFAULT of its own, which the domain's then never
+             -- applies to, and a partition that drops it
+             CREATE TABLE app.tr (id integer, x app.dm DEFAULT 1) PARTITION BY RANGE (id);
+             CREATE TABLE app.tra PARTITION OF app.tr FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.tra ALTER COLUMN x DROP DEFAULT;
+             CREATE TABLE app.pr4 (id integer PRIMARY KEY);
+             CREATE TABLE app.rf (id integer, pid app.dm DEFAULT 1,
+                 FOREIGN KEY (pid) REFERENCES app.pr4 (id) ON DELETE SET DEFAULT)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.rfa PARTITION OF app.rf FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.rfa ALTER COLUMN pid DROP DEFAULT;
+             CREATE TABLE app.pr3 (id integer PRIMARY KEY);
+             CREATE TABLE app.re (id integer, pid app.dm,
+                 FOREIGN KEY (pid) REFERENCES app.pr3 (id) ON DELETE SET DEFAULT)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE app.rea PARTITION OF app.re FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.rea ALTER COLUMN pid SET DEFAULT app.f_defb();",
+        );
+        let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+            routines.iter().copied().collect()
+        };
+        let (defa, defb, defx, domdef) = (
+            "app.f_defa()",
+            "app.f_defb()",
+            "app.f_defx()",
+            "app.f_domdef()",
+        );
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            macro_rules! ask {
+                ($table:expr, $operation:expr) => {
+                    names(
+                        &plan_time(&mut conn, $table, $operation, &Dropped::default(), None).await,
+                    )
+                };
+            }
+            // Through the partitioned parent: its default, and the domain's for
+            // `x`, which it has none of; never the partition's.
+            assert_eq!(
+                ask!("app.tp", insert(&["id"])),
+                set(&[domdef]),
+                "PG{version}: through the partitioned parent"
+            );
+            assert_eq!(
+                ask!("app.tp", insert(&["id", "x"])),
+                set(&[]),
+                "PG{version}: x supplied"
+            );
+            // Directly into the partition: its own defaults, the domain's
+            // overridden by the partition's default for `x`.
+            assert_eq!(
+                ask!("app.tpa", insert(&["id"])),
+                set(&[defx, defb]),
+                "PG{version}: directly into the partition"
+            );
+            assert_eq!(
+                ask!("app.tpa", insert(&["id", "v", "x"])),
+                set(&[]),
+                "PG{version}: all supplied"
+            );
+            // The same with inheritance: an INSERT never reaches the child.
+            assert_eq!(
+                ask!("app.ti", insert(&["id"])),
+                set(&[domdef]),
+                "PG{version}: through the parent"
+            );
+            assert_eq!(
+                ask!("app.tic", insert(&["id"])),
+                set(&[defx, defb]),
+                "PG{version}: directly into the child"
+            );
+            // An unsafe parent default is judged through the parent, and the
+            // partition's harmless override is the only one directly.
+            assert_eq!(
+                ask!("app.tq", insert(&["id"])),
+                set(&[defa]),
+                "PG{version}: unsafe parent default"
+            );
+            assert_eq!(
+                ask!("app.tqa", insert(&["id"])),
+                set(&[]),
+                "PG{version}: harmless override"
+            );
+            // A `SET DEFAULT` action on a partitioned referencing table sets the
+            // parent's default (measured), the partition's is never run.
+            assert_eq!(
+                ask!("app.pr", RowOperation::Delete),
+                set(&[]),
+                "PG{version}: action, harmless parent default"
+            );
+            assert_eq!(
+                ask!("app.pr2", RowOperation::Delete),
+                set(&[defa]),
+                "PG{version}: action, unsafe parent default"
+            );
+            assert_eq!(
+                ask!("app.pr3", RowOperation::Delete),
+                set(&[domdef]),
+                "PG{version}: action, domain default"
+            );
+            // The parent's own DEFAULT keeps the domain's from applying, whatever
+            // a partition that has none would do.
+            assert_eq!(
+                ask!("app.tr", insert(&["id"])),
+                set(&[]),
+                "PG{version}: parent default over the domain's"
+            );
+            assert_eq!(
+                ask!("app.tra", insert(&["id"])),
+                set(&[domdef]),
+                "PG{version}: partition without a default"
+            );
+            assert_eq!(
+                ask!("app.pr4", RowOperation::Delete),
+                set(&[]),
+                "PG{version}: action, parent default over the domain's"
+            );
+            // The recheck just before the statement reads the same relation.
+            let at = names(&at_the_statement_of(&mut conn, "app.tp", insert(&["id"])).await);
+            assert_eq!(at, set(&[domdef]), "PG{version}: at the statement");
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Whole plans: a table that already carries an expression, then a plan that
 // writes rows to it, or rewrites it.

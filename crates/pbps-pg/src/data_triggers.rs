@@ -1238,12 +1238,23 @@ fn site_arms(
     } else {
         String::new()
     };
+    // A DEFAULT is the one of the relation the statement names, before any
+    // routing: an INSERT through a partitioned parent fills the columns it leaves
+    // out from the parent's, and a `SET DEFAULT` action on a partitioned
+    // referencing table sets the parent's, so a default a partition or a child
+    // sets of its own runs only for a write that names it (measured on 16.15 and
+    // 18.6, #2748).
+    let named_only = format!("AND r.oid = {}::pg_catalog.oid", statement.relation);
     for (kind, generated, wanted) in [
         ("default", "= ''", defaults),
         ("generated", "<> ''", insert || update),
     ] {
         if wanted {
-            let omitted_only = if kind == "default" { &omitted_only } else { "" };
+            let omitted_only = if kind == "default" {
+                format!("{omitted_only} {named_only}")
+            } else {
+                String::new()
+            };
             // A default is the INSERT's, and a referential action's own
             // `SET DEFAULT`; the latter reads the columns the statement sets.
             let join = touched;
@@ -1393,6 +1404,10 @@ fn site_arms(
                     .collect::<Vec<_>>()
                     .join(" OR ")
             };
+            // Whether the column has a DEFAULT of its own is a fact of the relation
+            // the statement names, so it is that relation's column that is asked.
+            let domain_named_only =
+                format!("AND d.attrelid = {}::pg_catalog.oid", statement.relation);
             let supplied_column = if insert && !statement.supplied.is_empty() {
                 format!(
                     "OR a.attname::pg_catalog.text = ANY (ARRAY[{supplied}]::pg_catalog.text[])"
@@ -1408,6 +1423,7 @@ fn site_arms(
                  JOIN pg_catalog.pg_type dt ON dt.oid = d.typid
                  JOIN pg_catalog.pg_namespace dn ON dn.oid = dt.typnamespace
                  WHERE d.typid = d.declared AND dt.typdefaultbin IS NOT NULL
+                   {domain_named_only}
                    AND NOT ({gone_default})
                    AND NOT EXISTS (
                        SELECT 1 FROM pg_catalog.pg_attribute a
@@ -1956,6 +1972,43 @@ mod tests {
         let domain = arm(&unknown, "domain_default");
         assert!(domain.contains("(a.atthasdef )"), "{domain}");
         assert!(!domain.contains("ANY (ARRAY["), "{domain}");
+    }
+
+    #[test]
+    fn a_default_is_read_on_the_relation_the_statement_names_and_no_other() {
+        // An INSERT and a `SET DEFAULT` action alike: the relation's own default
+        // runs, a partition's or a child's override only for a write naming it.
+        let mut action = statement(UPDATE, false);
+        action.sets_default = true;
+        for (label, statement, through_an_action) in [
+            ("insert", statement(INSERT, false), false),
+            ("action", action, true),
+        ] {
+            let (_, arms) = site_arms(&statement, through_an_action, &Dropped::default());
+            let arm = |kind: &str| -> String {
+                arms.iter()
+                    .find(|a| a.contains(&format!("'{kind}' AS kind")))
+                    .unwrap_or_else(|| panic!("{label}: no {kind} query"))
+                    .clone()
+            };
+            assert!(
+                arm("default").contains("AND r.oid = 16384::pg_catalog.oid"),
+                "{label}"
+            );
+            assert!(
+                arm("domain_default").contains("AND d.attrelid = 16384::pg_catalog.oid"),
+                "{label}"
+            );
+            // What the descendants carry still runs for the row they hold.
+            for kind in ["check", "generated", "index_key", "domain_check"] {
+                let text = arm(kind);
+                assert!(!text.contains("r.oid = 16384"), "{label} {kind}: {text}");
+                assert!(
+                    !text.contains("d.attrelid = 16384"),
+                    "{label} {kind}: {text}"
+                );
+            }
+        }
     }
 
     #[test]

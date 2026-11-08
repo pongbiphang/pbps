@@ -5685,6 +5685,33 @@ The same holds for the copy of a rebuild, which lists its columns as an
 `UPDATE` are all judged because a heap-only update may skip them depending on
 the data: both are conservative by design and say so.
 
+Which relation's object runs (#2748). The same sweep along the other axis, on
+16.15 and 18.6, identically: an inheritance parent with a child, and a
+partitioned table with a partition and a sub-partitioned partition with its own
+partition, each relation carrying a DEFAULT, a CHECK and an index of its own (a
+sequence advanced from each), written through the parent, directly, and by an
+`UPDATE` that moves the row.
+
+| arm | `INSERT` through a partitioned parent | `INSERT` through an inheritance parent | `INSERT` directly into a partition or child | `UPDATE` through either parent | `UPDATE` directly into a partition or child | row movement | judged |
+|---|---|---|---|---|---|---|---|
+| column DEFAULT | the parent's | the parent's | the relation's own | none | none | none | the named relation only (fixed) |
+| domain DEFAULT | the parent's column: its domain DEFAULT if the parent's column has no DEFAULT | the same | the relation's own column | none | none | none | the named relation only (fixed) |
+| `SET DEFAULT` action on a partitioned referencing table | the parent's DEFAULT, and the domain's if it has none; a partition's override never ran | | | | | | the named (declared) relation only (fixed) |
+| CHECK | the landing partition's own, and the copies of every ancestor's | the parent's only | the relation's own and its ancestors' copies | the relations holding a matching row, with their copies | the relation's own and its ancestors' copies | the destination's | the named relation and every partition (over-approximation 1); inheritance children for an `UPDATE` |
+| index key, filter | the landing partition's, with the clone of the parent's index | the parent's only | the relation's own | as CHECK | the relation's own | the destination's | as CHECK |
+| generated | the landing partition's (the expression is the parent's by construction) | the parent's | the relation's | as CHECK | the relation's | the destination's | as CHECK |
+| domain CHECK | the column type's, the same on every relation | the same | the same | the same | the same | the same | the closure; the same routines on every relation |
+| policy | the parent's | the parent's | the relation's | the named table's | the relation's | none | the named relation only (round 2) |
+
+So an `INSERT` never reaches an inheritance child, an `UPDATE` through an
+inheritance parent reaches the child for the rows it holds, and a row's
+partition is a fact of its values, which is why CHECK, index and generated stay
+judged over every partition (over-approximation 1, with the all-index `UPDATE`
+the two already recorded). Not measurable per relation: a generated column
+whose expression differs between a relation and its parent (none can; the
+tested partitions and inheritance children copy the parent's), and a domain's
+CHECK, which belongs to the type, not to a relation.
+
 Every site kind has a step that removes it, and each is excused (#2748, a sweep
 of the plan's changes against the sites; all of them run before the rows, in
 `order_key` classes 0 to 9 against 11):
