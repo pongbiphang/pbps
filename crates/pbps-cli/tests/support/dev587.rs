@@ -1,6 +1,10 @@
 //! Shared scratch acquisition, exercised through the preview CLI (#587).
 use super::*;
 
+#[cfg(unix)]
+#[path = "../../../pbps-db/tests/support/refused_endpoint.rs"]
+mod refused_endpoint;
+
 #[test]
 fn shared_selection_is_lazy_and_rejects_ambiguous_or_unknown_dev_entries() {
     let d = Demo::new("dev587-selection");
@@ -453,9 +457,8 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
     let id = d.dir.join("id");
     let once = d.dir.join("once");
     let removed = d.dir.join("removed");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let mapping = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    drop(listener);
+    let socket = refused_endpoint::refused_endpoint();
+    let mapping = format!("127.0.0.1:{}", socket.local_addr().unwrap().port());
     let cases = if mapping_case {
         vec![
             ("0.0.0.0:49154", "0", "", "loopback"),

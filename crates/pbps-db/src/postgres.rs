@@ -1743,18 +1743,13 @@ mod tests {
     /// `Connect`/`ConnectTimeout` into a configuration refusal it was never
     /// meant to produce.
     ///
-    /// The endpoint is a real, bound-then-dropped local listener rather than
-    /// a black hole: nothing is listening on it by the time this dials, so
-    /// the OS refuses the connection immediately instead of dropping it,
-    /// which proves the point just as well without a thirty-second wait.
+    /// The endpoint stays bound without listening, so the OS refuses the dial
+    /// immediately and no other process can take its port before this dials.
     #[tokio::test]
     async fn the_same_unreachable_endpoint_without_tcp_user_timeout_still_fails_as_a_network_error()
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a listener");
-        let addr = listener.local_addr().expect("the bound address");
-        drop(listener);
+        let socket = crate::test_support::refused_endpoint();
+        let addr = socket.local_addr().expect("the reserved address");
 
         let error = match Conn::connect_as(
             &format!("host={} port={} user=u", addr.ip(), addr.port()),
@@ -1762,7 +1757,7 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("nothing is listening on this port anymore"),
+            Ok(_) => panic!("the reserved endpoint never listens"),
             Err(error) => error,
         };
 
