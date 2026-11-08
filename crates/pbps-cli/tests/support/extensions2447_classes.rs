@@ -53,6 +53,25 @@ fn fixture(server: &str, slug: &str) -> Fixture {
     fixture_on(server, slug, Kind::Supplied, PACKAGES)
 }
 
+/// [`fixture`] with no resolver selected. A plan that drops a package cannot also ask the
+/// resolver anything: the selected scratch holds the package and cannot describe it leaving,
+/// so the combination is refused with "Plan the drop alone first" (DEC-2447.8,
+/// `resolution.rs`). A table change such as `DROP INDEX` sends every kept surface of the
+/// project to the resolver, so the drop is planned with none selected, as the other
+/// extension-drop tests do.
+fn fixture_unselected(server: &str, slug: &str) -> Fixture {
+    Fixture::new(
+        server,
+        slug,
+        Kind::Supplied,
+        &Options {
+            externals: Some(PACKAGES),
+            unselected: true,
+            ..Options::default()
+        },
+    )
+}
+
 fn pulled(f: &Fixture, packages: &[&str]) -> Output {
     let mut args = vec!["pull", "--force", "--db", f.target()];
     for name in packages {
@@ -450,7 +469,7 @@ fn a_move_of_the_package_carries_its_class_without_rebuilding_the_index() {
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
     servers(|server, slug| {
-        let f = fixture(server, &format!("classes2447-drop-{slug}"));
+        let f = fixture_unselected(server, &format!("classes2447-drop-{slug}"));
         adopted(&f, DOCS, &["pg_trgm", "hstore"]);
         let base = table_file(&f);
         std::fs::write(table_path(&f), with_index(&base, KEPT)).unwrap();
