@@ -361,7 +361,65 @@ pub fn forward_moved_types<'a>(
     >,
 ) -> std::borrow::Cow<'a, pbps_model::Schema> {
     use pbps_model::{ColumnType, TypeRef};
-    let mut moved: std::collections::BTreeMap<TypeRef, TypeRef> = std::collections::BTreeMap::new();
+    // The engine names a type as one qualified name (`moved.citext`, or
+    // `"My B".citext`). The array type of a member is the column's own `[]` and
+    // has no entry: a name with a suffix does not parse as one.
+    let parse = |names: &[String]| {
+        let [name] = names else { return None };
+        let reference = name.parse::<TypeRef>().ok()?;
+        Some((reference.schema().to_owned(), reference))
+    };
+    forward_moved(
+        comparison,
+        base,
+        desired,
+        facts,
+        "type",
+        parse,
+        |schema, moved| {
+            let forward = |ty: &mut ColumnType| {
+                if let Some(carried) =
+                    carry_reference(ty, |reference| moved.get(reference).cloned())
+                {
+                    *ty = carried;
+                }
+            };
+            for table in schema.tables.values_mut() {
+                table.columns.values_mut().for_each(|c| forward(&mut c.ty));
+            }
+            for ty in schema.types.values_mut() {
+                if let pbps_model::ManagedType::Domain { base, .. } = ty {
+                    forward(base);
+                }
+            }
+        },
+    )
+}
+
+/// The comparison schema with every reference to a member of one class of a
+/// moved package spelled where the package moves to (DEC-2447.12, DEC-2447.13).
+///
+/// The one loop for every provider-owned object: for each package the plan
+/// moves (same uid on both sides, a different schema), it reads the members of
+/// `class` the connected read listed, as the destination names them, and the
+/// name each had before (`relocated` read the other way). `parse` turns a
+/// member's names into the schema it stands in and a key the kind compares by;
+/// `write` carries the references of that kind through the comparison schema.
+/// Only the kind's typed references are forwarded: a default, a CHECK or an
+/// expression that spells the old schema is a declared text change.
+pub fn forward_moved<'a, K: Ord>(
+    comparison: std::borrow::Cow<'a, pbps_model::Schema>,
+    base: Side<'_>,
+    desired: Side<'_>,
+    facts: &std::collections::BTreeMap<
+        pbps_model::ObjectLocalName,
+        std::collections::BTreeSet<pbps_model::ProviderMember>,
+    >,
+    class: &str,
+    parse: impl Fn(&[String]) -> Option<(String, K)>,
+    write: impl FnOnce(&mut pbps_model::Schema, &std::collections::BTreeMap<K, K>),
+) -> std::borrow::Cow<'a, pbps_model::Schema> {
+    let mut moved: std::collections::BTreeMap<K, K> = std::collections::BTreeMap::new();
     for (name, to) in &desired.schema.extensions {
         let (Some(from), Some(members)) = (base.schema.extensions.get(name), facts.get(name))
         else {
@@ -374,17 +432,10 @@ pub fn forward_moved_types<'a>(
         if !same || from.schema == to.schema {
             continue;
         }
-        // The facts are the members as the destination names them. The engine
-        // names a type as one qualified name (`moved.citext`, or `"My B".citext`),
-        // and `relocated` read the other way is how it reads where the package
-        // is now. The array type of a member is the column's own `[]` and has
-        // no entry: a name with a suffix does not parse as one.
-        for member in members.iter().filter(|m| m.class == "type") {
-            if let [name] = member.names.as_slice()
-                && let Ok(new) = name.parse::<TypeRef>()
-                && new.schema() == to.schema
-                && let [previous] = member.relocated(&to.schema, &from.schema).names.as_slice()
-                && let Ok(old) = previous.parse::<TypeRef>()
+        for member in members.iter().filter(|m| m.class == class) {
+            if let Some((schema, new)) = parse(&member.names)
+                && schema == to.schema
+                && let Some((_, old)) = parse(&member.relocated(&to.schema, &from.schema).names)
             {
                 moved.insert(old, new);
             }
@@ -393,20 +444,8 @@ pub fn forward_moved_types<'a>(
     if moved.is_empty() {
         return comparison;
     }
-    let forward = |ty: &mut ColumnType| {
-        if let Some(carried) = carry_reference(ty, |reference| moved.get(reference).cloned()) {
-            *ty = carried;
-        }
-    };
     let mut schema = comparison.into_owned();
-    for table in schema.tables.values_mut() {
-        table.columns.values_mut().for_each(|c| forward(&mut c.ty));
-    }
-    for ty in schema.types.values_mut() {
-        if let pbps_model::ManagedType::Domain { base, .. } = ty {
-            forward(base);
-        }
-    }
+    write(&mut schema, &moved);
     std::borrow::Cow::Owned(schema)
 }
 
