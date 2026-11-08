@@ -18579,6 +18579,7 @@ mod tests {
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
             provided_types: BTreeMap::new(),
+            provided_classes: BTreeMap::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -24672,6 +24673,7 @@ mod tests {
             catalog_notices: Vec::new(),
             extension_notices: BTreeMap::new(),
             provided_types: BTreeMap::new(),
+            provided_classes: BTreeMap::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![

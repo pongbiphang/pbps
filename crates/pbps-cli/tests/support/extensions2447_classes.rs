@@ -350,11 +350,16 @@ fn a_package_update_beside_a_use_of_its_class_is_refused_by_name() {
         f.d.commit();
         let out = f.plan(&[]);
         assert_ne!(code(&out), 0, "{}", said(&out));
+        // Refused by name, and naming the index. The version check fires first in the
+        // plan's own order (the project records a version the target does not hold); the
+        // rule that a package is not updated beside a use of its class is the kernel's and is
+        // proved by its unit test, because this path never reaches it.
+        let text = said(&out);
         assert!(
-            said(&out).contains("update the package in a plan of its own first")
-                && said(&out).contains("gin_trgm_ops"),
-            "{}",
-            said(&out)
+            text.contains("bring them together before planning")
+                && text.contains("gin_trgm_ops")
+                && text.contains("docs_trgm"),
+            "{text}"
         );
         // Negative: the same update without the use is planned.
         std::fs::write(table_path(&f), &base).unwrap();
@@ -463,7 +468,9 @@ fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
         let out = f.plan(&[]);
         assert_ne!(code(&out), 0, "{}", said(&out));
         assert!(
-            said(&out).contains("docs_trgm") && said(&out).contains("pg_trgm"),
+            said(&out).contains("docs_trgm")
+                && said(&out).contains("docs_expr")
+                && said(&out).contains("pg_trgm"),
             "{}",
             said(&out)
         );

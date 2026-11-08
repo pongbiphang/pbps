@@ -3486,6 +3486,18 @@ fn add_exclusion(
                 ),
             );
         };
+        if !owner.is_empty()
+            && let Some((package, _)) = pulled
+                .schema
+                .extensions
+                .iter()
+                .find(|(package, _)| package.raw() == owner.as_str())
+        {
+            let package = package.clone();
+            pulled
+                .provided_classes
+                .insert((parts.name.clone(), raw.name.clone()), package);
+        }
         excluded.push(pbps_model::ExclusionKey { key, operator });
     }
     let timing = match (raw.deferrable, raw.deferred) {
@@ -4123,7 +4135,7 @@ fn key_class(
             );
             return None;
         }
-        return provider_class(raw, position, column, class, pulled, left_out);
+        return provider_class(raw, parts, position, column, class, pulled, left_out);
     };
     let held = OpClassRef::bare(name);
     match class_problem(policy, &held) {
@@ -4159,6 +4171,7 @@ fn key_class(
 /// package and the command that adopts it.
 fn provider_class(
     raw: &RawIndex,
+    parts: &Parts,
     position: usize,
     column: &str,
     class: &str,
@@ -4219,6 +4232,13 @@ fn provider_class(
         );
         return None;
     };
+    // Which packages the run manages is the caller's to say (`pull --extension`): it
+    // leaves out an index whose package it does not manage (DEC-2447.14).
+    if let Some((package, _)) = managed {
+        pulled
+            .provided_classes
+            .insert((parts.name.clone(), raw.name.clone()), package.clone());
+    }
     Some(Some(OpClassRef::in_schema(&schema, name)))
 }
 

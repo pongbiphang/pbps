@@ -142,6 +142,34 @@ pub(crate) fn leave_out_unmanaged_providers(
             }
         }
     }
+    // An index, or an exclusion constraint, under a class or operator of a package the run
+    // does not manage is left out alone: the table stands, and `plan` would refuse the
+    // declaration that names the class (DEC-2447.14).
+    let unmanaged: Vec<_> = pulled
+        .provided_classes
+        .iter()
+        .filter(|(_, extension)| !managed.contains(*extension))
+        .map(|((table, name), extension)| (table.clone(), name.clone(), extension.clone()))
+        .collect();
+    for (table, name, extension) in unmanaged {
+        let Some(held) = pulled.schema.tables.get_mut(&table) else {
+            continue;
+        };
+        let removed = held.indexes.remove(&name).is_some() || held.exclude.remove(&name).is_some();
+        if !removed {
+            continue;
+        }
+        let argument = crate::report::shell_arg(extension.raw())
+            .unwrap_or_else(|| crate::report::placeholder("extension name"));
+        pulled.warnings.push(format!(
+            "index `{index}` on `{table}` was left out: it uses an operator class or operator \
+             that the extension `{extension}` provides and this project does not manage. To \
+             manage it: pbps pull --extension {argument}",
+            index = name.shown(),
+            table = table.shown(),
+            extension = extension.shown(),
+        ));
+    }
     for (name, column, ty, extension) in left {
         pulled.schema.tables.remove(&name);
         let argument = crate::report::shell_arg(&extension)
@@ -912,6 +940,61 @@ mod tests {
         );
         leave_out_unmanaged_providers(&mut managed, &BTreeSet::from(["citext".into()]));
         assert_eq!(managed.schema.tables.len(), 1);
+        assert!(managed.warnings.is_empty());
+    }
+
+    /// An index, or an exclusion constraint, under a class or operator of a package the run
+    /// does not manage is left out alone and named with the command; the table stands. With the
+    /// package managed nothing is left out, and an index under no package's class is untouched
+    /// (DEC-2447.14).
+    #[test]
+    fn an_index_under_an_unmanaged_packages_class_is_left_out_alone_and_named() {
+        use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, OpClassRef};
+        let index = |class: Option<OpClassRef>| Index {
+            columns: vec![IndexColumn {
+                key: IndexKey::Column("body".into()),
+                descending: false,
+                opclass: class,
+                collation: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: IndexMethod::Gin,
+            storage_parameters: Default::default(),
+        };
+        let docs = TableName::new("app", "docs");
+        let build = || {
+            let mut pulled = Pulled::default();
+            let mut table = Table::default();
+            table.indexes.insert(
+                "docs_trgm".into(),
+                index(Some(OpClassRef::in_schema("ext", "gin_trgm_ops"))),
+            );
+            table.indexes.insert("docs_plain".into(), index(None));
+            pulled.schema.tables.insert(docs.clone(), table);
+            pulled
+                .provided_classes
+                .insert((docs.clone(), "docs_trgm".into()), "pg_trgm".into());
+            pulled
+        };
+        let mut pulled = build();
+        leave_out_unmanaged_providers(&mut pulled, &BTreeSet::new());
+        let table = &pulled.schema.tables[&docs];
+        assert!(
+            !table.indexes.contains_key("docs_trgm") && table.indexes.contains_key("docs_plain")
+        );
+        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("docs_trgm")
+                && pulled.warnings[0].contains("pbps pull --extension pg_trgm"),
+            "{:?}",
+            pulled.warnings
+        );
+        // Negative: the package managed leaves both indexes and says nothing.
+        let mut managed = build();
+        leave_out_unmanaged_providers(&mut managed, &BTreeSet::from(["pg_trgm".into()]));
+        assert_eq!(managed.schema.tables[&docs].indexes.len(), 2);
         assert!(managed.warnings.is_empty());
     }
 

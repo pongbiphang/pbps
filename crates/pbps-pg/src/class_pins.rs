@@ -220,9 +220,24 @@ fn type_mismatch(class: &Class, column: &ColumnType) -> Option<String> {
 /// A refusal about a class, with the first index or constraint that names it, so
 /// that a plan which drops a package its declared index still uses says which one.
 fn held_by(uses: &[Use], class: &Wanted, why: String) -> String {
-    match uses.iter().find(|u| &u.wanted == class) {
-        Some(used) if !used.holder.is_empty() => format!("{why} (named by {})", used.holder),
-        _ => why,
+    let mut holders: Vec<&str> = Vec::new();
+    for used in uses
+        .iter()
+        .filter(|u| &u.wanted == class && !u.holder.is_empty())
+    {
+        if !holders.contains(&used.holder.as_str()) {
+            holders.push(&used.holder);
+        }
+    }
+    match holders.as_slice() {
+        [] => why,
+        [only] => format!("{why} (named by {only})"),
+        [first, second] => {
+            format!("{why} (named by {first} and {second})")
+        }
+        [first, second, rest @ ..] => {
+            format!("{why} (named by {first}, {second} and {} more)", rest.len())
+        }
     }
 }
 
@@ -532,6 +547,29 @@ mod tests {
         }];
         let named = held_by(&uses, &wanted, "no.".into());
         assert_eq!(named, "no. (named by index `docs_trgm` on `app.docs`)");
+        // Every holder is named, the first two in full and the rest counted.
+        let more = |names: &[&str]| -> Vec<Use> {
+            names
+                .iter()
+                .map(|n| Use {
+                    holder: format!("index `{n}`"),
+                    ..used(&class("text"), "text")
+                })
+                .collect()
+        };
+        assert_eq!(
+            held_by(&more(&["a", "b"]), &wanted, "no.".into()),
+            "no. (named by index `a` and index `b`)"
+        );
+        assert_eq!(
+            held_by(&more(&["a", "b", "c", "d"]), &wanted, "no.".into()),
+            "no. (named by index `a`, index `b` and 2 more)"
+        );
+        // The same holder twice (two keys of one index) is named once.
+        assert_eq!(
+            held_by(&more(&["a", "a"]), &wanted, "no.".into()),
+            "no. (named by index `a`)"
+        );
         // Negative: a class no use names, and a use with no holder, add nothing.
         let other = Wanted {
             name: "other_ops".into(),
