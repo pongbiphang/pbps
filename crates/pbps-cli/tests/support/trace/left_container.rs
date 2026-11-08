@@ -20,8 +20,8 @@ pub fn remove_left_container(docker: &str, id: &str, volumes: &[String]) {
     remove_within(docker, id, volumes, GONE);
 }
 
-/// The shim records mounts while the keeper still protects this run. Once a
-/// sweep has removed the container, its inspect cannot recover those names.
+/// The shim records mounts inside the startup grace, before the run can
+/// connect and later release its keeper. After removal, inspect loses the names.
 pub fn remove_captured_container(docker: &str, id: &str, created: &std::path::Path) {
     let mut path = created.as_os_str().to_owned();
     path.push(".volumes");

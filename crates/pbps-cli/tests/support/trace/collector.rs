@@ -389,6 +389,138 @@ pub(super) fn read_ui(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::{Demo, stderr, stdout};
+    use std::process::Command;
+
+    #[test]
+    fn disposal_control_separates_prior_recovery_from_the_new_runs_cleanup() {
+        let dir = Demo::new("trace2560-recovery");
+        let shim = dir.dir.join("docker");
+        let created = dir.dir.join("disposal.created");
+        let attempted = dir.dir.join("disposal.attempted");
+        let forwarded = dir.dir.join("forwarded");
+        let id = "a".repeat(64);
+        let prior = "b".repeat(64);
+        std::fs::write(&shim, DISPOSAL_SHIM).unwrap();
+        // The real-runtime stand-in is an interpreter reading these files. No
+        // daemon-visible orphan or freshly written executable is involved.
+        std::fs::write(
+            dir.dir.join("run"),
+            "printf '%s\\n' run \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
+             printf '%s\\n' \"$PBPS_TRACE_CONTROL_ID\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.dir.join("rm"),
+            "printf '%s\\n' rm \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
+             exit \"${PBPS_TRACE_CONTROL_STATUS:-0}\"\n",
+        )
+        .unwrap();
+        // The shim captures mounts before a failed teardown can release the
+        // run to recovery. Model this real-runtime command, too (#2652).
+        std::fs::write(
+            dir.dir.join("container"),
+            r#"printf '%s\n' container "$@" "" >> "$PBPS_TRACE_FORWARDED"
+if [ "$PBPS_TRACE_CONTROL_INSPECT_STATUS" != 0 ]; then
+  echo 'forced control volume inspection failure' >&2
+  exit "$PBPS_TRACE_CONTROL_INSPECT_STATUS"
+fi
+printf '%s\n' trace-volume
+"#,
+        )
+        .unwrap();
+        let command = |args: &[&str]| {
+            let mut command = Command::new("sh");
+            command
+                .arg(&shim)
+                .args(args)
+                .current_dir(&dir.dir)
+                .env("PBPS_TRACE_DOCKER_REAL", "sh")
+                .env("PBPS_TRACE_CREATED", &created)
+                .env("PBPS_TRACE_ATTEMPTED", &attempted)
+                .env("PBPS_TRACE_FORWARDED", &forwarded)
+                .env("PBPS_TRACE_CONTROL_ID", &id)
+                .env("PBPS_TRACE_CONTROL_STATUS", "0")
+                .env("PBPS_TRACE_CONTROL_INSPECT_STATUS", "0");
+            command
+        };
+        let prior_rm = ["rm", "--force", "--volumes", &prior];
+        // An opened but empty capture is already the current run's phase. It
+        // must not turn a foreign cleanup into unobserved recovery.
+        std::fs::write(&created, "").unwrap();
+        assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
+        let record = std::fs::read_to_string(&attempted).unwrap();
+        assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&forwarded).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_file(&created).unwrap();
+        std::fs::remove_file(&attempted).unwrap();
+
+        assert!(command(&prior_rm).output().unwrap().status.success());
+        assert_eq!(
+            command(&prior_rm)
+                .env("PBPS_TRACE_CONTROL_STATUS", "37")
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(37),
+            "recovery preserves the real runtime's failure status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&attempted).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let run = command(&["run", "--detach", "fixture-image"])
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(stdout(&run), format!("{id}\n"));
+        assert_eq!(
+            std::fs::read_to_string(&created).unwrap(),
+            format!("{id}\n")
+        );
+        let captured = dir.dir.join("disposal.created.volumes");
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "trace-volume\n"
+        );
+        let recovery = format!("rm\n--force\n--volumes\n{prior}\n\n");
+        let inspection = format!(
+            "container\ninspect\n--format\n{}\n{id}\n\n",
+            "{{range .Mounts}}{{.Name}} {{end}}"
+        );
+        let before = std::fs::read_to_string(&forwarded).unwrap();
+        assert_eq!(
+            before,
+            format!("{recovery}{recovery}run\n--detach\nfixture-image\n\n{inspection}")
+        );
+
+        let own_rm = ["rm", "--force", "--volumes", &id];
+        assert_eq!(command(&own_rm).output().unwrap().status.code(), Some(1));
+        assert_disposal_attempts(&std::fs::read_to_string(&attempted).unwrap(), &id);
+        assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
+        let record = std::fs::read_to_string(&attempted).unwrap();
+        assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
+        assert_eq!(std::fs::read_to_string(&forwarded).unwrap(), before);
+
+        // A failed mount read must not publish an ID or a completed capture.
+        // The caller cannot infer a known empty mount set from this failure.
+        std::fs::remove_file(&captured).unwrap();
+        let refused = command(&["run", "--detach", "fixture-image"])
+            .env("PBPS_TRACE_CONTROL_INSPECT_STATUS", "41")
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(41));
+        assert!(refused.stdout.is_empty());
+        assert!(stderr(&refused).contains("forced control volume inspection failure"));
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn ui_reader_cannot_discard_private_terminal_stderr() {
