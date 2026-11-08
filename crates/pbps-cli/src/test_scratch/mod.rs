@@ -4,8 +4,9 @@
 //!
 //! It adds to the resolver's recovery (#2410, DEC-2410.1) what a test run needs
 //! beyond it and does not repeat it: the container is still the resolver's
-//! (`Held`, its labels, its keeper, its removal), so a resolver run's sweep
-//! sees a live test run as alive. What this adds is the client-side record that
+//! (`Held`, its labels, its keeper, its removal). Its journal location makes
+//! the resolver defer to test recovery while its record exists (DEC-2471.1).
+//! What this adds is the client-side record that
 //! makes the owner's death provable without a clock, and a cleanup that fails
 //! the command instead of warning.
 
@@ -21,6 +22,7 @@ use pbps_config::resolver::PullPolicy;
 use pbps_db::Driver;
 
 use pbps_cli::resolver::server::ProduceError;
+use pbps_cli::resolver::server::scratch::container::journal;
 use pbps_cli::resolver::server::scratch::container::{Held, Owner as ContainerOwner};
 
 pub(crate) use reconcile::Reconciliation;
@@ -202,6 +204,7 @@ impl Journal<'_> {
 /// Bridges the resolver's container start to the journal.
 struct RunOwner<'j, 'd> {
     journal: &'j mut Journal<'d>,
+    location: String,
 }
 
 impl ContainerOwner for RunOwner<'_, '_> {
@@ -216,6 +219,8 @@ impl ContainerOwner for RunOwner<'_, '_> {
             .iter()
             .filter(|(key, _)| key.starts_with("pbps.test."))
             .map(|(key, value)| format!("{key}={value}"))
+            // Runtime routing metadata, not a change to the versioned record.
+            .chain([format!("{}={}", journal::LOCATION_LABEL, self.location)])
             .collect()
     }
 
@@ -366,6 +371,7 @@ impl<'d> TestScratch<'d> {
         };
         let resource = journal.record.container.name.clone();
         let mut owner = RunOwner {
+            location: journal::location(dir.path()).map_err(Error::State)?,
             journal: &mut journal,
         };
         let start = Held::start_owned(driver, image, pull, &mut owner);

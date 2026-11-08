@@ -520,6 +520,7 @@ mod recovery {
             "nothing is written before the start"
         );
         let mut owner = RunOwner {
+            location: super::super::journal::location(d.dir.path()).unwrap(),
             journal: &mut journal,
         };
         owner.before_create().await.unwrap();
@@ -527,7 +528,14 @@ mod recovery {
         assert_eq!(owner.token(), run('a'));
         assert_eq!(
             owner.labels(),
-            vec![format!("{RUN_LABEL}={}", run('a'))],
+            vec![
+                format!("{RUN_LABEL}={}", run('a')),
+                format!(
+                    "{}={}",
+                    super::super::journal::LOCATION_LABEL,
+                    owner.location
+                ),
+            ],
             "the resolver sets its own"
         );
         // Negative: an id that is not a container id is refused and recorded nowhere.
@@ -1004,6 +1012,8 @@ mod live {
     use pbps_config::resolver::PullPolicy;
     use pbps_db::Driver;
 
+    mod sweep2471;
+
     fn image() -> String {
         std::env::var("PBPS_TEST_PG_SCRATCH_IMAGE")
             .expect("PBPS_TEST_PG_SCRATCH_IMAGE must name the pinned PostgreSQL image")
@@ -1226,6 +1236,7 @@ mod live {
         );
         assert!(!exists(&dead_id).await && exists(&alive_id).await);
         Box::pin(raced_removals(&d, &alive, image)).await;
+        Box::pin(sweep2471::sweep_before_recovery(&d, &alive, driver, image)).await;
         alive.finish().await.unwrap();
         assert!(d.dir.runs().unwrap().is_empty());
     }
