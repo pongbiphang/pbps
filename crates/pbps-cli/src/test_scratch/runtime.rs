@@ -150,23 +150,61 @@ impl Runtime for Docker {
     }
 }
 
-/// Where the runtime is and which daemon answers there. The first template
-/// that works: Docker has an id and a root directory, Podman a graph root
-/// (measured: Podman 5.7 rejects `{{.ID}}`). A runtime that answers neither
-/// is unreadable, never an empty identity.
+/// Where the runtime is and which daemon answers there. Podman's reported
+/// socket follows its effective connection, including named and default
+/// connections that do not change `DOCKER_HOST` (DEC-2459.1).
 pub(super) async fn current() -> Result<Daemon, Fail> {
-    let identity = match docker(&["info", "--format", "{{.ID}}|{{.DockerRootDir}}"]).await {
+    current_with(
+        docker,
+        std::env::var("DOCKER_HOST").unwrap_or_else(|_| "default".into()),
+    )
+    .await
+}
+
+pub(super) async fn current_with(
+    info: impl AsyncFn(&[&str]) -> Result<String, String>,
+    endpoint: String,
+) -> Result<Daemon, Fail> {
+    let identity = match info(&["info", "--format", "{{.ID}}|{{.DockerRootDir}}"]).await {
         Ok(text) => text,
-        Err(first) => docker(&["info", "--format", "{{.Store.GraphRoot}}"])
-            .await
-            .map_err(|_| fail(first))?,
+        // Podman 5.7 rejects `.ID`. Its graph root alone is a path that
+        // another host can share, so all three identity parts are required.
+        Err(_) => {
+            let text = info(&["info", "--format", "{{json .}}"])
+                .await
+                .map_err(fail)?;
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                Fail::Unreadable(format!("the runtime identity did not parse: {e}"))
+            })?;
+            let part = |path: &str| {
+                value
+                    .pointer(path)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| {
+                        Fail::Unreadable(format!(
+                            "the runtime identity has no nonempty string {path}"
+                        ))
+                    })
+            };
+            let hostname = part("/host/hostname")?;
+            let socket = part("/host/remoteSocket/path")?;
+            let graph_root = part("/store/graphRoot")?;
+            return Ok(Daemon {
+                endpoint: socket.to_owned(),
+                // JSON keeps delimiters in any reported value unambiguous;
+                // the tag cannot match an older graph-root-only identity.
+                identity: serde_json::to_string(&["podman", hostname, graph_root])
+                    .expect("strings serialize"),
+            });
+        }
     };
     let identity = identity.trim();
     if identity.is_empty() || identity == "|" {
         return Err(Fail::Unreadable("the runtime reports no identity".into()));
     }
     Ok(Daemon {
-        endpoint: std::env::var("DOCKER_HOST").unwrap_or_else(|_| "default".into()),
+        endpoint,
         identity: identity.to_owned(),
     })
 }
