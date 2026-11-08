@@ -314,6 +314,12 @@ struct Statement {
     /// 16.15 and 18.6, #2748). Empty when the list is not known, which judges
     /// every DEFAULT, the conservative answer.
     supplied: BTreeSet<String>,
+    /// Whether `read_actions` made this statement: the engine's own write for a
+    /// referential action, or one half of a row movement such a write causes. A
+    /// property the statement is given where it is created, never read off which
+    /// relation it names: a self-referencing foreign key, or a cycle, queues an
+    /// action on the very relation the plan writes (#2748).
+    from_action: bool,
     /// A referential action that is `SET DEFAULT`: the only action whose UPDATE
     /// runs the DEFAULT of the columns it sets. `CASCADE` writes the new key and
     /// `SET NULL` a NULL (#2748).
@@ -416,6 +422,7 @@ async fn walk(
                 BTreeSet::new()
             }
         },
+        from_action: false,
         sets_default: false,
         partitions_only: false,
         rows_only: false,
@@ -434,7 +441,7 @@ async fn walk(
         }
         // The expressions this statement runs, on the relation it names and on
         // the partitions and descendants it reaches (DEC-2563.9).
-        sites.extend(read_sites(conn, &statement, statement.relation != named, dropped).await?);
+        sites.extend(read_sites(conn, &statement, dropped).await?);
         if !fires {
             continue;
         }
@@ -444,7 +451,7 @@ async fn walk(
                 .await?
                 .into_iter()
                 .map(|mut trigger| {
-                    trigger.through_an_action = statement.relation != named;
+                    trigger.through_an_action = statement.from_action;
                     trigger
                 }),
         );
@@ -468,6 +475,9 @@ async fn walk(
                 columns: BTreeSet::new(),
                 // The INSERT half of a movement evaluates no default at all.
                 supplied: BTreeSet::new(),
+                // The halves of a movement a referential action causes are the
+                // engine's own as well.
+                from_action: statement.from_action,
                 sets_default: false,
                 partitions_only: statement.partitions_only,
                 rows_only: true,
@@ -1012,6 +1022,7 @@ async fn read_actions(
                 event,
                 columns,
                 supplied: BTreeSet::new(),
+                from_action: true,
                 sets_default,
                 partitions_only: true,
                 rows_only: false,
@@ -1164,20 +1175,16 @@ fn table_filter(tables: &BTreeSet<TableName>) -> String {
 async fn read_sites(
     conn: &mut Conn,
     statement: &Statement,
-    through_an_action: bool,
     dropped: &Dropped,
 ) -> Result<Vec<Site>, DbError> {
-    let (extra, arms) = site_arms(statement, through_an_action, dropped);
+    let (extra, arms) = site_arms(statement, dropped);
     run_sites(conn, statement, dropped, &extra, &arms).await
 }
 
 /// The queries, one per kind of expression the statement runs, and the CTE the
 /// domain ones read. Pure, so the table of the module docs is a unit test.
-fn site_arms(
-    statement: &Statement,
-    through_an_action: bool,
-    dropped: &Dropped,
-) -> (String, Vec<String>) {
+fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) {
+    let through_an_action = statement.from_action;
     let event = statement.event;
     let (insert, update, delete, rewrite) = (
         event == INSERT,
@@ -1597,20 +1604,35 @@ mod tests {
             event,
             columns: BTreeSet::from(["b".to_owned()]),
             supplied: BTreeSet::new(),
+            from_action: false,
             sets_default: false,
             partitions_only: false,
             rows_only,
         }
     }
 
+    /// A statement `read_actions` made.
+    fn action_statement(event: i16, sets_default: bool) -> Statement {
+        Statement {
+            from_action: true,
+            sets_default,
+            ..statement(event, false)
+        }
+    }
+
     /// The kinds of expression `event` is judged for, by the label each query
     /// selects.
     fn kinds(event: i16, rows_only: bool, through_an_action: bool) -> BTreeSet<String> {
-        let (_, arms) = site_arms(
-            &statement(event, rows_only),
-            through_an_action,
-            &Dropped::default(),
-        );
+        let statement = if through_an_action {
+            Statement {
+                from_action: true,
+                rows_only,
+                ..statement(event, rows_only)
+            }
+        } else {
+            statement(event, rows_only)
+        };
+        let (_, arms) = site_arms(&statement, &Dropped::default());
         arms.iter()
             .map(|arm| arm.split('\'').nth(1).expect("a labelled query").to_owned())
             .collect()
@@ -1649,9 +1671,7 @@ mod tests {
 
     /// The kinds a referential action's UPDATE is judged for.
     fn action_kinds(sets_default: bool) -> BTreeSet<String> {
-        let mut action = statement(UPDATE, false);
-        action.sets_default = sets_default;
-        let (_, arms) = site_arms(&action, true, &Dropped::default());
+        let (_, arms) = site_arms(&action_statement(UPDATE, sets_default), &Dropped::default());
         arms.iter()
             .map(|arm| arm.split('\'').nth(1).expect("a labelled query").to_owned())
             .collect()
@@ -1702,7 +1722,7 @@ mod tests {
     #[test]
     fn every_policy_query_asks_the_server_whether_row_security_applies() {
         for event in [INSERT, UPDATE, DELETE] {
-            let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+            let (_, arms) = site_arms(&statement(event, false), &Dropped::default());
             let policies: Vec<_> = arms
                 .iter()
                 .filter(|arm| arm.contains("'policy' AS kind"))
@@ -1723,7 +1743,7 @@ mod tests {
 
     #[test]
     fn an_update_reads_only_the_generated_and_domain_columns_it_sets() {
-        let (extra, arms) = site_arms(&statement(UPDATE, false), false, &Dropped::default());
+        let (extra, arms) = site_arms(&statement(UPDATE, false), &Dropped::default());
         assert!(extra.contains("FROM touched t"), "{extra}");
         let generated = arms
             .iter()
@@ -1731,7 +1751,7 @@ mod tests {
             .unwrap();
         assert!(generated.contains("JOIN touched t"), "{generated}");
         // An INSERT reads every one.
-        let (extra, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        let (extra, arms) = site_arms(&statement(INSERT, false), &Dropped::default());
         assert!(!extra.contains("touched"), "{extra}");
         assert!(
             !arms
@@ -1744,7 +1764,7 @@ mod tests {
 
     /// The expression columns the policy arms of `event` read.
     fn policy_columns(event: i16) -> Vec<String> {
-        let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+        let (_, arms) = site_arms(&statement(event, false), &Dropped::default());
         arms.iter()
             .filter(|arm| arm.contains("'policy' AS kind"))
             .map(|arm| {
@@ -1773,13 +1793,13 @@ mod tests {
         // DELETE: the USING alone; a WITH CHECK is never run by a DELETE.
         assert_eq!(policy_columns(DELETE), ["p.polqual"]);
         // And the commands a policy is for: a SELECT policy joins what reads a row.
-        let (_, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        let (_, arms) = site_arms(&statement(INSERT, false), &Dropped::default());
         let insert = arms
             .iter()
             .find(|a| a.contains("'policy' AS kind"))
             .unwrap();
         assert!(insert.contains("p.polcmd IN ('*', 'a')"), "{insert}");
-        let (_, arms) = site_arms(&statement(DELETE, false), false, &Dropped::default());
+        let (_, arms) = site_arms(&statement(DELETE, false), &Dropped::default());
         let delete = arms
             .iter()
             .find(|a| a.contains("'policy' AS kind"))
@@ -1913,7 +1933,7 @@ mod tests {
         dropped.columns.insert((table.clone(), "x".to_owned()));
         dropped.domain_defaults.insert("app.dm".parse().unwrap());
         dropped.detached.insert(TableName::new("app", "p1"));
-        let (extra, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        let (extra, arms) = site_arms(&statement(INSERT, false), &dropped);
         // The columns come out of the domain scan, with the ones a parent's
         // drop takes along.
         assert!(
@@ -1939,14 +1959,14 @@ mod tests {
         }
         assert!(extra.contains("SELECT oid FROM detached"), "{extra}");
         // Nothing dropped, nothing left out of the domain scan.
-        let (extra, _) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        let (extra, _) = site_arms(&statement(INSERT, false), &Dropped::default());
         assert!(extra.contains("NOT (false)"), "{extra}");
     }
 
     #[test]
     fn an_insert_judges_the_default_of_the_columns_it_leaves_out() {
         let arm = |statement: &Statement, label: &str| -> String {
-            let (_, arms) = site_arms(statement, false, &Dropped::default());
+            let (_, arms) = site_arms(statement, &Dropped::default());
             arms.into_iter()
                 .find(|a| a.contains(&format!("'{label}' AS kind")))
                 .unwrap_or_else(|| panic!("no {label} query"))
@@ -1978,13 +1998,11 @@ mod tests {
     fn a_default_is_read_on_the_relation_the_statement_names_and_no_other() {
         // An INSERT and a `SET DEFAULT` action alike: the relation's own default
         // runs, a partition's or a child's override only for a write naming it.
-        let mut action = statement(UPDATE, false);
-        action.sets_default = true;
-        for (label, statement, through_an_action) in [
-            ("insert", statement(INSERT, false), false),
-            ("action", action, true),
+        for (label, statement) in [
+            ("insert", statement(INSERT, false)),
+            ("action", action_statement(UPDATE, true)),
         ] {
-            let (_, arms) = site_arms(&statement, through_an_action, &Dropped::default());
+            let (_, arms) = site_arms(&statement, &Dropped::default());
             let arm = |kind: &str| -> String {
                 arms.iter()
                     .find(|a| a.contains(&format!("'{kind}' AS kind")))
@@ -2014,7 +2032,7 @@ mod tests {
     #[test]
     fn a_policy_is_read_on_the_relation_the_statement_names_and_no_other() {
         for event in [INSERT, UPDATE, DELETE] {
-            let (_, arms) = site_arms(&statement(event, false), false, &Dropped::default());
+            let (_, arms) = site_arms(&statement(event, false), &Dropped::default());
             let policies: Vec<_> = arms
                 .iter()
                 .filter(|a| a.contains("'policy' AS kind"))
@@ -2039,7 +2057,7 @@ mod tests {
         dropped.indexes.insert((parent.clone(), "ix".to_owned()));
         dropped.policies.insert((parent.clone(), "p".to_owned()));
         dropped.tables.insert(TableName::new("app", "gone"));
-        let (_, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        let (_, arms) = site_arms(&statement(INSERT, false), &dropped);
         let all = arms.join("\n");
         // The owner is the joined relation, never the table the statement names.
         assert!(!all.contains("root.table_name"), "{all}");
@@ -2055,7 +2073,7 @@ mod tests {
         assert!(!all.contains("p.polname::pg_catalog.text = E'p' AND ((n.nspname = E'app' AND c.relname = E'parent') OR"), "{all}");
         assert!(all.contains("pi.relname::pg_catalog.text = E'ix' AND pn.nspname = E'app' AND pt.relname = E'parent'"), "{all}");
         // Every query leaves out a table the plan drops, and its partitions.
-        let (extra, _) = site_arms(&statement(INSERT, false), false, &dropped);
+        let (extra, _) = site_arms(&statement(INSERT, false), &dropped);
         assert!(extra.contains("gone_tables"), "{extra}");
         assert!(
             arms.iter()
@@ -2073,7 +2091,7 @@ mod tests {
         dropped.indexes.insert((table.clone(), "ix".to_owned()));
         dropped.policies.insert((table.clone(), "p".to_owned()));
         dropped.values.insert((table, "d".to_owned()));
-        let (_, arms) = site_arms(&statement(INSERT, false), false, &dropped);
+        let (_, arms) = site_arms(&statement(INSERT, false), &dropped);
         let all = arms.join("\n");
         for needle in [
             "con.conname::pg_catalog.text = E'ck'",
@@ -2084,7 +2102,7 @@ mod tests {
             assert!(all.contains(needle), "{needle} is not in {all}");
         }
         // And nothing is left out when the plan drops nothing: `check` asks so.
-        let (_, arms) = site_arms(&statement(INSERT, false), false, &Dropped::default());
+        let (_, arms) = site_arms(&statement(INSERT, false), &Dropped::default());
         assert!(arms.join("\n").contains("NOT (false)"));
     }
 

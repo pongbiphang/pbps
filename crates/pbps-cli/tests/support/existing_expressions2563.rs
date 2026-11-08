@@ -1897,6 +1897,163 @@ fn a_default_is_the_one_of_the_relation_a_statement_names_and_no_other() {
     });
 }
 
+/// A referential action is the engine's own write whichever table it lands on
+/// (#2748). Measured on 16 and 18 (DEC-2563.9): on a self-referencing table the
+/// action runs the DEFAULT of the columns `SET DEFAULT` sets, the CHECKs and the
+/// domain CHECKs, and bypasses row security, exactly as on another table; an
+/// ordinary UPDATE of the same table still meets the policy; and in a cycle the
+/// action that comes back to the table the plan writes is the same.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_action_that_lands_on_the_table_the_plan_writes_is_still_the_engines_own() {
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2748-self-{version}"));
+        let role = format!("ee2748_s_{version}_{}", std::process::id());
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+        on_server(url, &format!("CREATE ROLE {role}"));
+        let mut sql = String::from(
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_defa() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_pol(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_other(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;",
+        );
+        // A self-referencing key with each action and an unsafe or a harmless default.
+        for (key, default, action) in [
+            ("unsafe_setdefault", "app.f_defa()", "SET DEFAULT"),
+            ("safe_setdefault", "1", "SET DEFAULT"),
+            ("unsafe_setnull", "app.f_defa()", "SET NULL"),
+            ("unsafe_cascade", "app.f_defa()", "CASCADE"),
+        ] {
+            sql.push_str(&format!(
+                "CREATE TABLE app.{key} (id integer PRIMARY KEY, parent integer DEFAULT {default},
+                     FOREIGN KEY (parent) REFERENCES app.{key} (id)
+                         ON DELETE {action} ON UPDATE {action});"
+            ));
+        }
+        // Policies: DELETE and UPDATE run different routines, so that which statement
+        // is judged for a policy shows in the routine named.
+        sql.push_str(&format!(
+            "CREATE TABLE app.policed (id integer PRIMARY KEY, parent integer,
+                 FOREIGN KEY (parent) REFERENCES app.policed (id)
+                     ON DELETE SET NULL ON UPDATE SET NULL);
+             ALTER TABLE app.policed ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY pd ON app.policed FOR DELETE USING (app.f_pol(id));
+             CREATE POLICY pu ON app.policed FOR UPDATE
+                 USING (app.f_other(id)) WITH CHECK (app.f_other(id));
+             CREATE POLICY ps ON app.policed FOR SELECT USING (true);
+             GRANT USAGE ON SCHEMA app TO {role}; GRANT ALL ON app.policed TO {role};"
+        ));
+        // A trigger that no baseline records, fired by the action's UPDATE only.
+        sql.push_str(
+            "CREATE FUNCTION app.tg() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+             CREATE TABLE app.trigd (id integer PRIMARY KEY, parent integer,
+                 FOREIGN KEY (parent) REFERENCES app.trigd (id) ON DELETE SET NULL);
+             CREATE TRIGGER t_upd AFTER UPDATE ON app.trigd
+                 FOR EACH ROW EXECUTE FUNCTION app.tg();",
+        );
+        // A cycle: deleting from `ca` cascades to `cb`, whose rows' deletion sets the
+        // default of `ca.bid`: an action that returns to the table the plan writes.
+        sql.push_str(
+            "CREATE TABLE app.ca (id integer PRIMARY KEY, bid integer DEFAULT app.f_defa());
+             CREATE TABLE app.cb (id integer PRIMARY KEY, aid integer);
+             ALTER TABLE app.ca ADD FOREIGN KEY (bid) REFERENCES app.cb (id) ON DELETE SET DEFAULT;
+             ALTER TABLE app.cb ADD FOREIGN KEY (aid) REFERENCES app.ca (id) ON DELETE CASCADE;",
+        );
+        on_server(own.connection(), &sql);
+        let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+            routines.iter().copied().collect()
+        };
+        let (defa, pol, other) = ("app.f_defa()", "app.f_pol(integer)", "app.f_other(integer)");
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            macro_rules! ask {
+                ($table:expr, $operation:expr, $role:expr) => {
+                    names(
+                        &plan_time(&mut conn, $table, $operation, &Dropped::default(), $role).await,
+                    )
+                };
+            }
+            // The action's UPDATE runs the DEFAULT only for SET DEFAULT, and only
+            // an unsafe one is named.
+            for (table, expected) in [
+                ("app.unsafe_setdefault", set(&[defa])),
+                ("app.safe_setdefault", set(&[])),
+                ("app.unsafe_setnull", set(&[])),
+                ("app.unsafe_cascade", set(&[])),
+            ] {
+                assert_eq!(
+                    ask!(table, RowOperation::Delete, None),
+                    expected,
+                    "PG{version}: ON DELETE on {table}"
+                );
+                assert_eq!(
+                    ask!(table, update(&["id"]), None),
+                    expected,
+                    "PG{version}: ON UPDATE on {table}"
+                );
+            }
+            // Row security: the DELETE meets its own policy and the action does not
+            // meet the UPDATE's; an ordinary UPDATE of the same table does.
+            assert_eq!(
+                ask!("app.policed", RowOperation::Delete, Some(&role)),
+                set(&[pol]),
+                "PG{version}: DELETE on the table with the policies"
+            );
+            assert_eq!(
+                ask!("app.policed", update(&["parent"]), Some(&role)),
+                set(&[other]),
+                "PG{version}: an ordinary UPDATE of the same table"
+            );
+            // A trigger fired by the action is refused as the action's, even on the
+            // table the plan writes; an ordinary UPDATE of that table is not.
+            let by_the_action = plan_time(
+                &mut conn,
+                "app.trigd",
+                RowOperation::Delete,
+                &Dropped::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                by_the_action.contains("foreign-key referential action"),
+                "PG{version}: {by_the_action}"
+            );
+            let ordinary = plan_time(
+                &mut conn,
+                "app.trigd",
+                update(&["parent"]),
+                &Dropped::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                !ordinary.contains("foreign-key referential action"),
+                "PG{version}: {ordinary}"
+            );
+            // The cycle: the SET DEFAULT that returns to `ca`.
+            assert_eq!(
+                ask!("app.ca", RowOperation::Delete, None),
+                set(&[defa]),
+                "PG{version}: a cycle"
+            );
+            // The recheck just before the statement agrees.
+            let at = names(
+                &at_the_statement_of(&mut conn, "app.unsafe_setdefault", RowOperation::Delete)
+                    .await,
+            );
+            assert_eq!(at, set(&[defa]), "PG{version}: at the statement");
+        });
+        drop(own);
+        on_server(url, &format!("DROP ROLE IF EXISTS {role}"));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Whole plans: a table that already carries an expression, then a plan that
 // writes rows to it, or rewrites it.

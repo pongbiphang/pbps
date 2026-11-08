@@ -5685,6 +5685,35 @@ The same holds for the copy of a rebuild, which lists its columns as an
 `UPDATE` are all judged because a heap-only update may skip them depending on
 the data: both are conservative by design and say so.
 
+A referential action is the engine's own write wherever it lands, including on
+the table the plan writes (#2748). Measured on 16.15 and 18.6, identically, on a
+table that references itself (a CHECK, a generated column, an index, a domain
+column with a CHECK and a DEFAULT, and a policy on the table, run as a role it
+applies to), with the same statement on a row nothing references as the
+baseline, and on a cycle:
+
+| statement | what the action ran | policy |
+|---|---|---|
+| `DELETE` of a referenced row, `ON DELETE CASCADE` | nothing | the `DELETE`'s own, once, as in the baseline |
+| the same with `SET NULL` | the CHECK and the domain CHECK | as the baseline: the action's `UPDATE` meets none |
+| the same with `SET DEFAULT` | the CHECK, the domain CHECK and the domain DEFAULT | as the baseline |
+| `UPDATE` of a referenced key, each action | the CHECK and the domain CHECK once more, and for `SET DEFAULT` the domain DEFAULT | as the baseline |
+| an ordinary `UPDATE` of the same table | its own CHECK and domain CHECK | judged |
+| a cycle `a` to `b` and `b` to `a`, `SET DEFAULT` both ways | the default of the table the first reaches only | n/a |
+| `a` cascading to `b`, and `b`'s deletion setting `a`'s default | the DEFAULT of `a.bid`, on the table the plan writes | n/a |
+
+So whether a statement is a referential action is a property the statement is
+given where `read_actions` makes it (`Statement.from_action`, carried onto the
+two halves of a movement it causes), not an inference from the relation it
+names differing from the one the plan writes. That inference judged a
+self-referencing `SET DEFAULT` as an ordinary write, which left the default it
+runs unjudged, and judged the policy that the action bypasses. The statements
+that differ only by this property are different statements for the walk, so the
+cascaded `DELETE` of a self-referencing key is no longer folded into the plan's
+own. Nothing else in the walk reads the named relation to decide how a
+statement is judged: the sweep found the two uses, the site queries and the
+flag a trigger carries for its refusal text, and both read the property now.
+
 Which relation's object runs (#2748). The same sweep along the other axis, on
 16.15 and 18.6, identically: an inheritance parent with a child, and a
 partitioned table with a partition and a sub-partitioned partition with its own
