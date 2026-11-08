@@ -42,11 +42,36 @@ pub(crate) fn class_problem(policy: &MethodPolicy, class: &OpClassRef) -> Option
     (!policy.classes.contains(&name)).then_some(ClassProblem::NotHeld)
 }
 
-/// Whether `key` names a class a managed package provides, which lifts the
-/// method's key-type gate: the class, pinned against the package, is what says
-/// the key is one the engine takes (`gin_trgm_ops` over `text`), not the type.
+/// Whether a key names a class a managed package provides, given the schema of
+/// the class (`None` for the engine's own bare class). The one rule behind both
+/// the declaration and the pull (DEC-2447.14): the class, pinned against the
+/// package, is what says the key is one the engine takes (`gin_trgm_ops` over
+/// `text`, or over an expression), so the method's key-type and expression gates,
+/// which are for the engine's own classes, do not apply to it.
+pub(crate) fn provider_class(policy: &MethodPolicy, class_schema: Option<&str>) -> bool {
+    policy.provider_classes && class_schema.is_some()
+}
+
+/// [`provider_class`] for a declared key.
 pub(crate) fn provider_key(policy: &MethodPolicy, key: &pbps_model::IndexColumn) -> bool {
-    policy.provider_classes && key.opclass.as_ref().is_some_and(|c| c.schema().is_some())
+    provider_class(policy, key.opclass.as_ref().and_then(|c| c.schema()))
+}
+
+/// [`provider_class`] for a pulled key, whose class is the catalog's `schema.name`
+/// text (empty for the default, `pg_catalog.` for the engine's own).
+pub(crate) fn provider_class_text(policy: &MethodPolicy, class: &str) -> bool {
+    provider_class(
+        policy,
+        (!class.is_empty() && !class.starts_with("pg_catalog.")).then_some(class),
+    )
+}
+
+/// Whether an expression key is held: the method holds expression keys, or the key
+/// names a class a package provides. Asked by the declaration and by the pull, so
+/// a declaration this model accepts is one the pull reads back (a GIN expression
+/// under `gin_trgm_ops` is, a GIN expression under no class is not).
+pub(crate) fn holds_expression_key(policy: &MethodPolicy, provider: bool) -> bool {
+    policy.expression_keys || provider
 }
 
 /// Whether `class` is one of the engine's own that a later part of the same
@@ -149,6 +174,51 @@ mod tests {
         assert!(!holds_key_type(gin, &column("jsonb[]")));
         assert!(!holds_key_type(gin, &column("text")));
         assert!(holds_key_type(IndexMethod::Btree.policy(), &column("text")));
+    }
+
+    /// One rule for the declaration and the pull: a key naming a package's class is
+    /// held where the method would not hold it, an expression key included; a key
+    /// naming the engine's class, or none, is held as the method holds it. BRIN
+    /// holds no package class, so nothing lifts its gates.
+    #[test]
+    fn a_package_class_lifts_the_expression_gate_for_the_declaration_and_the_pull_alike() {
+        let gin = IndexMethod::Gin.policy();
+        let brin = IndexMethod::Brin.policy();
+        assert!(!holds_expression_key(gin, false));
+        assert!(holds_expression_key(gin, true));
+        assert!(holds_expression_key(IndexMethod::Btree.policy(), false));
+        // The declared and the pulled spelling of the same class agree.
+        let key = |class: Option<&str>| pbps_model::IndexColumn {
+            key: pbps_model::IndexKey::Expression("lower(body)".into()),
+            descending: false,
+            opclass: class.map(|c| c.parse().unwrap()),
+            collation: None,
+        };
+        for (declared, pulled) in [
+            (Some("ext.gin_trgm_ops"), "ext.gin_trgm_ops"),
+            (
+                Some("pg_catalog.jsonb_path_ops"),
+                "pg_catalog.jsonb_path_ops",
+            ),
+            (Some("jsonb_path_ops"), "pg_catalog.jsonb_path_ops"),
+            (None, ""),
+        ] {
+            assert_eq!(
+                provider_key(gin, &key(declared)),
+                provider_class_text(gin, pulled),
+                "{declared:?} / {pulled:?}"
+            );
+        }
+        assert!(provider_class_text(gin, "ext.gin_trgm_ops"));
+        // Negatives: the engine's class, the default, and a method with none.
+        assert!(!provider_class_text(gin, "pg_catalog.jsonb_path_ops"));
+        assert!(!provider_class_text(gin, ""));
+        assert!(!provider_class_text(brin, "ext.int4_ops"));
+        assert!(!provider_key(brin, &key(Some("ext.int4_ops"))));
+        assert!(!holds_expression_key(
+            gin,
+            provider_class_text(gin, "pg_catalog.jsonb_path_ops")
+        ));
     }
 
     #[test]

@@ -340,7 +340,8 @@ fn exclusion(
 /// has no default GIN class at all.
 fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
     use crate::index_policy::{
-        ClassProblem, class_problem, holds_key_type, key_scope, later_class, offered, provider_key,
+        ClassProblem, class_problem, holds_expression_key, holds_key_type, key_scope, later_class,
+        offered, provider_key,
     };
     let policy = index.method.policy();
     let method = index.method.as_str().to_ascii_uppercase();
@@ -368,7 +369,7 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
         let provided = provider_key(policy, key);
         let column = match key.key.column() {
             Some(column) => Some(column),
-            None if !policy.expression_keys && !provided => {
+            None if !holds_expression_key(policy, provided) => {
                 found.push(invalid(format!(
                     "{what} is a {method} index over the expression `{shown}`, and this model \
                      holds {method} only over {}",
@@ -1665,6 +1666,24 @@ mod tests {
             indexed(IndexMethod::Gin, &[("n", None, false)]),
             &["only over `jsonb` columns"],
         );
+    }
+
+    /// A GIN expression key is declarable exactly where the pull reads it back: under
+    /// a class a package provides. Under no class, or the engine's, it is refused as
+    /// before (DEC-2447.14).
+    #[test]
+    fn a_gin_expression_key_is_declarable_only_under_a_package_class() {
+        let expression = |class: Option<&str>| {
+            let mut table = indexed(IndexMethod::Gin, &[("body", class, false)]);
+            let ix = table.indexes.get_mut("ix").unwrap();
+            ix.columns[0].key = pbps_model::IndexKey::Expression("lower(body::text)".into());
+            table
+        };
+        assert!(structure(&expression(Some("ext.gin_trgm_ops"))).is_empty());
+        for class in [None, Some("pg_catalog.jsonb_path_ops")] {
+            let found = structure(&expression(class)).join("\n");
+            assert!(found.contains("over the expression"), "{class:?}: {found}");
+        }
     }
 
     /// A qualified class is held only where the project declares a package in

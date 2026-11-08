@@ -3795,22 +3795,6 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
         );
         return None;
     };
-    // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
-    // `jsonb` columns (DEC-1169.1). Each method's policy says which.
-    if !method.policy().expression_keys && (raw.has_expressions || raw.columns.contains(&0)) {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "index `{}` on `{}` is a {} index over an expression, which this model does not \
-                 hold. It is left out of the pull, so a plan cannot see it.",
-                raw.name.shown(),
-                parts.name.shown(),
-                method.as_str().to_ascii_uppercase(),
-            ),
-        );
-        return None;
-    }
     // A failed `CREATE INDEX CONCURRENTLY` leaves a row behind that the
     // planner will not use. Read back as an index, a declaration of the same
     // shape compares clean — and the index the operator believes they have
@@ -3864,6 +3848,28 @@ fn read_index(raw: &RawIndex, parts: &Parts, table: &Table, pulled: &mut Pulled)
     let mut keys = Vec::with_capacity(key_attnums.len());
     for (position, attnum) in key_attnums.iter().enumerate() {
         if *attnum == 0 {
+            // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
+            // `jsonb` columns (DEC-1169.1), or over an expression under a class a
+            // package provides (DEC-2447.14). The method's policy says which, and
+            // the declaration asks the same question.
+            let provider = raw
+                .key_classes
+                .get(position)
+                .is_some_and(|c| crate::index_policy::provider_class_text(method.policy(), c));
+            if !crate::index_policy::holds_expression_key(method.policy(), provider) {
+                note(
+                    pulled,
+                    &parts.name,
+                    format!(
+                        "index `{}` on `{}` is a {} index over an expression, which this model \
+                         does not hold. It is left out of the pull, so a plan cannot see it.",
+                        raw.name.shown(),
+                        parts.name.shown(),
+                        method.as_str().to_ascii_uppercase(),
+                    ),
+                );
+                return None;
+            }
             let Some(text) = raw.key_texts.get(position).filter(|t| !t.is_empty()) else {
                 note(
                     pulled,
@@ -4081,8 +4087,7 @@ fn key_class(
     let in_table = table.columns.get(column);
     // A key type the method does not hold is named before its class: the class
     // of a key the model cannot read back is no part of the answer.
-    let provided =
-        policy.provider_classes && !class.is_empty() && !class.starts_with("pg_catalog.");
+    let provided = crate::index_policy::provider_class_text(policy, class);
     if !provided
         && policy.key_type.is_some()
         && !in_table.is_some_and(|c| holds_key_type(policy, c))
@@ -8405,6 +8410,68 @@ mod tests {
             assert!(
                 pulled.warnings.iter().any(|w| w.contains(expected)),
                 "{what}: {:?}",
+                pulled.warnings
+            );
+        }
+    }
+
+    /// A GIN expression key is held exactly when it names a class a managed package
+    /// provides: the declaration accepts the same keys, so an accepted index is one the
+    /// pull reads back (a wrong recording otherwise: the next plan would create it
+    /// again). A GIN expression under no class, or under the engine's, stays out.
+    #[test]
+    fn a_gin_expression_key_is_read_back_only_under_a_package_class() {
+        let managed: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension> = [(
+            "pg_trgm".into(),
+            pbps_model::Extension {
+                schema: "ext".into(),
+                version: "1.6".into(),
+            },
+        )]
+        .into();
+        let build = |class: &str, owner: &str| {
+            let mut ix = index(50, 1, "t_expr");
+            ix.method = "gin".to_owned();
+            ix.columns = vec![0];
+            ix.has_expressions = true;
+            ix.key_count = 1;
+            ix.options = vec![0];
+            ix.key_classes = vec![class.to_owned()];
+            ix.key_texts = vec!["lower(body)".to_owned()];
+            ix.key_collations = vec![String::new()];
+            ix.key_options = vec![String::new()];
+            ix.key_class_extensions = vec![owner.to_owned()];
+            assemble(&RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "body", "text")],
+                indexes: vec![ix],
+                extensions: managed.clone(),
+                ..RawCatalog::default()
+            })
+        };
+        let held = build("ext.gin_trgm_ops", "pg_trgm");
+        let key = &only(&held).indexes["t_expr"].columns[0];
+        assert_eq!(key.key.text(), "lower(body)", "{:?}", held.warnings);
+        assert_eq!(
+            key.opclass,
+            Some(OpClassRef::in_schema("ext", "gin_trgm_ops"))
+        );
+        // Negatives: no class, and the engine's class, are the expression the model
+        // does not hold under GIN; a class no package owns is left out by its owner.
+        for (class, owner, expected) in [
+            ("", "", "over an expression, which this model does not hold"),
+            (
+                "pg_catalog.jsonb_path_ops",
+                "",
+                "over an expression, which this model does not hold",
+            ),
+            ("ext.fake_ops", "", "which no package owns"),
+        ] {
+            let pulled = build(class, owner);
+            assert!(only(&pulled).indexes.is_empty(), "{class}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{class}: {:?}",
                 pulled.warnings
             );
         }

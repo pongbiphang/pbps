@@ -100,8 +100,8 @@ fn no_changes(out: &Output) {
 
 /// The table as pulled, with one more index declared.
 /// The index the apply test declares first.
-const KEPT: &str =
-    "  docs_trgm:\n    method: gin\n    keys:\n      - {column: body, opclass: ext.gin_trgm_ops}\n";
+const KEPT: &str = "  docs_trgm:\n    method: gin\n    keys:\n      - {column: body, opclass: ext.gin_trgm_ops}\n  \
+    docs_expr:\n    method: gin\n    keys:\n      - {expression: \"lower(body)\", opclass: ext.gin_trgm_ops}\n";
 
 fn with_index(base: &str, index: &str) -> String {
     format!("{}indexes:\n{index}", base.trim_end().to_owned() + "\n")
@@ -120,11 +120,17 @@ fn a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_whe
             &f,
             &format!(
                 "{DOCS}; CREATE INDEX docs_trgm ON app.docs USING gin (body ext.gin_trgm_ops); \
-                 CREATE INDEX docs_fuzzy ON app.docs USING gist (lower(body) ext.gist_trgm_ops)"
+                 CREATE INDEX docs_fuzzy ON app.docs USING gist (lower(body) ext.gist_trgm_ops); \
+                 CREATE INDEX docs_expr ON app.docs USING gin (lower(body) ext.gin_trgm_ops)"
             ),
             &["pg_trgm", "hstore"],
         );
         let table = table_file(&f);
+        // The GIN expression key is read back, so a declaration of it is a no-op plan.
+        assert!(
+            table.contains("docs_expr") && table.contains("lower(body)"),
+            "{table}"
+        );
         for held in ["ext.gin_trgm_ops", "ext.gist_trgm_ops"] {
             assert!(table.contains(held), "{held}:\n{table}");
         }
@@ -139,7 +145,8 @@ fn a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_whe
                 "{DOCS}; {LOOKALIKE}; \
                  CREATE INDEX docs_fake ON app.docs USING gin (body ext.fake_trgm_ops); \
                  CREATE INDEX docs_param ON app.docs USING gist (body ext.gist_trgm_ops (siglen=32)); \
-                 CREATE INDEX docs_trgm ON app.docs USING gin (body ext.gin_trgm_ops)"
+                 CREATE INDEX docs_trgm ON app.docs USING gin (body ext.gin_trgm_ops); \
+                 CREATE INDEX docs_plain_expr ON app.docs USING gin ((to_jsonb(body)))"
             ),
         );
         let out = pulled(&g, &["pg_trgm", "hstore"]);
@@ -236,13 +243,16 @@ fn a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_
 
         succeeds(f.plan(&[]));
         succeeds(f.apply("destructive"));
+        // Both the column key and the expression key are built on the class, and the
+        // expression reads back byte for byte: the next plan is no change.
         assert_eq!(
             scalar(
                 f.target(),
                 "SELECT count(*) FROM pg_index i JOIN pg_opclass oc ON oc.oid = i.indclass[0] \
-                 WHERE i.indexrelid = 'app.docs_trgm'::regclass AND oc.opcname = 'gin_trgm_ops'"
+                 WHERE i.indexrelid IN ('app.docs_trgm'::regclass, 'app.docs_expr'::regclass) \
+                 AND oc.opcname = 'gin_trgm_ops'"
             ),
-            1
+            2
         );
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         succeeds(f.d.run(&["verify", "--db", f.target()]));
@@ -269,6 +279,11 @@ fn a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_
                 "a class under a method it is not for",
                 "  docs_x:\n    method: gist\n    keys:\n      - {column: body, opclass: ext.gin_trgm_ops}\n",
                 "gin_trgm_ops",
+            ),
+            (
+                "a GIN expression key under no class",
+                "  docs_x:\n    method: gin\n    keys:\n      - {expression: \"lower(body)\"}\n",
+                "over the expression",
             ),
             (
                 "a class of a schema no declared package stands in",
