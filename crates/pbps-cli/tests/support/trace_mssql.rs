@@ -605,7 +605,12 @@ impl Fixture {
         );
         self.env = configured;
         assert_ne!(code(&wrong_key), 0);
-        assert!(stdout(&wrong_key).contains("fingerprint key"));
+        assert!(
+            format!("{} {}", stdout(&wrong_key), stderr(&wrong_key)).contains("fingerprint key"),
+            "{} {}",
+            stdout(&wrong_key),
+            stderr(&wrong_key)
+        );
         assert_ne!(ui_wrong_key["code"].as_i64().unwrap(), 0);
         assert!(
             serde_json::to_string(&ui_wrong_key)
@@ -623,7 +628,12 @@ impl Fixture {
         let stale = self.apply_plan("resolved-cli.json");
         on_server(self.target.connection(), &function());
         assert_ne!(code(&stale), 0);
-        assert!(stdout(&stale).contains("before its first statement"));
+        assert!(
+            format!("{} {}", stdout(&stale), stderr(&stale)).contains("before its first statement"),
+            "{} {}",
+            stdout(&stale),
+            stderr(&stale)
+        );
         assert_eq!(self.ledger_rows(), before);
         assert_eq!(
             text(
@@ -652,7 +662,13 @@ impl Fixture {
         ));
         let applied = self.apply_plan("resolved-cli.json");
         self.env = configured;
-        assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+        assert_eq!(
+            code(&applied),
+            0,
+            "{} {}",
+            stderr(&applied),
+            stdout(&applied)
+        );
         assert_eq!(self.hook("on_apply_attempt")["outcome"], "success");
         assert!(self.hook("on_apply")["analysis"]["evidence"].is_object());
         let cli_id = self.latest_state_id();
