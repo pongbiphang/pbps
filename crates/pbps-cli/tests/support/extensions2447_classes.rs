@@ -545,6 +545,8 @@ fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
 fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed() {
     const TWO: &str = "CREATE SCHEMA IF NOT EXISTS ext; \
         CREATE EXTENSION pg_trgm SCHEMA ext; CREATE EXTENSION btree_gin SCHEMA ext";
+    // `DOCS` has an hstore column; this fixture installs no hstore, so it has its own table.
+    const TABLE: &str = "CREATE TABLE app.docs (id integer PRIMARY KEY, body text, n integer)";
     const INDEX: &str = "CREATE INDEX docs_two ON app.docs USING gin \
         (body ext.gin_trgm_ops, n ext.int4_ops)";
     servers(|server, slug| {
@@ -554,7 +556,7 @@ fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed()
             Kind::Supplied,
             TWO,
         );
-        adopted(&f, &format!("{DOCS}; {INDEX}"), &["pg_trgm", "btree_gin"]);
+        adopted(&f, &format!("{TABLE}; {INDEX}"), &["pg_trgm", "btree_gin"]);
         assert!(table_file(&f).contains("docs_two"), "{}", table_file(&f));
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
 
@@ -566,7 +568,7 @@ fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed()
                 Kind::Supplied,
                 TWO,
             );
-            on_server(g.target(), &format!("{DOCS}; {INDEX}"));
+            on_server(g.target(), &format!("{TABLE}; {INDEX}"));
             let notes = said(&pulled(&g, &[managed]));
             assert!(
                 notes.contains("docs_two")
