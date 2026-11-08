@@ -13,7 +13,8 @@ pub(crate) fn refused_endpoint() -> tokio::net::TcpSocket {
 fn a_reserved_endpoint_refuses_connections_without_listening() {
     let socket = refused_endpoint();
     let addr = socket.local_addr().expect("the reserved address");
-    let error = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1))
+    // Windows retries refused SYNs, so its refusal can take several seconds.
+    let error = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(30))
         .expect_err("an endpoint that never listens must refuse the dial");
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
 }
