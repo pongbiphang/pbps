@@ -5206,7 +5206,13 @@ fn cmd_plan(
         // reported as stale: running `pbps plan` would not help.
         // The tree is judged first: a layout that cannot exist must be named even
         // when the mapping also changed.
-        let tree_stale = ids_store::is_stale(project, &res.ids, &loaded)?;
+        let tree_stale = output::or_unanswerable_at(
+            "plan",
+            json,
+            "identity.unwritable",
+            project.ids_dir(),
+            ids_store::is_stale(project, &res.ids, &loaded),
+        )?;
         let stale = res.ids != ids || tree_stale;
         if stale && check {
             let message = format!(

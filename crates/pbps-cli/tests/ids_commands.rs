@@ -886,3 +886,39 @@ fn a_file_and_a_directory_at_one_identity_path_are_named_before_anything_is_writ
     // No aside is left behind.
     assert!(!p.0.join(".pbps/ids/.a.json.aside").exists());
 }
+
+#[test]
+fn the_identity_layout_refusal_is_one_json_envelope_for_plan_and_plan_check() {
+    let p = migrated();
+    // A clean tree still prints an ordinary report (negative case).
+    let clean = p.pbps(&["plan", "--check", "--format", "json"]);
+    assert_ok(&clean);
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert!(
+        !report.to_string().contains("identity.unwritable"),
+        "{report}"
+    );
+    // `a.yml` mirrors to `a.json`; `a.json/b.yml` to `a.json/b.json`.
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.yml"),
+        p.0.join("schema/a.yml"),
+    )
+    .unwrap();
+    p.write(
+        "schema/a.json/b.yml",
+        "table: dbo.extra\ncolumns:\n  id: {type: int}\n",
+    );
+    for args in [
+        &["plan", "--format", "json"][..],
+        &["plan", "--check", "--format", "json"][..],
+    ] {
+        let out = p.pbps(args);
+        assert!(!out.status.success(), "{args:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!("{args:?}: stdout is not one envelope ({e}): {}", text(&out))
+        });
+        let shown = envelope.to_string();
+        assert!(shown.contains("identity.unwritable"), "{args:?}: {shown}");
+        assert!(shown.contains("a.json/b.json"), "{args:?}: {shown}");
+    }
+}
