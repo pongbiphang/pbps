@@ -1396,6 +1396,7 @@ fn batch_query(identity: &str) -> String {
         ("roles", ROLES.to_owned(), "name"),
         ("extensions", crate::extension_provider::INSTALLED.to_owned(), "name"),
         ("types", crate::user_types::managed_query(), "schema, name"),
+        ("search", crate::search::query(), "kind, schema, name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
         ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
         ("routine_args", grant_routine_args_query(), "oid, pos"),
@@ -1620,6 +1621,10 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             .get("extensions")
             .ok_or_else(|| missing("extensions"))?,
     )?;
+    let (search, limits) =
+        crate::search::decode(batch.get("search").ok_or_else(|| missing("search"))?)?;
+    raw.search = search;
+    warnings.extend(limits);
     for row in batch.get("types").ok_or_else(|| missing("types"))? {
         // Without these query columns there is no identity to attribute a
         // limitation to. Their failure still means the query and reader differ.
@@ -5356,6 +5361,7 @@ mod tests {
             "modules",
             "module_args",
             "types",
+            "search",
             "extensions",
             "roles",
             "grants",

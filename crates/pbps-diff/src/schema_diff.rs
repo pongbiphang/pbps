@@ -52,6 +52,11 @@ pub enum DiffError {
         name: pbps_model::ObjectLocalName,
         reason: String,
     },
+    #[error("{}: {reason} (DEC-2728.1)", .name.shown())]
+    SearchRefused {
+        name: pbps_model::SearchRef,
+        reason: String,
+    },
     #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
     ExtensionLifecycleUnsupported {
         name: pbps_model::ObjectLocalName,
@@ -898,6 +903,7 @@ pub(crate) fn diff_partial_rebuilding(
         declared,
         dialect.name(),
     ));
+    diff_search(base.schema, declared.schema, &mut errs);
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
         errs.push(DiffError::ConversionsUnsupported {
             count: declared.ids.conversions.len(),
@@ -6623,6 +6629,33 @@ fn diff_constraints(
     errs: &mut Vec<DiffError>,
 ) {
     diff_constraints_by(name, base, declared, changes, errs, &IndexMethod::policy);
+}
+
+/// Text search configurations and dictionaries, by kind and name (DEC-2728.1).
+/// **Every difference is refused here, by name**: this part reads and holds them and plans
+/// nothing for them. Creating one arrives in the next part, and changing, renaming or
+/// dropping one after it, so a plan that would leave a declaration unmet, or give an
+/// object up, is refused rather than made without the change that says so. An object the
+/// target has and the declarations do not is not this project's, and is left alone.
+fn diff_search(
+    base: &pbps_model::Schema,
+    declared: &pbps_model::Schema,
+    errs: &mut Vec<DiffError>,
+) {
+    for (name, now) in &declared.search {
+        let reason = match base.search.get(name) {
+            Some(was) if was == now => continue,
+            Some(_) => {
+                "changing one arrives in a later part of #2728; for now it stands as the \
+                        target holds it"
+            }
+            None => "creating one arrives with the next part of #2728",
+        };
+        errs.push(DiffError::SearchRefused {
+            name: name.clone(),
+            reason: reason.to_owned(),
+        });
+    }
 }
 
 /// A table's exclusion constraints, by name (DEC-2448.3). **Every difference is
@@ -28930,5 +28963,78 @@ mod meeting_shape_tests {
                 }
             }
         }
+    }
+    /// A text search object the declarations hold is compared with the target's and every
+    /// difference is refused by name, since nothing plans them yet (DEC-2728.1): one the
+    /// target lacks, one it holds differently. An identical one is no difference, and one
+    /// only the target has is not this project's.
+    #[test]
+    fn every_difference_in_a_text_search_object_is_refused_and_an_unmanaged_one_is_left_alone() {
+        use pbps_model::{SearchKind, SearchObject, SearchRef};
+        let name = |kind, text: &str| SearchRef::new(kind, text.parse().unwrap());
+        let dictionary = |template: &str| SearchObject::Dictionary {
+            template: template.parse().unwrap(),
+            options: Default::default(),
+        };
+        let mut base = Schema::default();
+        let mut declared = Schema::default();
+        let same = name(SearchKind::Dictionary, "app.same");
+        base.search
+            .insert(same.clone(), dictionary("pg_catalog.simple"));
+        declared
+            .search
+            .insert(same, dictionary("pg_catalog.simple"));
+        // Only the target has it: not this project's.
+        base.search.insert(
+            name(SearchKind::Config, "app.theirs"),
+            SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: Default::default(),
+            },
+        );
+        let mut errs = Vec::new();
+        diff_search(&base, &declared, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        // Changed, and absent from the target.
+        let changed = name(SearchKind::Dictionary, "app.changed");
+        base.search
+            .insert(changed.clone(), dictionary("pg_catalog.simple"));
+        declared
+            .search
+            .insert(changed, dictionary("pg_catalog.synonym"));
+        declared.search.insert(
+            name(SearchKind::Dictionary, "app.new"),
+            dictionary("pg_catalog.simple"),
+        );
+        diff_search(&base, &declared, &mut errs);
+        let said: Vec<String> = errs.iter().map(ToString::to_string).collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|m| m.contains("app.changed") && m.contains("changing one")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("app.new") && m.contains("creating one")),
+            "{said:?}"
+        );
+        // Two kinds of one name are two objects: the configuration is absent though the
+        // dictionary of that name is held.
+        declared.search.insert(
+            name(SearchKind::Config, "app.same"),
+            SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: Default::default(),
+            },
+        );
+        let mut errs = Vec::new();
+        diff_search(&base, &declared, &mut errs);
+        assert!(
+            errs.iter().any(|e| e
+                .to_string()
+                .contains("text search configuration `app.same`")),
+            "{errs:?}"
+        );
     }
 }

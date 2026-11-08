@@ -223,11 +223,29 @@ static TABLES: &[(&str, Rows)] = &[
         (&["tgenabled"], Named("triggers that are disabled or set to REPLICA / ALWAYS are named")),
         (&["oid"], IDENTITY),
     ])),
-    ("pg_ts_config", Rows::All(Named("text search configurations: census notice (S7, #2728)"))),
-    ("pg_ts_config_map", Rows::All(Named("a text search configuration's mappings: the configuration is named by the census"))),
-    ("pg_ts_dict", Rows::All(Named("text search dictionaries: census notice (S7, #2728)"))),
-    ("pg_ts_parser", Rows::All(Named("text search parsers: census notice (S7)"))),
-    ("pg_ts_template", Rows::All(Named("text search templates: census notice (S7)"))),
+    ("pg_ts_config", Rows::Each(&[
+        (&["cfgname", "cfgnamespace", "cfgparser"], Held(None)),
+        (&["cfgowner"], OWNER),
+        (&["oid"], IDENTITY),
+    ])),
+    ("pg_ts_config_map", Rows::Each(&[
+        (&["mapcfg", "maptokentype", "mapseqno", "mapdict"], Held(None)),
+    ])),
+    ("pg_ts_dict", Rows::Each(&[
+        (&["dictname", "dictnamespace", "dicttemplate", "dictinitoption"], Held(None)),
+        (&["dictowner"], OWNER),
+        (&["oid"], IDENTITY),
+    ])),
+    ("pg_ts_parser", Rows::Each(&[
+        (&["prsname", "prsnamespace"], Held(None)),
+        (&["prsstart", "prstoken", "prsend", "prsheadline", "prslextype"], Named("text search parsers: census notice (S7)")),
+        (&["oid"], IDENTITY),
+    ])),
+    ("pg_ts_template", Rows::Each(&[
+        (&["tmplname", "tmplnamespace"], Held(None)),
+        (&["tmplinit", "tmpllexize"], Named("text search templates: census notice (S7)")),
+        (&["oid"], IDENTITY),
+    ])),
     ("pg_type", Rows::Each(&[
         (&["typname", "typnamespace", "typtype", "typrelid", "typelem", "typarray", "typbasetype", "typnotnull", "typtypmod", "typcollation", "typdefaultbin", "typacl", "typisdefined"], Held(None)),
         (&["oid"], IDENTITY),
@@ -444,6 +462,7 @@ mod tests {
             include_str!("roles.rs"),
             include_str!("partman.rs"),
             include_str!("extension_provider.rs"),
+            include_str!("search.rs"),
         ]
         .join("\n");
         let word = |token: &str| {

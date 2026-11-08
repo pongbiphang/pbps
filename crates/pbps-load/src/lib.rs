@@ -15,7 +15,9 @@ mod extensions;
 pub mod fmt;
 mod managed_types;
 pub mod project;
+mod search;
 pub use extensions::{LoadedExtension, load_extension_str, render_extension};
+pub use search::{LoadedSearch, load_search_str, render_search};
 
 use std::path::Path;
 
@@ -103,6 +105,7 @@ pub enum LoadedFile {
     Extension(Box<LoadedExtension>),
     Dependency(Box<LoadedDependency>),
     Type(Box<LoadedType>),
+    Search(Box<LoadedSearch>),
     Table(Box<LoadedTable>),
     Module(Box<LoadedModule>),
     Role(Box<LoadedRole>),
@@ -165,6 +168,9 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     if probe.enumeration.is_some() || probe.domain.is_some() {
         return load_type_str(path, text).map(|t| LoadedFile::Type(Box::new(t)));
     }
+    if probe.text_search_config.is_some() || probe.text_search_dictionary.is_some() {
+        return load_search_str(path, text).map(|s| LoadedFile::Search(Box::new(s)));
+    }
     if probe.table.is_some() {
         return load_table_str(path, text).map(|t| LoadedFile::Table(Box::new(t)));
     }
@@ -181,7 +187,8 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     Err(vec![LoadError::Yaml {
         path: path.to_owned(),
         message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:`, \
-                  `trigger:`, `extension:`, `role:`, `enum:`, `domain:` or `dependency:`"
+                  `trigger:`, `extension:`, `role:`, `enum:`, `domain:`, `text_search_config:`, \
+                  `text_search_dictionary:` or `dependency:`"
             .to_owned(),
     }])
 }
@@ -285,6 +292,8 @@ fn collect_files(
         std::collections::BTreeMap::new();
     let mut seen_types: std::collections::BTreeMap<pbps_model::TypeRef, std::path::PathBuf> =
         std::collections::BTreeMap::new();
+    let mut seen_search: std::collections::BTreeMap<pbps_model::SearchRef, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
     let mut seen_dependencies: std::collections::BTreeMap<
         pbps_model::dependency::DependencyName,
         std::path::PathBuf,
@@ -350,6 +359,19 @@ fn collect_files(
                         .insert(t.name.clone(), t.value_renames);
                 }
                 loaded.schema.types.insert(t.name, t.definition);
+                continue;
+            }
+            LoadedFile::Search(s) => {
+                if let Some(first) = seen_search.get(&s.name) {
+                    errs.push(already(&path, &s.name.shown().to_string(), first));
+                    continue;
+                }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Search(s.name.clone()),
+                    path.clone(),
+                );
+                seen_search.insert(s.name.clone(), path);
+                loaded.schema.search.insert(s.name, s.definition);
                 continue;
             }
             LoadedFile::Table(t) => {
@@ -449,6 +471,7 @@ fn collect_files(
             LoadedFile::Extension(_)
             | LoadedFile::Role(_)
             | LoadedFile::Type(_)
+            | LoadedFile::Search(_)
             | LoadedFile::Dependency(_) => {}
         }
     }
@@ -1718,6 +1741,7 @@ indexes:
             | LoadedFile::Module(_)
             | LoadedFile::Extension(_)
             | LoadedFile::Type(_)
+            | LoadedFile::Search(_)
             | LoadedFile::Dependency(_)) => {
                 panic!("not a role: {other:?}")
             }

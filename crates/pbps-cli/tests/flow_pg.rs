@@ -45,6 +45,8 @@ mod domain_defaults2537;
 
 #[path = "support/managed_types.rs"]
 mod managed_types;
+#[path = "support/text_search2728.rs"]
+mod text_search2728;
 
 #[path = "support/mixed_cast_defaults2456.rs"]
 mod mixed_cast_defaults2456;

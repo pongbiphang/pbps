@@ -32,6 +32,10 @@ pub struct KindProbe {
     #[serde(default)]
     pub domain: Option<String>,
     #[serde(default)]
+    pub text_search_config: Option<String>,
+    #[serde(default)]
+    pub text_search_dictionary: Option<String>,
+    #[serde(default)]
     pub table: Option<String>,
     #[serde(default)]
     pub view: Option<String>,
@@ -1528,7 +1532,8 @@ pub enum IndexOrder {
 // happened to be tried first. This type exists so the *schema* says what the
 // loader accepts, in one place, generated from the very structures it reads.
 
-/// One pbps declaration file: a table, module, role, enum or domain.
+/// One pbps declaration file: a table, module, role, enum, domain, or a text search
+/// configuration or dictionary.
 /// The leading key is both the kind and the name.
 #[derive(schemars::JsonSchema)]
 #[serde(untagged)]
@@ -1543,6 +1548,8 @@ pub enum DeclarationFile {
     Role(Box<RoleDto>),
     Enum(Box<EnumTypeDto>),
     Domain(Box<DomainTypeDto>),
+    SearchConfig(Box<SearchConfigDto>),
+    SearchDictionary(Box<SearchDictionaryDto>),
 }
 
 #[cfg(test)]
@@ -1621,6 +1628,36 @@ mod tests {
             "[Vv][Ii][Ee][Ww][-_ ][Dd][Ee][Ff][Ii][Nn][Ii][Tt][Ii][Oo][Nn]"
         );
     }
+}
+
+/// A PostgreSQL text search configuration: a parser and, per token type of that
+/// parser, the dictionaries tried in order (#2728). The leading key names it,
+/// qualified by its schema. It lives in its own namespace, so it may share a name with a
+/// dictionary or a domain.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfigDto {
+    pub text_search_config: String,
+    /// The parser, qualified by its schema. Only the built-in one,
+    /// `pg_catalog."default"`, is held.
+    pub parser: String,
+    /// Token type alias (`asciiword`) to the dictionaries tried for it, in order,
+    /// each qualified by its schema.
+    #[serde(default)]
+    pub mappings: BTreeMap<String, Vec<String>>,
+}
+
+/// A PostgreSQL text search dictionary: a template and its options (#2728).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchDictionaryDto {
+    pub text_search_dictionary: String,
+    /// The template, qualified by its schema. Only the built-in ones are held.
+    pub template: String,
+    /// The template's options, verbatim. A file-backed dictionary's file name is
+    /// one of them; the file itself is not held.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 /// Exact PostgreSQL package declaration. Rename is deliberately not a field.

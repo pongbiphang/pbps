@@ -1207,3 +1207,52 @@ they stay notices until a need appears.
 
 Formats: none. The notices are report-only strings, not part of a plan, state,
 schema set or evidence, and `plan.unheld-object` carries its message as text.
+
+<a id="dec-2728-1"></a>
+
+**DEC-2728.1. A text search configuration and dictionary are held and pulled, in a namespace of their own, and nothing plans them yet.**
+An expression index, a generated column or a check names a configuration by a
+string literal (`'app.docs'::regconfig`), so a pull that held the expression and
+not the configuration wrote declarations that could not be created in an empty
+database (#168 S7). This part holds and pulls them; creating, altering, renaming
+and dropping arrive in the parts that follow (#2728).
+
+- **A model of its own.** `Schema.search` is keyed by `SearchRef { kind, name }`,
+  not folded into `ManagedType`: the engine keeps configurations, dictionaries and
+  types in separate namespaces, and a configuration and a dictionary commonly share
+  a name (measured: `app.russian` as both, and as a domain, coexist). A declaration
+  is a file whose leading key is `text_search_config:` or `text_search_dictionary:`
+  (the pull writes `<schema>.<name>.textsearch-config.yml`, the kind in the name).
+- **What is held.** A configuration is its parser and, per token type, the
+  dictionaries in order, by the token's **alias** (`asciiword`), never its number. A
+  dictionary is its template and its options, verbatim as the catalog keeps the
+  values. Not held are system objects (`oid < 16384`), a package's members, and
+  anything over a parser or a template outside `pg_catalog`, which is built from C
+  functions or comes with a package. A configuration that maps a dictionary left out
+  is left out with it, never half held; a mapping to a system or a package dictionary
+  is held as that reference. The census names what is left out; one SQL text decides
+  "held" for the pull and the census, so an object is named exactly when it is not read.
+- **A copied configuration** (`COPY = english`) is a creation shorthand the catalog
+  does not keep; the pull holds the result, expanded.
+- **Validation** (`pbps-pg`, offline): the built-in parser and templates only, every
+  mapping alias a token type of the built-in parser, a dictionary at most once per
+  mapping. A dictionary the project does not declare is the target's to resolve.
+  SQL Server has no equivalent: the declaration is refused by name (`validate_search`
+  beside `validate_type`), as an `exclude:` block is.
+- **The differ refuses every difference by name**, as it did for exclusions: a
+  declared object the target lacks, or holds differently, is refused as arriving with a
+  later part. There is no `Change` and no plan bump. An object the target has and the
+  declarations do not is left alone.
+- **Known gap.** The objects have no identity until the part that creates them, so the
+  scoped read keeps every held object the database has: one created outside the
+  declarations after a baseline reads as drift in `verify` and `status`, where an
+  unmanaged table would not. The identities arrive with creation.
+- **Coverage (#168).** `pg_ts_config`, `pg_ts_config_map` and `pg_ts_dict` are held per
+  column; the parser and template names are held and their functions stay named. The
+  S7 notices for configurations and dictionaries, and their "cannot be created until
+  they are supported" consequence, are removed with the two live cases that asserted
+  them.
+
+Formats: state moves (a snapshot may hold `search`; an older one truthfully holds
+none), and the published declaration schema gains the two file kinds. The plan does
+not move.

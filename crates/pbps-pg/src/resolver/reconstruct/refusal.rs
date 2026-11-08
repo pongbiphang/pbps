@@ -204,6 +204,7 @@ pub fn declaration(owner: &Declaration) -> String {
         Declaration::Module(m) => format!("module {}", m.shown()),
         Declaration::Extension(e) => format!("extension {}", e.shown()),
         Declaration::Type(t) => format!("type {}", t.shown()),
+        Declaration::Search(s) => s.shown().to_string(),
         Declaration::Role(r) => format!("role {}", r.shown()),
     }
 }

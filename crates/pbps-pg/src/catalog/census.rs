@@ -72,9 +72,13 @@ pub(super) const QUERY: &str = concat!(
     UNION ALL
     SELECT 'pg_catalog.pg_tablespace'::regclass, oid, 'tablespace', false FROM pg_catalog.pg_tablespace
     UNION ALL
-    SELECT 'pg_catalog.pg_ts_config'::regclass, oid, 'text search configuration', false FROM pg_catalog.pg_ts_config
+    SELECT 'pg_catalog.pg_ts_config'::regclass, c.oid, 'text search configuration', "#,
+    crate::search::config_held!("c"),
+    r#" FROM pg_catalog.pg_ts_config c
     UNION ALL
-    SELECT 'pg_catalog.pg_ts_dict'::regclass, oid, 'text search dictionary', false FROM pg_catalog.pg_ts_dict
+    SELECT 'pg_catalog.pg_ts_dict'::regclass, d.oid, 'text search dictionary', "#,
+    crate::search::dictionary_held!("d"),
+    r#" FROM pg_catalog.pg_ts_dict d
     UNION ALL
     SELECT 'pg_catalog.pg_ts_parser'::regclass, oid, 'text search parser', false FROM pg_catalog.pg_ts_parser
     UNION ALL
@@ -104,19 +108,6 @@ SELECT o.kind, i.identity,
  WHERE NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = o.classid AND s.objid = o.oid)
 "#
 );
-
-/// What else a census object costs, where it is more than being absent.
-/// An expression index or a generated column can name a text search
-/// configuration, and the declarations pulled from here then fail in an empty
-/// database (#168).
-fn consequence(kind: &str) -> &'static str {
-    match kind {
-        "text search configuration" | "text search dictionary" => {
-            "; a declaration that names it cannot be created until they are supported (#2728)"
-        }
-        _ => "",
-    }
-}
 
 #[derive(Debug, Default)]
 pub(super) struct Notices {
@@ -156,9 +147,8 @@ pub(super) fn notices(rows: &[Value]) -> Result<Notices, DbError> {
         };
         if !system && !extension && !owned {
             let message = format!(
-                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison{}",
+                "{kind} `{}` is not held by this model; it is left out of the pull and schema comparison",
                 pbps_model::escape::Escaped(&identity),
-                consequence(&kind),
             );
             if let Some(name) = name {
                 out.extensions.insert(name.into(), message);

@@ -279,6 +279,21 @@ where
         .as_array_mut()
         .unwrap()
         .retain(|variant| variant["const"] != "gist" && variant["const"] != "brin");
+    // #2728 PR A adds the two text search file kinds (schema set 100); the captured
+    // declaration schema predates them.
+    declaration_schema["anyOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| {
+            variant["$ref"] != "#/$defs/SearchConfigDto"
+                && variant["$ref"] != "#/$defs/SearchDictionaryDto"
+        });
+    for definition in ["SearchConfigDto", "SearchDictionaryDto"] {
+        declaration_schema["$defs"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove(definition);
+    }
     // #2448 PR C1 adds a table's `exclude:` (schema set 94); the captured table
     // branch predates it.
     for definition in ["ExclusionDto", "ExclusionKeyDto", "InitiallyDto"] {

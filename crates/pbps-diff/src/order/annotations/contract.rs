@@ -56,6 +56,13 @@ fn containing(declaration: &Declaration) -> Result<ObjectRef, String> {
                 name.shown()
             ));
         }
+        // Text search objects take no dependency annotation until they are planned.
+        Declaration::Search(name) => {
+            return Err(format!(
+                "{} has no dependency annotation address yet",
+                name.shown()
+            ));
+        }
         Declaration::Table(n) => Root::Table(n.clone()),
         Declaration::Module(n) => Root::Module(n.clone()),
         Declaration::Type(n) => Root::Type(n.clone()),

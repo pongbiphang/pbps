@@ -80,6 +80,7 @@ fn fixture() -> Schema {
     view.options.indexes = t.indexes.clone();
     Schema {
         extensions: Default::default(),
+        search: Default::default(),
         tables: [("app.t".parse().unwrap(), t)].into(),
         types: [(
             "app.d".parse().unwrap(),

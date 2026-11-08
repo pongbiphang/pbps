@@ -186,6 +186,8 @@ pub enum LimitationTarget {
     /// Keep the catalog spelling even when the type-reference grammar cannot
     /// name it; types have a namespace distinct from relations and modules.
     Type(ObjectName),
+    /// A text search configuration or dictionary, whose namespace is its own (#2728).
+    Search(pbps_model::SearchRef),
     /// A module in a shared object namespace, even when its declaration also
     /// carries a trigger parent. The unreadable body cannot supply that parent.
     SharedModule(ObjectName),
@@ -212,7 +214,7 @@ impl LimitationTarget {
             Self::Relation(name) => matches!(id, pbps_model::ModuleId::Named(n) if n == name),
             Self::SharedModule(name) => *name == id.object_name(),
             Self::Module(module) => module == id,
-            Self::Type(_) | Self::UnnameableModule(_) => false,
+            Self::Type(_) | Self::Search(_) | Self::UnnameableModule(_) => false,
         }
     }
 
@@ -223,6 +225,7 @@ impl LimitationTarget {
             | Self::SharedModule(name)
             | Self::UnnameableModule(name) => name.clone(),
             Self::Module(id) => id.object_name(),
+            Self::Search(search) => ObjectName::new(search.name.schema(), search.name.name()),
         }
     }
 }
@@ -235,6 +238,7 @@ impl std::fmt::Display for LimitationTarget {
             | Self::SharedModule(name)
             | Self::UnnameableModule(name) => name.raw().fmt(f),
             Self::Module(id) => id.raw().fmt(f),
+            Self::Search(search) => std::fmt::Display::fmt(&search.raw(), f),
         }
     }
 }

@@ -51,6 +51,7 @@ pub mod engine_effects;
 pub mod extension_provider;
 mod index_policy;
 pub mod resolver;
+pub mod search;
 
 /// This engine's lexis, for the definition scanners (ADR-0011 Amendment 2):
 /// `"` quotes an identifier and `[` does not, `E'…'` is an escape string and
@@ -2913,6 +2914,15 @@ impl Dialect for Postgres {
         schema: &Schema,
     ) -> Vec<DialectError> {
         validate::role(name, role, schema)
+    }
+
+    fn validate_search(
+        &self,
+        name: &pbps_model::SearchRef,
+        definition: &pbps_model::SearchObject,
+        schema: &Schema,
+    ) -> Vec<DialectError> {
+        search::validate(name, definition, schema)
     }
 
     fn intermediate_tables(

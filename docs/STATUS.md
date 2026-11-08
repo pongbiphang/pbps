@@ -474,6 +474,7 @@ How each kind is handled today:
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read and round trip held, DEC-2448.3; add, drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
+| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create, alter, rename and drop next) | partly held | #2728 |
 
 ### Silent today (bugs)
 
@@ -506,7 +507,7 @@ column-used types are excluded. An unreadable catalog is an error.
 | Transforms | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Large objects | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Tablespaces beyond the two defaults | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
-| Text search configurations and dictionaries | [#2728](https://github.com/pongbiphang/pbps/issues/2728) |
+| Text search configurations and dictionaries over a custom parser or template, or provided by a package | [#2728](https://github.com/pongbiphang/pbps/issues/2728) |
 | Text search parsers and templates | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | Conversions | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | Foreign data wrappers, foreign servers and user mappings | [#168](https://github.com/pongbiphang/pbps/issues/168) |

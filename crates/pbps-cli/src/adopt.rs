@@ -379,6 +379,7 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
                 }
             }
             LimitationTarget::Type(_)
+            | LimitationTarget::Search(_)
             | LimitationTarget::SharedModule(_)
             | LimitationTarget::Module(_)
             | LimitationTarget::UnnameableModule(_) => {}
@@ -665,6 +666,12 @@ pub(crate) fn write_declarations_with_deps(
     for (name, definition) in &schema.types {
         let path = declaration_file::type_path(dir, name)?;
         std::fs::write(&path, pbps_load::render_type(name, definition))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
+    for (name, definition) in &schema.search {
+        let path = declaration_file::search_path(dir, name)?;
+        std::fs::write(&path, pbps_load::render_search(name, definition))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }

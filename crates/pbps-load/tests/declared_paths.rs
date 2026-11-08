@@ -108,6 +108,7 @@ fn only_declarations_that_carry_a_uid_have_a_path() {
             Declaration::Type(_) => "type",
             Declaration::Extension(_) => "extension",
             Declaration::Module(_) => "module",
+            Declaration::Search(_) => "search",
         })
         .collect();
     assert!(!kinds.contains(&"module"), "{kinds:?}");

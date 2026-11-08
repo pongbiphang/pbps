@@ -20,6 +20,17 @@ use crate::types::{self, DIALECT};
 /// SQL Server's limit on the number of key columns in one index.
 const MAX_INDEX_KEY_COLUMNS: usize = 32;
 
+/// A declared text search object. PostgreSQL has them; SQL Server's full-text search
+/// is configured by catalogs and stoplists that this tool does not hold, so the file
+/// is refused by name and the remedy (#2728). The loader is dialect-blind and cannot.
+pub(crate) fn search(name: &pbps_model::SearchRef) -> Vec<DialectError> {
+    vec![invalid(format!(
+        "`{}` declares a PostgreSQL text search object; SQL Server's full-text search is \
+         configured by catalogs and stoplists that this tool does not hold, so remove the file",
+        name.kind.key()
+    ))]
+}
+
 fn invalid(message: impl Into<String>) -> DialectError {
     DialectError::Invalid {
         dialect: DIALECT,
@@ -3606,6 +3617,47 @@ mod tests {
         assert!(
             said.iter().any(|m| m.contains("exclusion constraints")),
             "{said:?}"
+        );
+    }
+    /// A declared text search object is refused by name, with the remedy, whichever its
+    /// kind: SQL Server's full-text search is configured by catalogs and stoplists this tool
+    /// does not hold (#2728). The same dialect still validates a table with none.
+    #[test]
+    fn a_text_search_declaration_is_refused_for_sql_server_by_kind() {
+        use pbps_dialect::Dialect;
+        let dialect = crate::Mssql;
+        for (kind, key) in [
+            (pbps_model::SearchKind::Config, "text_search_config"),
+            (pbps_model::SearchKind::Dictionary, "text_search_dictionary"),
+        ] {
+            let name = pbps_model::SearchRef::new(kind, "dbo.docs".parse().unwrap());
+            let object = match kind {
+                pbps_model::SearchKind::Config => pbps_model::SearchObject::Config {
+                    parser: "pg_catalog.\"default\"".parse().unwrap(),
+                    mappings: Default::default(),
+                },
+                pbps_model::SearchKind::Dictionary => pbps_model::SearchObject::Dictionary {
+                    template: "pg_catalog.simple".parse().unwrap(),
+                    options: Default::default(),
+                },
+            };
+            let said: Vec<String> = dialect
+                .validate_search(&name, &object, &pbps_model::Schema::default())
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].contains(key) && said[0].contains("remove the file"),
+                "{said:?}"
+            );
+        }
+        // Negative: the dialect accepts a project with none (the table check is unchanged).
+        assert!(
+            dialect
+                .validate_table(&"dbo.t".parse().unwrap(), &pbps_model::Table::default())
+                .iter()
+                .all(|e| !e.to_string().contains("text_search"))
         );
     }
 }

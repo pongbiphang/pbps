@@ -414,6 +414,8 @@ pub struct RawCatalog {
     /// Extension census objects, classified against managed ids by the caller.
     pub extension_notices: BTreeMap<pbps_model::ObjectLocalName, String>,
     pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
+    /// Held text search configurations and dictionaries (#2728).
+    pub search: BTreeMap<pbps_model::SearchRef, pbps_model::SearchObject>,
     pub extensions: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
     pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
@@ -795,6 +797,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         ..Pulled::default()
     };
     pulled.schema.types = raw.types.clone();
+    pulled.schema.search = raw.search.clone();
     pulled.schema.extensions = raw.extensions.clone();
     // The package behind each held base-type reference, so that the caller
     // that selects the managed packages can leave a table out when its

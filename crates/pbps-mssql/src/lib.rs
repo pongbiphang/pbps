@@ -759,6 +759,17 @@ impl Dialect for Mssql {
         validate::role(name, role, schema)
     }
 
+    /// There is no equivalent: SQL Server's full-text search is configured by
+    /// catalogs and stoplists this tool does not hold (#2728).
+    fn validate_search(
+        &self,
+        name: &pbps_model::SearchRef,
+        _definition: &pbps_model::SearchObject,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
+        validate::search(name)
+    }
+
     /// A SQL Server database role is scoped to the database this connection
     /// names, so it is the tool's to create, rename and drop (ADR-0005) —
     /// today's answer, kept (ADR-0010 §3, DECISIONS 211).
