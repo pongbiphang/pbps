@@ -10,163 +10,16 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const SOURCES: [&str; 5] = [
-    "TRACE2488_PRIVATE_VIEW_s5C8",
-    "TRACE2488_PRIVATE_ROUTINE_d9E2",
-    "TRACE2488_PRIVATE_TRIGGER_k7H4",
-    "TRACE2488_PRIVATE_CHECK_m3J6",
-    "TRACE2488_PRIVATE_DEFAULT_p8L1",
-];
-const DICTIONARY: [&str; 3] = [
-    "TRACE2488_PRIVATE_CHOICE_red",
-    "TRACE2488_PRIVATE_CHOICE_amber",
-    "TRACE2488_PRIVATE_CHOICE_green",
-];
+#[path = "trace/collector.rs"]
+mod collector;
+use collector::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Sink {
-    Stdout,
-    Stderr,
-    Artifact,
-    Plan,
-    Sql,
-    Ledger,
-    Snapshot,
-    HookArgv,
-    HookEnvironment,
-    HookStdin,
-    Ui,
-}
+#[path = "trace/left_container.rs"]
+pub mod left_container;
 
-const SINKS: [Sink; 11] = [
-    Sink::Stdout,
-    Sink::Stderr,
-    Sink::Artifact,
-    Sink::Plan,
-    Sink::Sql,
-    Sink::Ledger,
-    Sink::Snapshot,
-    Sink::HookArgv,
-    Sink::HookEnvironment,
-    Sink::HookStdin,
-    Sink::Ui,
-];
-
-#[derive(Default)]
-struct Trace {
-    forbidden: BTreeSet<Vec<u8>>,
-    seen: BTreeSet<Sink>,
-}
-
-impl Trace {
-    fn new() -> Self {
-        let mut trace = Self::default();
-        for value in SOURCES.into_iter().chain(DICTIONARY) {
-            trace.candidate(value.as_bytes());
-        }
-        trace
-    }
-
-    fn candidate(&mut self, value: &[u8]) {
-        assert!(!value.is_empty());
-        let digest = Sha256::digest(value);
-        self.forbidden.insert(value.to_vec());
-        self.forbidden.insert(format!("{digest:x}").into_bytes());
-        self.forbidden.insert(format!("{digest:X}").into_bytes());
-        self.forbidden.insert(
-            base64::engine::general_purpose::STANDARD
-                .encode(digest)
-                .into_bytes(),
-        );
-    }
-
-    fn check(&mut self, sink: Sink, bytes: &[u8]) -> Result<(), String> {
-        self.seen.insert(sink);
-        // Patterns are UTF-8 fixture definitions or ASCII verifiers. Lossy
-        // decoding preserves each pattern even in an otherwise binary artifact.
-        let text = String::from_utf8_lossy(bytes);
-        if self
-            .forbidden
-            .iter()
-            .any(|value| text.contains(std::str::from_utf8(value).unwrap()))
-        {
-            // Even an assertion failure must not echo a captured definition.
-            Err(format!(
-                "private definition or unkeyed verifier reached {sink:?}"
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn collect(&mut self, sink: Sink, bytes: &[u8]) {
-        self.check(sink, bytes).unwrap();
-    }
-
-    fn output(&mut self, output: &Output) {
-        self.collect(Sink::Stdout, &output.stdout);
-        self.collect(Sink::Stderr, &output.stderr);
-    }
-
-    fn artifact(&mut self, sink: Sink, path: &Path) -> Vec<u8> {
-        let bytes = std::fs::read(path).unwrap();
-        self.collect(Sink::Artifact, &bytes);
-        if sink != Sink::Artifact {
-            self.collect(sink, &bytes);
-        }
-        bytes
-    }
-
-    fn rows(&mut self, raw: &str) {
-        self.collect(Sink::Ledger, raw.as_bytes());
-        let rows: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
-        assert!(!rows.is_empty());
-        for row in rows {
-            self.collect(
-                Sink::Snapshot,
-                row["state_json"].as_str().unwrap().as_bytes(),
-            );
-        }
-    }
-
-    fn ui(&mut self, bytes: &[u8]) {
-        self.collect(Sink::Ui, bytes);
-    }
-
-    fn files(&mut self, root: &Path) {
-        for entry in std::fs::read_dir(root).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let kind = entry.file_type().unwrap();
-            if kind.is_dir() {
-                self.files(&path);
-            } else if kind.is_file() {
-                let bytes = self.artifact(Sink::Artifact, &path);
-                match path.extension().and_then(|s| s.to_str()) {
-                    Some("stdout") => self.collect(Sink::Stdout, &bytes),
-                    Some("stderr") => self.collect(Sink::Stderr, &bytes),
-                    Some("argv") => self.collect(Sink::HookArgv, &bytes),
-                    Some("environment") => self.collect(Sink::HookEnvironment, &bytes),
-                    Some("stdin") => self.collect(Sink::HookStdin, &bytes),
-                    _ => {}
-                }
-            } else {
-                panic!(
-                    "trace cannot inspect a non-regular artifact at {}",
-                    path.display()
-                );
-            }
-        }
-    }
-
-    fn complete(&self) {
-        assert_eq!(
-            self.seen,
-            SINKS.into_iter().collect(),
-            "unobserved output sink"
-        );
-    }
-}
+#[path = "trace/recheck.rs"]
+mod recheck;
+use recheck::RecheckTarget;
 
 #[test]
 fn every_sink_rejects_planted_plaintext_and_all_dictionary_verifiers() {
@@ -717,18 +570,14 @@ impl Fixture {
             .output()
             .unwrap();
         self.env = before;
-        let id = std::fs::read_to_string(created).unwrap();
+        let id = std::fs::read_to_string(&created).unwrap();
         let id = id.trim();
         assert!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_disposal_attempts(&std::fs::read_to_string(attempted).unwrap(), id);
-        assert!(
-            Command::new(&real)
-                .args(["rm", "--force", "--volumes", id])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        // A later run's recovery sweep may be removing it (#2652): `rm` then
+        // exits 1, "already in progress". What matters is that it and its
+        // volumes are gone.
+        left_container::remove_captured_container(&real, id, &created);
         self.trace.output(&output);
         self.trace.files(&self.d.dir);
         assert_ne!(code(&output), 0);
@@ -746,7 +595,8 @@ impl Fixture {
         // lineage is checked before any catalog or ledger is trusted there.
         let other = OwnDatabase::new(&alternate, &self.slug);
         let primary_sessions = if docker { 3 } else { 2 };
-        let proxy = RecheckTarget::new(self.own.connection(), other.connection(), primary_sessions);
+        let proxy =
+            RecheckTarget::from_pg(self.own.connection(), other.connection(), primary_sessions);
         let before = self.env.clone();
         self.env
             .iter_mut()
@@ -809,16 +659,7 @@ impl Fixture {
     }
 
     fn launcher(&self) -> PathBuf {
-        let path = self.d.dir.join("ui-launcher.sh");
-        let mut script = String::from("#!/bin/sh\nset -eu\n");
-        for (key, value) in &self.env {
-            script.push_str(&format!("export {key}={}\n", quoted(value)));
-        }
-        // Client deliberately drops stderr; preserve both real streams before
-        // it does. Trigger's bounded browser payload cannot hide a late leak.
-        script.push_str(&format!("set +e\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(BIN)));
-        executable(&path, &script);
-        path
+        capture_launcher(&self.d.dir, Path::new(BIN), &self.env)
     }
 
     fn ui_plan(&mut self, file: &str, apply: bool) {
@@ -868,9 +709,7 @@ impl Fixture {
             View::Timeline("prod".into()),
             View::Docs,
         ] {
-            let payload = client.read(&view).unwrap();
-            self.trace.ui(&payload);
-            self.trace.files(&self.d.dir);
+            read_ui(&mut self.trace, &client, &self.d.dir, &view);
         }
     }
 
@@ -940,29 +779,6 @@ impl Fixture {
     }
 }
 
-fn ui_child_wait(
-    slowest: Duration,
-    elapsed: Duration,
-    action: &str,
-    last: &serde_json::Value,
-) -> Duration {
-    // Resolver commands slow down with the host. Allow several times an earlier
-    // command's cost, but keep a hung child bounded even after a very slow step.
-    let budget = slowest
-        .saturating_mul(3)
-        .clamp(Duration::from_secs(180), Duration::from_secs(600));
-    assert!(
-        elapsed < budget,
-        "{action}: UI child never completed after {elapsed:?} (budget {budget:?}, slowest earlier command {slowest:?}); last state: ended={}, code={}, truncated={}, stdout_bytes={}, stderr_bytes={}",
-        last["ended"],
-        last["code"],
-        last["truncated"],
-        last["stdout"].as_str().map(str::len).unwrap_or(0),
-        last["stderr"].as_str().map(str::len).unwrap_or(0),
-    );
-    budget
-}
-
 #[test]
 fn ui_child_wait_scales_with_observed_commands_and_caps_the_budget() {
     for (slowest, expected) in [
@@ -1030,30 +846,8 @@ fn ui_child_timeout_reports_the_last_state_without_captured_text() {
     assert!(!message.contains(SOURCES[0]) && !message.contains(DICTIONARY[0]));
 }
 
-struct OfflineExport(PathBuf);
-
-impl Drop for OfflineExport {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Route only the publication session to another real cluster (DEC-1685.1).
-/// The planner and resolver each open a target session first; Docker acquisition
-/// also binds its target before the resolver runs. The following session is
-/// the fresh publication recheck. Bytes are forwarded unchanged in both
-/// directions: a manufactured protocol reply would not test this boundary.
-struct RecheckTarget {
-    address: std::net::SocketAddr,
-    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
 impl RecheckTarget {
-    fn new(primary: &str, alternate: &str, primary_sessions: usize) -> Self {
-        use std::net::{Shutdown, TcpListener, TcpStream};
-        use std::sync::atomic::Ordering;
+    fn from_pg(primary: &str, alternate: &str, primary_sessions: usize) -> Self {
         let endpoint = |connection: &str| {
             let field = |prefix: &str| {
                 connection
@@ -1066,48 +860,7 @@ impl RecheckTarget {
         };
         let primary = endpoint(primary);
         let alternate = endpoint(alternate);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen = count.clone();
-        let stopped = stop.clone();
-        let thread = std::thread::spawn(move || {
-            let mut copies = Vec::new();
-            for client in listener.incoming() {
-                let mut client = client.unwrap();
-                if stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let index = seen.fetch_add(1, Ordering::AcqRel);
-                let destination = if index < primary_sessions {
-                    &primary
-                } else {
-                    &alternate
-                };
-                let mut server =
-                    TcpStream::connect((destination.0.as_str(), destination.1)).unwrap();
-                let mut client_read = client.try_clone().unwrap();
-                let mut server_write = server.try_clone().unwrap();
-                copies.push(std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut client_read, &mut server_write);
-                    let _ = server_write.shutdown(Shutdown::Write);
-                }));
-                copies.push(std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut server, &mut client);
-                    let _ = client.shutdown(Shutdown::Write);
-                }));
-            }
-            for copy in copies {
-                copy.join().unwrap();
-            }
-        });
-        Self {
-            address,
-            count,
-            stop,
-            thread: Some(thread),
-        }
+        Self::new(primary, alternate, primary_sessions)
     }
 
     fn connection(&self, original: &str) -> String {
@@ -1117,117 +870,6 @@ impl RecheckTarget {
             .collect::<Vec<_>>()
             .join(" ");
         format!("host=127.0.0.1 port={} {retained}", self.address.port())
-    }
-}
-
-impl Drop for RecheckTarget {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        let _ = std::net::TcpStream::connect(self.address);
-        let result = self.thread.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
-    }
-}
-
-// Use the public HTTP boundary: Trigger is intentionally private to the UI.
-// The idle listener lives only until this integration-test process exits.
-struct Ui {
-    address: String,
-    token: String,
-}
-
-impl Ui {
-    fn new(executable: PathBuf, project: PathBuf) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let viewer = pbps_ui::Viewer::bind(pbps_ui::Config {
-                executable,
-                project,
-                token: [0x48; 32],
-                docs_style_hash: "A".repeat(44),
-            })
-            .unwrap();
-            sender.send(viewer.url()).unwrap();
-            viewer.serve().unwrap();
-        });
-        let url = receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        let (address, token) = url
-            .strip_prefix("http://")
-            .unwrap()
-            .split_once("/#")
-            .unwrap();
-        Self {
-            address: address.into(),
-            token: token.into(),
-        }
-    }
-
-    fn answer(&mut self, action: &str, body: &[u8]) -> Vec<u8> {
-        use std::io::{Read as _, Write as _};
-        let mut stream = std::net::TcpStream::connect(&self.address).unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(90)))
-            .unwrap();
-        write!(stream, "POST /api/trigger/{action} HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nX-Pbps-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", self.address, self.address, self.token, body.len()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
-        assert!(
-            response.starts_with(b"HTTP/1.1 200 "),
-            "UI refused the test request"
-        );
-        let split = response.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
-        response[split..].to_vec()
-    }
-}
-
-const DISPOSAL_SHIM: &str = r#"#!/bin/sh
-set -eu
-if [ "$1" = run ]; then
-  set +e
-  "$PBPS_TRACE_DOCKER_REAL" "$@" > "$PBPS_TRACE_CREATED"
-  pbps_trace_status=$?
-  set -e
-  cat "$PBPS_TRACE_CREATED"
-  exit "$pbps_trace_status"
-fi
-if [ "$1" = rm ]; then
-  # Recovery precedes this run opening its capture (DEC-2410.3). Once opened,
-  # even an empty capture keeps every target subject to the disposal assertion.
-  # Recorder-only controls omit CREATED and always exercise recording.
-  if [ -n "${PBPS_TRACE_CREATED:-}" ] && [ ! -e "$PBPS_TRACE_CREATED" ]; then
-    exec "$PBPS_TRACE_DOCKER_REAL" "$@"
-  fi
-  # Drop may record another attempt while the parent reads this append-only log.
-  printf '%s\n' "$@" "" >> "$PBPS_TRACE_ATTEMPTED"
-  echo 'forced trace Docker disposal failure' >&2
-  exit 1
-fi
-exec "$PBPS_TRACE_DOCKER_REAL" "$@"
-"#;
-
-fn assert_disposal_attempts(recorded: &str, id: &str) {
-    // A blank line commits one argv record; a late writer may still be appending.
-    let (complete, _) = recorded
-        .rsplit_once("\n\n")
-        .expect("at least one disposal attempt must be recorded");
-    assert!(
-        !complete.is_empty(),
-        "at least one disposal attempt must be recorded"
-    );
-    for attempt in complete.split("\n\n") {
-        let mut args = attempt.split('\n');
-        assert_eq!(args.next(), Some("rm"));
-        let removed = args.filter(|v| !v.starts_with('-')).collect::<Vec<_>>();
-        assert_eq!(
-            removed,
-            [id],
-            "cleanup must target exactly this run's new container"
-        );
     }
 }
 
@@ -1248,99 +890,6 @@ fn disposal_records_require_at_least_one_attempt_and_only_the_owned_container() 
     ] {
         assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&recorded, "owned")).is_err());
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn disposal_control_separates_prior_recovery_from_the_new_runs_cleanup() {
-    let dir = Demo::new("trace2560-recovery");
-    let shim = dir.dir.join("docker");
-    let created = dir.dir.join("disposal.created");
-    let attempted = dir.dir.join("disposal.attempted");
-    let forwarded = dir.dir.join("forwarded");
-    let id = "a".repeat(64);
-    let prior = "b".repeat(64);
-    std::fs::write(&shim, DISPOSAL_SHIM).unwrap();
-    // The real-runtime stand-in is an interpreter reading these files. No
-    // daemon-visible orphan or freshly written executable is involved.
-    std::fs::write(
-        dir.dir.join("run"),
-        "printf '%s\\n' run \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
-         printf '%s\\n' \"$PBPS_TRACE_CONTROL_ID\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.dir.join("rm"),
-        "printf '%s\\n' rm \"$@\" \"\" >> \"$PBPS_TRACE_FORWARDED\"\n\
-         exit \"${PBPS_TRACE_CONTROL_STATUS:-0}\"\n",
-    )
-    .unwrap();
-    let command = |args: &[&str]| {
-        let mut command = Command::new("sh");
-        command
-            .arg(&shim)
-            .args(args)
-            .current_dir(&dir.dir)
-            .env("PBPS_TRACE_DOCKER_REAL", "sh")
-            .env("PBPS_TRACE_CREATED", &created)
-            .env("PBPS_TRACE_ATTEMPTED", &attempted)
-            .env("PBPS_TRACE_FORWARDED", &forwarded)
-            .env("PBPS_TRACE_CONTROL_ID", &id)
-            .env("PBPS_TRACE_CONTROL_STATUS", "0");
-        command
-    };
-    let prior_rm = ["rm", "--force", "--volumes", &prior];
-    // An opened but empty capture is already the current run's phase. It
-    // must not turn a foreign cleanup into unobserved recovery.
-    std::fs::write(&created, "").unwrap();
-    assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
-    let record = std::fs::read_to_string(&attempted).unwrap();
-    assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
-    assert_eq!(
-        std::fs::read_to_string(&forwarded).unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    std::fs::remove_file(&created).unwrap();
-    std::fs::remove_file(&attempted).unwrap();
-
-    assert!(command(&prior_rm).output().unwrap().status.success());
-    assert_eq!(
-        command(&prior_rm)
-            .env("PBPS_TRACE_CONTROL_STATUS", "37")
-            .output()
-            .unwrap()
-            .status
-            .code(),
-        Some(37),
-        "recovery preserves the real runtime's failure status"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&attempted).unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    let run = command(&["run", "--detach", "fixture-image"])
-        .output()
-        .unwrap();
-    assert!(run.status.success());
-    assert_eq!(stdout(&run), format!("{id}\n"));
-    assert_eq!(
-        std::fs::read_to_string(&created).unwrap(),
-        format!("{id}\n")
-    );
-    let recovery = format!("rm\n--force\n--volumes\n{prior}\n\n");
-    let before = std::fs::read_to_string(&forwarded).unwrap();
-    assert_eq!(
-        before,
-        format!("{recovery}{recovery}run\n--detach\nfixture-image\n\n")
-    );
-
-    let own_rm = ["rm", "--force", "--volumes", &id];
-    assert_eq!(command(&own_rm).output().unwrap().status.code(), Some(1));
-    assert_disposal_attempts(&std::fs::read_to_string(&attempted).unwrap(), &id);
-    assert_eq!(command(&prior_rm).output().unwrap().status.code(), Some(1));
-    let record = std::fs::read_to_string(&attempted).unwrap();
-    assert!(std::panic::catch_unwind(|| assert_disposal_attempts(&record, &id)).is_err());
-    assert_eq!(std::fs::read_to_string(&forwarded).unwrap(), before);
 }
 
 #[cfg(unix)]
@@ -1426,28 +975,6 @@ fn disposal_records_survive_a_blocked_late_writer() {
     assert_eq!(after.matches("\n\n").count(), 2);
 }
 
-fn quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn executable(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-}
-
-fn has_namespace(object: &serde_json::Value, namespace: &str) -> bool {
-    object["name"]
-        .as_array()
-        .is_some_and(|names| names.first().and_then(|v| v.as_str()) == Some(namespace))
-        || object["signature"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|o| has_namespace(o, namespace)))
-}
-
 fn retained_classes(plan: &serde_json::Value) {
     let records = plan["analysis"]["evidence"]["before"]["prerequisites"]
         .as_array()
@@ -1464,29 +991,6 @@ fn retained_classes(plan: &serde_json::Value) {
                 .iter()
                 .any(|r| r["object"]["class"] == class && has_namespace(&r["object"], "ext")),
             "the fixture did not capture {class}"
-        );
-    }
-}
-
-fn keyed_records_differ(first: &serde_json::Value, second: &serde_json::Value) {
-    let before = |plan: &serde_json::Value| plan["analysis"]["evidence"]["before"].clone();
-    let a = before(first);
-    let b = before(second);
-    assert_ne!(a["key_id"], b["key_id"]);
-    let records = b["prerequisites"].as_array().unwrap();
-    for record in a["prerequisites"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| has_namespace(&r["object"], "ext"))
-    {
-        let other = records
-            .iter()
-            .find(|r| r["object"] == record["object"])
-            .unwrap();
-        assert_ne!(
-            record["properties"], other["properties"],
-            "a retained property became a key-independent guessing oracle"
         );
     }
 }

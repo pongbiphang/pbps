@@ -13,6 +13,9 @@ use std::process::{Command, Output};
 #[path = "support/stand_in.rs"]
 mod stand_in;
 
+#[path = "support/trace_mssql.rs"]
+mod trace2488;
+
 #[cfg(test)]
 #[path = "../../pbps-diff/tests/support/role_order.rs"]
 mod role_order_oracle;
