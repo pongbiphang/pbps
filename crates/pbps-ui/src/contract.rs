@@ -121,6 +121,8 @@ pub struct Explanation {
     pub approve_with: String,
     pub plan_path: Option<String>,
     pub probes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_requirements: Vec<String>,
     pub unchecked: Vec<Unchecked>,
     pub statement_count: usize,
     pub target: Option<Target>,
@@ -130,6 +132,9 @@ pub struct Explanation {
     /// A plan's sealed rehearsal record (#2379); absent when never asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rehearsal: Option<Rehearsal>,
+    // These are observations made while planning; absence claims no checks ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_assertions: Vec<TargetAssertion>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -206,6 +211,11 @@ pub struct Resolver {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_notice: Option<String>,
     pub outside_writes: String,
+    // SQL Server reports this policy; PostgreSQL omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<ResolverDependency>,
     pub rule: String,
     pub key_id: String,
     pub sealed: Vec<String>,
@@ -213,6 +223,29 @@ pub struct Resolver {
     pub surfaces: Vec<ResolverSurface>,
     pub order: Vec<ResolverOrder>,
     pub prerequisites: Vec<ResolverPrerequisite>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverDependency {
+    pub name: String,
+    pub placement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetAssertion {
+    pub path: String,
+    pub sha256: String,
+    pub outcome: AssertionOutcome,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionOutcome {
+    Pass,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -442,6 +475,114 @@ mod tests {
         assert!(parse("status", &serde_json::to_vec(&unknown_finding).unwrap(), 0).is_err());
         assert!(parse("status", b"not JSON", 1).is_err());
         assert!(parse("apply", b"{}", 0).is_err());
+    }
+
+    fn resolver_detail() -> serde_json::Value {
+        json!({"entry":"scratch", "scratch":"server", "layout":"run-owned",
+            "outside_writes":"refused", "rule":"rule", "key_id":"key", "sealed":[],
+            "limitations":[], "surfaces":[], "order":[], "prerequisites":[]})
+    }
+
+    #[test]
+    fn same_instance_policy_is_optional_without_relaxing_the_resolver_contract() {
+        let legacy = resolver_detail();
+        for policy in [None, Some("refused"), Some("allowed")] {
+            let mut value = legacy.clone();
+            if let Some(policy) = policy {
+                value["same_instance"] = json!(policy);
+            }
+            let parsed: Resolver = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+        let mut wrong_type = legacy.clone();
+        wrong_type["same_instance"] = json!(true);
+        assert!(serde_json::from_value::<Resolver>(wrong_type).is_err());
+        let mut unknown = legacy;
+        unknown["unknown_policy"] = json!("allowed");
+        assert!(serde_json::from_value::<Resolver>(unknown).is_err());
+    }
+
+    #[test]
+    fn resolver_dependency_placements_retain_shapes_and_strict_fields() {
+        for (placement, shape) in [
+            ("bound", None),
+            ("companion", Some("compared")),
+            ("companion", Some("declared, not compared")),
+        ] {
+            let mut dependency = json!({"name":"other.dbo.t", "placement":placement});
+            if let Some(shape) = shape {
+                dependency["shape"] = json!(shape);
+            }
+            let mut value = resolver_detail();
+            value["dependencies"] = json!([dependency]);
+            let parsed: Resolver = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+            for (pointer, bad) in [
+                ("/dependencies", json!({})),
+                ("/dependencies/0/name", json!([])),
+                ("/dependencies/0/shape", json!(true)),
+            ] {
+                let mut wrong = value.clone();
+                if pointer.ends_with("/shape") {
+                    wrong["dependencies"][0]["shape"] = json!("compared");
+                }
+                *wrong
+                    .pointer_mut(pointer)
+                    .unwrap_or_else(|| panic!("missing control location {pointer}")) = bad;
+                assert!(serde_json::from_value::<Resolver>(wrong).is_err());
+            }
+            let mut unknown = value;
+            unknown["dependencies"][0]["new_field"] = json!(true);
+            assert!(serde_json::from_value::<Resolver>(unknown).is_err());
+        }
+    }
+
+    #[test]
+    fn mssql_explanations_keep_reviewed_drop_and_assertion_details() {
+        let mut resolver = resolver_detail();
+        resolver["same_instance"] = json!("refused");
+        resolver["dependencies"] = json!([{"name":"other.dbo.t", "placement":"bound"}]);
+        let base = json!({"schema_version":1,"tool_version":"0.0.0","command":"explain",
+            "result":"ok","findings":[],"data":{"applyable":true,"dialect":"mssql",
+            "created_at":"now","baseline":"prod","mode":"transactional","checksum":"c",
+            "change_count":1,"table_count":1,"module_count":0,"role_count":0,"risks":[],
+            "approve_with":"pbps apply","probes":[],"unchecked":[],"statement_count":1,
+            "resolver":resolver,"drop_requirements":["dbo.t must be empty"],
+            "target_assertions":[{"path":"checks/empty.sql","sha256":"a".repeat(64),"outcome":"pass"}]}});
+        let served = parse("explain", &serde_json::to_vec(&base).unwrap(), 0).unwrap();
+        let served: serde_json::Value = serde_json::from_slice(&served).unwrap();
+        for field in ["drop_requirements", "target_assertions", "resolver"] {
+            assert_eq!(served["data"][field], base["data"][field]);
+        }
+        let mut legacy = base.clone();
+        for field in ["drop_requirements", "target_assertions"] {
+            legacy["data"].as_object_mut().unwrap().remove(field);
+        }
+        for field in ["same_instance", "dependencies"] {
+            legacy["data"]["resolver"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let served = parse("explain", &serde_json::to_vec(&legacy).unwrap(), 0).unwrap();
+        let served: serde_json::Value = serde_json::from_slice(&served).unwrap();
+        assert!(served["data"].get("drop_requirements").is_none());
+        assert!(served["data"].get("target_assertions").is_none());
+        assert!(served["data"]["resolver"].get("same_instance").is_none());
+        assert!(served["data"]["resolver"].get("dependencies").is_none());
+        for (pointer, bad) in [
+            ("/data/drop_requirements", json!([true])),
+            ("/data/target_assertions", json!({})),
+            ("/data/target_assertions/0/sha256", json!(7)),
+            ("/data/target_assertions/0/outcome", json!("violation")),
+        ] {
+            let mut wrong = base.clone();
+            *wrong.pointer_mut(pointer).unwrap() = bad;
+            assert!(parse("explain", &serde_json::to_vec(&wrong).unwrap(), 0).is_err());
+        }
+        let mut unknown = base;
+        unknown["data"]["target_assertions"][0]["rows"] = json!(0);
+        assert!(parse("explain", &serde_json::to_vec(&unknown).unwrap(), 0).is_err());
     }
 
     #[test]
