@@ -194,6 +194,14 @@ impl TreeWrite {
         // Every directory this write creates, outermost first: only those are
         // taken away again on a failure.
         let mut created: Vec<PathBuf> = Vec::new();
+        // Names a temp file or an aside must not take: every planned
+        // destination and each of its ancestors (a declaration may be called
+        // `.a.json.tmp/b.yml`), on top of what already exists on disk.
+        let mut reserved: BTreeSet<PathBuf> = self
+            .files
+            .keys()
+            .flat_map(|rel| Path::new(rel).ancestors().map(|a| self.dir.join(a)))
+            .collect();
         let result = (|| -> anyhow::Result<()> {
             for (rel, text) in &self.files {
                 let path = self.dir.join(rel);
@@ -207,7 +215,7 @@ impl TreeWrite {
                 {
                     ancestor.push(part);
                     if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| !m.is_dir()) {
-                        set_aside(&ancestor, &mut asides)?;
+                        set_aside(&ancestor, &mut asides, &mut reserved)?;
                     }
                 }
                 let mut missing: Vec<PathBuf> = parent
@@ -219,8 +227,7 @@ impl TreeWrite {
                 created.extend(missing);
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let tmp = parent.join(format!(".{name}.tmp"));
+                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", &mut reserved);
                 // Recorded before the write: `write` can create the file and
                 // then fail (no space, an I/O error), and the rollback must
                 // find what the call may have left.
@@ -243,7 +250,7 @@ impl TreeWrite {
             // way round).
             let mut displaced = None;
             if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-                set_aside(path, &mut asides)?;
+                set_aside(path, &mut asides, &mut reserved)?;
                 displaced = asides.last().cloned();
             }
             if let Err(e) = std::fs::rename(tmp, path) {
@@ -392,15 +399,12 @@ fn roll_back(
 }
 
 /// Renames `path` to an unused `.<name>.aside` sibling and records the pair.
-fn set_aside(path: &Path, asides: &mut Vec<(PathBuf, PathBuf)>) -> anyhow::Result<()> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let mut aside = parent.join(format!(".{name}.aside"));
-    let mut n = 1;
-    while std::fs::symlink_metadata(&aside).is_ok() {
-        aside = parent.join(format!(".{name}.aside{n}"));
-        n += 1;
-    }
+fn set_aside(
+    path: &Path,
+    asides: &mut Vec<(PathBuf, PathBuf)>,
+    reserved: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    let aside = crate::ids_cmd::unused_sibling(path, "aside", reserved);
     std::fs::rename(path, &aside).with_context(|| {
         format!(
             "cannot move `{}` aside to make room for the identity file that takes its place",

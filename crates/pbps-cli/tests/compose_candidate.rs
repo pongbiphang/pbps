@@ -487,6 +487,31 @@ fn a_dropped_table_replaced_at_its_yaml_path_previews_with_its_identity_set_asid
 }
 
 #[test]
+fn a_dropped_role_replaced_at_its_yaml_path_previews_with_its_identity_set_aside() {
+    let repo = Repository::new("drop-role-replaced", "");
+    fs::write(repo.project.join("schema/r.yml"), "role: app_reader\n").unwrap();
+    checked(repo.cli(&["plan"]));
+    repo.commit();
+    // Another role is declared where the dropped one was: its identity file
+    // takes the mirrored path and the old one goes to `<name>.<uid>.json`.
+    fs::write(repo.project.join("schema/r.yml"), "role: app_writer\n").unwrap();
+    let mut action = request();
+    action.intent = Intent::DropRole {
+        role: "app_reader".into(),
+        reason: "Replaced".into(),
+    };
+    let preview = repo.store().preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("Replaced"), "{}", preview.diff);
+    // Negative: dropping a role nothing records is refused, not previewed.
+    let mut other = request();
+    other.intent = Intent::DropRole {
+        role: "never_existed".into(),
+        reason: "No such role".into(),
+    };
+    assert!(repo.store().preview(other, SystemTime::now()).is_err());
+}
+
+#[test]
 fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
     for (directory_first, foreign) in [(false, false), (true, false), (true, true)] {
         let repo = Repository::new(&format!("replacement-{directory_first}-{foreign}"), "");

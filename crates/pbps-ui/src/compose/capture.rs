@@ -71,20 +71,30 @@ impl Workspace {
     }
 }
 
-/// Where `pbps` puts the identity file of the table a `DropTable` intent drops
+/// Where `pbps` puts the identity file of the table or role a `DropTable` or
+/// `DropRole` intent drops
 /// when another declaration takes its mirrored path: `<name>.<uid>.json` in the
 /// identity directory (`pbps-cli`'s `ids_cmd::aside`, design §3.4 step 5). This
 /// crate may not depend on the model (ADR-0015), so the rule is repeated here;
 /// the compose test `a_dropped_table_replaced_at_its_yaml_path_...` runs the real
 /// CLI against it, so the two cannot drift apart unnoticed. The uid comes from
 /// the table's own identity file, found by its recorded name.
-fn dropped_table_aside<'a>(
+fn dropped_object_aside<'a>(
     intent: &Intent,
     ids: &str,
     files: impl Iterator<Item = (&'a String, &'a FileBytes)>,
 ) -> Option<String> {
-    let Intent::DropTable { table, .. } = intent else {
-        return None;
+    // The intents that drop an object with an identity file of its own, and the
+    // key its file records the name under. Compose can express no other drop of
+    // such an object (a column's tombstone lives in its table's file).
+    let (key, table) = match intent {
+        Intent::DropTable { table, .. } => ("table", table),
+        Intent::DropRole { role, .. } => ("role", role),
+        Intent::Rename { .. }
+        | Intent::RenameTable { .. }
+        | Intent::Drop { .. }
+        | Intent::RenameRole { .. }
+        | Intent::Declarations => return None,
     };
     for (name, file) in files {
         if !name.starts_with(&format!("{ids}/")) || !name.ends_with(".json") {
@@ -93,7 +103,7 @@ fn dropped_table_aside<'a>(
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file.bytes) else {
             continue;
         };
-        if value.get("table").and_then(|t| t.as_str()) != Some(table.as_str()) {
+        if value.get(key).and_then(|t| t.as_str()) != Some(table.as_str()) {
             continue;
         }
         let uid = value.get("uid")?.as_str()?;
@@ -1132,7 +1142,7 @@ pub(super) fn capture(
     // identity file under the aside name, which the CLI writes; admit that one
     // name and no other.
     if let Some(name) =
-        dropped_table_aside(&request.intent, &ids, live.iter().chain(recorded.iter()))
+        dropped_object_aside(&request.intent, &ids, live.iter().chain(recorded.iter()))
     {
         known_path(&mut known, &format!("repository/{name}"));
     }
@@ -1335,23 +1345,76 @@ mod aside_tests {
     fn only_the_dropped_tables_own_aside_name_is_admitted() {
         let files = tree();
         assert_eq!(
-            dropped_table_aside(&drop_table("dbo.t"), ".pbps/ids", files.iter()),
+            dropped_object_aside(&drop_table("dbo.t"), ".pbps/ids", files.iter()),
             Some(".pbps/ids/dbo.t.t_aaaaaa.json".to_owned())
         );
         // Another table's aside, an unknown table and other intents admit nothing.
         assert_eq!(
-            dropped_table_aside(&drop_table("dbo.missing"), ".pbps/ids", files.iter()),
+            dropped_object_aside(&drop_table("dbo.missing"), ".pbps/ids", files.iter()),
             None
         );
         assert_eq!(
-            dropped_table_aside(&Intent::Declarations, ".pbps/ids", files.iter()),
+            dropped_object_aside(&Intent::Declarations, ".pbps/ids", files.iter()),
             None
         );
         // A name outside the identity directory is not an identity file.
         assert_eq!(
-            dropped_table_aside(&drop_table("dbo.t"), "other/ids", files.iter()),
+            dropped_object_aside(&drop_table("dbo.t"), "other/ids", files.iter()),
             None
         );
+    }
+
+    #[test]
+    fn a_dropped_roles_own_aside_name_is_admitted_and_a_table_intent_does_not_reach_it() {
+        let mut files = tree();
+        files.insert(
+            ".pbps/ids/r.json".to_owned(),
+            FileBytes {
+                bytes: br#"{"uid":"r_dddddd","role":"app_reader"}"#.to_vec(),
+                mode: 0o644,
+            },
+        );
+        let drop_role = |role: &str| Intent::DropRole {
+            role: role.into(),
+            reason: "r".into(),
+        };
+        assert_eq!(
+            dropped_object_aside(&drop_role("app_reader"), ".pbps/ids", files.iter()),
+            Some(".pbps/ids/app_reader.r_dddddd.json".to_owned())
+        );
+        // A table of that name is not a role, and a role of that name is not a table.
+        assert_eq!(
+            dropped_object_aside(&drop_table("app_reader"), ".pbps/ids", files.iter()),
+            None
+        );
+        assert_eq!(
+            dropped_object_aside(&drop_role("dbo.t"), ".pbps/ids", files.iter()),
+            None
+        );
+        for intent in [
+            Intent::Rename {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Intent::RenameTable {
+                from: "dbo.t".into(),
+                to: "dbo.v".into(),
+            },
+            Intent::Drop {
+                column: "dbo.t.id".into(),
+                reason: "r".into(),
+            },
+            Intent::RenameRole {
+                from: "app_reader".into(),
+                to: "x".into(),
+            },
+        ] {
+            assert_eq!(
+                dropped_object_aside(&intent, ".pbps/ids", files.iter()),
+                None,
+                "{intent:?}"
+            );
+        }
     }
 
     #[test]
@@ -1364,7 +1427,7 @@ mod aside_tests {
             },
         )]);
         assert_eq!(
-            dropped_table_aside(&drop_table("my schema.t/x"), ".pbps/ids", files.iter()),
+            dropped_object_aside(&drop_table("my schema.t/x"), ".pbps/ids", files.iter()),
             Some(".pbps/ids/my_schema.t_x.t_cccccc.json".to_owned())
         );
     }

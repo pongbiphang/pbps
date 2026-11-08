@@ -911,3 +911,74 @@ fn a_config_write_that_fails_leaves_no_temp_file() {
     write_atomic(&dir.join("pbps.yml"), "ids_dir: x\n").unwrap_err();
     assert_eq!(listing(&dir), before);
 }
+
+#[test]
+fn a_destination_named_like_a_temp_file_does_not_collide_with_it() {
+    // `-a.yml` and `.-a.json.tmp/b.yml` mirror to `-a.json` and
+    // `.-a.json.tmp/b.json`. `-` sorts before `.`, so `-a.json` is staged first
+    // and its temp file would take exactly the name of the next destination's
+    // directory. (The other order is caught by the disk alone.)
+    for (tag, first, second) in [
+        ("temp-name", "-a.yml", ".-a.json.tmp/b.yml"),
+        ("temp-name-reverse", "a.yml", ".a.json.tmp/b.yml"),
+    ] {
+        let project = project(tag);
+        let paths = declared(&[
+            ("dbo.customer", first, &["id", "name"]),
+            ("dbo.other", second, &[]),
+        ]);
+        plan(&project, &two_tables(), &paths)
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert_eq!(read_opt(&project).unwrap(), Some(two_tables()), "{tag}");
+        // Nothing of the staging is left, and a second plan has nothing to do.
+        assert_eq!(names_in(&project.ids_dir()).len(), 2, "{tag}");
+        assert!(plan(&project, &two_tables(), &paths).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_destination_named_like_an_aside_does_not_collide_with_it() {
+    let project = project("aside-name");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("-a.json"), "old").unwrap();
+    // `-a.json` becomes a directory (its old file goes aside first) while
+    // another destination is the directory `.-a.json.aside`.
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("-a.json/x.json".to_owned(), "x".to_owned()),
+            (".-a.json.aside/c.json".to_owned(), "c".to_owned()),
+        ]
+        .into(),
+        removals: vec!["-a.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    write.apply().unwrap();
+    assert_eq!(
+        names_in(&dir),
+        ["-a.json", ".-a.json.aside"],
+        "the old file was removed from wherever it was set aside"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".-a.json.aside/c.json")).unwrap(),
+        "c"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("-a.json/x.json")).unwrap(),
+        "x"
+    );
+}
+
+#[test]
+fn ordinary_moves_keep_the_plain_temp_and_aside_names() {
+    let mut reserved = BTreeSet::new();
+    let path = Path::new("/ids/a.json");
+    let first = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved);
+    assert_eq!(first, Path::new("/ids/.a.json.tmp"));
+    // The same name twice in one write gets the next one.
+    let second = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved);
+    assert_eq!(second, Path::new("/ids/.a.json.tmp1"));
+}

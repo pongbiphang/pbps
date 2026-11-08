@@ -6,7 +6,7 @@
 //! identity for the user: `resolve` merges by uid and refuses what the resolved
 //! YAML cannot decide, and there is no `--take`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -109,13 +109,31 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
     Ok((loaded, paths))
 }
 
+/// A name beside `path` for a temp file or an aside (`.<name>.<kind>`, then
+/// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
+/// `reserved`, the planned destinations and their ancestors, which a later step
+/// of the same write may still create. The pick is added to `reserved`.
+pub(crate) fn unused_sibling(path: &Path, kind: &str, reserved: &mut BTreeSet<PathBuf>) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut n = 0;
+    loop {
+        let suffix = if n == 0 { String::new() } else { n.to_string() };
+        let candidate = parent.join(format!(".{name}.{kind}{suffix}"));
+        if !reserved.contains(&candidate) && std::fs::symlink_metadata(&candidate).is_err() {
+            reserved.insert(candidate.clone());
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Writes through a temporary name in the same directory, so a crash leaves
 /// either the old file or the new one (design §2.4 rule 4).
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let tmp = unused_sibling(path, "tmp", &mut BTreeSet::new());
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
     let result = std::fs::write(&tmp, text)
