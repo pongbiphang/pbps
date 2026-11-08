@@ -3,10 +3,13 @@
 //! A run that cannot dispose of its scratch container leaves it running with
 //! no keeper session. That is exactly a dead run's leftover, and the next run
 //! on the same Docker daemon removes it before starting its own (#2410). So a
-//! test that cleans such a container up itself races every concurrent run: its
-//! `docker rm` can find the container already gone. What the test needs is the
-//! container, and the anonymous volumes it held, absent; who removed them is
-//! not its concern. A failure names the command's exit code and stderr.
+//! test that cleans such a container up itself can meet another remover
+//! half way through: `docker rm --force` answers a container that is already
+//! gone with exit 0 (measured on Docker 29.1.3), but one that another remover
+//! is deleting with exit 1, "removal of container ... is already in progress".
+//! What the test needs is the container, and the anonymous volumes it held,
+//! absent; who removed them is not its concern. A failure names the command's
+//! exit code and stderr, which the former bare `status.success()` discarded.
 use super::*;
 use std::process::Output;
 
@@ -162,14 +165,14 @@ mod tests {
     }
 
     /// The run's container was removed by a later run's recovery sweep before
-    /// the test's own `docker rm`: the race of #2652, made without a daemon.
-    /// The former assertion (`rm` exits 0) fails here.
+    /// the test's own `docker rm`: Docker prints the error and exits 0, which
+    /// the former assertion accepted too; pinned so that it stays accepted.
     #[test]
     fn a_container_taken_first_by_another_remover_is_gone_not_a_failure() {
         let (_dir, docker) = fake(
             "trace2652-taken",
             &format!(
-                "\"container inspect\") {NO_CONTAINER};;\n\"rm --force\") {NO_CONTAINER};;\n\"volume inspect\") {NO_VOLUME};;"
+                "\"container inspect\") {NO_CONTAINER};;\n\"rm --force\") echo 'Error response from daemon: No such container: x' >&2; exit 0;;\n\"volume inspect\") {NO_VOLUME};;"
             ),
         );
         remove_within(&docker, ID, &["vol1".into()], SHORT);

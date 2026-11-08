@@ -574,8 +574,9 @@ impl Fixture {
         let id = id.trim();
         assert!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_disposal_attempts(&std::fs::read_to_string(attempted).unwrap(), id);
-        // A later run's recovery sweep may have removed it first (#2652): what
-        // matters is that it and its volumes are gone.
+        // A later run's recovery sweep may be removing it (#2652): `rm` then
+        // exits 1, "already in progress". What matters is that it and its
+        // volumes are gone.
         left_container::remove_captured_container(&real, id, &created);
         self.trace.output(&output);
         self.trace.files(&self.d.dir);
