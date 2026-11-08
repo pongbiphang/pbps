@@ -3256,6 +3256,7 @@ async fn managed_state_full(
             pbps_db::catalog::LimitationTarget::Relation(_)
             | pbps_db::catalog::LimitationTarget::Type(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Search(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
         })
@@ -3396,6 +3397,16 @@ fn moved_time_zone(
             label = pbps_model::escape::Escaped(label),
         )),
     }
+}
+
+/// Text search objects have no identity yet, so a drift comparison cannot tell a project's
+/// object from another's: one the database holds that the recorded state does not is not
+/// drift (as an unmanaged type is not), and the differ would otherwise read it as a creation
+/// it cannot express. Only the objects the record holds are compared, so one of them that
+/// changed is still reported by name (DEC-2728.1).
+fn only_recorded_search_objects(recorded: &Schema, live: &mut Schema) {
+    live.search
+        .retain(|name, _| recorded.search.contains_key(name));
 }
 
 /// The catalog, read once.
@@ -4215,11 +4226,16 @@ pub(crate) fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     let Schema {
         tables,
         types,
+        search,
         modules,
         roles,
         extensions,
     } = schema;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for name in search.keys() {
+        out.entry(name.name.schema().to_owned())
+            .or_insert_with(|| format!("the schema of {}", name.shown()));
+    }
     for (name, definition) in extensions {
         out.entry(definition.schema.clone())
             .or_insert_with(|| format!("the schema of extension `{}`", name.shown()));
@@ -4573,6 +4589,9 @@ pub(crate) fn managed_limitations(
                 .types
                 .values()
                 .any(|t| t.schema() == name.schema && t.name() == name.name),
+            // A text search object has no identity yet (#2728), so none is inside the
+            // managed set: its omission is named by the census and not reported here.
+            pbps_db::catalog::LimitationTarget::Search(_) => false,
             pbps_db::catalog::LimitationTarget::Relation(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
@@ -5006,6 +5025,8 @@ pub(crate) fn unmanaged_objects(
                         .types
                         .values()
                         .any(|t| t.schema() == name.schema && t.name() == name.name),
+                    // Unreadable, and with no identity to be managed by (#2728): outside.
+                    pbps_db::catalog::LimitationTarget::Search(_) => true,
                     pbps_db::catalog::LimitationTarget::Relation(_)
                     | pbps_db::catalog::LimitationTarget::SharedModule(_)
                     | pbps_db::catalog::LimitationTarget::Module(_)
@@ -6602,6 +6623,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
         let mut live_read = scoped.schema.clone();
         pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
+        only_recorded_search_objects(&recorded_read, &mut live_read);
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &recorded_read,
@@ -7261,6 +7283,8 @@ fn refuse_unidentified_bootstrap_objects(schema: &Schema, ids: &IdsFile) -> anyh
     let Schema {
         tables,
         types,
+        // Text search objects take identities with the next part (#2728).
+        search: _,
         modules: _,
         roles,
         extensions,
@@ -7320,6 +7344,7 @@ fn refuse_nonempty_bootstrap(
     let Schema {
         tables,
         types,
+        search,
         modules,
         roles,
         extensions,
@@ -7327,6 +7352,7 @@ fn refuse_nonempty_bootstrap(
     let names: Vec<String> = tables
         .keys()
         .map(|name| name.shown().to_string())
+        .chain(search.keys().map(|name| name.shown().to_string()))
         .chain(modules.keys().map(|id| id.shown().to_string()))
         // PostgreSQL cluster roles with no managed grants are prerequisites,
         // rather than objects bootstrap creates (DECISIONS 211).
@@ -27117,5 +27143,42 @@ mod extension_guard_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod search_drift_tests {
+    use super::*;
+    use pbps_model::{SearchKind, SearchObject, SearchRef};
+
+    fn dictionary(template: &str) -> SearchObject {
+        SearchObject::Dictionary {
+            template: template.parse().unwrap(),
+            options: Default::default(),
+        }
+    }
+    fn name(text: &str) -> SearchRef {
+        SearchRef::new(SearchKind::Dictionary, text.parse().unwrap())
+    }
+
+    /// A drift comparison leaves out a text search object the record does not hold, and
+    /// still compares one it does: a change to a recorded one is named (DEC-2728.1).
+    #[test]
+    fn a_text_search_object_the_record_lacks_is_not_compared_and_a_recorded_one_is() {
+        let mut recorded = Schema::default();
+        recorded
+            .search
+            .insert(name("app.kept"), dictionary("pg_catalog.simple"));
+        let mut live = recorded.clone();
+        live.search
+            .insert(name("app.made_later"), dictionary("pg_catalog.simple"));
+        only_recorded_search_objects(&recorded, &mut live);
+        assert_eq!(live, recorded, "the unrecorded object is left out");
+        // Negative: a recorded object that changed stays in, so the differ names it.
+        live.search
+            .insert(name("app.kept"), dictionary("pg_catalog.synonym"));
+        only_recorded_search_objects(&recorded, &mut live);
+        assert_ne!(live, recorded);
+        assert!(live.search.contains_key(&name("app.kept")));
     }
 }

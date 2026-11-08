@@ -3578,6 +3578,21 @@ pub trait Dialect {
         }]
     }
 
+    /// Text search configurations and dictionaries (#2728). A dialect with no such
+    /// objects refuses the declaration by name; `schema` is the whole project, so a
+    /// mapping can be checked against the dictionaries it declares.
+    fn validate_search(
+        &self,
+        _name: &pbps_model::SearchRef,
+        _definition: &pbps_model::SearchObject,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
+        vec![DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "declared text search configurations and dictionaries".into(),
+        }]
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see

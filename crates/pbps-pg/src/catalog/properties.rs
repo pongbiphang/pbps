@@ -344,19 +344,6 @@ mod tests {
                 None,
             ),
             (
-                "CREATE TEXT SEARCH CONFIGURATION app.s7c (COPY = pg_catalog.simple);
-                 CREATE TEXT SEARCH DICTIONARY app.s7d (TEMPLATE = pg_catalog.simple)",
-                "text search configuration `app.s7c` is not held by this model",
-                None,
-            ),
-            (
-                "SELECT 1",
-                "text search dictionary `app.s7d` is not held by this model; it is left out of \
-                 the pull and schema comparison; a declaration that names it cannot be created \
-                 until they are supported (#2728)",
-                None,
-            ),
-            (
                 "CREATE CONVERSION app.s8 FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1",
                 "conversion `app.s8` is not held by this model",
                 None,

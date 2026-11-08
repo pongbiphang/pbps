@@ -98,6 +98,8 @@ mod drop_requirements2400;
 mod index_gist2448;
 #[path = "support/index_policy2448.rs"]
 mod index_policy2448;
+#[path = "support/text_search2728.rs"]
+mod text_search2728;
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
@@ -19602,6 +19604,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
             }) => format!("{}.{name}", on.name),
             target @ (pbps_db::catalog::LimitationTarget::Relation(_)
             | pbps_db::catalog::LimitationTarget::Type(_)
+            | pbps_db::catalog::LimitationTarget::Search(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_)) => target.object_name().name,

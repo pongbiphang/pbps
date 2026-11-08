@@ -21,6 +21,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     let Schema {
         tables,
         types,
+        search,
         modules,
         roles,
         extensions,
@@ -60,11 +61,61 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         }
     }
     types_section(&mut s, types);
+    search_section(&mut s, search);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
     s
+}
+
+/// Text search objects: a row each, with what makes the object (#2728).
+fn search_section(
+    s: &mut String,
+    search: &BTreeMap<pbps_model::SearchRef, pbps_model::SearchObject>,
+) {
+    if search.is_empty() {
+        return;
+    }
+    s.push_str("\n## Text search\n\n| Object | Kind | Built on | Mappings or options |\n|---|---|---|---|\n");
+    for (name, definition) in search {
+        let (kind, base, detail) = search_row(definition);
+        let _ = writeln!(
+            s,
+            "| {} | {kind} | {} | {} |",
+            code_cell(&name.name.raw().to_string()),
+            code_cell(&base),
+            code_cell(&detail)
+        );
+    }
+}
+
+/// The kind, parser or template, and mappings or options of one text search object, as text.
+pub(crate) fn search_row(definition: &pbps_model::SearchObject) -> (&'static str, String, String) {
+    match definition {
+        pbps_model::SearchObject::Config { parser, mappings } => (
+            "configuration",
+            parser.raw().to_string(),
+            mappings
+                .iter()
+                .map(|(alias, dictionaries)| {
+                    let listed: Vec<String> =
+                        dictionaries.iter().map(|d| d.raw().to_string()).collect();
+                    format!("{alias}: {}", listed.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        pbps_model::SearchObject::Dictionary { template, options } => (
+            "dictionary",
+            template.raw().to_string(),
+            options
+                .iter()
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    }
 }
 
 /// Declared types are grouped by schema; enum labels retain their authored order.

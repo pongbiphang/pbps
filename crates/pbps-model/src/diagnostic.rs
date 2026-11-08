@@ -16,6 +16,7 @@ pub enum Declaration {
     Table(TableName),
     Module(crate::ModuleId),
     Type(crate::TypeRef),
+    Search(crate::SearchRef),
     Role(crate::RoleName),
 }
 

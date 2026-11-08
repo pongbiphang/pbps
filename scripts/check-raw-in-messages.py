@@ -243,6 +243,10 @@ ALLOWED = {
         None,
         "writes dependency declaration YAML, quoting each raw value with fmt's scalar",
     ),
+    "crates/pbps-load/src/search.rs": (
+        None,
+        "writes the text search declaration YAML, quoting each value with fmt's `scalar`",
+    ),
     "crates/pbps-docs/src/html.rs": (
         None,
         "writes the HTML document, escaping each value with its own `esc`",
@@ -255,6 +259,10 @@ ALLOWED = {
         10,
         "Canonical command arguments are passed to shell_arg, which quotes them or substitutes "
         "a non-executable placeholder.",
+    ),
+    "crates/pbps-model/src/search.rs": (
+        None,
+        "the canonical serialization spelling of a text search object's identity, not diagnostic prose",
     ),
     "crates/pbps-model/src/name.rs": (
         2,

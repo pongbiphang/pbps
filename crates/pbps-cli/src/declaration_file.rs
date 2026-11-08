@@ -106,6 +106,30 @@ pub fn type_path(dir: &Path, name: &pbps_model::TypeRef) -> anyhow::Result<PathB
     Ok(dir.join(file))
 }
 
+/// The file a text search object is written to: `<schema>.<name>.textsearch-config.yml`
+/// or `.textsearch-dictionary.yml` (#2728). The kind is in the name because a
+/// configuration and a dictionary commonly share one.
+pub fn search_path(dir: &Path, name: &pbps_model::SearchRef) -> anyhow::Result<PathBuf> {
+    let suffix = match name.kind {
+        pbps_model::SearchKind::Config => "textsearch-config.yml",
+        pbps_model::SearchKind::Dictionary => "textsearch-dictionary.yml",
+    };
+    let readable = format!(
+        "{}.{}.{suffix}",
+        escape_reserved_stem(component(name.name.schema())),
+        component(name.name.name())
+    );
+    let file = if readable.len() <= 240 {
+        readable
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(name.raw().to_string().as_bytes());
+        hasher.update(b"\0search");
+        format!("~pbps-{:x}.{suffix}", hasher.finalize())
+    };
+    Ok(dir.join(file))
+}
+
 /// The file a module is written to, under its whole identity.
 ///
 /// The whole identity, because anything less lets `pull` write one
@@ -208,6 +232,9 @@ pub fn paths_of(
             format!("type {}", name.shown()),
             type_path(directory, name)?,
         ));
+    }
+    for name in schema.search.keys() {
+        out.push((name.shown().to_string(), search_path(directory, name)?));
     }
     // A partition is written in its parent's file, not one of its own
     // (#1170).
@@ -454,5 +481,40 @@ mod tests {
         let readable = filename(&ObjectName::new(format!("~{stem}"), "view"), None);
         assert_ne!(hashed, readable);
         assert!(readable.starts_with("%7E"), "{readable}");
+    }
+    /// A configuration and a dictionary of one name are two files, the kind in the name, and a
+    /// name too long for a file is hashed to a name that still tells the kinds apart (#2728).
+    #[test]
+    fn a_text_search_object_is_written_under_its_kind_as_well_as_its_name() {
+        let dir = Path::new("schema");
+        let of = |kind, name: &str| {
+            search_path(
+                dir,
+                &pbps_model::SearchRef::new(kind, name.parse().unwrap()),
+            )
+            .unwrap()
+        };
+        let config = of(pbps_model::SearchKind::Config, "app.russian");
+        let dictionary = of(pbps_model::SearchKind::Dictionary, "app.russian");
+        assert_eq!(config, dir.join("app.russian.textsearch-config.yml"));
+        assert_eq!(
+            dictionary,
+            dir.join("app.russian.textsearch-dictionary.yml")
+        );
+        let long = format!("app.{}", "n".repeat(240));
+        let (a, b) = (
+            of(pbps_model::SearchKind::Config, &long),
+            of(pbps_model::SearchKind::Dictionary, &long),
+        );
+        assert_ne!(a, b);
+        assert!(
+            a.to_string_lossy().ends_with(".textsearch-config.yml"),
+            "{a:?}"
+        );
+        assert!(
+            b.to_string_lossy().ends_with(".textsearch-dictionary.yml"),
+            "{b:?}"
+        );
+        assert!(a.file_name().unwrap().len() <= 240);
     }
 }

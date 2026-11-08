@@ -65,6 +65,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     let Schema {
         tables,
         types,
+        search,
         modules,
         roles,
         extensions,
@@ -112,6 +113,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         s.push_str("</table>\n");
     }
     types_section(&mut s, types);
+    search_section(&mut s, search);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
@@ -122,6 +124,28 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
 }
 
 /// Types have no document ids: this section introduces no new link namespace.
+/// Text search objects: a row each, with what makes the object (#2728).
+fn search_section(
+    s: &mut String,
+    search: &BTreeMap<pbps_model::SearchRef, pbps_model::SearchObject>,
+) {
+    if search.is_empty() {
+        return;
+    }
+    s.push_str("<h2>Text search</h2>\n<table><tr><th>Object</th><th>Kind</th><th>Built on</th><th>Mappings or options</th></tr>\n");
+    for (name, definition) in search {
+        let (kind, base, detail) = crate::markdown::search_row(definition);
+        let _ = writeln!(
+            s,
+            "<tr><td>{}</td><td>{kind}</td><td>{}</td><td>{}</td></tr>",
+            code(&name.name.raw().to_string()),
+            code(&base),
+            code(&detail)
+        );
+    }
+    s.push_str("</table>\n");
+}
+
 fn types_section(s: &mut String, types: &BTreeMap<TypeRef, ManagedType>) {
     if types.is_empty() {
         return;

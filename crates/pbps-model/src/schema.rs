@@ -37,6 +37,11 @@ pub struct Schema {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<crate::TypeRef, crate::ManagedType>,
 
+    /// Text search configurations and dictionaries, in a namespace of their own
+    /// (#2728, DEC-2728.1). Held and pulled; planning them arrives with a later part.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub search: BTreeMap<crate::SearchRef, crate::SearchObject>,
+
     /// Database-global PostgreSQL packages, pinned exactly (DEC-2447.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<ObjectLocalName, Extension>,
