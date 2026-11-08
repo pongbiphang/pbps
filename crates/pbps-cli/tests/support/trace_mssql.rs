@@ -568,8 +568,6 @@ impl Fixture {
             &checksum,
             "--allow",
             "rename,destructive,constraint",
-            "--format",
-            "json",
         ])
     }
 
