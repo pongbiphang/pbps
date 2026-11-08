@@ -537,18 +537,20 @@ fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
     });
 }
 
-/// Two packages on one multi-key GIN index: pg_trgm's class on `body` and btree_gin's on
-/// `n`. The index is held when both are managed, and left out when either is not, naming
+/// Two packages on one multi-key GIN index: pg_trgm's class on `body` and intarray's on
+/// `arr`. The index is held when both are managed, and left out when either is not, naming
 /// the other (DEC-2447.14). Recording one package per index kept it beside an unmanaged one.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed() {
     const TWO: &str = "CREATE SCHEMA IF NOT EXISTS ext; \
-        CREATE EXTENSION pg_trgm SCHEMA ext; CREATE EXTENSION btree_gin SCHEMA ext";
-    // `DOCS` has an hstore column; this fixture installs no hstore, so it has its own table.
-    const TABLE: &str = "CREATE TABLE app.docs (id integer PRIMARY KEY, body text, n integer)";
+        CREATE EXTENSION pg_trgm SCHEMA ext; CREATE EXTENSION intarray SCHEMA ext";
+    // intarray's class, not btree_gin's: a package's DEFAULT class for a key type reads back as
+    // the default (the catalog query reports '' for it), so only a non-default class shows its
+    // package. `DOCS` has an hstore column; this fixture installs no hstore, so it has its own table.
+    const TABLE: &str = "CREATE TABLE app.docs (id integer PRIMARY KEY, body text, arr integer[])";
     const INDEX: &str = "CREATE INDEX docs_two ON app.docs USING gin \
-        (body ext.gin_trgm_ops, n ext.int4_ops)";
+        (body ext.gin_trgm_ops, arr ext.gin__int_ops)";
     servers(|server, slug| {
         let f = fixture_on(
             server,
@@ -556,12 +558,12 @@ fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed()
             Kind::Supplied,
             TWO,
         );
-        adopted(&f, &format!("{TABLE}; {INDEX}"), &["pg_trgm", "btree_gin"]);
+        adopted(&f, &format!("{TABLE}; {INDEX}"), &["pg_trgm", "intarray"]);
         assert!(table_file(&f).contains("docs_two"), "{}", table_file(&f));
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
 
         // Negative: with either package alone the index is left out and the other named.
-        for (managed, other) in [("pg_trgm", "btree_gin"), ("btree_gin", "pg_trgm")] {
+        for (managed, other) in [("pg_trgm", "intarray"), ("intarray", "pg_trgm")] {
             let g = fixture_on(
                 server,
                 &format!("classes2447-two-{managed}-{slug}"),
