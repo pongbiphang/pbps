@@ -425,6 +425,8 @@ impl Fixture {
             ),
         )
         .unwrap();
+        self.ok(&["plan", "--no-dev"]);
+        self.d.commit();
         let prior = std::fs::read(self.d.dir.join("second.json")).unwrap();
         on_server(
             self.target.connection(),
@@ -581,6 +583,7 @@ impl Fixture {
     }
 
     fn resolved_outputs(&mut self) -> (String, String) {
+        self.ok(&["plan", "--no-dev"]);
         self.d.commit();
         self.plan("resolved-cli.json");
         let checksum = plan_checksum(&self.d.dir.join("resolved-cli.json"));
@@ -937,6 +940,9 @@ impl Fixture {
         std::fs::remove_file(self.view()).unwrap();
         let base = "table: dbo.base\ncolumns:\n  id: {type: int, nullable: false}\n  note: {type: int, nullable: true}\nprimary_key: {name: base_pk, columns: [id]}\n";
         std::fs::write(self.d.dir.join("schema/dbo.base.yml"), base).unwrap();
+        // Connected plans must review the identity of the edited declarations.
+        self.ok(&["plan", "--no-dev"]);
+        self.d.commit();
         self.ok(&["plan", "--env", "prod", "--out", "ordinary.json"]);
         let ordinary: serde_json::Value = serde_json::from_slice(
             &self
@@ -974,6 +980,8 @@ impl Fixture {
         )
         .unwrap();
         std::fs::write(&anchor, definition.replace("id + 0", "id + 0 + 0")).unwrap();
+        self.ok(&["plan", "--no-dev"]);
+        self.d.commit();
         self.ui(
             "plan",
             serde_json::json!({"environment":"prod", "out":"ui.json"}),
