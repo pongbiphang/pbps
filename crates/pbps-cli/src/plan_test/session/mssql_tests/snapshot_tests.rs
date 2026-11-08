@@ -59,6 +59,30 @@ pub(super) async fn exercise_snapshot(session: &Session<'_>) -> anyhow::Result<(
     Ok(())
 }
 
+pub(super) async fn raw_table_name(session: &Session<'_>) -> anyhow::Result<()> {
+    let mut conn = apply_connection(session).await?;
+    run(&mut conn, "CREATE SCHEMA snap").await?;
+    run(
+        &mut conn,
+        "CREATE TABLE snap.[t\\\tx] (id int); INSERT snap.[t\\\tx] VALUES (7)",
+    )
+    .await?;
+    let mut schema = pbps_model::Schema::default();
+    schema
+        .tables
+        .insert(TableName::new("snap", "t\\\tx"), Default::default());
+    let found = crate::plan_test::snapshot::read(session, &schema).await?;
+    let (tables, allocators) = crate::plan_test::snapshot::compare(&found, &found);
+    let json = serde_json::to_value(tables)?;
+    ensure!(json[0]["table"] == "snap.t\\\tx", "{json}");
+    ensure!(
+        json[0]["original_rows"] == 1 && json[0]["equal"] == true,
+        "{json}"
+    );
+    ensure!(allocators.is_empty());
+    Ok(())
+}
+
 async fn rows(conn: &mut Conn) -> anyhow::Result<()> {
     // CREATE SCHEMA must be alone in its batch.
     run(conn, "CREATE SCHEMA snap").await?;

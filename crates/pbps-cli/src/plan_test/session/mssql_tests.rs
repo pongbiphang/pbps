@@ -458,6 +458,7 @@ enum Case {
     Identities,
     Sealed,
     Snapshot,
+    RawSnapshotNames,
 }
 
 async fn lifecycle(image: &str, case: Case) -> anyhow::Result<()> {
@@ -502,6 +503,7 @@ async fn lifecycle(image: &str, case: Case) -> anyhow::Result<()> {
                     Case::Identities => exercise(&scratch, &session).await,
                     Case::Sealed => exercise_sealed(&session).await,
                     Case::Snapshot => snapshot_tests::exercise_snapshot(&session).await,
+                    Case::RawSnapshotNames => snapshot_tests::raw_table_name(&session).await,
                 }
             }),
         )
@@ -537,6 +539,15 @@ async fn m1165_mssql_snapshot_reads_typed_rows_and_the_engines_own_next_values_a
 {
     let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
     Box::pin(lifecycle(&image, Case::Snapshot)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker and the pinned SQL Server scratch image"]
+async fn m1165_mssql_snapshot_serializes_raw_table_names() {
+    let image = std::env::var("PBPS_TEST_DEV_IMAGE").unwrap();
+    Box::pin(lifecycle(&image, Case::RawSnapshotNames))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

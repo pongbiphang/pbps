@@ -323,6 +323,7 @@
         "deploy::test_run::tests::d2a1165_pg18_policy_recipient_prerequisites_use_the_schema_named_role_inventory",
         "plan_test::report::live_tests::pg16_interrupted_planning_and_ledger_seams_keep_the_cause_and_cleanup",
         "plan_test::report::live_tests::pg18_interrupted_planning_and_ledger_seams_keep_the_cause_and_cleanup",
+        "plan_test::snapshot::tests::pg18_snapshot_serializes_raw_table_and_sequence_names",
         "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_keeps_the_principal_across_hops::d2a1165_pg16",
         "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_keeps_the_principal_across_hops::d2a1165_pg18",
         "deploy::test_run::tests::prerequisite_tests::a_recorded_role_rename_under_strict_unmanaged_still_refuses_a_lookalike::d2a1165_pg16",
@@ -3482,6 +3483,7 @@
         "test_scratch::tests::live_mssql::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
         "test_scratch::tests::live_mssql::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone",
         "plan_test::session::mssql_tests::m1165_mssql_snapshot_reads_typed_rows_and_the_engines_own_next_values_as_the_apply_login",
+        "plan_test::session::mssql_tests::m1165_mssql_snapshot_serializes_raw_table_names",
         "plan_test::session::mssql_tests::m1165_mssql_a_scratch_that_cannot_start_reports_its_recorded_cause"
       ]
     },
