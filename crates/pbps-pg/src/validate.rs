@@ -243,7 +243,7 @@ pub(crate) fn provider_classes(
     schema: &pbps_model::Schema,
 ) -> Vec<DialectError> {
     let mut uses = Vec::new();
-    crate::class_pins::uses_in_table(table, &mut uses);
+    crate::class_pins::uses_in_table(name, table, &mut uses);
     let mut found = Vec::new();
     for used in uses {
         if schema

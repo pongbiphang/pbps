@@ -38,9 +38,16 @@ pub struct Use {
     pub wanted: Wanted,
     pub column: Option<ColumnType>,
     pub shown: String,
+    /// What holds the key, as a message names it: "index `ix` on `app.docs`".
+    pub holder: String,
 }
 
-fn uses_in_keys(keys: &[IndexColumn], method: &str, table: &Table, out: &mut Vec<Use>) {
+fn uses_in_keys(
+    keys: &[IndexColumn],
+    method: &str,
+    (holder, table): (String, &Table),
+    out: &mut Vec<Use>,
+) {
     for key in keys {
         let Some(class) = &key.opclass else { continue };
         let Some(schema) = class.schema() else {
@@ -57,18 +64,25 @@ fn uses_in_keys(keys: &[IndexColumn], method: &str, table: &Table, out: &mut Vec
                 IndexKey::Expression(_) => None,
             },
             shown: class.shown().to_string(),
+            holder: holder.clone(),
         });
     }
 }
 
 /// The qualified classes a table's indexes and exclusions name.
-pub(crate) fn uses_in_table(table: &Table, out: &mut Vec<Use>) {
-    for index in table.indexes.values() {
-        uses_in_keys(&index.columns, index.method.as_str(), table, out);
+pub(crate) fn uses_in_table(name: &pbps_model::TableName, table: &Table, out: &mut Vec<Use>) {
+    for (index_name, index) in &table.indexes {
+        let holder = format!("index `{}` on `{}`", index_name.shown(), name.shown());
+        uses_in_keys(&index.columns, index.method.as_str(), (holder, table), out);
     }
-    for constraint in table.exclude.values() {
+    for (constraint_name, constraint) in &table.exclude {
+        let holder = format!(
+            "exclusion constraint `{}` on `{}`",
+            constraint_name.shown(),
+            name.shown()
+        );
         let keys: Vec<_> = constraint.keys.iter().map(|k| k.key.clone()).collect();
-        uses_in_keys(&keys, constraint.method.as_str(), table, out);
+        uses_in_keys(&keys, constraint.method.as_str(), (holder, table), out);
     }
 }
 
@@ -78,10 +92,9 @@ pub(crate) fn uses_in_table(table: &Table, out: &mut Vec<Use>) {
 pub fn uses(schemas: &[&Schema]) -> Vec<Use> {
     let mut out = Vec::new();
     if let Some(desired) = schemas.last() {
-        desired
-            .tables
-            .values()
-            .for_each(|t| uses_in_table(t, &mut out));
+        for (name, table) in &desired.tables {
+            uses_in_table(name, table, &mut out);
+        }
     }
     out
 }
@@ -98,17 +111,17 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
                 uses_in_keys(
                     &index.columns,
                     index.method.as_str(),
-                    &Table::default(),
+                    (String::new(), &Table::default()),
                     &mut out,
                 );
             }
-            Change::CreateTable { table, .. } => uses_in_table(table, &mut out),
+            Change::CreateTable { name, table, .. } => uses_in_table(name, table, &mut out),
             Change::BuildPartitionedIndex(build) => {
                 if let pbps_model::PartitionIndexDefinition::Index(index) = &build.definition {
                     uses_in_keys(
                         &index.columns,
                         index.method.as_str(),
-                        &Table::default(),
+                        (String::new(), &Table::default()),
                         &mut out,
                     );
                 }
@@ -204,6 +217,15 @@ fn type_mismatch(class: &Class, column: &ColumnType) -> Option<String> {
         .then_some(base)
 }
 
+/// A refusal about a class, with the first index or constraint that names it, so
+/// that a plan which drops a package its declared index still uses says which one.
+fn held_by(uses: &[Use], class: &Wanted, why: String) -> String {
+    match uses.iter().find(|u| &u.wanted == class) {
+        Some(used) if !used.holder.is_empty() => format!("{why} (named by {})", used.holder),
+        _ => why,
+    }
+}
+
 /// What a key may not do with a class that stands: spell out the default the
 /// catalog cannot tell from the omission, or name a class for another type.
 fn refuse_use(class: &Class, used: &Use) -> Result<(), String> {
@@ -258,34 +280,39 @@ pub async fn seal(
             ClassRead::Absent if declared.contains_key(one.schema.as_str()) => {
                 let package = provider::defer_to_package(&declared, &one.schema, &shown, CLASS)
                     .expect("the schema holds a declared package")
-                    .map_err(failed)?;
+                    .map_err(|why| failed(held_by(&uses, one, why)))?;
                 pins.push(placeholder(one, package));
             }
             ClassRead::Present(class) => {
                 if let Some(why) = read.refusal(one) {
-                    return Err(failed(why));
+                    return Err(failed(held_by(&uses, one, why)));
                 }
                 let (extension, version) = class
                     .extension
                     .as_ref()
                     .expect("a refusal-free class has a package");
                 provider::check_package(schemas, extension, version, &shown, CLASS)
-                    .map_err(failed)?;
+                    .map_err(|why| failed(held_by(&uses, one, why)))?;
                 classes.push(class);
                 pins.push(pin(class));
             }
             absent_or_unreadable @ (ClassRead::Absent | ClassRead::Unreadable(_)) => {
-                return Err(failed(
-                    absent_or_unreadable
-                        .refusal(one)
-                        .expect("a non-present class refuses"),
-                ));
+                let why = absent_or_unreadable
+                    .refusal(one)
+                    .expect("a non-present class refuses");
+                return Err(failed(held_by(&uses, one, why)));
             }
         }
     }
     for used in &uses {
         if let Some(class) = classes.iter().find(|c| c.wanted == used.wanted) {
-            refuse_use(class, used).map_err(failed)?;
+            refuse_use(class, used).map_err(|why| {
+                failed(if used.holder.is_empty() {
+                    why
+                } else {
+                    format!("{why} (named by {})", used.holder)
+                })
+            })?;
         }
     }
     provider::refuse_update_beside_provided(
@@ -490,7 +517,31 @@ mod tests {
             wanted: class.wanted.clone(),
             column: Some(column.parse().unwrap()),
             shown: "ext.gin_trgm_ops".into(),
+            holder: String::new(),
         }
+    }
+
+    /// A refusal about a class names the first index or constraint that uses it, so
+    /// that dropping a package its declared index still names says which index.
+    #[test]
+    fn a_refusal_names_the_index_that_uses_the_class() {
+        let wanted = class("text").wanted;
+        let uses = [Use {
+            holder: "index `docs_trgm` on `app.docs`".into(),
+            ..used(&class("text"), "text")
+        }];
+        let named = held_by(&uses, &wanted, "no.".into());
+        assert_eq!(named, "no. (named by index `docs_trgm` on `app.docs`)");
+        // Negative: a class no use names, and a use with no holder, add nothing.
+        let other = Wanted {
+            name: "other_ops".into(),
+            ..wanted.clone()
+        };
+        assert_eq!(held_by(&uses, &other, "no.".into()), "no.");
+        assert_eq!(
+            held_by(&[used(&class("text"), "text")], &wanted, "no.".into()),
+            "no."
+        );
     }
 
     #[test]

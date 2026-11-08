@@ -156,7 +156,10 @@ fn a_declaration_this_tool_cannot_hold_is_refused_and_an_unreadable_exclusion_is
         (
             "  x:\n    method: btree\n    keys:\n      - {column: n, operator: \"ext.=\"}\n"
                 .to_owned(),
-            "pg_catalog",
+            // A schema's operator is held since #2447 PR G2 (DEC-2447.14), where the
+            // project declares a package in that schema. This project declares none in
+            // `ext`, so it is refused for that, no longer for being outside `pg_catalog`.
+            "declares no extension in schema",
         ),
         (
             format!("  x:\n    method: btree\n{key}    not_valid: true\n"),

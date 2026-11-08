@@ -146,7 +146,7 @@ fn a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_whe
                  CREATE INDEX docs_fake ON app.docs USING gin (body ext.fake_trgm_ops); \
                  CREATE INDEX docs_param ON app.docs USING gist (body ext.gist_trgm_ops (siglen=32)); \
                  CREATE INDEX docs_trgm ON app.docs USING gin (body ext.gin_trgm_ops); \
-                 CREATE INDEX docs_plain_expr ON app.docs USING gin ((to_jsonb(body)))"
+                 CREATE INDEX docs_plain_expr ON app.docs USING gin ((body::jsonb))"
             ),
         );
         let out = pulled(&g, &["pg_trgm", "hstore"]);
@@ -315,7 +315,9 @@ fn a_package_update_beside_a_use_of_its_class_is_refused_by_name() {
             "CREATE SCHEMA IF NOT EXISTS ext; \
              DO $$ DECLARE v text; BEGIN \
                SELECT version INTO v FROM pg_available_extension_versions \
-                WHERE name = 'pg_trgm' AND NOT \"default\" ORDER BY version LIMIT 1; \
+                WHERE name = 'pg_trgm' AND version <> (SELECT default_version \
+                  FROM pg_available_extensions WHERE name = 'pg_trgm') \
+                ORDER BY version LIMIT 1; \
                EXECUTE format('CREATE EXTENSION pg_trgm VERSION %L SCHEMA ext', v); \
              END $$",
         );
