@@ -352,7 +352,7 @@ pub(super) fn capture_launcher(
     for (key, value) in environment {
         script.push_str(&format!("export {key}={}\n", quoted(value)));
     }
-    script.push_str(&format!("cd {}\nset +e\nprintf %+s \"$$\" > ui-last.pid\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(&root.display().to_string()), quoted(&binary.display().to_string())));
+    script.push_str(&format!("cd {}\nset +e\nprintf %s \"$$\" > ui-last.pid\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(&root.display().to_string()), quoted(&binary.display().to_string())));
     executable(&path, &script);
     path
 }
