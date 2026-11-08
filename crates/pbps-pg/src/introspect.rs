@@ -3496,7 +3496,9 @@ fn add_exclusion(
             let package = package.clone();
             pulled
                 .provided_classes
-                .insert((parts.name.clone(), raw.name.clone()), package);
+                .entry((parts.name.clone(), raw.name.clone()))
+                .or_default()
+                .insert(package);
         }
         excluded.push(pbps_model::ExclusionKey { key, operator });
     }
@@ -4237,7 +4239,9 @@ fn provider_class(
     if let Some((package, _)) = managed {
         pulled
             .provided_classes
-            .insert((parts.name.clone(), raw.name.clone()), package.clone());
+            .entry((parts.name.clone(), raw.name.clone()))
+            .or_default()
+            .insert(package.clone());
     }
     Some(Some(OpClassRef::in_schema(&schema, name)))
 }

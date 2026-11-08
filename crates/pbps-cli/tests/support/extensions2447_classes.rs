@@ -536,3 +536,44 @@ fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
         );
     });
 }
+
+/// Two packages on one multi-key GIN index: pg_trgm's class on `body` and btree_gin's on
+/// `n`. The index is held when both are managed, and left out when either is not, naming
+/// the other (DEC-2447.14). Recording one package per index kept it beside an unmanaged one.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed() {
+    const TWO: &str = "CREATE SCHEMA IF NOT EXISTS ext; \
+        CREATE EXTENSION pg_trgm SCHEMA ext; CREATE EXTENSION btree_gin SCHEMA ext";
+    const INDEX: &str = "CREATE INDEX docs_two ON app.docs USING gin \
+        (body ext.gin_trgm_ops, n ext.int4_ops)";
+    servers(|server, slug| {
+        let f = fixture_on(
+            server,
+            &format!("classes2447-two-{slug}"),
+            Kind::Supplied,
+            TWO,
+        );
+        adopted(&f, &format!("{DOCS}; {INDEX}"), &["pg_trgm", "btree_gin"]);
+        assert!(table_file(&f).contains("docs_two"), "{}", table_file(&f));
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+
+        // Negative: with either package alone the index is left out and the other named.
+        for (managed, other) in [("pg_trgm", "btree_gin"), ("btree_gin", "pg_trgm")] {
+            let g = fixture_on(
+                server,
+                &format!("classes2447-two-{managed}-{slug}"),
+                Kind::Supplied,
+                TWO,
+            );
+            on_server(g.target(), &format!("{DOCS}; {INDEX}"));
+            let notes = said(&pulled(&g, &[managed]));
+            assert!(
+                notes.contains("docs_two")
+                    && notes.contains(&format!("pbps pull --extension {other}")),
+                "{managed}: {notes}"
+            );
+            assert!(!table_file(&g).contains("docs_two"), "{managed}");
+        }
+    });
+}

@@ -148,10 +148,16 @@ pub(crate) fn leave_out_unmanaged_providers(
     let unmanaged: Vec<_> = pulled
         .provided_classes
         .iter()
-        .filter(|(_, extension)| !managed.contains(*extension))
-        .map(|((table, name), extension)| (table.clone(), name.clone(), extension.clone()))
+        .filter_map(|((table, name), packages)| {
+            let missing: Vec<_> = packages
+                .iter()
+                .filter(|package| !managed.contains(*package))
+                .cloned()
+                .collect();
+            (!missing.is_empty()).then(|| (table.clone(), name.clone(), missing))
+        })
         .collect();
-    for (table, name, extension) in unmanaged {
+    for (table, name, missing) in unmanaged {
         let Some(held) = pulled.schema.tables.get_mut(&table) else {
             continue;
         };
@@ -159,15 +165,24 @@ pub(crate) fn leave_out_unmanaged_providers(
         if !removed {
             continue;
         }
-        let argument = crate::report::shell_arg(extension.raw())
-            .unwrap_or_else(|| crate::report::placeholder("extension name"));
+        // Every unmanaged package, so one pull with all of them manages the index.
+        let arguments: Vec<_> = missing
+            .iter()
+            .map(|extension| {
+                let argument = crate::report::shell_arg(extension.raw())
+                    .unwrap_or_else(|| crate::report::placeholder("extension name"));
+                ["--extension", argument.as_str()].join(" ")
+            })
+            .collect();
+        let packages: Vec<_> = missing.iter().map(|e| format!("`{}`", e.shown())).collect();
         pulled.warnings.push(format!(
             "index `{index}` on `{table}` was left out: it uses an operator class or operator \
-             that the extension `{extension}` provides and this project does not manage. To \
-             manage it: pbps pull --extension {argument}",
+             that the extension {packages} provides and this project does not manage. To \
+             manage it: pbps pull {arguments}",
             index = name.shown(),
             table = table.shown(),
-            extension = extension.shown(),
+            packages = packages.join(", "),
+            arguments = arguments.join(" "),
         ));
     }
     for (name, column, ty, extension) in left {
@@ -973,9 +988,10 @@ mod tests {
             );
             table.indexes.insert("docs_plain".into(), index(None));
             pulled.schema.tables.insert(docs.clone(), table);
-            pulled
-                .provided_classes
-                .insert((docs.clone(), "docs_trgm".into()), "pg_trgm".into());
+            pulled.provided_classes.insert(
+                (docs.clone(), "docs_trgm".into()),
+                BTreeSet::from(["pg_trgm".into()]),
+            );
             pulled
         };
         let mut pulled = build();
@@ -996,6 +1012,88 @@ mod tests {
         leave_out_unmanaged_providers(&mut managed, &BTreeSet::from(["pg_trgm".into()]));
         assert_eq!(managed.schema.tables[&docs].indexes.len(), 2);
         assert!(managed.warnings.is_empty());
+    }
+
+    /// An index (or an exclusion constraint) whose keys use classes of two packages is held
+    /// only when BOTH are managed, and is left out naming every package that is not
+    /// (DEC-2447.14). One package per index, overwritten by the last key, kept it beside an
+    /// unmanaged package.
+    #[test]
+    fn an_index_on_two_packages_is_held_only_when_both_are_managed() {
+        use pbps_model::{ExclusionConstraint, ExclusionTiming};
+        let docs = TableName::new("app", "docs");
+        let build = || {
+            let mut pulled = Pulled::default();
+            let mut table = Table::default();
+            let mut index = |name: &str| {
+                table.indexes.insert(
+                    name.into(),
+                    pbps_model::Index {
+                        columns: vec![],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: pbps_model::IndexMethod::Gin,
+                        storage_parameters: Default::default(),
+                    },
+                );
+            };
+            index("both");
+            table.exclude.insert(
+                "ex".into(),
+                ExclusionConstraint {
+                    method: pbps_model::IndexMethod::Gist,
+                    keys: vec![],
+                    include: vec![],
+                    filter: None,
+                    storage_parameters: Default::default(),
+                    timing: ExclusionTiming::Immediate,
+                },
+            );
+            pulled.schema.tables.insert(docs.clone(), table);
+            for name in ["both", "ex"] {
+                // Two keys, two packages: recorded as a union.
+                let packages = pulled
+                    .provided_classes
+                    .entry((docs.clone(), name.into()))
+                    .or_default();
+                packages.insert("btree_gin".into());
+                packages.insert("pg_trgm".into());
+            }
+            pulled
+        };
+        // One of the two managed: both left out, each naming the other package only.
+        let mut one = build();
+        leave_out_unmanaged_providers(&mut one, &BTreeSet::from(["pg_trgm".into()]));
+        let held = &one.schema.tables[&docs];
+        assert!(held.indexes.is_empty() && held.exclude.is_empty());
+        assert_eq!(one.warnings.len(), 2, "{:?}", one.warnings);
+        assert!(
+            one.warnings.iter().all(|w| w.contains("btree_gin")
+                && w.contains("--extension btree_gin")
+                && !w.contains("--extension pg_trgm")),
+            "{:?}",
+            one.warnings
+        );
+        // Neither managed: every package is named.
+        let mut none = build();
+        leave_out_unmanaged_providers(&mut none, &BTreeSet::new());
+        assert!(
+            none.warnings
+                .iter()
+                .all(|w| w.contains("btree_gin") && w.contains("pg_trgm")),
+            "{:?}",
+            none.warnings
+        );
+        // Negative: both managed holds both and says nothing.
+        let mut both = build();
+        leave_out_unmanaged_providers(
+            &mut both,
+            &BTreeSet::from(["btree_gin".into(), "pg_trgm".into()]),
+        );
+        let held = &both.schema.tables[&docs];
+        assert!(held.indexes.contains_key("both") && held.exclude.contains_key("ex"));
+        assert!(both.warnings.is_empty());
     }
 
     use super::*;
