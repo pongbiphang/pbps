@@ -616,6 +616,7 @@ pub fn names(
         | Change::SetColumnDeprecated { .. }
         | Change::SetRowSecurity { .. }
         | Change::SetReplicaIdentity { .. }
+        | Change::SetComment { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::SetPartitionDefault { .. }

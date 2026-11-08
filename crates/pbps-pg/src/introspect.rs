@@ -412,10 +412,21 @@ pub struct RawIndex {
     pub attached: bool,
 }
 
+/// One comment on a table (`subid` 0) or on one of its columns (`subid` the attribute
+/// number), as `pg_description` has it (#2729). Only rows of tables the pull reads are here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDescription {
+    pub oid: i64,
+    pub subid: i32,
+    pub text: String,
+}
+
 /// Everything one pull read, before any of it is interpreted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawCatalog {
     pub catalog_notices: Vec<String>,
+    /// The comments of the tables the pull reads, and of their columns (#2729).
+    pub descriptions: Vec<RawDescription>,
     /// Extension census objects, classified against managed ids by the caller.
     pub extension_notices: BTreeMap<pbps_model::ObjectLocalName, String>,
     pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
@@ -804,6 +815,18 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     pulled.schema.types = raw.types.clone();
     pulled.schema.search = raw.search.clone();
     pulled.schema.extensions = raw.extensions.clone();
+    // A comment is its object's own: a partition's is not its parent's (measured on 16
+    // and 18: `PARTITION OF` copies nothing), so the key is the object and the column.
+    let comments: BTreeMap<(i64, i32), &str> = raw
+        .descriptions
+        .iter()
+        .map(|d| ((d.oid, d.subid), d.text.as_str()))
+        .collect();
+    let comment = |oid: i64, subid: i32| {
+        comments
+            .get(&(oid, subid))
+            .map(|t| pbps_model::Text::from(*t))
+    };
     // The package behind each held base-type reference, so that the caller
     // that selects the managed packages can leave a table out when its
     // provider is not one of them.
@@ -980,6 +1003,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     bound,
                     columns: own_columns,
                 }),
+                description: comment(raw_table.oid, 0),
                 ..Table::default()
             };
             for constraint in constraints_by_table
@@ -1061,9 +1085,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .flatten()
                 .map(|p| (p.name.clone(), p.policy.clone()))
                 .collect(),
+            description: comment(raw_table.oid, 0),
             columns: raw_columns
                 .iter()
-                .map(|c| (c.name.clone().into(), column(c, &parts, &mut pulled)))
+                .map(|c| {
+                    let mut held = column(c, &parts, &mut pulled);
+                    held.description = comment(raw_table.oid, c.attnum);
+                    (c.name.clone().into(), held)
+                })
                 .collect(),
             partition_by: raw_table
                 .partition_key
@@ -7052,6 +7081,61 @@ mod tests {
                 .contains("toast.autovacuum_enabled"),
             "{:?}",
             pulled.limitations
+        );
+    }
+
+    /// A comment is its object's own (#2729): the table's by `subid` 0, a column's by its
+    /// attribute number, and a partition's is never its parent's (measured on 16 and 18).
+    /// Negative: a row for a table the pull does not read, and an object with no row, give
+    /// no description.
+    #[test]
+    fn a_comment_lands_on_its_own_table_and_column_and_a_partition_has_its_own() {
+        let mut parent = table(1, "ev");
+        parent.partition_key = Some(vec!["k".to_owned()]);
+        parent.partition_strategy = pbps_model::PartitionStrategy::Range;
+        let mut p1 = table(2, "p1");
+        p1.partition_of = Some((1, "FOR VALUES FROM (0) TO (10)".to_owned()));
+        let mut p2 = table(3, "p2");
+        p2.partition_of = Some((1, "DEFAULT".to_owned()));
+        let description = |oid, subid, text: &str| RawDescription {
+            oid,
+            subid,
+            text: text.to_owned(),
+        };
+        let raw = RawCatalog {
+            tables: vec![parent, p1, p2, table(4, "plain")],
+            columns: (1..=4)
+                .flat_map(|t| [col(t, 1, "k", "integer"), col(t, 2, "v", "text")])
+                .collect(),
+            descriptions: vec![
+                description(1, 0, "the parent"),
+                description(1, 2, "parent v"),
+                description(2, 0, "partition one"),
+                description(4, 1, "plain k"),
+                description(99, 0, "a table the pull does not read"),
+            ],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        let get = |n: &str| &pulled.schema.tables[&TableName::new("app", n)];
+        let text = |t: &Option<pbps_model::Text>| t.as_ref().map(|t| t.raw().to_owned());
+        assert_eq!(text(&get("ev").description).as_deref(), Some("the parent"));
+        assert_eq!(
+            text(&get("ev").columns["v"].description).as_deref(),
+            Some("parent v")
+        );
+        assert_eq!(text(&get("ev").columns["k"].description), None);
+        // The partition's comment is its own; the other partition has none, and the parent's
+        // is not copied to either.
+        assert_eq!(
+            text(&get("p1").description).as_deref(),
+            Some("partition one")
+        );
+        assert_eq!(text(&get("p2").description), None);
+        assert_eq!(text(&get("plain").description), None);
+        assert_eq!(
+            text(&get("plain").columns["k"].description).as_deref(),
+            Some("plain k")
         );
     }
 

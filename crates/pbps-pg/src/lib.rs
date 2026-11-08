@@ -1630,6 +1630,10 @@ impl Dialect for Postgres {
         true
     }
 
+    fn holds_descriptions(&self) -> bool {
+        true
+    }
+
     fn retype_dependents(
         &self,
         from: &ColumnType,

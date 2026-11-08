@@ -1082,6 +1082,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
@@ -1478,6 +1479,20 @@ pub fn rehearsal(r: &crate::rehearsal::Findings) -> String {
     out
 }
 
+/// A comment's text for a plan line: the first 60 characters, escaped, since a description
+/// is free text of any length and may hold line breaks.
+fn comment_preview(text: &pbps_model::Text) -> String {
+    const SHOWN: usize = 60;
+    let whole = text.raw();
+    let head: String = whole.chars().take(SHOWN).collect();
+    let cut = if whole.chars().nth(SHOWN).is_some() {
+        "…"
+    } else {
+        ""
+    };
+    format!("\"{}{cut}\"", Escaped(&head))
+}
+
 pub fn describe(c: &Change) -> String {
     match c {
         Change::RebuildPartitionedTable(_)
@@ -1842,6 +1857,16 @@ pub fn describe(c: &Change) -> String {
         ),
         Change::DropComputedColumn { name, .. } => {
             format!("- drop computed column {name}", name = name.shown(),)
+        }
+        Change::SetComment { target, text } => {
+            let what = match target.column() {
+                Some(column) => format!("{} comment", column.name.shown()),
+                None => "comment".to_owned(),
+            };
+            match text {
+                Some(t) => format!("~ {what} -> {}", comment_preview(t)),
+                None => format!("- {what} removed"),
+            }
         }
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
             Some(r) => format!("~ {} marked deprecated: {}", column.name.shown(), r.shown()),

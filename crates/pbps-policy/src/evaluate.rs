@@ -376,6 +376,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::AlterColumnExpression { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
+                | Change::SetComment { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }

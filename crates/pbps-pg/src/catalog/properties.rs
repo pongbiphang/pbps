@@ -93,6 +93,12 @@ SELECT f.kind, i.type, i.identity, f.detail
    AND NOT EXISTS (SELECT 1 FROM session_owned s WHERE s.classid = f.classid AND s.objid = f.objid)
    AND NOT (f.classid = 'pg_catalog.pg_class'::regclass AND f.kind IN ('comment', 'security label')
             AND NOT EXISTS (SELECT 1 FROM relations r WHERE r.oid = f.objid))
+   -- A table's comment, and its columns' (a partition's columns are its parent's, which it
+   -- does not declare), are held (#2729): the notice keeps the kinds that are not.
+   AND NOT (f.classid = 'pg_catalog.pg_class'::regclass AND f.kind = 'comment'
+            AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                         WHERE c.oid = f.objid AND c.relkind IN ('r', 'p')
+                           AND (f.objsubid = 0 OR NOT c.relispartition)))
 "#
 );
 
@@ -366,8 +372,9 @@ mod tests {
             ),
             (
                 "CREATE TABLE app.s11 (id int PRIMARY KEY, v int);
-                 COMMENT ON TABLE app.s11 IS 'a'; COMMENT ON COLUMN app.s11.v IS 'b'",
-                "comment(s) on table: `app.s11` are not held by this model; they are not \
+                 COMMENT ON TABLE app.s11 IS 'a'; COMMENT ON COLUMN app.s11.v IS 'b';
+                 CREATE INDEX s11_ix ON app.s11 (v); COMMENT ON INDEX app.s11_ix IS 'c'",
+                "comment(s) on index: `app.s11_ix` are not held by this model; they are not \
                  written back (#2729)",
                 Some("s11"),
             ),
@@ -447,6 +454,12 @@ mod tests {
         assert!(
             !notices.contains("`app.plain"),
             "a table without the properties draws no notice:\n{notices}"
+        );
+        // A table's comment and a column's are held (#2729): the notice names the kinds that
+        // are not, so `app.s11`'s two comments draw none while its index's does.
+        assert!(
+            !notices.contains("on table:") && !notices.contains("on table column:"),
+            "a held comment drew a notice:\n{notices}"
         );
         // A note, never a managed-set limitation: no plan may refuse a table for it.
         assert!(

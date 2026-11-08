@@ -440,8 +440,8 @@ fn record_catalog_findings(
             // read that failed, never "no drift".
             .map_err(|e| format!("the recorded rows cannot be compared: {e}"))
             .map(|live_schema| {
-                pbps_model::state_checksum(&live_schema, recorded_ids)
-                    != pbps_model::state_checksum(&entry.snapshot.schema, recorded_ids)
+                pbps_model::drift_checksum(&live_schema, recorded_ids)
+                    != pbps_model::drift_checksum(&entry.snapshot.schema, recorded_ids)
             })
     });
     if moved == Ok(true) {

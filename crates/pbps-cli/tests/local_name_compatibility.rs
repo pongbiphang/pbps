@@ -374,6 +374,12 @@ where
         .as_object_mut()
         .unwrap()
         .shift_remove("exclude");
+    // #2729 PR A adds a partition entry's own `description:` (schema set 101); the captured
+    // entry predates it.
+    declaration_schema["$defs"]["PartitionEntryDto"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("description");
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );

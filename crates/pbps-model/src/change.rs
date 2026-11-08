@@ -646,6 +646,15 @@ pub enum Change {
         to: Option<ReplicaIdentity>,
     },
 
+    /// `COMMENT ON … IS …` for an object whose declaration has a `description`
+    /// (#2729, DEC-2729.1). `None` is `IS NULL`: the declared `""`, which the engine
+    /// stores as no comment. One variant for every kind of object, so a kind added
+    /// later is a [`CommentTarget`] arm and not a new `Change`.
+    SetComment {
+        target: CommentTarget,
+        text: Option<crate::Text>,
+    },
+
     /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
     /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
     /// `reset`. Only what changes: a parameter the plan leaves alone is not
@@ -1212,6 +1221,10 @@ pub enum ColumnField {
     /// Named for exhaustiveness rather than because a comparison turns on it:
     /// deprecation emits no statement and no catalog reads it back.
     Deprecated,
+    /// The comment (#2729): named so that a promise can be keyed by it. A comment
+    /// redefines nothing, so no change names it in [`Change::columns_redefined`], and the
+    /// resolver is never asked about one.
+    Description,
 }
 
 /// Which of a table's named parts a change is about.
@@ -1404,6 +1417,9 @@ pub enum ColumnPromise<'a> {
     /// The explicit collation the column has after the change, `None` being
     /// the database default (#1175).
     Collation(Option<&'a Collation>),
+    /// The comment the column has after the change, `None` being no comment
+    /// (#2729). A comment is held where the plan sets it, not where it leaves one be.
+    Description(Option<&'a crate::Text>),
 }
 
 impl ColumnPromise<'_> {
@@ -1426,6 +1442,7 @@ impl ColumnPromise<'_> {
             ColumnPromise::Generated(_) => ColumnField::Generated,
             ColumnPromise::Numbering { .. } => ColumnField::Numbering,
             ColumnPromise::Collation(_) => ColumnField::Collation,
+            ColumnPromise::Description(_) => ColumnField::Description,
         }
     }
 }
@@ -1582,6 +1599,40 @@ macro_rules! catalog_change {
     };
 }
 
+/// The object a [`Change::SetComment`] comments (#2729). Each arm carries the uid the plan
+/// names the object by, as the other changes on it do, and the name it has when the
+/// statement runs (the final one, after any rename).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommentTarget {
+    Table { uid: Uid, table: TableName },
+    Column { uid: Uid, column: ColumnRef },
+}
+
+impl CommentTarget {
+    /// The table the object is, or is a column of.
+    pub fn table(&self) -> &TableName {
+        match self {
+            Self::Table { table, .. } => table,
+            Self::Column { column, .. } => &column.table,
+        }
+    }
+
+    pub fn uid(&self) -> &Uid {
+        match self {
+            Self::Table { uid, .. } | Self::Column { uid, .. } => uid,
+        }
+    }
+
+    /// The column, for a column's comment.
+    pub fn column(&self) -> Option<&ColumnRef> {
+        match self {
+            Self::Table { .. } => None,
+            Self::Column { column, .. } => Some(column),
+        }
+    }
+}
+
 impl Change {
     /// The kind of catalog object this change creates, drops or renames, or
     /// `None` for every other change.
@@ -1620,6 +1671,7 @@ impl Change {
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
@@ -1778,6 +1830,7 @@ impl Change {
             | Change::AlterColumnExpression { column, .. }
             | Change::AlterColumnNumbering { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
+            Change::SetComment { target, .. } => target.table(),
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
@@ -1854,6 +1907,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -1989,6 +2043,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2076,6 +2131,7 @@ impl Change {
             | Change::AlterColumnNumbering { column, .. } => vec![column.clone()],
             Change::AlterColumnNullability { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2222,6 +2278,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2297,6 +2354,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2390,6 +2448,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2471,6 +2530,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2527,6 +2587,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -2637,9 +2698,22 @@ impl Change {
             } => {
                 vec![(column.clone(), ColumnPromise::Numbering { from, to })]
             }
+            // The comment the plan leaves; an empty text is no comment (DEC-2729.1).
+            Change::SetComment {
+                target: CommentTarget::Column { column, .. },
+                text,
+                ..
+            } => vec![(
+                column.clone(),
+                ColumnPromise::Description(text.as_ref().filter(|t| !t.is_empty())),
+            )],
             Change::RenameColumn { .. }
             | Change::DropColumn { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment {
+                target: CommentTarget::Table { .. },
+                ..
+            }
             | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2721,6 +2795,10 @@ impl Change {
             | Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), Presence::Present)]
             }
+            Change::SetComment {
+                target: CommentTarget::Column { column, .. },
+                ..
+            } => vec![(column.clone(), Presence::Present)],
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -2736,6 +2814,10 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment {
+                target: CommentTarget::Table { .. },
+                ..
+            }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2917,7 +2999,8 @@ impl Change {
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. } => None,
+            | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. } => None,
         }
     }
 
@@ -2971,6 +3054,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -3041,6 +3125,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -3101,6 +3186,7 @@ impl Change {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -3468,6 +3554,8 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             | Change::CreatePolicy { origin: RowSecurityOrigin::Created, .. }
             | Change::SetRowSecurity { origin: RowSecurityOrigin::Created, .. }
             | Change::SetReplicaIdentity { .. }
+            // A comment is metadata the declaration states: listed in the plan, no gate (DEC-2729.1).
+            | Change::SetComment { .. }
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table
             // (DEC-1441.1).

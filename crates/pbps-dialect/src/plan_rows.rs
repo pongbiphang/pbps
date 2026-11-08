@@ -229,6 +229,7 @@ impl<'p> PlanFacts<'p> {
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
+                | Change::SetComment { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }

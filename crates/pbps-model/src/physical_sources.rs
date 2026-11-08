@@ -666,6 +666,7 @@ impl Build<'_, '_> {
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }

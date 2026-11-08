@@ -2093,8 +2093,11 @@ designed to *notice*, not to prevent.
   justified by finding earlier what is found anyway.
 - Anything about the *text* of an expression the engine stores in its own
   rendering. Presence is compared; wording is not.
-- Fields no catalog reads back (a column's `description`, its `deprecated`
-  reason). They cannot move in a read-back and are not compared.
+- Fields no catalog reads back (a column's `deprecated` reason, and a
+  `description` on an engine that does not hold comments). They cannot move in
+  a read-back and are not compared. On PostgreSQL a table's and a column's
+  `description` is the object's comment (DEC-2729.1): an observed field the
+  close keeps, and holds to the text the plan sets where it sets one.
 
 A finding that falls inside the last list is a recorded limitation of this
 section, not a defect; it is answered by pointing here.

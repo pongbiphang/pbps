@@ -83,6 +83,19 @@ pub struct Extension {
 }
 
 impl Schema {
+    /// This schema without the comments of its tables and columns (#2729). A comment is
+    /// reconciled when a plan is made and held for the ones the plan writes; it is not
+    /// part of the state a drift check compares, because an object with none declared has
+    /// a comment nothing here manages, and one pbps did not set must not read as drift.
+    pub fn clear_descriptions(&mut self) {
+        for table in self.tables.values_mut() {
+            table.description = None;
+            for column in table.columns.values_mut() {
+                column.description = None;
+            }
+        }
+    }
+
     pub fn get(&self, name: &TableName) -> Option<&Table> {
         self.tables.get(name)
     }

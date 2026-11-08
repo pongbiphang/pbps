@@ -97,6 +97,7 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }

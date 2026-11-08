@@ -44,6 +44,30 @@ fn invalid(message: impl Into<String>) -> DialectError {
 pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
     found.extend(table.constraint_name_conflicts().into_iter().map(invalid));
+    // A comment is text, and the engine stores text without a NUL: refused where the file is
+    // open rather than as a statement the server rejects (#2729; measured, DEC-2729.1).
+    if table
+        .description
+        .as_ref()
+        .is_some_and(|d| d.raw().contains('\0'))
+    {
+        found.push(invalid(
+            "the table's `description` holds a NUL character, which a PostgreSQL comment cannot",
+        ));
+    }
+    for (name, column) in &table.columns {
+        if column
+            .description
+            .as_ref()
+            .is_some_and(|d| d.raw().contains('\0'))
+        {
+            found.push(invalid(format!(
+                "column `{name}`'s `description` holds a NUL character, which a PostgreSQL \
+                 comment cannot",
+                name = name.shown()
+            )));
+        }
+    }
     // Refused whatever it names, so its structural problems are not asked
     // on top: the whole line is the mistake. `CLUSTER` is not the same
     // thing under another name — the engine's documentation calls it "a
@@ -2342,5 +2366,31 @@ mod tests {
             "{}",
             said(&shared)
         );
+    }
+
+    /// A comment cannot hold a NUL (#2729): refused where the file is open, for the table's and
+    /// a column's, rather than as a statement the server rejects. Negative: the same text
+    /// without it, and `""`, are accepted.
+    #[test]
+    fn a_description_with_a_nul_is_refused_and_other_text_is_not() {
+        let with = |table: &str, column: &str| {
+            let mut t = Table {
+                description: Some(table.into()),
+                ..Table::default()
+            };
+            let mut c = pbps_model::Column::new("integer".parse().unwrap());
+            c.description = Some(column.into());
+            t.columns.insert("a".into(), c);
+            table_structure(&t)
+                .iter()
+                .map(ToString::to_string)
+                .filter(|m| m.contains("NUL"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(with("a\0b", "fine").len(), 1);
+        assert_eq!(with("fine", "a\0b").len(), 1);
+        assert_eq!(with("a\0", "\0b").len(), 2);
+        assert!(with("fine", "").is_empty());
+        assert!(with("", "multi\nline \r\n tab\t").is_empty());
     }
 }

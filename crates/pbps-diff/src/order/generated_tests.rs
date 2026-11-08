@@ -371,6 +371,18 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
     pin(
+        Change::SetComment {
+            target: pbps_model::CommentTarget::Table {
+                uid: uid.clone(),
+                table: table.clone(),
+            },
+            text: None,
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
         Change::SetReplicaIdentity {
             uid: uid.clone(),
             table: table.clone(),

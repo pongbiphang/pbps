@@ -1301,6 +1301,14 @@
           "type": "boolean",
           "default": false
         },
+        "description": {
+          "description": "The partition's own comment (#2729): a partition takes none from its parent, so the\nparent's `description:` is not it. As a table's: absent is unmanaged, `\"\"` is no comment.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "checks": {
           "description": "Constraint name to check expression, the partition's own.",
           "type": "object",
@@ -2063,6 +2071,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 102,
+  "x-pbps-schema-version": 104,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -740,6 +740,7 @@ impl Unchecked {
             | Change::SetPartitionDefault { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
@@ -2642,6 +2643,14 @@ pub trait Dialect {
     /// *modifier* keeps a base every family claims, so the family reads the
     /// modifier as one the engine would accept and can call it `Safe`.
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
+
+    /// Whether this engine holds an object's `description` as its comment: the
+    /// differ compares and plans descriptions only where it does (#2729). An engine
+    /// that does not behaves as before: a description there is free text no
+    /// catalog is asked for. SQL Server follows in its own issue.
+    fn holds_descriptions(&self) -> bool {
+        false
+    }
 
     /// Whether this engine takes a recorded conversion (`pbps convert`, #2331).
     /// Only an engine whose `ALTER COLUMN ... TYPE` has a `USING` clause: the
@@ -7295,6 +7304,62 @@ impl Dialect for MinimalDialect {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),
         })
+    }
+}
+
+/// [`MinimalDialect`] for an engine that holds descriptions as comments (#2729): the same
+/// rules, with the one capability a test of the comment planning needs. Not any real database
+/// either.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DescribingDialect;
+
+impl Dialect for DescribingDialect {
+    fn name(&self) -> &'static str {
+        MinimalDialect.name()
+    }
+
+    fn lexicon(&self) -> Lexicon {
+        MinimalDialect.lexicon()
+    }
+
+    fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming {
+        MinimalDialect.transaction_framing(zone)
+    }
+
+    fn probe_framing(&self) -> Option<TransactionFraming> {
+        None
+    }
+
+    fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+        MinimalDialect.normalize_type(ty)
+    }
+
+    fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+        MinimalDialect.type_change_risk(from, to)
+    }
+
+    fn fold_ident<'a>(&self, ident: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed(ident)
+    }
+
+    fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
+        MinimalDialect.quote_ident(ident)
+    }
+
+    fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
+        MinimalDialect.validate_table(name, table)
+    }
+
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<TableName>, DialectError> {
+        MinimalDialect.intermediate_tables(change, strategy)
+    }
+
+    fn holds_descriptions(&self) -> bool {
+        true
     }
 }
 

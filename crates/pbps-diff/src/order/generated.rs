@@ -125,6 +125,7 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         },
         // These need only an existing name or change recorded metadata.
         Change::RenameTable { .. }
+        | Change::SetComment { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }
@@ -1009,6 +1010,7 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::AlterColumnNumbering { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }

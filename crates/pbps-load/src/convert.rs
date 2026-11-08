@@ -771,6 +771,7 @@ pub(crate) fn convert_for_diagnostics(
                             &mut errs,
                         ),
                         unlogged: e.unlogged,
+                        description: e.description.map(pbps_model::Text::from),
                         ..Default::default()
                     };
                     let mut columns = std::collections::BTreeMap::new();

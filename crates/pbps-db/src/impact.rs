@@ -139,6 +139,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // catalog lists that (#1889).
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }

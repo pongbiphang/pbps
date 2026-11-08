@@ -292,6 +292,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::SetColumnDeprecated { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionNotNull { .. }

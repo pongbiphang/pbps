@@ -821,6 +821,7 @@ impl Declared {
                 | Change::SetStorageParameters { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::SetReplicaIdentity { .. }
+                | Change::SetComment { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }

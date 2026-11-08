@@ -1259,3 +1259,67 @@ and dropping arrive in the parts that follow (#2728).
 Formats: state moves (a snapshot may hold `search`; an older one truthfully holds
 none), and the published declaration schema gains the two file kinds. The plan does
 not move.
+
+<a id="dec-2729-1"></a>
+
+**DEC-2729.1. A declared `description` is the object's comment; one declared
+nowhere is not this tool's.** On PostgreSQL a table's and a column's
+`description` is applied as `COMMENT ON` (`Change::SetComment`, one variant for
+every kind of object: `CommentTarget` has a `Table` and a `Column` arm, and the
+later kinds add arms, not changes). A project that wrote free-text descriptions
+before sees them become comments on its first plan on PostgreSQL, which is what
+the field says; that is the one behaviour change for an existing project. SQL
+Server does not hold descriptions yet (`Dialect::holds_descriptions` is false),
+so its plans, goldens and pulls are as before.
+
+The rules, each measured on 16.15 and 18.6 (`COMMENT ON` takes a
+`ShareUpdateExclusiveLock` and blocks no read or write):
+
+- **Managed only where declared.** No `description` key is a comment nothing
+  compares, changes or removes; `description: ""` is managed as no comment (the
+  engine stores an empty comment as none) and plans `IS NULL` only if a comment
+  exists. A pull writes `description` for every commented table and column, so
+  a pulled project starts in sync. No new risk class and no gate: removing a
+  comment is what the declaration says, and the plan lists it.
+- **One pass, after the others.** `diff_comments` compares the declared
+  descriptions with the base by the object's uid, so a rename keeps its comment
+  and a rename beside an edit plans one `SetComment` under the final name. An
+  object the plan creates, and a column it adds (the drop and add of a column
+  is one), has no comment to compare with, so its declared text is written
+  after the create (a drop and a create lose a comment; a `RENAME` and an
+  `ALTER COLUMN TYPE` do not). A drop plans nothing.
+- **Ordering:** class 10, and the operation requires its object in its last
+  incarnation (`Is(Final)`, not `Exists`, which a dropped and created table
+  makes ambiguous), so it follows the create, the rebuild and the final rename.
+- **Text:** the statement uses the escape-string literal of declared values
+  (`E'…'`, backslash and quote doubled), so no session setting changes a byte;
+  CRLF, tabs, edge spaces, Unicode and 100 KB round trip. A NUL is refused when
+  the file is validated.
+- **Not drift.** The state checksum of a drift check (`drift_checksum`) and the
+  differ of `verify` leave comments out: an undeclared comment must not read as
+  drift, and the plan compares the declared ones itself. A rebuild's approval
+  still pins the declared description (`state_checksum`). The plan ends with
+  one note, "N comments in the database are not declared; pbps leaves them as
+  they are", which is `plan.undeclared-comments` in JSON.
+- **The closing guard** holds a comment like every other observed field: kept
+  between the reads unless this plan sets it, and where the plan sets it the
+  close holds the text it set (a promise per `SetComment` on a column, an
+  expectation on a table). Another session's edit of a comment during the
+  apply is therefore refused, declared or not; the guard cannot tell, because
+  the saved plan does not carry the declarations. A created table's comment is
+  not read back separately.
+- **Pull:** one `descriptions` batch part over the tables the pull reads
+  (an extension member's comment is never read; a partition's is its own, and
+  the columns of a partition are its parent's, so their comments are not read).
+  A row that cannot be decoded is an error, not "no comment". The `pg_description`
+  coverage row is held for these kinds, and the S11 notice excludes them, so it
+  names only the kinds not yet held (indexes, constraints, types, modules).
+
+Formats: plan 72 (a plan with a `SetComment` is unreadable to an older build,
+which refuses it by version); a plan with no comment change serialises as
+before. The state snapshot is unchanged (Table and Column already carry
+`description`). Schema set 104 adds a partition entry's own `description:` to
+the declaration schema: a partition takes no comment from its parent, so its
+comment is written under its entry and read back as the partition's own. No
+published document names a `Change`, so the plan version is the only other
+format that moved.

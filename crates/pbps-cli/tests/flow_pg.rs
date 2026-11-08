@@ -138,6 +138,8 @@ fn plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres_16() {
 #[path = "support/census2444.rs"]
 mod census2444;
 
+#[path = "support/comments2729.rs"]
+mod comments2729;
 #[path = "support/exclude2448.rs"]
 mod exclude2448;
 #[path = "support/extensions2447.rs"]
@@ -2696,6 +2698,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::AlterColumnNumbering { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
+            | change @ pbps_model::Change::SetComment { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::SetIndexStorageParameters { .. }
             | change @ pbps_model::Change::SetTablePersistence { .. }

@@ -3942,6 +3942,7 @@ name = name.shown(),
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
@@ -4396,6 +4397,7 @@ pub(crate) fn probes(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }

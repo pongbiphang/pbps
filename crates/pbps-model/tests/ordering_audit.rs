@@ -767,6 +767,26 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "SetComment",
+                Change::SetComment {
+                    target: pbps_model::CommentTarget::Table {
+                        uid: t.clone(),
+                        table: tn("t"),
+                    },
+                    text: Some("a table".into()),
+                },
+            ),
+            (
+                "SetComment",
+                Change::SetComment {
+                    target: pbps_model::CommentTarget::Column {
+                        uid: y.clone(),
+                        column: yref.clone(),
+                    },
+                    text: None,
+                },
+            ),
+            (
                 "SetReplicaIdentity",
                 Change::SetReplicaIdentity {
                     uid: t.clone(),

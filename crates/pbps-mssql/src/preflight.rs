@@ -865,6 +865,7 @@ name = name.shown(),
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }

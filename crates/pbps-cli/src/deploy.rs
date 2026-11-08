@@ -3409,6 +3409,25 @@ fn only_recorded_search_objects(recorded: &Schema, live: &mut Schema) {
         .retain(|name, _| recorded.search.contains_key(name));
 }
 
+/// The informational line that ends a plan when the database holds comments no declaration
+/// manages (DEC-2729.1): a note, not a change.
+fn undeclared_comments_note(count: usize) -> String {
+    let (are, comments) = if count == 1 {
+        ("is", "comment in the database")
+    } else {
+        ("are", "comments in the database")
+    };
+    format!("{count} {comments} {are} not declared; pbps leaves them as they are.")
+}
+
+/// Both sides of a drift comparison without the comments of their tables and columns: a
+/// comment is reconciled by the plan, never drift, and the differ would otherwise read one the
+/// database holds and the record does not as a creation to plan (DEC-2729.1).
+fn without_comments(recorded: &mut Schema, live: &mut Schema) {
+    recorded.clear_descriptions();
+    live.clear_descriptions();
+}
+
 /// The catalog, read once.
 ///
 /// Split out so a caller that needs two *cuts* of one database state can take
@@ -6624,6 +6643,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut live_read = scoped.schema.clone();
         pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
         only_recorded_search_objects(&recorded_read, &mut live_read);
+        without_comments(&mut recorded_read, &mut live_read);
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &recorded_read,
@@ -6683,12 +6703,12 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                 baseline: pbps_model::DriftBaseline {
                     entry_id: baseline.id,
                     applied_at: baseline.applied_at.clone(),
-                    checksum: pbps_model::state_checksum(&baseline.snapshot.schema, &recorded_ids),
+                    checksum: pbps_model::drift_checksum(&baseline.snapshot.schema, &recorded_ids),
                 },
                 // The checksum compares like with like: both sides fingerprinted
                 // with the recorded mapping, so a derived identity for a hand-added
                 // column cannot by itself make the two differ.
-                live_checksum: pbps_model::state_checksum(&scoped.schema, &recorded_ids),
+                live_checksum: pbps_model::drift_checksum(&scoped.schema, &recorded_ids),
                 changes,
                 unmanaged: scoped.unmanaged,
                 unexpressible,
@@ -8588,7 +8608,7 @@ async fn plan_db_selected(
             &recorded_data,
             &entry.snapshot.schema,
         )?;
-        let live = pbps_model::state_checksum(&as_recorded, &recorded_ids);
+        let live = pbps_model::drift_checksum(&as_recorded, &recorded_ids);
         let mut expected = entry.snapshot.schema.clone();
         // Done also permits drop-and-create (377). Grants lost with the old
         // principal must be planned onto the new one, not rejected as drift.
@@ -8609,7 +8629,7 @@ async fn plan_db_selected(
                 expected.types.insert(name.clone(), definition.clone());
             }
         }
-        let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
+        let recorded = pbps_model::drift_checksum(&expected, &recorded_ids);
         if live != recorded {
             bail!(
                 "`{}` has drifted from the state recorded at {} (entry #{}).\n\
@@ -8646,6 +8666,17 @@ async fn plan_db_selected(
                 println!("{}", message);
             }
             findings.push(crate::output::Finding::note("data.adoption", message));
+        }
+        // The comments the database holds that no declaration has a `description` for: left as
+        // they are, and said once at the end of the plan (DEC-2729.1).
+        if dialect.holds_descriptions() {
+            let count = pbps_diff::undeclared_comments(&scoped.schema, &loaded.schema);
+            if count > 0 {
+                findings.push(crate::output::Finding::note(
+                    "plan.undeclared-comments",
+                    undeclared_comments_note(count),
+                ));
+            }
         }
         let read_back = pbps_model::data::plan_base(
             &scoped.schema,
@@ -9471,7 +9502,7 @@ async fn plan_db_selected(
             ),
             &entry.snapshot.schema,
         )?;
-        let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
+        let baseline = pbps_model::drift_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
         let crate::engine::Prerequisites {
             types: type_pins,
@@ -9842,6 +9873,9 @@ async fn plan_db_selected(
                 print!("{}", crate::explain::rehearsal_render(detail));
             }
             print!("{}", crate::report::plan(&cs, &names));
+            if let Some(note) = findings.iter().find(|f| f.id == "plan.undeclared-comments") {
+                println!("{}", note.message);
+            }
             for check in &data.connected_checks {
                 println!("{}: {}", check.name, check.message);
             }
@@ -10278,7 +10312,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     // The drift check, and the whole reason a coarse `--allow` is safe: this
     // plan is only valid against the environment it was computed against, down
     // to the identity mapping.
-    let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+    let live = pbps_model::drift_checksum(&scoped.schema, &recorded_ids);
     if live != plan.baseline.checksum {
         bail!(
             "`{}` is no longer the database this plan was computed against.\n\
@@ -10855,8 +10889,8 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &scopes_at(plan, at_checkpoint),
             &mut watching,
         );
-        let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
-        let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, at_checkpoint);
+        let live = pbps_model::drift_checksum(&scoped.schema, at_checkpoint);
+        let checkpoint = pbps_model::drift_checksum(&entry.snapshot.schema, at_checkpoint);
         if live != checkpoint {
             bail!(
                 "`{}` has moved since the checkpoint at entry #{}.\n\
@@ -10974,7 +11008,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &mut watching,
         );
 
-        let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
+        let live = pbps_model::drift_checksum(&scoped.schema, &recorded_ids);
         if live != plan.baseline.checksum {
             bail!(
                 "`{}` is no longer the database this plan was computed against.\n\
@@ -27191,5 +27225,39 @@ mod search_drift_tests {
         only_recorded_search_objects(&recorded, &mut live);
         assert_ne!(live, recorded);
         assert!(live.search.contains_key(&name("app.kept")));
+    }
+}
+
+#[cfg(test)]
+mod comment_drift_tests {
+    use super::*;
+
+    /// A comment the database holds and the record does not is no drift; a comment on only
+    /// one side, in either direction, is gone from the comparison. Negative: a column that
+    /// differs still does.
+    #[test]
+    fn a_comment_on_one_side_only_is_not_a_difference_and_a_column_still_is() {
+        let table = TableName::new("app", "t");
+        let mut recorded = Schema::default();
+        let mut shape = pbps_model::Table::default();
+        shape.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        recorded.tables.insert(table.clone(), shape);
+        let mut live = recorded.clone();
+        live.tables.get_mut(&table).unwrap().description = Some("ops note".into());
+        live.tables.get_mut(&table).unwrap().columns["id"].description = Some("also".into());
+        assert_ne!(recorded, live);
+        let (mut was, mut now) = (recorded.clone(), live.clone());
+        without_comments(&mut was, &mut now);
+        assert_eq!(was, now);
+        let (mut was, mut now) = (live.clone(), recorded.clone());
+        without_comments(&mut was, &mut now);
+        assert_eq!(was, now);
+        live.tables.get_mut(&table).unwrap().columns["id"].ty = "bigint".parse().unwrap();
+        let (mut was, mut now) = (recorded, live);
+        without_comments(&mut was, &mut now);
+        assert_ne!(was, now);
     }
 }

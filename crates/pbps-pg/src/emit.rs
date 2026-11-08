@@ -4634,6 +4634,7 @@ fn emit_statements(
         Change::SetReplicaIdentity { table, to, .. } => {
             unscoped(set_replica_identity(table, to.as_ref())?)
         }
+        Change::SetComment { target, text } => unscoped(comment_on(target, text.as_ref())?),
         // Rewrites the table and its indexes, in either direction (#1443).
         Change::SetTablePersistence {
             table, unlogged, ..
@@ -6266,6 +6267,28 @@ fn storage_actions(
 /// is named by the server, `_pkey` or `_pkey1` after a collision, and a
 /// pulled one carries no name. A table with no key there formats a NULL
 /// identifier, which the engine refuses, rather than setting nothing.
+/// `COMMENT ON … IS …` for a declared description (DEC-2729.1). The text is a **declared
+/// value**, so it is the escape-string literal no session setting can reinterpret
+/// ([`value_literal`]); `None` is `IS NULL`, which is also what the engine makes of an empty
+/// comment (measured on 16 and 18). Every name is qualified or quoted, so the statement needs
+/// no `search_path`.
+fn comment_on(
+    target: &pbps_model::CommentTarget,
+    text: Option<&pbps_model::Text>,
+) -> Result<String, DialectError> {
+    use pbps_model::CommentTarget;
+    let object = match target {
+        CommentTarget::Table { table, .. } => format!("TABLE {}", qualified(table)?),
+        CommentTarget::Column { column, .. } => format!(
+            "COLUMN {}.{}",
+            qualified(&column.table)?,
+            quote(column.name.raw())?
+        ),
+    };
+    let value = text.map_or_else(|| "NULL".to_owned(), |t| value_literal(t.raw()));
+    Ok(format!("COMMENT ON {object} IS {value};"))
+}
+
 fn set_replica_identity(
     table: &TableName,
     to: Option<&ReplicaIdentity>,
@@ -8637,6 +8660,48 @@ mod tests {
     /// by a `DO` block when it runs, as an unnamed key's drop is, and a name
     /// that would close the dollar quote cannot (#1444). A created table sets
     /// its identity last, after the index it names.
+    /// A comment is one `COMMENT ON` statement per edit, its text an escape-string literal that
+    /// means the same bytes under either `standard_conforming_strings` (backslash doubled, quote
+    /// doubled), and `None` is `IS NULL` (DEC-2729.1). Negative: a name needing quotes is quoted,
+    /// and the text never reaches an identifier position.
+    #[test]
+    fn a_comment_is_one_statement_with_an_exact_literal_and_null_removes_it() {
+        use pbps_model::CommentTarget;
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let on_table = |text: Option<&str>| {
+            sql_of(
+                &pg,
+                &Change::SetComment {
+                    target: CommentTarget::Table {
+                        uid: "t_000000".parse().unwrap(),
+                        table: table.clone(),
+                    },
+                    text: text.map(Into::into),
+                },
+            )
+        };
+        assert_eq!(
+            on_table(Some("it's a \\ back\\slash\r\n\tend ")),
+            ["COMMENT ON TABLE \"app\".\"t\" IS E'it''s a \\\\ back\\\\slash\r\n\tend ';"]
+        );
+        assert_eq!(on_table(None), ["COMMENT ON TABLE \"app\".\"t\" IS NULL;"]);
+        let column = sql_of(
+            &pg,
+            &Change::SetComment {
+                target: CommentTarget::Column {
+                    uid: "c_000000".parse().unwrap(),
+                    column: table.column("we\"ird"),
+                },
+                text: Some("中文 \u{1F600}".into()),
+            },
+        );
+        assert_eq!(
+            column,
+            ["COMMENT ON COLUMN \"app\".\"t\".\"we\"\"ird\" IS E'中文 \u{1F600}';"]
+        );
+    }
+
     #[test]
     fn every_replica_identity_spells_its_statement() {
         use pbps_model::ReplicaIdentity as R;
