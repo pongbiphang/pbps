@@ -352,7 +352,7 @@ pub(super) fn capture_launcher(
     for (key, value) in environment {
         script.push_str(&format!("export {key}={}\n", quoted(value)));
     }
-    script.push_str(&format!("cd {}\nset +e\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(&root.display().to_string()), quoted(&binary.display().to_string())));
+    script.push_str(&format!("cd {}\nset +e\nprintf %+s \"$$\" > ui-last.pid\n{} \"$@\" > ui-$$.stdout 2> ui-$$.stderr\nresult=$?\ncat ui-$$.stdout\ncat ui-$$.stderr >&2\nexit \"$result\"\n", quoted(&root.display().to_string()), quoted(&binary.display().to_string())));
     executable(&path, &script);
     path
 }
@@ -366,7 +366,17 @@ pub(super) fn read_ui(
     let result = client.read(view);
     // Read the raw streams even if the UI rejected its typed stdout contract.
     trace.files(root);
-    trace.ui(&result.unwrap());
+    let bytes = result.unwrap_or_else(|why| {
+        let pid = std::fs::read_to_string(root.join("ui-last.pid")).unwrap();
+        let stdout = std::fs::read(root.join(format!("ui-{pid}.stdout"))).unwrap();
+        let stderr = std::fs::read(root.join(format!("ui-{pid}.stderr"))).unwrap();
+        panic!(
+            "{view:?}: {why}; stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    });
+    trace.ui(&bytes);
 }
 
 #[cfg(all(test, unix))]
