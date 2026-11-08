@@ -121,16 +121,16 @@ the separate B trace obligation still needs execution evidence.
 | trace-pg16-docker | trace::pg16_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 16.15 | docker | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
 | trace-pg18-server | trace::pg18_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 18.6 | server | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
 | trace-pg18-docker | trace::pg18_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace.rs | pbps-cli/test/flow_pg | pg | live-pg | linux | PG 18.6 | docker | Executed receipts and protection-removal controls in [PR #2498](https://github.com/pongbiphang/pbps/pull/2498); shared-collector regression receipts in [#2488](https://github.com/pongbiphang/pbps/issues/2488) | [PR #2498](https://github.com/pongbiphang/pbps/pull/2498) |
-| trace-mssql-server | trace2488::mssql_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | server | Execution pending in [#2488](https://github.com/pongbiphang/pbps/issues/2488); resolved-apply success requires #2144 | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
-| trace-mssql-docker | trace2488::mssql_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | docker | Execution pending in [#2488](https://github.com/pongbiphang/pbps/issues/2488); resolved-apply success requires #2144 | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
+| trace-mssql-server | trace2488::mssql_server_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | server | Executed Linux server/Docker receipts and three independent protection-removal controls in [#2488](https://github.com/pongbiphang/pbps/issues/2488); actual CLI/UI resolved apply included | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
+| trace-mssql-docker | trace2488::mssql_docker_keeps_definition_sources_out_of_every_sink | crates/pbps-cli/tests/support/trace_mssql.rs | pbps-cli/test/flow | resolver-mssql | resolver-mssql | linux | SQL Server 2025 Developer 17.0.4075.5 | docker | Executed Linux server/Docker receipts and three independent protection-removal controls in [#2488](https://github.com/pongbiphang/pbps/issues/2488); actual CLI/UI resolved apply included | [#2488](https://github.com/pongbiphang/pbps/issues/2488) |
 
 ## Engine, scratch and platform boundaries
 
 | Operation | PostgreSQL | SQL Server | Windows | macOS |
 | --- | --- | --- | --- | --- |
-| Connected resolver planning | Linux PG16.15/18.6 witnesses above; each server/Docker cell needs its own receipt | Capture, separation and assessment components exist on pinned 2025 Developer; connected planning/evidence remains #2143 | Compile/dispatch is not live planning qualification; LocalDB is tracked by #2271 | Not exercised; not advertised as live qualified |
-| Offline explanation | Ordinary evidence-reader tests; starts no resolver | Reader/evidence integration remains #2143 | Ordinary tests can exercise the portable reader; their run receipt is independent of planning/apply | Not exercised |
-| Resolved apply | #616, independently checked on target; starts no resolver | #2144, the same checks inside the apply transaction; starts no resolver | No OS gate is not execution evidence; resolved apply remains unqualified without a live receipt | Not exercised |
+| Connected resolver planning | Linux PG16.15/18.6 witnesses above; each server/Docker cell needs its own receipt | Linux 2025 Developer 17.0.4075.5 server/Docker trace witnesses above include connected planning and sealed evidence; other builds remain unqualified | Compile/dispatch is not live planning qualification; LocalDB is tracked by #2271 | Not exercised; not advertised as live qualified |
+| Offline explanation | Ordinary evidence-reader tests; starts no resolver | Linux trace witnesses above read human/JSON explanations with project, key and resolver unavailable | Ordinary tests can exercise the portable reader; their run receipt is independent of planning/apply | Not exercised |
+| Resolved apply | #616, independently checked on target; starts no resolver | Linux trace witnesses above exercise CLI/UI apply after #2144, including wrong-key and stale-target refusal; starts no resolver | No OS gate is not execution evidence; resolved apply remains unqualified without a live receipt | Not exercised |
 
 The exact qualified core image/build/edition pins are in
 [COMPATIBILITY](COMPATIBILITY.md). A compact core contract does not qualify
@@ -160,8 +160,18 @@ This is neither a green cell nor a waiver at #595 close-out.
 The plan records keyed external fingerprints, not a public small-dictionary
 oracle; the ordinary approved checksum remains public.
 Cases 17/18 do not reintroduce a protected ledger, launch path or history field.
-B must still scan every output sink and exercise its planted-leak and protection
-controls. Its unfinished work is not qualified by #618 being closed.
+B scans every output sink with per-sink planted-leak controls. Its Linux trace
+receipts on `5f875cddd2bcc9203622a1ebe5c5b748a96240a9` (tree
+`38c4b421a422d00c5b50f0923273ff7ec6c8d4d7`) are recorded under
+`~/pbps-workers/cx-r-2488-evidence/post2144-live5` and
+`post2144-controls5`: SQL Server 2025 Developer `17.0.4075.5` server/Docker
+and PostgreSQL `16.15`/`18.6` server/Docker each ran independently. Separately
+removing keyed fingerprints, private-property nonserialization and identity-only
+explanation caused the named SQL Server witness to fail for the intended reason;
+restoring each protection passed. The controls include public computed shapes
+and private computed-text refusal, rather than claiming private text is copied
+into the declared shape. These receipts qualify those cells only; C still audits
+the final merge-group run.
 
 For cases 12, 13, 19, 20 and 21, the operator vouches for logging, containment,
 channels and in-place scratch stability under SPEC 9.3.2. There is no
