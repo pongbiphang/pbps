@@ -209,15 +209,16 @@ fn declared(project: &Path) -> BTreeMap<(UidKind, String), String> {
     paths
         .files
         .into_iter()
-        .map(|(declaration, file)| {
+        .filter_map(|(declaration, file)| {
             let key = match declaration {
                 Declaration::Table(n) => (UidKind::Table, n.raw().to_string()),
                 Declaration::Role(n) => (UidKind::Role, n.raw().to_string()),
                 Declaration::Type(n) => (UidKind::Type, n.raw().to_string()),
                 Declaration::Extension(n) => (UidKind::Extension, n.raw().to_string()),
-                Declaration::Module(_) => unreachable!("a module has no identity file"),
+                // A module and a text search object keep no identity file.
+                Declaration::Module(_) | Declaration::Search(_) => return None,
             };
-            (key, file.path)
+            Some((key, file.path))
         })
         .collect()
 }
