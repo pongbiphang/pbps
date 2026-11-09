@@ -5559,3 +5559,311 @@ Formats. The saved plan moves (a new skip-empty field an older build rejects as
 malformed rather than as a newer plan), and the state moves (a snapshot may hold a
 qualified operator an older build cannot parse). A plan with no provider class
 serialises as before.
+
+<a id="dec-2563-9"></a>
+
+**DEC-2563.9. The expressions already on a table the plan writes rows to or rewrites are judged by the one predicate, per statement (PostgreSQL).**
+
+(#2563, slice 2c; the maintainer decisions of 2026-11-03 and 2026-11-07.) A
+row the plan writes runs what the table already carries, as the deploying role:
+its CHECKs, defaults, generated columns, index keys and filters, the CHECKs and
+DEFAULT of its columns' domains, and the policies that apply to that role. Slices
+2a and 2b judged only what a plan introduces; a routine in a CHECK nobody in this
+plan touched ran unjudged on the plan's own `INSERT`. It is now judged by the
+same predicate (DEC-2563.2), from the trees as stored.
+
+Which tables. The tables the reference-data guard's closure reaches, unchanged
+(DECISIONS 445, 451): the table a row change names, the referencing tables a
+cascade, `SET NULL` or `SET DEFAULT` reaches, partitions and inheritance
+descendants, and the two halves of a cross-partition row movement. Beyond row
+changes, a column retype that rewrites the table (`estimate`: `Yes` or
+`Unknown`), an added column that fills every row, a change of persistence,
+`ANALYZE`, and the copy of a rebuild are writes of the same kind
+(`RowOperation::Rewrite` and `RowOperation::Copy`); they fire no trigger the guard
+answers for, and the walk reads their expressions only.
+
+Which expressions, per statement. Measured on 16.15 and 18.6, identically, by
+advancing a sequence from an IMMUTABLE routine at each site:
+
+| statement | runs |
+|---|---|
+| `INSERT` | CHECK, generated, every index key and filter, domain CHECKs, and the DEFAULT (column and domain) of a column the statement leaves out |
+| `UPDATE` | CHECK, every index key and filter, the generated expressions and domain CHECKs of the columns it sets |
+| `DELETE`, `TRUNCATE`, a cascaded `DELETE` | none |
+| a referential action's `UPDATE` | as an `UPDATE` of the columns it sets, and only for `SET DEFAULT` the DEFAULT of those columns (see below) |
+| a rewrite, `REINDEX`, `ANALYZE` | every index key and filter, and for a retype or `SET EXPRESSION` the CHECKs that mention the column and its domain's CHECKs (see below) |
+
+So a plan that only deletes is never refused for a CHECK, default, generated
+expression or index; the one thing a `DELETE` can run is a policy that applies to
+the deploying role (DEC-2563.10). An `UPDATE` judges
+every index, not those reading the columns it sets: PostgreSQL may skip an
+index's expression on a heap-only update, but whether it does depends on the
+data, a false refusal has a one-line remedy, and a false admission is a hole.
+The INSERT half of a row movement evaluates no default.
+
+An `INSERT` runs the DEFAULT of the columns its column list leaves out and of no
+column it supplies. Measured on 16.15 and 18.6, identically (2026-11-08), by
+advancing a sequence from each default: a column the statement names runs
+neither its own DEFAULT nor its domain's; a column left out with a DEFAULT of its
+own runs that and not the domain's; a column left out with none runs the domain's;
+a generated column left out runs no domain DEFAULT. So the write carries the
+columns its statement names (`RowOperation::Insert` holds them, derived from the
+statement the plan emits, the key and each cell the row sets), and only a
+default of a column left out is judged, a domain's only when the column has no
+default or generated expression of its own. Where the list is not known
+(empty), every default is judged: the conservative answer.
+
+How. The trees are read from `conbin`, `adbin`, `indexprs`, `indpred`, `polqual`,
+`polwithcheck` and a domain's `conbin` and `typdefaultbin`, and judged without
+binding by `judge_trees`, in one call for everything a plan reaches, so a refusal
+names every routine that is not admitted, each with its fix. The decoder's
+"empty unless listed" rule applies: a node it does not know is a refusal, never
+an admission.
+
+When. At plan time and at the start of apply (`prepare`), skipping what the
+plan itself removes before the row statement runs (a dropped check, index,
+policy or domain check, and a default or generated expression it drops or
+replaces; all are `order_key` classes before the rows and the rewrites), so a
+plan that drops the unfit expression and writes the rows is not refused; and
+again just before each row statement and each rewriting statement (`check`),
+under the lock the guard holds, with no allowance: whatever is still standing is
+judged. That is the same statement-moment parity DEC-2563.4 has. A table the plan
+creates has no stored name, so `prepare` finds nothing to judge and `check`
+judges what stands when its first row is written. The routines the review
+admits are recorded in `type_routines` and pinned like every other site's; there
+is no new field in the plan, and so no format number.
+
+What a removal excuses is matched on the relation that owns the expression, not
+on the table the statement names (#2748): a statement on a parent reaches its
+inheritance children and partitions, and a plan that drops an unfit CHECK, index
+or policy on a child has dropped exactly the expression that child's site reads.
+What goes with an object the plan drops is excused with it: a CHECK or a column
+a descendant inherits (not one it also declares itself, which stays), the
+clones of a partitioned parent's index, and every expression of a table the plan
+drops and of the partitions that go with it. A name alone excuses nothing: it
+must be the owner's.
+
+What a rewrite runs, and who says it is one (#2775). Which changes rewrite is
+`estimate`'s answer for every change, not a list kept here: a `Yes` or an
+`Unknown` is judged and only a `No` is free. A list of kinds is what let
+`SET EXPRESSION` rebuild a table's indexes unjudged (PostgreSQL 17 and later);
+`estimate` matches every change without a wildcard, so a kind added later is
+classified there. Named besides: the rebuild's copy and `ANALYZE`, which `estimate`
+leaves out because they are the statements and not estimates, and the retype step of
+an enum or domain rebuild, which it leaves out in error (it is the table rewrite
+above, and the rebuild's tmp type is the one the column becomes).
+
+Measured on 16.15 and 18.6 (2026-11-09), three rows, a CHECK on each column and
+on both, an index key and a filter over each, an expression index over a
+generated column, and a CHECK on it:
+
+| statement | index keys and filters | CHECKs | domain CHECK |
+|---|---|---|---|
+| `SET UNLOGGED` | all | none | none |
+| `ADD COLUMN` with a volatile default | all | none (the new column's default runs, which the plan introduced) | none |
+| `ALTER COLUMN b TYPE bigint` | all | those that mention `b` (`ck_b`, `ck_ab`), not `ck_a` or `ck_g` | none |
+| `ALTER COLUMN b TYPE` a domain | all | those that mention `b` | the domain's, once per row |
+| `ALTER COLUMN g SET EXPRESSION` (18 only) | all | those that mention `g`, not `ck_a`, `ck_b`, `ck_ab` | `g`'s domain's |
+| `ALTER COLUMN a TYPE` for a column a generated column reads | refused by the engine | | |
+| the retype of an enum or domain rebuild (`ALTER COLUMN c TYPE <tmp> USING c::text::<tmp>`) | all | those that mention `c` (`eck`, three rows, on both) | the rebuilt type's |
+
+On 16 `SET EXPRESSION` is a syntax error, so the plan that needs it is refused
+before it runs; on 18 it rewrites and revalidates. So a rewrite carries a scope
+(`RowOperation::Rewrite`): the indexes alone for a persistence switch and
+`ADD COLUMN`; for a retype or `SET EXPRESSION` the column and the domain it has
+afterwards (the one it is changed to, read by name, since the column does not
+have it yet; none when it leaves a domain for another type); and for a kind
+nobody measured, judged in full as an insert is, defaults and policies aside,
+because an unmeasured rewrite is not a free one. The CHECKs are those whose
+`conkey` holds the column.
+
+Referential actions, measured on 16.15 and 18.6, identically (2026-11-08), with
+a referencing table carrying a column DEFAULT, a CHECK, a generated column over
+the key, an index expression, a second column's DEFAULT, and a second
+referencing table whose key column is a domain with a CHECK and a DEFAULT:
+
+| action (ON UPDATE or ON DELETE) | writes | DEFAULT of the set columns | CHECK, generated, index, domain CHECK | domain DEFAULT |
+|---|---|---|---|---|
+| `CASCADE` | UPDATE (ON UPDATE); DELETE (ON DELETE) | no | yes (ON UPDATE); none (ON DELETE) | no |
+| `SET NULL` | UPDATE | no | yes | no |
+| `SET NULL (cols)`, `SET DEFAULT (cols)` | UPDATE of `cols` only | `SET DEFAULT` only, `cols` only | yes | `SET DEFAULT` only |
+| `SET DEFAULT` | UPDATE | yes | yes | yes |
+| `RESTRICT`, `NO ACTION` | nothing | no | none | no |
+
+The DEFAULT of a column the action does not set never runs. So the action kind
+is kept from the catalog (`confupdtype`, `confdeltype`) onto the statement, and
+the DEFAULT and the domain DEFAULT are judged only for `SET DEFAULT`, for the
+columns it sets (#2748). The same measurement of a partitioned table: an
+`INSERT`, and an `UPDATE` that moves no row, run the CHECKs and indexes of the
+one partition the row is in; a row that moves runs the destination's and
+nothing of the source's. Which partition is a fact of the row's values, which
+the plan's write does not carry, so every partition is judged: the one place
+a statement is judged for more than it runs, kept because the alternative is
+to admit what a different row would run.
+
+The arms of the site queries, against what each statement runs (#2748; every
+cell judged is a cell measured to run, except where a note says why not):
+
+| arm | `INSERT` | `UPDATE` | referential `UPDATE` | `DELETE` | rewrite |
+|---|---|---|---|---|---|
+| CHECK | all | all | all | none | none |
+| column DEFAULT | the columns left out | none | `SET DEFAULT`'s set columns | none | none |
+| generated | all | those of the set columns | those of the set columns | none | none |
+| index key, filter | all | all (see above) | all | none | all |
+| policy | `WITH CHECK` of the named table | `USING` and `WITH CHECK` of the named table | none | `USING` of the named table | none |
+| domain CHECK | all columns | the set columns | the set columns | none | none |
+| domain DEFAULT | left out, no DEFAULT of its own | none | `SET DEFAULT`'s set columns | none | none |
+
+The same holds for the copy of a rebuild, which lists its columns as an
+`INSERT` does. Partitions are judged whole (above), and the indexes of an
+`UPDATE` are all judged because a heap-only update may skip them depending on
+the data: both are conservative by design and say so.
+
+A referential action is the engine's own write wherever it lands, including on
+the table the plan writes (#2748). Measured on 16.15 and 18.6, identically, on a
+table that references itself (a CHECK, a generated column, an index, a domain
+column with a CHECK and a DEFAULT, and a policy on the table, run as a role it
+applies to), with the same statement on a row nothing references as the
+baseline, and on a cycle:
+
+| statement | what the action ran | policy |
+|---|---|---|
+| `DELETE` of a referenced row, `ON DELETE CASCADE` | nothing | the `DELETE`'s own, once, as in the baseline |
+| the same with `SET NULL` | the CHECK and the domain CHECK | as the baseline: the action's `UPDATE` meets none |
+| the same with `SET DEFAULT` | the CHECK, the domain CHECK and the domain DEFAULT | as the baseline |
+| `UPDATE` of a referenced key, each action | the CHECK and the domain CHECK once more, and for `SET DEFAULT` the domain DEFAULT | as the baseline |
+| an ordinary `UPDATE` of the same table | its own CHECK and domain CHECK | judged |
+| a cycle `a` to `b` and `b` to `a`, `SET DEFAULT` both ways | the default of the table the first reaches only | n/a |
+| `a` cascading to `b`, and `b`'s deletion setting `a`'s default | the DEFAULT of `a.bid`, on the table the plan writes | n/a |
+
+So whether a statement is a referential action is a property the statement is
+given where `read_actions` makes it (`Statement.from_action`, carried onto the
+two halves of a movement it causes), not an inference from the relation it
+names differing from the one the plan writes. That inference judged a
+self-referencing `SET DEFAULT` as an ordinary write, which left the default it
+runs unjudged, and judged the policy that the action bypasses. The statements
+that differ only by this property are different statements for the walk, so the
+cascaded `DELETE` of a self-referencing key is no longer folded into the plan's
+own. Nothing else in the walk reads the named relation to decide how a
+statement is judged: the sweep found the two uses, the site queries and the
+flag a trigger carries for its refusal text, and both read the property now.
+
+Which relation's object runs (#2748). The same sweep along the other axis, on
+16.15 and 18.6, identically: an inheritance parent with a child, and a
+partitioned table with a partition and a sub-partitioned partition with its own
+partition, each relation carrying a DEFAULT, a CHECK and an index of its own (a
+sequence advanced from each), written through the parent, directly, and by an
+`UPDATE` that moves the row.
+
+| arm | `INSERT` through a partitioned parent | `INSERT` through an inheritance parent | `INSERT` directly into a partition or child | `UPDATE` through either parent | `UPDATE` directly into a partition or child | row movement | judged |
+|---|---|---|---|---|---|---|---|
+| column DEFAULT | the parent's | the parent's | the relation's own | none | none | none | the named relation only (fixed) |
+| domain DEFAULT | the parent's column: its domain DEFAULT if the parent's column has no DEFAULT | the same | the relation's own column | none | none | none | the named relation only (fixed) |
+| `SET DEFAULT` action on a partitioned referencing table | the parent's DEFAULT, and the domain's if it has none; a partition's override never ran | | | | | | the named (declared) relation only (fixed) |
+| CHECK | the landing partition's own, and the copies of every ancestor's | the parent's only | the relation's own and its ancestors' copies | the relations holding a matching row, with their copies | the relation's own and its ancestors' copies | the destination's | the named relation and every partition (over-approximation 1); inheritance children for an `UPDATE` |
+| index key, filter | the landing partition's, with the clone of the parent's index | the parent's only | the relation's own | as CHECK | the relation's own | the destination's | as CHECK |
+| generated | the landing partition's (the expression is the parent's by construction) | the parent's | the relation's | as CHECK | the relation's | the destination's | as CHECK |
+| domain CHECK | the column type's, the same on every relation | the same | the same | the same | the same | the same | the closure; the same routines on every relation |
+| policy | the parent's | the parent's | the relation's | the named table's | the relation's | none | the named relation only (round 2) |
+
+So an `INSERT` never reaches an inheritance child, an `UPDATE` through an
+inheritance parent reaches the child for the rows it holds, and a row's
+partition is a fact of its values, which is why CHECK, index and generated stay
+judged over every partition (over-approximation 1, with the all-index `UPDATE`
+the two already recorded). Not measurable per relation: a generated column
+whose expression differs between a relation and its parent (none can; the
+tested partitions and inheritance children copy the parent's), and a domain's
+CHECK, which belongs to the type, not to a relation.
+
+Every site kind has a step that removes it, and each is excused (#2748, a sweep
+of the plan's changes against the sites; all of them run before the rows, in
+`order_key` classes 0 to 9 against 11):
+
+| site | removed, before the rows, by | noted as |
+|---|---|---|
+| CHECK | `DropCheck`; `DropTable` | `checks`; `tables` |
+| index key, filter | `DropIndex`; `DropTable` | `indexes`; `tables` |
+| column DEFAULT, generated | `DropColumn`; `AlterColumnDefault`, `AlterColumnExpression`; `DropTable` | `values`; `tables` |
+| policy | `DropPolicy`; `DropTable` | `policies`; `tables` |
+| domain CHECK | `AlterDomain` dropping it; `DropColumn` or `AlterColumnType` of every column that has the domain; `DropTable` | `domain_checks`; `columns`; `tables` |
+| domain DEFAULT | `AlterDomain` setting or dropping it; the same column steps; `DropTable` | `domain_defaults`; `columns`; `tables` |
+| any, on a partition | `DetachPartition`: a write through the parent no longer reaches it | `detached` |
+
+A column the plan retypes keeps its own default and expressions (they are
+re-cast), so only the domain is excused; a column whose default or expression
+changes keeps its domain, so only the default or expression is. `DropType` of a
+domain runs after the rows (class 18) but cannot until no column has it, so the
+column steps above are what excuse it. A detached partition is excused only for
+a write that does not name it: a write to the partition itself, or to its own
+partitions, still runs what it holds. Not excused, because it is not a removal:
+`SetRowSecurity` and `AttachPartition`. A partition attached by the plan is
+judged when the statement runs, not before (`check` reads the catalog as it
+stands).
+
+Refused. The words are the predicate's own, with the site named as
+`the existing CHECK `ck` of app.t`, and the same three ways out: bring the
+routine into the project, list its owner in `trusted_roles`, or set
+`pin_type_routines: true`; a routine that sets no `search_path` also gets
+`ALTER FUNCTION ... SET search_path`. An existing expression the user never
+touched is refused too: it runs as the deployer on the plan's own statement, which
+is the threat a new CHECK is (maintainer, 2026-11-07).
+
+<a id="dec-2563-10"></a>
+
+**DEC-2563.10. A policy is judged only where row security applies to the deploying role (PostgreSQL).**
+
+(#2563, slice 2c.) A policy's expression runs only for a role subject to row
+security. The answer is the server's own, `pg_catalog.row_security_active`, asked
+of the deploying role for the table in the guard's transaction, so the owner
+without `FORCE`, a superuser and a `BYPASSRLS` role skip policies exactly as the
+engine does, and the owner with `FORCE` and a role that is not the owner do not.
+Only the policies that apply to the role (`public`, or one it is a member of) and
+to the command are read: `WITH CHECK` of an `INSERT`, both of an `UPDATE`, `USING`
+of a `DELETE`; a `SELECT` policy joins an `UPDATE` and a `DELETE`. A referential
+action bypasses row security (measured on 16 and 18: a policy on the table a
+cascade writes did not run, even for the owner with `FORCE`), so a table reached
+only by an action has its policies skipped. A policy with a subquery cannot be
+read by the decoder and is refused like any unreadable tree, and so is judged
+only where it can run.
+
+Which expression of a policy each command runs was measured the same way
+(2026-11-08, 16.15 and 18.6, identically), by advancing a separate sequence
+from the `USING` and from the `WITH CHECK` of one policy and running each
+command as a role the policy applies to:
+
+| command | `USING` runs | `WITH CHECK` runs |
+|---|---|---|
+| `INSERT` | only for a policy that has no `WITH CHECK` (it is used instead) | yes |
+| `UPDATE` | yes, for the row it finds | yes, for the row it writes; without one, the `USING` again |
+| `DELETE` | yes | no |
+
+A `FOR ALL` or `SELECT` policy's `USING` also runs for the read an `UPDATE` or a
+`DELETE` does first, and so a `SELECT` policy joins both, as above. So a command
+judges only the expression it runs: `FOR ALL USING (true) WITH CHECK (f)` is
+never refused for a `DELETE`, and an `INSERT` of a policy that has its own
+`WITH CHECK` does not judge its `USING`. `INSERT ... ON CONFLICT` runs both
+expressions and `RETURNING` adds none, but the plan emits neither. A policy
+without a `WITH CHECK` still falls back to its `USING` for an `INSERT`.
+
+Whose policies. The policies of the table the SQL names, and no other.
+Measured on 16.15 and 18.6, identically (2026-11-08), for an inheritance parent
+with a child and a partitioned parent with a partition, each table carrying a
+policy that advances a sequence of its own, as a role the policies apply to: an
+`UPDATE`, a `DELETE` and an `INSERT` through the parent run the parent's policy
+and never the child's or the partition's (an `INSERT` routed to a partition
+included), and the same three written directly to the child or partition run its
+own and not the parent's. It follows that a parent without row security
+enabled applies no policy to a write through it even when the child has one (the
+guard's live test asserts it). So the policy query is limited to the relation the statement names, while the other
+kinds of expression keep the descendants and partitions the statement reaches.
+
+Measured on 16.15 and 18.6, identically (2026-11-07): `row_security_active` is
+false for a superuser, for the owner without `FORCE`, for a `BYPASSRLS` role and
+for a member of the owner without `FORCE`; it is true for a role that is not the
+owner, and for the owner and its members with `FORCE`. The guard's tests assert
+exactly that table. What the lock does not settle: under `ROW EXCLUSIVE`,
+adding or dropping a CHECK, a default, an index or a policy, enabling row
+security and tightening a domain wait for the writer, but `ALTER DOMAIN ... SET
+DEFAULT`, `ALTER DOMAIN ... DROP CONSTRAINT` and a routine's body do not. The
+domain's default is re-read immediately before each row statement (`check`), and
+a routine's change is the pins check's, as for every other site.

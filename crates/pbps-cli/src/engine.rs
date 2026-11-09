@@ -4418,6 +4418,16 @@ pub async fn prepare_data_writes(
                     .and_then(|uid| baseline.ids.tables.get(uid))
                     .cloned()
             };
+            let stored_column = |column: &pbps_model::ColumnRef| {
+                planned_names
+                    .column_uid(column)
+                    .or_else(|| baseline_names.column_uid(column))
+                    .and_then(|uid| baseline.ids.columns.get(uid))
+                    .map_or_else(
+                        || column.name.raw().to_owned(),
+                        |old| old.name.raw().to_owned(),
+                    )
+            };
             for planned in &changes.changes {
                 if let Change::DropModule { id, .. } = &planned.change {
                     dropped.modules.insert(id.clone());
@@ -4435,28 +4445,62 @@ pub async fn prepare_data_writes(
                         .tables
                         .insert(stored(name).unwrap_or_else(|| name.clone()));
                 }
-                let (table, mut operation) =
-                    if let Change::InsertRow { table, .. } = &planned.change {
-                        (table, RowOperation::Insert)
-                    } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
-                        (
-                            table,
-                            RowOperation::Update {
-                                columns: columns.keys().cloned().collect(),
-                            },
-                        )
-                    } else if let Change::DeleteRow { table, .. } = &planned.change {
-                        (table, RowOperation::Delete)
-                    } else {
-                        continue;
-                    };
+                // The expressions the plan removes or replaces before a row is
+                // written or a table rewritten: `prepare` does not judge what
+                // will be gone by then, and `check` judges whatever is not
+                // (DEC-2563.9).
+                dropped.note_removed_expressions(&planned.change, &stored, &stored_column);
+                // A table the plan rewrites, scans or copies into runs its index
+                // expressions as the deploying role even though no row of the
+                // plan is written to it. One that did not exist has no stored
+                // name and is judged at its own statement instead.
+                if let Some(write) = pbps_pg::existing_expressions::rewrite_write(&planned.change)
+                    && let Some(old) = stored(&write.table)
+                {
+                    writes.push(RowWrite {
+                        table: old,
+                        operation: write.operation,
+                    });
+                }
+                let (table, mut operation) = if let Change::InsertRow {
+                    table,
+                    key_column,
+                    row,
+                    ..
+                } = &planned.change
+                {
+                    // The columns the INSERT names: the guard judges the
+                    // DEFAULT of no other (#2748).
+                    (
+                        table,
+                        RowOperation::Insert {
+                            columns: std::iter::once(key_column.clone())
+                                .chain(row.columns().map(|(column, _)| column.clone()))
+                                .collect(),
+                        },
+                    )
+                } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
+                    (
+                        table,
+                        RowOperation::Update {
+                            columns: columns.keys().cloned().collect(),
+                        },
+                    )
+                } else if let Change::DeleteRow { table, .. } = &planned.change {
+                    (table, RowOperation::Delete)
+                } else {
+                    continue;
+                };
                 // The logical target has the plan's final spelling; locks are
                 // acquired before any rename, through the stable table uid.
                 // New tables receive no existing-trigger allowance.
                 if let Some(old) = stored(table).as_ref() {
-                    // Like the table, an updated column may still carry its
-                    // pre-plan name while the guard authenticates triggers.
-                    if let RowOperation::Update { columns } = &mut operation {
+                    // Like the table, an updated or inserted column may still
+                    // carry its pre-plan name while the guard authenticates
+                    // triggers.
+                    if let RowOperation::Update { columns } | RowOperation::Insert { columns } =
+                        &mut operation
+                    {
                         *columns = columns
                             .iter()
                             .map(|name| {
@@ -4507,18 +4551,24 @@ pub async fn settle_data_writes(conn: &mut Conn) -> anyhow::Result<bool> {
 
 pub async fn check_data_write(
     conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
     statement: &pbps_dialect::Statement,
     guard: &DataWriteGuard,
 ) -> anyhow::Result<()> {
-    let Some(write) = &statement.row_write else {
+    let Some(write) = statement.row_write.as_ref().or(statement.rewrites.as_ref()) else {
         return Ok(());
     };
     match conn.driver() {
         Driver::Mssql => Ok(()),
         Driver::Postgres => {
             let empty = pbps_pg::data_triggers::Guard::default();
-            pbps_pg::data_triggers::check(conn, write, guard.postgres.as_ref().unwrap_or(&empty))
-                .await?;
+            pbps_pg::data_triggers::check(
+                conn,
+                admission,
+                write,
+                guard.postgres.as_ref().unwrap_or(&empty),
+            )
+            .await?;
             Ok(())
         }
     }
