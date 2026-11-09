@@ -1398,6 +1398,12 @@ fn old_server() -> String {
 #[path = "support/rehearsal2379.rs"]
 mod rehearsal2379;
 
+// The same cases on the Windows runner's native clusters, run by the
+// `resolver-pg-windows` job (#2491).
+#[cfg(windows)]
+#[path = "support/pgwin2491.rs"]
+mod pgwin2491;
+
 #[test]
 #[ignore = "needs live postgres and docker"]
 fn a_connected_plan_is_rehearsed_and_sealed_on_every_kind_of_scratch() {
@@ -1623,6 +1629,34 @@ fn doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine() {
 fn server() -> String {
     std::env::var("PBPS_TEST_PG_DB")
         .expect("PBPS_TEST_PG_DB is not set; see scripts/live-tests-pg.sh")
+}
+
+/// Set where `pbps key generate --out` cannot be used: a key file's owner-only
+/// mode cannot be proved on Windows, so the command refuses there and the
+/// `resolver-pg-windows` job (scripts/pgwin_qualify.py) names this variable
+/// instead (#2491). Unset, fixtures write a key file as they always did.
+const KEY_ENV: &str = "PBPS_TEST_FINGERPRINT_KEY";
+
+/// The `pbps.yml` line that names the fingerprint key.
+fn key_line() -> &'static str {
+    if std::env::var_os(KEY_ENV).is_some() {
+        "    fingerprint_key_env: PBPS_TEST_FINGERPRINT_KEY\n"
+    } else {
+        "    fingerprint_key_file: key\n"
+    }
+}
+
+/// Writes the key file the project names, unless the key comes from the
+/// environment.
+fn generate_key(d: &Demo) {
+    if std::env::var_os(KEY_ENV).is_none() {
+        succeeds(d.run(&[
+            "key",
+            "generate",
+            "--out",
+            d.dir.join("key").to_str().unwrap(),
+        ]));
+    }
 }
 
 /// Runs one statement against the server under test, through the same

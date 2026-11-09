@@ -35,16 +35,7 @@ pub fn published(server: &str) {
     successful(run(&d, &["plan"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -282,16 +273,7 @@ pub fn ordinary_checks(server: &str, refused: bool) {
     successful(run(&d, &["plan"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -565,9 +547,12 @@ fn assert_exact_order(script: &str) {
 fn configure(d: &Demo) {
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    \
-         url_env: PBPS_SCRATCH_1516\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_1516\n    \
-         resolve_with: scratch\n    fingerprint_key_file: key\n",
+        format!(
+            "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    \
+             url_env: PBPS_SCRATCH_1516\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_1516\n    \
+             resolve_with: scratch\n{}",
+            key_line()
+        ),
     )
     .unwrap();
 }
@@ -747,16 +732,7 @@ impl Sealed {
             );
             std::fs::write(&config, configured).unwrap();
         }
-        successful(run(
-            &d,
-            &[
-                "key",
-                "generate",
-                "--out",
-                d.dir.join("key").to_str().unwrap(),
-            ],
-            None,
-        ));
+        generate_key(&d);
         let artifact = d.dir.join("plan.json");
         let sql = d.dir.join("plan.sql");
         let targets = Targets {
@@ -1566,16 +1542,7 @@ pub fn row_security(server: &str, scratch_server: &str) {
         None,
     ));
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let scratch = Confined::new(scratch_server);
     if server != scratch_server {
         assert_eq!(
@@ -1924,16 +1891,7 @@ pub fn declared_types(server: &str) {
             )
             .unwrap();
         }
-        successful(run(
-            &d,
-            &[
-                "key",
-                "generate",
-                "--out",
-                d.dir.join("key").to_str().unwrap(),
-            ],
-            None,
-        ));
+        generate_key(&d);
         let targets = Targets {
             target: connection,
             scratch: &scratch.connection,
@@ -2106,16 +2064,7 @@ pub fn in_place_default_edits(server: &str, drop_function: bool) {
     println!("logical #1896 input: {:#?}", logical.changes);
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -2260,16 +2209,7 @@ pub fn partition_own_default_bindings(server: &str) {
     successful(run(&d, &["plan", "--no-dev"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,

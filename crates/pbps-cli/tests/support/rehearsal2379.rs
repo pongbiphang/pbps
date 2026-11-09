@@ -245,12 +245,7 @@ impl Fixture {
             scratch_server,
         };
         fixture.configure(options);
-        succeeds(fixture.d.run(&[
-            "key",
-            "generate",
-            "--out",
-            fixture.d.dir.join("key").to_str().unwrap(),
-        ]));
+        generate_key(&fixture.d);
         fixture
     }
 
@@ -280,7 +275,8 @@ impl Fixture {
             self.d.dir.join("pbps.yml"),
             format!(
                 "dialect: postgres\nresolvers:\n  scratch:\n{entry}environments:\n  prod:\n    \
-                 url_env: {TARGET}\n{selected}    fingerprint_key_file: key\n{}",
+                 url_env: {TARGET}\n{selected}{}{}",
+                key_line(),
                 options.environment
             ),
         )
