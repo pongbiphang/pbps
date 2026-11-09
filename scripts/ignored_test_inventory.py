@@ -1100,7 +1100,12 @@ def validate(root, inventory, targets, platform, rules=None):
         if selected is not None:
             require(set(group["cases"]) <= selected, f"runner no longer selects cases: {group['owner']}")
             if platform == group["validate_on"]:
-                require(selected <= targets[key]["all"], f"stale runner selector: {group['owner']}: {sorted(selected - targets[key]['all'])}")
+                # One runner may run the cases of several targets (the LocalDB
+                # job runs library and CLI flow cases, #2491). A selected case
+                # is stale only when none of the owner's targets has it.
+                reachable = set().union(*(targets.get(tuple(g["target"]), {}).get("all", set())
+                                          for g in groups if g["owner"] == group["owner"]))
+                require(selected <= reachable, f"stale runner selector: {group['owner']}: {sorted(selected - reachable)}")
         for name in group["cases"]:
             if cache[group["owner"]] is not None:
                 require(any(selects(c, key, name) for c in cache[group["owner"]]), f"CI no longer executes {name}")

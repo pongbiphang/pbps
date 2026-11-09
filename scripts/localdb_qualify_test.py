@@ -5,6 +5,7 @@ The script itself runs only on a Windows runner; these are the parts that
 decide whether a case ran and what the user's process is handed.
 """
 
+import ast
 import importlib.util
 import json
 import re
@@ -177,6 +178,42 @@ class Plan(unittest.TestCase):
                              self.source()))
         self.assertTrue(run)
         self.assertEqual(run, defined, "a defined case the job never runs, or a run case that is gone")
+
+    def test_every_flow_case_the_script_runs_is_defined_and_none_is_left_out(self):
+        tests = (Path(__file__).resolve().parents[1]
+                 / "crates/pbps-cli/tests/support/localdb2491.rs").read_text(encoding="utf-8")
+        defined = set(re.findall(r"\nfn (localdb_\w+)\(\) \{", tests))
+        run = set(re.findall(r'run_case\(flow, "localdb2491::(\w+)"[,)]', self.source()))
+        self.assertTrue(run)
+        self.assertEqual(run, defined, "a defined flow case the job never runs, or a run case that is gone")
+        # The Docker kind cannot run on hosted Windows, and no case may ask for it.
+        self.assertNotIn("Kind::Docker", tests)
+
+    def test_the_owner_entries_are_exactly_the_cases_the_script_selects(self):
+        """What the inventory checks only on Windows (#2491 round fix), checked here on every platform.
+
+        The one `localdb` owner selects, through `run_case`, the library cases
+        of #2271 and the CLI flow cases of #2491, so its groups name those two
+        targets and together exactly the cases the script runs.
+        """
+        root = Path(__file__).resolve().parents[1]
+        registry = json.loads((root / "scripts/ignored-test-owners.json").read_text(encoding="utf-8"))
+        owner = registry["owners"]["localdb"]
+        selection = owner["selection"]
+        self.assertEqual((owner["script"], selection["kind"], selection["file"], selection["scope"],
+                          selection["callee"], selection["argument"]),
+                         ("scripts/localdb_qualify.py", "calls", "scripts/localdb_qualify.py", "main", "run_case", 1))
+        main = next(n for n in ast.parse(self.source()).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        selected = {node.args[1].value for node in ast.walk(main)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "run_case" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)}
+        groups = [g for g in registry["groups"] if g["owner"] == "localdb"]
+        self.assertEqual({tuple(g["target"]) for g in groups},
+                         {("pbps-cli", "lib", "pbps_cli"), ("pbps-cli", "test", "flow")})
+        self.assertEqual({case for g in groups for case in g["cases"]}, selected)
+        for group in groups:
+            self.assertEqual((group["validate_on"], group["ignored_on"]), ("win32", ["win32"]))
+            self.assertEqual(len(group["cases"]), len(set(group["cases"])))
 
     def test_every_shared_case_exists_and_none_uses_a_sql_login_or_docker(self):
         tests = (Path(__file__).resolve().parents[1]

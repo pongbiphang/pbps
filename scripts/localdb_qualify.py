@@ -19,8 +19,12 @@ What the job does, in order, and fails on the first thing that does not hold:
    disturb (so no case depends on another's order).
 5. Resolves the target and scratch to pipe strings with the engine's own
    discovery (`examples/localdb_endpoint.rs`), then runs, as that user:
-   the LocalDB cases, and the shared SQL Server resolver suites against the
-   same two instances.
+   the LocalDB cases, the shared SQL Server resolver suites against the
+   same two instances, and the CLI flow cases of `tests/support/localdb2491.rs`
+   (#2491: connected rehearsal on a server scratch with its offline explanation
+   and its checksum-approved apply, and the raised-guard messages on every apply
+   path). The flow cases get the target and the harness's scratch as pipes and
+   pbps's scratch as the `(localdb)` selector.
 
 A case that does not run is a failure. libtest exits successfully when a
 filter selects nothing, so every run is held to the number of cases it listed,
@@ -272,6 +276,10 @@ def main():
                      "pbps-cli", "lib")
     example = executable(cargo_json(["build", "-p", "pbps-mssql", "--example", "localdb_endpoint"]),
                          "pbps-mssql", "example", "localdb_endpoint")
+    # Builds the `pbps` binary the flow cases run as well; its path is fixed at
+    # compile time inside the test program.
+    flow = executable(cargo_json(["test", "--no-run", "-p", "pbps-cli", "--test", "flow"]),
+                      "pbps-cli", "test", "flow")
 
     for name in (TARGET, SCRATCH, DISPOSABLE):
         code, text = as_user(secret, [HELPER, "create", name, "-s"])
@@ -343,6 +351,17 @@ def main():
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe")
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_a_missing_or_stopped_instance_fails_by_name_within_the_bound")
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifies")
+
+    # The CLI flows, each held to running and passing exactly once. The
+    # Docker scratch kind of these cases has no hosted-Windows counterpart.
+    run_case(flow, "localdb2491::localdb_rehearsal_converges_on_a_server_scratch")
+    run_case(flow, "localdb2491::localdb_rehearsal_refuses_a_rejected_statement_on_a_server_scratch")
+    run_case(flow, "localdb2491::localdb_rehearsal_off_switches_seal_off_on_a_server_scratch")
+    run_case(flow, "localdb2491::localdb_rehearsal_killed_on_a_server_scratch_is_cleaned_up_by_the_next_run")
+    run_case(flow, "localdb2491::localdb_rehearsal_without_an_entry_leaves_no_record")
+    run_case(flow, "localdb2491::localdb_rehearsal_builds_a_base_that_calls_its_own_function_on_a_server_scratch")
+    run_case(flow, "localdb2491::localdb_rehearsal_runs_roles_and_grants_without_a_server_principal_on_a_server_scratch")
+    run_case(flow, "localdb2491::localdb_raised_guard_messages_are_shown_once_on_every_apply_path")
 
     # The shared suites, against the same two instances. Their SQL-login cases
     # cannot run here by design: a pipe is integrated authentication only.
