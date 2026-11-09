@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use super::cli::{Cli, Intent, Paths};
+use super::cli::{Cli, Paths};
 use super::files::{self, FileBytes, MAX_BYTES, MAX_FILES, Root};
 use super::git::{Git, text};
 use super::{
@@ -71,55 +71,18 @@ impl Workspace {
     }
 }
 
-/// Where `pbps` puts the identity file of the table or role a `DropTable` or
-/// `DropRole` intent drops
-/// when another declaration takes its mirrored path: `<name>.<uid>.json` in the
-/// identity directory (`pbps-cli`'s `ids_cmd::aside`, design §3.4 step 5). This
-/// crate may not depend on the model (ADR-0015), so the rule is repeated here;
-/// the compose test `a_dropped_table_replaced_at_its_yaml_path_...` runs the real
-/// CLI against it, so the two cannot drift apart unnoticed. The uid comes from
-/// the table's own identity file, found by its recorded name.
-fn dropped_object_aside<'a>(
-    intent: &Intent,
+/// Admits the identity files (`<ids>/**.json`) among `names` as private snapshot
+/// entries.
+fn known_identity_files<'a>(
+    known: &mut BTreeSet<String>,
     ids: &str,
-    files: impl Iterator<Item = (&'a String, &'a FileBytes)>,
-) -> Option<String> {
-    // The intents that drop an object with an identity file of its own, and the
-    // key its file records the name under. Compose can express no other drop of
-    // such an object (a column's tombstone lives in its table's file).
-    let (key, table) = match intent {
-        Intent::DropTable { table, .. } => ("table", table),
-        Intent::DropRole { role, .. } => ("role", role),
-        Intent::Rename { .. }
-        | Intent::RenameTable { .. }
-        | Intent::Drop { .. }
-        | Intent::RenameRole { .. }
-        | Intent::Declarations => return None,
-    };
-    for (name, file) in files {
-        if !name.starts_with(&format!("{ids}/")) || !name.ends_with(".json") {
-            continue;
+    names: impl IntoIterator<Item = &'a String>,
+) {
+    for name in names {
+        if name.starts_with(&format!("{ids}/")) && name.ends_with(".json") {
+            known_path(known, &format!("repository/{name}"));
         }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file.bytes) else {
-            continue;
-        };
-        if value.get(key).and_then(|t| t.as_str()) != Some(table.as_str()) {
-            continue;
-        }
-        let uid = value.get("uid")?.as_str()?;
-        let safe: String = table
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        return Some(format!("{ids}/{safe}.{uid}.json"));
     }
-    None
 }
 
 fn known_path(known: &mut BTreeSet<String>, name: &str) {
@@ -1127,25 +1090,6 @@ pub(super) fn capture(
     }
     known_path(&mut known, &format!("repository/{declarations}"));
     known_path(&mut known, &format!("repository/{ids}"));
-    // The CLI may write the identity file of a declaration it records an intent
-    // for, at the path the declaration mirrors; admit exactly those and no other
-    // new file in the tree.
-    for name in &names {
-        if let Some(rel) = name.strip_prefix(&format!("{declarations}/"))
-            && files::declaration_path(name)
-        {
-            let stem = rel.rsplit_once('.').map_or(rel, |(stem, _)| stem);
-            known_path(&mut known, &format!("repository/{ids}/{stem}.json"));
-        }
-    }
-    // A dropped table whose YAML path another declaration now holds keeps its
-    // identity file under the aside name, which the CLI writes; admit that one
-    // name and no other.
-    if let Some(name) =
-        dropped_object_aside(&request.intent, &ids, live.iter().chain(recorded.iter()))
-    {
-        known_path(&mut known, &format!("repository/{name}"));
-    }
     known_git(&mut known, "attribute-view");
     known_path(&mut known, "attribute-view/.git/info/attributes");
     for (index, _) in &attribute_view.indexes {
@@ -1167,6 +1111,14 @@ pub(super) fn capture(
     // The identity files now in the snapshot, which the recording may have added to.
     let mut after = names.clone();
     after.extend(private.identities(&ids)?.into_keys());
+    // What the writer left in the identity tree is what it decided: the file of
+    // each declaration at its mirrored path, an aside for a dropped object that
+    // another declaration displaced, a numbered aside when that name was taken.
+    // Compose does not re-derive those rules (it may not depend on the model,
+    // ADR-0015); it admits the `.json` files found, and the CLI's own loader
+    // vets every one of them in the validation that follows. Anything that is
+    // not an identity file (a temp file, a leftover) stays unknown.
+    known_identity_files(&mut known, &ids, &after);
     for name in &after {
         result.insert(name.clone(), private.input(name, &declarations, &ids)?);
     }
@@ -1313,122 +1265,36 @@ pub(super) fn capture(
 }
 
 #[cfg(test)]
-mod aside_tests {
+mod identity_admission_tests {
     use super::*;
 
-    fn tree() -> BTreeMap<String, FileBytes> {
-        let file = |text: &str| FileBytes {
-            bytes: text.as_bytes().to_vec(),
-            mode: 0o644,
-        };
-        BTreeMap::from([
-            (
-                ".pbps/ids/t.json".to_owned(),
-                file(r#"{"uid":"t_aaaaaa","table":"dbo.t"}"#),
-            ),
-            (
-                ".pbps/ids/u.json".to_owned(),
-                file(r#"{"uid":"t_bbbbbb","table":"dbo.u"}"#),
-            ),
-            ("schema/t.yml".to_owned(), file("table: dbo.t\n")),
-        ])
-    }
-
-    fn drop_table(table: &str) -> Intent {
-        Intent::DropTable {
-            table: table.into(),
-            reason: "r".into(),
-        }
-    }
-
     #[test]
-    fn only_the_dropped_tables_own_aside_name_is_admitted() {
-        let files = tree();
-        assert_eq!(
-            dropped_object_aside(&drop_table("dbo.t"), ".pbps/ids", files.iter()),
-            Some(".pbps/ids/dbo.t.t_aaaaaa.json".to_owned())
-        );
-        // Another table's aside, an unknown table and other intents admit nothing.
-        assert_eq!(
-            dropped_object_aside(&drop_table("dbo.missing"), ".pbps/ids", files.iter()),
-            None
-        );
-        assert_eq!(
-            dropped_object_aside(&Intent::Declarations, ".pbps/ids", files.iter()),
-            None
-        );
-        // A name outside the identity directory is not an identity file.
-        assert_eq!(
-            dropped_object_aside(&drop_table("dbo.t"), "other/ids", files.iter()),
-            None
-        );
-    }
-
-    #[test]
-    fn a_dropped_roles_own_aside_name_is_admitted_and_a_table_intent_does_not_reach_it() {
-        let mut files = tree();
-        files.insert(
-            ".pbps/ids/r.json".to_owned(),
-            FileBytes {
-                bytes: br#"{"uid":"r_dddddd","role":"app_reader"}"#.to_vec(),
-                mode: 0o644,
-            },
-        );
-        let drop_role = |role: &str| Intent::DropRole {
-            role: role.into(),
-            reason: "r".into(),
-        };
-        assert_eq!(
-            dropped_object_aside(&drop_role("app_reader"), ".pbps/ids", files.iter()),
-            Some(".pbps/ids/app_reader.r_dddddd.json".to_owned())
-        );
-        // A table of that name is not a role, and a role of that name is not a table.
-        assert_eq!(
-            dropped_object_aside(&drop_table("app_reader"), ".pbps/ids", files.iter()),
-            None
-        );
-        assert_eq!(
-            dropped_object_aside(&drop_role("dbo.t"), ".pbps/ids", files.iter()),
-            None
-        );
-        for intent in [
-            Intent::Rename {
-                from: "a".into(),
-                to: "b".into(),
-            },
-            Intent::RenameTable {
-                from: "dbo.t".into(),
-                to: "dbo.v".into(),
-            },
-            Intent::Drop {
-                column: "dbo.t.id".into(),
-                reason: "r".into(),
-            },
-            Intent::RenameRole {
-                from: "app_reader".into(),
-                to: "x".into(),
-            },
+    fn only_json_files_in_the_identity_directory_are_admitted() {
+        let names: Vec<String> = [
+            ".pbps/ids/t.json",
+            ".pbps/ids/sub/dbo.t.t_aaaaaa.1.json",
+            // Not identity files: a temp file, an aside left by a crash, a file
+            // elsewhere that merely ends in .json, a sibling directory.
+            ".pbps/ids/.t.json.tmp",
+            ".pbps/ids/.t.json.aside",
+            "schema/t.json",
+            ".pbps/ids2/t.json",
+        ]
+        .map(String::from)
+        .into();
+        let mut known = BTreeSet::new();
+        known_identity_files(&mut known, ".pbps/ids", &names);
+        assert!(known.contains("repository/.pbps/ids/t.json"));
+        assert!(known.contains("repository/.pbps/ids/sub/dbo.t.t_aaaaaa.1.json"));
+        // The directories above an admitted file come with it.
+        assert!(known.contains("repository/.pbps/ids/sub"));
+        for stray in [
+            "repository/.pbps/ids/.t.json.tmp",
+            "repository/.pbps/ids/.t.json.aside",
+            "repository/schema/t.json",
+            "repository/.pbps/ids2/t.json",
         ] {
-            assert_eq!(
-                dropped_object_aside(&intent, ".pbps/ids", files.iter()),
-                None,
-                "{intent:?}"
-            );
+            assert!(!known.contains(stray), "{stray}");
         }
-    }
-
-    #[test]
-    fn a_name_with_unsafe_characters_is_sanitised_as_the_cli_does() {
-        let files = BTreeMap::from([(
-            ".pbps/ids/x.json".to_owned(),
-            FileBytes {
-                bytes: br#"{"uid":"t_cccccc","table":"my schema.t/x"}"#.to_vec(),
-                mode: 0o644,
-            },
-        )]);
-        assert_eq!(
-            dropped_object_aside(&drop_table("my schema.t/x"), ".pbps/ids", files.iter()),
-            Some(".pbps/ids/my_schema.t_x.t_cccccc.json".to_owned())
-        );
     }
 }

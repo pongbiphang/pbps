@@ -487,6 +487,85 @@ fn a_dropped_table_replaced_at_its_yaml_path_previews_with_its_identity_set_asid
 }
 
 #[test]
+fn a_declarations_candidate_over_a_dropped_tables_yaml_path_admits_the_aside_the_writer_makes() {
+    let repo = Repository::new("declarations-aside", "");
+    // `dbo.t` is dropped and committed: its identity file stays, marked dropped.
+    fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
+    checked(repo.cli(&["drop-table", "--reason=Retired", "--", "dbo.t"]));
+    repo.commit();
+    // Another table is declared at the dropped one's YAML path: planning sends
+    // the dropped file aside, which no intent named.
+    repo.table("table: dbo.u\ncolumns:\n  id: {type: int}\n");
+    let mut action = request();
+    action.intent = Intent::Declarations;
+    let preview = repo.store().preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("dbo.u"), "{}", preview.diff);
+}
+
+#[test]
+fn a_numbered_aside_is_admitted_when_the_plain_aside_name_is_occupied() {
+    let repo = Repository::new("numbered-aside", "");
+    // The plain aside of `dbo.t` is `dbo.t.<uid>.json`; a live declaration
+    // mirrors exactly that path, so the writer must use `<uid>.1.json`.
+    let uid = fs::read_to_string(repo.project.join(".pbps/ids/t.json"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"uid\": \"").map(str::to_owned))
+        .unwrap()
+        .trim_end_matches(['"', ','])
+        .to_owned();
+    fs::write(
+        repo.project.join(format!("schema/dbo.t.{uid}.yml")),
+        "table: dbo.w\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    checked(repo.cli(&["plan"]));
+    repo.commit();
+    repo.table("table: dbo.u\ncolumns:\n  id: {type: int}\n");
+    let mut action = request();
+    action.intent = Intent::DropTable {
+        table: "dbo.t".into(),
+        reason: "Replaced".into(),
+    };
+    let preview = repo.store().preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("Replaced"), "{}", preview.diff);
+}
+
+#[test]
+fn an_unknown_private_file_the_cli_leaves_in_the_identity_tree_is_still_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repository::new("unknown-entry", "");
+    // A stand-in executable: the real CLI, then a stray temp file in the
+    // identity tree after the recording (only for `drop-table`).
+    let script = repo.root.join("cli-with-a-stray.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\"{BIN}\" \"$@\"\nrc=$?\ncase \" $* \" in *\" drop-table \"*) \
+             mkdir -p .pbps/ids; echo x > .pbps/ids/.stray.json.tmp;; esac\nexit $rc\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut store = Candidates::new(Config {
+        executable: script,
+        project: repo.project.clone(),
+        deadline: Duration::from_secs(30),
+    });
+    fs::remove_file(repo.project.join("schema/t.yml")).unwrap();
+    let mut action = request();
+    action.intent = Intent::DropTable {
+        table: "dbo.t".into(),
+        reason: "Retired".into(),
+    };
+    let error = store.preview(action, SystemTime::now()).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Unknown private snapshot entries"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_dropped_role_replaced_at_its_yaml_path_previews_with_its_identity_set_aside() {
     let repo = Repository::new("drop-role-replaced", "");
     fs::write(repo.project.join("schema/r.yml"), "role: app_reader\n").unwrap();
