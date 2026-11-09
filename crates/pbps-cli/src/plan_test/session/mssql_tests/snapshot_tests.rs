@@ -72,7 +72,7 @@ pub(super) async fn raw_table_name(session: &Session<'_>) -> anyhow::Result<()> 
         .tables
         .insert(TableName::new("snap", "t\\\tx"), Default::default());
     let found = crate::plan_test::snapshot::read(session, &schema).await?;
-    let (tables, allocators) = crate::plan_test::snapshot::compare(&found, &found);
+    let (tables, allocators) = crate::plan_test::snapshot::compare(&found, &found).await;
     let json = serde_json::to_value(tables)?;
     ensure!(json[0]["table"] == "snap.t\\\tx", "{json}");
     ensure!(
