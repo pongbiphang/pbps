@@ -79,6 +79,20 @@
       ],
       "issue": 2652,
       "expires": "2026-12-02"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::docker2410::a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2767,
+      "expires": "2026-12-08"
     }
   ]
 }
