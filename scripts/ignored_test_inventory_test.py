@@ -72,6 +72,58 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "no execution owner"):
             self.check()
 
+    RUNNER = """def run_case(binary, test):
+    pass
+
+
+def main():
+    run_case("lib", "one::first")
+    run_case("flow", "two::second")
+    raise RuntimeError("no qualification case ran")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+    def two_target_runner(self):
+        """A Windows script owner whose runner selects the cases of two targets (#2491)."""
+        flow = ("demo", "test", "flow")
+        (self.root / "scripts").mkdir(exist_ok=True)
+        (self.root / "scripts/runner.py").write_text(self.RUNNER, encoding="utf-8")
+        self.workflow.write_text(WORKFLOW + """  win:
+    runs-on: windows-2025
+    steps:
+      - run: python3 scripts/runner.py
+""", encoding="utf-8")
+        self.inventory["owners"]["win"] = {
+            "platform": "win32", "fixture": "Owned runner", "job": "win", "script": "scripts/runner.py",
+            "selection": {"kind": "calls", "file": "scripts/runner.py", "scope": "main",
+                          "callee": "run_case", "argument": 1},
+            "witnesses": [
+                {"file": "scripts/runner.py", "language": "python", "scope": "<module>", "requires": ["main()"]},
+                {"file": "scripts/runner.py", "language": "python", "scope": "main",
+                 "requires": ['raise RuntimeError("no qualification case ran")']}]}
+        self.inventory["groups"] += [
+            {"target": list(KEY), "owner": "win", "validate_on": "win32", "ignored_on": ["win32"],
+             "cases": ["one::first"]},
+            {"target": list(flow), "owner": "win", "validate_on": "win32", "ignored_on": ["win32"],
+             "cases": ["two::second"]}]
+        self.targets[KEY] = {"all": {"owned", "ordinary", "one::first"}, "ignored": {"owned", "one::first"}}
+        self.targets[flow] = {"all": {"two::second"}, "ignored": {"two::second"}}
+        return flow
+
+    def test_one_runner_may_select_the_cases_of_several_targets(self):
+        self.two_target_runner()
+        self.assertEqual(self.check("win32"), 3)
+
+    def test_a_selected_case_no_target_has_is_still_a_stale_selector(self):
+        self.two_target_runner()
+        (self.root / "scripts/runner.py").write_text(
+            self.RUNNER.replace('    raise', '    run_case("flow", "three::gone")\n    raise'), encoding="utf-8")
+        with self.assertRaisesRegex(audit.InventoryError, r"stale runner selector: win: \['three::gone'\]"):
+            self.check("win32")
+
     def test_removed_case_and_wrong_target_are_stale_not_empty_success(self):
         for mutate in (lambda: self.targets[KEY]["all"].clear(),
                        lambda: self.inventory["groups"][0]["target"].__setitem__(2, "missing")):
