@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::admission::{self, Admission, Cause, Judgement};
 use crate::existing_expressions::{self, Kind, Site};
 use pbps_db::{Conn, DbError};
-use pbps_dialect::{RowOperation, RowWrite};
+use pbps_dialect::{ColumnDomain, RewriteScope, RowOperation, RowWrite};
 use pbps_model::{ModuleId, ModuleKind, Schema, TableName};
 
 /// `insufficient_privilege`, which `LOCK TABLE` raises for a table the
@@ -259,14 +259,17 @@ fn event(operation: &RowOperation) -> i16 {
         RowOperation::Insert { .. } | RowOperation::Copy { .. } => INSERT,
         RowOperation::Update { .. } => UPDATE,
         RowOperation::Delete => DELETE,
-        RowOperation::Rewrite => REWRITE,
+        RowOperation::Rewrite { .. } => REWRITE,
     }
 }
 
 /// Whether the operation writes through the trigger catalog at all. A rewrite
 /// and a copy into a table the plan created fire none the guard answers for.
 fn fires_triggers(operation: &RowOperation) -> bool {
-    !matches!(operation, RowOperation::Rewrite | RowOperation::Copy { .. })
+    !matches!(
+        operation,
+        RowOperation::Rewrite { .. } | RowOperation::Copy { .. }
+    )
 }
 
 /// What one write reaches: the triggers it fires and the expressions it runs.
@@ -314,6 +317,10 @@ struct Statement {
     /// 16.15 and 18.6, #2748). Empty when the list is not known, which judges
     /// every DEFAULT, the conservative answer.
     supplied: BTreeSet<String>,
+    /// For a rewrite, what it re-evaluates besides the indexes (measured on 16
+    /// and 18, DEC-2563.9). `Indexes` for every other statement, which never
+    /// reads it.
+    rewrite: RewriteScope,
     /// Whether `read_actions` made this statement: the engine's own write for a
     /// referential action, or one half of a row movement such a write causes. A
     /// property the statement is given where it is created, never read off which
@@ -407,10 +414,22 @@ async fn walk(
             RowOperation::Update { columns } => {
                 columns.iter().map(|c| c.raw().to_owned()).collect()
             }
+            // The column a rewrite recomputes or retypes: the CHECKs that
+            // mention it, and its domain's, are what the rewrite validates.
+            RowOperation::Rewrite {
+                scope: RewriteScope::Column { column, .. },
+            } => BTreeSet::from([column.raw().to_owned()]),
             RowOperation::Insert { .. }
             | RowOperation::Delete
             | RowOperation::Copy { .. }
-            | RowOperation::Rewrite => BTreeSet::new(),
+            | RowOperation::Rewrite { .. } => BTreeSet::new(),
+        },
+        rewrite: match &write.operation {
+            RowOperation::Rewrite { scope } => scope.clone(),
+            RowOperation::Insert { .. }
+            | RowOperation::Update { .. }
+            | RowOperation::Delete
+            | RowOperation::Copy { .. } => RewriteScope::Indexes,
         },
         supplied: match &write.operation {
             RowOperation::Insert { columns } => {
@@ -418,7 +437,7 @@ async fn walk(
             }
             // `INSERT ... SELECT` lists its columns as well.
             RowOperation::Copy { columns } => columns.iter().map(|c| c.raw().to_owned()).collect(),
-            RowOperation::Update { .. } | RowOperation::Delete | RowOperation::Rewrite => {
+            RowOperation::Update { .. } | RowOperation::Delete | RowOperation::Rewrite { .. } => {
                 BTreeSet::new()
             }
         },
@@ -477,6 +496,7 @@ async fn walk(
                 supplied: BTreeSet::new(),
                 // The halves of a movement a referential action causes are the
                 // engine's own as well.
+                rewrite: RewriteScope::Indexes,
                 from_action: statement.from_action,
                 sets_default: false,
                 partitions_only: statement.partitions_only,
@@ -1022,6 +1042,7 @@ async fn read_actions(
                 event,
                 columns,
                 supplied: BTreeSet::new(),
+                rewrite: RewriteScope::Indexes,
                 from_action: true,
                 sets_default,
                 partitions_only: true,
@@ -1198,6 +1219,17 @@ fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) 
     let defaults =
         (insert && !statement.rows_only) || (update && through_an_action && statement.sets_default);
     let policies = (insert || update || delete) && !through_an_action && !statement.rows_only;
+    // A rewrite validates the constraints on the column it recomputes, and the
+    // domain that column has afterwards; one nobody measured is judged as an
+    // insert is (DEC-2563.9).
+    let unmeasured = rewrite && statement.rewrite == RewriteScope::Unmeasured;
+    let rewrites_a_column = rewrite && matches!(statement.rewrite, RewriteScope::Column { .. });
+    let only_mentioning = if rewrites_a_column {
+        "AND EXISTS (SELECT 1 FROM touched t WHERE t.attrelid = con.conrelid \
+                     AND t.attnum = ANY (con.conkey))"
+    } else {
+        ""
+    };
     // An UPDATE runs the generated expressions and domain checks of the columns
     // it sets (and of the ones those feed); an INSERT, every one.
     let touched = if update { touched_join() } else { "" };
@@ -1216,14 +1248,14 @@ fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) 
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                 CROSS JOIN root";
     let mut arms: Vec<String> = Vec::new();
-    if insert || update {
+    if insert || update || unmeasured || rewrites_a_column {
         arms.push(format!(
             "SELECT 'check' AS kind, r.oid::int8 AS oid, {on} AS place,
                     con.conname::pg_catalog.text AS name, con.conbin::pg_catalog.text AS tree
              {from}
              JOIN pg_catalog.pg_constraint con
                ON con.conrelid = r.oid AND con.contype = 'c' AND con.conbin IS NOT NULL
-             WHERE NOT ({gone}) AND {alive}",
+             WHERE NOT ({gone}) AND {alive} {only_mentioning}",
             gone = gone_owned(
                 &dropped.checks,
                 "con.conname::pg_catalog.text",
@@ -1254,7 +1286,7 @@ fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) 
     let named_only = format!("AND r.oid = {}::pg_catalog.oid", statement.relation);
     for (kind, generated, wanted) in [
         ("default", "= ''", defaults),
-        ("generated", "<> ''", insert || update),
+        ("generated", "<> ''", insert || update || unmeasured),
     ] {
         if wanted {
             let omitted_only = if kind == "default" {
@@ -1354,8 +1386,19 @@ fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) 
             ));
         }
     }
-    if insert || update {
-        let only_set = if update {
+    // The domain's checks: of the columns an UPDATE sets, of the column a rewrite
+    // recomputes (the type it has after), of every column an INSERT, or a rewrite
+    // nobody measured, writes.
+    let domain_of_a_rewrite = match &statement.rewrite {
+        RewriteScope::Indexes
+        | RewriteScope::Column {
+            domain: ColumnDomain::Leaves,
+            ..
+        } => false,
+        RewriteScope::Column { .. } | RewriteScope::Unmeasured => rewrite,
+    };
+    if insert || update || domain_of_a_rewrite {
+        let only_set = if update || (rewrite && rewrites_a_column) {
             "AND EXISTS (SELECT 1 FROM touched t WHERE t.attrelid = a.attrelid AND t.attnum = a.attnum)"
         } else {
             ""
@@ -1446,15 +1489,41 @@ fn site_arms(statement: &Statement, dropped: &Dropped) -> (String, Vec<String>) 
             "a.attname::pg_catalog.text",
             Some("a.attinhcount > 0"),
         );
+        // A column changed to a domain has it only once the statement has run, so
+        // the domain is read by the name the change gives it.
+        let (type_of_column, domain_join) = match &statement.rewrite {
+            RewriteScope::Column {
+                domain: ColumnDomain::Becomes(ty),
+                ..
+            } if rewrite => (
+                "t.oid".to_owned(),
+                format!(
+                    "JOIN pg_catalog.pg_type t ON t.typtype = 'd' AND t.typname = {}
+                       AND t.typnamespace = (SELECT x.oid FROM pg_catalog.pg_namespace x
+                                             WHERE x.nspname = {})",
+                    literal(ty.name()),
+                    literal(ty.schema())
+                ),
+            ),
+            RewriteScope::Indexes
+            | RewriteScope::Unmeasured
+            | RewriteScope::Column {
+                domain: ColumnDomain::Unchanged | ColumnDomain::Leaves | ColumnDomain::Becomes(_),
+                ..
+            } => (
+                "a.atttypid".to_owned(),
+                "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype = 'd'".to_owned(),
+            ),
+        };
         let domains = format!(
             ", domains(attrelid, attnum, declared, typid) AS (
-                 SELECT a.attrelid, a.attnum, a.atttypid, a.atttypid
+                 SELECT a.attrelid, a.attnum, {type_of_column}, {type_of_column}
                  FROM relations r
                  JOIN pg_catalog.pg_class c ON c.oid = r.oid
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                  JOIN pg_catalog.pg_attribute a
                    ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
-                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid AND t.typtype = 'd'
+                 {domain_join}
                  WHERE {alive} AND NOT ({gone_columns}) {only_set}
                  UNION ALL
                  SELECT d.attrelid, d.attnum, d.declared, t.typbasetype
@@ -1604,6 +1673,7 @@ mod tests {
             event,
             columns: BTreeSet::from(["b".to_owned()]),
             supplied: BTreeSet::new(),
+            rewrite: RewriteScope::Indexes,
             from_action: false,
             sets_default: false,
             partitions_only: false,
@@ -1703,6 +1773,71 @@ mod tests {
         let mut with = without.clone();
         with.extend(set(&["default", "domain_default"]));
         assert_eq!(action_kinds(true), with);
+    }
+
+    /// The kinds a rewrite of the given scope is judged for.
+    fn rewrite_arms(scope: RewriteScope) -> (String, Vec<String>) {
+        let mut rewrite = statement(REWRITE, false);
+        if let RewriteScope::Column { column, .. } = &scope {
+            rewrite.columns = BTreeSet::from([column.raw().to_owned()]);
+        }
+        rewrite.rewrite = scope;
+        site_arms(&rewrite, &Dropped::default())
+    }
+
+    fn labels(arms: &[String]) -> BTreeSet<String> {
+        arms.iter()
+            .map(|arm| arm.split('\'').nth(1).expect("a labelled query").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_rewrite_is_judged_for_what_it_validates() {
+        let column = |domain| RewriteScope::Column {
+            column: "v".into(),
+            domain,
+        };
+        // The indexes alone.
+        let (_, arms) = rewrite_arms(RewriteScope::Indexes);
+        assert_eq!(labels(&arms), set(&["index_key", "index_filter"]));
+        // A column recomputed in place: the CHECKs that mention it, and its domain's.
+        let (extra, arms) = rewrite_arms(column(ColumnDomain::Unchanged));
+        assert_eq!(
+            labels(&arms),
+            set(&["check", "index_key", "index_filter", "domain_check"])
+        );
+        let check = arms.iter().find(|a| a.contains("'check' AS kind")).unwrap();
+        assert!(check.contains("t.attnum = ANY (con.conkey)"), "{check}");
+        assert!(extra.contains("FROM touched t"), "{extra}");
+        // A column changed to a domain: the domain is read by the name the
+        // change gives it, not the type the column has now.
+        let (extra, arms) = rewrite_arms(column(ColumnDomain::Becomes("app.dm".parse().unwrap())));
+        assert!(labels(&arms).contains("domain_check"));
+        assert!(
+            extra.contains("t.typname = E'dm'") && extra.contains("x.nspname = E'app'"),
+            "{extra}"
+        );
+        // A column changed to a type that is no domain: the old one goes with it.
+        let (extra, arms) = rewrite_arms(column(ColumnDomain::Leaves));
+        assert_eq!(
+            labels(&arms),
+            set(&["check", "index_key", "index_filter"]),
+            "{extra}"
+        );
+        // A rewrite nobody measured is judged in full, defaults and policies aside.
+        let (_, arms) = rewrite_arms(RewriteScope::Unmeasured);
+        assert_eq!(
+            labels(&arms),
+            set(&[
+                "check",
+                "generated",
+                "index_key",
+                "index_filter",
+                "domain_check"
+            ])
+        );
+        let check = arms.iter().find(|a| a.contains("'check' AS kind")).unwrap();
+        assert!(!check.contains("conkey"), "{check}");
     }
 
     #[test]
@@ -2115,12 +2250,15 @@ mod tests {
         assert!(fires_triggers(&RowOperation::Update {
             columns: BTreeSet::new()
         }));
-        assert!(!fires_triggers(&RowOperation::Rewrite));
+        let rewrite = RowOperation::Rewrite {
+            scope: RewriteScope::Indexes,
+        };
+        assert!(!fires_triggers(&rewrite));
         let copy = RowOperation::Copy {
             columns: BTreeSet::new(),
         };
         assert!(!fires_triggers(&copy));
         assert_eq!(event(&copy), INSERT);
-        assert_eq!(event(&RowOperation::Rewrite), REWRITE);
+        assert_eq!(event(&rewrite), REWRITE);
     }
 }

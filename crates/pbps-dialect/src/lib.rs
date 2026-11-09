@@ -449,9 +449,11 @@ pub enum RowOperation {
     /// A statement that rewrites or scans the table's stored rows without being
     /// a row write of the plan's: a column retype that rebuilds the table, an
     /// `ADD COLUMN` that fills every row, `ANALYZE`. It fires no trigger; it
-    /// re-evaluates the table's index expressions as the deploying role
-    /// (#2563, DEC-2563.9).
-    Rewrite,
+    /// re-evaluates the table's index expressions as the deploying role, and
+    /// what else the scope says (#2563, DEC-2563.9).
+    Rewrite {
+        scope: RewriteScope,
+    },
     /// A bulk `INSERT … SELECT` into a table the plan created (the copy of a
     /// rebuild). Its expressions run as a row insert's do; the triggers of a
     /// table that did not exist before the plan are not the guard's concern
@@ -460,6 +462,36 @@ pub enum RowOperation {
     Copy {
         columns: std::collections::BTreeSet<pbps_model::ColumnName>,
     },
+}
+
+/// What a rewrite re-evaluates besides the table's indexes, which every rewrite
+/// rebuilds (measured on 16 and 18: a persistence switch, `ADD COLUMN`, a retype
+/// and `SET EXPRESSION` each evaluated every index expression and filter).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RewriteScope {
+    /// The indexes alone: a persistence switch, `ADD COLUMN`, `ANALYZE`.
+    Indexes,
+    /// The indexes, the CHECKs that mention one column, and the CHECKs of the
+    /// domain the column has afterwards: a retype and `SET EXPRESSION` validate
+    /// the constraints on the column they recompute.
+    Column {
+        column: pbps_model::ColumnName,
+        domain: ColumnDomain,
+    },
+    /// A rewrite nobody has measured: judged as a row insert is, defaults and
+    /// policies aside, because an unmeasured rewrite is not a free one.
+    Unmeasured,
+}
+
+/// The domain a rewritten column has once the statement has run.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ColumnDomain {
+    /// The type it has now: its domain, if it has one, validates the new values.
+    Unchanged,
+    /// The type it is changed to.
+    Becomes(pbps_model::TypeRef),
+    /// A type that is no domain: the domain it has now goes with the old type.
+    Leaves,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

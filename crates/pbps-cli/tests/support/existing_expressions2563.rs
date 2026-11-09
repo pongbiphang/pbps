@@ -242,7 +242,9 @@ fn each_statement_is_judged_for_exactly_the_expressions_it_runs() {
             ),
             (
                 "a rewrite re-runs the index keys and filters and nothing else",
-                RowOperation::Rewrite,
+                RowOperation::Rewrite {
+                    scope: pbps_dialect::RewriteScope::Indexes,
+                },
                 vec![
                     "app.f_key(integer)",
                     "app.f_filter(integer)",
@@ -2054,6 +2056,113 @@ fn an_action_that_lands_on_the_table_the_plan_writes_is_still_the_engines_own() 
     });
 }
 
+/// What a rewrite re-evaluates besides the indexes, by scope (#2775). Measured on
+/// 16 and 18 (DEC-2563.9): every rewrite rebuilds every index; a retype or
+/// `SET EXPRESSION` also validates the CHECKs that mention the column it
+/// recomputes, and a domain it is changed to validates its values; a
+/// persistence switch and `ADD COLUMN` rebuild the indexes alone.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_rewrite_is_judged_for_the_expressions_it_validates_and_no_other() {
+    use pbps_dialect::{ColumnDomain, RewriteScope};
+    each_server(|version, url| {
+        let own = OwnDatabase::new(url, &format!("ee2775-scope-{version}"));
+        on_server(
+            own.connection(),
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f_check(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_cchk(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_key(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN 1; END$$;
+             CREATE FUNCTION app.f_filter(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE FUNCTION app.f_dom(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE
+                 AS $$BEGIN RETURN true; END$$;
+             CREATE DOMAIN app.d AS integer CONSTRAINT dc CHECK (app.f_dom(VALUE));
+             CREATE TABLE app.t (a integer, b integer, c app.d,
+                 CONSTRAINT ck_a CHECK (app.f_cchk(a)),
+                 CONSTRAINT ck_b CHECK (app.f_check(b)));
+             CREATE INDEX ix_key ON app.t ((app.f_key(a)));
+             CREATE INDEX ix_filter ON app.t (a) WHERE app.f_filter(b)",
+        );
+        let set = |routines: &[&'static str]| -> BTreeSet<&'static str> {
+            routines.iter().copied().collect()
+        };
+        let (check, cchk, key, filter, dom) = (
+            "app.f_check(integer)",
+            "app.f_cchk(integer)",
+            "app.f_key(integer)",
+            "app.f_filter(integer)",
+            "app.f_dom(integer)",
+        );
+        let column = |name: &str, domain| RewriteScope::Column {
+            column: name.into(),
+            domain,
+        };
+        let cases: Vec<(&str, RewriteScope, BTreeSet<&'static str>)> = vec![
+            (
+                "the indexes alone",
+                RewriteScope::Indexes,
+                set(&[key, filter]),
+            ),
+            (
+                "b retyped to a type that is no domain: the CHECKs that mention b",
+                column("b", ColumnDomain::Leaves),
+                set(&[check, key, filter]),
+            ),
+            (
+                "a retyped: the CHECKs that mention a",
+                column("a", ColumnDomain::Leaves),
+                set(&[cchk, key, filter]),
+            ),
+            (
+                "b changed to the domain: the CHECKs that mention b and the domain's",
+                column("b", ColumnDomain::Becomes(domain_named("d"))),
+                set(&[check, key, filter, dom]),
+            ),
+            (
+                "c recomputed in place: its domain's (no CHECK mentions c)",
+                column("c", ColumnDomain::Unchanged),
+                set(&[key, filter, dom]),
+            ),
+            (
+                "c retyped away from its domain: the old domain goes with the old type",
+                column("c", ColumnDomain::Leaves),
+                set(&[key, filter]),
+            ),
+            (
+                "a rewrite nobody measured: judged in full",
+                RewriteScope::Unmeasured,
+                set(&[check, cchk, key, filter, dom]),
+            ),
+        ];
+        runtime().block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, own.connection())
+                .await
+                .unwrap();
+            for (label, scope, expected) in cases {
+                let operation = RowOperation::Rewrite { scope };
+                let got = names(
+                    &plan_time(
+                        &mut conn,
+                        "app.t",
+                        operation.clone(),
+                        &Dropped::default(),
+                        None,
+                    )
+                    .await,
+                );
+                assert_eq!(got, expected, "PG{version}: {label}");
+                // And just before the statement, which allows nothing.
+                let at = names(&at_the_statement_of(&mut conn, "app.t", operation).await);
+                assert_eq!(at, expected, "PG{version}: {label}, at the statement");
+            }
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Whole plans: a table that already carries an expression, then a plan that
 // writes rows to it, or rewrites it.
@@ -2298,6 +2407,173 @@ fn a_row_that_supplies_a_column_is_not_refused_for_its_default() {
             "PG{version}: {shown}"
         );
         assert_eq!(s.rows(), 1, "PG{version}");
+    }
+}
+
+/// A deployed table whose expressions call a routine that is then made one the
+/// predicate refuses: `setup` makes the routine with a fixed `search_path`,
+/// `unfit` takes it away.
+fn standing_custom(
+    version: i32,
+    url: &str,
+    slug: &str,
+    setup: &str,
+    declared: &str,
+    unfit: &str,
+) -> Standing {
+    let slug = format!("{slug}-{version}");
+    let own = OwnDatabase::new(url, &slug);
+    let connection = own.connection().to_owned();
+    let d = bootstrapped_demo(&connection, &slug, BASE);
+    d.keyed(&connection);
+    on_server(&connection, setup);
+    d.table(declared);
+    let standing = Standing {
+        plan: d.dir.join("ee-plan.json"),
+        _own: own,
+        d,
+        connection,
+        site: Site::Check,
+    };
+    let planned = standing.plan_now();
+    assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+    let applied = standing.apply();
+    assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
+    on_server(&standing.connection, unfit);
+    standing
+}
+
+/// A retype rewrites the table and re-validates the CHECKs that mention the
+/// column (measured on 16 and 18, DEC-2563.9, #2775): an unfit routine in one is
+/// refused before anything runs, a fixed one is admitted, and it is judged again
+/// when the statement runs.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_retype_is_judged_for_a_check_that_mentions_the_column() {
+    const FIXED: &str = "ALTER FUNCTION app.okn(anyelement) SET search_path = pg_catalog, pg_temp";
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let declared = format!("{BASE}checks:\n  ck: 'app.okn(n)'\n");
+        let s = standing_custom(
+            version,
+            &url,
+            "ee2775-retype",
+            "CREATE FUNCTION app.okn(anyelement) RETURNS boolean LANGUAGE plpgsql IMMUTABLE \
+             SET search_path = pg_catalog AS $$BEGIN RETURN true; END$$",
+            &declared,
+            "ALTER FUNCTION app.okn(anyelement) RESET search_path",
+        );
+        let retyped = declared.replace("n: {type: integer}", "n: {type: bigint}");
+        s.declare(&retyped);
+        let planned = s.plan_now();
+        let shown = text(&planned);
+        assert_ne!(code(&planned), 0, "PG{version}: {shown}");
+        assert!(
+            shown.contains("the existing CHECK `ck` of app.t"),
+            "PG{version}: {shown}"
+        );
+        // (The refusal spells the pseudo-type with its schema.)
+        assert!(
+            shown.contains("ALTER FUNCTION app.okn(")
+                && shown.contains("SET search_path = pg_catalog, pg_temp"),
+            "PG{version}: {shown}"
+        );
+        // Fixed: admitted at plan time.
+        on_server(&s.connection, FIXED);
+        let planned = s.plan_now();
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        // And judged again when the statement runs: the routine is unfit again.
+        on_server(
+            &s.connection,
+            "ALTER FUNCTION app.okn(anyelement) RESET search_path",
+        );
+        let applied = s.apply();
+        let shown = text(&applied);
+        assert_ne!(code(&applied), 0, "PG{version}: {shown}");
+        assert!(
+            shown.contains("the existing CHECK `ck` of app.t"),
+            "PG{version}: {shown}"
+        );
+        assert_eq!(
+            scalar(
+                &s.connection,
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'n' \
+                   AND data_type = 'integer'"
+            ),
+            1,
+            "PG{version}: nothing was changed"
+        );
+        // Fixed again, it applies.
+        on_server(&s.connection, FIXED);
+        let applied = s.apply();
+        assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
+    }
+}
+
+/// A stored generated expression changed in place (PostgreSQL 17 and later)
+/// rewrites the table and rebuilds every index (measured on 18, DEC-2563.9,
+/// #2775). The first ready review found it unjudged: an unfit routine in a
+/// standing index ran as the deploying role. On 16, which has no in-place form,
+/// the change is refused by name before it runs.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_stored_generated_expression_change_is_judged_for_the_indexes_it_rebuilds() {
+    for (version, url) in [(16, old_server()), (18, server())] {
+        let with_g = |expression: &str| {
+            Site::IndexKey.declared().replace(
+                "n: {type: integer}",
+                &format!(
+                    "n: {{type: integer}}\n  g: {{type: integer, generated: {{expression: '{expression}', stored: true}}}}"
+                ),
+            )
+        };
+        let s = standing_custom(
+            version,
+            &url,
+            "ee2775-genexpr",
+            "CREATE FUNCTION app.ok(text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE \
+             SET search_path = pg_catalog AS $$BEGIN RETURN true; END$$",
+            &with_g("n * 2"),
+            "ALTER FUNCTION app.ok(text) RESET search_path",
+        );
+        s.declare(&with_g("n * 3"));
+        let planned = s.plan_now();
+        let shown = text(&planned);
+        assert_ne!(code(&planned), 0, "PG{version}: {shown}");
+        // Refused by the guard first, on 16 as on 18, since the plan is judged
+        // before any engine could refuse the change.
+        assert!(
+            shown.contains("the existing index `ix` of app.t (its keys)"),
+            "PG{version}: {shown}"
+        );
+        assert!(shown.contains(FIX), "PG{version}: {shown}");
+        if version == 16 {
+            // Fixed, what is left is the engine's own limit: no `SET EXPRESSION`.
+            on_server(&s.connection, FIX);
+            let planned = s.plan_now();
+            let shown = text(&planned);
+            assert_ne!(code(&planned), 0, "PG{version}: {shown}");
+            assert!(shown.contains("SET EXPRESSION"), "PG{version}: {shown}");
+            continue;
+        }
+        // Fixed: admitted at plan time; unfit again, refused when the statement runs.
+        on_server(&s.connection, FIX);
+        let planned = s.plan_now();
+        assert_eq!(code(&planned), 0, "PG{version}: {}", text(&planned));
+        on_server(
+            &s.connection,
+            "ALTER FUNCTION app.ok(text) RESET search_path",
+        );
+        let applied = s.apply();
+        let shown = text(&applied);
+        assert_ne!(code(&applied), 0, "PG{version}: {shown}");
+        assert!(
+            shown.contains("the existing index `ix` of app.t (its keys)"),
+            "PG{version}: {shown}"
+        );
+        on_server(&s.connection, FIX);
+        let applied = s.apply();
+        assert_eq!(code(&applied), 0, "PG{version}: {}", text(&applied));
     }
 }
 

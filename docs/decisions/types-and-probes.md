@@ -5591,7 +5591,7 @@ advancing a sequence from an IMMUTABLE routine at each site:
 | `UPDATE` | CHECK, every index key and filter, the generated expressions and domain CHECKs of the columns it sets |
 | `DELETE`, `TRUNCATE`, a cascaded `DELETE` | none |
 | a referential action's `UPDATE` | as an `UPDATE` of the columns it sets, and only for `SET DEFAULT` the DEFAULT of those columns (see below) |
-| a rewrite, `REINDEX`, `ANALYZE` | index keys and filters only |
+| a rewrite, `REINDEX`, `ANALYZE` | every index key and filter, and for a retype or `SET EXPRESSION` the CHECKs that mention the column and its domain's CHECKs (see below) |
 
 So a plan that only deletes is never refused for a CHECK, default, generated
 expression or index; the one thing a `DELETE` can run is a policy that applies to
@@ -5642,6 +5642,40 @@ a descendant inherits (not one it also declares itself, which stays), the
 clones of a partitioned parent's index, and every expression of a table the plan
 drops and of the partitions that go with it. A name alone excuses nothing: it
 must be the owner's.
+
+What a rewrite runs, and who says it is one (#2775). Which changes rewrite is
+`estimate`'s answer for every change, not a list kept here: a `Yes` or an
+`Unknown` is judged and only a `No` is free. A list of kinds is what let
+`SET EXPRESSION` rebuild a table's indexes unjudged (PostgreSQL 17 and later);
+`estimate` matches every change without a wildcard, so a kind added later is
+classified there. Named besides: the rebuild's copy and `ANALYZE`, which `estimate`
+leaves out because they are the statements and not estimates, and the retype step of
+an enum or domain rebuild, which it leaves out in error (it is the table rewrite
+above, and the rebuild's tmp type is the one the column becomes).
+
+Measured on 16.15 and 18.6 (2026-11-09), three rows, a CHECK on each column and
+on both, an index key and a filter over each, an expression index over a
+generated column, and a CHECK on it:
+
+| statement | index keys and filters | CHECKs | domain CHECK |
+|---|---|---|---|
+| `SET UNLOGGED` | all | none | none |
+| `ADD COLUMN` with a volatile default | all | none (the new column's default runs, which the plan introduced) | none |
+| `ALTER COLUMN b TYPE bigint` | all | those that mention `b` (`ck_b`, `ck_ab`), not `ck_a` or `ck_g` | none |
+| `ALTER COLUMN b TYPE` a domain | all | those that mention `b` | the domain's, once per row |
+| `ALTER COLUMN g SET EXPRESSION` (18 only) | all | those that mention `g`, not `ck_a`, `ck_b`, `ck_ab` | `g`'s domain's |
+| `ALTER COLUMN a TYPE` for a column a generated column reads | refused by the engine | | |
+| the retype of an enum or domain rebuild (`ALTER COLUMN c TYPE <tmp> USING c::text::<tmp>`) | all | those that mention `c` (`eck`, three rows, on both) | the rebuilt type's |
+
+On 16 `SET EXPRESSION` is a syntax error, so the plan that needs it is refused
+before it runs; on 18 it rewrites and revalidates. So a rewrite carries a scope
+(`RowOperation::Rewrite`): the indexes alone for a persistence switch and
+`ADD COLUMN`; for a retype or `SET EXPRESSION` the column and the domain it has
+afterwards (the one it is changed to, read by name, since the column does not
+have it yet; none when it leaves a domain for another type); and for a kind
+nobody measured, judged in full as an insert is, defaults and policies aside,
+because an unmeasured rewrite is not a free one. The CHECKs are those whose
+`conkey` holds the column.
 
 Referential actions, measured on 16.15 and 18.6, identically (2026-11-08), with
 a referencing table carrying a column DEFAULT, a CHECK, a generated column over
