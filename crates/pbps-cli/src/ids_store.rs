@@ -266,21 +266,30 @@ impl PathKey {
                 Err(e) if depth > 0 && e.kind() == std::io::ErrorKind::PermissionDenied => continue,
                 Err(e) => return Err(e),
             };
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let twin = if name.to_uppercase() != name {
+            // One listing: the filesystem's own answer to which spellings exist.
+            let listed: BTreeSet<String> = entries
+                .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<_, _>>()?;
+            for name in &listed {
+                let twin = if name.to_uppercase() != *name {
                     name.to_uppercase()
                 } else {
                     name.to_lowercase()
                 };
-                if twin == name {
+                if twin == *name {
                     continue;
                 }
+                // Both spellings listed as entries: two files, a definite answer
+                // (hard links or symlinks to one file do not make it fold: they
+                // are two entries).
+                if listed.contains(&twin) {
+                    return Ok(Self { fold: false });
+                }
+                // Only one spelling listed: if the other still resolves, the
+                // filesystem folds. Not followed through a link: the entry
+                // itself is what is asked for.
                 return match std::fs::symlink_metadata(above.join(&twin)) {
-                    Ok(_) => Ok(Self {
-                        fold: same_file(&entry.path(), &above.join(&twin)),
-                    }),
+                    Ok(_) => Ok(Self { fold: true }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { fold: false }),
                     Err(e) => Err(e),
                 };

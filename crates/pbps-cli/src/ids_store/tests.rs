@@ -1429,3 +1429,41 @@ fn a_writable_directory_with_nothing_to_look_at_anywhere_gets_a_probe_file_and_l
     assert_eq!(key == PathKey::folding(), case_insensitive(&dir));
     assert!(names_in(&dir).is_empty(), "the probe file is removed again");
 }
+
+#[test]
+fn two_listed_spellings_of_one_name_are_a_case_sensitive_answer_even_when_they_are_one_file() {
+    use std::os::unix::fs as ufs;
+    for how in ["hard link", "symlink"] {
+        let project = project(&format!("probe-linked-{}", how.replace(' ', "-")));
+        let dir = project.ids_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        if how == "hard link" {
+            std::fs::hard_link(dir.join("a"), dir.join("A")).unwrap();
+        } else {
+            ufs::symlink("a", dir.join("A")).unwrap();
+        }
+        if case_insensitive(&dir) {
+            continue; // `a` and `A` cannot both exist here
+        }
+        // `a` and `A` are one file and two entries: the directory tells them apart.
+        assert_eq!(PathKey::probe(&dir).unwrap(), PathKey::default(), "{how}");
+        // Negative: a single spelling is judged by whether its twin resolves.
+        std::fs::remove_file(dir.join("A")).unwrap();
+        assert_eq!(PathKey::probe(&dir).unwrap(), PathKey::default(), "{how}");
+    }
+}
+
+#[test]
+fn a_dangling_symlink_spelled_like_the_twin_is_an_entry_not_a_fold() {
+    use std::os::unix::fs as ufs;
+    let project = project("probe-dangling");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a"), "x").unwrap();
+    if case_insensitive(&dir) {
+        return;
+    }
+    ufs::symlink("nowhere", dir.join("A")).unwrap();
+    assert_eq!(PathKey::probe(&dir).unwrap(), PathKey::default());
+}
