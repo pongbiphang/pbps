@@ -769,6 +769,84 @@ impl Drop for Running {
         }
     }
 }
+// A re-pin can retire its first scratch after the directory was listed.
+fn run_record_io<T>(result: std::io::Result<T>) -> Option<T> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        other => Some(other.unwrap()),
+    }
+}
+
+fn read_run_record(path: &Path) -> Option<Value> {
+    let bytes = run_record_io(std::fs::read(path))?;
+    Some(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[cfg(test)]
+mod run_record_tests {
+    use super::*;
+
+    fn record_path() -> (Demo, std::path::PathBuf) {
+        let p = Demo::new(&format!("run-record-{:x}", rand::random::<u64>()));
+        let path = p.dir.join("run.json");
+        (p, path)
+    }
+
+    #[test]
+    fn a_present_record_returns_its_value() {
+        let (_p, path) = record_path();
+        let value = json!({"container": {"id": "fixture"}});
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(read_run_record(&path), Some(value));
+    }
+
+    #[test]
+    fn a_record_removed_after_listing_is_already_gone() {
+        let (p, path) = record_path();
+        std::fs::write(&path, b"{}").unwrap();
+        let entry = std::fs::read_dir(&p.dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path() == path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_run_record(&entry.path()).is_none());
+    }
+
+    #[test]
+    fn a_missing_directory_entry_is_already_gone() {
+        let entry = Err(std::io::ErrorKind::NotFound.into());
+        assert!(run_record_io::<std::fs::DirEntry>(entry).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_directory_entry_still_fails() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let entry = Err(std::io::ErrorKind::PermissionDenied.into());
+                run_record_io::<std::fs::DirEntry>(entry)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_and_malformed_records_still_fail() {
+        let (_p, path) = record_path();
+        for bytes in [b"".as_slice(), b"{".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(std::panic::catch_unwind(|| read_run_record(&path)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_record_still_fails() {
+        let (_p, path) = record_path();
+        std::fs::create_dir(&path).unwrap();
+        assert!(std::panic::catch_unwind(|| read_run_record(&path)).is_err());
+    }
+}
+
 fn waiting(p: &Project) -> (Running, String) {
     waiting_on(p, p.command("json"))
 }
@@ -796,13 +874,17 @@ fn waiting_on(p: &Project, mut command: Command) -> (Running, String) {
             "child exited before the fixture wait"
         );
         let dir = p.state().join("pbps/test-runs");
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Some(entries) = run_record_io(std::fs::read_dir(dir)) {
             for e in entries {
-                let e = e.unwrap();
+                let Some(e) = run_record_io(e) else {
+                    continue;
+                };
                 if e.path().extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                let v: Value = serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+                let Some(v) = read_run_record(&e.path()) else {
+                    continue;
+                };
                 let Some(id) = v["container"]["id"].as_str() else {
                     continue;
                 };
