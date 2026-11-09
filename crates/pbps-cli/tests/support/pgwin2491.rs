@@ -4,18 +4,19 @@
 //! publication and apply flows (#616, #1516).
 //!
 //! These run only in the `resolver-pg-windows` job, as its dedicated ordinary
-//! user, against two native clusters it creates (`scripts/pgwin_qualify.py`):
-//! `PBPS_TEST_PG_DB` is the target cluster and `PBPS_TEST_PG_SCRATCH_DB` the
-//! cluster of its own the server scratch kinds use. The bodies are the ones the
-//! Linux jobs run; only the fixture differs. The Docker scratch kind has no
-//! Windows counterpart here (hosted Windows runs Windows containers only), and
-//! the PostgreSQL 16 half of the two-server tests has no counterpart (the image
-//! ships one major), so those stay unexercised rows of
+//! user, against three native clusters it creates from EnterpriseDB's pinned
+//! archives (`scripts/pgwin_qualify.py`): `PBPS_TEST_PG_DB` is the target
+//! (PostgreSQL 18.6), `PBPS_TEST_PG_SCRATCH_DB` the cluster of its own the
+//! server scratch kinds use (18.6) and `PBPS_TEST_PG_OLD_DB` the older server
+//! of the two-server tests (16.15). The bodies, and the halves the two-server
+//! tests run on each server, are the ones the Linux jobs run; only the fixture
+//! differs. The Docker scratch kind has no Windows counterpart here (hosted
+//! Windows runs Windows containers only), so it stays an unexercised row of
 //! docs/RESOLVER-ACCEPTANCE.md.
 
 use super::rehearsal2379::{self, Kind};
 use super::resolver_publication;
-use super::server;
+use super::{old_server, server};
 
 /// The scratch placements a native cluster offers without Docker.
 const NATIVE: [Kind; 2] = [Kind::Server, Kind::Supplied];
@@ -149,11 +150,13 @@ fn pg_rehearsal_a_kept_module_is_rebuilt_under_its_recorded_dependencies() {
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_publishes_its_rechecked_plan() {
     resolver_publication::published(&server());
+    resolver_publication::published(&old_server());
 }
 
 #[test]
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_plans_pass_the_ordinary_connected_checks() {
+    resolver_publication::ordinary_checks(&old_server(), true);
     resolver_publication::ordinary_checks(&server(), false);
 }
 
@@ -161,22 +164,26 @@ fn pg_resolver_plans_pass_the_ordinary_connected_checks() {
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_plans_apply_with_their_sealed_checks() {
     resolver_publication::applied(&server());
+    resolver_publication::applied(&old_server());
 }
 
 #[test]
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_plan_is_refused_before_ddl_when_a_sealed_input_moved() {
     resolver_publication::refused_before_ddl(&server());
+    resolver_publication::refused_before_ddl(&old_server());
 }
 
 #[test]
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_plan_closes_over_what_it_newly_reaches() {
     resolver_publication::newly_reached(&server());
+    resolver_publication::newly_reached(&old_server());
 }
 
 #[test]
 #[ignore = "needs the native PostgreSQL clusters of scripts/pgwin_qualify.py"]
 fn pg_resolver_plan_rolls_back_when_its_closing_check_finds_another_writer() {
     resolver_publication::closing_refusals(&server());
+    resolver_publication::closing_refusals(&old_server());
 }
