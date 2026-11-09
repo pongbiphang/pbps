@@ -228,34 +228,84 @@ impl PathKey {
     /// exists, when the tree is not there yet). An answer that cannot be had is
     /// an error, never "case-sensitive": that guess is the one that loses files.
     pub(crate) fn probe(dir: &Path) -> std::io::Result<Self> {
+        Self::probe_on(dir, &device_of)
+    }
+
+    /// [`probe`](Self::probe) with the device lookup given, so a mount boundary
+    /// can be tested without a mount.
+    fn probe_on(
+        dir: &Path,
+        device: &dyn Fn(&Path) -> std::io::Result<u64>,
+    ) -> std::io::Result<Self> {
         let base = dir
             .ancestors()
             .find(|d| d.is_dir())
             .unwrap_or(Path::new("."));
-        // Looked at without writing when an entry with a letter in its name is
-        // there: `plan --check` must work on a read-only checkout.
-        for entry in std::fs::read_dir(base)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let twin = if name.to_uppercase() != name {
-                name.to_uppercase()
+        // Looked at without writing: `plan --check` must work on a read-only
+        // checkout. The tree's own directory first; when it is empty, each
+        // directory above it on the same device (the project directory holds
+        // `pbps.yml`, so this normally answers). A directory on another device
+        // is another filesystem and says nothing about this one. Case folding
+        // can be set per directory (ext4 casefold, NTFS), so an ancestor's
+        // answer is the best a read-only look can give, never a better one than
+        // the directory's own.
+        let here = device(base)?;
+        for (depth, above) in base.ancestors().enumerate() {
+            let above = if above.as_os_str().is_empty() {
+                Path::new(".")
             } else {
-                name.to_lowercase()
+                above
             };
-            if twin == name {
+            if depth > 0 && device(above).ok() != Some(here) {
                 continue;
             }
-            return match std::fs::symlink_metadata(base.join(&twin)) {
-                Ok(_) => Ok(Self {
-                    fold: same_file(&entry.path(), &base.join(&twin)),
-                }),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { fold: false }),
-                Err(e) => Err(e),
+            let entries = match std::fs::read_dir(above) {
+                Ok(entries) => entries,
+                // A directory above that cannot be listed offers nothing; the
+                // tree's own must be readable.
+                Err(e) if depth > 0 && e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(e) => return Err(e),
             };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let twin = if name.to_uppercase() != name {
+                    name.to_uppercase()
+                } else {
+                    name.to_lowercase()
+                };
+                if twin == name {
+                    continue;
+                }
+                return match std::fs::symlink_metadata(above.join(&twin)) {
+                    Ok(_) => Ok(Self {
+                        fold: same_file(&entry.path(), &above.join(&twin)),
+                    }),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { fold: false }),
+                    Err(e) => Err(e),
+                };
+            }
         }
-        // Nothing to look at: make an entry, look for its twin, take it away.
+        // Nothing to look at anywhere: make an entry, look for its twin, take it
+        // away.
         let probe = base.join(format!(".PbpsCaseProbe{}", std::process::id()));
-        std::fs::write(&probe, b"")?;
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {}
+            // This process cannot write here, so a write of the tree is refused
+            // anyway; the key only decides what a check or a refusal says. Take
+            // the answer that cannot lose a file: fold. The cost is a refusal
+            // of two paths that differ only in case, on a directory that cannot
+            // be written.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                return Ok(Self { fold: true });
+            }
+            Err(e) => return Err(e),
+        }
         let found =
             std::fs::symlink_metadata(base.join(format!(".pbpscaseprobe{}", std::process::id())));
         std::fs::remove_file(&probe)?;
@@ -480,6 +530,24 @@ fn write_staged(tmp: &Path, text: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("injected: no space left on device"));
     }
     std::fs::write(tmp, text)
+}
+
+/// The device a path is on: `st_dev` on Unix. Elsewhere the volume (drive or
+/// share prefix) stands in, as the standard library offers no volume serial.
+fn device_of(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(path)?.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::hash::{Hash, Hasher};
+        let full = std::fs::canonicalize(path)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        full.components().next().hash(&mut hasher);
+        Ok(hasher.finish())
+    }
 }
 
 /// Whether two paths name one file or directory on disk, decided by the

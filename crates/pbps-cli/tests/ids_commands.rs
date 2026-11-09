@@ -922,3 +922,28 @@ fn the_identity_layout_refusal_is_one_json_envelope_for_plan_and_plan_check() {
         assert!(shown.contains("a.json/b.json"), "{args:?}: {shown}");
     }
 }
+
+#[test]
+fn plan_check_succeeds_on_a_read_only_checkout_with_an_empty_identity_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Project::new();
+    p.write("pbps.yml", "dialect: postgres\nids_dir: .pbps/ids\n");
+    std::fs::create_dir_all(p.0.join("schema")).unwrap();
+    let ids = p.0.join(".pbps/ids");
+    std::fs::create_dir_all(&ids).unwrap();
+    std::fs::set_permissions(&ids, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(ids.join(".probe"), "x").is_ok() {
+        let _ = std::fs::remove_file(ids.join(".probe"));
+        return; // an account that ignores permissions
+    }
+    let before = tree_of(&p);
+    let out = p.pbps(&["plan", "--check"]);
+    std::fs::set_permissions(&ids, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_ok(&out);
+    assert_eq!(tree_of(&p), before);
+    assert_eq!(
+        std::fs::read_dir(&ids).unwrap().count(),
+        0,
+        "nothing written"
+    );
+}

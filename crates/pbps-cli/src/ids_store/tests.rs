@@ -1375,3 +1375,57 @@ fn a_live_pair_is_still_refused_after_the_substitutions() {
         "{error}"
     );
 }
+
+// -------------------------------------------- the probe, read-only first ----
+
+#[test]
+fn an_empty_read_only_tree_directory_is_probed_without_a_write() {
+    let project = project("probe-readonly");
+    let dir = project.ids_dir();
+    if unwritable(&dir).is_none() {
+        return;
+    }
+    let before = listing(project.root());
+    // The key comes from an entry in a directory above (`pbps.yml`); nothing is
+    // written, so a no-op plan on a read-only checkout is a no-op, not an error.
+    let key = PathKey::probe(&dir).unwrap();
+    assert_eq!(key == PathKey::folding(), case_insensitive(project.root()));
+    let write = plan(&project, &IdsFile::default(), &DeclaredPaths::default()).unwrap();
+    writable(&dir);
+    assert!(write.is_empty());
+    assert_eq!(listing(project.root()), before, "nothing was written");
+}
+
+#[test]
+fn an_ancestor_on_another_device_says_nothing_about_this_filesystem() {
+    let project = project("probe-device");
+    let dir = project.ids_dir();
+    if unwritable(&dir).is_none() {
+        return;
+    }
+    let root = project.root().to_path_buf();
+    let same = |_: &Path| Ok(7u64);
+    // Only the tree's own directory is on this device; everything above is a
+    // mount of something else, so there is nothing to look at and nothing may be
+    // written: the answer that cannot lose a file.
+    let other = |p: &Path| Ok(if p == dir { 7u64 } else { 8u64 });
+    let looked = PathKey::probe_on(&dir, &same).unwrap();
+    let blind = PathKey::probe_on(&dir, &other).unwrap();
+    writable(&dir);
+    assert_eq!(looked == PathKey::folding(), case_insensitive(&root));
+    assert_eq!(blind, PathKey::folding());
+    if !case_insensitive(&root) {
+        assert_ne!(looked, blind, "the other device's entry was not used");
+    }
+}
+
+#[test]
+fn a_writable_directory_with_nothing_to_look_at_anywhere_gets_a_probe_file_and_loses_it() {
+    let project = project("probe-write");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let other = |p: &Path| Ok(if p == dir { 7u64 } else { 8u64 });
+    let key = PathKey::probe_on(&dir, &other).unwrap();
+    assert_eq!(key == PathKey::folding(), case_insensitive(&dir));
+    assert!(names_in(&dir).is_empty(), "the probe file is removed again");
+}
