@@ -1284,3 +1284,94 @@ fn a_git_path_is_matched_to_the_configured_directory_by_key() {
     assert_eq!(fold.strip_prefix_str(".pbps", ".pbps/ids/"), None);
     assert_eq!(fold.strip_prefix_str("é", "e"), None);
 }
+
+// ------------------------------------ one check on the final destinations ----
+
+/// `dbo.customer` (file `a.json`) is dropped; `dbo.other` is declared below
+/// that path, so the dropped file must go aside, and `dbo.third` is declared in
+/// a directory named like that aside.
+fn dropped_in_the_way_of_two() -> IdsFile {
+    ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other", "t_cccccc": "dbo.third"},
+        "columns": {},
+        "tombstones": {
+            T: {"was": "dbo.customer", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa1": {"was": "dbo.customer.id", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa2": {"was": "dbo.customer.name", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }))
+}
+
+#[test]
+fn an_aside_that_collides_with_a_destination_takes_the_next_free_name() {
+    let flat = declared(&[("dbo.customer", "a.yml", &["id", "name"])]);
+    let after = dropped_in_the_way_of_two();
+    for (spelling, key, expect) in [
+        // Exactly the aside's name as a directory.
+        (
+            "dbo.customer.t_aaaaaa.json/c.yml",
+            PathKey::default(),
+            "dbo.customer.t_aaaaaa.1.json",
+        ),
+        (
+            "dbo.customer.t_aaaaaa.json/c.yml",
+            PathKey::folding(),
+            "dbo.customer.t_aaaaaa.1.json",
+        ),
+        // Only the same name once case is folded.
+        (
+            "DBO.customer.T_aaaaaa.JSON/c.yml",
+            PathKey::folding(),
+            "dbo.customer.t_aaaaaa.1.json",
+        ),
+        // Negative: case is significant, so no collision and the plain name.
+        (
+            "DBO.customer.T_aaaaaa.JSON/c.yml",
+            PathKey::default(),
+            "dbo.customer.t_aaaaaa.json",
+        ),
+    ] {
+        let project = written("aside-collides", &customer(), &flat);
+        let paths = declared(&[
+            ("dbo.other", "a.json/b.yml", &[]),
+            ("dbo.third", spelling, &[]),
+        ]);
+        let write = plan_keyed(&project, &after, &paths, key).unwrap();
+        assert!(
+            write.files.contains_key(expect),
+            "{spelling} {key:?}: {:?}",
+            write.files.keys().collect::<Vec<_>>()
+        );
+        assert!(write.files[expect].contains("\"dropped\""), "{spelling}");
+        assert_eq!(write.removals, ["a.json"], "{spelling} {key:?}");
+        if key == PathKey::default() {
+            // The real filesystem here is case-sensitive: write it, read it back.
+            write.apply().unwrap();
+            assert_eq!(read_opt(&project).unwrap().unwrap().tombstones.len(), 3);
+            assert!(
+                plan_keyed(&project, &after, &paths, key)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_live_pair_is_still_refused_after_the_substitutions() {
+    // Two live destinations in conflict are refused whatever is dropped.
+    let project = project("final-live-pair");
+    let paths = declared(&[
+        ("dbo.customer", "a.yml", &["id", "name"]),
+        ("dbo.other", "a.json/b.yml", &[]),
+    ]);
+    let error = format!(
+        "{:#}",
+        plan_keyed(&project, &two_tables(), &paths, PathKey::default()).unwrap_err()
+    );
+    assert!(
+        error.contains("a file cannot also be a directory"),
+        "{error}"
+    );
+}

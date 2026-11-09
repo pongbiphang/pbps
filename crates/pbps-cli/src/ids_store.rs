@@ -711,67 +711,53 @@ pub(crate) fn plan_keyed(
             }
             // Step 4: a drop keeps the file it has. One the tree never held gets
             // the aside name, as `migrate` gives a dropped object with no YAML.
-            (false, _) => old.cloned().unwrap_or_else(|| aside_of(after, uid)),
+            (false, _) => old.cloned().unwrap_or_else(|| aside_of(after, uid, 0)),
         };
         want.insert(uid.clone(), path);
     }
-    // Step 5: a path wanted by a live object and held by a dropped one sends the
-    // dropped file aside (`<name>.<uid>.json`); the live object takes the path.
-    // Two live objects for one path would be two declarations for one file,
-    // which the loader already refuses.
-    let mut holders: BTreeMap<String, Vec<Uid>> = BTreeMap::new();
-    for (uid, path) in &want {
-        holders.entry(key.of(path)).or_default().push(uid.clone());
-    }
-    for (_, uids) in holders.into_iter().filter(|(_, u)| u.len() > 1) {
-        let (dead, live): (Vec<_>, Vec<_>) = uids
-            .into_iter()
-            .partition(|u| after.tombstones.contains_key(u));
-        if live.len() > 1 {
+    // Step 5: the final destinations, checked once. Two objects may not share a
+    // file (same key) and no destination may be a directory above another (a
+    // file cannot also be a directory). A dropped object in the way goes to its
+    // aside name (`<name>.<uid>.json`) and the check runs again on the result,
+    // since the aside is itself a destination that can collide; a name that does
+    // is replaced by the next free one. Two live objects in conflict are two
+    // declarations whose files cannot both exist, which the loader refuses.
+    let dead = |u: &Uid| after.tombstones.contains_key(u);
+    let mut spare: BTreeMap<Uid, usize> = BTreeMap::new();
+    while let Some((first, second, same)) = first_conflict(&want, key) {
+        let victim = if dead(&first) {
+            first.clone()
+        } else if dead(&second) {
+            second.clone()
+        } else if same {
             return Err(refused(format!(
                 "{} and {} are both declared at `{}` and `{}`, which are one file here",
-                name_of(&live[0]),
-                name_of(&live[1]),
-                shown(&dirs, &want[&live[0]]),
-                shown(&dirs, &want[&live[1]])
+                name_of(&first),
+                name_of(&second),
+                shown(&dirs, &want[&first]),
+                shown(&dirs, &want[&second])
             )));
-        }
-        // At most one dropped file kept this path, but a dropped object with no
-        // file of its own may have been assigned it too; all go aside.
-        for uid in dead {
-            want.insert(uid.clone(), aside_of(after, &uid));
-        }
-    }
-    // A path that is a file cannot also be the directory of another: no
-    // destination may be a proper ancestor of another. A live pair is two
-    // declarations whose mirrored paths cannot both exist on disk; a dropped
-    // file in the way goes aside, as in step 5. (Old-vs-new transitions are the
-    // write's business: `TreeWrite::apply` makes room for them.)
-    let snapshot: Vec<(Uid, String)> = want.iter().map(|(u, p)| (u.clone(), p.clone())).collect();
-    for (uid, path) in &snapshot {
-        let folded = key.of(path);
-        let below = |p: &str| {
-            key.of(p)
-                .strip_prefix(folded.as_str())
-                .is_some_and(|r| r.starts_with('/'))
+        } else {
+            return Err(refused(format!(
+                "{} is declared at `{}` and {} below it at `{}`; a file cannot also be a \
+                 directory, so rename one of the two YAML files",
+                name_of(&first),
+                shown(&dirs, &want[&first]),
+                name_of(&second),
+                shown(&dirs, &want[&second])
+            )));
         };
-        for (inner, inner_path) in snapshot.iter().filter(|(_, p)| below(p)) {
-            let dead = |u: &Uid| after.tombstones.contains_key(u);
-            if dead(uid) {
-                want.insert(uid.clone(), aside_of(after, uid));
-            } else if dead(inner) {
-                want.insert(inner.clone(), aside_of(after, inner));
-            } else {
-                return Err(refused(format!(
-                    "{} is declared at `{}` and {} below it at `{}`; a file cannot also be a \
-                     directory, so rename one of the two YAML files",
-                    name_of(uid),
-                    shown(&dirs, path),
-                    name_of(inner),
-                    shown(&dirs, inner_path)
-                )));
-            }
+        // The aside name; if the victim is already there and still collides,
+        // the next one (`<name>.<uid>.1.json`, ...): a dropped object's aside is
+        // nobody's choice, and the reader takes a file by its content.
+        let mut n = spare.get(&victim).copied().unwrap_or(0);
+        let mut path = aside_of(after, &victim, n);
+        while path == want[&victim] {
+            n += 1;
+            path = aside_of(after, &victim, n);
         }
+        spare.insert(victim.clone(), n);
+        want.insert(victim, path);
     }
     let mut placement = Placement {
         paths: want,
@@ -893,12 +879,38 @@ pub(crate) fn plan_keyed(
 }
 
 /// The file a dropped object gets when no declaration names its place.
-fn aside_of(after: &IdsFile, uid: &Uid) -> String {
+fn aside_of(after: &IdsFile, uid: &Uid, n: usize) -> String {
     let was = after
         .tombstones
         .get(uid)
         .map_or_else(|| uid.to_string(), |t| t.was.clone());
-    crate::ids_cmd::aside(&was, uid)
+    let name = crate::ids_cmd::aside(&was, uid);
+    match n {
+        0 => name,
+        // `<name>.<uid>.json` -> `<name>.<uid>.<n>.json`
+        _ => format!("{}.{n}.json", name.trim_end_matches(".json")),
+    }
+}
+
+/// The first two destinations that cannot both exist, by key: the same file, or
+/// one a directory above the other. `true` when they are the same file.
+fn first_conflict(want: &BTreeMap<Uid, String>, key: PathKey) -> Option<(Uid, Uid, bool)> {
+    let mut by_key: BTreeMap<String, &Uid> = BTreeMap::new();
+    for (uid, path) in want {
+        if let Some(other) = by_key.insert(key.of(path), uid) {
+            return Some((other.clone(), uid.clone(), true));
+        }
+    }
+    for (uid, path) in want {
+        let folded = key.of(path);
+        // Every directory above this destination, outermost first.
+        for (at, _) in folded.match_indices('/') {
+            if let Some(above) = by_key.get(&folded[..at]) {
+                return Some(((*above).clone(), uid.clone(), false));
+            }
+        }
+    }
+    None
 }
 
 /// Whether the tree on disk is not what `after` and the declarations in
