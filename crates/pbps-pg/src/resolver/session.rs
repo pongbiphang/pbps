@@ -109,8 +109,7 @@ impl Step<'_> {
                 Some(format!("SET ROLE \"{quoted}\""))
             }
             Self::Pins(zone) => Some(crate::session_pins(zone)),
-            Self::Keeper => Some(scratch::KEEPER_SETTINGS.into()),
-            Self::Backend | Self::Settings(_) => None,
+            Self::Backend | Self::Settings(_) | Self::Keeper => None,
         }
     }
 }
@@ -165,7 +164,9 @@ async fn restore_steps(
                 }
             }
             Step::Settings(context) => authorization::apply_session_settings(conn, context).await?,
-            Step::Reset(_) | Step::Path | Step::Role(_) | Step::Pins(_) | Step::Keeper => {
+            // The same procedure as the first application, so that the two cannot differ (#2777).
+            Step::Keeper => scratch::keep(conn).await?,
+            Step::Reset(_) | Step::Path | Step::Role(_) | Step::Pins(_) => {
                 conn.execute(&step.statement().expect("a SQL restoration step"))
                     .await?
             }

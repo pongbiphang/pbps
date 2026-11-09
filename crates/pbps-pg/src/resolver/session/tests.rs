@@ -25,7 +25,8 @@ fn recipe(intent: &Intent, reset: Reset) -> Vec<String> {
         .map(|step| match step {
             Step::Settings(_) => "overlay".into(),
             Step::Backend => "checked backend".into(),
-            Step::Reset(_) | Step::Path | Step::Role(_) | Step::Pins(_) | Step::Keeper => {
+            Step::Keeper => "keeper settings".into(),
+            Step::Reset(_) | Step::Path | Step::Role(_) | Step::Pins(_) => {
                 step.statement().unwrap()
             }
         })
@@ -64,7 +65,7 @@ fn the_session_path_precedes_the_overlay_and_target_pins() {
                 assert_eq!(&all[all.len() - 1], pin);
                 assert!(pin.contains("SET TimeZone = 'Asia/Taipei'"));
             }
-            assert_eq!(all[3], scratch::KEEPER_SETTINGS);
+            assert_eq!(all[3], "keeper settings");
             let discard = recipe(&intent, Reset::Discard);
             assert_eq!(
                 &discard[..4],

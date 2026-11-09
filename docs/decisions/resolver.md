@@ -6431,3 +6431,46 @@ case, both reports carried, the unconfirmed removal) and by
 demand only by CPU saturation, so the acceptance evidence is the 30-start
 old-path/new-path comparison recorded on the PR. Formats: none. No sealed
 bytes, plan, state, schema set or evidence change.
+
+<a id="dec-2777-1"></a>
+
+**DEC-2777.1. The scratch keeper tolerates the engine refusing
+`client_connection_check_interval` as unsupported, and nothing else (#2777,
+#2491 W2).** The keeper session (DEC-2410.3) sent its four settings in one
+batch. On Windows, PostgreSQL rejects any nonzero `client_connection_check_interval`
+(SQLSTATE `22023`, "invalid value for parameter", because the operating system
+cannot report that the peer closed), so the batch failed and no resolver scratch
+could be opened on any Windows PostgreSQL: 22 of the 23 flow cases of the W2
+measurement failed with that one error on 18.6 and 16.15 (run 42610643076).
+
+**Decision (the maintainer bundled the fix into the Windows slice, 2026-11-09).**
+The settings are sent as two statements, in this order, by one procedure that
+the first application and the restoration after `RESET ALL` / `DISCARD ALL` share:
+the three `tcp_keepalives_*` settings, mandatory, alone; then the check interval,
+alone. Only the engine's own answer to that second statement decides: SQLSTATE
+`22023` on a message that begins "invalid value for parameter" and names
+`"client_connection_check_interval"` is tolerated. Any other error on either
+statement fails the run: another parameter rejected with the same code, that
+parameter with another code (a permission, a syntax error), a lost connection, a
+tool-authored refusal. The operating system's name is never consulted, so the
+procedure follows the engine if a later release supports the interval on Windows
+or stops supporting it elsewhere.
+
+**Why two statements.** A failing statement of a multi-statement simple query
+rolls the whole batch back, so the mandatory keepalives could not share a batch
+with the one setting that may be refused. A third statement per setting would
+buy nothing: the three keepalives are accepted on every platform measured.
+
+**Consequence, stated once.** Where the interval is refused, a client killed
+inside a long statement is noticed when the statement ends instead of within
+10 s; an idle session or a vanished host is still noticed by the keepalives. The
+run reads as alive until then, which only keeps its resources, as for any wait.
+SPEC 9.3.2 says it in one sentence.
+
+Pinned by the unit tests of `resolver::scratch` (`keep_with` driven by a scripted
+engine: the Windows answer is tolerated with the keepalives sent first; another
+parameter with the same code, that parameter with another code or none, a lost
+connection and a refusal are failures; a refused keepalive stops everything
+after it) and the restoration recipe test. The real-engine proof is the Windows
+CI of the PR (`resolver-pg-windows`). Formats: none. No sealed bytes, plan, state
+or evidence change.

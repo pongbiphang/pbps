@@ -108,17 +108,73 @@ pub async fn extension_manifests(
         .collect()
 }
 
-/// What the keeper session sets so the engine notices a vanished client
-/// (#2410). `RESET ALL` and `DISCARD ALL` clear them, so a session that runs
-/// either sends them again; `application_name` is set at connection instead.
+/// What the keeper session must set so the engine notices a vanished client
+/// (#2410): TCP keepalives, which every platform accepts. `RESET ALL` and
+/// `DISCARD ALL` clear them, so a session that runs either sends them again;
+/// `application_name` is set at connection instead.
 pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_interval = 10; \
-     SET tcp_keepalives_count = 3; \
-     SET client_connection_check_interval = '10s'";
+     SET tcp_keepalives_count = 3";
 
-/// Applies [`KEEPER_SETTINGS`], in one round trip.
-pub async fn keep(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
-    conn.execute(KEEPER_SETTINGS).await
+/// The keeper's check that the client is still connected while a statement
+/// runs (#2410), sent alone. PostgreSQL accepts a nonzero value only where the
+/// operating system can report that the peer closed, and rejects it as an
+/// invalid value elsewhere (Windows): see [`unsupported_interval`] (#2777).
+pub const KEEPER_CHECK_INTERVAL: &str = "SET client_connection_check_interval = '10s'";
+
+/// The parameter [`KEEPER_CHECK_INTERVAL`] sets, as the server quotes it.
+const CHECK_INTERVAL_PARAMETER: &str = "\"client_connection_check_interval\"";
+
+/// Whether `error` is the engine saying that it does not support
+/// [`KEEPER_CHECK_INTERVAL`] on this platform, and nothing else: SQLSTATE
+/// `22023` (invalid parameter value) on a message naming exactly that
+/// parameter. Another parameter's rejection, the same parameter with another
+/// code (a permission, a syntax error, a lost connection) and a connection
+/// that failed before reaching the engine are all different things and stay
+/// failures. The answer is the engine's, never the operating system's name.
+pub fn unsupported_interval(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Driver { code: Some(code), message, .. }
+            if code == "22023"
+                && message.starts_with("invalid value for parameter ")
+                && message.contains(CHECK_INTERVAL_PARAMETER)
+    )
+}
+
+/// Where the keeper's statements are sent: any engine connection, or in the
+/// unit tests a scripted one (the connection traits are sealed, so a test
+/// cannot implement them).
+pub trait SendKeeper {
+    fn send<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a;
+}
+
+impl<T: ExecuteConnection> SendKeeper for T {
+    fn send<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a {
+        self.execute(sql)
+    }
+}
+
+/// Applies the keeper's settings, one statement per call: the mandatory
+/// keepalives first and alone (a failing statement of a multi-statement batch
+/// rolls the whole batch back, so the one that may be refused cannot share
+/// it), then the check interval, whose rejection as unsupported is tolerated
+/// and nothing else is. Where it is refused, a client killed inside a long
+/// statement is noticed when the statement ends instead of within the
+/// interval, which only keeps the run's resources a while longer (SPEC 9.3.2,
+/// DEC-2777.1).
+pub async fn keep(conn: &mut impl SendKeeper) -> Result<(), DbError> {
+    conn.send(KEEPER_SETTINGS).await?;
+    match conn.send(KEEPER_CHECK_INTERVAL).await {
+        Err(error) if unsupported_interval(&error) => Ok(()),
+        other => other,
+    }
 }
 
 /// The first OID a database assigns after initdb. Everything below it was
@@ -1454,5 +1510,131 @@ mod tests {
         let mut empty = account;
         empty.shared.clear();
         assert!(empty.confined());
+    }
+
+    fn rejection(code: Option<&str>, message: &str) -> DbError {
+        DbError::Driver {
+            message: message.to_owned(),
+            code: code.map(str::to_owned),
+            diagnostic: None,
+        }
+    }
+
+    /// What PostgreSQL on Windows answers to the interval (#2777): measured on
+    /// 18.6 and 16.15 (the run 42610643076 job log).
+    fn windows_answer() -> DbError {
+        rejection(
+            Some("22023"),
+            "invalid value for parameter \"client_connection_check_interval\": 10000",
+        )
+    }
+
+    /// A scripted engine: `answers` maps a statement to its error, every other
+    /// statement succeeds; `sent` records what arrived, in order.
+    struct Scripted {
+        answers: Vec<(&'static str, DbError)>,
+        sent: Vec<String>,
+    }
+
+    impl SendKeeper for Scripted {
+        async fn send<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
+            self.sent.push(sql.to_owned());
+            match self
+                .answers
+                .iter()
+                .position(|(statement, _)| *statement == sql)
+            {
+                Some(index) => Err(self.answers.remove(index).1),
+                None => Ok(()),
+            }
+        }
+    }
+
+    async fn keep_scripted(
+        answers: Vec<(&'static str, DbError)>,
+    ) -> (Vec<String>, Result<(), DbError>) {
+        let mut engine = Scripted {
+            answers,
+            sent: Vec::new(),
+        };
+        let outcome = keep(&mut engine).await;
+        (engine.sent, outcome)
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_does_not_support_the_check_interval_still_keeps_the_session() {
+        let (sent, outcome) = keep_scripted(vec![(KEEPER_CHECK_INTERVAL, windows_answer())]).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        // The mandatory keepalives went first and alone, the interval last.
+        assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL]);
+        assert!(!KEEPER_SETTINGS.contains("client_connection_check_interval"));
+        assert!(KEEPER_SETTINGS.contains("tcp_keepalives_count = 3"));
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_supports_it_gets_both_statements() {
+        let (sent, outcome) = keep_scripted(vec![]).await;
+        assert!(outcome.is_ok());
+        assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL]);
+    }
+
+    #[tokio::test]
+    async fn only_that_parameters_rejection_is_tolerated() {
+        for (why, error) in [
+            (
+                "another parameter, same code",
+                rejection(
+                    Some("22023"),
+                    "invalid value for parameter \"tcp_keepalives_count\": 3",
+                ),
+            ),
+            (
+                "that parameter, another code",
+                rejection(
+                    Some("42501"),
+                    "permission denied to set parameter \"client_connection_check_interval\"",
+                ),
+            ),
+            (
+                "that parameter named in a message with no code",
+                rejection(
+                    None,
+                    "invalid value for parameter \"client_connection_check_interval\": 10000",
+                ),
+            ),
+            ("a lost connection", rejection(None, "connection closed")),
+            (
+                "the code alone",
+                rejection(Some("22023"), "invalid value for parameter"),
+            ),
+            (
+                "a tool-authored refusal",
+                DbError::Refused(
+                    "invalid value for parameter \"client_connection_check_interval\"".into(),
+                ),
+            ),
+        ] {
+            let (sent, outcome) = keep_scripted(vec![(KEEPER_CHECK_INTERVAL, error)]).await;
+            assert!(outcome.is_err(), "{why}: {outcome:?}");
+            assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL], "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_keepalive_fails_even_with_the_windows_answer_on_the_interval() {
+        // The mandatory batch fails: nothing after it is sent, whatever the
+        // interval would have answered.
+        for error in [
+            windows_answer(),
+            rejection(
+                Some("22023"),
+                "invalid value for parameter \"tcp_keepalives_idle\": 30",
+            ),
+            rejection(None, "connection closed"),
+        ] {
+            let (sent, outcome) = keep_scripted(vec![(KEEPER_SETTINGS, error)]).await;
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert_eq!(sent, [KEEPER_SETTINGS]);
+        }
     }
 }
