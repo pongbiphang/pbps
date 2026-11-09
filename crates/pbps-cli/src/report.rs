@@ -1952,6 +1952,12 @@ pub fn describe(c: &Change) -> String {
         Change::DropForeignKey { name, .. } => {
             format!("- foreign key {name}", name = name.shown(),)
         }
+        Change::SetExclusion {
+            name, to: Some(_), ..
+        } => format!("+ exclusion constraint {name}", name = name.shown()),
+        Change::SetExclusion { name, to: None, .. } => {
+            format!("- exclusion constraint {name}", name = name.shown())
+        }
         Change::AddCheck { name, .. } => format!("+ check constraint {name}", name = name.shown(),),
         Change::DropCheck { name, .. } => {
             format!("- check constraint {name}", name = name.shown(),)

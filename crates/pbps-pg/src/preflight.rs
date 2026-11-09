@@ -3116,6 +3116,13 @@ fn reads_recomputed<'v, 'p: 'v>(
         Change::AddUnique {
             table, constraint, ..
         } => named(table, &constraint.columns),
+        Change::SetExclusion {
+            table, to: Some(x), ..
+        } => {
+            ((x.filter.is_some() || x.keys.iter().any(|k| k.key.key.expression().is_some()))
+                && anywhere(table))
+                || x.key_columns().is_some_and(|keys| named(table, &keys))
+        }
         Change::SetPrimaryKey {
             table,
             to: Some(pk),
@@ -3648,6 +3655,18 @@ name = name.shown(),
                 sql,
             )])
         }
+
+        // The engine's own build checks every pair of rows under the table's
+        // lock, and the rehearsal runs that build. A pairwise probe here would
+        // be expensive and stale by apply, and the operator may be any the
+        // engine accepts, so it is reported as unchecked (DEC-2448.3).
+        Change::SetExclusion { to: Some(_), .. } => Ok(skip(
+            change,
+            "an exclusion constraint's conflicts are found by the engine while it builds the \
+             constraint, which the rehearsal runs",
+            unchecked,
+        )),
+        Change::SetExclusion { to: None, .. } => Ok(Vec::new()),
 
         Change::AddUnique {
             table,
@@ -4397,6 +4416,7 @@ pub(crate) fn probes(
             | pbps_model::change_family!(policies)
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }

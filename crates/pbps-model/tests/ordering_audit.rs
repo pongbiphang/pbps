@@ -880,6 +880,44 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "SetExclusion { to: Some }",
+                Change::SetExclusion {
+                    table: tn("t"),
+                    name: "x".into(),
+                    from: None,
+                    to: Some(Box::new(pbps_model::ExclusionConstraint {
+                        method: pbps_model::IndexMethod::Gist,
+                        keys: vec![pbps_model::ExclusionKey {
+                            key: pbps_model::IndexColumn::column("x"),
+                            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                        }],
+                        include: Vec::new(),
+                        filter: None,
+                        storage_parameters: BTreeMap::new(),
+                        timing: pbps_model::ExclusionTiming::Immediate,
+                    })),
+                },
+            ),
+            (
+                "SetExclusion { to: None }",
+                Change::SetExclusion {
+                    table: tn("t"),
+                    name: "x0".into(),
+                    from: Some(Box::new(pbps_model::ExclusionConstraint {
+                        method: pbps_model::IndexMethod::Gist,
+                        keys: vec![pbps_model::ExclusionKey {
+                            key: pbps_model::IndexColumn::column("x"),
+                            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                        }],
+                        include: Vec::new(),
+                        filter: None,
+                        storage_parameters: BTreeMap::new(),
+                        timing: pbps_model::ExclusionTiming::Immediate,
+                    })),
+                    to: None,
+                },
+            ),
+            (
                 "AddForeignKey",
                 Change::AddForeignKey {
                     table: tn("t"),

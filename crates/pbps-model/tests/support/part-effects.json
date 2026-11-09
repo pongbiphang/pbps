@@ -515,6 +515,27 @@
     }
   },
   {
+    "name": "SetExclusion",
+    "change": {
+      "op": "set_exclusion",
+      "table": "app.t",
+      "name": "part",
+      "from": null,
+      "to": {
+        "method": "gist",
+        "keys": [
+          {
+            "key": {
+              "expression": "int4range(n, n)",
+              "descending": false
+            },
+            "operator": "&&"
+          }
+        ]
+      }
+    }
+  },
+  {
     "name": "AddForeignKey",
     "change": {
       "op": "add_foreign_key",

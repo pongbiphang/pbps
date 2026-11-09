@@ -310,6 +310,12 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             feature: format!("declared type {}", name.shown()),
         }),
+        // An exclusion constraint is PostgreSQL's: SQL Server has no such
+        // constraint, and the declaration is refused by name before any plan.
+        Change::SetExclusion { name, .. } => Err(DialectError::Unsupported {
+            dialect: crate::types::DIALECT,
+            feature: format!("exclusion constraint {}", name.shown()),
+        }),
         Change::CreateExtension { name, .. }
         | Change::DropExtension { name, .. }
         | Change::UpdateExtension { name, .. }

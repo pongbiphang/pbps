@@ -212,6 +212,7 @@ pub async fn drop_blockers(
                 index,
                 format!("primary key on {table}", table = table.shown()),
             )),
+            Change::SetExclusion { .. } => None,
             Change::DropUnique { table, name } => Some((
                 index,
                 format!(

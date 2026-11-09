@@ -8,7 +8,7 @@
 //! and the two refusals only a class has: the default class spelled out and a
 //! class for another type.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
 use pbps_model::escape::Escaped;
@@ -19,17 +19,13 @@ use pbps_model::{
 
 use crate::class_read::{self, Class, ClassRead, Wanted};
 use crate::pins::Within;
-use crate::provider::{self, Noun, Standing};
+use crate::provider::{self, Noun, PinKind};
 
 /// The words of a refusal about a class.
 pub const CLASS: Noun = Noun {
     object: "operator class",
     consumer: "an index",
 };
-
-fn failed(why: impl Into<String>) -> DbError {
-    DbError::BadRow(why.into())
-}
 
 /// One place a qualified class is named: the class and the type of the column
 /// it is the key of, where the key is a plain column.
@@ -101,7 +97,7 @@ pub fn uses(schemas: &[&Schema]) -> Vec<Use> {
 
 /// The classes the changes of a plan name, which a sealed plan must carry a pin
 /// for (the check refuses a plan that names one it has no pin for).
-// Only these three changes carry an index, or a table with indexes.
+// Only these four changes carry an index or an exclusion, or a table with them.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
     let mut out = Vec::new();
@@ -116,6 +112,17 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
                 );
             }
             Change::CreateTable { name, table, .. } => uses_in_table(name, table, &mut out),
+            // A new exclusion constraint names the classes of its keys as an index does.
+            Change::SetExclusion {
+                table,
+                name,
+                to: Some(x),
+                ..
+            } => {
+                let mut one = Table::default();
+                one.exclude.insert(name.clone(), (**x).clone());
+                uses_in_table(table, &one, &mut out);
+            }
             Change::BuildPartitionedIndex(build) => {
                 if let pbps_model::PartitionIndexDefinition::Index(index) = &build.definition {
                     uses_in_keys(
@@ -130,58 +137,6 @@ fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
         }
     }
     out.into_iter().map(|u| u.wanted).collect()
-}
-
-fn pin(class: &Class) -> ProviderPin {
-    ProviderPin {
-        kind: ProviderKind::Class,
-        schema: class.wanted.schema.clone(),
-        name: class.wanted.name.clone(),
-        method: class.wanted.method.clone(),
-        oid: class.oid,
-        digest: class.digest.clone(),
-        planned: false,
-        provider: class
-            .extension
-            .as_ref()
-            .map(|(extension, version)| TypeProvider {
-                extension: extension.clone(),
-                version: version.clone(),
-                moved_to: None,
-            }),
-    }
-}
-
-fn placeholder(wanted: &Wanted, provider: TypeProvider) -> ProviderPin {
-    ProviderPin {
-        kind: ProviderKind::Class,
-        schema: wanted.schema.clone(),
-        name: wanted.name.clone(),
-        method: wanted.method.clone(),
-        oid: 0,
-        digest: String::new(),
-        planned: true,
-        provider: Some(provider),
-    }
-}
-
-fn wanted_of(pin: &ProviderPin) -> Wanted {
-    Wanted {
-        method: pin.method.clone(),
-        schema: pin.schema.clone(),
-        name: pin.name.clone(),
-    }
-}
-
-impl<'a> From<&'a ProviderPin> for Standing<'a> {
-    fn from(pin: &'a ProviderPin) -> Self {
-        Standing {
-            schema: &pin.schema,
-            name: &pin.name,
-            planned: pin.planned,
-            provider: pin.provider.as_ref(),
-        }
-    }
 }
 
 /// Types the class cannot take for certain: a plain scalar column under a class
@@ -267,200 +222,151 @@ fn refuse_use(class: &Class, used: &Use) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads and checks every class the desired schema names; a class missing from
-/// the target in the schema of exactly one declared package is that package's
-/// placeholder (DEC-2447.12).
+/// The kind of pin a class is, for the kernel in [`crate::provider`].
+pub(crate) struct ClassPins;
+
+impl PinKind for ClassPins {
+    type Wanted = Wanted;
+    type Item = Class;
+    type Read = ClassRead;
+    type Use = Use;
+    const NOUN: Noun = CLASS;
+    const KIND: ProviderKind = ProviderKind::Class;
+
+    fn uses(schemas: &[&Schema]) -> Vec<Use> {
+        uses(schemas)
+    }
+    fn used(used: &Use) -> &Wanted {
+        &used.wanted
+    }
+    fn named_by(changes: &ChangeSet) -> BTreeSet<Wanted> {
+        named_by(changes)
+    }
+    async fn read(conn: &mut Conn, within: Within, wanted: &[Wanted]) -> Vec<ClassRead> {
+        class_read::read(conn, within, wanted).await
+    }
+    fn present(read: &ClassRead) -> Option<&Class> {
+        match read {
+            ClassRead::Present(class) => Some(class),
+            ClassRead::Absent | ClassRead::Unreadable(_) => None,
+        }
+    }
+    fn is_absent(read: &ClassRead) -> bool {
+        matches!(read, ClassRead::Absent)
+    }
+    fn refusal(read: &ClassRead, wanted: &Wanted) -> Option<String> {
+        read.refusal(wanted)
+    }
+    fn item_wanted(class: &Class) -> &Wanted {
+        &class.wanted
+    }
+    fn extension(class: &Class) -> Option<&(String, String)> {
+        class.extension.as_ref()
+    }
+    fn pin(class: &Class) -> ProviderPin {
+        ProviderPin {
+            kind: ProviderKind::Class,
+            schema: class.wanted.schema.clone(),
+            name: class.wanted.name.clone(),
+            method: class.wanted.method.clone(),
+            oid: class.oid,
+            digest: class.digest.clone(),
+            planned: false,
+            provider: class
+                .extension
+                .as_ref()
+                .map(|(extension, version)| TypeProvider {
+                    extension: extension.clone(),
+                    version: version.clone(),
+                    moved_to: None,
+                }),
+        }
+    }
+    fn placeholder(wanted: &Wanted, provider: TypeProvider) -> ProviderPin {
+        ProviderPin {
+            kind: ProviderKind::Class,
+            schema: wanted.schema.clone(),
+            name: wanted.name.clone(),
+            method: wanted.method.clone(),
+            oid: 0,
+            digest: String::new(),
+            planned: true,
+            provider: Some(provider),
+        }
+    }
+    fn wanted_of(pin: &ProviderPin) -> Wanted {
+        Wanted {
+            method: pin.method.clone(),
+            schema: pin.schema.clone(),
+            name: pin.name.clone(),
+        }
+    }
+    fn in_schema(wanted: &Wanted, schema: &str) -> Wanted {
+        Wanted {
+            schema: schema.to_owned(),
+            ..wanted.clone()
+        }
+    }
+    fn qualified(wanted: &Wanted) -> (&str, &str) {
+        (&wanted.schema, &wanted.name)
+    }
+    fn held_by(uses: &[Use], wanted: &Wanted, why: String) -> String {
+        held_by(uses, wanted, why)
+    }
+    fn refuse_uses(classes: &[&Class], uses: &[Use]) -> Result<(), String> {
+        for used in uses {
+            if let Some(class) = classes.iter().find(|c| c.wanted == used.wanted) {
+                refuse_use(class, used).map_err(|why| {
+                    if used.holder.is_empty() {
+                        why
+                    } else {
+                        format!("{why} (named by {})", used.holder)
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+    fn is_member(pin: &ProviderPin, member: &ProviderMember) -> bool {
+        member.class == "operator class"
+            && member.args.is_empty()
+            && member.names == [pin.method.clone(), pin.schema.clone(), pin.name.clone()]
+    }
+}
+
+/// Reads and checks every class the desired schema names, and every package operator an
+/// exclusion constraint names, which are pinned beside them (DEC-2447.14, #2448 C1b): one list
+/// in the plan, one set of calls for the engine.
 pub async fn seal(
     conn: &mut Conn,
     schemas: &[&Schema],
     changes: &ChangeSet,
 ) -> Result<Vec<ProviderPin>, DbError> {
-    let uses = uses(schemas);
-    let wanted: Vec<Wanted> = uses
-        .iter()
-        .map(|u| u.wanted.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let declared = provider::packages_by_schema(schemas);
-    let reads = class_read::read(conn, Within::OwnTransaction, &wanted).await;
-    let mut pins = Vec::new();
-    let mut classes = Vec::new();
-    for (one, read) in wanted.iter().zip(&reads) {
-        let shown = format!("{}.{}", Escaped(&one.schema), Escaped(&one.name));
-        match read {
-            ClassRead::Absent if declared.contains_key(one.schema.as_str()) => {
-                let package = provider::defer_to_package(&declared, &one.schema, &shown, CLASS)
-                    .expect("the schema holds a declared package")
-                    .map_err(|why| failed(held_by(&uses, one, why)))?;
-                pins.push(placeholder(one, package));
-            }
-            ClassRead::Present(class) => {
-                if let Some(why) = read.refusal(one) {
-                    return Err(failed(held_by(&uses, one, why)));
-                }
-                let (extension, version) = class
-                    .extension
-                    .as_ref()
-                    .expect("a refusal-free class has a package");
-                provider::check_package(schemas, extension, version, &shown, CLASS)
-                    .map_err(|why| failed(held_by(&uses, one, why)))?;
-                classes.push(class);
-                pins.push(pin(class));
-            }
-            absent_or_unreadable @ (ClassRead::Absent | ClassRead::Unreadable(_)) => {
-                let why = absent_or_unreadable
-                    .refusal(one)
-                    .expect("a non-present class refuses");
-                return Err(failed(held_by(&uses, one, why)));
-            }
-        }
-    }
-    for used in &uses {
-        if let Some(class) = classes.iter().find(|c| c.wanted == used.wanted) {
-            refuse_use(class, used).map_err(|why| {
-                failed(if used.holder.is_empty() {
-                    why
-                } else {
-                    format!("{why} (named by {})", used.holder)
-                })
-            })?;
-        }
-    }
-    provider::refuse_update_beside_provided(
-        |extension| {
-            classes
-                .iter()
-                .find(|c| c.extension.as_ref().is_some_and(|(e, _)| e == extension))
-                .map(|c| format!("{}.{}", Escaped(&c.wanted.schema), Escaped(&c.wanted.name)))
-        },
-        changes,
-        CLASS,
-    )
-    .map_err(failed)?;
-    for pin in pins.iter_mut().filter(|p| !p.planned) {
-        if let Some(package) = &mut pin.provider {
-            package.moved_to = provider::moved_to(&package.extension, &pin.schema, changes);
-        }
-    }
+    let mut pins = provider::seal_kind::<ClassPins>(conn, schemas, changes).await?;
+    pins.extend(crate::operator_pins::seal(conn, schemas, changes).await?);
     Ok(pins)
 }
 
-/// The proof after the rehearsal for each placeholder: the package the plan
-/// creates, or moves and updates, must list that exact class among its sealed
-/// members, so a class of the same spelling from anywhere else does not stand
-/// in for the one the order assumed (DEC-2447.12).
+/// The proof after the rehearsal for each placeholder of a class or an operator
+/// (DEC-2447.12).
 pub fn proof(
     pins: &[ProviderPin],
     created: &[pbps_model::ExtensionPin],
     changed: &[pbps_model::ExtensionChangePin],
 ) -> Result<(), String> {
-    for pin in pins.iter().filter(|p| p.planned) {
-        let member = ProviderMember {
-            class: "operator class".to_owned(),
-            names: vec![pin.method.clone(), pin.schema.clone(), pin.name.clone()],
-            args: Vec::new(),
-        };
-        provider::proof(Standing::from(pin), &member, CLASS, created, changed)?;
-    }
-    Ok(())
+    crate::operator_pins::proof(pins, created, changed)?;
+    provider::proof_kind::<ClassPins>(pins, created, changed)
 }
 
-/// A pin read again is the pin that was sealed, except that a class its
-/// package's move carried is in the schema the plan said it would be.
-fn same(sealed: &ProviderPin, now: &ProviderPin) -> bool {
-    provider::same_pin(
-        sealed,
-        now,
-        |p| {
-            (
-                p.schema.clone(),
-                p.provider.as_ref().and_then(|x| x.moved_to.clone()),
-            )
-        },
-        |p| {
-            let mut p = p.clone();
-            if let Some(x) = &mut p.provider {
-                x.moved_to = None;
-            }
-            p
-        },
-        |p, schema| ProviderPin {
-            schema: schema.to_owned(),
-            ..p
-        },
-    )
-}
-
-/// Refuses a sealed plan whose classes are not what it was sealed over: one the
-/// plan names with no pin, a class that is gone, or one that changed.
+/// Refuses a sealed plan whose classes or operators are not what it was sealed over.
 pub async fn check(
     conn: &mut Conn,
     within: Within,
     expected: &[ProviderPin],
     changes: &ChangeSet,
 ) -> Result<(), DbError> {
-    let pinned: BTreeSet<Wanted> = expected.iter().map(wanted_of).collect();
-    for wanted in named_by(changes) {
-        if !pinned.contains(&wanted) {
-            return Err(failed(format!(
-                "plan has no pin for the operator class `{}.{}`; plan again against the database",
-                Escaped(&wanted.schema),
-                Escaped(&wanted.name)
-            )));
-        }
-    }
-    let live: Vec<&ProviderPin> = expected
-        .iter()
-        .filter(|p| p.kind == ProviderKind::Class && !p.planned)
-        .collect();
-    // Where each class is now: under its own name or the name its package's
-    // move gave it; it keeps its OID, so exactly one is there.
-    let mut candidates = Vec::new();
-    for pin in &live {
-        candidates.push(wanted_of(pin));
-        if let Some(schema) = pin.provider.as_ref().and_then(|p| p.moved_to.as_deref()) {
-            candidates.push(Wanted {
-                schema: schema.to_owned(),
-                ..wanted_of(pin)
-            });
-        }
-    }
-    let reads: BTreeMap<Wanted, ClassRead> = candidates
-        .iter()
-        .cloned()
-        .zip(class_read::read(conn, within, &candidates).await)
-        .collect();
-    for pin in live {
-        let own = wanted_of(pin);
-        let moved = pin
-            .provider
-            .as_ref()
-            .and_then(|p| p.moved_to.as_deref())
-            .map(|schema| Wanted {
-                schema: schema.to_owned(),
-                ..own.clone()
-            });
-        let now = moved
-            .as_ref()
-            .and_then(|m| reads.get(m).filter(|r| matches!(r, ClassRead::Present(_))))
-            .or_else(|| reads.get(&own));
-        let changed = || {
-            failed(format!(
-                "the operator class `{}.{}` changed since planning; plan again",
-                Escaped(&pin.schema),
-                Escaped(&pin.name)
-            ))
-        };
-        match now {
-            Some(ClassRead::Present(class)) if same(pin, &self::pin(class)) => {}
-            _ => return Err(changed()),
-        }
-    }
-    Ok(())
+    crate::operator_pins::check(conn, within, expected, changes).await?;
+    provider::check_kind::<ClassPins>(conn, within, expected, changes).await
 }
 
 #[cfg(test)]
@@ -500,6 +406,48 @@ mod tests {
         // An array, or a class over any type, is the engine's to answer.
         assert_eq!(type_mismatch(&trgm, &column("integer[]")), None);
         assert_eq!(type_mismatch(&class("anyarray"), &column("integer")), None);
+    }
+
+    /// A new exclusion constraint names the classes of its keys as an index does (#2448 C1b):
+    /// a package's class is pinned, an engine's or absent class is not, and a constraint the
+    /// plan drops names none.
+    #[test]
+    fn a_new_exclusion_names_the_package_classes_of_its_keys() {
+        let key = |class: Option<&str>| pbps_model::ExclusionKey {
+            key: IndexColumn {
+                key: IndexKey::Column("body".into()),
+                descending: false,
+                opclass: class.map(|c| c.parse().unwrap()),
+                collation: None,
+            },
+            operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+        };
+        let exclusion = |classes: &[Option<&str>]| pbps_model::ExclusionConstraint {
+            method: pbps_model::IndexMethod::Gist,
+            keys: classes.iter().map(|c| key(*c)).collect(),
+            include: vec![],
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: pbps_model::ExclusionTiming::Immediate,
+        };
+        let set = |from, to| ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::SetExclusion {
+                table: pbps_model::TableName::new("app", "docs"),
+                name: "no_similar".into(),
+                from,
+                to,
+            })],
+        };
+        let added = exclusion(&[Some("ext.gist_trgm_ops"), None]);
+        let wanted = named_by(&set(None, Some(Box::new(added.clone()))));
+        assert_eq!(wanted.len(), 1);
+        let one = wanted.iter().next().unwrap();
+        assert_eq!(
+            (one.method.as_str(), one.schema.as_str(), one.name.as_str()),
+            ("gist", "ext", "gist_trgm_ops")
+        );
+        assert!(named_by(&set(None, Some(Box::new(exclusion(&[None]))))).is_empty());
+        assert!(named_by(&set(Some(Box::new(added)), None)).is_empty());
     }
 
     #[test]
@@ -597,7 +545,7 @@ mod tests {
     /// package the plan creates, and by nothing that only shares a spelling.
     #[test]
     fn a_class_placeholder_is_proved_by_the_exact_member_of_the_package() {
-        let pin = placeholder(
+        let pin = ClassPins::placeholder(
             &class("text").wanted,
             TypeProvider {
                 extension: "pg_trgm".into(),

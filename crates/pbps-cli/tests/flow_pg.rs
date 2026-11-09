@@ -147,6 +147,8 @@ mod census2444;
 mod comments2729;
 #[path = "support/exclude2448.rs"]
 mod exclude2448;
+#[path = "support/exclude2448_operators.rs"]
+mod exclude2448_operators;
 #[path = "support/extensions2447.rs"]
 mod extensions2447;
 #[path = "support/extensions2447_classes.rs"]
@@ -2696,6 +2698,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
             | change @ pbps_model::Change::DropUnique { .. }
+            | change @ pbps_model::Change::SetExclusion { .. }
             | change @ pbps_model::Change::AddForeignKey { .. }
             | change @ pbps_model::Change::DropForeignKey { .. }
             | change @ pbps_model::Change::AddCheck { .. }

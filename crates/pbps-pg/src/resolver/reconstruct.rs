@@ -346,6 +346,26 @@ impl Reconstruction {
                         None,
                     )?);
                 }
+                // The differ splits every new table's exclusion constraint out of its CREATE,
+                // as it does a foreign key, so a bootstrap carries it as its own change, and
+                // not as a generated part of the table (#2448 C1b). Its backing index is a
+                // relation of the constraint's name, as an index's is.
+                Change::SetExclusion {
+                    table,
+                    name,
+                    from: None,
+                    to: Some(_),
+                } => {
+                    steps.push(make(
+                        &format!(
+                            "exclusion constraint {name} on {table}",
+                            name = name.shown(),
+                            table = table.shown()
+                        ),
+                        vec![(Nameable::Index, table.schema.clone(), name.raw().to_owned())],
+                        None,
+                    )?);
+                }
                 Change::SetPrimaryKey { .. } | Change::AddUnique { .. } if is_part => {
                     steps.push(make(
                         &pbps_model::escape::Escaped(&change.subject()).to_string(),
@@ -441,6 +461,7 @@ impl Reconstruction {
                 | Change::SetPartitionNotNull { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
+                | Change::SetExclusion { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }

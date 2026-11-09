@@ -256,7 +256,11 @@ pub(super) fn classify(
         Change::SetPrimaryKey { to, .. } => {
             write(write_hit && to.is_some() && !unchanged(&p.change, table))
         }
-        Change::AddUnique { .. } | Change::AddCheck { .. } => {
+        // An exclusion is added as a unique constraint is: it checks the rows
+        // the table holds; dropping one asks nothing of a consumer.
+        Change::AddUnique { .. }
+        | Change::AddCheck { .. }
+        | Change::SetExclusion { to: Some(_), .. } => {
             write(write_hit && !unchanged(&p.change, table))
         }
         Change::AddForeignKey { constraint, .. } => write(
@@ -305,6 +309,7 @@ pub(super) fn classify(
         | Change::SetIndexStorageParameters { .. }
         | pbps_model::change_family!(policies)
         | Change::DropUnique { .. }
+        | Change::SetExclusion { to: None, .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }

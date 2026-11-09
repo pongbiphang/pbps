@@ -164,8 +164,8 @@ pub const RECORDS: &[Record] = &[
     },
     Record {
         planned: Some(Planned {
-            label: "`gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read and round \
-                    trip held, DEC-2448.3; add, drop, replace, rebuild and partitions next)",
+            label: "`gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare \
+                    and add held, DEC-2448.3; drop, replace, rebuild and partitions next)",
             today: "partly held",
             tracking: "#2448",
         }),

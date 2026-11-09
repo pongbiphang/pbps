@@ -709,6 +709,27 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
+        // Measured on 16.15 and 18.6: the constraint takes `AccessExclusive`
+        // (with `ShareRowExclusive` and `Share`) on the table, so reads wait
+        // too, and the build checks every row the table holds; the engine has
+        // no `NOT VALID` for it (DEC-2448.3).
+        Change::SetExclusion {
+            table,
+            name,
+            to: Some(_),
+            ..
+        } => e(
+            format!(
+                "adding the exclusion constraint {name}, which builds its index and checks \
+                 every existing row while reads and writes wait",
+                name = name.shown(),
+            ),
+            table,
+            Rewrite::No,
+            Reads::EveryRow,
+            Lock::AccessExclusive,
+        ),
+
         Change::SetPrimaryKey {
             table, to: Some(_), ..
         } => e(
@@ -1038,6 +1059,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::SetColumnDeprecated { .. }
         | Change::SetComment { .. }
         | Change::SetPrimaryKey { to: None, .. }
+        | Change::SetExclusion { to: None, .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
@@ -2429,5 +2451,40 @@ mod tests {
                 column: Some("v".into())
             }
         );
+    }
+
+    /// Adding an exclusion constraint is announced for what it costs: the engine
+    /// takes the table exclusively, so reads wait too, and checks every row
+    /// (measured on 16.15 and 18.6); dropping one is metadata (DEC-2448.3).
+    #[test]
+    fn an_exclusion_constraints_add_is_estimated_exclusive_and_its_drop_is_not() {
+        let constraint = pbps_model::ExclusionConstraint {
+            method: pbps_model::IndexMethod::Btree,
+            keys: vec![pbps_model::ExclusionKey {
+                key: pbps_model::IndexColumn::column("a"),
+                operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+            }],
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: pbps_model::ExclusionTiming::Immediate,
+        };
+        let add = Change::SetExclusion {
+            table: tname("app.t"),
+            name: "x".into(),
+            from: None,
+            to: Some(Box::new(constraint.clone())),
+        };
+        let e = estimate(&add, Strategy::default()).expect("an estimate");
+        assert!(matches!(e.lock, Lock::AccessExclusive));
+        assert!(matches!(e.reads, Reads::EveryRow), "{e:?}");
+        assert!(e.about.contains("exclusion constraint x"), "{e:?}");
+        let drop = Change::SetExclusion {
+            table: tname("app.t"),
+            name: "x".into(),
+            from: Some(Box::new(constraint)),
+            to: None,
+        };
+        assert!(estimate(&drop, Strategy::default()).is_none());
     }
 }

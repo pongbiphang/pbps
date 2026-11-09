@@ -564,8 +564,9 @@ indexes:
   `method:` (`btree` or `gist`), `keys:` that each name a column or an expression and
   the `operator:` (a `pg_catalog` symbol such as `&&` or `=`) it is excluded with,
   and the optional `include:`, `where:`, `storage_parameters:`, `deferrable:` and
-  `initially:`. The pull reads one and the round trip is empty; there is no
-  `NOT VALID` or `NOT ENFORCED` for it. Adding, dropping, replacing or renaming one,
+  `initially:`. It is added by its own change after the table's rows, behind the
+  `constraint` risk, and takes an exclusive lock while it checks every row. There
+  is no `NOT VALID` or `NOT ENFORCED` for it. Dropping, replacing or renaming one,
   a change to a column it holds, and a partitioned table's are refused by name until
   the parts that deliver them (DEC-2448.3). SQL Server has no such constraint.
 - **A stored generated column is `generated: {expression: "a * 2", stored:

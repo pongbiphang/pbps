@@ -485,6 +485,27 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
     pin(
+        Change::SetExclusion {
+            table: table.clone(),
+            name: "xc".into(),
+            from: None,
+            to: Some(Box::new(pbps_model::ExclusionConstraint {
+                method: pbps_model::IndexMethod::Gist,
+                keys: vec![pbps_model::ExclusionKey {
+                    key: pbps_model::IndexColumn::column("id"),
+                    operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                }],
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            })),
+        },
+        vec![&table],
+        vec![],
+        None,
+    );
+    pin(
         Change::AddForeignKey {
             table: table.clone(),
             name: "fk".into(),

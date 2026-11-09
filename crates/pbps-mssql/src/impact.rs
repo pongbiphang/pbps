@@ -86,6 +86,7 @@ pub async fn key_drop_blockers(
                 | Change::SetIndexStorageParameters { .. }
                 | pbps_model::change_family!(policies)
                 | Change::AddUnique { .. }
+                | Change::SetExclusion { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
@@ -238,6 +239,7 @@ pub async fn key_drop_blockers(
             | pbps_model::change_family!(policies)
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }

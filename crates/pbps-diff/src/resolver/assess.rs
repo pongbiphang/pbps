@@ -237,6 +237,7 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
+        | Change::SetExclusion { .. }
         | Change::AddIndex { .. }
         | Change::DropIndex { .. } => engine.indexes_are_relations,
         Change::AlterModule { id, .. } => declared_differently(id, base, desired, engine),

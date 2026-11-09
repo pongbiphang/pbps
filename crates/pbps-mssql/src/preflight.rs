@@ -898,6 +898,7 @@ name = name.shown(),
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetExclusion { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is

@@ -1265,6 +1265,30 @@ impl Cx<'_> {
                     Incarnation::Final,
                 ));
             }
+            Change::SetExclusion {
+                table,
+                name,
+                from,
+                to,
+            } => {
+                let owner = self.table(table)?;
+                self.exists(ObjectKey::Table(owner.clone()));
+                if from.is_some() {
+                    self.releases_constraint(&owner, PartKey::Exclusion(name.clone()));
+                }
+                // Adding one checks every row the table holds when it runs.
+                if let Some(constraint) = to {
+                    self.requires_valid_data(&owner);
+                    for key in constraint.keys.iter().map(|k| &k.key.key) {
+                        if let IndexKey::Column(c) = key {
+                            self.requires_column(table, c.raw(), false);
+                        }
+                    }
+                    for c in &constraint.include {
+                        self.requires_column(table, c.raw(), false);
+                    }
+                }
+            }
             Change::AddCheck { table, .. } => {
                 let owner = self.table(table)?;
                 self.exists(ObjectKey::Table(owner.clone()));
@@ -1910,6 +1934,15 @@ impl Cx<'_> {
                 gone.push(Self::part(owner, PartKey::Unique(n.clone())));
             }
         }
+        for (n, x) in &table.exclude {
+            let keyed = x
+                .keys
+                .iter()
+                .any(|k| matches!(&k.key.key, IndexKey::Column(c) if c.raw() == column));
+            if keyed || x.include.iter().any(|c| c.raw() == column) {
+                gone.push(Self::part(owner, PartKey::Exclusion(n.clone())));
+            }
+        }
         for (n, fk) in &table.foreign_keys {
             if fk.columns.iter().any(|c| c.raw() == column) {
                 gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
@@ -2014,6 +2047,15 @@ impl Cx<'_> {
         for (n, u) in &table.unique {
             if u.columns.iter().any(|c| c.raw() == column) {
                 gone.push(Self::part(owner, PartKey::Unique(n.clone())));
+            }
+        }
+        for (n, x) in &table.exclude {
+            let keyed = x
+                .keys
+                .iter()
+                .any(|k| matches!(&k.key.key, IndexKey::Column(c) if c.raw() == column));
+            if keyed || x.include.iter().any(|c| c.raw() == column) {
+                gone.push(Self::part(owner, PartKey::Exclusion(n.clone())));
             }
         }
         for (n, index) in &table.indexes {
