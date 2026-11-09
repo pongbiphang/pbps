@@ -33,6 +33,7 @@ fn added(purpose: Purpose) -> Option<bool> {
         Purpose::Teardown => Some(true),
         Purpose::Restoration => Some(false),
         Purpose::Tree
+        | Purpose::Describe
         | Purpose::Copy
         | Purpose::Own
         | Purpose::Analyze
@@ -318,7 +319,12 @@ impl Expansion for Rule<'_> {
                 }
             }
         }
+        // A comment is written under the intermediate name, so before the swap renames it.
+        let describes = positions(Purpose::Describe);
         for &swap in &swaps {
+            for &describe in &describes {
+                edge(describe, swap, Source::Effect);
+            }
             edge(analyze, swap, Source::Effect);
             for release in positions(Purpose::Teardown) {
                 edge(release, swap, Source::Effect);

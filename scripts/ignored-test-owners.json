@@ -818,6 +818,7 @@
         "comments2729::a_comments_bytes_survive_the_pull_the_file_and_the_apply",
         "comments2729::a_created_table_and_an_added_column_get_their_comments",
         "comments2729::another_sessions_edit_of_a_comment_the_plan_wrote_is_refused",
+        "comments2729::an_approved_rebuild_keeps_the_declared_comments_of_the_table_its_partitions_and_its_columns",
         "index_brin2449::a_brin_index_round_trips_alters_autosummarize_in_place_and_rebuilds_for_its_granularity",
         "index_brin2449::a_brin_declaration_the_engine_or_this_part_does_not_hold_is_refused_by_name",
         "index_brin2449::an_option_change_on_a_partitioned_parents_index_rebuilds_it_and_its_leaves_carry_the_value",

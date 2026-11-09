@@ -463,3 +463,78 @@ fn another_sessions_edit_of_a_comment_the_plan_wrote_is_refused() {
         assert!(said(&refused).contains("comment"), "{}", said(&refused));
     });
 }
+
+/// An approved `rebuild-table` replaces a partitioned table and its partitions, and the
+/// replacements carry the declared comments: the parent's, the partition's own and a column's
+/// (#2729). Before, the expansion built the tables with no `COMMENT ON` while the recorded state
+/// held the descriptions. Negative: a comment nothing declares is not invented, and the next plan
+/// is empty.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_approved_rebuild_keeps_the_declared_comments_of_the_table_its_partitions_and_its_columns() {
+    let _ = server();
+    servers(|url| {
+        let own = OwnDatabase::new(url, "comments-rebuild");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.p (k integer NOT NULL, bucket integer NOT NULL, label text, note text) \
+               PARTITION BY RANGE (k); \
+             CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10); \
+             CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20); \
+             INSERT INTO app.p VALUES (1, 2, 'a', 'x'), (11, 4, 'b', 'y'); \
+             COMMENT ON TABLE app.p IS 'the parent'; \
+             COMMENT ON COLUMN app.p.label IS 'the label'; \
+             COMMENT ON TABLE app.p1 IS 'first partition'; \
+             COMMENT ON COLUMN app.p.note IS 'ops note'",
+        );
+        let d = adopted(connection, "comments-rebuild");
+        let file = schema_file(&d, "app.p.yml");
+        let text = read(&d, "app.p.yml");
+        assert!(
+            text.contains("the parent") && text.contains("first partition"),
+            "{text}"
+        );
+        // `note`'s comment is dropped from the declarations: unmanaged, so the rebuild owes it
+        // nothing, and the plan must not invent one.
+        let text = text.replace("    description: ops note\n", "");
+        std::fs::write(
+            &file,
+            text.replace("  k:\n    type: integer", "  k:\n    type: bigint"),
+        )
+        .unwrap();
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "10",
+            "--reason",
+            "maintenance",
+        ]));
+        d.commit();
+        let (plan, sql) = plan_sql(&d, connection);
+        assert!(
+            sql.contains("COMMENT ON"),
+            "the rebuild writes comments:\n{sql}"
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive,rename,constraint,narrowing,revoke"],
+        ));
+        assert!(has_comment(connection, "app.p", 0, "the parent"));
+        assert!(has_comment(connection, "app.p1", 0, "first partition"));
+        assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 2);
+        assert_eq!(comments_on(connection, "app.p2"), 0);
+        // The parent's table comment and `label`'s survive; `note` was never declared and is
+        // not in the replacement.
+        assert_eq!(
+            comments_on(connection, "app.p"),
+            2,
+            "the parent and `label` only"
+        );
+        no_changes(&d, connection);
+    });
+}

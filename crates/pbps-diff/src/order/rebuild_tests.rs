@@ -200,3 +200,72 @@ fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
         );
     }
 }
+
+/// A saved rebuild must carry the comments its replacements are declared with (#2729): a plan
+/// without one is named, for the table's own comment and for a column's. Negatives: the plan that
+/// has them passes, and a replacement declaring none (or `""`) is owed none.
+#[test]
+fn a_saved_rebuild_that_lost_a_declared_comment_is_named() {
+    use super::rebuild::lost_comment;
+    use pbps_model::{CommentTarget, RebuildRelation};
+    let relation = RebuildRelation {
+        uid: "t_000001".parse().unwrap(),
+        name: "app.__pbps_rebuild_t_000001".parse().unwrap(),
+    };
+    let mut declared = Table::default();
+    declared
+        .columns
+        .insert("k".into(), Column::new("integer".parse().unwrap()));
+    let none: Vec<PlannedChange> = Vec::new();
+    assert_eq!(
+        lost_comment(&none, &relation, &declared),
+        None,
+        "nothing declared, nothing owed"
+    );
+    declared.description = Some(String::new().into());
+    declared.columns["k"].description = Some(String::new().into());
+    assert_eq!(
+        lost_comment(&none, &relation, &declared),
+        None,
+        "`\"\"` is no comment"
+    );
+    declared.description = Some("the table".into());
+    declared.columns["k"].description = Some("the key".into());
+    let write = |target, text: &str| {
+        PlannedChange::new(Change::SetComment {
+            target,
+            text: Some(text.into()),
+        })
+    };
+    let table = write(
+        CommentTarget::Table {
+            uid: relation.uid.clone(),
+            table: relation.name.clone(),
+        },
+        "the table",
+    );
+    let key = write(
+        CommentTarget::Column {
+            uid: "c_000001".parse().unwrap(),
+            column: relation.name.column("k"),
+        },
+        "the key",
+    );
+    assert_eq!(
+        lost_comment(std::slice::from_ref(&key), &relation, &declared),
+        Some("a replacement table lost its declared comment")
+    );
+    assert_eq!(
+        lost_comment(std::slice::from_ref(&table), &relation, &declared),
+        Some("a replacement column lost its declared comment")
+    );
+    let other_text = write(
+        CommentTarget::Table {
+            uid: relation.uid.clone(),
+            table: relation.name.clone(),
+        },
+        "someone else's text",
+    );
+    assert!(lost_comment(&[other_text, key.clone()], &relation, &declared).is_some());
+    assert_eq!(lost_comment(&[table, key], &relation, &declared), None);
+}

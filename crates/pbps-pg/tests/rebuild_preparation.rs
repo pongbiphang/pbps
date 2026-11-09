@@ -29,6 +29,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::declared(|_| {})
+    }
+    /// The fixture whose declarations `declare` has edited before the rebuild is approved.
+    fn declared(declare: impl FnOnce(&mut Schema)) -> Self {
         let base = pbps_diff::rebuild::member_cases::source();
         let table = pbps_diff::rebuild::member_cases::root();
         let ctx = pbps_diff::Context {
@@ -48,6 +52,7 @@ impl Fixture {
             "p_idx".into(),
             serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
         );
+        declare(&mut desired);
         let pg = pbps_pg::Postgres::new();
         let recorded = pbps_diff::rebuild::record(
             side(&base, &ids),
@@ -437,4 +442,79 @@ fn a_column_renamed_after_the_approval_is_copied_from_the_column_it_continues() 
         .find(|c| c.target.name.raw() == "added")
         .unwrap();
     assert!(added.source.is_none(), "an unpaired column has no source");
+}
+
+/// The declared comments of a rebuilt tree are written on its replacements (#2729,
+/// DEC-2729.1): the parent's, a partition's own and a column's, under the relations' intermediate
+/// names and before the swap renames them, so the final tables carry them. Negatives: a tree with
+/// no description plans none, `""` is no comment on a fresh relation, and an undescribed
+/// partition gets none from its parent.
+#[test]
+fn a_rebuilt_trees_declared_comments_are_written_on_its_replacements_before_the_swap() {
+    let describe = |p: &Prepared| {
+        p.parts()
+            .iter()
+            .filter(|x| x.purpose == Purpose::Describe)
+            .map(|x| {
+                let Change::SetComment { target, text } = &x.change.change else {
+                    panic!("{:?}", x.change.change);
+                };
+                (
+                    match target {
+                        CommentTarget::Table { table, .. } => table.name.clone(),
+                        CommentTarget::Column { column, .. } => {
+                            [column.table.name.as_str(), column.name.raw()].join(".")
+                        }
+                    },
+                    text.as_ref().map(|t| t.raw().to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let f = Fixture::new();
+    assert!(
+        describe(&f.prepare().unwrap()).is_empty(),
+        "no description declared, no comment"
+    );
+    let parent = f.root.table.clone();
+    let f = Fixture::declared(|desired| {
+        let table = desired.tables.get_mut(&parent).unwrap();
+        table.description = Some("the parent".into());
+        table.columns.get_mut("k").unwrap().description = Some("the key".into());
+        table.columns.get_mut("added").unwrap().description = Some(String::new().into());
+        desired
+            .tables
+            .get_mut(&TableName::new("app", "p1"))
+            .unwrap()
+            .description = Some("the first partition".into());
+    });
+    let p = f.prepare().unwrap();
+    let said = describe(&p);
+    let address = |uid: &Uid| {
+        p.addresses()
+            .iter()
+            .find(|a| &a.uid == uid)
+            .unwrap()
+            .address
+            .name
+            .clone()
+    };
+    let parent_address = address(p.target().table_uid(&parent).unwrap());
+    let leaf_address = address(p.target().table_uid(&TableName::new("app", "p1")).unwrap());
+    let mut expected = vec![
+        (parent_address.clone(), Some("the parent".to_owned())),
+        (format!("{parent_address}.k"), Some("the key".to_owned())),
+        (leaf_address, Some("the first partition".to_owned())),
+    ];
+    expected.sort();
+    let mut said = said;
+    said.sort();
+    assert_eq!(
+        said, expected,
+        "the empty comment and the bare columns say nothing"
+    );
+    // The comments are on the relations by their intermediate names, so they come before the
+    // swap in the part order.
+    let at = |purpose| p.parts().iter().position(|x| x.purpose == purpose).unwrap();
+    assert!(at(Purpose::Tree) < at(Purpose::Describe));
 }
