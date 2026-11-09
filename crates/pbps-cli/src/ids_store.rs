@@ -134,7 +134,29 @@ pub(crate) fn protected(project: &Project) -> Vec<PathBuf> {
 /// included): a file written there becomes an identity file or collides with
 /// one the next `plan` writes.
 pub(crate) fn refuse_output_inside(project: &Project, destination: &Path) -> anyhow::Result<()> {
-    if crate::paths::is_inside(destination, &project.ids_dir())? {
+    // By the tree's own key: on a case-insensitive filesystem `.PBPS/IDS/x` is
+    // inside `.pbps/ids`.
+    let key = PathKey::probe(&project.ids_dir()).with_context(|| {
+        format!(
+            "cannot tell whether `{}` is case-sensitive",
+            project.ids_dir().display()
+        )
+    })?;
+    refuse_output_inside_keyed(project, destination, key)
+}
+
+fn refuse_output_inside_keyed(
+    project: &Project,
+    destination: &Path,
+    key: PathKey,
+) -> anyhow::Result<()> {
+    let inside = key
+        .strip_prefix(
+            &crate::paths::absolute(destination)?,
+            &crate::paths::absolute(&project.ids_dir())?,
+        )
+        .is_some();
+    if inside {
         bail!(
             "`{}` is inside the identity tree `{}`, which only pbps writes; write it elsewhere",
             pbps_model::Text::new(destination.display().to_string()).shown(),
@@ -177,6 +199,29 @@ impl PathKey {
 
     pub(crate) fn path(self, path: &Path) -> String {
         self.of(&path.to_string_lossy())
+    }
+
+    /// What is left of `path` below `prefix`, comparing component by component
+    /// by key (`Some("")`-like empty when they are equal); `None` when `path`
+    /// is not `prefix` or below it.
+    pub(crate) fn strip_prefix(self, path: &Path, prefix: &Path) -> Option<PathBuf> {
+        let mut rest = path.components();
+        for want in prefix.components() {
+            let got = rest.next()?;
+            if self.of(&got.as_os_str().to_string_lossy())
+                != self.of(&want.as_os_str().to_string_lossy())
+            {
+                return None;
+            }
+        }
+        Some(rest.as_path().to_path_buf())
+    }
+
+    /// [`strip_prefix`](Self::strip_prefix) for `/`-separated text, as git and
+    /// the configuration spell paths.
+    pub(crate) fn strip_prefix_str<'a>(self, path: &'a str, prefix: &str) -> Option<&'a str> {
+        let head = path.get(..prefix.len())?;
+        (self.of(head) == self.of(prefix)).then(|| &path[prefix.len()..])
     }
 
     /// The key of the filesystem under `dir` (or the nearest ancestor that
@@ -307,6 +352,7 @@ impl TreeWrite {
                 }
                 let mut missing: Vec<PathBuf> = parent
                     .ancestors()
+                    // Raw is right: `parent` was built by joining onto `self.dir`.
                     .take_while(|d| d.starts_with(&self.dir) && !d.exists())
                     .map(Path::to_path_buf)
                     .collect();
@@ -348,6 +394,7 @@ impl TreeWrite {
                 // directory this file was to replace is put back.
                 let pending: Vec<_> = staged
                     .iter()
+                    // Raw is right: `tmp` is this very generated path, not a spelling of it.
                     .skip_while(|(t, _)| t != tmp)
                     .cloned()
                     .collect();
@@ -361,17 +408,10 @@ impl TreeWrite {
         let placed: Vec<&PathBuf> = staged.iter().map(|(_, path)| path).collect();
         let placed_keys: BTreeSet<String> = placed.iter().map(|p| key.path(p)).collect();
         for rel in &self.removals {
-            let mut path = self.dir.join(rel);
-            // What was set aside is removed where it went.
-            if let Some((orig, aside)) = asides.iter().find(|(o, _)| path.starts_with(o)) {
-                // `join("")` would add a trailing slash and make the file a directory.
-                let rest = path.strip_prefix(orig).unwrap_or(Path::new(""));
-                path = if rest.as_os_str().is_empty() {
-                    aside.clone()
-                } else {
-                    aside.join(rest)
-                };
-            }
+            // What was set aside is removed where it went. The aside was made
+            // under the spelling of the new path, the removal carries the old
+            // one: they are compared by key.
+            let path = redirected(&self.dir.join(rel), &asides, key);
             // A path that is the very file this write just placed is not an old
             // copy: on a case-insensitive filesystem `Customer.json` and
             // `customer.json` are one file, and the rename above already
@@ -388,6 +428,8 @@ impl TreeWrite {
             // (`Sales/` to `sales/`, one directory on a case-insensitive
             // filesystem): the placed files are in it, so `remove_dir` refuses.
             let mut parent = path.parent();
+            // Raw is right: `path` comes from `self.dir` (or an aside beside
+            // such a path), so the prefix is `self.dir` as spelled.
             while let Some(dir) = parent.filter(|d| *d != self.dir && d.starts_with(&self.dir)) {
                 if std::fs::remove_dir(dir).is_err() {
                     break;
@@ -410,6 +452,23 @@ impl TreeWrite {
         }
         Ok(())
     }
+}
+
+/// Where `path` is now: under its aside when it, or a directory above it, was
+/// set aside, else where it was. Compared by key: the aside is named after the
+/// new path's spelling and `path` carries the old one.
+fn redirected(path: &Path, asides: &[(PathBuf, PathBuf)], key: PathKey) -> PathBuf {
+    for (orig, aside) in asides {
+        if let Some(rest) = key.strip_prefix(path, orig) {
+            // `join("")` would add a trailing slash and make the file a directory.
+            return if rest.as_os_str().is_empty() {
+                aside.clone()
+            } else {
+                aside.join(rest)
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Writes one temp file. Under test a fault can be armed (`tests::fail_write_number`)

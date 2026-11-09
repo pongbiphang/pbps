@@ -208,6 +208,10 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
     // for byte, and the rest are still to come. A crash inside the write loop
     // leaves exactly that. A file it would not write, or would write
     // differently, is somebody's work.
+    // Raw is right here and below: the declarations `place` mirrors were read
+    // from this same filesystem, so two of them cannot differ only in case where
+    // case folds, and `validate` reports `ids.case-collision` for a checkout
+    // moved to one that does.
     for (rel, text) in &tree {
         let why = match files.get(rel) {
             Some(expected) if expected == text => continue,
@@ -514,6 +518,12 @@ pub(crate) fn declarations(
 fn unmerged(project: &Project, dirs: &Dirs) -> anyhow::Result<BTreeMap<String, [bool; 3]>> {
     let out = crate::baseline::git(project.root(), &["ls-files", "-u", "-z", "--", &dirs.ids])
         .context("cannot list unmerged files (is this a git repository?)")?;
+    let key = crate::ids_store::PathKey::probe(&project.ids_dir()).with_context(|| {
+        format!(
+            "cannot tell whether `{}` is case-sensitive",
+            project.ids_dir().display()
+        )
+    })?;
     let mut stages: BTreeMap<String, [bool; 3]> = BTreeMap::new();
     for entry in out.split('\0').filter(|e| !e.is_empty()) {
         let (meta, path) = entry
@@ -524,7 +534,10 @@ fn unmerged(project: &Project, dirs: &Dirs) -> anyhow::Result<BTreeMap<String, [
             .next()
             .and_then(|s| s.parse().ok())
             .context("unexpected stage")?;
-        if let Some(rel) = path.strip_prefix(&format!("{}/", dirs.ids)) {
+        // By the tree's key: git spells the path as the index has it, the
+        // configuration as the user typed it, and on a case-insensitive
+        // filesystem those may differ in case.
+        if let Some(rel) = key.strip_prefix_str(path, &format!("{}/", dirs.ids)) {
             stages.entry(rel.to_owned()).or_default()[stage - 1] = true;
         }
     }

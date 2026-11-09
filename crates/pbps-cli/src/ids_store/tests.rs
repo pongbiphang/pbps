@@ -853,6 +853,18 @@ fn a_case_only_rename_loses_nothing_on_a_case_insensitive_filesystem() {
     plan(&project, &replaced, &paths).unwrap().apply().unwrap();
     assert_eq!(read_opt(&project).unwrap(), Some(replaced.clone()));
     assert!(plan(&project, &replaced, &paths).unwrap().is_empty());
+    // A file becomes a directory under another spelling: `a.yml` -> `A.json/x.yml`.
+    let before = declared(&[("dbo.customer", "a.yml", &["id", "name"])]);
+    let project = written("case-file-to-dir", &customer(), &before);
+    let after = declared(&[("dbo.customer", "A.json/x.yml", &["id", "name"])]);
+    plan(&project, &customer(), &after)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&project.ids_dir()), ["A.json"]);
+    assert_eq!(names_in(&project.ids_dir().join("A.json")), ["x.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(plan(&project, &customer(), &after).unwrap().is_empty());
 }
 
 #[test]
@@ -1171,4 +1183,104 @@ fn a_probe_that_cannot_read_is_an_error_not_case_sensitive() {
         return; // an account that ignores permissions
     }
     assert!(result.is_err(), "{result:?}");
+}
+
+// ------------------------------------- the sweep of raw path comparisons ----
+
+#[test]
+fn a_removal_is_redirected_to_an_aside_made_under_the_other_spelling_when_case_folds() {
+    // `a.yml` -> `A.json/x.yml`: on a folding filesystem the existing file is
+    // `A.json` whichever way it is spelled; stand in for that with the file on
+    // disk under the new spelling and the removal under the old.
+    for (key, folds) in [(PathKey::folding(), true), (PathKey::default(), false)] {
+        let project = project(if folds {
+            "redirect-fold"
+        } else {
+            "redirect-exact"
+        });
+        let dir = project.ids_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("A.json"), "old").unwrap();
+        let write = TreeWrite {
+            dir: dir.clone(),
+            files: [("A.json/x.json".to_owned(), "x".to_owned())].into(),
+            removals: vec!["a.json".to_owned()],
+            key,
+            ..TreeWrite::default()
+        };
+        let result = write.apply();
+        if folds {
+            result.unwrap();
+            assert_eq!(names_in(&dir), ["A.json"], "no aside is left behind");
+            assert_eq!(names_in(&dir.join("A.json")), ["x.json"]);
+            assert_eq!(read_ids_tree(&dir).unwrap().len(), 1);
+        } else {
+            // Case is significant: `a.json` is not the file that went aside, so
+            // the removal finds nothing and the aside is reported, not lost.
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("a.json"), "{error}");
+            assert!(dir.join(".A.json.aside").exists(), "the old file is kept");
+        }
+    }
+}
+
+#[test]
+fn the_redirect_compares_components_by_key() {
+    let asides = [(
+        PathBuf::from("/ids/A.json"),
+        PathBuf::from("/ids/.A.json.aside"),
+    )];
+    let at = |p: &str, key| redirected(Path::new(p), &asides, key);
+    let fold = PathKey::folding();
+    assert_eq!(at("/ids/a.json", fold), Path::new("/ids/.A.json.aside"));
+    assert_eq!(
+        at("/ids/a.JSON/b.json", fold),
+        Path::new("/ids/.A.json.aside/b.json")
+    );
+    // Not under it: a sibling that merely shares a prefix.
+    assert_eq!(at("/ids/a.json2", fold), Path::new("/ids/a.json2"));
+    assert_eq!(
+        at("/ids/a.json", PathKey::default()),
+        Path::new("/ids/a.json")
+    );
+}
+
+#[test]
+fn an_output_inside_the_identity_tree_is_refused_by_the_trees_key() {
+    let project = project("output-inside");
+    let inside = project.ids_dir().join("sub").join("x.json");
+    let shouted = PathBuf::from(
+        inside
+            .to_string_lossy()
+            .replacen("ids", "IDS", 1)
+            .replace(".pbps", ".PBPS"),
+    );
+    assert!(refuse_output_inside_keyed(&project, &inside, PathKey::default()).is_err());
+    // A differently cased spelling is the same place only where case folds.
+    assert!(refuse_output_inside_keyed(&project, &shouted, PathKey::folding()).is_err());
+    assert!(refuse_output_inside_keyed(&project, &shouted, PathKey::default()).is_ok());
+    // Negative: a sibling that shares a prefix is outside.
+    let outside = project.root().join(".pbps").join("ids2").join("x.json");
+    assert!(refuse_output_inside_keyed(&project, &outside, PathKey::folding()).is_ok());
+}
+
+#[test]
+fn a_git_path_is_matched_to_the_configured_directory_by_key() {
+    let fold = PathKey::folding();
+    let exact = PathKey::default();
+    assert_eq!(
+        fold.strip_prefix_str(".PBPS/IDS/a.json", ".pbps/ids/"),
+        Some("a.json")
+    );
+    assert_eq!(
+        exact.strip_prefix_str(".PBPS/IDS/a.json", ".pbps/ids/"),
+        None
+    );
+    assert_eq!(
+        exact.strip_prefix_str(".pbps/ids/a.json", ".pbps/ids/"),
+        Some("a.json")
+    );
+    // Shorter than the prefix, or not on a character boundary: no match, no panic.
+    assert_eq!(fold.strip_prefix_str(".pbps", ".pbps/ids/"), None);
+    assert_eq!(fold.strip_prefix_str("é", "e"), None);
 }
