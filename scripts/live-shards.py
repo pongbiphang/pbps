@@ -615,13 +615,13 @@ def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned, *, on_failure=None):
+def run_tests(command, assigned, *, on_failure=None, env=None):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
     # The commutation harness writes directly to stderr during passing tests.
     # Merging it here splits libtest's partial "test name ... " stdout line.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None,
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None, env=env,
                           text=True, bufsize=1) as process:
         for line in process.stdout:
             header = re.fullmatch(r"running ([0-9]+) tests?\n?", line)
@@ -1243,6 +1243,34 @@ def check_shard(suite="python"):
     return int(failed)
 
 
+def proof_environment(source):
+    """Supply runner image defaults only to the isolated child (DEC-2749.1)."""
+    env = dict(source)
+    for script, defaults in (
+        ("live-tests-pg.sh", (("PBPS_TEST_PG_SCRATCH_IMAGE", "IMAGE"),
+                              ("PBPS_TEST_PG_OLD_SCRATCH_IMAGE", "OLD_IMAGE"))),
+        ("live-tests.sh", (("PBPS_TEST_DEV_IMAGE", "IMAGE"),)),
+    ):
+        path = ROOT / "scripts" / script
+        try:
+            text = git_output(ROOT, "show", f"HEAD:scripts/{script}")
+        except (OSError, ValueError) as error:
+            names = ", ".join(name for name, _ in defaults)
+            raise ValueError(f"cannot read runner defaults {names} from {path}: {error}") from error
+        for name, pin in defaults:
+            problem = f"cannot derive runner default {name} from {path}: expected one pinned {pin} and default export"
+            images = re.findall(rf"^{pin}=(.*)$", text, re.MULTILINE)
+            exports = re.findall(rf"^export {name}=(.*)$", text, re.MULTILINE)
+            default = f"${{{name}:-${pin}}}"
+            # Read only the literal pin and known export form, never execute a
+            # runner: sourcing it would start fixtures and run unrelated tests.
+            require(len(images) == 1 and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", images[0]), problem)
+            require(len(exports) == 1 and exports[0] in (default, f'"{default}"'), problem)
+            env[name] = env.get(name) or images[0]
+    return env
+
+
 def record_proof(argv):
     global ROOT
     parser = argparse.ArgumentParser(description="Record one isolated pass for rerun independence evidence")
@@ -1282,7 +1310,7 @@ def record_proof(argv):
         name = args.name
         results, code, _, valid, _ = run_tests(
             ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-             "--color=never", args.name], [args.name])
+             "--color=never", args.name], [args.name], env=proof_environment(env))
     require(tree_identity(ROOT) == tree, "worktree changed during the isolated check")
     proof = {"version": 1, "commit": git_output(ROOT, "rev-parse", "HEAD").strip(),
              "tree": tree, "inputs": inputs, "cargo": cargo, "test": name,

@@ -10,7 +10,13 @@ worktrees for `origin/master` and the PR head. Use the same environment as the
 gate. Run cargo/test commands through the project's memory guard. These proofs
 execute only the named live test, or the whole named Python/Cargo check, and record the
 commit, tree, input digest and validated result. Keep outputs outside both
-worktrees. For example:
+worktrees.
+
+For isolated live tests, `proof` supplies the three scratch/dev image defaults
+from the clean worktree's runner scripts only to the child, refuses an unreadable
+or unrecognized default, and keeps explicit caller overrides in the input digest.
+
+For example:
 
 ```sh
 python3 /path/to/pr/scripts/live-shards.py proof --worktree /path/to/master \

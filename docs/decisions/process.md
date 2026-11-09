@@ -1888,3 +1888,21 @@ another worktree or later registration. It needs a fix and a new full gate.
 The final check union is exact; neither an old unstructured unit log nor a
 passing subset can replace the original whole-check receipt. Live/Python
 policy, register expiry and the existing per-head limits remain unchanged.
+
+<a id="dec-2749-1"></a>
+
+**DEC-2749.1. Isolated live proofs inherit image defaults from the proved tree,
+while caller overrides remain inputs.** The live runners export their pinned
+PostgreSQL scratch images and SQL Server dev image inside the runner process;
+the gate's caller environment therefore lacks them. A direct isolated proof
+could either fail for a missing image or obtain a different input digest by
+exporting it (#2749). After recording the unchanged caller input digest, `proof`
+supplies these three defaults only to its live-test child, reading the literal
+SHA-256 pin and expected default export from the clean `--worktree` runner
+scripts. An absent, unreadable, duplicate or unrecognized definition refuses
+with the variable and script, rather than executing an incomplete proof.
+Runner scripts are never sourced, since that would provision fixtures and run
+other tests. Explicit caller overrides still change the digest and retain the
+runners' nonempty-value precedence; an empty override uses the tree default
+but remains a caller input. Excluding the image names outright would lose
+that distinction. Python and whole-Cargo proofs retain their existing environment.
