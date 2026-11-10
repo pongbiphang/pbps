@@ -39,6 +39,11 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+// Choices of engine that the commands used to make for themselves, gathered
+// here so that this file stays the one place that names an engine (#2798).
+mod collected;
+pub(crate) use collected::*;
+
 /// A scratch baseline may assume only package state the scratch actually holds.
 pub async fn require_scratch_extensions(
     conn: &mut Conn,

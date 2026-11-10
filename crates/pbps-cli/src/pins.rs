@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, bail};
+use pbps_db::Conn;
 use pbps_db::fingerprint::FingerprintKey;
-use pbps_db::{Conn, Driver};
 use pbps_model::escape::Escaped;
 use pbps_model::{ModuleId, RoutineArg, RoutineId, RoutinePin, RoutinePins, TableName};
 use pbps_pg::admission::Admission;
@@ -69,7 +69,7 @@ pub enum Check<'a> {
 }
 
 impl<'a> Check<'a> {
-    fn within(self) -> pbps_pg::pins::Within {
+    pub(crate) fn within(self) -> pbps_pg::pins::Within {
         match self {
             Check::BeforeStatements { .. }
             | Check::BeforeRecording { .. }
@@ -82,7 +82,7 @@ impl<'a> Check<'a> {
         }
     }
 
-    fn executed(self) -> &'a [pbps_dialect::Statement] {
+    pub(crate) fn executed(self) -> &'a [pbps_dialect::Statement] {
         match self {
             Check::BeforeProbes => &[],
             Check::BeforeStatements { executed }
@@ -154,7 +154,7 @@ pub(crate) fn declared_requirements(
         .collect()
 }
 
-fn require_declared_types(
+pub(crate) fn require_declared_types(
     required: &BTreeSet<pbps_model::Uid>,
     pins: &[pbps_model::DeclaredTypePin],
     changes: &pbps_model::ChangeSet,
@@ -223,12 +223,13 @@ pub async fn seal(
     target: &Target,
     managed: &BTreeSet<ModuleId>,
 ) -> anyhow::Result<Option<RoutinePins>> {
-    if conn.driver() != Driver::Postgres {
+    let Some(read) =
+        crate::engine::read_pinned_routines(conn, pbps_pg::pins::Within::OwnTransaction)
+            .await
+            .context("could not read the routines this plan pins (DEC-319.1)")?
+    else {
         return Ok(None);
-    }
-    let read = pbps_pg::pins::read(conn, pbps_pg::pins::Within::OwnTransaction)
-        .await
-        .context("could not read the routines this plan pins (DEC-319.1)")?;
+    };
     let routines = unmanaged(read.routines, managed);
     if routines.is_empty() {
         return Ok(None);
@@ -264,28 +265,7 @@ pub async fn check(
     managed: &Managed,
     at: Check<'_>,
 ) -> anyhow::Result<()> {
-    if conn.driver() == Driver::Postgres {
-        require_declared_types(
-            &managed.declared_types,
-            &plan.declared_type_pins,
-            &plan.changes,
-        )?;
-        pbps_pg::type_refs::declared::check(
-            conn,
-            &plan.declared_type_pins,
-            &applying(project, plan),
-            at.within(),
-            matches!(
-                at,
-                Check::BeforeRecording { .. }
-                    | Check::BeforeCommit { .. }
-                    | Check::BeforeClosing { .. }
-            ),
-            &plan.changes,
-            at.executed(),
-        )
-        .await?;
-    }
+    crate::engine::check_declared_type_pins(conn, project, plan, managed, at).await?;
     crate::engine::check_type_pins(
         conn,
         plan,
@@ -296,17 +276,17 @@ pub async fn check(
     .await?;
     check_selected(conn, project, target, plan, at).await?;
     let pins = plan.routine_pins.as_ref();
-    if conn.driver() != Driver::Postgres {
-        return Ok(());
-    }
-    let read = pbps_pg::pins::read(conn, at.within())
+    let Some(read) = crate::engine::read_pinned_routines(conn, at.within())
         .await
         .with_context(|| {
             format!(
                 "could not read the routines this plan pins, {} (DEC-319.1)",
                 at.when()
             )
-        })?;
+        })?
+    else {
+        return Ok(());
+    };
     let now = unmanaged(read.routines, &managed.modules);
     let refuse = |what: String| -> anyhow::Error {
         anyhow::anyhow!(

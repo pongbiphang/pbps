@@ -112,8 +112,7 @@ async fn refuse_absent_roles(
     conn: &mut Conn,
     named: &std::collections::BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<()> {
-    let absent = pbps_pg::roles::missing_roles(conn, &named.iter().collect()).await?;
-    crate::engine::refuse_missing_cluster_roles(conn.driver(), &absent)
+    crate::engine::refuse_roles_absent_from_cluster(conn, named).await
 }
 
 /// Runs the rehearsal on the entry's scratch, which is released before this
@@ -141,9 +140,7 @@ pub async fn run<D: crate::emission::Engine>(
     // since is refused in its words, before a scratch is started for it.
     // (SQL Server's roles and users are the database's own, so there is no
     // cluster to ask: DEC-2379.3.)
-    if driver == pbps_db::Driver::Postgres {
-        refuse_absent_roles(conn, &named).await?;
-    }
+    refuse_absent_roles(conn, &named).await?;
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
     let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.desired);
@@ -167,10 +164,7 @@ pub async fn run<D: crate::emission::Engine>(
     // SQL Server's compiles the target's own namespace through the engine's
     // creation trials, which take the bootstrap of the base to build (a
     // default or computed column may call a function the base also holds).
-    let base_bootstrap = match driver {
-        pbps_db::Driver::Postgres => None,
-        pbps_db::Driver::Mssql => Some(base_bootstrap(plan)?),
-    };
+    let base_bootstrap = crate::engine::scratch_base_bootstrap(driver, plan)?;
     let binding = pbps_cli::resolver::server::BindingRequest {
         dependencies: plan.dependencies,
         bootstrap: base_bootstrap.as_ref().unwrap_or(&bootstrap),
@@ -271,13 +265,13 @@ fn lowered<D: crate::emission::Engine>(
         // The namespace of the base is already compiled (the scratch session
         // did it with the engine's trials); what is left of it is who may do
         // what, which the plan's own statements then change.
-        Ok(mapping) if driver == pbps_db::Driver::Mssql => Ok(Lowered {
+        Ok(mapping) if crate::engine::scratch_compiles_base_namespace(driver) => Ok(Lowered {
             base: all_statements(&base_remainder(plan)?.0),
             plan: all_statements(plan.statements),
             mapping: Some(mapping),
             authorization: AuthorizationRehearsal::Rehearsed,
         }),
-        Err(why) if driver == pbps_db::Driver::Mssql => Ok(Lowered {
+        Err(why) if crate::engine::scratch_compiles_base_namespace(driver) => Ok(Lowered {
             base: {
                 let (remainder, operations) = base_remainder(plan)?;
                 local_statements(&remainder, &operations)
@@ -332,7 +326,7 @@ fn lowered<D: crate::emission::Engine>(
 /// The bootstrap of the base: the plan from nothing to the target's managed
 /// model, as the differ writes it. SQL Server's scratch builds the namespace
 /// from it through the engine's creation trials.
-fn base_bootstrap<D: crate::emission::Engine>(
+pub(crate) fn base_bootstrap<D: crate::emission::Engine>(
     plan: &Plan<'_, D>,
 ) -> anyhow::Result<pbps_diff::order::DiffPlan> {
     let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.base);

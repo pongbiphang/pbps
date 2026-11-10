@@ -33,17 +33,14 @@ pub(super) async fn domain_check_not_valid_warnings(
     recorded: &Schema,
     json: bool,
 ) -> anyhow::Result<Vec<crate::output::Finding>> {
-    if conn.driver() != pbps_db::Driver::Postgres
-        || !recorded
-            .types
-            .values()
-            .any(|t| matches!(t, pbps_model::ManagedType::Domain { .. }))
+    if !recorded
+        .types
+        .values()
+        .any(|t| matches!(t, pbps_model::ManagedType::Domain { .. }))
     {
         return Ok(Vec::new());
     }
-    let standing = pbps_pg::domain_alter::not_valid(conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let standing = crate::engine::standing_not_valid_domain_checks(conn).await?;
     Ok(standing
         .into_iter()
         .filter(|found| recorded.types.contains_key(&found.domain))
@@ -691,36 +688,19 @@ pub(super) async fn plan_db_selected(
         // writes the swap that carries it (DEC-1635.7, DEC-1635.9). So is
         // which domains an array holds, which PostgreSQL refuses a new check
         // on in place and a rebuild takes instead.
-        if conn.driver() == pbps_db::Driver::Postgres {
-            let types: Vec<_> = base.types.keys().cloned().collect();
-            hints.enum_comments = pbps_pg::type_rebuild::comments(&mut conn, &types).await?;
-            let domains: Vec<_> = base
-                .types
-                .iter()
-                .filter(|(_, ty)| matches!(ty, pbps_model::ManagedType::Domain { .. }))
-                .filter_map(|(name, _)| Some((recorded_ids.type_uid(name)?.clone(), name.clone())))
-                .collect();
-            hints.domain_array_holders =
-                pbps_pg::domain_alter::array_holders(&mut conn, &domains).await?;
-            hints.extension_requires = extension_creates(&mut conn, &base, &declared, &resolved.ids).await?;
-            hints.extension_updates =
-                extension_update_facts(&mut conn, &base, &declared, &recorded_ids, &resolved.ids).await?;
-            hints.extension_moves =
-                extension_move_facts(&mut conn, &base, &declared, &recorded_ids, &resolved.ids).await?;
-            hints.extension_drops = extension_drop_facts(
-                &mut conn,
-                &retired_extensions(&base, &declared, &recorded_ids, &resolved.ids),
-            )
-            .await?;
-        }
+        crate::engine::type_rebuild_hints(
+            &mut conn,
+            &base,
+            &declared,
+            &recorded_ids,
+            &resolved.ids,
+            &mut hints,
+        )
+        .await?;
         // SQL Server's computed columns that stand throughout are judged by
         // the catalog's edges below (`order_computed_by_edges`), under the
         // database's collation, not by the text screen (#1460).
-        let screen = if conn.driver() == pbps_db::Driver::Mssql {
-            pbps_diff::Screen::Catalog
-        } else {
-            pbps_diff::Screen::Text
-        };
+        let screen = crate::engine::computed_column_screen(conn.driver());
         // plan_base uses the declared mode to compare newly managed rows.
         // Carry the takeover separately so matching rows still reach the
         // checksum/approval gate and the ordinary ledger write (DEC-1803.1).
@@ -767,18 +747,16 @@ pub(super) async fn plan_db_selected(
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
-        if conn.driver() == pbps_db::Driver::Postgres && let Some(entry) = scratch.as_mut() {
-            let before = pbps_diff::Side { schema: &base, ids: &recorded_ids };
-            let after = pbps_diff::Side { schema: &declared, ids: &resolved.ids };
-            let requests = pbps_diff::retained::candidates(before,after,&hints);
-            if !requests.is_empty() && pbps_pg::retained::available(&mut conn,&requests).await {
-                // Paired binding carries the resolver lifecycle. Keep its future
-                // separate from the connected planner's other binding phases.
-                hints.retained_expressions = Box::pin(crate::resolution::retained::compare(
-                    entry,&mut conn,target,before,after,&read_back,&hints,&requests,
-                )).await?;
-            }
-        }
+        crate::engine::retained_expression_hints(
+            scratch.as_mut(),
+            &mut conn,
+            target,
+            pbps_diff::Side { schema: &base, ids: &recorded_ids },
+            pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+            &read_back,
+            &mut hints,
+        )
+        .await?;
         // The modules a rebuilt enum's columns carry, found in the planning
         // transaction and kept for every plan that follows it.
         let enum_dependents = std::cell::RefCell::new(std::collections::BTreeSet::new());
@@ -931,15 +909,14 @@ pub(super) async fn plan_db_selected(
         // Before anything is checked against the plan: a name it creates that
         // the database already uses, outside what this project records, is a
         // `CREATE` the engine will refuse (#316, #320, #323).
-        if conn.driver() == pbps_db::Driver::Postgres {
-            refuse_occupied_names(
-                &cs,
-                &scoped,
-                &managed.unreadable,
-                &managed.unmanaged_relations,
-                &target.label,
-            )?;
-        }
+        crate::engine::refuse_occupied_relation_names(
+            conn.driver(),
+            &cs,
+            &scoped,
+            &managed.unreadable,
+            &managed.unmanaged_relations,
+            &target.label,
+        )?;
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         // The one admission rule of every site that runs code the plan holds
         // (DEC-2563.2). Review admits routines into it as the sites vet; the plan
@@ -1037,27 +1014,18 @@ pub(super) async fn plan_db_selected(
             // bodies and triggers over its columns come down and go back through
             // the module rebuild below, and anything else is refused by name
             // (DEC-1635.7).
-            let cs = if conn.driver() == pbps_db::Driver::Postgres
-                && cs.changes().changes.iter().any(|p| {
-                    matches!(p.change, pbps_model::Change::EnumRebuild { .. })
-                }) {
-                let census = pbps_pg::type_rebuild::census(
-                    &mut conn,
-                    cs.changes(),
-                    Some(&loaded.schema),
-                    &recorded_ids,
-                    false,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                if census.rebuild.is_empty() {
-                    cs
-                } else {
-                    enum_dependents.borrow_mut().extend(census.rebuild);
-                    rediff(&std::collections::BTreeSet::new())?
-                }
-            } else {
+            let rebuild = crate::engine::enum_rebuild_dependents(
+                &mut conn,
+                cs.changes(),
+                Some(&loaded.schema),
+                &recorded_ids,
+            )
+            .await?;
+            let cs = if rebuild.is_empty() {
                 cs
+            } else {
+                enum_dependents.borrow_mut().extend(rebuild);
+                rediff(&std::collections::BTreeSet::new())?
             };
             let mut rebuild_verification = None;
             let (mut cs, dependents) = if cs.changes.iter().any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))) {
@@ -1214,45 +1182,26 @@ pub(super) async fn plan_db_selected(
         // The expressions a table gains are bound the same way, to learn which
         // routines the review admits; one that uses an object this plan creates
         // cannot be bound yet and is said so, then judged at apply (DEC-2563.4).
-        if conn.driver() == pbps_db::Driver::Postgres {
-            for planned in requirement_names.changes() {
-                let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) =
-                    crate::engine::vet_table_expressions(
-                        &mut conn,
-                        &site_admission,
-                        pbps_pg::pins::Within::OwnTransaction,
-                        pbps_pg::table_expressions::Moment::Early,
-                        &planned.change,
-                    )
-                    .await
-                else {
-                    continue;
-                };
-                for note in notes {
-                    if !json {
-                        eprintln!("warning: {note}");
-                    }
-                    findings.push(crate::output::Finding::warning(
-                        "plan.table-expression-unbound",
-                        &note,
-                    ));
+        crate::engine::table_expression_notes(
+            &mut conn,
+            &site_admission,
+            requirement_names.changes(),
+            |note| {
+                if !json {
+                    eprintln!("warning: {note}");
                 }
-            }
-        }
+                findings.push(crate::output::Finding::warning(
+                    "plan.table-expression-unbound",
+                    &note,
+                ));
+            },
+        )
+        .await;
         // Rows that hold a label an enum rebuild removes, or that a domain's
         // narrower base cannot hold, are counted now, by the same probes the
         // apply runs, so the plan is refused by name and with a count before
         // anything is written (DEC-1635.7, DEC-1635.9).
-        if conn.driver() == pbps_db::Driver::Postgres
-            && cs.changes().changes.iter().any(|p| {
-                matches!(&p.change, pbps_model::Change::EnumRebuild {
-                    step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
-                } if match values.as_ref() {
-                    pbps_model::ValueChange::Cast { from, to, .. } => from != to,
-                    pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
-                })
-            })
-        {
+        if crate::engine::counts_rows_an_enum_retype_strands(conn.driver(), cs.changes()) {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
             let result = run_probes_observed(
                 &mut conn,
@@ -1497,7 +1446,7 @@ pub(super) async fn plan_db_selected(
         .await?;
         let mut domain_vet_unavailable = false;
         let mut domain_code = None;
-        if conn.driver() == pbps_db::Driver::Postgres
+        if crate::engine::vets_declared_domain_code(conn.driver())
             && crate::resolution::domain::needed(cs.changes())
             && let Some(entry) = scratch.as_mut()
         {

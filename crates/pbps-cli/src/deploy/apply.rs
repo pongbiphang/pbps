@@ -760,18 +760,7 @@ pub(super) async fn recheck_enum_rebuilds(
     stored: &IdsFile,
     resuming: bool,
 ) -> anyhow::Result<()> {
-    if conn.driver() != pbps_db::Driver::Postgres
-        || !changes
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
-    {
-        return Ok(());
-    }
-    pbps_pg::type_rebuild::census(conn, changes, None, stored, resuming)
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    crate::engine::recheck_enum_rebuild_census(conn, changes, stored, resuming).await
 }
 
 /// The tightened domains again, where the plan runs: a column of an array or
