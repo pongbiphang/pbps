@@ -594,6 +594,43 @@ fn a_new_column_in_the_middle_changes_only_its_own_file() {
 }
 
 #[test]
+fn plan_check_names_an_identity_file_that_differs_from_its_declaration_only_in_case() {
+    let p = migrated();
+    // What a checkout looks like after a case-only rename made on a filesystem
+    // that ignores case, with only the declaration's rename recorded.
+    std::fs::rename(
+        p.0.join("schema/dbo/customer.yml"),
+        p.0.join("schema/dbo/Customer.yml"),
+    )
+    .unwrap();
+    if p.0.join("schema/dbo/customer.yml").exists() {
+        // This directory ignores case: the two spellings are one file, and
+        // `pbps plan` mends it here, so there is nothing more to say.
+        return;
+    }
+    let check = p.pbps(&["plan", "--check"]);
+    assert_refused(&check, "out of date");
+    assert_refused(
+        &check,
+        "`dbo/customer.json` and `dbo/Customer.json` differ only in case",
+    );
+    assert_refused(&check, "git rm -r -q --cached");
+    // Negative: any other move is told as before, with no word about case.
+    std::fs::rename(
+        p.0.join("schema/dbo/Customer.yml"),
+        p.0.join("schema/dbo/client.yml"),
+    )
+    .unwrap();
+    let check = p.pbps(&["plan", "--check"]);
+    assert_refused(&check, "out of date");
+    assert!(
+        !text(&check).contains("differ only in case"),
+        "{}",
+        text(&check)
+    );
+}
+
+#[test]
 fn moving_a_declaration_file_moves_its_identity_file_and_plan_check_sees_it_first() {
     let p = migrated();
     let before = tree_of(&p);

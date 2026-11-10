@@ -1074,10 +1074,10 @@ fn ordinary_moves_keep_the_plain_temp_and_aside_names() {
     let mut reserved = BTreeSet::new();
     let path = Path::new("/ids/a.json");
     let key = PathKey::default();
-    let first = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved, key);
+    let first = crate::ids_cmd::unused_sibling(path, "tmp", "", &mut reserved, key);
     assert_eq!(first, Path::new("/ids/.a.json.tmp"));
     // The same name twice in one write gets the next one.
-    let second = crate::ids_cmd::unused_sibling(path, "tmp", &mut reserved, key);
+    let second = crate::ids_cmd::unused_sibling(path, "tmp", "", &mut reserved, key);
     assert_eq!(second, Path::new("/ids/.a.json.tmp1"));
 }
 
@@ -1104,15 +1104,18 @@ fn a_dropped_object_and_a_new_one_that_differ_only_in_case_do_not_share_a_file_w
     let project = written("fold-dropped", &customer(), &before);
     let after = dropped_customer_replaced();
     let paths = declared(&[("dbo.other", "customer.yml", &["id"])]);
-    // Case folds: the new object takes `customer.json`, the old file's path, so
-    // the dropped one goes aside instead of being overwritten.
+    // Case folds: the new object takes the old file itself, so the dropped one
+    // goes aside instead of being overwritten. The file is written where the
+    // disk has it and then given the spelling its declaration asks for.
     let write = plan_keyed(&project, &after, &paths, PathKey::folding()).unwrap();
     assert_eq!(
         write.files.keys().collect::<Vec<_>>(),
-        ["customer.json", "dbo.customer.t_aaaaaa.json"]
+        ["Customer.json", "dbo.customer.t_aaaaaa.json"]
     );
+    assert!(write.files["Customer.json"].contains("dbo.other"));
     assert!(write.files["dbo.customer.t_aaaaaa.json"].contains("\"dropped\""));
-    assert_eq!(write.removals, ["Customer.json"]);
+    assert!(write.removals.is_empty(), "{:?}", write.removals);
+    assert_eq!(write.respell, ["customer.json"]);
     // Case is significant: two files, no aside, nothing renamed.
     let write = plan_keyed(&project, &after, &paths, PathKey::default()).unwrap();
     // (`Customer.json` is rewritten in place, as dropped; nothing is set aside.)
@@ -1168,26 +1171,320 @@ fn a_file_and_a_directory_differing_only_in_case_are_refused_when_case_folds() {
     plan_keyed(&project, &two_tables(), &paths, PathKey::default()).unwrap();
 }
 
+// A folding key on a filesystem that does not fold: the plan is the one a
+// folding filesystem gets, and the two-step rename is an ordinary rename here,
+// so these run everywhere. What a folding filesystem itself does with them is
+// `a_case_only_rename_loses_nothing_on_a_case_insensitive_filesystem`.
+
 #[test]
-fn a_case_only_rename_is_planned_as_one_file_and_proved_when_case_folds() {
+fn a_case_only_rename_is_a_respelling_that_writes_and_removes_no_file_when_case_folds() {
     let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
     let project = written("fold-rename", &customer(), &before);
     let after = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
-    let write = plan_keyed(&project, &customer(), &after, PathKey::folding()).unwrap();
-    assert_eq!(write.files.keys().collect::<Vec<_>>(), ["customer.json"]);
-    assert_eq!(write.removals, ["Customer.json"]);
-    // The removal names a file the write placed: with the key it is skipped,
-    // with case significant it is the old file and goes.
     let dir = project.ids_dir();
-    write.apply().unwrap();
-    assert!(
-        dir.join("Customer.json").exists(),
-        "skipped as the placed file"
-    );
-    std::fs::remove_file(dir.join("customer.json")).unwrap();
-    let write = plan_keyed(&project, &customer(), &after, PathKey::default()).unwrap();
+    let write = plan_keyed(&project, &customer(), &after, PathKey::folding()).unwrap();
+    // One file under another spelling: nothing to write, nothing to remove.
+    assert!(write.files.is_empty() && write.removals.is_empty());
+    assert_eq!(write.respell, ["customer.json"]);
+    assert!(!write.is_empty(), "the spelling alone is a difference");
     write.apply().unwrap();
     assert_eq!(names_in(&dir), ["customer.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    // Negative: done once, it is not asked for again.
+    assert!(
+        plan_keyed(&project, &customer(), &after, PathKey::folding())
+            .unwrap()
+            .is_empty()
+    );
+    // Negative: where case is significant it is another path, so the file
+    // moves and no spelling is involved.
+    let project = written("fold-rename-plain", &customer(), &before);
+    let write = plan_keyed(&project, &customer(), &after, PathKey::default()).unwrap();
+    assert_eq!(write.files.keys().collect::<Vec<_>>(), ["customer.json"]);
+    assert_eq!(write.removals, ["Customer.json"]);
+    assert!(write.respell.is_empty());
+}
+
+#[test]
+fn a_file_that_changes_under_another_spelling_is_written_once_and_respelled() {
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id"])]);
+    let project = written("fold-rename-edit", &customer(), &before);
+    // The declaration is renamed and its columns reordered in one edit.
+    let after = declared(&[("dbo.customer", "customer.yml", &["name", "id"])]);
+    let write = plan_keyed(&project, &customer(), &after, PathKey::folding()).unwrap();
+    // Written under the spelling the disk has: the same write whether or not
+    // the directory this test runs in folds case.
+    assert_eq!(write.files.keys().collect::<Vec<_>>(), ["Customer.json"]);
+    assert!(write.removals.is_empty(), "the file written is the old one");
+    assert_eq!(write.respell, ["customer.json"]);
+    write.apply().unwrap();
+    assert_eq!(names_in(&project.ids_dir()), ["customer.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(
+        plan_keyed(&project, &customer(), &after, PathKey::folding())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_respelled_directory_comes_before_what_it_holds() {
+    let before = declared(&[("dbo.customer", "Sales/Customer.yml", &["id", "name"])]);
+    let project = written("fold-rename-dir", &customer(), &before);
+    let after = declared(&[("dbo.customer", "sales/customer.yml", &["id", "name"])]);
+    let dir = project.ids_dir();
+    let write = plan_keyed(&project, &customer(), &after, PathKey::folding()).unwrap();
+    assert!(write.files.is_empty() && write.removals.is_empty());
+    assert_eq!(write.respell, ["sales", "sales/customer.json"]);
+    write.apply().unwrap();
+    assert_eq!(names_in(&dir), ["sales"]);
+    assert_eq!(names_in(&dir.join("sales")), ["customer.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(
+        plan_keyed(&project, &customer(), &after, PathKey::folding())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_spelling_the_disk_has_stays_while_any_declaration_asks_for_it() {
+    // Two declarations spell one directory two ways (they were loaded from a
+    // filesystem that tells them apart). Either spelling would do; the one on
+    // disk stays, or every plan would ask for the other.
+    let before = declared(&[
+        ("dbo.customer", "Sales/a.yml", &["id", "name"]),
+        ("dbo.other", "Sales/b.yml", &[]),
+    ]);
+    let project = written("fold-two-spellings", &two_tables(), &before);
+    let after = declared(&[
+        ("dbo.customer", "Sales/a.yml", &["id", "name"]),
+        ("dbo.other", "sales/b.yml", &[]),
+    ]);
+    let write = plan_keyed(&project, &two_tables(), &after, PathKey::folding()).unwrap();
+    assert!(write.is_empty(), "{:?}", write.respell);
+    // Negative: when no declaration asks for it any more, it goes.
+    let after = declared(&[
+        ("dbo.customer", "sales/a.yml", &["id", "name"]),
+        ("dbo.other", "sales/b.yml", &[]),
+    ]);
+    let write = plan_keyed(&project, &two_tables(), &after, PathKey::folding()).unwrap();
+    assert_eq!(write.respell, ["sales"]);
+}
+
+#[test]
+fn a_dropped_objects_file_asks_for_no_spelling_and_follows_its_directory() {
+    // `dbo.customer` is dropped and keeps `Sales/customer.json`; the live
+    // `dbo.other` beside it is now declared under `sales/`.
+    let before = declared(&[
+        ("dbo.customer", "Sales/customer.yml", &["id", "name"]),
+        ("dbo.other", "Sales/other.yml", &[]),
+    ]);
+    let project = written("fold-dropped-dir", &two_tables(), &before);
+    let after_ids = ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other"},
+        "tombstones": {
+            T: {"was": "dbo.customer", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa1": {"was": "dbo.customer.id", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+            "c_aaaaa2": {"was": "dbo.customer.name", "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }));
+    let paths = declared(&[("dbo.other", "sales/other.yml", &[])]);
+    let dir = project.ids_dir();
+    let write = plan_keyed(&project, &after_ids, &paths, PathKey::folding()).unwrap();
+    assert!(write.removals.is_empty(), "{:?}", write.removals);
+    assert_eq!(write.respell, ["sales"]);
+    write.apply().unwrap();
+    assert_eq!(names_in(&dir), ["sales"]);
+    assert_eq!(
+        names_in(&dir.join("sales")),
+        ["customer.json", "other.json"]
+    );
+    assert_eq!(read_opt(&project).unwrap(), Some(after_ids.clone()));
+    assert!(
+        plan_keyed(&project, &after_ids, &paths, PathKey::folding())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_respelling_never_takes_the_place_of_another_entry() {
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("fold-rename-twins", &customer(), &before);
+    let dir = project.ids_dir();
+    if PathKey::probe(&dir).unwrap() == PathKey::folding() {
+        return; // two spellings of one name cannot both be here
+    }
+    // The key says these are one name and this directory holds both: it does
+    // not fold them, and neither is the other's spelling.
+    std::fs::write(dir.join("customer.json"), "other").unwrap();
+    let respell = |rel: &str| TreeWrite {
+        dir: dir.clone(),
+        respell: vec![rel.to_owned()],
+        key: PathKey::folding(),
+        ..TreeWrite::default()
+    };
+    respell("customer.json").apply().unwrap();
+    assert_eq!(names_in(&dir), ["Customer.json", "customer.json"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("customer.json")).unwrap(),
+        "other"
+    );
+    // An entry that is not there (the write removed it) is nothing to rename.
+    respell("gone/customer.json").apply().unwrap();
+    respell("gone.json").apply().unwrap();
+    assert_eq!(names_in(&dir), ["Customer.json", "customer.json"]);
+}
+
+#[test]
+fn a_rename_through_a_free_name_refuses_a_name_that_is_taken_and_puts_the_entry_back() {
+    let dir = project("rename-through").ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Customer.json"), "mine").unwrap();
+    std::fs::write(dir.join("other.json"), "theirs").unwrap();
+    let via = dir.join(".Customer.json.respell.json");
+    // Where the wanted name is another entry (an alias the key does not
+    // model), a plain rename would replace it without a word.
+    let err =
+        rename_through(&dir.join("Customer.json"), &via, &dir.join("other.json")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("could not be renamed"),
+        "{err:#}"
+    );
+    assert_eq!(names_in(&dir), ["Customer.json", "other.json"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("other.json")).unwrap(),
+        "theirs"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("Customer.json")).unwrap(),
+        "mine"
+    );
+    // A free name is taken, and nothing is left in the middle.
+    rename_through(&dir.join("Customer.json"), &via, &dir.join("client.json")).unwrap();
+    assert_eq!(names_in(&dir), ["client.json", "other.json"]);
+}
+
+#[test]
+fn a_move_between_two_spellings_of_one_name_is_told_apart_from_any_other_move() {
+    let before = declared(&[("dbo.customer", "Sales/Customer.yml", &["id", "name"])]);
+    let moved = |name: &str, to: &str, key: PathKey| {
+        let project = written(name, &customer(), &before);
+        let after = declared(&[("dbo.customer", to, &["id", "name"])]);
+        let write = plan_keyed(&project, &customer(), &after, key).unwrap();
+        write
+            .case_only_move()
+            .map(|(old, new)| (old.to_owned(), new.to_owned()))
+    };
+    // Case is significant (a CI checkout): the tree has the old spelling, the
+    // declaration the new one, and the plan is a move between the two.
+    assert_eq!(
+        moved("case-move-file", "Sales/customer.yml", PathKey::default()),
+        Some((
+            "Sales/Customer.json".to_owned(),
+            "Sales/customer.json".to_owned()
+        ))
+    );
+    assert_eq!(
+        moved("case-move-dir", "sales/Customer.yml", PathKey::default()),
+        Some((
+            "Sales/Customer.json".to_owned(),
+            "sales/Customer.json".to_owned()
+        ))
+    );
+    // Negative: another name is an ordinary move.
+    assert_eq!(
+        moved("case-move-other", "Sales/client.yml", PathKey::default()),
+        None
+    );
+    // Negative: where case folds there is no move at all, only a spelling.
+    assert_eq!(
+        moved("case-move-fold", "Sales/customer.yml", PathKey::folding()),
+        None
+    );
+}
+
+#[test]
+fn a_respelling_interrupted_halfway_reads_back_and_the_next_plan_finishes_it() {
+    // The name in the middle of the two renames, as `respell_entries` picks it.
+    let middle = |path: &Path| {
+        crate::ids_cmd::unused_sibling(
+            path,
+            "respell",
+            ".json",
+            &mut BTreeSet::new(),
+            PathKey::folding(),
+        )
+    };
+    // A file.
+    let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
+    let project = written("fold-rename-crash", &customer(), &before);
+    let dir = project.ids_dir();
+    let via = middle(&dir.join("Customer.json"));
+    assert_eq!(via, dir.join(".Customer.json.respell.json"));
+    std::fs::rename(dir.join("Customer.json"), &via).unwrap();
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    let after = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
+    for key in [PathKey::folding(), PathKey::default()] {
+        let write = plan_keyed(&project, &customer(), &after, key).unwrap();
+        assert_eq!(write.files.keys().collect::<Vec<_>>(), ["customer.json"]);
+    }
+    plan_keyed(&project, &customer(), &after, PathKey::folding())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&dir), ["customer.json"]);
+    // A directory: what it holds is read where it is, and moves out of it.
+    let before = declared(&[("dbo.customer", "Sales/customer.yml", &["id", "name"])]);
+    let project = written("fold-rename-crash-dir", &customer(), &before);
+    let dir = project.ids_dir();
+    let via = middle(&dir.join("Sales"));
+    std::fs::rename(dir.join("Sales"), &via).unwrap();
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    let after = declared(&[("dbo.customer", "sales/customer.yml", &["id", "name"])]);
+    plan_keyed(&project, &customer(), &after, PathKey::folding())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&dir), ["sales"]);
+    assert_eq!(names_in(&dir.join("sales")), ["customer.json"]);
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+}
+
+#[test]
+fn an_aside_name_is_never_one_windows_keeps_for_a_device() {
+    let uid: Uid = T.parse().unwrap();
+    let aside = |was: &str| crate::ids_cmd::aside(was, &uid);
+    // Windows takes the part before the first dot, in any case.
+    for was in ["aux.gone", "CON.x", "nul", "Prn.a.b", "com1.x", "LPT9.x"] {
+        assert_eq!(aside(was), format!("_{was}.t_aaaaaa.json"));
+    }
+    // Negative: a longer or shorter name is nobody's device.
+    for was in [
+        "auxiliary.gone",
+        "dbo.aux",
+        "com.x",
+        "com10.x",
+        "lpt.x",
+        "console.x",
+    ] {
+        assert_eq!(aside(was), format!("{was}.t_aaaaaa.json"));
+    }
+}
+
+/// `PathKey::path` joins with the platform's separator and a relative path
+/// keeps its `/`; on Windows that is one path spelled two ways.
+#[cfg(windows)]
+#[test]
+fn a_path_key_spells_both_separators_one_way() {
+    let key = PathKey::default();
+    assert_eq!(
+        key.path(&Path::new("ids").join("a/b.json")),
+        key.path(&Path::new("ids").join("a").join("b.json"))
+    );
+    assert_eq!(key.path(Path::new(r"ids\a\b.json")), "ids/a/b.json");
 }
 
 #[test]
@@ -1213,6 +1510,7 @@ fn generated_names_avoid_a_planned_path_that_differs_only_in_case_when_case_fold
             let tmp = crate::ids_cmd::unused_sibling(
                 &Path::new("/ids").join(file),
                 "tmp",
+                "",
                 &mut reserved,
                 key,
             );

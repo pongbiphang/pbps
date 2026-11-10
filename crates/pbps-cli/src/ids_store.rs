@@ -199,7 +199,13 @@ impl PathKey {
     }
 
     pub(crate) fn path(self, path: &Path) -> String {
-        self.of(&path.to_string_lossy())
+        let text = path.to_string_lossy();
+        // Where `\` separates too, `join("a/b")` keeps its `/` and
+        // `parent().join(name)` adds a `\`: one path, two spellings. A key is
+        // only ever compared, never opened, so it is spelled one way.
+        #[cfg(windows)]
+        let text = text.replace('\\', "/");
+        self.of(&text)
     }
 
     /// What is left of `path` below `prefix`, comparing component by component
@@ -345,6 +351,11 @@ pub(crate) struct TreeWrite {
     removals: Vec<String>,
     /// `pbps.yml` with `ids_dir` named, when this write creates the tree.
     config: Option<(PathBuf, String)>,
+    /// Entries the disk has under another spelling of the name a declaration
+    /// asks for (`Customer.json` for `customer.json`), by the path wanted,
+    /// parents before what they hold. Always empty where case is significant:
+    /// there another spelling is another path, and the file moves.
+    respell: Vec<String>,
     /// Whether the filesystem holding the tree folds case, as the plan decided.
     key: PathKey,
 }
@@ -356,6 +367,7 @@ impl TreeWrite {
     fn reserved_names(&self) -> BTreeSet<String> {
         self.files
             .keys()
+            .chain(&self.respell)
             .flat_map(|rel| Path::new(rel).ancestors())
             .map(|a| self.key.path(&self.dir.join(a)))
             .collect()
@@ -364,7 +376,25 @@ impl TreeWrite {
     /// Nothing to write, move or remove: the tree is what the mapping and the
     /// declarations say it should be.
     pub(crate) fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.removals.is_empty() && self.config.is_none()
+        self.files.is_empty()
+            && self.removals.is_empty()
+            && self.respell.is_empty()
+            && self.config.is_none()
+    }
+
+    /// A file this write removes and the one it writes in its place, when the
+    /// two paths differ only in case. Where case is significant that is an
+    /// ordinary move, and it is also what a checkout shows when the rename was
+    /// made on a filesystem that ignores case and git did not record it:
+    /// running `pbps plan` there again changes nothing, so `--check` says more.
+    pub(crate) fn case_only_move(&self) -> Option<(&str, &str)> {
+        self.removals.iter().find_map(|old| {
+            let new = self
+                .files
+                .keys()
+                .find(|new| new.to_lowercase() == old.to_lowercase())?;
+            Some((old.as_str(), new.as_str()))
+        })
     }
 
     /// Writes every file next to its final name first, and only then renames
@@ -420,7 +450,7 @@ impl TreeWrite {
                 created.extend(missing);
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create `{}`", parent.display()))?;
-                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", &mut reserved, key);
+                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", "", &mut reserved, key);
                 // Recorded before the write: `write` can create the file and
                 // then fail (no space, an I/O error), and the rollback must
                 // find what the call may have left.
@@ -466,19 +496,16 @@ impl TreeWrite {
             }
         }
         let placed: Vec<&PathBuf> = staged.iter().map(|(_, path)| path).collect();
-        let placed_keys: BTreeSet<String> = placed.iter().map(|p| key.path(p)).collect();
         for rel in &self.removals {
             // What was set aside is removed where it went. The aside was made
             // under the spelling of the new path, the removal carries the old
             // one: they are compared by key.
             let path = redirected(&self.dir.join(rel), &asides, key);
             // A path that is the very file this write just placed is not an old
-            // copy: on a case-insensitive filesystem `Customer.json` and
-            // `customer.json` are one file, and the rename above already
-            // replaced it. Asked of the filesystem, not of a case-folding rule.
-            if placed_keys.contains(&key.path(&path))
-                || placed.iter().any(|new| same_file(&path, new))
-            {
+            // copy. The plan never removes a path with the key of one it
+            // places; this asks the filesystem about the aliases the key does
+            // not model (another case table, Unicode normalisation).
+            if placed.iter().any(|new| same_file(&path, new)) {
                 continue;
             }
             std::fs::remove_file(&path)
@@ -512,8 +539,123 @@ impl TreeWrite {
         if let Some((path, text)) = &self.config {
             write_atomic(path, text)?;
         }
+        // Last, after the config too: nothing waits on a spelling, so a
+        // failure here leaves a write that is whole.
+        self.respell_entries(&mut reserved)
+    }
+
+    /// Gives every entry in `respell` the spelling the plan wants.
+    ///
+    /// It runs after the write itself, so a failure here leaves a tree that
+    /// holds everything and only spells an entry the old way: the next plan is
+    /// this step alone.
+    ///
+    /// Where names fold, a rename onto another spelling of the same name is
+    /// not something every filesystem performs (measured on Linux casefold: it
+    /// reports success and changes nothing), and a replacing rename keeps the
+    /// name that was there. A rename through a free name works wherever a
+    /// rename does, so that is the one way taken. The name in the middle ends
+    /// in `.json`, which the reader takes for a file and for a directory
+    /// alike: a crash between the two renames leaves a tree that reads back to
+    /// the same mapping, and the next plan moves each declared file from there
+    /// to its place.
+    fn respell_entries(&self, reserved: &mut BTreeSet<String>) -> anyhow::Result<()> {
+        let key = self.key;
+        let mut respelled = false;
+        for rel in &self.respell {
+            let wanted = self.dir.join(rel);
+            let (Some(parent), Some(name)) =
+                (wanted.parent(), wanted.file_name().and_then(|n| n.to_str()))
+            else {
+                continue;
+            };
+            // Asked of the directory, not assumed: the write above may have
+            // made the entry anew under the wanted spelling (a file that became
+            // a directory), or taken it away.
+            let entries = match std::fs::read_dir(parent) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot list `{}`", parent.display()));
+                }
+            };
+            let mut twins = Vec::new();
+            for entry in entries {
+                let found = entry
+                    .with_context(|| format!("cannot list `{}`", parent.display()))?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                if key.of(&found) == key.of(name) {
+                    twins.push(found);
+                }
+            }
+            // Two entries the key calls one name: this directory does not fold
+            // them, whatever the key says, and neither is the other's spelling.
+            let [found] = twins.as_slice() else {
+                continue;
+            };
+            if found == name {
+                continue;
+            }
+            let from = parent.join(found);
+            let via = crate::ids_cmd::unused_sibling(&from, "respell", ".json", reserved, key);
+            rename_through(&from, &via, &wanted)?;
+            eprintln!(
+                "note: `{}` is now spelled `{}`, as its declaration is",
+                from.display(),
+                wanted.display()
+            );
+            respelled = true;
+        }
+        if respelled {
+            // Measured (git 2.53, `core.ignorecase` as `git init` sets it where
+            // names fold): `git status` and `git add -A` see no change, and
+            // `git mv` refuses a directory. Without this a checkout elsewhere
+            // keeps the old spelling and `plan --check` there stays stale.
+            eprintln!(
+                "note: git may not record a change of case made on this filesystem; if `git \
+                 status` does not show it, run `git rm -r -q --cached \"{dir}\"` and then `git \
+                 add \"{dir}\"`",
+                dir = self.dir.display()
+            );
+        }
         Ok(())
     }
+}
+
+/// Renames `from` to `wanted`, another spelling of its name, by way of `via`,
+/// a free name beside it, and never onto an entry that is already there.
+fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> {
+    let cannot = || {
+        format!(
+            "the identity files are written, but `{}` could not be renamed to `{}`",
+            from.display(),
+            wanted.display()
+        )
+    };
+    std::fs::rename(from, via).with_context(cannot)?;
+    // Free now, where names fold. Anything still there is another entry, and
+    // a rename onto it would replace it.
+    let placed = match std::fs::symlink_metadata(wanted) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(via, wanted),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "another entry has that name",
+        )),
+        Err(e) => Err(e),
+    };
+    placed.map_err(|e| {
+        let e = anyhow::Error::new(e).context(cannot());
+        match std::fs::rename(via, from) {
+            Ok(()) => e,
+            Err(left) => e.context(format!(
+                "`{}` is still at `{}` ({left}); rename it back",
+                from.display(),
+                via.display()
+            )),
+        }
+    })
 }
 
 /// Removes the directories `path` sat in, from the nearest up, while they are
@@ -670,7 +812,7 @@ fn set_aside(
     reserved: &mut BTreeSet<String>,
     key: PathKey,
 ) -> anyhow::Result<()> {
-    let aside = crate::ids_cmd::unused_sibling(path, "aside", reserved, key);
+    let aside = crate::ids_cmd::unused_sibling(path, "aside", "", reserved, key);
     std::fs::rename(path, &aside).with_context(|| {
         format!(
             "cannot move `{}` aside to make room for the identity file that takes its place",
@@ -875,6 +1017,13 @@ pub(crate) fn plan_keyed(
         spare.insert(victim.clone(), n);
         want.insert(victim, path);
     }
+    // The spellings a declaration asks for. A file nobody declares (a dropped
+    // object's, a live one's with no declaration) keeps the spelling it has.
+    let asked: Vec<String> = want
+        .iter()
+        .filter(|(uid, path)| !dead(uid) && wanted.paths.get(*uid) == Some(*path))
+        .map(|(_, path)| path.clone())
+        .collect();
     let mut placement = Placement {
         paths: want,
         children,
@@ -947,20 +1096,32 @@ pub(crate) fn plan_keyed(
             anyhow::Error::new(e).context("cannot place the identities in files")
         }
     })?;
+    // Which file is which is the filesystem's to say: a path the disk has
+    // under another spelling of the same name is that file. It is not written
+    // again beside itself and not removed as an old copy; what is left to do
+    // for it is its spelling.
+    let on_disk: BTreeMap<String, &String> =
+        tree.iter().map(|(rel, text)| (key.of(rel), text)).collect();
+    let kept: BTreeSet<String> = new.keys().map(|rel| key.of(rel)).collect();
     let removals: Vec<String> = tree
         .keys()
-        .filter(|rel| !new.contains_key(*rel))
+        .filter(|rel| !kept.contains(&key.of(rel)))
         .cloned()
         .collect();
+    let names = disk_names(&tree, key);
+    let respell = respellings(&names, &asked, key);
+    // A file is written under the spelling the disk has for it, and for the
+    // directories it is in. Where names fold that is where the write lands
+    // anyway; said here, the plan is the same write on every filesystem, and
+    // the spelling is left to the one step that changes it.
     let files: BTreeMap<String, String> = new
         .into_iter()
-        .filter(|(rel, text)| tree.get(rel) != Some(text))
+        .filter(|(rel, text)| on_disk.get(&key.of(rel)) != Some(&text))
+        .map(|(rel, text)| (as_on_disk(&rel, &names, key), text))
         .collect();
     // The proof: what is on disk after the write reads back to what was asked
-    // for. A tree that does not is never written.
-    // What the disk holds afterwards, by key: a placed file replaces the file
-    // it is the same as, and a removal of a file the write placed is skipped.
-    let placed: BTreeSet<String> = files.keys().map(|rel| key.of(rel)).collect();
+    // for. A tree that does not is never written. A spelling changes no file,
+    // so the proof does not depend on it.
     let mut merged: BTreeMap<String, (String, String)> = tree
         .iter()
         .map(|(rel, text)| (key.of(rel), (rel.clone(), text.clone())))
@@ -969,9 +1130,7 @@ pub(crate) fn plan_keyed(
         merged.insert(key.of(rel), (rel.clone(), text.clone()));
     }
     for rel in &removals {
-        if !placed.contains(&key.of(rel)) {
-            merged.remove(&key.of(rel));
-        }
+        merged.remove(&key.of(rel));
     }
     let merged: BTreeMap<String, String> = merged.into_values().collect();
     let back = ids_tree::assemble(&merged).context("the new tree does not read back")?;
@@ -989,9 +1148,71 @@ pub(crate) fn plan_keyed(
         dir: project.ids_dir(),
         files,
         removals,
+        respell,
         config,
         key,
     })
+}
+
+/// The entries the disk spells otherwise than a declaration asks, where the
+/// filesystem takes both spellings for one name: by the path wanted, parents
+/// before what they hold.
+///
+/// Where case is significant a path is its own key, so this is empty. Two
+/// declarations can spell one directory two ways (`Sales/a.yml` beside
+/// `sales/b.yml`, loaded from a filesystem that tells them apart); the spelling
+/// on disk stays when either asks for it, so the answer cannot change from one
+/// plan to the next.
+fn respellings(names: &BTreeMap<String, String>, asked: &[String], key: PathKey) -> Vec<String> {
+    let mut spelled: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for step in asked.iter().flat_map(|rel| steps(rel)) {
+        spelled.entry(key.of(step)).or_default().push(step);
+    }
+    spelled
+        .into_iter()
+        .filter_map(|(folded, asked)| {
+            let have = names.get(&folded)?;
+            // The smallest, not the first: which declaration comes first is
+            // no reason to prefer its spelling.
+            let pick = asked.iter().min()?;
+            (!asked.iter().any(|path| last_name(path) == have)).then(|| (*pick).to_owned())
+        })
+        .collect()
+}
+
+/// A path and every directory above it, outermost first.
+fn steps(rel: &str) -> impl Iterator<Item = &str> {
+    rel.match_indices('/')
+        .map(|(at, _)| &rel[..at])
+        .chain([rel])
+}
+
+fn last_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// What the disk calls every entry of the tree, file or directory, by the key
+/// of its path.
+fn disk_names(tree: &BTreeMap<String, String>, key: PathKey) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    for step in tree.keys().flat_map(|rel| steps(rel)) {
+        names
+            .entry(key.of(step))
+            .or_insert_with(|| last_name(step).to_owned());
+    }
+    names
+}
+
+/// `rel` as the disk spells it, as far down as the disk has it.
+fn as_on_disk(rel: &str, names: &BTreeMap<String, String>, key: PathKey) -> String {
+    steps(rel)
+        .map(|step| {
+            names
+                .get(&key.of(step))
+                .map_or(last_name(step), String::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The file a dropped object gets when no declaration names its place.
@@ -1033,13 +1254,16 @@ fn first_conflict(want: &BTreeMap<Uid, String>, key: PathKey) -> Option<(Uid, Ui
 /// `loaded` say it should be: a file to write, move or remove (design §3.5).
 /// This is `plan --check`'s "stale", and it also sees a declaration that moved
 /// or bytes that are not canonical when the mapping itself is unchanged.
-pub(crate) fn is_stale(
+///
+/// The write it would take is returned, for what `--check` can say about it.
+pub(crate) fn stale(
     project: &Project,
     after: &IdsFile,
     loaded: &pbps_load::Loaded,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<TreeWrite>> {
     let paths = loaded.declared_paths(&project.schema_dir())?;
-    Ok(!plan(project, after, &paths)?.is_empty())
+    let write = plan(project, after, &paths)?;
+    Ok((!write.is_empty()).then_some(write))
 }
 
 /// The live columns of the table that owns `file`, in YAML order when its

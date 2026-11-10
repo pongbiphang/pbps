@@ -1528,3 +1528,54 @@ but also a declaration that moved, or bytes that are not canonical, when the
 mapping is unchanged. A plan that cannot be made is stale too, and `plan`
 reports why. `validate` keeps the tree validator's findings (including
 `ids.orphan`); `plan --check` does not repeat them.
+
+<a id="dec-2600-10"></a>
+
+**DEC-2600.10. Where names fold, a file is written under the spelling the disk has, and a change of spelling is one last step: a rename through a free name. Git is the user's to tell, and pbps says how.**
+A declaration renamed only in case (`customer.yml` to `Customer.yml`) asks its
+identity file to follow. On a filesystem that ignores case the two names are one
+file, and the ordinary write (new file into place, old one removed) cannot make
+the change. Measured on a Linux casefold tmpfs: a rename onto another spelling
+of the same name reports success and changes nothing, for a file and for a
+directory; a replacing rename keeps the name that was there; `mkdir -p` of
+another spelling is a no-op. Only a rename through a third name changes the
+spelling. NTFS and APFS were not measured here; a rename through a free name
+works wherever a rename does, so it is the one way taken on every filesystem.
+
+- **The plan.** `PathKey` says which paths are one file. A file whose text
+  changes is written under the spelling the disk has for it and for the
+  directories it is in, so the plan is the same write on every filesystem and
+  the spelling is left to one step. `respell` lists the wanted paths, parents
+  first. A spelling on disk that any declaration asks for stays (two
+  declarations can spell one directory two ways where case is significant);
+  otherwise the smallest asked spelling is taken, so the answer does not depend
+  on which declaration is read first.
+- **The write.** Spellings change last, after `pbps.yml`: nothing waits on a
+  spelling, so a failure there leaves a write that is whole and the next plan is
+  that step alone. The name in the middle ends in `.json`, which the reader
+  takes for a file and for a directory alike, so a crash between the two renames
+  leaves a tree that reads back to the same mapping. The second rename never
+  lands on an entry that is already there; the entry is put back and the write
+  says which rename it could not make.
+- **Git.** Measured with git 2.53 and `core.ignorecase` as `git init` sets it
+  where names fold: `git status` and `git add -A` see no change after a
+  case-only rename, and `git mv` refuses a directory. `git rm -r -q --cached
+  <dir>` followed by `git add <dir>` records every rename. A respelling prints
+  that remedy. `plan --check` on a checkout where case is significant names a
+  pair that differs only in case and prints the same remedy, because `pbps plan`
+  where the rename was made finds nothing left to do.
+- **Windows names.** A path's key reads `\` as `/` on Windows, and an aside
+  name that Windows keeps for a device (`aux.<uid>.json`) gets a leading `_`.
+
+Two other designs were weighed. Comparing paths without regard to case on every
+platform needs no rename, but it gives up "an identity file's path is its
+declaration's path", and it would refuse two declarations that differ only in
+case where the filesystem holds both. Refusing a change of case and asking for
+the rename to be undone is enough for a rename made by hand, since a file's name
+carries no meaning (SPEC §4.2); but `pull` names each file after its object, so
+a table renamed only in case in the database changes the file's name with
+nobody to undo it, and a refusal there has no remedy on that machine. The
+maintainer chose the respelling.
+
+Not covered: two names that differ only in Unicode normalisation, which the key
+does not model, and macOS, which CI does not run.

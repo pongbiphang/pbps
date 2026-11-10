@@ -113,9 +113,11 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
 /// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
 /// `reserved`, the planned destinations and their ancestors, which a later step
 /// of the same write may still create. The pick is added to `reserved`.
+/// `tail` ends the name, for one the reader must still take (`.json`).
 pub(crate) fn unused_sibling(
     path: &Path,
     kind: &str,
+    tail: &str,
     reserved: &mut BTreeSet<String>,
     key: crate::ids_store::PathKey,
 ) -> PathBuf {
@@ -124,7 +126,7 @@ pub(crate) fn unused_sibling(
     let mut n = 0;
     loop {
         let suffix = if n == 0 { String::new() } else { n.to_string() };
-        let candidate = parent.join(format!(".{name}.{kind}{suffix}"));
+        let candidate = parent.join(format!(".{name}.{kind}{suffix}{tail}"));
         if !reserved.contains(&key.path(&candidate))
             && std::fs::symlink_metadata(&candidate).is_err()
         {
@@ -140,7 +142,7 @@ pub(crate) fn unused_sibling(
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let tmp = unused_sibling(path, "tmp", &mut BTreeSet::new(), Default::default());
+    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default());
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
     let result = std::fs::write(&tmp, text)
@@ -258,7 +260,22 @@ pub(crate) fn aside(was: &str, uid: &Uid) -> String {
             }
         })
         .collect();
-    format!("{safe}.{uid}.json")
+    // Windows keeps these names for devices whatever follows the first dot, so
+    // `aux.r_1.json` cannot be created there. A declaration cannot be called
+    // that on Windows either, and its file mirrors it; this name is ours.
+    let stem = safe.split('.').next().unwrap_or_default();
+    let numbered = |port: &str| {
+        stem.len() == 4
+            && stem[..3].eq_ignore_ascii_case(port)
+            && stem.as_bytes()[3].is_ascii_digit()
+    };
+    let device = ["con", "prn", "aux", "nul"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+        || numbered("com")
+        || numbered("lpt");
+    let guard = if device { "_" } else { "" };
+    format!("{guard}{safe}.{uid}.json")
 }
 
 /// Where the declarations say each identity lives: the mirrored path of the

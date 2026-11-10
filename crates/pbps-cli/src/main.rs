@@ -5211,14 +5211,24 @@ fn cmd_plan(
             json,
             "identity.unwritable",
             project.ids_dir(),
-            ids_store::is_stale(project, &res.ids, &loaded),
+            ids_store::stale(project, &res.ids, &loaded),
         )?;
-        let stale = res.ids != ids || tree_stale;
+        let stale = res.ids != ids || tree_stale.is_some();
         if stale && check {
-            let message = format!(
+            let mut message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
                 project.ids_dir().display()
             );
+            // The one stale tree `pbps plan` does not mend where the rename was
+            // made: there the files are already right and only git is behind.
+            if let Some((old, new)) = tree_stale.as_ref().and_then(|w| w.case_only_move()) {
+                message.push_str(&format!(
+                    ". `{old}` and `{new}` differ only in case: if the rename was made on a \
+                     filesystem that ignores case, git did not record it; there, run `git rm -r \
+                     -q --cached \"{dir}\"` and then `git add \"{dir}\"`",
+                    dir = project.ids_dir().display()
+                ));
+            }
             if json {
                 let report = output::Report::new(
                     "plan",
