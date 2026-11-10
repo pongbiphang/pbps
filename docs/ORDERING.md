@@ -903,6 +903,12 @@ decision or the issue named in its row.
   take the new kind out of the ones where it differs (DEC-2447.5). A
   `matches!` or `if let` does not use the macro, so a new kind never joins it
   unseen.
+- Every `Change` variant belongs to one family (`change_family!`,
+  `ChangeFamily`, DEC-2790.1), and `Change::family` does not compile until a
+  new variant is listed in one. A match arm that names a family is joined by
+  the new kind without a compile error, as with `catalog_change!()`: read each
+  `change_family!(<its family>)` site and name the members there where the new
+  kind differs.
 - A kind that waits for another kind of its own class (a package for the
   packages it requires, DEC-2447.6) needs two things: the effect edge, and a
   rank in the differ's draft so that the draft does not contradict the effects.

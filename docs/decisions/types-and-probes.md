@@ -5867,3 +5867,38 @@ security and tightening a domain wait for the writer, but `ALTER DOMAIN ... SET
 DEFAULT`, `ALTER DOMAIN ... DROP CONSTRAINT` and a routine's body do not. The
 domain's default is re-read immediately before each row statement (`check`), and
 a routine's change is the pins check's, as for every other site.
+
+<a id="dec-2790-1"></a>
+
+**DEC-2790.1. Kinds of change are grouped into families, and an arm may name a
+family (#2790).** `Change` is matched without a wildcard everywhere, so that a
+new kind does not compile until each consumer has decided about it
+(ORDERING, "Keeping this current"). Measured on `c905a3450`, that rule cost
+155 runs of payload-free arms outside `change.rs`, 1,856 lines, 33 of them
+listing twenty or more kinds; and the kind #2774 added was named 79 times in
+35 production files, 57 of them an arm saying it does not apply. The same sets
+were listed together again and again: about seven edits in ten for a new kind
+restated a decision already made for kinds like it.
+
+`change_family!(<family>)` expands to the variant patterns of one of fourteen
+families (tables, table properties, partitions, columns, constraints, indexes,
+policies, rows, modules, permissions, type values, roles, types, extensions),
+`ChangeFamily` names them, and `Change::family` is the total match built from
+the macro. `catalog_change!` (DEC-2447.5) is now the last three families, so a
+kind is listed once. A macro and not a method for DEC-2447.5's reason: a guard
+does not count towards exhaustiveness, and only patterns keep a consumer's
+match exhaustive.
+
+Rejected: a wildcard arm, which lets a new kind read as "not applicable" at
+every consumer; and a static record per kind (risk class, sort class, label),
+because those depend on the payload (`intrinsic_risks_with`, the ordering
+annotations), so the record would be wrong or grow a callback per property and
+trade the compile error for a default.
+
+What it gives up, deliberately: "read every site when adding a kind" becomes
+"read every site of its family". A kind that joins a family joins each arm
+naming the family with no compile error. The macro's doc says to name the
+members wherever one differs, and not to use it in `matches!` or `if let`.
+This entry adds the vocabulary and converts `Change::catalog_object` only;
+consumers move to it, to a projection in `change.rs`, or to the effects table
+case by case, each shown equal to the listing it replaces.

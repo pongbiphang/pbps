@@ -1557,6 +1557,179 @@ pub enum CatalogObject {
     Extension,
 }
 
+/// The `Change` patterns of one family of kinds, for a match arm that treats
+/// the whole family alike: `change_family!(rows) => None`.
+///
+/// A family is a set of kinds that most consumers decide about together
+/// (DEC-2790.1). [`ChangeFamily`] names them and [`Change::family`] is built
+/// from this macro, so the two cannot disagree, and that match is total: a new
+/// kind does not compile until it is put in a family.
+///
+/// A macro and not a method for the reason [`catalog_change!`] gives: a match
+/// guard does not count towards exhaustiveness, so only variant patterns keep
+/// a consumer's match exhaustive. The cost is the same too. A kind added to a
+/// family joins every arm that names the family without a compile error, so
+/// when adding one, read every `change_family!(<its family>)` site and name
+/// the members there where the new kind differs. Name the members, too,
+/// wherever one of them already differs. Do not use it in `matches!` or
+/// `if let`, which are not exhaustive.
+#[macro_export]
+macro_rules! change_family {
+    (tables) => {
+        $crate::Change::CreateTable { .. }
+            | $crate::Change::DropTable { .. }
+            | $crate::Change::RenameTable { .. }
+    };
+    (table_properties) => {
+        $crate::Change::SetReplicaIdentity { .. }
+            | $crate::Change::SetComment { .. }
+            | $crate::Change::SetStorageParameters { .. }
+            | $crate::Change::SetTablePersistence { .. }
+    };
+    (partitions) => {
+        $crate::Change::RebuildPartitionedTable(..)
+            | $crate::Change::CopyTableRows(..)
+            | $crate::Change::AnalyzeTableTree(..)
+            | $crate::Change::DetachPartition { .. }
+            | $crate::Change::AttachPartition { .. }
+            | $crate::Change::SetPartitionDefault { .. }
+            | $crate::Change::SetPartitionNotNull { .. }
+    };
+    (columns) => {
+        $crate::Change::AddColumn { .. }
+            | $crate::Change::DropColumn { .. }
+            | $crate::Change::RenameColumn { .. }
+            | $crate::Change::AlterColumnType { .. }
+            | $crate::Change::AlterColumnNullability { .. }
+            | $crate::Change::AlterColumnDefault { .. }
+            | $crate::Change::AlterColumnExpression { .. }
+            | $crate::Change::AlterColumnNumbering { .. }
+            | $crate::Change::AddComputedColumn { .. }
+            | $crate::Change::DropComputedColumn { .. }
+            | $crate::Change::SetColumnDeprecated { .. }
+    };
+    (constraints) => {
+        $crate::Change::SetPrimaryKey { .. }
+            | $crate::Change::AddUnique { .. }
+            | $crate::Change::DropUnique { .. }
+            | $crate::Change::AddForeignKey { .. }
+            | $crate::Change::DropForeignKey { .. }
+            | $crate::Change::AddCheck { .. }
+            | $crate::Change::DropCheck { .. }
+    };
+    (indexes) => {
+        $crate::Change::AddIndex { .. }
+            | $crate::Change::DropIndex { .. }
+            | $crate::Change::SetIndexStorageParameters { .. }
+            | $crate::Change::BuildPartitionedIndex(..)
+    };
+    (policies) => {
+        $crate::Change::CreatePolicy { .. }
+            | $crate::Change::DropPolicy { .. }
+            | $crate::Change::SetRowSecurity { .. }
+    };
+    (rows) => {
+        $crate::Change::InsertRow { .. }
+            | $crate::Change::UpdateRow { .. }
+            | $crate::Change::DeleteRow { .. }
+            | $crate::Change::SetDataMode { .. }
+            | $crate::Change::SetEnsureKeys { .. }
+    };
+    (modules) => {
+        $crate::Change::CreateModule { .. }
+            | $crate::Change::AlterModule { .. }
+            | $crate::Change::DropModule { .. }
+    };
+    (permissions) => {
+        $crate::Change::Grant { .. }
+            | $crate::Change::Revoke { .. }
+            | $crate::Change::PublicExecution { .. }
+    };
+    (type_values) => {
+        $crate::Change::AddEnumValue { .. }
+            | $crate::Change::RenameEnumValue { .. }
+            | $crate::Change::AlterDomain { .. }
+            | $crate::Change::EnumRebuild { .. }
+    };
+    (roles) => {
+        $crate::Change::CreateRole { .. }
+            | $crate::Change::DropRole { .. }
+            | $crate::Change::RenameRole { .. }
+    };
+    (types) => {
+        $crate::Change::CreateType { .. }
+            | $crate::Change::DropType { .. }
+            | $crate::Change::RenameType { .. }
+    };
+    (extensions) => {
+        $crate::Change::CreateExtension { .. }
+            | $crate::Change::DropExtension { .. }
+            | $crate::Change::UpdateExtension { .. }
+            | $crate::Change::SetExtensionSchema { .. }
+    };
+}
+
+/// The families of [`Change`] kinds; see [`change_family!`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeFamily {
+    /// Creating, dropping and renaming a table.
+    Tables,
+    /// A property of a standing table that holds no rows and no shape: replica identity, comment, storage parameters, persistence.
+    TableProperties,
+    /// Partition structure: attaching, detaching, the default and NOT NULL of a partition, and the steps of a partitioned-table rebuild.
+    Partitions,
+    /// A column of a standing table.
+    Columns,
+    /// Keys, foreign keys and checks.
+    Constraints,
+    /// Indexes and their storage.
+    Indexes,
+    /// Row-security policies and the table's row-security flags.
+    Policies,
+    /// Reference data: its rows and how they are managed.
+    Rows,
+    /// Views, routines, triggers and the other definition-carrying modules.
+    Modules,
+    /// Grants, revokes and a routine's default EXECUTE.
+    Permissions,
+    /// Edits inside a managed type: enum labels, a domain's constraints, an enum rebuild.
+    TypeValues,
+    /// Creating, dropping and renaming a role.
+    Roles,
+    /// Creating, dropping and renaming a managed type.
+    Types,
+    /// Creating, dropping, updating and moving an extension.
+    Extensions,
+}
+
+impl Change {
+    /// The family this kind belongs to.
+    ///
+    /// Total on purpose, like [`Change::catalog_object`]: every variant is
+    /// reached through its family's patterns, so a new one does not compile
+    /// until it is added to an arm of [`change_family!`], and a variant listed
+    /// in two families is an unreachable pattern.
+    #[must_use]
+    pub fn family(&self) -> ChangeFamily {
+        match self {
+            crate::change_family!(tables) => ChangeFamily::Tables,
+            crate::change_family!(table_properties) => ChangeFamily::TableProperties,
+            crate::change_family!(partitions) => ChangeFamily::Partitions,
+            crate::change_family!(columns) => ChangeFamily::Columns,
+            crate::change_family!(constraints) => ChangeFamily::Constraints,
+            crate::change_family!(indexes) => ChangeFamily::Indexes,
+            crate::change_family!(policies) => ChangeFamily::Policies,
+            crate::change_family!(rows) => ChangeFamily::Rows,
+            crate::change_family!(modules) => ChangeFamily::Modules,
+            crate::change_family!(permissions) => ChangeFamily::Permissions,
+            crate::change_family!(type_values) => ChangeFamily::TypeValues,
+            crate::change_family!(roles) => ChangeFamily::Roles,
+            crate::change_family!(types) => ChangeFamily::Types,
+            crate::change_family!(extensions) => ChangeFamily::Extensions,
+        }
+    }
+}
+
 /// The `Change` patterns of the catalog objects, for a match arm that treats
 /// all of them alike: `catalog_change!()` is every one, `catalog_change!(roles)`,
 /// `catalog_change!(types)` and `catalog_change!(extensions)` one kind.
@@ -1582,20 +1755,13 @@ macro_rules! catalog_change {
             | $crate::catalog_change!(extensions)
     };
     (roles) => {
-        $crate::Change::CreateRole { .. }
-            | $crate::Change::DropRole { .. }
-            | $crate::Change::RenameRole { .. }
+        $crate::change_family!(roles)
     };
     (types) => {
-        $crate::Change::CreateType { .. }
-            | $crate::Change::DropType { .. }
-            | $crate::Change::RenameType { .. }
+        $crate::change_family!(types)
     };
     (extensions) => {
-        $crate::Change::CreateExtension { .. }
-            | $crate::Change::DropExtension { .. }
-            | $crate::Change::UpdateExtension { .. }
-            | $crate::Change::SetExtensionSchema { .. }
+        $crate::change_family!(extensions)
     };
 }
 
@@ -1646,60 +1812,17 @@ impl Change {
             crate::catalog_change!(roles) => Some(CatalogObject::Role),
             crate::catalog_change!(types) => Some(CatalogObject::Type),
             crate::catalog_change!(extensions) => Some(CatalogObject::Extension),
-            Change::RebuildPartitionedTable(..)
-            | Change::CopyTableRows(..)
-            | Change::AnalyzeTableTree(..)
-            | Change::BuildPartitionedIndex(..)
-            | Change::AddEnumValue { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::DetachPartition { .. }
-            | Change::AttachPartition { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetPartitionDefault { .. }
-            | Change::SetPartitionNotNull { .. }
-            | Change::SetIndexStorageParameters { .. }
-            | Change::CreatePolicy { .. }
-            | Change::DropPolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            crate::change_family!(tables)
+            | crate::change_family!(table_properties)
+            | crate::change_family!(partitions)
+            | crate::change_family!(columns)
+            | crate::change_family!(constraints)
+            | crate::change_family!(indexes)
+            | crate::change_family!(policies)
+            | crate::change_family!(rows)
+            | crate::change_family!(modules)
+            | crate::change_family!(permissions)
+            | crate::change_family!(type_values) => None,
         }
     }
 }
@@ -4263,6 +4386,66 @@ mod tests {
         };
         assert_eq!(grant.table(), None);
         assert_eq!(grant.subject(), "role app_reader");
+    }
+
+    /// A consumer's arm: `change_family!` in pattern position, in a match that
+    /// stays exhaustive without a wildcard.
+    fn is_about_a_column(change: &Change) -> bool {
+        match change {
+            crate::change_family!(columns) => true,
+            crate::change_family!(tables)
+            | crate::change_family!(table_properties)
+            | crate::change_family!(partitions)
+            | crate::change_family!(constraints)
+            | crate::change_family!(indexes)
+            | crate::change_family!(policies)
+            | crate::change_family!(rows)
+            | crate::change_family!(modules)
+            | crate::change_family!(permissions)
+            | crate::change_family!(type_values)
+            | crate::catalog_change!() => false,
+        }
+    }
+
+    #[test]
+    fn a_change_reports_the_family_its_kind_is_in() {
+        assert_eq!(drop_column().family(), ChangeFamily::Columns);
+        assert_eq!(add_column().family(), ChangeFamily::Columns);
+        let grant = Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: BTreeSet::new(),
+        };
+        assert_eq!(grant.family(), ChangeFamily::Permissions);
+        let role = Change::CreateRole {
+            uid: uid("r_aaaaaa"),
+            name: "app_reader".into(),
+        };
+        assert_eq!(role.family(), ChangeFamily::Roles);
+    }
+
+    /// The other direction: a kind is in no family but its own, a family arm
+    /// takes only its members, and only the three catalog families are catalog
+    /// objects (DEC-2790.1).
+    #[test]
+    fn a_change_is_in_no_family_but_its_own() {
+        let grant = Change::Grant {
+            role: "app_reader".into(),
+            target: "dbo.customer".parse().unwrap(),
+            permissions: BTreeSet::new(),
+        };
+        let role = Change::CreateRole {
+            uid: uid("r_aaaaaa"),
+            name: "app_reader".into(),
+        };
+        assert_ne!(drop_column().family(), ChangeFamily::Tables);
+        assert_ne!(grant.family(), ChangeFamily::Roles);
+        assert!(is_about_a_column(&drop_column()));
+        assert!(!is_about_a_column(&grant));
+        assert!(!is_about_a_column(&role));
+        assert_eq!(drop_column().catalog_object(), None);
+        assert_eq!(grant.catalog_object(), None);
+        assert_eq!(role.catalog_object(), Some(CatalogObject::Role));
     }
 
     // ---- modules (ADR-0002) ----
