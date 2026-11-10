@@ -88,6 +88,28 @@ async fn start() -> (Made, String, String, String) {
     (made, name, token, connection)
 }
 
+// A ready server can still close a later TLS handshake (#2767). Match only
+// the two observed EOF diagnostics; keep the typed last error and #2689's bound.
+async fn retry_tls_eof<T, E: std::fmt::Display, F: std::future::Future<Output = Result<T, E>>>(
+    mut attempt: impl FnMut() -> F,
+) -> Result<T, E> {
+    let mut result = attempt().await;
+    for _ in 0..2 {
+        let Err(error) = &result else {
+            break;
+        };
+        let why = error.to_string();
+        if !why.contains("tls handshake eof")
+            && !why.contains("peer closed connection without sending TLS close_notify")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        result = attempt().await;
+    }
+    result
+}
+
 // Readiness cannot prevent a later TLS handshake from failing. The production
 // sweep correctly keeps an unreadable server (DEC-2410.3); this test gets at
 // most three cleanup observations, retaining the last diagnostic (#2689).
@@ -117,18 +139,22 @@ async fn retry_unreadable_cleanup<F: std::future::Future<Output = Report>>(
 async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone() {
     let (made, name, token, connection) = start().await;
     let token_of_run = format!("{:032x}", rand::random::<u128>());
-    let keeper = Keeper::open(Driver::Mssql, &connection, &token)
+    let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &token))
         .await
         .unwrap();
     // While the session is there, and the server has the mark of it.
-    let held = seen(Driver::Mssql, &connection, &token_of_run, &token).await;
+    let held = retry_tls_eof(|| seen(Driver::Mssql, &connection, &token_of_run, &token))
+        .await
+        .unwrap();
     let live = swept(&token_of_run).await;
     let kept = exists(&name);
     drop(keeper);
     // The marker goes with the session; the persistent mark stays.
     let mut gone = false;
     for _ in 0..100 {
-        let mut conn = Conn::connect(Driver::Mssql, &connection).await.unwrap();
+        let mut conn = retry_tls_eof(|| Conn::connect(Driver::Mssql, &connection))
+            .await
+            .unwrap();
         let rows = conn
             .query(&format!(
                 "SELECT OBJECT_ID(N'tempdb..##pbps_{token}') AS marker;"
@@ -143,7 +169,9 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
     }
     // Gone, and the mark that it was there stays: that, not the age, is what
     // makes the container the dead run's however young it is.
-    let after = seen(Driver::Mssql, &connection, &token_of_run, &token).await;
+    let after = retry_tls_eof(|| seen(Driver::Mssql, &connection, &token_of_run, &token))
+        .await
+        .unwrap();
     let dead = retry_unreadable_cleanup(&name, || swept(&token_of_run)).await;
     let removed = !exists(&name);
     drop(made);
@@ -178,7 +206,7 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
 #[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
 async fn a_sql_server_container_stopped_after_a_running_observation_is_removed_at_once() {
     let (made, name, token, connection) = start().await;
-    let keeper = Keeper::open(Driver::Mssql, &connection, &token)
+    let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &token))
         .await
         .unwrap();
     let own = format!("{:032x}", rand::random::<u128>());
@@ -223,7 +251,7 @@ async fn a_sql_server_keeper_that_connects_between_the_two_reads_is_alive_and_no
         engine::keeper_seen(Driver::Mssql, &connection, &reader, &run),
         async {
             between.await.unwrap();
-            let keeper = Keeper::open(Driver::Mssql, &connection, &run)
+            let keeper = retry_tls_eof(|| Keeper::open(Driver::Mssql, &connection, &run))
                 .await
                 .unwrap();
             go.send(()).unwrap();
@@ -348,5 +376,117 @@ mod cleanup_retry_tests {
             report.unread.as_deref(),
             Some("the daemon could not be read")
         );
+    }
+}
+
+mod connection_retry_tests {
+    use super::*;
+
+    const EOF: &str = "tls handshake eof";
+    const CLOSE_NOTIFY: &str = "peer closed connection without sending TLS close_notify";
+
+    #[tokio::test]
+    async fn a_tls_eof_is_retried_for_keeper_observations() {
+        for why in [EOF, CLOSE_NOTIFY] {
+            let mut reads = [Err(why.to_owned()), Ok(Some((true, true)))].into_iter();
+            let observed = retry_tls_eof(|| {
+                std::future::ready(reads.next().expect("a successful read ends retries"))
+            })
+            .await;
+            assert_eq!(observed, Ok(Some((true, true))));
+            assert!(reads.next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tls_eof_is_retried_for_marker_connections() {
+        for why in [EOF, CLOSE_NOTIFY] {
+            let mut connections = [Err(std::io::Error::other(why)), Ok("connected")].into_iter();
+            let connected = retry_tls_eof(|| {
+                std::future::ready(
+                    connections
+                        .next()
+                        .expect("a successful connection ends retries"),
+                )
+            })
+            .await;
+            assert_eq!(connected.unwrap(), "connected");
+            assert!(connections.next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tls_eof_is_retried_when_opening_a_keeper() {
+        let mut opens = [Err(ProduceError::Acquire(CLOSE_NOTIFY.into())), Ok(())].into_iter();
+        retry_tls_eof(|| {
+            std::future::ready(opens.next().expect("only the failed open is retried"))
+        })
+        .await
+        .unwrap();
+        assert!(opens.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn other_errors_stop_without_retrying() {
+        for why in [
+            "login failed",
+            "connection refused",
+            "unexpected EOF",
+            "tls handshake failed: invalid certificate",
+            "the server did not answer in time",
+        ] {
+            let mut attempts = 0;
+            let error = retry_tls_eof(|| {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    why,
+                )))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts, 1, "{why}");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), why);
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_tls_eof_stops_after_three_attempts_with_the_last_error() {
+        let mut attempts = 0;
+        let error = retry_tls_eof(|| {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(format!("{EOF}: attempt {attempts}")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(error, "tls handshake eof: attempt 3");
+    }
+
+    #[tokio::test]
+    async fn a_different_error_after_eof_stops_retrying() {
+        let mut errors = [EOF, "login failed"].into_iter();
+        let error = retry_tls_eof(|| {
+            std::future::ready(Err::<(), _>(
+                errors.next().expect("a different error ends retries"),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, "login failed");
+        assert!(errors.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_absent_keeper_is_not_a_read_error() {
+        let mut attempts = 0;
+        let observed = retry_tls_eof(|| {
+            attempts += 1;
+            std::future::ready(Ok::<Option<(bool, bool)>, String>(None))
+        })
+        .await;
+        assert_eq!(observed, Ok(None));
+        assert_eq!(attempts, 1);
     }
 }

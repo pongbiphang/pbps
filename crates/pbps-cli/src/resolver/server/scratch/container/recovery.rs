@@ -563,11 +563,11 @@ pub(in crate::resolver::server::scratch) async fn seen(
     connection: &str,
     own: &str,
     token: &str,
-) -> Option<(bool, bool)> {
+) -> Result<Option<(bool, bool)>, String> {
+    // Let the caller bound retries for its engine's transient transport error.
     look(driver, connection, own, token)
         .await
-        .unwrap()
-        .map(|kept| (kept.alive, kept.ever))
+        .map(|kept| kept.map(|kept| (kept.alive, kept.ever)))
 }
 
 /// The sweep, with its report returned instead of printed.
