@@ -544,6 +544,19 @@ fn assert_exact_order(script: &str) {
     assert_eq!(statements, expected, "{script}");
 }
 
+/// The hook command that copies its standard input to `path`, as the YAML
+/// scalar that holds it. Hooks run through `sh -c` on Unix and `cmd /D /S /C`
+/// on Windows (#2491): there `cat` does not exist and a path's backslashes are
+/// escapes in a double-quoted scalar, so the command is `findstr` in a
+/// single-quoted one.
+fn capture_hook(path: &std::path::Path) -> String {
+    if cfg!(windows) {
+        format!("'findstr \"^\" > \"{}\"'", path.display())
+    } else {
+        format!("\"cat > {}\"", path.display())
+    }
+}
+
 fn configure(d: &Demo) {
     std::fs::write(
         d.dir.join("pbps.yml"),
@@ -1412,9 +1425,9 @@ pub fn applied(server: &str) {
     let attempt_hook = sealed.d.dir.join("on_apply_attempt.json");
     let mut configured = std::fs::read_to_string(&config).unwrap();
     configured.push_str(&format!(
-        "hooks:\n  on_apply: \"cat > {}\"\n  on_apply_attempt: \"cat > {}\"\n",
-        applied_hook.display(),
-        attempt_hook.display()
+        "hooks:\n  on_apply: {}\n  on_apply_attempt: {}\n",
+        capture_hook(&applied_hook),
+        capture_hook(&attempt_hook)
     ));
     std::fs::write(&config, configured).unwrap();
     // The scratch the plan was made with, and a Docker socket, both listen
