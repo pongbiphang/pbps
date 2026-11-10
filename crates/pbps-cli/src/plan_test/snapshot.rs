@@ -12,7 +12,7 @@ use pbps_mssql::test_scratch::snapshot as sql;
 use super::report::{AllocatorComparison, Cell, RowDifference, TableComparison};
 use super::session::{Session, quoted, table};
 
-/// Differences shown per table; the comparison itself never stops early.
+/// Differences shown per table; this limit never decides equality.
 const SHOWN: usize = 20;
 /// Characters of one value shown in a difference.
 const VALUE: usize = 200;
@@ -210,7 +210,7 @@ fn total(rows: &Rows) -> u64 {
 
 /// Rows and allocators of the two sides, with every difference found. A table
 /// or sequence only one side has is a difference, never skipped.
-pub(super) fn compare(
+pub(super) async fn compare(
     original: &Snapshot,
     proposed: &Snapshot,
 ) -> (Vec<TableComparison>, Vec<AllocatorComparison>) {
@@ -219,68 +219,68 @@ pub(super) fn compare(
         .keys()
         .chain(proposed.tables.keys())
         .collect();
-    let tables = names
-        .into_iter()
-        .map(|name| {
-            let (a, b) = (original.tables.get(name), proposed.tables.get(name));
-            let empty = BTreeMap::new();
-            let (ar, br) = (a.map_or(&empty, |t| &t.rows), b.map_or(&empty, |t| &t.rows));
-            let mut differences = Vec::new();
-            let mut truncated = false;
-            for row in ar.keys().chain(br.keys()).collect::<BTreeSet<_>>() {
-                let (x, y) = (
-                    ar.get(row).copied().unwrap_or(0),
-                    br.get(row).copied().unwrap_or(0),
-                );
-                if x == y {
-                    continue;
-                }
-                if differences.len() == SHOWN {
-                    truncated = true;
-                    break;
-                }
-                differences.push(RowDifference {
-                    original_count: x,
-                    proposed_count: y,
-                    row: row.iter().map(cell).collect(),
-                });
+    let mut tables = Vec::new();
+    for name in names {
+        let (a, b) = (original.tables.get(name), proposed.tables.get(name));
+        let empty = BTreeMap::new();
+        let (ar, br) = (a.map_or(&empty, |t| &t.rows), b.map_or(&empty, |t| &t.rows));
+        let mut differences = Vec::new();
+        let mut truncated = false;
+        for row in ar.keys().chain(br.keys()).collect::<BTreeSet<_>>() {
+            let (x, y) = (
+                ar.get(row).copied().unwrap_or(0),
+                br.get(row).copied().unwrap_or(0),
+            );
+            if x == y {
+                continue;
             }
-            let columns = |t: Option<&Rows>| t.map(|t| t.columns.clone()).unwrap_or_default();
-            let same_columns = a.map(|t| &t.columns) == b.map(|t| &t.columns);
-            TableComparison {
-                table: name.clone(),
-                equal: same_columns && ar == br,
-                original_columns: columns(a),
-                proposed_columns: columns(b),
-                original_rows: a.map_or(0, total),
-                proposed_rows: b.map_or(0, total),
-                differences,
-                truncated,
+            if differences.len() == SHOWN {
+                truncated = true;
+                break;
             }
-        })
-        .collect();
+            differences.push(RowDifference {
+                original_count: x,
+                proposed_count: y,
+                row: row.iter().map(cell).collect(),
+            });
+        }
+        let columns = |t: Option<&Rows>| t.map(|t| t.columns.clone()).unwrap_or_default();
+        let same_columns = a.map(|t| &t.columns) == b.map(|t| &t.columns);
+        tables.push(TableComparison {
+            table: name.clone(),
+            equal: same_columns && ar == br,
+            original_columns: columns(a),
+            proposed_columns: columns(b),
+            original_rows: a.map_or(0, total),
+            proposed_rows: b.map_or(0, total),
+            differences,
+            truncated,
+        });
+        // Give the run's Control a chance to observe its deadline and signal,
+        // including after the last table, before a match can be published.
+        tokio::task::yield_now().await;
+    }
     let names: BTreeSet<&String> = original
         .allocators
         .keys()
         .chain(proposed.allocators.keys())
         .collect();
-    let allocators = names
-        .into_iter()
-        .map(|name| {
-            let (a, b) = (original.allocators.get(name), proposed.allocators.get(name));
-            let named = |x: &Allocator| x.name.clone();
-            AllocatorComparison {
-                sequence: match (a, b) {
-                    (Some(a), Some(b)) if a.name != b.name => format!("{} -> {}", a.name, b.name),
-                    (a, b) => a.or(b).map(named).unwrap_or_default(),
-                },
-                used_by: a.or(b).and_then(|x| x.used_by.clone()),
-                original_next: a.map(|x| x.next.clone()),
-                proposed_next: b.map(|x| x.next.clone()),
-                equal: a.map(|x| &x.next) == b.map(|x| &x.next),
-            }
-        })
-        .collect();
+    let mut allocators = Vec::new();
+    for name in names {
+        let (a, b) = (original.allocators.get(name), proposed.allocators.get(name));
+        let named = |x: &Allocator| x.name.clone();
+        allocators.push(AllocatorComparison {
+            sequence: match (a, b) {
+                (Some(a), Some(b)) if a.name != b.name => format!("{} -> {}", a.name, b.name),
+                (a, b) => a.or(b).map(named).unwrap_or_default(),
+            },
+            used_by: a.or(b).and_then(|x| x.used_by.clone()),
+            original_next: a.map(|x| x.next.clone()),
+            proposed_next: b.map(|x| x.next.clone()),
+            equal: a.map(|x| &x.next) == b.map(|x| &x.next),
+        });
+        tokio::task::yield_now().await;
+    }
     (tables, allocators)
 }
 

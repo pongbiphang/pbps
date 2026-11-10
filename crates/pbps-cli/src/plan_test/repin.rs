@@ -561,7 +561,15 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     ));
     let write = rows + 2;
     if let [original, proposed] = &snapshots[..] {
-        compare(data, rows, original, proposed);
+        compare(
+            data,
+            rows,
+            original,
+            proposed,
+            &mut control,
+            ms(timeouts.run_ms),
+        )
+        .await;
     }
     data.reverify(&plan.inputs);
     if let Some(moved) = head_moved(plan) {
@@ -592,13 +600,28 @@ async fn execute(plan: &Plan, data: &mut TestData) {
     }
 }
 
-pub(super) fn compare(
+pub(super) async fn compare(
     data: &mut TestData,
     rows: usize,
     original: &snapshot::Snapshot,
     proposed: &snapshot::Snapshot,
+    control: &mut Control,
+    allowance: std::time::Duration,
 ) {
-    let (tables, allocators) = snapshot::compare(original, proposed);
+    let started = Instant::now();
+    let result = control
+        .bounded(allowance, async {
+            Ok(snapshot::compare(original, proposed).await)
+        })
+        .await;
+    data.phases[rows].elapsed_ms = elapsed(started);
+    let (tables, allocators) = match result {
+        Ok(compared) => compared,
+        Err(error) => {
+            data.failure(rows, "test.repin.unestablished", format!("{error:#}"), true);
+            return;
+        }
+    };
     for t in tables.iter().filter(|t| !t.equal) {
         data.failure(
             rows,
