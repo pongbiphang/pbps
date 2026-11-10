@@ -53,6 +53,37 @@
         }
       ]
     },
+    "pgwin": {
+      "platform": "win32",
+      "fixture": "Three native PostgreSQL clusters (18.6 twice, 16.15 once) extracted from pinned EnterpriseDB archives and run by a dedicated ordinary Windows user.",
+      "job": "resolver-pg-windows",
+      "script": "scripts/pgwin_qualify.py",
+      "selection": {
+        "kind": "calls",
+        "file": "scripts/pgwin_qualify.py",
+        "scope": "main",
+        "callee": "run_case",
+        "argument": 1
+      },
+      "witnesses": [
+        {
+          "file": "scripts/pgwin_qualify.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/pgwin_qualify.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "raise RuntimeError(\"no qualification case ran\")"
+          ]
+        }
+      ]
+    },
     "editions": {
       "platform": "linux",
       "fixture": "Pinned SQL Server Developer and case-sensitive Express instances.",
@@ -3229,6 +3260,37 @@
         "localdb2491::localdb_rehearsal_builds_a_base_that_calls_its_own_function_on_a_server_scratch",
         "localdb2491::localdb_rehearsal_runs_roles_and_grants_without_a_server_principal_on_a_server_scratch",
         "localdb2491::localdb_raised_guard_messages_are_shown_once_on_every_apply_path"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pgwin",
+      "validate_on": "win32",
+      "ignored_on": ["win32"],
+      "cases": [
+        "pgwin2491::pg_rehearsal_converges_on_every_native_scratch",
+        "pgwin2491::pg_rehearsal_shares_one_scratch_with_the_resolver",
+        "pgwin2491::pg_rehearsal_refuses_a_statement_the_engine_rejects",
+        "pgwin2491::pg_rehearsal_off_switches_seal_a_plan_as_not_rehearsed",
+        "pgwin2491::pg_rehearsal_without_an_entry_carries_no_record",
+        "pgwin2491::pg_rehearsal_supplied_database_is_empty_after_every_use",
+        "pgwin2491::pg_rehearsal_stages_the_entrys_externals_and_compares_them",
+        "pgwin2491::pg_rehearsal_authorization_is_rehearsed_on_roles_made_for_the_run",
+        "pgwin2491::pg_rehearsal_a_wrong_policy_is_refused_and_leaves_no_role",
+        "pgwin2491::pg_rehearsal_an_account_without_createrole_is_downgraded",
+        "pgwin2491::pg_rehearsal_killed_run_is_cleaned_up_by_the_next_run",
+        "pgwin2491::pg_rehearsal_killed_same_cluster_run_leaves_nothing_naming_the_real_role",
+        "pgwin2491::pg_rehearsal_a_policy_naming_a_role_in_text_converges_on_every_native_placement",
+        "pgwin2491::pg_rehearsal_concurrent_plans_do_not_collide",
+        "pgwin2491::pg_rehearsal_a_declared_domain_is_rehearsed",
+        "pgwin2491::pg_rehearsal_a_declared_enum_is_rehearsed",
+        "pgwin2491::pg_rehearsal_a_kept_module_is_rebuilt_under_its_recorded_dependencies",
+        "pgwin2491::pg_resolver_publishes_its_rechecked_plan",
+        "pgwin2491::pg_resolver_plans_pass_the_ordinary_connected_checks",
+        "pgwin2491::pg_resolver_plans_apply_with_their_sealed_checks",
+        "pgwin2491::pg_resolver_plan_is_refused_before_ddl_when_a_sealed_input_moved",
+        "pgwin2491::pg_resolver_plan_closes_over_what_it_newly_reaches",
+        "pgwin2491::pg_resolver_plan_rolls_back_when_its_closing_check_finds_another_writer"
       ]
     },
     {

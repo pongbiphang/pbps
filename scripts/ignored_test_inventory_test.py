@@ -1008,6 +1008,27 @@ class RuleOwnership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*windows_only"):
             self.check("win32")
 
+    def test_the_same_case_is_accepted_from_a_platform_that_cannot_compile_it(self):
+        # Linux discovery does not see the cfg(windows) case, but the registry
+        # names it; its Windows owner is authoritative there (#2491).
+        self.windows_only_case_with_an_exact_entry("win")
+        self.targets[KEY]["all"].discard("scope::windows_only")
+        self.targets[KEY]["ignored"].discard("scope::windows_only")
+        self.assertGreater(self.check("linux"), 0)
+
+    def test_an_undiscovered_case_still_disagrees_when_its_owner_runs_on_the_discovering_platform(self):
+        self.windows_only_case_with_an_exact_entry("linux2")
+        self.targets[KEY]["all"].discard("scope::windows_only")
+        self.targets[KEY]["ignored"].discard("scope::windows_only")
+        with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*windows_only"):
+            self.check("linux")
+
+    def test_a_case_that_is_compiled_here_cannot_use_an_owner_of_another_platform(self):
+        # Discovered on Linux with a Windows exact owner under a Linux rule: a conflict.
+        self.windows_only_case_with_an_exact_entry("win")
+        with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*windows_only"):
+            self.check("linux")
+
     def test_two_owners_on_the_same_platform_still_disagree(self):
         # A Linux case with a Linux rule owner and a different Linux exact owner.
         self.workflow.write_text(self.WIN_WORKFLOW)
@@ -1180,7 +1201,16 @@ class RuleOwnership(unittest.TestCase):
                   for group in inventory["groups"] for name in group["cases"]}
         assigned = audit.rule_assignments(inventory["owners"], rules, legacy, "linux")
         self.assertTrue(assigned)
-        self.assertEqual(legacy | assigned, legacy)
+        # A rule and an exact entry agree, except for a case compiled on one
+        # platform only that a broad rule gives to another platform's owner
+        # (#2491: flow_pg's Windows-only PostgreSQL cases, owned by `pgwin`).
+        owners = inventory["owners"]
+        disagreeing = {case for case, owner in assigned.items() if legacy[case] != owner}
+        for case in disagreeing:
+            self.assertNotEqual(owners[legacy[case]]["platform"], owners[assigned[case]]["platform"], case)
+        self.assertEqual({(case[:3], legacy[case]) for case in disagreeing},
+                         {(("pbps-cli", "test", "flow_pg"), "pgwin")} if disagreeing else set())
+        self.assertEqual(legacy | {c: o for c, o in assigned.items() if c not in disagreeing}, legacy)
         exact_only = {owner for owner, details in inventory["owners"].items()
                       if any(key in details for key in ("script", "selection", "parent"))}
         self.assertFalse(exact_only.intersection(assigned.values()))

@@ -1004,19 +1004,28 @@ def validate(root, inventory, targets, platform, rules=None):
                                    cases, platform)
     if rules is not None:
         used.update(rule["owner"] for rule in rules["rules"])
+    discovered = {(*key, name) for key, target in targets.items() for name in target["ignored"]}
     for case, owner in assignments.items():
         if case in entries:
             exact = entries[case]["owner"]
             # The one disagreement that is the documented rule, not a conflict
             # (AGENTS.md, "Cross-platform discovery needs an exact legacy entry
             # or an owner that runs on the discovering platform"): a case
-            # compiled on this platform only, which a broad rule gives to an
-            # owner of another platform, has an exact entry whose owner runs
-            # here (#2491: the Windows-only PostgreSQL cases under flow_pg's
-            # blanket rule). Two owners on the same platform, or an exact owner
-            # that does not run here either, still disagree.
+            # compiled on one platform only, which a broad rule gives to an
+            # owner of another platform, has an exact entry whose owner is
+            # authoritative for it (#2491: the Windows-only PostgreSQL cases
+            # under flow_pg's blanket rule). Where the case is compiled, that
+            # owner must run on the discovering platform; where it is not
+            # (the registry names it, discovery here cannot see it), the
+            # owner must run on another platform, exactly as a legacy entry's
+            # stale-mapping check is left to its own platform. Two owners on
+            # the same platform, or an exact owner that does not fit either
+            # way, still disagree.
+            seen = case in discovered
+            owner_here = owners[exact]["platform"] == platform
             require(exact == owner
-                    or (owners[owner]["platform"] != platform and owners[exact]["platform"] == platform),
+                    or (owners[owner]["platform"] != platform and owner_here and seen)
+                    or (not seen and not owner_here),
                     f"rule and legacy owners disagree for {case}: {owner} != {exact}")
         else:
             # Exact entries are checked on validate_on. A namespace alone cannot

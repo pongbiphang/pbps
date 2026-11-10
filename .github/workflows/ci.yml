@@ -151,6 +151,7 @@ jobs:
       - run: python3 scripts/live_shards_resume_test.py
       - run: python3 scripts/pr_size_test.py
       - run: python3 scripts/localdb_qualify_test.py
+      - run: python3 scripts/pgwin_qualify_test.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -439,6 +440,30 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - run: python3 scripts/localdb_qualify.py
+
+  # The resolver flows on native PostgreSQL clusters on Windows (#2491, W2).
+  # The runner image ships PostgreSQL 17, which the resolver refuses (it reads
+  # 16 and 18 only), so the job extracts the two qualified majors from
+  # EnterpriseDB's archives, pinned by SHA-256 in the script, and runs three
+  # clusters as a dedicated ordinary user. The cache only saves the download:
+  # the script verifies every hash again, a cached file included.
+  resolver-pg-windows:
+    needs: [approve, lint]
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v6
+        with:
+          path: C:\pbps-localdb\downloads
+          key: pgwin-edb-${{ hashFiles('scripts/pgwin_qualify.py') }}
+      - run: python3 scripts/pgwin_qualify.py
 
   # The SQL Server TLS fixture starts its own disposable SQL Server (3 GiB
   # limit). Run in `live`, it sat beside that job's service container: two SQL
@@ -1044,7 +1069,7 @@ jobs:
 
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, resolver-mssql, resolver-localdb, live-transport-mssql, live-editions, live-pg, viewer, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
+    needs: [approve, lint, quick, windows, live, resolver-mssql, resolver-localdb, resolver-pg-windows, live-transport-mssql, live-editions, live-pg, viewer, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
