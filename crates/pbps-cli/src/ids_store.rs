@@ -122,12 +122,15 @@ pub(crate) fn tree_at(
 /// tree that exists. A file of the tree not yet written is not listed, so every
 /// command that writes somewhere the user names also calls
 /// [`refuse_output_inside`].
-pub(crate) fn protected(project: &Project) -> Vec<PathBuf> {
+///
+/// A tree that cannot be listed is an error, not a tree with no files: the
+/// files it hides are the ones an output could reach through a hard link, and
+/// not every command that writes an output reads the identities first.
+pub(crate) fn protected(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = vec![project.config_file(), project.ids_file()];
-    if let Ok(tree) = read_ids_tree(&project.ids_dir()) {
-        out.extend(tree.keys().map(|rel| project.ids_dir().join(rel)));
-    }
-    out
+    let tree = read_ids_tree(&project.ids_dir())?;
+    out.extend(tree.keys().map(|rel| project.ids_dir().join(rel)));
+    Ok(out)
 }
 
 /// Refuses an output destination inside the identity tree, whether or not the

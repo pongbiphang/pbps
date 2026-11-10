@@ -1962,7 +1962,7 @@ fn cmd_pull(
         }
     }
 
-    let protected_inputs = ids_store::protected(project);
+    let protected_inputs = ids_store::protected(project)?;
     let extension_scope =
         adopt::extension_scope(&dir, existing_ids.as_ref(), extensions, &protected_inputs)?;
 
@@ -4984,7 +4984,7 @@ fn refuse_aliased_outputs(
     if let (Some(out), Some(sql)) = (out, sql) {
         distinct(out, sql)?;
     }
-    let mut inputs = ids_store::protected(project);
+    let mut inputs = ids_store::protected(project)?;
     // The ordinary loader owns declaration-enumeration errors and runs before
     // writes or connection. An unreadable directory must not become a clean plan.
     if let Ok(files) = pbps_load::schema_files(&project.schema_dir()) {

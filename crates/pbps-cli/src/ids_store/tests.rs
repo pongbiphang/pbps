@@ -1856,3 +1856,25 @@ fn a_dangling_symlink_spelled_like_the_twin_is_an_entry_not_a_fold() {
     ufs::symlink("nowhere", dir.join("A")).unwrap();
     assert_eq!(PathKey::probe(&dir).unwrap(), PathKey::default());
 }
+
+#[test]
+fn the_protected_inputs_of_an_unreadable_tree_are_an_error_never_fewer_files() {
+    let fresh = project("protected-fresh");
+    assert_eq!(
+        protected(&fresh).unwrap(),
+        vec![fresh.config_file(), fresh.ids_file()],
+        "a tree that is not there has no files to protect"
+    );
+
+    let project = written("protected-unreadable", &customer(), &customer_declared());
+    let file = project
+        .ids_dir()
+        .join(tree(&project).keys().next().unwrap());
+    assert!(protected(&project).unwrap().contains(&file));
+    // A stray entry makes the listing fail. The identity file beside it can
+    // still be written over through a hard link, so leaving it out of the list
+    // would let a forced output through.
+    std::fs::write(project.ids_dir().join("notes.txt"), "x").unwrap();
+    let error = format!("{:#}", protected(&project).unwrap_err());
+    assert!(error.contains("notes.txt"), "{error}");
+}
