@@ -28,7 +28,7 @@ test('launch token protects reports', async ({guarded: {page, context, requests}
 test('saved plan uses actual CLI artifact', async ({guarded: {page}, app}) => {
   await open(page, app); await readView(page, 'Saved plan', app.plan); await loaded(page, 'explain');
   await expect(page.getByRole('heading', {name: 'Preview plan', exact: true})).toBeVisible();
-  await expect(page.locator('.stat').first()).toHaveText('1changes');
+  await expect(page.locator('.stat').first()).toHaveText('2changes');
   await expect(page.locator('#content')).toContainText(app.explanation.data.checksum);
   await expect(page.locator('#content')).toContainText('false');
 });
