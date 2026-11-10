@@ -202,17 +202,12 @@ pub async fn planning_identity(
     pbps_cli::resolver::server::target_identity(conn)
         .await
         .map(Some)
-        .map_err(|error| match driver {
-            pbps_db::Driver::Postgres => identity_unread(error),
-            pbps_db::Driver::Mssql => Refused::Unanswerable(anyhow::anyhow!(
-                "the target's master family_guid could not be read: {error}"
-            )),
-        })
+        .map_err(|error| crate::engine::target_identity_unread(driver, error))
 }
 
 /// A refused read of the cluster's identity is the deployment role's to
 /// fix, and names the grant; any other failure is unanswerable.
-fn identity_unread(error: pbps_db::DbError) -> Refused {
+pub(crate) fn identity_unread(error: pbps_db::DbError) -> Refused {
     if error.server_error_code().as_deref() == Some("42501") {
         return Refused::Finding(
             crate::output::Finding::error(
@@ -655,26 +650,7 @@ mod producer {
         driver: pbps_db::Driver,
         profile: &pbps_config::resolver::ResolverProfile,
     ) -> pbps_model::resolver::SameInstance {
-        use pbps_config::resolver::ResolverProfile;
-        match (driver, profile) {
-            (pbps_db::Driver::Mssql, profile) => {
-                let choice = match profile {
-                    ResolverProfile::Server { same_instance, .. } => {
-                        same_instance.unwrap_or_default()
-                    }
-                    ResolverProfile::Docker { .. } => pbps_config::resolver::SameInstance::Refuse,
-                };
-                match choice {
-                    pbps_config::resolver::SameInstance::Refuse => {
-                        pbps_model::resolver::SameInstance::Refused
-                    }
-                    pbps_config::resolver::SameInstance::Allow => {
-                        pbps_model::resolver::SameInstance::Allowed
-                    }
-                }
-            }
-            (pbps_db::Driver::Postgres, _) => pbps_model::resolver::SameInstance::NotApplicable,
-        }
+        crate::engine::same_instance_consent(driver, profile)
     }
 
     fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {

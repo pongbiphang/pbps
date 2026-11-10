@@ -93,7 +93,7 @@ pub(crate) use services::{cmd_bootstrap, cmd_plan_db};
 /// change in the plan can clear the name first.
 // The complement is every change that does not create a name.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn refuse_occupied_names(
+pub(crate) fn refuse_occupied_names(
     cs: &pbps_model::ChangeSet,
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],

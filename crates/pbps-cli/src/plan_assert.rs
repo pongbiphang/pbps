@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pbps_db::query::{AssertionResult, EvidenceCell, QueryEvidence};
-use pbps_db::{Conn, DbError, Driver};
+use pbps_db::{Conn, DbError};
 use pbps_model::escape::Escaped;
 use pbps_model::{AssertionOutcome, TargetAssertion};
 
@@ -164,18 +164,7 @@ impl Selection {
                 .assertion_ms
                 .get(),
         ));
-        let expected = match planning.driver() {
-            Driver::Postgres => Expected::Postgres(
-                pbps_pg::assertions::Target::read(planning)
-                    .await
-                    .map_err(|e| stop("the planning target", e))?,
-            ),
-            Driver::Mssql => Expected::Mssql(
-                pbps_mssql::assertions::Target::read(planning)
-                    .await
-                    .map_err(|e| stop("the planning target", e))?,
-            ),
-        };
+        let expected = crate::engine::read_assertion_target(planning).await?;
         let mut passed = Vec::new();
         for assertion in &self.assertions {
             let path = assertion.record.path.raw();
@@ -206,7 +195,7 @@ impl Selection {
     }
 }
 
-enum Expected {
+pub(crate) enum Expected {
     Postgres(pbps_pg::assertions::Target),
     Mssql(pbps_mssql::assertions::Target),
 }
@@ -230,7 +219,7 @@ fn input_problem(path: &str, problem: &str) -> Finding {
 /// A failure before or around the assertion's own SQL. A refusal is the
 /// engine's answer about the login or target and the user can fix it; a
 /// deadline or an unreadable answer is not an answer at all.
-fn stop(what: &str, error: DbError) -> Stop {
+pub(crate) fn stop(what: &str, error: DbError) -> Stop {
     match error {
         DbError::Refused(reason) => Stop::Refused(
             Finding::error(

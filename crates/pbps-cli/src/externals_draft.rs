@@ -23,12 +23,7 @@ pub fn cmd_externals(
     out: Option<&Path>,
     force: bool,
 ) -> anyhow::Result<()> {
-    if target.driver() != pbps_db::Driver::Postgres {
-        bail!(
-            "`pbps resolver externals` reads a PostgreSQL target; SQL Server has no binding \
-             adapter yet (#619, #620)"
-        );
-    }
+    crate::engine::refuse_externals_draft_unsupported(target.driver())?;
     // Before connecting: where the draft goes is a fact about the command
     // line and the project.
     if let Some(out) = out {

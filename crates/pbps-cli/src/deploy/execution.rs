@@ -56,26 +56,8 @@ pub(super) async fn run_probes_observed(
     // they are judged first. One that is not admitted yet, or cannot be bound
     // before the plan creates what it uses, is left to the check just before its
     // statement; the probes that would run it are skipped, not run unjudged.
-    let mut table_unjudged = false;
-    if conn.driver() == pbps_db::Driver::Postgres {
-        for planned in names.changes() {
-            match crate::engine::vet_table_expressions(
-                conn,
-                admission,
-                pbps_pg::pins::Within::OwnTransaction,
-                pbps_pg::table_expressions::Moment::Early,
-                &planned.change,
-            )
-            .await
-            {
-                Ok(pbps_pg::table_expressions::Vetted::Admitted) => {}
-                // Not judged, however it came about: refused, or unbound here.
-                Ok(pbps_pg::table_expressions::Vetted::Unjudged(_)) | Err(_) => {
-                    table_unjudged |= pbps_pg::table_expressions::probed(&planned.change);
-                }
-            }
-        }
-    }
+    let table_unjudged =
+        crate::engine::table_expressions_left_unjudged(conn, admission, names.changes()).await;
     if table_unjudged || admission.relied_since(mark) {
         // Plan time, and a conversion or requirement is admitted only by the
         // review: no probe evaluates it before the human has read the source.

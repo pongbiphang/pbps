@@ -1500,9 +1500,6 @@ pub(super) async fn refuse_taken_history_names(
     cs: &pbps_model::ChangeSet,
     label: &str,
 ) -> anyhow::Result<()> {
-    if conn.driver() != pbps_db::Driver::Mssql {
-        return Ok(());
-    }
     let names: Vec<TableName> = cs
         .changes
         .iter()
@@ -1525,7 +1522,9 @@ pub(super) async fn refuse_taken_history_names(
     if names.is_empty() {
         return Ok(());
     }
-    let held = pbps_mssql::catalog::object_name_occupants(conn, &names, &[]).await?;
+    let Some(held) = crate::engine::history_name_occupants(conn, &names).await? else {
+        return Ok(());
+    };
     let taken: Vec<String> = blocking_history_occupants(cs, &held)
         .into_iter()
         .map(|(table, history, o)| {

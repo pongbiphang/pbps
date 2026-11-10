@@ -38,7 +38,7 @@ pub(super) fn changed_extensions(
 /// judged before any plan is written (DEC-2447.6): every refusal names the
 /// package and the fact. The answer is each package's own prerequisites, which
 /// the differ turns into the order among the plan's creates.
-pub(super) async fn extension_creates(
+pub(crate) async fn extension_creates(
     conn: &mut pbps_db::Conn,
     base: &Schema,
     declared: &Schema,
@@ -84,7 +84,7 @@ pub(super) async fn extension_creates(
 /// the same schema, under one recorded identity: each becomes an update, judged
 /// before any plan is written (DEC-2447.10). Every refusal names the package;
 /// the facts are what the differ turns into the update's order.
-pub(super) async fn extension_update_facts(
+pub(crate) async fn extension_update_facts(
     conn: &mut pbps_db::Conn,
     base: &Schema,
     declared: &Schema,
@@ -152,7 +152,7 @@ pub(super) async fn extension_update_facts(
 /// (DEC-2447.11). Every refusal names the package; the answer is each package's
 /// members as the destination would name them, which the differ turns into the
 /// modules the move waits for.
-pub(super) async fn extension_move_facts(
+pub(crate) async fn extension_move_facts(
     conn: &mut pbps_db::Conn,
     base: &Schema,
     declared: &Schema,
@@ -334,7 +334,7 @@ pub(super) async fn extension_change_pins(
 
 /// The packages a recorded intent retires, by name: held by the target, no
 /// longer declared, and tombstoned in the identity this plan will carry.
-pub(super) fn retired_extensions(
+pub(crate) fn retired_extensions(
     base: &Schema,
     declared: &Schema,
     recorded: &IdsFile,
@@ -356,7 +356,7 @@ pub(super) fn retired_extensions(
 /// before any plan is written (DEC-2447.8): the connected role must be allowed
 /// to drop it, and the facts become the differ's input, which carries what the
 /// plan also removes and refuses the rest by name.
-pub(super) async fn extension_drop_facts(
+pub(crate) async fn extension_drop_facts(
     conn: &mut pbps_db::Conn,
     retired: &BTreeSet<pbps_model::ObjectLocalName>,
 ) -> anyhow::Result<BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionDropFacts>> {
