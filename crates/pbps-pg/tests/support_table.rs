@@ -148,6 +148,16 @@ fn regenerated(text: &str) -> String {
     for (name, table) in support::status_tables() {
         let open = format!("<!-- generated:{name} -->\n");
         let close = format!("<!-- /generated:{name} -->");
+        // Only the first region would be rendered, so a second one could hold
+        // a stale table that compares equal to itself.
+        for marker in [&open, &close] {
+            assert_eq!(
+                out.matches(marker.as_str()).count(),
+                1,
+                "docs/STATUS.md must have exactly one `{}`",
+                marker.trim_end()
+            );
+        }
         let start = out
             .find(&open)
             .unwrap_or_else(|| panic!("docs/STATUS.md has no `{name}` region"))
@@ -189,4 +199,14 @@ fn a_hand_edited_status_table_is_a_difference() {
     let removed = text.replacen(row, "", 1);
     assert_ne!(removed, text);
     assert_eq!(regenerated(&removed), text);
+}
+
+/// Negative: a second region of one name is refused, since only the first
+/// would be rendered and the other could go stale unseen.
+#[test]
+#[should_panic(expected = "exactly one `<!-- generated:sqlserver -->`")]
+fn a_repeated_generated_region_is_refused() {
+    let text = std::fs::read_to_string(repo("docs/STATUS.md")).unwrap();
+    let stale = "\n<!-- generated:sqlserver -->\n| stale |\n<!-- /generated:sqlserver -->\n";
+    regenerated(&format!("{text}{stale}"));
 }
