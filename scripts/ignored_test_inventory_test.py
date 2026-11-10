@@ -974,6 +974,61 @@ class RuleOwnership(unittest.TestCase):
                                    "exact legacy entry.*runs on win32"):
             self.check("win32")
 
+    WIN_WORKFLOW = WORKFLOW + """  win:
+    runs-on: windows-latest
+    steps:
+      - run: cargo test -p demo --lib -- --ignored
+"""
+
+    def windows_only_case_with_an_exact_entry(self, exact_owner):
+        """flow_pg's shape (#2491): a broad Linux rule, and a case compiled on Windows only."""
+        self.workflow.write_text(self.WIN_WORKFLOW)
+        self.inventory["owners"]["win"] = {"platform": "win32", "fixture": "Owned runner", "job": "win"}
+        self.inventory["owners"]["win2"] = {"platform": "win32", "fixture": "Another runner", "job": "win"}
+        self.inventory["owners"]["linux2"] = {"platform": "linux", "fixture": "Another runner", "job": "live"}
+        self.inventory["groups"].append(
+            {"target": list(KEY), "owner": exact_owner, "validate_on": self.inventory["owners"][exact_owner]["platform"],
+             "ignored_on": ["win32"], "cases": ["scope::windows_only"]})
+        self.add_case("scope::windows_only")
+        # Owners that no group uses are refused, so give the others a case of their own.
+        for index, name in enumerate(sorted({"win", "win2", "linux2"} - {exact_owner})):
+            case = f"other{index}::case"
+            self.inventory["groups"].append(
+                {"target": list(KEY), "owner": name, "validate_on": self.inventory["owners"][name]["platform"],
+                 "ignored_on": ["linux", "win32", "darwin"], "cases": [case]})
+            self.add_case(case)
+
+    def test_a_windows_only_case_under_a_linux_rule_is_owned_by_its_exact_windows_entry(self):
+        self.windows_only_case_with_an_exact_entry("win")
+        # Only the owner that runs on the discovering platform may take it.
+        self.assertGreater(self.check("win32"), 0)
+
+    def test_an_exact_entry_whose_owner_is_not_on_the_discovering_platform_still_disagrees(self):
+        self.windows_only_case_with_an_exact_entry("linux2")
+        with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*windows_only"):
+            self.check("win32")
+
+    def test_two_owners_on_the_same_platform_still_disagree(self):
+        # A Linux case with a Linux rule owner and a different Linux exact owner.
+        self.workflow.write_text(self.WIN_WORKFLOW)
+        self.inventory["owners"]["linux2"] = {"platform": "linux", "fixture": "Another runner", "job": "live"}
+        self.inventory["groups"] = [{"target": list(KEY), "owner": "linux2", "validate_on": "linux",
+                                     "ignored_on": ["linux", "win32", "darwin"], "cases": ["scope::owned"]}]
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*scope::owned"):
+                    self.check(platform)
+
+    def test_a_win32_exact_owner_does_not_take_over_a_case_the_rule_owner_runs_here(self):
+        # Discovered on Linux the rule owner (Linux) runs it, so an exact entry
+        # of a Windows owner for the same case is a real disagreement there.
+        self.workflow.write_text(self.WIN_WORKFLOW)
+        self.inventory["owners"]["win"] = {"platform": "win32", "fixture": "Owned runner", "job": "win"}
+        self.inventory["groups"] = [{"target": list(KEY), "owner": "win", "validate_on": "win32",
+                                     "ignored_on": ["linux", "win32", "darwin"], "cases": ["scope::owned"]}]
+        with self.assertRaisesRegex(audit.InventoryError, "rule and legacy owners disagree.*scope::owned"):
+            self.check("linux")
+
     def test_a_legacy_backed_linux_rule_case_can_be_discovered_on_both_platforms(self):
         for platform in ("linux", "win32"):
             with self.subTest(platform=platform):

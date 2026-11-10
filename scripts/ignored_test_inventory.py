@@ -1006,8 +1006,18 @@ def validate(root, inventory, targets, platform, rules=None):
         used.update(rule["owner"] for rule in rules["rules"])
     for case, owner in assignments.items():
         if case in entries:
-            require(entries[case]["owner"] == owner,
-                    f"rule and legacy owners disagree for {case}: {owner} != {entries[case]['owner']}")
+            exact = entries[case]["owner"]
+            # The one disagreement that is the documented rule, not a conflict
+            # (AGENTS.md, "Cross-platform discovery needs an exact legacy entry
+            # or an owner that runs on the discovering platform"): a case
+            # compiled on this platform only, which a broad rule gives to an
+            # owner of another platform, has an exact entry whose owner runs
+            # here (#2491: the Windows-only PostgreSQL cases under flow_pg's
+            # blanket rule). Two owners on the same platform, or an exact owner
+            # that does not run here either, still disagree.
+            require(exact == owner
+                    or (owners[owner]["platform"] != platform and owners[exact]["platform"] == platform),
+                    f"rule and legacy owners disagree for {case}: {owner} != {exact}")
         else:
             # Exact entries are checked on validate_on. A namespace alone cannot
             # establish that another platform compiles this particular case.

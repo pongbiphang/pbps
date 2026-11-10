@@ -6444,22 +6444,43 @@ could be opened on any Windows PostgreSQL: 22 of the 23 flow cases of the W2
 measurement failed with that one error on 18.6 and 16.15 (run 42610643076).
 
 **Decision (the maintainer bundled the fix into the Windows slice, 2026-11-09).**
-The settings are sent as two statements, in this order, by one procedure that
-the first application and the restoration after `RESET ALL` / `DISCARD ALL` share:
-the three `tcp_keepalives_*` settings, mandatory, alone; then the check interval,
-alone. Only the engine's own answer to that second statement decides: SQLSTATE
-`22023` on a message that begins "invalid value for parameter" and names
-`"client_connection_check_interval"` is tolerated. Any other error on either
-statement fails the run: another parameter rejected with the same code, that
-parameter with another code (a permission, a syntax error), a lost connection, a
-tool-authored refusal. The operating system's name is never consulted, so the
-procedure follows the engine if a later release supports the interval on Windows
-or stops supporting it elsewhere.
+One procedure, shared by the first application and by the restoration after
+`RESET ALL` / `DISCARD ALL`, sends two strings in this order: the three
+`tcp_keepalives_*` settings, mandatory, alone; then the check interval, alone, in
+`SAVEPOINT pbps_keeper; SET client_connection_check_interval = '10s'; RELEASE
+SAVEPOINT pbps_keeper`. Only the engine's own answer to that second string decides:
+SQLSTATE `22023` on a message that begins "invalid value for parameter" and names
+`"client_connection_check_interval"` is tolerated, and then
+`ROLLBACK TO SAVEPOINT pbps_keeper; RELEASE SAVEPOINT pbps_keeper` is sent. Any
+other error on either string fails the run: another parameter rejected with the
+same code, that parameter with another code (a permission, a syntax error), a
+lost connection, a tool-authored refusal, and any failure of the rollback other
+than "no savepoint to return to". The operating system's name is never consulted,
+so the procedure follows the engine if a later release supports the interval on
+Windows or stops supporting it elsewhere.
 
-**Why two statements.** A failing statement of a multi-statement simple query
-rolls the whole batch back, so the mandatory keepalives could not share a batch
-with the one setting that may be refused. A third statement per setting would
-buy nothing: the three keepalives are accepted on every platform measured.
+**Why two strings.** A failing statement of a multi-statement simple query rolls
+the whole batch back, so the mandatory keepalives cannot share a batch with the
+one setting that may be refused.
+
+**Why the savepoint (measured, run 42629932339).** The first form of this fix
+swallowed the refusal on the client and 6 of the 23 cases still failed: the
+restoration runs inside the fill's `BEGIN`, and a refused statement inside a
+transaction block leaves the block aborted (`25P02: current transaction is
+aborted`), so the next read failed. That is the shape docs/PITFALLS.md calls
+"a recovery path that the engine's own transaction rules delete": tolerating an
+error on the client while continuing on the same transaction. The refused string
+runs in a savepoint, and the rollback to it returns the block to a usable state.
+Outside a transaction block the multi-statement string is its own block, which a
+refusal already rolled back, so the rollback to the savepoint finds none and
+answers `3B001` (no such savepoint) or `25P01` (no active transaction); only those
+two codes are accepted, and only for that rollback.
+
+**Why not branch on the transaction status.** The session's transaction status
+(ReadyForQuery) is not exposed by the driver the seam wraps, and a probe query
+would cost the same round trip the rollback does. So the rollback is sent after a
+tolerated refusal only, and its answer is classified by code; on a Linux engine,
+which accepts the interval, no savepoint is ever rolled back.
 
 **Consequence, stated once.** Where the interval is refused, a client killed
 inside a long statement is noticed when the statement ends instead of within
@@ -6467,10 +6488,15 @@ inside a long statement is noticed when the statement ends instead of within
 run reads as alive until then, which only keeps its resources, as for any wait.
 SPEC 9.3.2 says it in one sentence.
 
-Pinned by the unit tests of `resolver::scratch` (`keep_with` driven by a scripted
-engine: the Windows answer is tolerated with the keepalives sent first; another
-parameter with the same code, that parameter with another code or none, a lost
-connection and a refusal are failures; a refused keepalive stops everything
-after it) and the restoration recipe test. The real-engine proof is the Windows
-CI of the PR (`resolver-pg-windows`). Formats: none. No sealed bytes, plan, state
-or evidence change.
+Pinned by the unit tests of `resolver::scratch` (the procedure driven by a scripted
+engine: the Windows answer is tolerated with the keepalives sent first and the
+rollback after; `3B001` and `25P01` on the rollback are accepted and any other
+failure is not; another parameter with the same code, that parameter with another
+code or none, a lost connection and a refusal are failures with no rollback sent; a
+refused keepalive stops everything after it), the restoration recipe test, and a
+live test that runs the technique against a real engine with `lc_messages` standing
+in for the unsupported parameter (the same code and message shape): the block is
+aborted by the refusal, usable after the rollback, and outside a block the rollback
+answers a code the procedure accepts. The real-engine proof of the interval itself
+is the Windows CI of the PR (`resolver-pg-windows`). Formats: none. No sealed
+bytes, plan, state or evidence change.
