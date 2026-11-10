@@ -2775,9 +2775,7 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
             | pbps_model::Change::AddEnumValue { .. }
             | pbps_model::Change::RenameEnumValue { .. }
             | pbps_model::Change::EnumRebuild { .. }
-            | pbps_model::Change::CreateType { .. }
-            | pbps_model::Change::DropType { .. }
-            | pbps_model::Change::RenameType { .. }
+            | pbps_model::change_family!(types)
             | pbps_model::Change::CreateRole { .. }
             | pbps_model::Change::Grant { .. }
             | pbps_model::Change::PublicExecution { .. }

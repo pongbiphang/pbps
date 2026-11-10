@@ -817,26 +817,15 @@ impl Declared {
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
+                | crate::change_family!(table_properties)
                 | Change::SetPartitionNotNull { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::SetComment { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => {}
+                | crate::change_family!(rows)
+                | crate::change_family!(roles)
+                | crate::change_family!(permissions) => {}
             }
         }
     }

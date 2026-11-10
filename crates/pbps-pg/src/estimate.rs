@@ -1044,18 +1044,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::DropIndex { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
+        | pbps_model::change_family!(modules)
+        | pbps_model::change_family!(rows)
+        | pbps_model::change_family!(type_values)
         | pbps_model::catalog_change!()
         | Change::Grant { .. }
         | Change::Revoke { .. }

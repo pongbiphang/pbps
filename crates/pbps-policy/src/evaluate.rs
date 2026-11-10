@@ -363,11 +363,9 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     .is_none_or(|id| !added.contains(&(id, name.raw())))
                     .then_some(table),
                 Change::AlterColumnType { .. }
-                | Change::CreateTable { .. }
+                | pbps_model::change_family!(tables)
                 | Change::DetachPartition { .. }
                 | Change::AttachPartition { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
@@ -376,35 +374,15 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::AlterColumnExpression { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
-                | Change::SetComment { .. }
-                | Change::SetPrimaryKey { .. }
+                | pbps_model::change_family!(table_properties)
+                | pbps_model::change_family!(constraints)
                 | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
+                | pbps_model::change_family!(policies)
                 | Change::AddIndex { .. }
                 | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::AddEnumValue { .. }
-                | Change::AlterDomain { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild { .. }
+                | pbps_model::change_family!(rows)
+                | pbps_model::change_family!(modules)
+                | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
                 | Change::Grant { .. }
                 | Change::Revoke { .. }

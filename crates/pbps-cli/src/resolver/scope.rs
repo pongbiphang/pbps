@@ -336,53 +336,21 @@ pub(crate) fn planned_schema_grants(
                 target: GrantTarget::Schema(schema),
                 permissions,
             } => Some((role, schema, permissions)),
-            Change::CreateTable { .. }
+            pbps_model::change_family!(tables)
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetStorageParameters { .. }
+            | pbps_model::change_family!(columns)
+            | pbps_model::change_family!(policies)
+            | pbps_model::change_family!(table_properties)
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
+            | pbps_model::change_family!(constraints)
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            | pbps_model::change_family!(rows)
+            | pbps_model::change_family!(modules)
+            | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }

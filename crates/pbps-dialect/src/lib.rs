@@ -790,9 +790,7 @@ impl Unchecked {
                     parent = parent.shown()
                 )
             }
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
+            pbps_model::change_family!(tables)
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
@@ -808,13 +806,8 @@ impl Unchecked {
             | Change::UpdateRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            | pbps_model::change_family!(modules)
+            | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }

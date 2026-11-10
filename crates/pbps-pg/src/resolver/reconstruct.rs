@@ -420,10 +420,7 @@ impl Reconstruction {
                 Change::SetEnsureKeys { .. } => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
-                Change::AddEnumValue { .. }
-                | Change::AlterDomain { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild { .. }
+                pbps_model::change_family!(type_values)
                 | Change::DropType { .. }
                 | Change::RenameType { .. }
                 | Change::DropTable { .. }
@@ -437,14 +434,11 @@ impl Reconstruction {
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
-                | Change::SetComment { .. }
+                | pbps_model::change_family!(table_properties)
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::DropForeignKey { .. }

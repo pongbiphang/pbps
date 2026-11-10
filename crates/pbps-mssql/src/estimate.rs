@@ -204,47 +204,21 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     Work::MaybeClusteredDrop(Some(name.clone())),
                     format!("dropping `{name}`", name = name.shown(),),
                 ),
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::AlterColumnNumbering { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetComment { .. }
+                pbps_model::change_family!(tables)
+                | pbps_model::change_family!(columns)
+                | pbps_model::change_family!(table_properties)
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
-                | Change::SetReplicaIdentity { .. }
+                | pbps_model::change_family!(policies)
                 | Change::AddUnique { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::AddEnumValue { .. }
-                | Change::AlterDomain { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild { .. }
+                | pbps_model::change_family!(rows)
+                | pbps_model::change_family!(modules)
+                | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
@@ -314,9 +288,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     to_nullable,
                     ..
                 } => (uid, column, ty, ty, !*to_nullable, *to_nullable),
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
+                pbps_model::change_family!(tables)
                 | Change::AddColumn { .. }
                 | Change::DropColumn { .. }
                 | Change::RenameColumn { .. }
@@ -324,37 +296,17 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::AlterColumnExpression { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
-                | Change::SetComment { .. }
-                | Change::SetPrimaryKey { .. }
+                | pbps_model::change_family!(table_properties)
+                | pbps_model::change_family!(constraints)
                 | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
+                | pbps_model::change_family!(policies)
                 | Change::AddIndex { .. }
                 | Change::AddComputedColumn { .. }
                 | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::AddEnumValue { .. }
-                | Change::AlterDomain { .. }
-                | Change::RenameEnumValue { .. }
-                | Change::EnumRebuild { .. }
+                | pbps_model::change_family!(rows)
+                | pbps_model::change_family!(modules)
+                | pbps_model::change_family!(type_values)
                 | pbps_model::catalog_change!()
                 | Change::Grant { .. }
                 | Change::Revoke { .. }

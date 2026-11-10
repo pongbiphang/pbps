@@ -801,23 +801,12 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
             ..
         } => (Exact(Surface::Type(name.clone())), true, true),
-        Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
+        crate::change_family!(rows)
         | Change::SetColumnDeprecated { .. }
         | Change::SetComment { .. }
-        | Change::CreateRole { .. }
-        | Change::CreateExtension { .. }
-        | Change::DropExtension { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. }
-        | Change::RenameRole { .. }
-        | Change::DropRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => return None,
+        | crate::change_family!(roles)
+        | crate::change_family!(extensions)
+        | crate::change_family!(permissions) => return None,
     };
     Some((vec![owner], opening, closing))
 }

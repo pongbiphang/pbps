@@ -600,10 +600,7 @@ pub fn names(
             );
         }
         // A module rebuilt in place keeps its name; the rest take none.
-        Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
+        crate::change_family!(type_values)
         | Change::AlterModule { .. }
         | Change::UpdateExtension { .. }
         | Change::SetExtensionSchema { .. }
@@ -615,21 +612,12 @@ pub fn names(
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetRowSecurity { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::SetComment { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
+        | crate::change_family!(table_properties)
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::SetIndexStorageParameters { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => {}
+        | crate::change_family!(rows)
+        | crate::change_family!(permissions) => {}
     }
     Ok(nx.names)
 }
