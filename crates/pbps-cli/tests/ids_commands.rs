@@ -947,3 +947,40 @@ fn plan_check_succeeds_on_a_read_only_checkout_with_an_empty_identity_directory(
         "nothing written"
     );
 }
+
+#[test]
+fn resolve_refuses_a_conflicted_entry_that_is_not_a_json_file() {
+    use std::io::Write as _;
+    let p = conflicted();
+    p.write("schema/dbo/customer.yml", CUSTOMER);
+    // Two stages of one blob under a name that is not an identity file's, valid
+    // identity JSON though it is: the same refusal as every other reader.
+    let blob = String::from_utf8(
+        p.git(&["hash-object", "-w", ".pbps/ids/dbo/customer.json"])
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let mut index = Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&p.0)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let path = ".pbps/ids/dbo/customer.json.aside";
+    index
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("100644 {blob} 2\t{path}\n100644 {blob} 3\t{path}\n").as_bytes())
+        .unwrap();
+    assert!(index.wait().unwrap().success());
+    let out = p.pbps(&["ids", "resolve"]);
+    assert_refused(&out, "customer.json.aside");
+    assert!(
+        text(&out).contains("a regular .json file"),
+        "{}",
+        text(&out)
+    );
+}

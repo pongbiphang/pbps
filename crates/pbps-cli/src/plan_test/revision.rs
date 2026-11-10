@@ -22,6 +22,7 @@ use pbps_config::{Config, DialectName};
 use pbps_model::IdsFile;
 use pbps_model::escape::Escaped;
 use pbps_model::ids::{CURRENT_VERSION, IdsError};
+use pbps_model::ids_tree;
 use sha2::{Digest as _, Sha256};
 
 use super::{ConsumedFile, Revision, Role};
@@ -355,6 +356,17 @@ pub(super) fn read_commit_recorded(
     )
     .map_err(|p| problems.push(p))
     .unwrap_or_default();
+    // `ids_tree::parse` does not look at names; the other readers of the tree
+    // refuse an entry that is not an identity file, so this one does too (a
+    // refusal, not a skip: `x.json.aside` holding valid JSON is not "nothing").
+    for (path, _) in &ids {
+        if *path != relative(&prefix, &ids_dir_rel) && !ids_tree::is_identity_file(path) {
+            problems.push(Problem::NotRegular {
+                path: path.clone(),
+                what: format!("it is not {}", ids_tree::IDENTITY_FILE_RULE),
+            });
+        }
+    }
     // A file standing where the directory should be is not an empty tree.
     // (A symlink or a submodule there is refused by `tree_entries`.)
     if ids

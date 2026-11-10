@@ -559,6 +559,49 @@ fn a_revision_with_a_damaged_identity_tree_is_refused() {
     assert!(!here.contains(&&RevisionProblem::IdsOutOfDate), "{found:?}");
 }
 
+/// An entry of the identity tree that is not a `*.json` file is refused by every
+/// reader, even holding valid identity JSON: `ids_tree::parse` does not look at
+/// names, so the readers must. A refusal, never a skip.
+#[test]
+fn a_revision_with_an_identity_tree_entry_that_is_not_a_json_file_is_refused() {
+    for stray in ["app.orders.json.aside", "app.orders.txt"] {
+        let (repo, c1, _) = standard();
+        let legacy_path = repo.project.join("schema.ids.json");
+        let legacy: pbps_model::IdsFile =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();
+        let mut placement = pbps_model::ids_tree::Placement::default();
+        for (uid, name) in &legacy.tables {
+            placement
+                .paths
+                .insert(uid.clone(), name.raw().to_string() + ".json");
+        }
+        std::fs::remove_file(&legacy_path).unwrap();
+        let files = pbps_model::ids_tree::split(&legacy, &placement).unwrap();
+        for (rel, text) in &files {
+            repo.write(&format!(".pbps/ids/{rel}"), text);
+        }
+        // Negative: the plain tree passes.
+        let plain = repo.commit("plain tree");
+        repo.manifest(&plain, &[("f", &c1)], None);
+        assert!(repo.validate().is_ok(), "{stray}: the tree itself is fine");
+        // The same valid JSON under a name that is not an identity file's.
+        let (_, text) = files.iter().next().unwrap();
+        repo.write(&format!(".pbps/ids/{stray}"), text);
+        let bad = repo.commit("stray entry");
+        repo.manifest(&bad, &[("f", &c1)], None);
+        let found = refused(repo.validate());
+        let expected = format!(".pbps/ids/{stray}");
+        assert!(
+            at(&found, &bad).iter().any(|p| matches!(
+                p,
+                RevisionProblem::NotRegular { path, what }
+                    if *path == expected && what.contains("a regular .json file")
+            )),
+            "{stray}: {found:?}"
+        );
+    }
+}
+
 /// `.pbps/ids` as a file is not an empty tree.
 #[test]
 fn a_revision_whose_identity_directory_is_a_file_is_refused() {

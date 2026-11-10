@@ -581,6 +581,15 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
     let mut refusals: Vec<String> = Vec::new();
     for (rel, present) in unmerged(project, &dirs)? {
         let git_path = format!("{}/{rel}", dirs.ids);
+        // The same rule as every other reader of the tree: a conflicted
+        // `x.json.aside` is refused, not parsed.
+        if !ids_tree::is_identity_file(&rel) {
+            refusals.push(format!(
+                "{git_path}: is not {}",
+                ids_tree::IDENTITY_FILE_RULE
+            ));
+            continue;
+        }
         let stage = |n: usize| -> anyhow::Result<Option<ids_tree::TreeFile>> {
             if !present[n - 1] {
                 return Ok(None);

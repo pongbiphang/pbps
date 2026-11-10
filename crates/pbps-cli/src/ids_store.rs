@@ -104,8 +104,9 @@ pub(crate) fn tree_at(
                 "`{shown}` at `{rev}` is not a directory of identity files (git mode {mode})"
             );
             anyhow::ensure!(
-                matches!(mode, "100644" | "100755") && path.ends_with(".json"),
-                "`{shown}` at `{rev}` is not a regular .json file"
+                matches!(mode, "100644" | "100755") && ids_tree::is_identity_file(path),
+                "`{shown}` at `{rev}` is not {}",
+                ids_tree::IDENTITY_FILE_RULE
             );
             let text = std::str::from_utf8(bytes)
                 .with_context(|| format!("`{shown}` at `{rev}` is not UTF-8"))?;
