@@ -97,31 +97,16 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { .. }
+        | pbps_model::change_family!(table_properties)
+        | pbps_model::change_family!(constraints)
         | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-        | Change::SetRowSecurity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
+        | pbps_model::change_family!(policies)
         | Change::AddIndex { .. }
         | Change::AddComputedColumn { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
+        | pbps_model::change_family!(rows)
         | pbps_model::catalog_change!()
         | Change::AlterDomain { .. }
         | Change::Grant { .. }

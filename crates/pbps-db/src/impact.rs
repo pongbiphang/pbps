@@ -139,21 +139,10 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // catalog lists that (#1889).
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
+            | pbps_model::change_family!(table_properties)
+            | pbps_model::change_family!(constraints)
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
+            | pbps_model::change_family!(policies)
             | Change::AddIndex { .. }
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }

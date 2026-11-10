@@ -4388,47 +4388,23 @@ pub(crate) fn probes(
                 .collect(),
             Change::DropTable { .. }
             | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
+            | pbps_model::change_family!(columns)
+            | pbps_model::change_family!(table_properties)
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
+            | pbps_model::change_family!(policies)
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            | pbps_model::change_family!(rows)
+            | pbps_model::change_family!(modules)
+            | pbps_model::change_family!(type_values)
             | pbps_model::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }

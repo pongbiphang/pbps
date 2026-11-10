@@ -1010,10 +1010,7 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::AlterColumnNumbering { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
+        | pbps_model::change_family!(table_properties)
         | Change::SetPartitionNotNull { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetPrimaryKey { .. }
@@ -1027,13 +1024,8 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::SetEnsureKeys { .. }
         | Change::DropPolicy { .. }
         | Change::SetRowSecurity { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
-        | Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
+        | pbps_model::change_family!(modules)
+        | pbps_model::change_family!(type_values)
         | pbps_model::catalog_change!()
         | Change::Grant { .. }
         | Change::Revoke { .. }

@@ -1963,20 +1963,10 @@ pub fn before_its_partitions_indexes(
             Change::AddIndex { .. }
                 | Change::DropIndex { .. }
                 | Change::SetIndexStorageParameters { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
+                | pbps_model::change_family!(constraints)
+                | pbps_model::change_family!(policies)
                 | Change::SetReplicaIdentity { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. }
+                | pbps_model::change_family!(permissions)
         )
     };
     let mut schedule = Schedule::new(cs.changes.len());

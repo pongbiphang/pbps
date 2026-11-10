@@ -656,37 +656,17 @@ impl Build<'_, '_> {
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
+            | crate::change_family!(constraints)
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
+            | crate::change_family!(table_properties)
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
+            | crate::change_family!(policies)
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
+            | crate::change_family!(rows)
+            | crate::change_family!(modules)
+            | crate::change_family!(type_values)
             | crate::catalog_change!()
             | Change::Grant { .. }
             | Change::Revoke { .. }

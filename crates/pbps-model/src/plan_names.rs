@@ -365,39 +365,19 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(from.clone()),
             Some(to.clone()),
         )),
-        Change::AddEnumValue { .. }
-        | Change::AlterDomain { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
-        | Change::CreateExtension { .. }
-        | Change::DropExtension { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. }
+        crate::change_family!(type_values)
+        | crate::change_family!(extensions)
         | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
-        | Change::SetPrimaryKey { .. }
+        | crate::change_family!(constraints)
         | Change::SetIndexStorageParameters { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
         | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
         | Change::AddIndex { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => Other,
+        | crate::change_family!(rows)
+        | crate::change_family!(modules)
+        | crate::change_family!(permissions) => Other,
     }
 }
 

@@ -1068,49 +1068,20 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::Grant { role: name, .. }
         | Change::Revoke { role: name, .. } => Some(name),
         Change::RenameRole { from, .. } => Some(from),
-        Change::CreateTable { .. }
+        pbps_model::change_family!(tables)
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
-        | Change::DropTable { .. }
-        | Change::RenameTable { .. }
-        | Change::AddColumn { .. }
-        | Change::DropColumn { .. }
-        | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
-        | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
-        | Change::AlterColumnNumbering { .. }
-        | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetPrimaryKey { .. }
+        | pbps_model::change_family!(columns)
+        | pbps_model::change_family!(table_properties)
+        | pbps_model::change_family!(constraints)
         | Change::SetIndexStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-        | Change::AddUnique { .. }
-        | Change::DropUnique { .. }
-        | Change::AddForeignKey { .. }
-        | Change::DropForeignKey { .. }
-        | Change::AddCheck { .. }
-        | Change::DropCheck { .. }
+        | pbps_model::change_family!(policies)
         | Change::AddIndex { .. }
-        | Change::AddComputedColumn { .. }
-        | Change::DropComputedColumn { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::CreateModule { .. }
-        | Change::AlterModule { .. }
-        | Change::DropModule { .. }
+        | pbps_model::change_family!(rows)
+        | pbps_model::change_family!(modules)
         // `PUBLIC` is not a role the summary can count: no declaration, ids
         // file or pull ever names it (ADR-0010 §5).
         | Change::PublicExecution { .. } => None,

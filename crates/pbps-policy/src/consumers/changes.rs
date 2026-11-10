@@ -298,34 +298,18 @@ pub(super) fn classify(
         | Change::AnalyzeTableTree(_)
         | Change::AddEnumValue { .. }
         | Change::CreateType { .. }
-        | Change::CreateExtension { .. }
-        | Change::DropExtension { .. }
-        | Change::UpdateExtension { .. }
-        | Change::SetExtensionSchema { .. }
+        | pbps_model::change_family!(extensions)
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::SetReplicaIdentity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
+        | pbps_model::change_family!(table_properties)
         | Change::SetIndexStorageParameters { .. }
-        | Change::CreatePolicy { .. }
-        | Change::DropPolicy { .. }
-        | Change::SetRowSecurity { .. }
+        | pbps_model::change_family!(policies)
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
-        | Change::CreateRole { .. }
-        | Change::DropRole { .. }
-        | Change::RenameRole { .. }
-        | Change::Grant { .. }
-        | Change::Revoke { .. }
-        | Change::PublicExecution { .. } => None,
+        | pbps_model::change_family!(rows)
+        | pbps_model::change_family!(roles)
+        | pbps_model::change_family!(permissions) => None,
     }
 }

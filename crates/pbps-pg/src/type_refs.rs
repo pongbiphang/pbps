@@ -125,37 +125,20 @@ fn reference_uses<'a>(
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
+            | pbps_model::change_family!(table_properties)
+            | pbps_model::change_family!(policies)
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
+            | pbps_model::change_family!(constraints)
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
+            | pbps_model::change_family!(modules)
             | Change::DropType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => {}
+            | pbps_model::change_family!(roles)
+            | pbps_model::change_family!(permissions) => {}
         }
     }
     types

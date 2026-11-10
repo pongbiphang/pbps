@@ -256,20 +256,11 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         | Change::DropForeignKey { .. }
         | Change::AlterColumnNullability { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::SetComment { .. }
-        | Change::DropPolicy { .. }
-        | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-        | Change::SetStorageParameters { .. }
-        | Change::SetTablePersistence { .. }
+        | pbps_model::change_family!(table_properties)
+        | pbps_model::change_family!(policies)
         | Change::SetIndexStorageParameters { .. }
         | Change::SetPartitionNotNull { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
-        | Change::SetDataMode { .. }
-        | Change::SetEnsureKeys { .. }
+        | pbps_model::change_family!(rows)
         | Change::AddEnumValue { .. }
         | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }

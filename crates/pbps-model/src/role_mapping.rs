@@ -140,58 +140,23 @@ impl RoleMapping {
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_)
             | Change::PublicExecution { .. }
-            | Change::AddEnumValue { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. }
-            | Change::CreateTable { .. }
+            | crate::change_family!(type_values)
+            | crate::change_family!(types)
+            | crate::change_family!(extensions)
+            | crate::change_family!(tables)
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterDomain { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
+            | crate::change_family!(columns)
+            | crate::change_family!(constraints)
             | Change::SetIndexStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
-            | Change::SetStorageParameters { .. }
+            | crate::change_family!(table_properties)
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetComment { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
             | Change::AddIndex { .. }
-            | Change::AddComputedColumn { .. }
-            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. } => {}
+            | crate::change_family!(rows)
+            | crate::change_family!(modules) => {}
         }
     }
 }

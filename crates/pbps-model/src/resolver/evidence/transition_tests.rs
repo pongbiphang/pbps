@@ -1354,20 +1354,13 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             Change::RenameTable { from, .. } => Surface::Table(from.clone()),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
-            | Change::CreateExtension { .. }
-            | Change::DropExtension { .. }
-            | Change::UpdateExtension { .. }
-            | Change::SetExtensionSchema { .. }
+            | crate::change_family!(extensions)
             | Change::AttachPartition { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
             | Change::AddComputedColumn { .. }
-            | Change::DropPolicy { .. }
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
-            | Change::SetReplicaIdentity { .. }
-            | Change::SetStorageParameters { .. }
-            | Change::SetTablePersistence { .. }
+            | crate::change_family!(policies)
+            | crate::change_family!(table_properties)
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1379,37 +1372,15 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::SetComment { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
+            | crate::change_family!(constraints)
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::SetEnsureKeys { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::AddEnumValue { .. }
-            | Change::AlterDomain { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => panic!("rename fixture"),
+            | crate::change_family!(rows)
+            | crate::change_family!(modules)
+            | crate::change_family!(type_values)
+            | crate::change_family!(types)
+            | crate::change_family!(roles)
+            | crate::change_family!(permissions) => panic!("rename fixture"),
         };
         let rename_index = evidence
             .transitions
