@@ -38,6 +38,7 @@
 
 use std::ops::RangeInclusive;
 
+use pbps_dialect::types::{ArgShape, Excess, MaxWord, Omitted, ScaleRange, TypeTable, Unknown};
 use pbps_dialect::{DialectError, TypeChangeRisk};
 use pbps_model::{ColumnType, RoutineArg, TypeArg, TypeRef};
 
@@ -64,23 +65,22 @@ const MAX_FLOAT_BITS: i64 = 53;
 /// declaration that records itself at one value and reads back at another.
 const MAX_INTERVAL_PRECISION: i64 = 6;
 
-/// What kind of argument list a type takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArgShape {
-    /// No arguments at all: `integer`, `text`, `date`, `uuid`, `inet`.
-    None,
-    /// One length in `1..=MAX_STRING_LEN`. `fills_in` is what the engine
-    /// supplies when the declaration writes none, and the two string types
-    /// disagree about it — measured, `character` becomes `character(1)` and
-    /// `character varying` stays unbounded.
-    Length { fills_in: Option<i64> },
-    /// `numeric[(p[,s])]`. Measured: bare `numeric` reads back as `numeric`
-    /// with no arguments at all — unbounded, and *not* the `(18,0)` SQL Server
-    /// fills in — while `numeric(10)` reads back as `numeric(10,0)`.
-    Numeric,
-    /// Seconds precision, bounded because the engine silently clamps excess.
-    Precision { max: i64 },
-}
+/// `numeric[(p[,s])]`. Measured: bare `numeric` reads back as `numeric` with no
+/// arguments at all -- unbounded, and *not* the `(18,0)` SQL Server fills in --
+/// while `numeric(10)` reads back as `numeric(10,0)`.
+const NUMERIC: ArgShape = ArgShape::Scale {
+    max_precision: MAX_NUMERIC_PRECISION,
+    scale: ScaleRange::Signed(MAX_NUMERIC_SCALE),
+    omitted: Omitted::Empty,
+};
+
+/// Seconds precision of the time types and `interval`, all measured at 6 and
+/// bounded because the engine silently clamps excess. Bare, it reads back bare.
+const TIME_PRECISION: ArgShape = ArgShape::Precision {
+    max: 6,
+    omitted: Omitted::Empty,
+    excess: Excess::Clamped,
+};
 
 /// Every type name this dialect admits, spelled as the engine spells it back,
 /// with the shape of its argument list. Aliases are resolved before this table
@@ -98,27 +98,38 @@ const CATALOGUE: &[(&str, ArgShape)] = &[
     ("smallint", ArgShape::None),
     ("integer", ArgShape::None),
     ("bigint", ArgShape::None),
-    ("numeric", ArgShape::Numeric),
+    ("numeric", NUMERIC),
     // Approximate numerics. `float(n)` is an alias that resolves into one of
     // these two, so the spelling `float` never survives normalization.
     ("real", ArgShape::None),
     ("double precision", ArgShape::None),
     ("boolean", ArgShape::None),
     // Character strings. Only `character varying` may be unbounded.
-    ("character", ArgShape::Length { fills_in: Some(1) }),
-    ("character varying", ArgShape::Length { fills_in: None }),
+    (
+        "character",
+        ArgShape::Length {
+            max: MAX_STRING_LEN,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Absent,
+        },
+    ),
+    (
+        "character varying",
+        ArgShape::Length {
+            max: MAX_STRING_LEN,
+            omitted: Omitted::Empty,
+            max_word: MaxWord::Absent,
+        },
+    ),
     ("text", ArgShape::None),
     ("bytea", ArgShape::None),
     // Date and time. Precision follows the first word of a time type's name.
     ("date", ArgShape::None),
-    ("time without time zone", ArgShape::Precision { max: 6 }),
-    ("time with time zone", ArgShape::Precision { max: 6 }),
-    (
-        "timestamp without time zone",
-        ArgShape::Precision { max: 6 },
-    ),
-    ("timestamp with time zone", ArgShape::Precision { max: 6 }),
-    ("interval", ArgShape::Precision { max: 6 }),
+    ("time without time zone", TIME_PRECISION),
+    ("time with time zone", TIME_PRECISION),
+    ("timestamp without time zone", TIME_PRECISION),
+    ("timestamp with time zone", TIME_PRECISION),
+    ("interval", TIME_PRECISION),
     // Everything else.
     ("uuid", ArgShape::None),
     ("json", ArgShape::None),
@@ -250,23 +261,14 @@ fn identifier(s: &str) -> Option<(&str, &str)> {
     (end > 0).then(|| s.split_at(end))
 }
 
-fn shape_of(base: &str) -> Option<ArgShape> {
-    CATALOGUE.iter().find(|(n, _)| *n == base).map(|(_, s)| *s)
-}
-
-fn canonical_base(base: &str) -> &str {
-    ALIASES
-        .iter()
-        .find(|(a, _)| *a == base)
-        .map_or(base, |(_, c)| *c)
-}
-
-fn unknown(ty: &ColumnType) -> DialectError {
-    DialectError::UnknownType {
-        dialect: DIALECT,
-        ty: ty.raw().to_string(),
-    }
-}
+/// The shared form of the two tables above, which the lookup and the
+/// argument filling read.
+const TABLE: TypeTable = TypeTable {
+    dialect: DIALECT,
+    catalogue: CATALOGUE,
+    aliases: ALIASES,
+    unknown: Unknown::Refuse,
+};
 
 fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     DialectError::BadTypeArity {
@@ -375,9 +377,9 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     // but a multi-word base name such as `double  precision` can still carry
     // runs of spaces.
     let base_words: Vec<&str> = ty.base.split_whitespace().collect();
-    let base = base_words.join(" ");
+    let base = TypeTable::squeeze(&ty.base);
     let temporal_name = matches!(
-        canonical_base(&base),
+        TABLE.alias(&base),
         "time without time zone"
             | "time with time zone"
             | "timestamp without time zone"
@@ -399,85 +401,15 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             "time and timestamp precision must follow the first word of the type name",
         ));
     }
-    let base = canonical_base(&base).to_owned();
+    let base = TABLE.alias(&base).to_owned();
     // `float(n)` is resolved before the catalogue is consulted, and is not in
     // it: the spelling is not a type this dialect ever returns, and which type
     // it becomes depends on its argument, which no alias table can express.
     if base == "float" {
         return resolve_float(ty);
     }
-    let Some(shape) = shape_of(&base) else {
-        return Err(unknown(ty));
-    };
-
-    let args = match shape {
-        ArgShape::None => {
-            if !ty.args.is_empty() {
-                return Err(arity(ty, format!("`{base}` takes no arguments")));
-            }
-            Vec::new()
-        }
-
-        ArgShape::Length { fills_in } => match ty.args.as_slice() {
-            [] => fills_in.map(TypeArg::Int).into_iter().collect(),
-            [TypeArg::Int(n)] if (1..=MAX_STRING_LEN).contains(n) => vec![TypeArg::Int(*n)],
-            [TypeArg::Int(n)] => {
-                return Err(arity(
-                    ty,
-                    format!("the length must be between 1 and {MAX_STRING_LEN}, got {n}"),
-                ));
-            }
-            // `max` is SQL Server's word, and this engine has no equivalent:
-            // the unbounded form of `character varying` is the one with no
-            // argument at all.
-            _ => {
-                return Err(arity(
-                    ty,
-                    format!("`{base}` takes one length, or none for the unbounded form"),
-                ));
-            }
-        },
-
-        ArgShape::Numeric => match ty.args.as_slice() {
-            // Bare `numeric` is arbitrary precision, and stays that way: the
-            // engine reads it back with no arguments, so filling any in would
-            // declare a different type from the one that comes back.
-            [] => Vec::new(),
-            [TypeArg::Int(p)] => {
-                check_numeric(ty, *p, 0)?;
-                vec![TypeArg::Int(*p), TypeArg::Int(0)]
-            }
-            [TypeArg::Int(p), TypeArg::Int(s)] => {
-                check_numeric(ty, *p, *s)?;
-                vec![TypeArg::Int(*p), TypeArg::Int(*s)]
-            }
-            _ => {
-                return Err(arity(
-                    ty,
-                    "`numeric` takes a precision and an optional scale, or nothing at all",
-                ));
-            }
-        },
-
-        ArgShape::Precision { max } => match ty.args.as_slice() {
-            [] => Vec::new(),
-            [TypeArg::Int(n)] if (0..=max).contains(n) => {
-                vec![TypeArg::Int(*n)]
-            }
-            [TypeArg::Int(n)] => {
-                return Err(arity(
-                    ty,
-                    format!(
-                        "the precision of `{base}` must be between 0 and \
-                         {max}, got {n}. The engine does not refuse a larger \
-                         one -- it stores precision {max} and says nothing, \
-                         so a declaration that kept it would read back as something else"
-                    ),
-                ));
-            }
-            _ => return Err(arity(ty, format!("`{base}` takes one precision"))),
-        },
-    };
+    let found = TABLE.shape_of(ty, &base)?;
+    let args = TABLE.fill(ty, &found)?;
 
     let normalized = ColumnType::new(base, args);
     if temporal_name && !normalized.args.is_empty() {
@@ -507,31 +439,6 @@ fn resolve_float(ty: &ColumnType) -> Result<ColumnType, DialectError> {
         )),
         _ => Err(arity(ty, "`float` takes one precision")),
     }
-}
-
-fn check_numeric(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
-    if !(1..=MAX_NUMERIC_PRECISION).contains(&p) {
-        return Err(arity(
-            ty,
-            format!(
-                "the precision of `numeric` must be between 1 and {MAX_NUMERIC_PRECISION}, got {p}"
-            ),
-        ));
-    }
-    // A scale larger than the precision is legal here, and so is a negative
-    // one — `numeric(10,-5)` rounds to the nearest hundred thousand and reads
-    // back as itself. Copying SQL Server's `0 <= s <= p` would refuse a
-    // declaration the engine accepts.
-    if !(-MAX_NUMERIC_SCALE..=MAX_NUMERIC_SCALE).contains(&s) {
-        return Err(arity(
-            ty,
-            format!(
-                "the scale of `numeric` must be between -{MAX_NUMERIC_SCALE} and \
-                 {MAX_NUMERIC_SCALE}, got {s}"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// The values a column of this type may hold, if it may carry an `identity:`
