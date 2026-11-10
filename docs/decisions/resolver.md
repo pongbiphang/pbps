@@ -6434,8 +6434,8 @@ bytes, plan, state, schema set or evidence change.
 
 <a id="dec-2777-1"></a>
 
-**DEC-2777.1. The scratch keeper tolerates the engine refusing
-`client_connection_check_interval` as unsupported, and nothing else (#2777,
+**DEC-2777.1. The engine absorbs the refusal of `client_connection_check_interval`
+as unsupported, in a block it decides; the client tolerates nothing (#2777,
 #2491 W2).** The keeper session (DEC-2410.3) sent its four settings in one
 batch. On Windows, PostgreSQL rejects any nonzero `client_connection_check_interval`
 (SQLSTATE `22023`, "invalid value for parameter", because the operating system
@@ -6443,60 +6443,76 @@ cannot report that the peer closed), so the batch failed and no resolver scratch
 could be opened on any Windows PostgreSQL: 22 of the 23 flow cases of the W2
 measurement failed with that one error on 18.6 and 16.15 (run 42610643076).
 
-**Decision (the maintainer bundled the fix into the Windows slice, 2026-11-09).**
-One procedure, shared by the first application and by the restoration after
+**Decision (the maintainer bundled the fix into the Windows slice, 2026-11-09;
+the maintainer's coordinator approved the engine-side form, 2026-11-10).** One
+procedure, shared by the first application and by the restoration after
 `RESET ALL` / `DISCARD ALL`, sends two strings in this order: the three
-`tcp_keepalives_*` settings, mandatory, alone; then the check interval, alone, in
-`SAVEPOINT pbps_keeper; SET client_connection_check_interval = '10s'; RELEASE
-SAVEPOINT pbps_keeper`. Only the engine's own answer to that second string decides:
-SQLSTATE `22023` on a message that begins "invalid value for parameter" and names
-`"client_connection_check_interval"` is tolerated, and then
-`ROLLBACK TO SAVEPOINT pbps_keeper; RELEASE SAVEPOINT pbps_keeper` is sent. Any
-other error on either string fails the run: another parameter rejected with the
-same code, that parameter with another code (a permission, a syntax error), a
-lost connection, a tool-authored refusal, and any failure of the rollback other
-than "no savepoint to return to". The operating system's name is never consulted,
-so the procedure follows the engine if a later release supports the interval on
-Windows or stops supporting it elsewhere.
+`tcp_keepalives_*` settings, mandatory, alone; then the check interval, alone, as
+a PL/pgSQL `DO` block whose exception handler catches `invalid_parameter_value`
+(SQLSTATE `22023`), looks at the message for the quoted parameter name
+`"client_connection_check_interval"` and, finding it, ends quietly; for anything
+else it executes `RAISE;`, which raises the original error again with its own code
+and message. The client treats every error from either string as the caller's.
+The decision about what is "unsupported" is the engine's: the block runs on the
+engine that refuses or accepts the setting, and nothing consults the operating
+system's name, so the procedure follows the engine if a later release supports
+the interval on Windows or stops supporting it elsewhere. The sentence is matched
+by the quoted name and the code, never by its English words: a server whose
+messages are translated keeps the name.
+
+**Why a block and not a client-side tolerance (measured twice).**
+- The first form swallowed the refusal on the client. 6 of the 23 cases still
+  failed (run 42629932339): the restoration runs inside the fill's `BEGIN`, and a
+  refused statement inside a transaction block leaves the block aborted
+  (`25P02: current transaction is aborted`). That is the shape docs/PITFALLS.md
+  calls "a recovery path that the engine's own transaction rules delete": a
+  recovery on the client that continues with the same transaction.
+- The second form wrapped the setting in `SAVEPOINT` in a multi-statement string.
+  It failed in 22 of 23 cases (run 42809308795): PostgreSQL refuses `SAVEPOINT`
+  outside a transaction block, and the implicit block of a multi-statement simple
+  query does not count (measured on 18.6 and 16.15). Branching on the
+  session's transaction status was not an option either: the driver the seam wraps
+  does not expose ReadyForQuery, and a probe would cost a round trip.
+- A `DO` block's exception handler is a subtransaction the engine opens itself,
+  in or out of a transaction block, so a refusal never aborts the block it ran in
+  and never reaches the client. One round trip, no failed statement and no log
+  line on an accepting engine.
 
 **Why two strings.** A failing statement of a multi-statement simple query rolls
 the whole batch back, so the mandatory keepalives cannot share a batch with the
-one setting that may be refused.
+setting that may be refused.
 
-**Why the savepoint (measured, run 42629932339).** The first form of this fix
-swallowed the refusal on the client and 6 of the 23 cases still failed: the
-restoration runs inside the fill's `BEGIN`, and a refused statement inside a
-transaction block leaves the block aborted (`25P02: current transaction is
-aborted`), so the next read failed. That is the shape docs/PITFALLS.md calls
-"a recovery path that the engine's own transaction rules delete": tolerating an
-error on the client while continuing on the same transaction. The refused string
-runs in a savepoint, and the rollback to it returns the block to a usable state.
-Outside a transaction block the multi-statement string is its own block, which a
-refusal already rolled back, so the rollback to the savepoint finds none and
-answers `3B001` (no such savepoint) or `25P01` (no active transaction); only those
-two codes are accepted, and only for that rollback.
-
-**Why not branch on the transaction status.** The session's transaction status
-(ReadyForQuery) is not exposed by the driver the seam wraps, and a probe query
-would cost the same round trip the rollback does. So the rollback is sent after a
-tolerated refusal only, and its answer is classified by code; on a Linux engine,
-which accepts the interval, no savepoint is ever rolled back.
+**The PL/pgSQL dependency, and what it looks like when it fails.** The block needs
+the language, which every database has and `PUBLIC` may use unless an operator
+revoked `USAGE`. Where it is unavailable or revoked the keeper fails with the
+engine's own error, which names the cause (`42501: permission denied for language
+plpgsql`; an absent language is `42704`), carried into the run's refusal "the
+scratch session's keepalive settings: ...". It is never absorbed: the handler is
+inside the block, so an error that stops the block from running is not its to
+catch. Nothing else in the resolver depended on PL/pgSQL before this; an
+operator who revoked it must grant `USAGE ON LANGUAGE plpgsql` to the scratch
+account. The live test revokes it from `PUBLIC` in a database of its own and
+checks the code and the language name.
 
 **Consequence, stated once.** Where the interval is refused, a client killed
 inside a long statement is noticed when the statement ends instead of within
 10 s; an idle session or a vanished host is still noticed by the keepalives. The
 run reads as alive until then, which only keeps its resources, as for any wait.
-SPEC 9.3.2 says it in one sentence.
+SPEC 9.3.2 says it in one sentence. On an engine that accepts the interval the
+behaviour is unchanged: the setting is in effect, in or out of a transaction block.
 
-Pinned by the unit tests of `resolver::scratch` (the procedure driven by a scripted
-engine: the Windows answer is tolerated with the keepalives sent first and the
-rollback after; `3B001` and `25P01` on the rollback are accepted and any other
-failure is not; another parameter with the same code, that parameter with another
-code or none, a lost connection and a refusal are failures with no rollback sent; a
-refused keepalive stops everything after it), the restoration recipe test, and a
-live test that runs the technique against a real engine with `lc_messages` standing
-in for the unsupported parameter (the same code and message shape): the block is
-aborted by the refusal, usable after the rollback, and outside a block the rollback
-answers a code the procedure accepts. The real-engine proof of the interval itself
-is the Windows CI of the PR (`resolver-pg-windows`). Formats: none. No sealed
-bytes, plan, state or evidence change.
+Pinned by unit tests of `resolver::scratch` (the order of the two strings; a
+scripted engine whose errors, whatever they say, are the caller's from either string; the
+template `guarded_set` yielding exactly the text the keeper sends) and four live
+tests against a real engine, with `lc_messages` standing in for the unsupported
+parameter (a locale the server lacks is refused with the same code and message
+shape): the interval and the keepalives in effect in and out of a block after the
+restoration; the named parameter's refusal absorbed in and out of a block without
+aborting it, also when the sentence is translated; another parameter, the code
+without the name, the name under another code (`42501`) and an unrelated error
+(`22012`) raised again with their own code, in and out of a block; the revoked
+language refusing by name. Revert witness: with the exception handler removed from the
+text, the absorption test fails; restored from a file copy and the four pass.
+The real-engine proof of the interval itself is the Windows CI of the PR
+(`resolver-pg-windows`). Formats: none. No sealed bytes, plan, state or evidence
+change.

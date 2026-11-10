@@ -117,40 +117,38 @@ pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_count = 3";
 
 /// The keeper's check that the client is still connected while a statement
-/// runs (#2410), sent alone and inside a savepoint. PostgreSQL accepts a
-/// nonzero value only where the operating system can report that the peer
-/// closed, and rejects it as an invalid value elsewhere (Windows): see
-/// [`unsupported_interval`] (#2777). The savepoint is what makes a refusal
-/// harmless inside a transaction: a failed statement would otherwise leave the
-/// block aborted ("current transaction is aborted"), and the restoration after
-/// `RESET ALL` runs inside the fill's transaction. It also works outside one:
-/// a multi-statement string is its own transaction block.
-pub const KEEPER_CHECK_INTERVAL: &str = "SAVEPOINT pbps_keeper; \
+/// runs (#2410), sent alone, as a block that the ENGINE decides (#2777):
+/// PostgreSQL accepts a nonzero `client_connection_check_interval` only where
+/// the operating system can report that the peer closed, and rejects it as an
+/// invalid value elsewhere (Windows). The refusal is caught where it happens,
+/// in a `DO` block's exception handler, which is a subtransaction: the session,
+/// in or out of a transaction block, goes on, and nothing reaches the client
+/// to be tolerated there (a refused statement the client swallowed left the
+/// fill's transaction aborted, 25P02; a `SAVEPOINT` in a multi-statement string
+/// is refused outside a block). It needs PL/pgSQL, which every database has and
+/// `PUBLIC` may use unless an operator revoked it: then the keeper fails with
+/// the engine's own error naming the language (DEC-2777.1).
+pub const KEEPER_CHECK_INTERVAL: &str = "DO $pbps$ DECLARE refusal text; BEGIN \
      SET client_connection_check_interval = '10s'; \
-     RELEASE SAVEPOINT pbps_keeper";
+     EXCEPTION WHEN invalid_parameter_value THEN \
+     GET STACKED DIAGNOSTICS refusal = MESSAGE_TEXT; \
+     IF position('\"client_connection_check_interval\"' in refusal) = 0 THEN RAISE; END IF; \
+     END $pbps$";
 
-/// What follows a tolerated refusal: back to the savepoint, in a transaction
-/// block that is still open. Outside one, the refused string rolled itself
-/// back and there is no savepoint to return to ([`nothing_to_undo`]).
-pub const KEEPER_UNDO: &str = "ROLLBACK TO SAVEPOINT pbps_keeper; RELEASE SAVEPOINT pbps_keeper";
-
-/// The parameter [`KEEPER_CHECK_INTERVAL`] sets, as the server quotes it.
-const CHECK_INTERVAL_PARAMETER: &str = "\"client_connection_check_interval\"";
-
-/// Whether `error` is the engine saying that it does not support
-/// [`KEEPER_CHECK_INTERVAL`] on this platform, and nothing else: SQLSTATE
-/// `22023` (invalid parameter value) on a message naming exactly that
-/// parameter. Another parameter's rejection, the same parameter with another
-/// code (a permission, a syntax error, a lost connection) and a connection
-/// that failed before reaching the engine are all different things and stay
-/// failures. The answer is the engine's, never the operating system's name.
-pub fn unsupported_interval(error: &DbError) -> bool {
-    matches!(
-        error,
-        DbError::Driver { code: Some(code), message, .. }
-            if code == "22023"
-                && message.starts_with("invalid value for parameter ")
-                && message.contains(CHECK_INTERVAL_PARAMETER)
+/// [`KEEPER_CHECK_INTERVAL`]'s shape for any one `SET` statement and the
+/// parameter whose refusal it tolerates: SQLSTATE `22023` naming exactly that
+/// quoted parameter, which is language-independent (the sentence is
+/// translated, the quoted name is not), and nothing else; every other error is
+/// raised again as it was. Exists so that the live tests drive the very text
+/// the keeper sends with other parameters the engine really refuses; a unit
+/// test pins that it yields [`KEEPER_CHECK_INTERVAL`] for the interval.
+pub fn guarded_set(parameter: &str, set: &str) -> String {
+    format!(
+        "DO $pbps$ DECLARE refusal text; BEGIN {set}; \
+         EXCEPTION WHEN invalid_parameter_value THEN \
+         GET STACKED DIAGNOSTICS refusal = MESSAGE_TEXT; \
+         IF position('\"{parameter}\"' in refusal) = 0 THEN RAISE; END IF; \
+         END $pbps$"
     )
 }
 
@@ -173,31 +171,18 @@ impl<T: ExecuteConnection> SendKeeper for T {
     }
 }
 
-/// Whether `error` is the engine saying that [`KEEPER_UNDO`] has no
-/// transaction block or savepoint to act on (`3B001` invalid savepoint,
-/// `25P01` no active transaction): the refused string was its own block and
-/// already rolled back. Any other error is a failure.
-fn nothing_to_undo(error: &DbError) -> bool {
-    matches!(error, DbError::Driver { code: Some(code), .. } if code == "3B001" || code == "25P01")
-}
-
 /// Applies the keeper's settings, one string per call: the mandatory
 /// keepalives first and alone (a failing statement of a multi-statement batch
-/// rolls the whole batch back, so the one that may be refused cannot share
-/// it), then the check interval in its savepoint, whose rejection as
-/// unsupported is tolerated and nothing else is. Where it is refused, a client
-/// killed inside a long statement is noticed when the statement ends instead
-/// of within the interval, which only keeps the run's resources a while longer
-/// (SPEC 9.3.2, DEC-2777.1).
+/// rolls the whole batch back, so nothing that may be refused shares it), then
+/// the check interval, whose refusal as unsupported the engine absorbs
+/// ([`KEEPER_CHECK_INTERVAL`]). The client tolerates nothing: any error from
+/// either string is the caller's. Where the engine refuses the interval, a
+/// client killed inside a long statement is noticed when the statement ends
+/// instead of within the interval, which only keeps the run's resources a
+/// while longer (SPEC 9.3.2, DEC-2777.1).
 pub async fn keep(conn: &mut impl SendKeeper) -> Result<(), DbError> {
     conn.send(KEEPER_SETTINGS).await?;
-    match conn.send(KEEPER_CHECK_INTERVAL).await {
-        Err(error) if unsupported_interval(&error) => match conn.send(KEEPER_UNDO).await {
-            Err(undo) if !nothing_to_undo(&undo) => Err(undo),
-            _ => Ok(()),
-        },
-        other => other,
-    }
+    conn.send(KEEPER_CHECK_INTERVAL).await
 }
 
 /// The first OID a database assigns after initdb. Everything below it was
@@ -1535,23 +1520,6 @@ mod tests {
         assert!(empty.confined());
     }
 
-    fn rejection(code: Option<&str>, message: &str) -> DbError {
-        DbError::Driver {
-            message: message.to_owned(),
-            code: code.map(str::to_owned),
-            diagnostic: None,
-        }
-    }
-
-    /// What PostgreSQL on Windows answers to the interval (#2777): measured on
-    /// 18.6 and 16.15 (the run 42610643076 job log).
-    fn windows_answer() -> DbError {
-        rejection(
-            Some("22023"),
-            "invalid value for parameter \"client_connection_check_interval\": 10000",
-        )
-    }
-
     /// A scripted engine: `answers` maps a statement to its error, every other
     /// statement succeeds; `sent` records what arrived, in order.
     struct Scripted {
@@ -1584,165 +1552,270 @@ mod tests {
         (engine.sent, outcome)
     }
 
-    #[tokio::test]
-    async fn an_engine_that_does_not_support_the_check_interval_still_keeps_the_session() {
-        // Inside a transaction block the refused string left the block aborted
-        // (#2777); the undo returns to the savepoint, and its answer decides
-        // nothing there.
-        let (sent, outcome) = keep_scripted(vec![(KEEPER_CHECK_INTERVAL, windows_answer())]).await;
-        assert!(outcome.is_ok(), "{outcome:?}");
-        // The mandatory keepalives went first and alone, the interval next,
-        // then the undo of the refused savepoint.
-        assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL, KEEPER_UNDO]);
-        assert!(!KEEPER_SETTINGS.contains("client_connection_check_interval"));
-        assert!(KEEPER_SETTINGS.contains("tcp_keepalives_count = 3"));
-    }
-
-    #[tokio::test]
-    async fn outside_a_transaction_block_there_is_nothing_to_undo_and_that_is_fine() {
-        for code in ["3B001", "25P01"] {
-            let (sent, outcome) = keep_scripted(vec![
-                (KEEPER_CHECK_INTERVAL, windows_answer()),
-                (KEEPER_UNDO, rejection(Some(code), "no such savepoint")),
-            ])
-            .await;
-            assert!(outcome.is_ok(), "{code}: {outcome:?}");
-            assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL, KEEPER_UNDO]);
+    fn error(code: &str, message: &str) -> DbError {
+        DbError::Driver {
+            message: message.to_owned(),
+            code: Some(code.to_owned()),
+            diagnostic: None,
         }
     }
 
     #[tokio::test]
-    async fn any_other_failure_of_the_undo_is_a_failure() {
-        for error in [
-            rejection(None, "connection closed"),
-            rejection(Some("25P02"), "current transaction is aborted"),
-            rejection(Some("42501"), "permission denied"),
-        ] {
-            let (sent, outcome) = keep_scripted(vec![
-                (KEEPER_CHECK_INTERVAL, windows_answer()),
-                (KEEPER_UNDO, error),
-            ])
-            .await;
-            assert!(outcome.is_err(), "{outcome:?}");
-            assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL, KEEPER_UNDO]);
-        }
-    }
-
-    #[tokio::test]
-    async fn an_engine_that_supports_it_gets_the_two_strings_and_no_undo() {
+    async fn the_keepalives_go_first_and_alone_then_the_interval() {
         let (sent, outcome) = keep_scripted(vec![]).await;
         assert!(outcome.is_ok());
         assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL]);
+        assert_eq!(KEEPER_SETTINGS.matches("SET ").count(), 3);
+        assert!(KEEPER_SETTINGS.contains("tcp_keepalives_count = 3"));
+        assert!(!KEEPER_SETTINGS.contains("client_connection_check_interval"));
+        assert!(!KEEPER_SETTINGS.contains("DO "));
+    }
+
+    #[tokio::test]
+    async fn the_client_tolerates_nothing_whatever_the_engine_answers() {
+        // The engine absorbs the one refusal inside the block; an error that
+        // does reach the client, from either string, is the caller's.
+        for (statement, sent_after) in [
+            (KEEPER_SETTINGS, vec![KEEPER_SETTINGS]),
+            (
+                KEEPER_CHECK_INTERVAL,
+                vec![KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL],
+            ),
+        ] {
+            for failure in [
+                error(
+                    "22023",
+                    "invalid value for parameter \"client_connection_check_interval\": 10000",
+                ),
+                error("42501", "permission denied for language plpgsql"),
+                error("25P02", "current transaction is aborted"),
+            ] {
+                let (sent, outcome) = keep_scripted(vec![(statement, failure)]).await;
+                assert!(outcome.is_err(), "{statement}: {outcome:?}");
+                assert_eq!(sent, sent_after);
+            }
+        }
     }
 
     #[test]
-    fn the_interval_is_one_setting_in_a_savepoint_and_the_keepalives_are_separate() {
-        assert_eq!(KEEPER_CHECK_INTERVAL.matches("SET ").count(), 1);
-        assert!(
+    fn the_interval_block_is_the_template_applied_to_the_interval() {
+        assert_eq!(
+            guarded_set(
+                "client_connection_check_interval",
+                "SET client_connection_check_interval = '10s'"
+            ),
             KEEPER_CHECK_INTERVAL
-                .starts_with("SAVEPOINT pbps_keeper; SET client_connection_check_interval")
         );
-        assert!(KEEPER_CHECK_INTERVAL.ends_with("RELEASE SAVEPOINT pbps_keeper"));
-        assert!(KEEPER_UNDO.starts_with("ROLLBACK TO SAVEPOINT pbps_keeper"));
-        assert_eq!(KEEPER_SETTINGS.matches("SET ").count(), 3);
-        assert!(!KEEPER_SETTINGS.contains("SAVEPOINT"));
+        // Exactly one SET, in a block that re-raises everything it does not name.
+        assert_eq!(KEEPER_CHECK_INTERVAL.matches("SET ").count(), 1);
+        assert!(KEEPER_CHECK_INTERVAL.contains("EXCEPTION WHEN invalid_parameter_value THEN"));
+        assert!(KEEPER_CHECK_INTERVAL.contains("RAISE; END IF"));
+        assert!(!KEEPER_CHECK_INTERVAL.contains("WHEN OTHERS"));
     }
 
-    #[tokio::test]
-    async fn only_that_parameters_rejection_is_tolerated() {
-        for (why, error) in [
-            (
-                "another parameter, same code",
-                rejection(
-                    Some("22023"),
-                    "invalid value for parameter \"tcp_keepalives_count\": 3",
-                ),
-            ),
-            (
-                "that parameter, another code",
-                rejection(
-                    Some("42501"),
-                    "permission denied to set parameter \"client_connection_check_interval\"",
-                ),
-            ),
-            (
-                "that parameter named in a message with no code",
-                rejection(
-                    None,
-                    "invalid value for parameter \"client_connection_check_interval\": 10000",
-                ),
-            ),
-            ("a lost connection", rejection(None, "connection closed")),
-            (
-                "the code alone",
-                rejection(Some("22023"), "invalid value for parameter"),
-            ),
-            (
-                "a tool-authored refusal",
-                DbError::Refused(
-                    "invalid value for parameter \"client_connection_check_interval\"".into(),
-                ),
-            ),
-        ] {
-            let (sent, outcome) = keep_scripted(vec![(KEEPER_CHECK_INTERVAL, error)]).await;
-            assert!(outcome.is_err(), "{why}: {outcome:?}");
-            // Not tolerated: nothing is undone, the error is the caller's.
-            assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL], "{why}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_refused_keepalive_fails_even_with_the_windows_answer_on_the_interval() {
-        // The mandatory batch fails: nothing after it is sent, whatever the
-        // interval would have answered.
-        for error in [
-            windows_answer(),
-            rejection(
-                Some("22023"),
-                "invalid value for parameter \"tcp_keepalives_idle\": 30",
-            ),
-            rejection(None, "connection closed"),
-        ] {
-            let (sent, outcome) = keep_scripted(vec![(KEEPER_SETTINGS, error)]).await;
-            assert!(outcome.is_err(), "{outcome:?}");
-            assert_eq!(sent, [KEEPER_SETTINGS]);
-        }
-    }
-
-    /// The technique against a real engine, on any platform: a refused setting
-    /// inside a savepoint leaves a transaction block usable after the undo,
-    /// and the undo outside a block answers with a code the procedure expects.
-    /// `lc_messages` stands in for the unsupported interval: it is rejected
-    /// with the same code and message shape.
-    #[tokio::test]
-    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
-    async fn a_refused_setting_in_its_savepoint_leaves_the_transaction_usable() {
+    /// The live tests below run the very text the keeper sends, against a real
+    /// engine, with parameters this engine really refuses: `lc_messages`
+    /// stands in for the unsupported interval (a locale the server lacks is
+    /// rejected with the same SQLSTATE and message shape).
+    mod live {
+        use super::*;
         use pbps_db::{Conn, Driver};
-        let base = std::env::var("PBPS_TEST_PG_DB").expect("live PostgreSQL fixture setting");
-        let mut conn = Conn::connect(Driver::Postgres, &base).await.unwrap();
-        let refused = "SAVEPOINT pbps_keeper; SET lc_messages = 'no_such_locale_pbps'; \
-                       RELEASE SAVEPOINT pbps_keeper";
-        // Inside a block: the refusal aborts it, the undo rescues it.
-        conn.execute("BEGIN").await.unwrap();
-        let error = conn.execute(refused).await.unwrap_err();
-        assert!(
-            matches!(&error, DbError::Driver { code: Some(code), message, .. }
-                if code == "22023" && message.starts_with("invalid value for parameter \"lc_messages\"")),
-            "{error:?}"
-        );
-        let aborted = conn.execute("SELECT 1").await.unwrap_err();
-        assert!(matches!(&aborted, DbError::Driver { code: Some(code), .. } if code == "25P02"));
-        conn.execute(KEEPER_UNDO).await.unwrap();
-        conn.execute("SELECT 1").await.unwrap();
-        conn.execute("ROLLBACK").await.unwrap();
-        // Outside a block: the refusal rolled itself back, and the undo has
-        // nothing to act on, with a code `nothing_to_undo` accepts.
-        let error = conn.execute(refused).await.unwrap_err();
-        assert!(matches!(&error, DbError::Driver { code: Some(code), .. } if code == "22023"));
-        let undo = conn.execute(KEEPER_UNDO).await.unwrap_err();
-        assert!(nothing_to_undo(&undo), "{undo:?}");
-        conn.execute("SELECT 1").await.unwrap();
-        // And the real settings are accepted where the engine supports them.
-        keep(&mut conn).await.unwrap();
+
+        async fn connect() -> Conn {
+            let base = std::env::var("PBPS_TEST_PG_DB").expect("live PostgreSQL fixture setting");
+            Conn::connect(Driver::Postgres, &base).await.unwrap()
+        }
+
+        const REFUSED: &str = "SET lc_messages = 'no_such_locale_pbps'";
+
+        async fn show(conn: &mut Conn, name: &str) -> String {
+            let rows = conn
+                .query(&format!("SELECT current_setting('{name}') AS value"))
+                .await
+                .unwrap();
+            rows[0]
+                .try_get::<&str>("value")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        }
+
+        fn code_of(error: &DbError) -> String {
+            let DbError::Driver {
+                code: Some(code), ..
+            } = error
+            else {
+                panic!("not a server error: {error:?}");
+            };
+            code.clone()
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn an_engine_that_supports_the_interval_has_it_in_effect_in_or_out_of_a_block() {
+            let mut conn = connect().await;
+            keep(&mut conn).await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+            assert_eq!(show(&mut conn, "tcp_keepalives_idle").await, "30");
+            assert_eq!(show(&mut conn, "tcp_keepalives_interval").await, "10");
+            assert_eq!(show(&mut conn, "tcp_keepalives_count").await, "3");
+            // The restoration runs inside a transaction block (the fill's).
+            conn.execute("RESET ALL").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            keep(&mut conn).await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn the_refusal_of_exactly_the_named_parameter_is_absorbed_in_or_out_of_a_block() {
+            let mut conn = connect().await;
+            let block = guarded_set("lc_messages", REFUSED);
+            let before = show(&mut conn, "lc_messages").await;
+            conn.execute(&block).await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute(&block).await.unwrap();
+            // The block is not aborted: the session goes on inside it.
+            conn.execute("SELECT 1").await.unwrap();
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(show(&mut conn, "lc_messages").await, before);
+            // Locale-proof: the sentence may be translated, the quoted name is
+            // not, and the handler looks at the name only.
+            let translated = guarded_set(
+                "lc_messages",
+                "RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = '\"lc_messages\" 的值無效'",
+            );
+            conn.execute(&translated).await.unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn anything_else_is_raised_again_with_its_own_code() {
+            let mut conn = connect().await;
+            let cases = [
+                (
+                    "another parameter refused, same code",
+                    guarded_set("client_connection_check_interval", REFUSED),
+                    "22023",
+                ),
+                (
+                    "the code without the name",
+                    guarded_set(
+                        "lc_messages",
+                        "RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid value for parameter \"other\"'",
+                    ),
+                    "22023",
+                ),
+                (
+                    "the name under another code",
+                    guarded_set(
+                        "lc_messages",
+                        "RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'permission denied to set parameter \"lc_messages\"'",
+                    ),
+                    "42501",
+                ),
+                (
+                    "an unrelated error",
+                    guarded_set("lc_messages", "PERFORM 1 / 0"),
+                    "22012",
+                ),
+            ];
+            for in_a_block in [false, true] {
+                for (why, block, expected) in &cases {
+                    if in_a_block {
+                        conn.execute("BEGIN").await.unwrap();
+                    }
+                    let error = conn.execute(block).await.unwrap_err();
+                    assert_eq!(
+                        &code_of(&error),
+                        expected,
+                        "{why} (in a block: {in_a_block}): {error:?}"
+                    );
+                    if in_a_block {
+                        conn.execute("ROLLBACK").await.unwrap();
+                    }
+                }
+            }
+            conn.execute("SELECT 1").await.unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn where_plpgsql_is_not_usable_the_keeper_fails_naming_the_language() {
+            // An operator who revoked USAGE on the language (a database-level
+            // privilege) gets an explicit refusal, not a silent loss of the
+            // interval: the engine names the language.
+            let mut admin = connect().await;
+            let name = format!(
+                "pbps_t2777_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let password = crate::catalog::probe_token().replace('-', "");
+            for statement in [
+                format!("CREATE ROLE {name} LOGIN PASSWORD '{password}'"),
+                format!("CREATE DATABASE {name} OWNER {name} TEMPLATE template0"),
+            ] {
+                admin.execute(&statement).await.unwrap();
+            }
+            let base = std::env::var("PBPS_TEST_PG_DB").unwrap();
+            let kept: Vec<&str> = base
+                .split_whitespace()
+                .filter(|word| {
+                    !word.starts_with("dbname=")
+                        && !word.starts_with("user=")
+                        && !word.starts_with("password=")
+                })
+                .collect();
+            let as_user = |user: &str, secret: &str| {
+                format!(
+                    "{} dbname={name} user={user} password={secret}",
+                    kept.join(" ")
+                )
+            };
+            let outcome = async {
+                // A privilege on a language is the language owner's to revoke
+                // (a superuser's); anyone else's REVOKE only warns. The
+                // database's owner then has no way left to use the language.
+                let base_in_database = format!(
+                    "{} dbname={name}",
+                    base.split_whitespace()
+                        .filter(|word| !word.starts_with("dbname="))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let mut superuser = Conn::connect(Driver::Postgres, &base_in_database)
+                    .await
+                    .unwrap();
+                superuser
+                    .execute("REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC")
+                    .await
+                    .unwrap();
+                let mut owner = Conn::connect(Driver::Postgres, &as_user(&name, &password))
+                    .await
+                    .unwrap();
+                keep(&mut owner).await
+            }
+            .await;
+            for statement in [
+                format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+                format!("DROP ROLE IF EXISTS {name}"),
+            ] {
+                admin.execute(&statement).await.unwrap();
+            }
+            let error = outcome.unwrap_err();
+            assert_eq!(code_of(&error), "42501", "{error:?}");
+            assert!(error.to_string().contains("plpgsql"), "{error}");
+        }
     }
 }
