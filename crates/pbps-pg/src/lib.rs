@@ -47,6 +47,7 @@ pub mod data_triggers;
 pub mod doctor;
 mod drop_impact;
 mod emit;
+pub mod engine;
 pub mod engine_effects;
 pub mod extension_provider;
 mod index_policy;
