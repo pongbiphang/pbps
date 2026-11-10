@@ -1962,6 +1962,7 @@ pub(crate) fn diff_partial_rebuilding(
     let rank = |from: &str, to: &str| dialect.bare_name_rank(from, to);
     let lexis = pbps_model::module::Lexis {
         code_only: &lex,
+        quoted_identifiers: dialect.lexicon().quoted_identifiers,
         continues_ident: dialect.lexicon().identifier_continues,
         reserved: dialect.lexicon().reserved,
         bare_rank: &rank,

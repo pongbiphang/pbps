@@ -1180,6 +1180,68 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
     references_with(definition, name, &SHARED)
 }
 
+/// One token of code, as far as a scan for names has to tell them apart.
+pub enum CodeToken {
+    /// A bare word, or the contents of a delimited identifier with its
+    /// escaped closer undoubled: the name the engine binds. The flag is
+    /// whether it was delimited.
+    Name(String, bool),
+    Dot,
+    Open,
+    Other,
+}
+
+/// `code` — already reduced to code, literals and comments blanked — as
+/// tokens. The one place a name's extent is decided, so that a scan can never
+/// read a name out of the middle of a longer one: `[Order Details Extended]`
+/// is one `Name`, and no substring of it is (#2436). It lives here, under the
+/// dialects, because the module scan in this crate needs it as much as theirs.
+///
+/// `quoted` is the engine's delimiter pairs. It is a parameter, and not read
+/// from a fixed `[`/`"`, because the same `[` is SQL Server's delimiter and
+/// PostgreSQL's array subscript: read as a delimiter where it is a subscript,
+/// `a[i + 1]` would hide the `i` from every scan.
+pub fn code_tokens(
+    code: &str,
+    quoted: &[(char, char)],
+    continues: fn(char) -> bool,
+) -> Vec<CodeToken> {
+    let mut tokens = Vec::new();
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(&(_, close)) = quoted.iter().find(|(open, _)| *open == c) {
+            // A delimited name doubles its closing delimiter.
+            let mut name = String::new();
+            while let Some(n) = chars.next() {
+                if n == close && chars.next_if_eq(&close).is_none() {
+                    break;
+                }
+                name.push(n);
+            }
+            tokens.push(CodeToken::Name(name, true));
+        } else if c.is_ascii_digit() || c == '$' {
+            // A number or a money literal, `1.5e0` or `$1.5`, dot and all:
+            // a bare name never starts with either (#1668 review).
+            while chars.next_if(|n| continues(*n) || *n == '.').is_some() {}
+            tokens.push(CodeToken::Other);
+        } else if continues(c) {
+            let mut name = String::from(c);
+            while let Some(n) = chars.next_if(|n| continues(*n)) {
+                name.push(n);
+            }
+            tokens.push(CodeToken::Name(name, false));
+        } else if c == '.' {
+            tokens.push(CodeToken::Dot);
+        } else if c == '(' {
+            tokens.push(CodeToken::Open);
+        } else if !c.is_whitespace() {
+            // `f(a).b` is not `a.b`.
+            tokens.push(CodeToken::Other);
+        }
+    }
+    tokens
+}
+
 /// What the name scans need of an engine's lexis: how a definition is
 /// reduced to code, which characters continue an identifier, and which words
 /// can never be a bare name.
@@ -1194,6 +1256,11 @@ pub fn references(definition: &str, name: &ObjectName) -> bool {
 pub struct Lexis<'a> {
     /// The definition with everything that is not code blanked out.
     pub code_only: &'a dyn Fn(&str) -> String,
+    /// Every opener of a delimited identifier, with the character that
+    /// closes it: SQL Server's `[`…`]` and `"`…`"`, PostgreSQL's `"`…`"`. A
+    /// delimited identifier is one name however much of it looks like
+    /// several, and the same `[` is a subscript on PostgreSQL (#2436).
+    pub quoted_identifiers: &'a [(char, char)],
     /// Whether a character continues an unquoted identifier.
     pub continues_ident: fn(char) -> bool,
     /// Whether a lower-cased word can never stand unquoted as a name.
@@ -1222,6 +1289,7 @@ pub fn every_schema(_: &str, _: &str) -> Option<usize> {
 /// has one, does not draw.
 pub const SHARED: Lexis<'static> = Lexis {
     code_only: &code_only,
+    quoted_identifiers: &[('[', ']'), ('"', '"')],
     continues_ident: is_regular_identifier_continue,
     reserved: never_reserved,
     bare_rank: &every_schema,
@@ -1234,6 +1302,7 @@ pub fn references_with(definition: &str, name: &ObjectName, lexis: &Lexis<'_>) -
         &(lexis.code_only)(definition),
         name,
         Case::Folded,
+        lexis.quoted_identifiers,
         lexis.continues_ident,
         lexis.reserved,
         true,
@@ -1268,17 +1337,13 @@ fn cased(text: &str, case: Case) -> String {
     }
 }
 
-/// The needle for the qualified form of `name`.
-fn qualified(name: &ObjectName, case: Case) -> String {
-    format!("{}.{}", cased(&name.schema, case), cased(&name.name, case))
-}
-
 #[cfg(test)]
 fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
     references_in(
         &code_only(definition),
         name,
         case,
+        SHARED.quoted_identifiers,
         is_regular_identifier_continue,
         never_reserved,
         true,
@@ -1286,23 +1351,45 @@ fn references_as(definition: &str, name: &ObjectName, case: Case) -> bool {
 }
 
 /// Whether `code` — a definition already lexed to code — mentions `name`,
-/// with words ending where `continues` says they do, a bare word that
-/// `reserved` names counting only where it is quoted, and the bare form
-/// counting at all only where `bare` says the engine would look there.
+/// with words ending where `continues` says they do, a delimited identifier
+/// (`quoted`: the engine's delimiter pairs) read as one name, a bare word
+/// that `reserved` names counting only where it is delimited, and the bare
+/// form counting at all only where `bare` says the engine would look there.
 fn references_in(
     code: &str,
     name: &ObjectName,
     case: Case,
+    quoted: &[(char, char)],
     continues: fn(char) -> bool,
     reserved: fn(&str) -> bool,
     bare: bool,
 ) -> bool {
-    let haystack = scannable_code(code, case, continues, false);
+    // Whole names, never substrings: `[dbo].[Order Details Extended]` is one
+    // name, and no part of it is `dbo.Order Details` (#2436).
+    let mut tokens = code_tokens(code, quoted, continues);
+    for token in &mut tokens {
+        if let CodeToken::Name(word, _) = token {
+            *word = cased(word, case);
+        }
+    }
+    // A dot beside a name makes it part of a longer path. Whitespace around a
+    // dot, `dbo\n  .\n  v`, is not a token and so cannot hide it (DECISIONS 239).
+    let dot_before = |i: usize| i > 0 && matches!(tokens[i - 1], CodeToken::Dot);
+    let dot_after = |i: usize| matches!(tokens.get(i + 1), Some(CodeToken::Dot));
 
     // The qualified form first — a word after a dot is a name whatever it
-    // is: measured, `FROM app.select` is accepted on PostgreSQL.
-    if contains_word(&haystack, &qualified(name, case), continues) {
-        return true;
+    // is: measured, `FROM app.select` is accepted on PostgreSQL. A third
+    // part on either side is another object, `sales.dbo.v`.
+    let (schema, leaf) = (cased(&name.schema, case), cased(&name.name, case));
+    for i in 0..tokens.len().saturating_sub(2) {
+        if let [CodeToken::Name(a, _), CodeToken::Dot, CodeToken::Name(b, _)] = &tokens[i..i + 3]
+            && *a == schema
+            && *b == leaf
+            && !dot_before(i)
+            && !dot_after(i + 2)
+        {
+            return true;
+        }
     }
     // A bare name resolves through the engine's lookup path and nowhere
     // else, so a same-named module in a schema off that path is not what
@@ -1312,17 +1399,17 @@ fn references_in(
     }
     // Then the bare one — a definition written inside its own schema very
     // often omits the qualifier. A reserved word is a name only where it is
-    // quoted: measured, `FROM select` is a syntax error on both engines and
+    // delimited: measured, `FROM select` is a syntax error on both engines and
     // `FROM "select"` names the view, so a bare `select` mentions nothing —
     // and read as a mention, it drew an edge from every view to the one of
     // that name (DECISIONS 316).
-    let bare = cased(&name.name, case);
-    if reserved(&name.name.to_ascii_lowercase()) {
-        let quoted = scannable_code(code, case, continues, true);
-        contains_word(&quoted, &format!("\"{bare}\""), continues)
-    } else {
-        contains_word(&haystack, &bare, continues)
-    }
+    let reserved = reserved(&name.name.to_ascii_lowercase());
+    tokens.iter().enumerate().any(|(i, token)| {
+        matches!(token, CodeToken::Name(word, delimited)
+            if *word == leaf && (*delimited || !reserved))
+            && !dot_before(i)
+            && !dot_after(i)
+    })
 }
 
 /// The definition with everything that is not code blanked out.
@@ -1518,7 +1605,7 @@ fn lexical_code(definition: &str, keep_quoted_identifiers: bool) -> String {
 /// plus a combining dot, which the engine does *not* read as `i` -- measured
 /// `ne`, and the object did not resolve. Worse than the wrong answer is where
 /// it lands: the combining mark is not an identifier character, so
-/// `contains_word` sees a word boundary inside what was one letter and reports
+/// a scan sees a word boundary inside what was one letter and reports
 /// a match for the bare needle `i`. Folding character by character keeps `İ`
 /// whole and keeps the scan's boundaries where the text put them.
 fn folded(s: &str) -> String {
@@ -1533,125 +1620,6 @@ fn folded(s: &str) -> String {
             }
         })
         .collect()
-}
-
-/// Lower-cases, drops the quoting characters and closes the gaps around dots,
-/// so that `[Dbo] . [V]` and `dbo.v` become one string to search.
-#[cfg(test)]
-fn scannable(definition: &str, case: Case) -> String {
-    scannable_code(
-        &code_only(definition),
-        case,
-        is_regular_identifier_continue,
-        false,
-    )
-}
-
-/// Whitespace to the scan: what Unicode calls whitespace **and the engine
-/// does not read as a name byte**. A non-breaking space continues an
-/// identifier on PostgreSQL, and read as a gap it split `x\u{a0}y` into a
-/// word the needle matched.
-fn is_a_gap(ch: char, continues: fn(char) -> bool) -> bool {
-    ch.is_whitespace() && !continues(ch)
-}
-
-fn scannable_code(
-    code: &str,
-    case: Case,
-    continues: fn(char) -> bool,
-    keep_quotes: bool,
-) -> String {
-    let lowered = cased(code, case);
-    // A quoting character goes; a bracket that stood between two identifier
-    // characters leaves a space behind. On PostgreSQL `[` is a subscript and
-    // `ARRAY[` an array constructor, not a quote — measured, a view over
-    // `(ARRAY[app.z()])[1]` is refused until `app.z()` exists — and dropping
-    // the bracket outright glued `ARRAY[app.z` into `arrayapp.z`, where no word
-    // boundary was left for the needle to match. The space is only put where
-    // the glue would form, so `[dbo].[v]` still folds to `dbo.v` (239).
-    //
-    // With `keep_quotes`, every quoting character becomes `"` instead, for
-    // the one needle that has to see them: a reserved word, which is a name
-    // only where it is quoted (316).
-    //
-    // A *doubled* quoting character is one character of the name and not two
-    // delimiters — measured, `dq."z""q"` names the view `z"q` and `[a]]b]`
-    // names `a]b` — so it survives into the haystack, where the needle built
-    // from the declared name carries the same character (DECISIONS 318).
-    let mut unquoted = String::with_capacity(lowered.len());
-    let mut skip_to = 0usize;
-    for (i, ch) in lowered.char_indices() {
-        if i < skip_to {
-            continue;
-        }
-        if matches!(ch, '"' | ']') && lowered[i + ch.len_utf8()..].starts_with(ch) {
-            unquoted.push(ch);
-            skip_to = i + 2 * ch.len_utf8();
-            continue;
-        }
-        match ch {
-            '"' | '`' | '[' | ']' if keep_quotes => unquoted.push('"'),
-            '"' | '`' => {}
-            '[' | ']' => {
-                let glued = unquoted.chars().next_back().is_some_and(continues)
-                    && lowered[i + ch.len_utf8()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| continues(c) || c == '.');
-                if glued {
-                    unquoted.push(' ');
-                }
-            }
-            _ => unquoted.push(ch),
-        }
-    }
-    let mut out = String::with_capacity(unquoted.len());
-    for (i, ch) in unquoted.char_indices() {
-        if is_a_gap(ch, continues) {
-            // From `out`, not from `unquoted`: what precedes this character in
-            // the *result* is the dot itself when the whitespace between them
-            // has already been dropped. Read from the input it was the first
-            // character of the run, so only that one went — a formatter's
-            // `dbo.\n    customer` kept its indentation and the qualified
-            // needle then matched nothing (DECISIONS 239). The trailing side
-            // never had the bug: `after` skips the whole run to find the dot.
-            let before = out.chars().next_back();
-            let after = unquoted[i + ch.len_utf8()..]
-                .chars()
-                .find(|c| !is_a_gap(*c, continues));
-            // Whitespace that only separates a qualifier from its dot is
-            // noise; everywhere else it is a boundary and must be kept.
-            if before == Some('.') || after == Some('.') {
-                continue;
-            }
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Whether `needle` occurs with no identifier character on either side.
-fn contains_word(haystack: &str, needle: &str, continues: fn(char) -> bool) -> bool {
-    let mut from = 0;
-    while let Some(at) = haystack[from..].find(needle) {
-        let start = from + at;
-        let end = start + needle.len();
-        if !is_ident_char(haystack[..start].chars().next_back(), continues)
-            && !is_ident_char(haystack[end..].chars().next(), continues)
-        {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// A dot counts: `dbo.active_customer` must not match inside
-/// `sales.dbo.active_customer`, and `active_customer` must not match inside
-/// `dbo.active_customer` — the qualified needle is tried first and answers that
-/// case properly.
-fn is_ident_char(c: Option<char>, continues: fn(char) -> bool) -> bool {
-    c.is_some_and(|c| continues(c) || c == '.')
 }
 
 /// Whether a character can continue an unquoted SQL Server identifier.
@@ -1700,6 +1668,7 @@ pub fn creation_order_with(
         .iter()
         .map(|(name, module)| (name, (lexis.code_only)(&module.definition)))
         .collect();
+    let quoted = lexis.quoted_identifiers;
     let continues = lexis.continues_ident;
     let reserved = lexis.reserved;
     let bare_rank = lexis.bare_rank;
@@ -1761,7 +1730,7 @@ pub fn creation_order_with(
                     && other.referenced_name().is_some_and(|n| {
                         let bare = bare_rank(name.schema(), other.schema())
                             .is_some_and(|rank| nearest.get(&cased(&n.name, case)) == Some(&rank));
-                        references_in(code, &n, case, continues, reserved, bare)
+                        references_in(code, &n, case, quoted, continues, reserved, bare)
                     });
                 if declared || attached || referenced {
                     set.insert(other.clone());
@@ -2102,6 +2071,70 @@ mod tests {
         module(ModuleKind::View, definition)
     }
 
+    const PG_QUOTES: &[(char, char)] = &[('"', '"')];
+
+    /// A delimited identifier is one name, however much of it looks like
+    /// several: a view over `[Order Details Extended]` does not reference
+    /// `Order Details`, and the invented edge cannot order or cycle (#2436).
+    #[test]
+    fn a_name_inside_a_longer_delimited_name_is_not_a_reference() {
+        let details = n("dbo.Order Details");
+        for definition in [
+            "SELECT * FROM [dbo].[Order Details]",
+            "SELECT * FROM dbo.[order details] o",
+            "SELECT * FROM \"dbo\".\"Order Details\"",
+            "SELECT * FROM [Order Details]",
+        ] {
+            assert!(references(definition, &details), "{definition}");
+        }
+        for definition in [
+            "SELECT * FROM [dbo].[Order Details Extended]",
+            "SELECT * FROM dbo.[Order Details Extended]",
+            "SELECT * FROM [dbo].[My Order Details]",
+            "SELECT * FROM [Order Details Extended]",
+            "SELECT * FROM \"dbo\".\"Order Details Extended\"",
+            // Bare, the words are several names, not the one.
+            "SELECT * FROM dbo.Order Details",
+        ] {
+            assert!(!references(definition, &details), "{definition}");
+        }
+        // The escaped closer is one character of the name it is in.
+        assert!(references("SELECT * FROM [dbo].[a]]b]", &n("dbo.a]b")));
+        assert!(!references("SELECT * FROM [dbo].[a]]b]", &n("dbo.a")));
+        let m = modules(&[
+            (
+                "dbo.Order Details",
+                "SELECT * FROM [dbo].[Order Details Extended]",
+            ),
+            ("dbo.Order Details Extended", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![id("dbo.Order Details Extended"), id("dbo.Order Details")]
+        );
+        // A chain of three, each name the start of the next: a false edge
+        // from the middle one back to the first made a cycle of the pair.
+        let m = modules(&[
+            (
+                "dbo.Order Details",
+                "SELECT * FROM [dbo].[Order Details Extended]",
+            ),
+            (
+                "dbo.Order Details Extended",
+                "SELECT * FROM [dbo].[Order Details Extended Archive]",
+            ),
+            ("dbo.Order Details Extended Archive", "SELECT 1 AS x"),
+        ]);
+        assert_eq!(
+            creation_order(&m, &ModuleDeps::default()),
+            vec![
+                id("dbo.Order Details Extended Archive"),
+                id("dbo.Order Details Extended"),
+                id("dbo.Order Details")
+            ]
+        );
+    }
+
     #[test]
     fn a_qualified_reference_is_found_in_every_spelling() {
         for definition in [
@@ -2135,21 +2168,11 @@ mod tests {
             "SELECT * FROM [dbo] . [active_customer]",
             "SELECT * FROM dbo\n  .\n  active_customer",
         ] {
-            assert_eq!(
-                scannable(definition, Case::Folded),
-                "select * from dbo.active_customer",
-                "{definition:?}"
-            );
             assert!(
                 references(definition, &n("dbo.active_customer")),
                 "{definition:?}"
             );
         }
-        // Whitespace that is not beside a dot is a boundary and stays.
-        assert_eq!(
-            scannable("select a\n  from dbo.t", Case::Folded),
-            "select a\n  from dbo.t"
-        );
     }
 
     /// Closing the gap must not fuse what the dot does not join. The three-part
@@ -2216,24 +2239,28 @@ mod tests {
     /// edge to put the function first.
     #[test]
     fn a_bracket_between_two_words_keeps_them_apart() {
-        assert_eq!(
-            scannable("SELECT (ARRAY[app.z()])[1] AS v", Case::Folded),
-            "select (array app.z())1 as v"
-        );
-        assert!(references("SELECT (ARRAY[app.z()])[1]", &n("app.z")));
-        assert!(references("SELECT x[app.z()]", &n("app.z")));
-        // And where nothing would be glued, nothing is added: the quoted
-        // spellings fold to the same string they always did.
-        assert_eq!(
-            scannable("SELECT * FROM [dbo].[active_customer]", Case::Folded),
-            "select * from dbo.active_customer"
-        );
+        let pg = Lexis {
+            code_only: &code_only,
+            quoted_identifiers: PG_QUOTES,
+            continues_ident: is_regular_identifier_continue,
+            reserved: never_reserved,
+            bare_rank: &every_schema,
+        };
+        let z = n("app.z");
+        assert!(references_with("SELECT (ARRAY[app.z()])[1]", &z, &pg));
+        assert!(references_with("SELECT x[app.z()]", &z, &pg));
+        // On SQL Server the bracket delimits, and `[app.z()]` is one name.
+        assert!(!references("SELECT x[app.z()]", &z));
+        assert!(references(
+            "SELECT * FROM [dbo].[active_customer]",
+            &n("dbo.active_customer")
+        ));
         let m = modules(&[
             ("app.a", "SELECT (ARRAY[app.z()])[1] AS v"),
             ("app.z()", "() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
         ]);
         assert_eq!(
-            creation_order(&m, &ModuleDeps::default()),
+            creation_order_with(&m, &ModuleDeps::default(), &pg),
             vec![id("app.z()"), id("app.a")]
         );
     }
@@ -2253,6 +2280,7 @@ mod tests {
             |d: &str| d.replace("E'x\\' , app.a'", "               ");
         let lexis = Lexis {
             code_only: &engine_reads_an_escape_string,
+            quoted_identifiers: SHARED.quoted_identifiers,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
             bare_rank: &every_schema,
@@ -2283,6 +2311,7 @@ mod tests {
             |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
         let lexis = Lexis {
             code_only: &code_only,
+            quoted_identifiers: PG_QUOTES,
             continues_ident: every_non_ascii_byte_is_a_name_byte,
             reserved: never_reserved,
             bare_rank: &every_schema,
@@ -2343,6 +2372,7 @@ mod tests {
         let own_schema_only = |from: &str, to: &str| (from == to).then_some(0);
         let lexis = Lexis {
             code_only: &code_only,
+            quoted_identifiers: SHARED.quoted_identifiers,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
             bare_rank: &own_schema_only,
@@ -2391,6 +2421,7 @@ mod tests {
         };
         let lexis = Lexis {
             code_only: &code_only,
+            quoted_identifiers: SHARED.quoted_identifiers,
             continues_ident: is_regular_identifier_continue,
             reserved: never_reserved,
             bare_rank: &z_then_a,
@@ -2424,6 +2455,7 @@ mod tests {
         }
         let lexis = Lexis {
             code_only: &code_only,
+            quoted_identifiers: SHARED.quoted_identifiers,
             continues_ident: is_regular_identifier_continue,
             reserved: select_is_reserved,
             bare_rank: &every_schema,

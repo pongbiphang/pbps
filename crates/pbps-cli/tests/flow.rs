@@ -5438,7 +5438,9 @@ fn a_call_on_a_column_without_methods_is_a_call_to_the_function() {
 /// A connected plan refuses what the catalog's edges say SQL Server would,
 /// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
 /// which `[cafe]` binds under an accent-insensitive collation (#1426); and a
-/// function's alter whose name holds `]` (#1437); and a computed column's
+/// function's alter whose name holds `]` (#1437), which the offline text scan
+/// now reads too (#2436) while the connected plan still says it by edge; and a
+/// computed column's
 /// change under a `WITH SCHEMABINDING` view, while a view merely selecting a
 /// column named `schemabinding` blocks nothing (#1439).
 #[test]
@@ -5477,8 +5479,10 @@ fn the_catalogs_edges_refuse_what_the_engine_would() {
     );
 
     // A function whose name holds the closing delimiter, which a text match
-    // read as another name (#1437): its alter is refused while a computed
-    // column calls it.
+    // once read as another name (#1437): its alter is refused while a computed
+    // column calls it. The text scan now reads `dbo.[f]]x]` as `f]x` (#2436,
+    // DEC-2436.1), so the offline plan refuses it too; the connected plan
+    // still refuses by the catalog's edge, in its own words.
     let esc = OwnDatabase::new(&server, "edges1431_esc");
     for sql in [
         "CREATE FUNCTION dbo.[f]]x] (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
@@ -5499,7 +5503,15 @@ fn the_catalogs_edges_refuse_what_the_engine_would() {
     let altered = text.replacen("@x * 3", "@x * 4", 1);
     assert_ne!(altered, text, "{text}");
     std::fs::write(&module, altered).unwrap();
-    let o = plan_against(&d, esc.connection());
+    let offline = d.run(&["plan"]);
+    assert_ne!(code(&offline), 0, "{}", stdout(&offline));
+    assert!(
+        stderr(&offline).contains("computed column dbo.e.tripled may call `f]x`"),
+        "{}",
+        stderr(&offline)
+    );
+    d.commit();
+    let o = d.run(&["plan", "--db", esc.connection()]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains("computed column dbo.e.tripled calls"),

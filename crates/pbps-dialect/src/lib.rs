@@ -50,6 +50,7 @@ pub mod slots;
 
 #[cfg(test)]
 use pbps_model::ChangeSet;
+use pbps_model::module::{CodeToken, code_tokens};
 use pbps_model::{
     Change, ColumnType, Module, ModuleId, ModuleKind, ObjectName, Partitions, RiskClass, Role,
     RoutineArg, Schema, SessionZone, Strategy, Table, TableName,
@@ -1312,6 +1313,80 @@ impl Lexicon {
         self.code_only_inner(definition, false)
     }
 
+    /// Whether `text` may name `name`: some identifier in its code, bare or
+    /// delimited, is `name` under the identifier fold. Whole identifiers are
+    /// compared, never substrings, so a longer delimited name that contains
+    /// `name` between spaces is another name (#2436); a delimited name's
+    /// doubled closer is one character of it (#1174 review). The scan behind
+    /// [`Dialect::may_name`].
+    #[must_use]
+    pub fn names(&self, text: &str, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let wanted = identifier_fold(name);
+        self.name_tokens(text, identifier_fold)
+            .iter()
+            .any(|token| matches!(token, CodeToken::Name(found, _) if *found == wanted))
+    }
+
+    /// Whether `text` names `name` exactly: a bare or delimited identifier
+    /// of that very spelling, with words ending where this engine's own rule
+    /// says. For a reader of a stored definition, which is the engine's
+    /// spelling already; [`names`](Lexicon::names) is the over-approximation
+    /// for declarations a person wrote (#2436).
+    #[must_use]
+    pub fn names_exactly(&self, text: &str, name: &str) -> bool {
+        !name.is_empty()
+            && code_tokens(
+                &self.code_only(text),
+                self.quoted_identifiers,
+                self.identifier_continues,
+            )
+            .iter()
+            .any(|token| matches!(token, CodeToken::Name(found, _) if found == name))
+    }
+
+    /// Whether `text` may name `schema.name`: the two identifiers with a dot
+    /// between them, compared whole after `fold`. Whitespace and comments
+    /// around the dot do not matter, a third part before it does not either
+    /// (`db.dbo.f`), and neither identifier may be part of a longer one.
+    fn names_qualified(
+        &self,
+        text: &str,
+        schema: &str,
+        name: &str,
+        fold: fn(&str) -> String,
+    ) -> bool {
+        let (schema, name) = (fold(schema), fold(name));
+        self.name_tokens(text, fold).windows(3).any(|w| match w {
+            [CodeToken::Name(a, _), CodeToken::Dot, CodeToken::Name(b, _)] => {
+                *a == schema && *b == name
+            }
+            _ => false,
+        })
+    }
+
+    /// The identifiers and dots of `text`'s code, each name folded.
+    ///
+    /// Words end where [`continues_ident`] says, not where the engine's own
+    /// rule does: SQL Server reads `@amount` as a variable and `#t` as a
+    /// temporary table, and the scan has always counted the `amount` in the
+    /// first (a false yes costs a second plan, DEC-1316.1).
+    fn name_tokens(&self, text: &str, fold: fn(&str) -> String) -> Vec<CodeToken> {
+        let mut tokens = code_tokens(
+            &self.code_only(text),
+            self.quoted_identifiers,
+            continues_ident,
+        );
+        for token in &mut tokens {
+            if let CodeToken::Name(name, _) = token {
+                *name = fold(name);
+            }
+        }
+        tokens
+    }
+
     /// Whether code parentheses stay inside one expression (DEC-2400.1).
     /// This is a boundary check, not SQL validation: the engine still binds it.
     #[must_use]
@@ -2324,6 +2399,19 @@ fn dollar_tag(s: &str) -> Option<usize> {
     None
 }
 
+/// A fold for comparing identifiers that can only make more of them equal:
+/// lowercase, with the dot `İ` lowercases into dropped and the dotless `ı`
+/// taken as `i`. A Turkish collation binds `[i]` to a column named `İ`, and
+/// plain lowercasing turns `İ` into `i` plus a combining dot that no `i` in
+/// the code matches (#1174 review).
+fn identifier_fold(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| *c != '\u{307}')
+        .map(|c| if c == 'ı' { 'i' } else { c })
+        .collect()
+}
+
 /// Whether `c` is a character PostgreSQL counts as part of an unquoted
 /// identifier once one has started.
 ///
@@ -2343,71 +2431,6 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// dollar-quoted literal ends before it can say whether a default is one — and
 /// a second spelling of this rule is how the difference above gets rediscovered
 /// (PITFALLS, "one rule, spelled in three places").
-/// Code with its delimiters dropped and the whitespace around a dot removed,
-/// so `[dbo] . [f]` reads `dbo.f`: the form [`Dialect::may_name_qualified`]
-/// looks for a qualified name in.
-fn undelimited(code: &str) -> String {
-    let bare: String = code
-        .chars()
-        .filter(|c| !matches!(c, '[' | ']' | '"'))
-        .collect();
-    let mut out = String::with_capacity(bare.len());
-    let mut chars = bare.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_whitespace() {
-            let mut run = String::from(c);
-            while let Some(next) = chars.peek().copied().filter(|n| n.is_whitespace()) {
-                run.push(next);
-                chars.next();
-            }
-            // Dropped next to a dot, on either side; kept anywhere else.
-            if out.ends_with('.') || chars.peek() == Some(&'.') {
-                continue;
-            }
-            out.push_str(&run);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// A fold for comparing identifiers that can only make more of them equal:
-/// lowercase, with the dot `İ` lowercases into dropped and the dotless `ı`
-/// taken as `i`. A Turkish collation binds `[i]` to a column named `İ`, and
-/// plain lowercasing turns `İ` into `i` plus a combining dot that no `i` in
-/// the code matches (#1174 review).
-fn identifier_fold(text: &str) -> String {
-    text.chars()
-        .flat_map(char::to_lowercase)
-        .filter(|c| *c != '\u{307}')
-        .map(|c| if c == 'ı' { 'i' } else { c })
-        .collect()
-}
-
-/// Whether `name` occurs in `code` with nothing that continues an identifier
-/// on either side: the scan behind [`Dialect::may_name`].
-fn names_at_a_boundary(code: &str, name: &str) -> bool {
-    let Some(first) = name.chars().next() else {
-        return false;
-    };
-    let mut from = 0;
-    while let Some(offset) = code[from..].find(name) {
-        let start = from + offset;
-        let end = start + name.len();
-        let before = code[..start]
-            .chars()
-            .next_back()
-            .is_some_and(continues_ident);
-        let after = code[end..].chars().next().is_some_and(continues_ident);
-        if !before && !after {
-            return true;
-        }
-        from = start + first.len_utf8();
-    }
-    false
-}
-
 pub fn continues_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
@@ -3005,16 +3028,6 @@ pub trait Dialect {
         false
     }
 
-    /// Whether `text` may name `name` as an identifier: in code, never in a
-    /// literal or a comment, ignoring case, and bounded by what cannot
-    /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does
-    /// not.
-    ///
-    /// An over-approximation, as DEC-1316.1's scan is: a function or a field
-    /// that shares the name counts too. A false yes costs a second plan; a
-    /// false no would cost an apply the engine refuses. Ignoring case is part
-    /// of that: under a case-insensitive collation `A2` reads `a2`, and the
-    /// engine stores `[a2]` either way (measured on 17.0, #1174).
     /// Whether `text` may name `schema.name`, schema-qualified: the scan
     /// [`may_name`](Dialect::may_name) makes, over the qualified form. For a
     /// function a computed column calls, which SQL Server only calls by a
@@ -3024,9 +3037,8 @@ pub trait Dialect {
         if schema.is_empty() || name.is_empty() {
             return false;
         }
-        let code = identifier_fold(&undelimited(&self.lexicon().code_only(text)));
-        let wanted = identifier_fold(&format!("{schema}.{name}"));
-        names_at_a_boundary(&code, &wanted)
+        self.lexicon()
+            .names_qualified(text, schema, name, identifier_fold)
     }
 
     /// The same qualified-name scan, preserving case. Managed names that
@@ -3036,8 +3048,8 @@ pub trait Dialect {
         if schema.is_empty() || name.is_empty() {
             return false;
         }
-        let code = undelimited(&self.lexicon().code_only(text));
-        names_at_a_boundary(&code, &format!("{schema}.{name}"))
+        self.lexicon()
+            .names_qualified(text, schema, name, str::to_owned)
     }
 
     /// Every two-part name `text` calls in code, undelimited:
@@ -3054,81 +3066,44 @@ pub trait Dialect {
     /// rejects it as ambiguous while a function of that name exists (Msg 327,
     /// measured on 17.0).
     fn qualified_calls(&self, text: &str) -> Vec<(String, String)> {
-        enum Token {
-            Name(String),
-            Dot,
-            Open,
-            Other,
-        }
-        let mut tokens = Vec::new();
         let lexicon = self.lexicon();
         // The engine's own rule: SQL Server continues a name with `@`, `#`
         // and `$`, so `dbo.cafe#helper` is not `dbo.cafe` (#1668 review).
-        let continues = lexicon.identifier_continues;
-        let code = lexicon.code_only(text);
-        let mut chars = code.chars().peekable();
-        while let Some(c) = chars.next() {
-            let close = match c {
-                '[' => Some(']'),
-                '"' => Some('"'),
-                _ => None,
-            };
-            if let Some(close) = close {
-                // A delimited name doubles its closing delimiter.
-                let mut name = String::new();
-                while let Some(n) = chars.next() {
-                    if n == close && chars.next_if_eq(&close).is_none() {
-                        break;
-                    }
-                    name.push(n);
-                }
-                tokens.push(Token::Name(name));
-            } else if c.is_ascii_digit() || c == '$' {
-                // A number or a money literal, `1.5e0` or `$1.5`, dot and all:
-                // a bare name never starts with either (#1668 review).
-                while chars.next_if(|n| continues(*n) || *n == '.').is_some() {}
-                tokens.push(Token::Other);
-            } else if continues(c) {
-                let mut name = String::from(c);
-                while let Some(n) = chars.next_if(|n| continues(*n)) {
-                    name.push(n);
-                }
-                tokens.push(Token::Name(name));
-            } else if c == '.' {
-                tokens.push(Token::Dot);
-            } else if c == '(' {
-                tokens.push(Token::Open);
-            } else if !c.is_whitespace() {
-                // `f(a).b` is not `a.b`.
-                tokens.push(Token::Other);
-            }
-        }
+        let tokens = code_tokens(
+            &lexicon.code_only(text),
+            &[('[', ']'), ('"', '"')],
+            lexicon.identifier_continues,
+        );
         tokens
             .windows(4)
             .filter_map(|w| match w {
-                [Token::Name(a), Token::Dot, Token::Name(b), Token::Open]
-                    if !a.is_empty() && !b.is_empty() =>
-                {
-                    Some((a.clone(), b.clone()))
-                }
+                [
+                    CodeToken::Name(a, _),
+                    CodeToken::Dot,
+                    CodeToken::Name(b, _),
+                    CodeToken::Open,
+                ] if !a.is_empty() && !b.is_empty() => Some((a.clone(), b.clone())),
                 _ => None,
             })
             .collect()
     }
 
+    /// Whether `text` may name `name` as an identifier: in code, never in a
+    /// literal or a comment, ignoring case, and bounded by what cannot
+    /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does
+    /// not.
+    ///
+    /// An over-approximation, as DEC-1316.1's scan is: a function or a field
+    /// that shares the name counts too. A false yes costs a second plan; a
+    /// false no would cost an apply the engine refuses. Ignoring case is part
+    /// of that: under a case-insensitive collation `A2` reads `a2`, and the
+    /// engine stores `[a2]` either way (measured on 17.0, #1174).
+    ///
+    /// A match lies on whole names: a delimited identifier is one name however
+    /// much of it looks like several, so `[Order Details Extended]` does not
+    /// name `Order Details` (#2436). The scan is [`Lexicon::names`].
     fn may_name(&self, text: &str, name: &str) -> bool {
-        // A delimited name doubles its closing delimiter: `a]b` is stored as
-        // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
-        // (#1174 review). A name with neither has one spelling.
-        let spellings = [
-            name.to_owned(),
-            name.replace(']', "]]"),
-            name.replace('"', "\"\""),
-        ];
-        let code = identifier_fold(&self.lexicon().code_only(text));
-        spellings
-            .iter()
-            .any(|spelling| names_at_a_boundary(&code, &identifier_fold(spelling)))
+        self.lexicon().names(text, name)
     }
 
     /// The comparison form of a module definition (ADR-0002).
@@ -5465,15 +5440,14 @@ mod tests {
         assert!(d.may_name("[i] * 2", "İ"));
         assert!(d.may_name("[ı] * 2", "I"));
         // Qualified: the schema decides, however the name is spelled.
-        assert!(d.may_name_qualified("[dbo].[f](a)", "dbo", "f"));
         assert!(d.may_name_qualified("DBO . f(a) + 1", "dbo", "f"));
         assert!(!d.may_name_qualified("x.f(a)", "dbo", "f"));
         assert!(!d.may_name_qualified("f(a)", "dbo", "f"));
         assert!(!d.may_name_qualified("'dbo.f'", "dbo", "f"));
         // Exact matching shares the code/boundary scan but distinguishes
         // neighbours a case-sensitive catalog can hold together.
-        assert!(d.may_name_qualified_exact("[dbo] . [F](a)", "dbo", "F"));
-        assert!(!d.may_name_qualified_exact("[dbo].[F](a)", "dbo", "f"));
+        assert!(d.may_name_qualified_exact("dbo . F(a)", "dbo", "F"));
+        assert!(!d.may_name_qualified_exact("dbo.F(a)", "dbo", "f"));
         assert!(!d.may_name_qualified_exact("DBO.f(a)", "dbo", "f"));
         for text in ["dbo.F_extra(a)", "'dbo.F'", "x -- dbo.F\n + 1", ""] {
             assert!(!d.may_name_qualified_exact(text, "dbo", "F"), "{text}");
@@ -5481,8 +5455,150 @@ mod tests {
         assert!(!d.may_name_qualified_exact("dbo.F", "", "F"));
         assert!(!d.may_name_qualified_exact("dbo.F", "dbo", ""));
         // A delimited name is stored with its closing delimiter doubled.
-        assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
+    }
+
+    fn qualified(lexicon: &Lexicon, text: &str, schema: &str, name: &str) -> bool {
+        lexicon.names_qualified(text, schema, name, identifier_fold)
+    }
+
+    fn qualified_exact(lexicon: &Lexicon, text: &str, schema: &str, name: &str) -> bool {
+        lexicon.names_qualified(text, schema, name, str::to_owned)
+    }
+
+    /// A delimited identifier is one name, however much of it looks like
+    /// several: the match counts only when the identifier is exactly the name
+    /// (#2436). Found on Northwind, where a view over `[Order Details Extended]`
+    /// was ordered after, and refused a change to, `Order Details`.
+    #[test]
+    fn a_delimited_name_is_one_name_and_no_part_of_it_is() {
+        for lexicon in [&T_SQL, &PG] {
+            for text in [
+                "\"Order Details\"",
+                "SELECT * FROM \"Order Details\" o",
+                "x.\"Order Details\".id",
+                "\"ORDER details\" + 1",
+            ] {
+                assert!(lexicon.names(text, "Order Details"), "{text}");
+            }
+            for text in [
+                "\"Order Details Extended\"",
+                "\"My Order Details\"",
+                "\"Order Details 2\"",
+                "\"Order  Details\"",
+                // Bare words are several names; one that needs delimiting is
+                // not written without.
+                "Order Details",
+            ] {
+                assert!(!lexicon.names(text, "Order Details"), "{text}");
+            }
+            // The doubled delimiter is one character of the name.
+            assert!(lexicon.names("\"a\"\"b\" * 2", "a\"b"));
+            assert!(!lexicon.names("\"a\"\"b\" * 2", "a"));
+            assert!(!lexicon.names("\"a\"\"b\" * 2", "b"));
+            assert!(!lexicon.names("\"a\"\"b\" * 2", "a\"\"b"));
+            // A bare name is unaffected: it is a whole word, a part of a
+            // longer word still is not it, and it is found beside a dot.
+            assert!(lexicon.names("a2 * 2", "a2"));
+            assert!(lexicon.names("x.a2 + f(a2)", "a2"));
+            assert!(!lexicon.names("a20 * 2", "a2"));
+            // Qualified.
+            for text in [
+                "\"dbo\".\"Order Details\"",
+                "dbo . \"Order Details\" o",
+                "db.dbo.\"Order Details\"",
+            ] {
+                assert!(qualified(lexicon, text, "dbo", "Order Details"), "{text}");
+            }
+            for text in [
+                "\"dbo\".\"Order Details Extended\"",
+                "dbo.\"Order Details Extended\"",
+                "\"dbo\".\"My Order Details\"",
+                "\"dbo x\".\"Order Details\"",
+                "dbo.Order Details",
+            ] {
+                assert!(!qualified(lexicon, text, "dbo", "Order Details"), "{text}");
+            }
+            assert!(qualified(lexicon, "\"d\"\"o\".\"a\"\"b\"", "d\"o", "a\"b"));
+            assert!(!qualified(lexicon, "\"d\"\"o\".\"a\"\"b\"", "do", "ab"));
+            // The case rules: the fold ignores case, the exact scan does not.
+            assert!(qualified(
+                lexicon,
+                "\"DBO\".\"ORDER details\"",
+                "dbo",
+                "Order Details"
+            ));
+            assert!(qualified_exact(
+                lexicon,
+                "\"dbo\".\"Order Details\"",
+                "dbo",
+                "Order Details"
+            ));
+            assert!(!qualified_exact(
+                lexicon,
+                "\"dbo\".\"ORDER Details\"",
+                "dbo",
+                "Order Details"
+            ));
+        }
+    }
+
+    /// SQL Server's brackets delimit and PostgreSQL's are an array subscript,
+    /// so the same text names different things: each engine's scan reads its
+    /// own delimiters (#2436).
+    #[test]
+    fn brackets_delimit_on_sql_server_and_subscript_on_postgresql() {
+        // SQL Server: the same cases as the quoted ones, in brackets.
+        assert!(T_SQL.names("[Order Details]", "Order Details"));
+        assert!(T_SQL.names("SELECT * FROM [Order Details] o", "Order Details"));
+        assert!(!T_SQL.names("[Order Details Extended]", "Order Details"));
+        assert!(!T_SQL.names("[My Order Details]", "Order Details"));
+        assert!(!T_SQL.names("Order Details", "Order Details"));
+        assert!(qualified(
+            &T_SQL,
+            "[dbo].[Order Details]",
+            "dbo",
+            "Order Details"
+        ));
+        assert!(qualified(
+            &T_SQL,
+            "[dbo] . [Order Details] o",
+            "dbo",
+            "Order Details"
+        ));
+        assert!(!qualified(
+            &T_SQL,
+            "[dbo].[Order Details Extended]",
+            "dbo",
+            "Order Details"
+        ));
+        assert!(!qualified(
+            &T_SQL,
+            "dbo.[Order Details Extended]",
+            "dbo",
+            "Order Details"
+        ));
+        assert!(qualified(&T_SQL, "[dbo].f(a)", "dbo", "f"));
+        assert!(qualified(&T_SQL, "DBO . [F](a)", "dbo", "f"));
+        assert!(!qualified(&T_SQL, "x.f(a)", "dbo", "f"));
+        assert!(qualified_exact(&T_SQL, "[dbo] . [F](a)", "dbo", "F"));
+        assert!(!qualified_exact(&T_SQL, "[dbo].[F](a)", "dbo", "f"));
+        // The escaped closer: `[a]]b]` is `a]b`, and the scan that dropped
+        // every bracket read it as `ab`.
+        assert!(T_SQL.names("[a]]b] * 2", "a]b"));
+        assert!(!T_SQL.names("[a]]b] * 2", "a"));
+        assert!(!T_SQL.names("[a]]b] * 2", "b"));
+        assert!(!T_SQL.names("[a]]b] * 2", "a]]b"));
+        assert!(qualified(&T_SQL, "[d]]o].[a]]b]", "d]o", "a]b"));
+        assert!(!qualified(&T_SQL, "[d]]o].[a]]b]", "do", "ab"));
+        // Two delimited names side by side are two names, not their glue.
+        assert!(!T_SQL.names("[a][b]", "ab"));
+        assert!(T_SQL.names("[a][b]", "b"));
+        // PostgreSQL: a subscript hides nothing.
+        assert!(PG.names("arr[idx + 1]", "idx"));
+        assert!(PG.names("arr[i]", "i"));
+        assert!(!PG.names("arr[i]", "ai"));
+        assert!(!PG.names("[Order Details Extended]", "Order Details Extended"));
     }
 
     /// The two-part names an expression calls in code, as written, for a

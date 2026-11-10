@@ -3081,6 +3081,44 @@ pub(crate) fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> S
 
 #[cfg(test)]
 mod tests {
+    /// A delimited name is one name (#2436): `"Order Details Extended"` is
+    /// no reference to `Order Details`. PostgreSQL's `[` is a subscript, so
+    /// it delimits nothing and hides nothing.
+    #[test]
+    fn a_quoted_name_is_found_only_as_the_whole_identifier() {
+        use pbps_dialect::Dialect;
+        let d = crate::Postgres::new();
+        for text in [
+            "\"Order Details\"",
+            "SELECT * FROM app.\"Order Details\" AS o",
+            "\"ORDER details\"",
+        ] {
+            assert!(d.may_name(text, "Order Details"), "{text}");
+        }
+        for text in [
+            "\"Order Details Extended\"",
+            "\"My Order Details\"",
+            "SELECT * FROM app.\"Order Details Extended\" AS o",
+            "Order Details",
+        ] {
+            assert!(!d.may_name(text, "Order Details"), "{text}");
+        }
+        assert!(d.may_name("\"a\"\"b\"", "a\"b"));
+        assert!(!d.may_name("\"a\"\"b\"", "a") && !d.may_name("\"a\"\"b\"", "b"));
+        assert!(d.may_name_qualified("app.\"Order Details\" o", "app", "Order Details"));
+        for text in [
+            "app.\"Order Details Extended\"",
+            "\"app\".\"My Order Details\"",
+        ] {
+            assert!(
+                !d.may_name_qualified(text, "app", "Order Details"),
+                "{text}"
+            );
+        }
+        assert!(d.may_name("a[idx + 1]", "idx"));
+        assert!(!d.may_name("a[idx + 1]", "a idx"));
+    }
+
     #[test]
     fn same_engine_continuations_keep_payload_sources_sql_and_checksum() {
         use pbps_dialect::{PlanDialect, PlanPayload};
