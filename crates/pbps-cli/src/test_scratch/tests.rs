@@ -12,10 +12,9 @@ use super::{FailureKind, TestScratch, settle_failed_start, state_dir};
 
 /// A state directory in its own temporary directory, removed with it.
 ///
-/// Tests that hold a run lock run one at a time: a lock belongs to the open
-/// file, not the process, so a `docker` child forked by a concurrent test while
-/// the lock is held keeps it held until the child execs, and the next
-/// reconciliation would read a dead run as live.
+/// Tests that hold a run lock run one at a time. This predates `RunLock`,
+/// which now unlocks on drop so that a child forked by a concurrent test cannot
+/// keep a released lock held; the serialisation was left as it was.
 struct Dir {
     base: PathBuf,
     dir: StateDir,
@@ -89,24 +88,11 @@ fn run(n: char) -> String {
     n.to_string().repeat(32)
 }
 
-/// Whether the run's lock can be taken, allowing for a `docker` or `git` child
-/// that another test's thread forked while the lock was held: a lock belongs to
-/// the open file, so it is held until that child execs (a few milliseconds).
+/// Whether the run's lock can be taken. The probe is a `RunLock`, which
+/// unlocks on drop, so a `docker` or `git` child that another test's thread
+/// forked while the probe was held cannot keep the lock held after it.
 fn released(dir: &StateDir, run_id: &str) -> bool {
-    released_with(|| dir.try_lock_existing(run_id).unwrap())
-}
-
-fn released_with(mut probe: impl FnMut() -> Option<std::fs::File>) -> bool {
-    (0..500).any(|_| {
-        let Some(lock) = probe() else {
-            std::thread::sleep(Duration::from_millis(10));
-            return false;
-        };
-        // A concurrent fork can inherit this probe too. Explicit unlock releases
-        // the shared open file description even if its child has not exec'd yet.
-        lock.unlock().unwrap();
-        true
-    })
+    dir.try_lock_existing(run_id).unwrap().is_some()
 }
 
 fn soon() -> Instant {
@@ -208,18 +194,7 @@ impl Runtime for Fake {
 }
 
 async fn reconciled(dir: &Dir, rt: &Fake) -> super::Reconciliation {
-    let done = reconcile(&dir.dir, rt, &daemon(), soon()).await.unwrap();
-    recovery_locks_released(&done, |run_id| released(&dir.dir, run_id));
-    done
-}
-
-fn recovery_locks_released(done: &super::Reconciliation, mut release: impl FnMut(&str) -> bool) {
-    // Failed recovery keeps its record for another pass. Dropping its File does
-    // not end a sibling child's inherited lock; wait before exposing that pass.
-    // Intentionally live runs retain their locks and must not be waited on.
-    for failure in &done.failures {
-        assert!(release(&failure.run_id), "{done:?}");
-    }
+    reconcile(&dir.dir, rt, &daemon(), soon()).await.unwrap()
 }
 
 fn kept(dir: &Dir, run_id: &str) -> bool {
@@ -263,9 +238,7 @@ mod daemon2459 {
     ) -> Result<super::super::Reconciliation, super::super::Error> {
         let deadline = soon();
         let daemon = super::super::discovered(deadline, identity(rt)).await?;
-        let done = reconcile(&dir.dir, rt, &daemon, deadline).await?;
-        recovery_locks_released(&done, |run_id| released(&dir.dir, run_id));
-        Ok(done)
+        reconcile(&dir.dir, rt, &daemon, deadline).await
     }
 
     #[tokio::test]
@@ -969,67 +942,42 @@ mod recovery {
         assert_eq!(d.dir.read(&run('c')).unwrap().unwrap().container.id, None);
     }
 
+    /// A file duplicate shares the open file description just as a descriptor
+    /// inherited by a forked child does, so it models the fork-to-exec window
+    /// without spawning (and without timing).
     #[tokio::test]
-    async fn a_failed_recovery_waits_for_inherited_locks_without_leaving_a_probe_lock() {
+    async fn a_forked_copy_of_a_dropped_run_lock_does_not_keep_the_run_live() {
         let d = Dir::new();
         let run_id = run('a');
         d.dir.write(&record(&run_id, State::Pending, None)).unwrap();
-        let refusing = Fake {
-            cannot_remove: Some(vec!["the docker volume vol1".into()]),
-            ..Fake::holding(&container(&run_id, &id('b')))
-        };
-        let failed = reconcile(&d.dir, &refusing, &daemon(), soon())
-            .await
-            .unwrap();
-        assert_eq!(failed.failures.len(), 1);
-        assert!(released(&d.dir, &run_id));
-
-        // File clones share the open file description just as forked descriptors
-        // do. Retain one after its parent's File drops, without spawn timing.
-        let parent = d.dir.try_lock_existing(&run_id).unwrap().unwrap();
-        let mut inherited = Some(parent.try_clone().unwrap());
-        drop(parent);
         let absent = Fake {
             orphans: vec!["vol1".into()],
             ..Fake::default()
         };
-        // Negative: the real reconciler must still leave a held lock alone.
+
+        // Negative: while its owner holds the lock, a copy or not, the run is
+        // live and the reconciler leaves it alone.
+        let held = d.dir.lock(&run_id).unwrap();
+        let held_copy = held.duplicate();
         let live = reconcile(&d.dir, &absent, &daemon(), soon()).await.unwrap();
         assert_eq!(live.live, vec![run_id.clone()]);
         assert!(live.removed.is_empty() && live.failures.is_empty());
         assert!(absent.removed.borrow().is_empty());
+        assert!(!released(&d.dir, &run_id));
 
-        let mut inherited_probe = None;
-        recovery_locks_released(&failed, |waiting_for| {
-            assert_eq!(waiting_for, run_id);
-            released_with(|| {
-                let lock = d.dir.try_lock_existing(waiting_for).unwrap();
-                if let Some(lock) = &lock {
-                    // Model a second fork during the successful release probe.
-                    inherited_probe = Some(lock.try_clone().unwrap());
-                } else {
-                    // Release the first inherited descriptor only after the
-                    // barrier has observed it, rather than after a timed sleep.
-                    drop(inherited.take());
-                }
-                lock
-            })
-        });
-        assert!(
-            inherited.is_none(),
-            "the inherited recovery lock was not observed"
-        );
-        assert!(
-            inherited_probe.is_some(),
-            "the release probe was not exercised"
-        );
-        // Keep the probe's duplicate open through the next real cleanup: merely
-        // dropping the probe File would still classify this run as live.
-        let cleaned = reconciled(&d, &absent).await;
+        // The owner is done; the copy outlives it.
+        drop(held);
+        assert!(released(&d.dir, &run_id), "the owner's lock outlived it");
+
+        // A probe is a lock too: a copy of it must not extend it either.
+        let probe = d.dir.try_lock_existing(&run_id).unwrap().unwrap();
+        let probe_copy = probe.duplicate();
+        drop(probe);
+        let cleaned = reconcile(&d.dir, &absent, &daemon(), soon()).await.unwrap();
         assert_eq!(cleaned.removed, vec![run_id.clone()], "{cleaned:?}");
         assert_eq!(*absent.removed.borrow(), vec!["vol1".to_owned()]);
         assert!(!kept(&d, &run_id));
-        drop(inherited_probe);
+        drop((held_copy, probe_copy));
     }
 
     #[tokio::test]
@@ -1284,7 +1232,7 @@ mod live {
         let record = journal.record.clone();
         held.disown();
         drop(journal);
-        // A sibling fork may still hold the journal's open file description.
+        // Dropping the journal unlocked its lock, whatever a sibling fork holds.
         assert!(released(&d.dir, &record.run_id));
         let mut dead = record.clone();
         dead.process.pid = GONE;
@@ -1542,7 +1490,7 @@ mod live {
         let mut dead = d.dir.read(&run_id).unwrap().unwrap();
         dead.process.pid = GONE;
         d.dir.write(&dead).unwrap();
-        // Failed finish drops the journal, but a sibling fork can retain its lock.
+        // Failed finish drops the journal, which unlocks its lock.
         assert!(released(&d.dir, &run_id));
         let done = Box::pin(recover(&d)).await;
         assert_eq!(done.removed, vec![run_id], "{done:?}");

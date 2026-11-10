@@ -83,6 +83,36 @@ pub(super) fn is_run_id(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// A run's lock, held until this value is dropped.
+///
+/// The lock belongs to the open file description, and a child forked by any
+/// thread (a `docker` or `git` spawn) shares that description until it execs,
+/// so merely closing our descriptor can leave the lock held for a few
+/// milliseconds and make a finished or dead run read as live (#2592). Setting
+/// close-on-exec cannot help: it acts at exec, not at fork. `unlock` acts on
+/// the description itself, so it releases the lock for every copy at once;
+/// that is why every lock of this file is held through this type and no
+/// caller can release one by `drop(File)`.
+#[derive(Debug)]
+pub(super) struct RunLock(File);
+
+impl RunLock {
+    /// A second handle on the same open file description, as a forked child
+    /// would hold; for tests that model a fork without spawning one.
+    #[cfg(test)]
+    pub(super) fn duplicate(&self) -> File {
+        self.0.try_clone().expect("a lock file can be duplicated")
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        // A failure leaves the lock to the close that follows, which is the
+        // behaviour a plain `File` has; there is nothing better to do.
+        let _ = self.0.unlock();
+    }
+}
+
 /// The per-user directory the records live in.
 pub(crate) struct StateDir {
     path: PathBuf,
@@ -177,7 +207,7 @@ impl StateDir {
     /// its name (a hard link is atomic and fails on an existing name), so a
     /// recovery that finds the name always finds a lock that is held, and never
     /// one it could take and delete from under a run that is just starting.
-    pub(super) fn lock(&self, run_id: &str) -> Result<File, Error> {
+    pub(super) fn lock(&self, run_id: &str) -> Result<RunLock, Error> {
         let path = self.file(run_id, "lock");
         let hidden = self.path.join(format!(".{run_id}.lock"));
         let file = OpenOptions::new()
@@ -192,7 +222,7 @@ impl StateDir {
         // Either way the hidden name has done its work; a kill between the two
         // leaves one file named by 128 random bits, which nothing reads.
         let _ = std::fs::remove_file(&hidden);
-        published.map(|()| file)
+        published.map(|()| RunLock(file))
     }
 
     /// Replaces the run's record: written to a temporary file, flushed,
@@ -271,7 +301,7 @@ impl StateDir {
 
     /// The lock file of `run_id`, taken only if nobody holds it. `None` means
     /// somebody does: a run that is alive.
-    pub(super) fn try_lock_existing(&self, run_id: &str) -> Result<Option<File>, Error> {
+    pub(super) fn try_lock_existing(&self, run_id: &str) -> Result<Option<RunLock>, Error> {
         let path = self.file(run_id, "lock");
         let file = OpenOptions::new()
             .write(true)
@@ -280,7 +310,7 @@ impl StateDir {
             .open(&path)
             .map_err(|e| state(&path, e))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => Ok(Some(RunLock(file))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(state(&path, e)),
         }
