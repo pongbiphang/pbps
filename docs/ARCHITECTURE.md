@@ -18,7 +18,9 @@ pbps-diff      model <-> ids comparison -> immutable PlanningPlan. Produces no S
 pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
                probes, shared operational row-work answers. Connection-bound
                work is free async fns in the dialect
-               crate, not trait methods; pbps-cli::engine routes to them.
+               crate, not methods of `Dialect`; pbps-cli::engine routes to them.
+               The operations every engine must provide are the exception:
+               they are the `Engine` trait in pbps-db (DEC-2798.1).
                Lowering takes the engine's associated input and returns immutable
                operation groups branded by that emitter (DEC-1959.5)
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
