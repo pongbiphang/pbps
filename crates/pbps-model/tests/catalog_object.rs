@@ -227,12 +227,13 @@ fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
     }
 }
 
-/// The classifier names every variant itself, so a new one is a decision made
-/// where the kinds are defined. The compiler enforces that (no wildcard); this
-/// pins it against someone adding one, because a wildcard is a warning level
-/// lint that an `allow` could silence.
+/// Every variant is listed in exactly one family, where the kinds are defined,
+/// and the two classifiers built from the families have no wildcard arm. The
+/// compiler enforces both (a missing variant does not compile, a repeated one
+/// is unreachable); this pins them against an `allow`, because both are
+/// warning-level lints (DEC-2790.1).
 #[test]
-fn the_classifier_names_every_variant_not_a_catalog_object() {
+fn every_variant_is_listed_in_exactly_one_family() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/change.rs");
     let text = std::fs::read_to_string(path).unwrap();
     let file = syn::parse_file(&text).unwrap();
@@ -249,30 +250,26 @@ fn the_classifier_names_every_variant_not_a_catalog_object() {
             }
         })
         .expect("`Change` is an enum in change.rs");
-    let start = text.find("pub fn catalog_object").unwrap();
-    let body = &text[start..text[start..].find("\n    }\n").map(|n| start + n).unwrap()];
-    assert!(!body.contains("_ =>"), "a wildcard arm hides new variants");
-    let catalog = [
-        "CreateRole",
-        "DropRole",
-        "RenameRole",
-        "CreateType",
-        "DropType",
-        "RenameType",
-        "CreateExtension",
-        "DropExtension",
-        "UpdateExtension",
-        "SetExtensionSchema",
-    ];
-    for variant in &variants {
-        let named = body.contains(&format!("Change::{variant} "))
-            || body.contains(&format!("Change::{variant}("));
-        // A catalog variant is named by the pattern macro, not here.
-        assert_eq!(
-            named,
-            !catalog.contains(&variant.as_str()),
-            "`{variant}` must be named in the classifier, except the catalog ones"
+    let body_of = |opening: &str, closing: &str| {
+        let start = text.find(opening).unwrap();
+        &text[start..text[start..].find(closing).map(|n| start + n).unwrap()]
+    };
+    for classifier in ["pub fn catalog_object", "pub fn family"] {
+        let body = body_of(classifier, "\n    }\n");
+        assert!(
+            !body.contains("_ =>"),
+            "a wildcard arm in `{classifier}` hides new variants"
+        );
+        assert!(
+            !body.contains("Change::"),
+            "`{classifier}` names families, so a kind is listed once"
         );
     }
-    assert!(variants.len() > catalog.len());
+    let families = body_of("macro_rules! change_family", "\n}\n");
+    for variant in &variants {
+        let listed = families.matches(&format!("Change::{variant} ")).count()
+            + families.matches(&format!("Change::{variant}(")).count();
+        assert_eq!(listed, 1, "`{variant}` must be in exactly one family");
+    }
+    assert!(variants.len() > 3);
 }
