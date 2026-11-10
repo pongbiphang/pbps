@@ -458,6 +458,40 @@ so it is *less* recourse than the stale crate, not more. Dialect plugins are
 declined separately: no stable Rust ABI, and a plugin API would freeze
 `ChangeSet` while the model still moves.
 
+## Object kinds, by engine
+
+The tables in this section and the two after it that sit between `generated`
+comments are rendered from `pbps_dialect::support` (#2717, DEC-2717.1). Edit the
+records there, then run
+`PBPS_REGENERATE_STATUS=1 cargo test -p pbps-pg --test support_table`. Tests
+fail when a table here differs from the records, when the PostgreSQL census
+names a kind with no record, and when the loader accepts a declaration with no
+record.
+
+What a project can declare, by the leading key of the declaration file.
+`refused` means the engine's validation rejects the declaration.
+
+<!-- generated:declared -->
+| Declaration | PostgreSQL | SQL Server |
+|---|---|---|
+| `table:` | managed | managed |
+| `view:` | managed | managed |
+| `procedure:` | managed | managed |
+| `function:` | managed | managed |
+| `trigger:` | managed | managed |
+| `extension:` | partly held | refused |
+| `role:` | partly held | managed |
+| `enum:` | managed | refused |
+| `domain:` | managed | refused |
+| `text_search_config:` | partly held | refused |
+| `text_search_dictionary:` | partly held | refused |
+| `dependency:` | refused | managed |
+<!-- /generated:declared -->
+
+On PostgreSQL a `role:` is `partly held` because a plan grants to the role and
+never creates it. An `extension:` and the two text search declarations are
+`partly held` as the tables below say.
+
 ## PostgreSQL objects and properties pbps does not hold
 
 This list was measured on PostgreSQL 16.15 and 18.6 (#2441). Each kind was created beside one ordinary table, and then pulled, planned against a database holding it, and declared. The two versions behave the same except where a row says otherwise. The list is the explicit form of what #168 will prove mechanically.
@@ -469,17 +503,21 @@ How each kind is handled today:
 
 ### Support planned, in order of how often users meet them
 
+<!-- generated:postgres-planned -->
 | Kind | Today | Tracking |
 |---|---|---|
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read and round trip held, DEC-2448.3; add, drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
 | Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create, alter, rename and drop next) | partly held | #2728 |
+<!-- /generated:postgres-planned -->
 
 ### Silent today (bugs)
 
+<!-- generated:postgres-silent -->
 | Kind | Tracking |
 |---|---|
+<!-- /generated:postgres-silent -->
 
 ### Named by the catalog census
 
@@ -488,6 +526,7 @@ Pull names these objects and connected plan reports them as nonfatal
 schema state. System objects, extension members, column-owned sequences and
 column-used types are excluded. An unreadable catalog is an error.
 
+<!-- generated:postgres-census -->
 | Kind | Tracking |
 |---|---|
 | Extensions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
@@ -512,6 +551,7 @@ column-used types are excluded. An unreadable catalog is an error.
 | Conversions | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | Foreign data wrappers, foreign servers and user mappings | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | User-created procedural languages | [#168](https://github.com/pongbiphang/pbps/issues/168) |
+<!-- /generated:postgres-census -->
 
 ### Named properties of objects the pull holds
 
@@ -601,6 +641,31 @@ These are held and detected as drift:
 - `fillfactor` and the autovacuum reloptions;
 - btree index reloptions;
 - the default null ordering for each direction.
+
+## SQL Server objects pbps does not hold
+
+Read from the pull's queries on `2032bf160`, not yet measured kind by kind on
+an engine as the PostgreSQL list was (#2794 does that). SQL Server has no
+catalog census.
+
+- **Named.** Pull warns by name and leaves the object, or the column, out.
+- **Not read.** The pull's queries do not read the catalog view that lists the
+  kind, so pull and plan say nothing about it. A declaration pulled from such a
+  database can name an object the declarations do not carry: a default over a
+  sequence, a module over a synonym.
+
+<!-- generated:sqlserver -->
+| Kind | Today | Tracking |
+|---|---|---|
+| CLR procedures, functions and triggers | named |  |
+| Modules whose definition cannot be read back (`WITH ENCRYPTION`, or no `VIEW DEFINITION`) | named |  |
+| Columns of a user-defined alias type | named |  |
+| Sequences | not read | #2721; [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
+| Synonyms | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
+| User-defined table types | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
+| Security policies | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
+| Database-level DDL triggers | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
+<!-- /generated:sqlserver -->
 
 ## Roadmap
 

@@ -47,6 +47,7 @@ pub mod lower;
 pub mod plan_rows;
 pub mod predicate;
 pub mod slots;
+pub mod support;
 
 #[cfg(test)]
 use pbps_model::ChangeSet;

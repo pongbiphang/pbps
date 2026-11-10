@@ -1323,3 +1323,41 @@ the declaration schema: a partition takes no comment from its parent, so its
 comment is written under its entry and read back as the partition's own. No
 published document names a `Change`, so the plan version is the only other
 format that moved.
+
+<a id="dec-2717-1"></a>
+
+**DEC-2717.1. What each engine does with each kind of object is one table in
+code, and STATUS.md's kind tables are rendered from it (#2717).** Which kinds
+are declared, which the PostgreSQL census names and which nothing reads was
+written only as prose in `docs/STATUS.md`, for PostgreSQL only, and no test or
+script read that file. The census names its kinds as string literals inside one
+query, so a kind added there, or a declaration the loader started to accept,
+changed what pbps does with no document forced to follow.
+
+`pbps_dialect::support` holds one record per engine and kind, with a tier:
+managed, partly held, named, silent, or not read. Tests in
+`crates/pbps-pg/tests/support_table.rs` tie it three ways. The kinds read from
+the census query's text equal the kinds the records name, in both directions.
+The leading keys the loader lists equal the declared records, in order. The
+STATUS.md tables between `generated` comments equal the rendering, and
+`PBPS_REGENERATE_STATUS=1` rewrites them.
+
+In code and not a data file, for `pull_coverage`'s reason (DEC-168.1): the
+tests read it with no parser, and a record is checked by the compiler. The list
+of named *properties* stays prose; `pull_coverage` already covers properties
+column by column, and its rows are not object kinds.
+
+The SQL Server rows are the first statement of what that pull does not read
+(sequences, synonyms, table types, security policies, database-level DDL
+triggers). They were read from its queries, not measured on an engine, and the
+section says so; #2794 measures them and adds a census.
+
+Rejected: reporting the tier in `doctor`. `doctor` runs the same validation as
+`validate`, which already refuses a declaration the project's engine does not
+hold, so the report would read "managed" for every project that loads, and
+putting the table in `doctor`'s data would change the published envelope for
+no reader. Also rejected: wording the census and limitation messages from the
+table, which would change pinned output and add no information.
+
+Not tied mechanically: that an engine marked `refused` for a declaration
+really refuses it. Each dialect's validation tests pin that separately.
