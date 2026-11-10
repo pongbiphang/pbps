@@ -707,9 +707,12 @@ fn a_dropped_file_in_the_way_of_a_directory_goes_aside_instead_of_refusing() {
     assert_eq!(read_opt(&project).unwrap().unwrap().tables.len(), 1);
 }
 
+// Unix only, with the tests that call it: the fault is injected with
+// permission bits, which Windows directories do not have.
 /// A directory the write cannot create files in, so that a later staged write
 /// fails after the earlier ones succeeded. `None` when the account ignores
 /// permissions (root), where the fault cannot be injected.
+#[cfg(unix)]
 fn unwritable(dir: &Path) -> Option<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
@@ -722,6 +725,7 @@ fn unwritable(dir: &Path) -> Option<()> {
     Some(())
 }
 
+#[cfg(unix)]
 fn writable(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -754,6 +758,7 @@ fn listing(dir: &Path) -> Vec<String> {
     out
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_staging_write_leaves_the_tree_as_it_was_when_a_file_became_a_directory() {
     let project = project("rollback-file-to-dir");
@@ -782,6 +787,7 @@ fn a_failed_staging_write_leaves_the_tree_as_it_was_when_a_file_became_a_directo
     assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "old");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_staging_write_leaves_the_tree_as_it_was_when_a_directory_became_a_file() {
     let project = project("rollback-dir-to-file");
@@ -1239,6 +1245,7 @@ fn the_probe_agrees_with_the_filesystem_with_or_without_an_entry_to_look_at() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_probe_that_cannot_read_is_an_error_not_case_sensitive() {
     use std::os::unix::fs::PermissionsExt;
@@ -1415,8 +1422,16 @@ fn an_aside_that_collides_with_a_destination_takes_the_next_free_name() {
         );
         assert!(write.files[expect].contains("\"dropped\""), "{spelling}");
         assert_eq!(write.removals, ["a.json"], "{spelling} {key:?}");
-        if key == PathKey::default() {
-            // The real filesystem here is case-sensitive: write it, read it back.
+        // Where the real filesystem folds case, a spelling that differs from
+        // the aside's name only in case IS that name there, so a plan made with
+        // the case-significant key cannot be written on it (the aside's
+        // directory and the aside file are one entry); the spelling in the
+        // aside's own case still can.
+        let writable_here =
+            !case_insensitive(&project.ids_dir()) || spelling == spelling.to_lowercase();
+        if key == PathKey::default() && writable_here {
+            // The real filesystem here treats the names as the key does: write
+            // it, read it back.
             write.apply().unwrap();
             assert_eq!(read_opt(&project).unwrap().unwrap().tombstones.len(), 3);
             assert!(
@@ -1448,6 +1463,7 @@ fn a_live_pair_is_still_refused_after_the_substitutions() {
 
 // -------------------------------------------- the probe, read-only first ----
 
+#[cfg(unix)]
 #[test]
 fn an_empty_read_only_tree_directory_is_probed_without_a_write() {
     let project = project("probe-readonly");
@@ -1466,6 +1482,7 @@ fn an_empty_read_only_tree_directory_is_probed_without_a_write() {
     assert_eq!(listing(project.root()), before, "nothing was written");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_ancestor_on_another_device_says_nothing_about_this_filesystem() {
     let project = project("probe-device");
@@ -1500,6 +1517,7 @@ fn a_writable_directory_with_nothing_to_look_at_anywhere_gets_a_probe_file_and_l
     assert!(names_in(&dir).is_empty(), "the probe file is removed again");
 }
 
+#[cfg(unix)]
 #[test]
 fn two_listed_spellings_of_one_name_are_a_case_sensitive_answer_even_when_they_are_one_file() {
     use std::os::unix::fs as ufs;
@@ -1507,14 +1525,16 @@ fn two_listed_spellings_of_one_name_are_a_case_sensitive_answer_even_when_they_a
         let project = project(&format!("probe-linked-{}", how.replace(' ', "-")));
         let dir = project.ids_dir();
         std::fs::create_dir_all(&dir).unwrap();
+        // Asked before the second spelling is made: where case folds, `a` and
+        // `A` cannot both exist, and the link fails with "already exists".
+        if case_insensitive(&dir) {
+            continue;
+        }
         std::fs::write(dir.join("a"), "x").unwrap();
         if how == "hard link" {
             std::fs::hard_link(dir.join("a"), dir.join("A")).unwrap();
         } else {
             ufs::symlink("a", dir.join("A")).unwrap();
-        }
-        if case_insensitive(&dir) {
-            continue; // `a` and `A` cannot both exist here
         }
         // `a` and `A` are one file and two entries: the directory tells them apart.
         assert_eq!(PathKey::probe(&dir).unwrap(), PathKey::default(), "{how}");
@@ -1524,6 +1544,7 @@ fn two_listed_spellings_of_one_name_are_a_case_sensitive_answer_even_when_they_a
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dangling_symlink_spelled_like_the_twin_is_an_entry_not_a_fold() {
     use std::os::unix::fs as ufs;

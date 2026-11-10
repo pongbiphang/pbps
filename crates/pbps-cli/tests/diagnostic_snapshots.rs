@@ -211,7 +211,6 @@ impl Capture {
 fn normalize(text: &str) -> String {
     let mut text = text.replace("\r\n", "\n");
     for path in [
-        ".pbps/ids",
         "schema/dbo.t.yml",
         "schema/dbo.café.yml",
         "schema/a.yml",
@@ -222,7 +221,12 @@ fn normalize(text: &str) -> String {
             &format!("./{path}"),
         );
     }
-    text
+    // `ids_dir` is spelled with `/` in the configuration and `join` does not
+    // rewrite it, so on Windows the project root and the directory meet as
+    // `.\.pbps/ids`: the one path here that is not all backslashes. The
+    // all-backslash spelling is accepted too, for a root given as a native path.
+    text.replace(".\\.pbps/ids", "./.pbps/ids")
+        .replace(".\\.pbps\\ids", "./.pbps/ids")
 }
 
 #[test]
@@ -240,6 +244,13 @@ fn normalization_preserves_diagnostic_content() {
         assert_ne!(normalize(&changed), normalize(text));
     }
     assert_eq!(normalize("unrelated\\path"), "unrelated\\path");
+    assert_eq!(
+        normalize("at `.\\.pbps/ids`;\r\n"),
+        "at `./.pbps/ids`;\n",
+        "the identity directory keeps its configured `/`"
+    );
+    // Negative: a path that merely contains the directory's name is left alone.
+    assert_eq!(normalize("x\\.pbps/ids"), "x\\.pbps/ids");
 }
 
 #[test]

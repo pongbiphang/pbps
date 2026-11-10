@@ -717,9 +717,11 @@ fn no_output_may_be_written_inside_the_identity_tree_existing_or_not() {
     let before = tree_of(&p);
     #[cfg(unix)]
     std::os::unix::fs::symlink(".pbps/ids", p.0.join("alias")).unwrap();
-    let mut targets = vec![".pbps/ids/x.json", ".pbps/ids/sub/y.json"];
-    #[cfg(unix)]
-    targets.push("alias/z.json");
+    // The alias exists only where the symlink above could be made.
+    let targets: Vec<&str> = [".pbps/ids/x.json", ".pbps/ids/sub/y.json"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("alias/z.json"))
+        .collect();
     for target in targets {
         for args in [
             vec!["plan", "--no-dev", "--out", target],
@@ -923,6 +925,9 @@ fn the_identity_layout_refusal_is_one_json_envelope_for_plan_and_plan_check() {
     }
 }
 
+// Unix only: the read-only checkout is made with permission bits, which
+// Windows directories do not have.
+#[cfg(unix)]
 #[test]
 fn plan_check_succeeds_on_a_read_only_checkout_with_an_empty_identity_directory() {
     use std::os::unix::fs::PermissionsExt;
