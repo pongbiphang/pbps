@@ -6366,3 +6366,65 @@ after one attempt). The nine single-attempt freshness cases call `owned_once`.
 
 Formats: none. No sealed bytes, plan, state, schema set or evidence change; the
 rule stays `postgres-catalog-inputs-v3`.
+
+<a id="dec-2762-1"></a>
+
+**DEC-2762.1. The owned SQL Server scratch starts once more after a startup core
+dump, and only then.** This extends the rule of [DEC-958.1](process.md#dec-958-1)
+from the dedicated-server fixture to the scratch pbps starts for a run:
+`Container::start_ready`, which `with_started` (a connected plan's resolver and
+`--dev docker://`) and `Held::start_owned` (`pbps test`, a held resolver) both
+use. DEC-958.1 is not edited.
+
+*Measured cause.* #2762 and #2667 are one failure. SQL Server 2025
+(17.0.4075.5) aborts inside its own start-up threads, 1 to 7 s after `docker
+start` and before any connection, when the host's CPUs are saturated. The
+container ran with no memory, pids or ulimit setting of ours, so nothing in a
+run can cause it. Same image, same plain `docker run`, own containers: 0 of 30
+sequential starts crashed on an idle host, 2 of 30 under 32 busy loops on 32
+cores, and 4 of 6 when six started together under that load. Both signatures
+seen in the gates reproduced: the `lsass` stack with `Reason: 0x2` (10/26 to
+11/03 events and the first six parallel starts) and `ASSERT:
+Expression=(IsStarted())` in `scheduler.cpp` (the pid-11 events). `Last errno:
+11` in the header is noise: a healthy start returns EAGAIN 59 times from
+non-blocking `flock`. It is not inotify (that failure is `inotify_init`, errno
+24), not memory (`OOMKilled` is false and the journal shows no pressure), not
+concurrent container starts, and not the host's aio, thread or pid limits.
+
+*The rule.* A second container is started only when all three hold, as in
+DEC-958.1: the engine is SQL Server; the container has exited, which the
+runtime reported (a container it no longer knows proves nothing); and its log
+names a `core.sqlservr` dump. The first container is removed and its removal
+confirmed before the second is named, so the two never coexist; an
+unconfirmed removal is the run's cleanup error and no second start happens.
+The retry happens once: a second crash fails the run with both reports.
+PostgreSQL, a running server that never answers, an exit with no dump, a
+vanished container and a failed `docker logs` fail as before.
+
+*The first crash stays on record.* A retry that succeeds prints one `note:`
+line with the first start's report on stderr before it moves on; a retry that
+fails carries the first report in the error (`test.infrastructure`,
+`resolver` acquisition). A journaled owner is told through `Owner::restarted`
+after the removal is confirmed and puts its record back to `Pending` without
+the crashed container's id and volumes, so the record never names a container
+that is gone and the next `before_create` writes it as it did the first time.
+
+*The report reaches the crash.* The readiness failure used `docker logs
+--tail 20`, which for a core dump holds only the collector's `find` lines, so
+#2762's finding never showed the fatal error. It now keeps the first 40 and the
+last 20 lines of the log, with a count of those omitted: the header, reason,
+stack and `Last errno` come first, the dump collector's end last. The password
+is redacted from both as before.
+
+*Not done.* Nothing makes the engine start reliably under load, and no host
+setting is changed. Serialising CPU-heavy builds against live suites lowers the
+rate and is a scheduling policy, not part of this rule. A crash after the server
+answered, or on a long-running container, is a different failure and is not
+retried.
+
+Pinned by `startup.rs` unit tests (the retry once and not twice, each refusal
+case, both reports carried, the unconfirmed removal) and by
+`restarted_returns_the_journal_to_pending`; the crash itself is forced on
+demand only by CPU saturation, so the acceptance evidence is the 30-start
+old-path/new-path comparison recorded on the PR. Formats: none. No sealed
+bytes, plan, state, schema set or evidence change.

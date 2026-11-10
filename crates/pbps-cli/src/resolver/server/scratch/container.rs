@@ -58,8 +58,9 @@ pub async fn with_started<T>(
     // later run can tell from them that the owner is gone (#2410).
     let token = format!("{:032x}", rand::random::<u128>());
     recovery::sweep(&token).await;
-    let container = Container::start(driver, image, &token, &mut Anonymous(token.clone())).await?;
-    let (outcome, keeper) = match container.ready(driver, READY).await {
+    let (container, ready) =
+        Container::start_ready(driver, image, &token, &mut Anonymous(token.clone())).await?;
+    let (outcome, keeper) = match ready {
         Ok(()) => match recovery::Keeper::open(driver, &container.connection, &token).await {
             Ok(keeper) => (run(&container.connection).await, Some(keeper)),
             Err(error) => (Err(error), None),
@@ -111,8 +112,8 @@ impl Held {
         // while it holds the container is recovered by the next one.
         let token = owner.token();
         recovery::sweep(&token).await;
-        let container = Container::start(driver, image, &token, owner).await?;
-        let kept = match container.ready(driver, READY).await {
+        let (container, ready) = Container::start_ready(driver, image, &token, owner).await?;
+        let kept = match ready {
             Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
             Err(error) => Err(error),
         };
@@ -170,6 +171,13 @@ pub trait Owner {
     /// Called with the id `docker run` returned, before anything connects; an
     /// error removes the container and stops the start.
     async fn created(&mut self, id: &str) -> Result<(), String>;
+    /// Called when a SQL Server container crashed while starting and was
+    /// confirmed removed, just before the run starts a second one under the
+    /// same token (DEC-2762.1). A journaled owner puts its record back to what
+    /// it was before the first `docker run`; `before_create` follows.
+    async fn restarted(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The resolver's own run: a fresh token and nothing else to tell anyone.
@@ -262,6 +270,36 @@ struct Container {
     /// Set once `remove` confirmed it gone, so the drop guard stands down.
     removed: bool,
     password: String,
+}
+
+/// One run's container start, as [`startup::started_ready`] drives it.
+struct Starting<'a, O: Owner> {
+    driver: Driver,
+    image: &'a str,
+    token: &'a str,
+    owner: &'a mut O,
+}
+
+impl<O: Owner> startup::Launch for Starting<'_, O> {
+    type Container = Container;
+
+    async fn start(&mut self, again: bool) -> Result<Container, ProduceError> {
+        if again {
+            self.owner.restarted().await.map_err(|why| {
+                ProduceError::Acquire(format!("before starting {} again: {why}", self.image))
+            })?;
+        }
+        Container::start(self.driver, self.image, self.token, &mut *self.owner).await
+    }
+
+    async fn wait(&mut self, container: Container) -> (Container, Result<(), startup::NotReady>) {
+        let waited = container.wait_ready(self.driver).await;
+        (container, waited)
+    }
+
+    async fn discard(&mut self, container: Container) -> Result<(), Vec<String>> {
+        container.remove().await
+    }
 }
 
 impl Container {
@@ -362,6 +400,46 @@ impl Container {
         Ok(container)
     }
 
+    /// The container started and its server answering. A SQL Server that
+    /// crashed while starting is started once more, and only then
+    /// (DEC-2762.1); PostgreSQL and every other failure are reported as they
+    /// are. The container returned is the one the caller must still remove,
+    /// with how it became ready.
+    async fn start_ready(
+        driver: Driver,
+        image: &str,
+        token: &str,
+        owner: &mut impl Owner,
+    ) -> Result<(Self, Result<(), ProduceError>), ProduceError> {
+        let started = startup::started_ready(&mut Starting {
+            driver,
+            image,
+            token,
+            owner,
+        })
+        .await?;
+        if let Some(first) = &started.first_crash {
+            // Reported before it is forgotten, as DEC-958.1 does for the
+            // fixture: the retry must not hide that the engine crashed.
+            eprintln!(
+                "note: SQL Server crashed while starting and was started once more (DEC-2762.1); the first start:\n{first}"
+            );
+        }
+        Ok((started.container, started.ready))
+    }
+
+    async fn wait_ready(&self, driver: Driver) -> Result<(), startup::NotReady> {
+        if driver == Driver::Mssql {
+            return startup::ready(&self.connection, &self.id, &self.password).await;
+        }
+        self.ready(driver, READY).await.map_err(|error| {
+            startup::NotReady::Failed(match error {
+                ProduceError::Acquire(why) => why,
+                other @ (ProduceError::Run(_) | ProduceError::Cleanup(_)) => other.to_string(),
+            })
+        })
+    }
+
     /// Polls until the server answers: a container runs well before its
     /// server listens on TCP.
     /// The deadline bounds each attempt too: a server that accepts TCP and
@@ -370,7 +448,7 @@ impl Container {
         if driver == Driver::Mssql {
             return startup::ready(&self.connection, &self.id, &self.password)
                 .await
-                .map_err(|e| ProduceError::Acquire(e.to_string()));
+                .map_err(|e| ProduceError::Acquire(e.into_report()));
         }
         let deadline = tokio::time::Instant::now() + within;
         loop {
