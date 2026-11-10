@@ -1078,31 +1078,42 @@ pub fn refused_before_ddl(server: &str) {
         .unwrap()
         .to_owned();
 
-    // Another key: both identifiers named.
-    let key = sealed.d.dir.join("key");
-    let kept = std::fs::read(&key).unwrap();
-    std::fs::remove_file(&key).unwrap();
-    successful(run(
-        &sealed.d,
-        &["key", "generate", "--out", key.to_str().unwrap()],
-        None,
-    ));
-    refused(
-        sealed.apply(&sealed.artifact),
-        &[
-            &format!("sealed under fingerprint key {sealed_key}, and `prod` has key"),
-            "Plan again",
-        ],
-    );
-    std::fs::write(&key, &kept).unwrap();
+    // Another key: both identifiers named. The key is a file the project
+    // names, or (where a key file cannot be made, on Windows) the environment
+    // variable it names (#2491): then the other key is the variable's other
+    // value for this one apply.
+    let other_apply_says = [
+        &format!("sealed under fingerprint key {sealed_key}, and `prod` has key") as &str,
+        "Plan again",
+    ];
+    if std::env::var_os(crate::KEY_ENV).is_some() {
+        refused(
+            sealed
+                .apply_command(&sealed.artifact)
+                .env(
+                    crate::KEY_ENV,
+                    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                )
+                .output()
+                .unwrap(),
+            &other_apply_says,
+        );
+    } else {
+        let key = sealed.d.dir.join("key");
+        let kept = std::fs::read(&key).unwrap();
+        std::fs::remove_file(&key).unwrap();
+        successful(run(
+            &sealed.d,
+            &["key", "generate", "--out", key.to_str().unwrap()],
+            None,
+        ));
+        refused(sealed.apply(&sealed.artifact), &other_apply_says);
+        std::fs::write(&key, &kept).unwrap();
+    }
     // No key at all: the sealed identifier and the remedy.
     let config = sealed.d.dir.join("pbps.yml");
     let configured = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(
-        &config,
-        configured.replace("    fingerprint_key_file: key\n", ""),
-    )
-    .unwrap();
+    std::fs::write(&config, configured.replace(key_line(), "")).unwrap();
     refused(
         sealed.apply(&sealed.artifact),
         &[
