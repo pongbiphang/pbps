@@ -2644,3 +2644,81 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
     // ...and a column the plan does not move is not excused by the rebuild.
     assert!(check("app.mood", "text").is_err());
 }
+
+/// A comment is held like every other observed field (#2729, DEC-2729.1): kept unless the plan
+/// sets it, and where it sets it the close holds the text it set, so another session's edit of
+/// either, between the plan and its apply, is refused. Negatives: the plan's own text passes.
+#[test]
+fn a_comment_is_kept_unless_the_plan_sets_it_and_then_held_to_the_text_it_sets() {
+    use pbps_model::CommentTarget;
+    let name = TableName::new("app", "t");
+    let mut t = table();
+    t.description = Some("old table".into());
+    t.columns["id"].description = Some("old column".into());
+    let before = schema(t);
+    let sets = |table: Option<&str>, column: Option<&str>| {
+        let mut changes = Vec::new();
+        if let Some(text) = table {
+            changes.push(Change::SetComment {
+                target: CommentTarget::Table {
+                    uid: "t_000001".parse().unwrap(),
+                    table: name.clone(),
+                },
+                text: Some(text.into()),
+            });
+        }
+        if let Some(text) = column {
+            changes.push(Change::SetComment {
+                target: CommentTarget::Column {
+                    uid: "c_000001".parse().unwrap(),
+                    column: name.column("id"),
+                },
+                text: Some(text.into()),
+            });
+        }
+        plan(changes)
+    };
+    let after = |table: &str, column: &str| {
+        let mut after = before.clone();
+        let t = after.tables.get_mut(&name).unwrap();
+        t.description = Some(table.into());
+        t.columns["id"].description = Some(column.into());
+        after
+    };
+    let pg = pbps_pg::Postgres::new();
+    let both = sets(Some("new table"), Some("new column"));
+    let check = |changes: &ChangeSet, after: &Schema| {
+        refuse_unplanned_movement(&pg, changes, &before, after, "test", Settled::Closing)
+    };
+    check(&both, &after("new table", "new column")).expect("the plan's own text");
+    let table_moved = check(&both, &after("someone else", "new column"))
+        .expect_err("another session edited the table's comment");
+    assert!(
+        format!("{table_moved:#}").contains("comment"),
+        "{table_moved:#}"
+    );
+    let column_moved = check(&both, &after("new table", "someone else"))
+        .expect_err("another session edited the column's comment");
+    assert!(
+        format!("{column_moved:#}").contains("comment"),
+        "{column_moved:#}"
+    );
+    // Removal is held too: the plan says no comment, and one came back.
+    let mut removal = both.clone();
+    if let Change::SetComment { text, .. } = &mut removal.changes[0].change {
+        *text = None;
+    }
+    let mut gone = after("new table", "new column");
+    gone.tables.get_mut(&name).unwrap().description = None;
+    check(&removal, &gone).expect("removed, and gone");
+    check(&removal, &after("new table", "new column"))
+        .expect_err("the comment the plan removed is back");
+    // A comment the plan leaves be is kept like any other observed field: another writer's
+    // edit of the column's comment is refused when the plan sets only the table's, and the
+    // table's own comment passes at the text the plan sets.
+    let only_table = sets(Some("new table"), None);
+    check(&only_table, &after("new table", "old column")).expect("only the table's comment moved");
+    let moved = check(&only_table, &after("new table", "edited elsewhere"))
+        .expect_err("a comment the plan leaves be moved");
+    assert!(format!("{moved:#}").contains("description"), "{moved:#}");
+}

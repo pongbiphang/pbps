@@ -29,6 +29,8 @@ pub(crate) struct Fields<'a> {
     pub(crate) replica_identity: &'a Option<ReplicaIdentity>,
     pub(crate) storage_parameters: &'a BTreeMap<String, String>,
     pub(crate) unlogged: bool,
+    /// The comment, an empty one being none (#2729).
+    pub(crate) description: Option<&'a str>,
     pub(crate) row_security: &'a pbps_model::RowSecurity,
     pub(crate) row_policies: &'a BTreeMap<String, pbps_model::RowPolicy>,
     pub(crate) system_time: &'a Option<SystemTime>,
@@ -40,9 +42,7 @@ pub(crate) struct Fields<'a> {
 impl<'a> Fields<'a> {
     pub(crate) fn of(table: &'a Table) -> Self {
         let Table {
-            // This metadata is not a catalog observation (SPEC 7.6). Rows
-            // remain with the existing scope-aware row comparator below.
-            description: _,
+            description,
             columns,
             computed,
             primary_key,
@@ -75,6 +75,10 @@ impl<'a> Fields<'a> {
             replica_identity,
             storage_parameters,
             unlogged: *unlogged,
+            description: description
+                .as_ref()
+                .filter(|t| !t.is_empty())
+                .map(pbps_model::Text::raw),
             row_security,
             row_policies,
             system_time,
@@ -135,7 +139,12 @@ pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) ->
         (expected.identity.accepts(&source.identity), "identity"),
         (expected.sequence.accepts(&source.sequence), "sequence"),
         (
-            expected.description == description.as_ref().map(pbps_model::Text::raw),
+            expected.description.accepts(
+                &description
+                    .as_ref()
+                    .filter(|t| !t.is_empty())
+                    .map(pbps_model::Text::raw),
+            ),
             "description",
         ),
     ] {
@@ -263,6 +272,12 @@ pub(crate) fn table(
             name = name.shown()
         ));
     }
+    if !expected.comment.accepts(&now.description) {
+        moved.push(format!(
+            "{name} has a comment other than the one this plan sets",
+            name = name.shown()
+        ));
+    }
     if !expected.place.accepts(&placed.place()) {
         moved.push(format!(
             "{name}'s partition parent, bound or key is not the one the plan was approved over",
@@ -382,6 +397,14 @@ pub(crate) fn columns_after(
             ),
             ColumnPromise::Numbering { from, to } => (numbering(from, to, now), "numbering source"),
             ColumnPromise::Collation(c) => (now.collation.as_ref() == *c, "collation"),
+            ColumnPromise::Description(text) => (
+                now.description
+                    .as_ref()
+                    .filter(|t| !t.is_empty())
+                    .map(pbps_model::Text::raw)
+                    == text.map(pbps_model::Text::raw),
+                "comment",
+            ),
         };
         if !kept {
             moved.push(format!(

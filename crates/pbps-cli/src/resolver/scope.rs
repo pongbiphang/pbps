@@ -361,6 +361,7 @@ pub(crate) fn planned_schema_grants(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }

@@ -296,7 +296,11 @@ use crate::zone::SessionZone;
 // 71 adds the pins of the operator classes a package provides (DEC-2447.14): an older build
 // would reject the field as malformed rather than as a newer plan; 70 belongs to another change.
 // 71 also carries the indexes a package's drop releases (`DropExtension.index_releases`).
-pub const CURRENT_VERSION: u32 = 71;
+// 72 adds `SetComment`, a table's or a column's `COMMENT ON` from a declared `description`
+// (DEC-2729.1): an older build would refuse the change as unknown, and would otherwise run a
+// plan that was reviewed with the comment statements missing; 70 and 71 belong to other
+// changes.
+pub const CURRENT_VERSION: u32 = 72;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -860,6 +864,17 @@ pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
     })
 }
 
+/// [`state_checksum`] of the state as a drift check compares it: without the comments of
+/// tables and columns (#2729). A comment is reconciled when a plan is made and held for the
+/// ones the plan writes; one nothing declares is not this tool's to call drift. Every
+/// comparison of a database with a recorded state or a plan's baseline uses this; the
+/// approvals that pin what a declaration says (a rebuild's) use [`state_checksum`].
+pub fn drift_checksum(schema: &Schema, ids: &IdsFile) -> String {
+    let mut bare = schema.clone();
+    bare.clear_descriptions();
+    state_checksum(&bare, ids)
+}
+
 /// The fingerprint of a plan, for the ledger.
 ///
 /// The whole file is hashed, `created_at` included: two plans that differ only
@@ -984,11 +999,6 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// The two rules that answer "has this environment moved" must answer it
-    /// the same way. `Schema`'s `==` ignores column order; a fingerprint that
-    /// did not made a hand-made drop-and-re-add of one column — which comes
-    /// back last — into drift the differ could not name and no plan could
-    /// resolve (DECISIONS 238).
     /// A text search object does not move the state checksum (DEC-2728.1): they have no
     /// identity yet, so the ones a database holds are not the recorded state's to answer
     /// for, and a database with some would otherwise read as drifted. A change to anything
@@ -1017,6 +1027,37 @@ mod tests {
         );
     }
 
+    /// A comment is not drift (#2729, DEC-2729.1): [`drift_checksum`] ignores a table's and a
+    /// column's, so a database with one nobody declared is the recorded state. Negatives: the
+    /// pinning [`state_checksum`] does see it (a rebuild's approval depends on the declared
+    /// description), and a change to the schema itself still moves the drift checksum.
+    #[test]
+    fn comments_do_not_move_the_drift_checksum_and_a_column_change_still_does() {
+        let bare = schema_with("nvarchar(255)");
+        let mut described = bare.clone();
+        let table = described.tables.values_mut().next().unwrap();
+        table.description = Some("a table".into());
+        table.columns.values_mut().next().unwrap().description = Some("a column".into());
+        let ids = IdsFile::default();
+        assert_eq!(
+            drift_checksum(&bare, &ids),
+            drift_checksum(&described, &ids)
+        );
+        assert_ne!(
+            state_checksum(&bare, &ids),
+            state_checksum(&described, &ids)
+        );
+        assert_ne!(
+            drift_checksum(&schema_with("nvarchar(100)"), &ids),
+            drift_checksum(&described, &ids)
+        );
+    }
+
+    /// The two rules that answer "has this environment moved" must answer it
+    /// the same way. `Schema`'s `==` ignores column order; a fingerprint that
+    /// did not made a hand-made drop-and-re-add of one column — which comes
+    /// back last — into drift the differ could not name and no plan could
+    /// resolve (DECISIONS 238).
     #[test]
     fn column_order_does_not_change_the_state_checksum() {
         let ids = ids_with("t_a1b2c3");
@@ -1547,7 +1588,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 71);
+        assert_eq!(plan.version, 72);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

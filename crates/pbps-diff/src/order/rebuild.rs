@@ -34,6 +34,9 @@ pub struct Input<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Tree,
+    /// A declared comment of a replacement relation, written on it under its intermediate name
+    /// before the swap: a comment follows the OID, so the final relation carries it (#2729).
+    Describe,
     Copy,
     Own,
     Analyze,
@@ -89,6 +92,7 @@ impl Prepared {
                         Purpose::Teardown => Origin::Teardown(OriginSource::Change(0)),
                         Purpose::Restoration => Origin::Restoration(OriginSource::Change(0)),
                         Purpose::Tree
+                        | Purpose::Describe
                         | Purpose::Copy
                         | Purpose::Own
                         | Purpose::Analyze
@@ -327,6 +331,22 @@ pub fn prepare(
             },
             Purpose::Tree,
         );
+    }
+    // The declared comments of the replacement tree, which the create writes none of (#2729,
+    // DEC-2729.1): the parent's, every partition's own and every column's. Only declared text is
+    // written: absent is unmanaged and `""` is no comment on a fresh relation, so neither is a
+    // statement.
+    for (table, spec) in &r.after {
+        let relation = rule.address(rule.out.target.table_uid(table).unwrap());
+        for (target, text) in described(table, spec, &relation, input.desired.ids)? {
+            rule.add(
+                Change::SetComment {
+                    target,
+                    text: Some(text),
+                },
+                Purpose::Describe,
+            );
+        }
     }
     let leaves = |ids: &RebuildIdentities| {
         ids.tables
@@ -650,6 +670,80 @@ pub fn recertify(
     Ok(())
 }
 
+/// The comments a replacement relation is declared with, as the changes that write them on it
+/// under its intermediate address: its own, then each column's. A column without a recorded
+/// identity cannot be named, and the rebuild is refused rather than made without its comment.
+fn described(
+    table: &TableName,
+    spec: &Table,
+    relation: &RebuildRelation,
+    ids: &IdsFile,
+) -> Result<Vec<(pbps_model::CommentTarget, pbps_model::Text)>, String> {
+    let mut out = Vec::new();
+    if let Some(text) = spec.description.as_ref().filter(|t| !t.is_empty()) {
+        out.push((
+            pbps_model::CommentTarget::Table {
+                uid: relation.uid.clone(),
+                table: relation.name.clone(),
+            },
+            text.clone(),
+        ));
+    }
+    for (name, column) in &spec.columns {
+        let Some(text) = column.description.as_ref().filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let uid = ids.column_uid(&table.column(name)).ok_or_else(|| {
+            format!(
+                "{}: the replacement column `{}` has a comment and no recorded identity",
+                table.shown(),
+                name.shown()
+            )
+        })?;
+        out.push((
+            pbps_model::CommentTarget::Column {
+                uid: uid.clone(),
+                column: relation.name.column(name.clone()),
+            },
+            text.clone(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether a plan lacks a comment the replacement `declared` carries, written on `relation`
+/// under its intermediate name: its own, or a column's.
+pub(super) fn lost_comment(
+    plan: &[PlannedChange],
+    relation: &RebuildRelation,
+    declared: &Table,
+) -> Option<&'static str> {
+    let written = |wanted: &dyn Fn(&pbps_model::CommentTarget) -> bool, text: &pbps_model::Text| {
+        plan.iter().any(|p| {
+            matches!(&p.change, Change::SetComment { target, text: Some(x) } if wanted(target) && x == text)
+        })
+    };
+    if let Some(text) = declared.description.as_ref().filter(|t| !t.is_empty())
+        && !written(
+            &|t| matches!(t, pbps_model::CommentTarget::Table { uid, .. } if uid == &relation.uid),
+            text,
+        )
+    {
+        return Some("a replacement table lost its declared comment");
+    }
+    for (name, column) in &declared.columns {
+        if let Some(text) = column.description.as_ref().filter(|t| !t.is_empty())
+            && !written(
+                &|t| matches!(t, pbps_model::CommentTarget::Column { column: c, .. } if c.table == relation.name && &c.name == name),
+                text,
+            )
+        {
+            return Some("a replacement column lost its declared comment");
+        }
+    }
+    None
+}
+
 /// Check the persisted copy against its lineage and the named endpoint parts.
 /// Admission preserves reviewed order; it does not invent missing operations.
 pub(super) fn validate_saved(
@@ -777,6 +871,16 @@ pub(super) fn validate_saved(
             || targets.len() != 1 + copy.target_partitions.len()
         {
             return Err("copy tree membership differs from its approved lineage".into());
+        }
+        // Every comment the replacement tree is declared with is in the plan, written on the
+        // relation under its intermediate name (#2729). A saved plan made without them would
+        // rebuild the tables and lose the comments the state records.
+        for relation in std::iter::once(&copy.target).chain(&copy.target_partitions) {
+            if let Some((_, declared)) = create(&relation.uid)
+                && let Some(lost) = lost_comment(&plan.changes.changes, relation, declared)
+            {
+                return Err(lost.into());
+            }
         }
         for relation in std::iter::once(&copy.target).chain(&copy.target_partitions) {
             let final_name = root

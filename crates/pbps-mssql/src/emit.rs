@@ -511,6 +511,16 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // *keep* a default this engine never grants is just as wrong a claim.
         // `validate` refuses the field on this engine; a change that carries
         // it anyway came from somewhere else and has no statement here.
+        // This engine does not hold descriptions (`holds_descriptions`), so no plan
+        // carries one here; a change that does came from somewhere else and has no
+        // statement. `MS_Description` follows in its own issue (#2729).
+        Change::SetComment { target, .. } => Err(DialectError::Unsupported {
+            dialect: DIALECT,
+            feature: format!(
+                "a comment on `{table}`, which this engine does not hold yet",
+                table = target.table().shown()
+            ),
+        }),
         Change::SetReplicaIdentity { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(

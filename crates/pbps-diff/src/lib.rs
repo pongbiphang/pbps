@@ -7,6 +7,8 @@
 //! This layer produces no SQL and touches no database (constraint 3 in
 //! CLAUDE.md).
 
+mod comments;
+pub use comments::undeclared as undeclared_comments;
 pub mod conversion;
 pub mod domain_rebuild;
 pub mod drop_requirements;

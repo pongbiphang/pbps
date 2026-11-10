@@ -129,7 +129,15 @@ static TABLES: &[(&str, Rows)] = &[
     ("pg_depend", Rows::Each(&[
         (&["classid", "objid", "objsubid", "refclassid", "refobjid", "refobjsubid", "deptype"], Held(None)),
     ])),
-    ("pg_description", Rows::All(Named("comments: unheld-property notice (S11, #2729)"))),
+    // Split by what the row is about, not by column (#2729): a comment on a table or one of its
+    // columns is read whole into `description` (the `descriptions` batch part); a comment on any
+    // other object is named by the unheld-property notice (S11), whose query now excludes the
+    // held kinds. A column cannot carry both dispositions, so each is Held here and the notice
+    // is pinned by its own live test (`catalog::properties`).
+    ("pg_description", Rows::Each(&[
+        (&["objoid", "classoid", "objsubid"], Held(None)),
+        (&["description"], Held(None)),
+    ])),
     ("pg_enum", Rows::Each(&[
         (&["enumtypid", "enumsortorder", "enumlabel"], Held(None)),
         (&["oid"], IDENTITY),

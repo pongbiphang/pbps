@@ -1001,6 +1001,22 @@ impl Cx<'_> {
                 // column's other alterations against it.
                 self.exists(key);
             }
+            // A comment goes on the object as the plan leaves it: after its create, its
+            // rebuild and its last rename (measured on 16 and 18: a drop and a create
+            // lose it, a rename keeps it; DEC-2729.1). `Is`, not `Exists`: a table the plan
+            // drops and creates again has two instances, and the comment is for the last.
+            // Metadata only, so nothing is rewritten.
+            Change::SetComment { target, .. } => {
+                let key = match target {
+                    crate::CommentTarget::Table { uid, .. } => {
+                        ObjectKey::Table(Recorded(uid.clone()))
+                    }
+                    crate::CommentTarget::Column { uid, .. } => {
+                        ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())))
+                    }
+                };
+                self.requires(Requirement::Is(key, Incarnation::Final));
+            }
             Change::SetReplicaIdentity { uid, to, .. } => {
                 let owner = Recorded(uid.clone());
                 self.exists(ObjectKey::Table(owner.clone()));

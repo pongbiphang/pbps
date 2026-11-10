@@ -21,7 +21,8 @@ pub(crate) struct ColumnExpected<'a> {
     pub(super) generated_expression: Expr<'a>,
     pub(super) identity: Req<Option<&'a pbps_model::Identity>>,
     pub(super) sequence: Req<Option<&'a pbps_model::OwnedSequence>>,
-    pub(super) description: Option<&'a str>,
+    /// The comment, an empty one being none: kept unless this plan sets it (#2729).
+    pub(super) description: Req<Option<&'a str>>,
 }
 
 impl<'a> ColumnExpected<'a> {
@@ -74,7 +75,13 @@ impl<'a> ColumnExpected<'a> {
             // source it gives the column at the close.
             identity: kept(source.identity, changed.contains(&ColumnField::Numbering)),
             sequence: kept(source.sequence, changed.contains(&ColumnField::Numbering)),
-            description: description.as_ref().map(pbps_model::Text::raw),
+            description: kept(
+                description
+                    .as_ref()
+                    .filter(|t| !t.is_empty())
+                    .map(pbps_model::Text::raw),
+                changed.contains(&ColumnField::Description),
+            ),
         }
     }
 }
@@ -92,6 +99,7 @@ struct TablePlan<'a> {
     persistence: Option<Setting<'a, bool>>,
     row_security: Option<Setting<'a, &'a pbps_model::RowSecurity>>,
     policies: Option<Setting<'a, ()>>,
+    comment: Option<Setting<'a, Option<&'a pbps_model::Text>>>,
 }
 
 pub(crate) struct TableChanges<'a> {
@@ -148,6 +156,8 @@ pub(crate) struct Expected<'a> {
     pub(super) identity: Req<Option<&'a ReplicaIdentity>>,
     pub(super) storage: Req<Cow<'a, Storage>>,
     pub(super) persistence: Req<bool>,
+    /// The comment the plan sets, where it sets one (#2729); otherwise not compared.
+    pub(super) comment: Req<Option<&'a str>>,
     pub(super) system_time: Req<Option<&'a SystemTime>>,
     pub(super) place: Req<Place>,
 }
@@ -194,6 +204,13 @@ impl<'a> TableChanges<'a> {
                     unlogged,
                 } => {
                     tables.entry(uid.clone()).or_default().persistence = Some((*unlogged, table));
+                }
+                Change::SetComment {
+                    target: pbps_model::CommentTarget::Table { uid, table },
+                    text,
+                } => {
+                    tables.entry(uid.clone()).or_default().comment =
+                        Some((text.as_ref().filter(|t| !t.is_empty()), table));
                 }
                 Change::RenameColumn { table, .. } => {
                     parents.insert(table);
@@ -273,6 +290,7 @@ impl<'a> TableChanges<'a> {
                 | Change::AddComputedColumn { .. }
                 | Change::DropComputedColumn { .. }
                 | Change::SetColumnDeprecated { .. }
+                | Change::SetComment { .. }
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -340,6 +358,7 @@ impl<'a> TableChanges<'a> {
             p.identity.is_some()
                 || p.storage.is_some()
                 || p.persistence.is_some()
+                || p.comment.is_some()
                 || p.row_security.is_some()
                 || p.policies.is_some()
         });
@@ -552,6 +571,16 @@ impl<'a> TableChanges<'a> {
             self.setting(name, now_name, |p| p.persistence),
             whole,
         );
+        // Kept like every other observed field, unless this plan sets it (#2729).
+        let comment = Req::at_close(
+            was.description
+                .as_ref()
+                .filter(|t| !t.is_empty())
+                .map(pbps_model::Text::raw),
+            self.setting(name, now_name, |p| p.comment)
+                .map(|text| text.map(pbps_model::Text::raw)),
+            whole,
+        );
         let kept = Cow::Borrowed(&was.storage_parameters);
         let storage = match self.setting(name, now_name, |p| p.storage) {
             None => Req::Keep(kept),
@@ -592,6 +621,7 @@ impl<'a> TableChanges<'a> {
             identity,
             storage,
             persistence,
+            comment,
             system_time: Req::Keep(was.system_time.as_ref()),
             place: Req::Keep(place),
         }
@@ -697,6 +727,16 @@ impl<'a> ColumnChanges<'a> {
             // again. A column removed later has no final definition to hold.
             for (column, promise) in p.change.columns_promised() {
                 if let Some(column) = surviving(&column, At::After(i)) {
+                    // A comment the plan sets is no longer the one the plan was approved
+                    // over, so the kept comparison excuses it; the promise holds it.
+                    if promise.field() == ColumnField::Description {
+                        this.changed
+                            .entry(column.table.clone())
+                            .or_default()
+                            .entry(column.name.clone())
+                            .or_default()
+                            .insert(ColumnField::Description);
+                    }
                     this.promises.insert((column, promise.field()), promise);
                 }
             }

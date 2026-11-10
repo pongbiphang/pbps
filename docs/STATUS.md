@@ -526,7 +526,7 @@ sets or resets it, and a plan never refuses a table for it.
 | Column options such as `n_distinct` | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | A column-owned sequence set `UNLOGGED` (reset after a crash) | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 | `DEPENDS ON EXTENSION` | [#168](https://github.com/pongbiphang/pbps/issues/168) |
-| Comments, by object type | [#2729](https://github.com/pongbiphang/pbps/issues/2729) |
+| Comments on objects other than tables and columns (held since #2729 PR A: those two) | [#2729](https://github.com/pongbiphang/pbps/issues/2729) |
 | Security labels, by object type | [#168](https://github.com/pongbiphang/pbps/issues/168) |
 
 A live test per supported major lists every column of every `pg_catalog` table

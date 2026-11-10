@@ -1036,6 +1036,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::CreatePolicy { .. }
         | Change::SetRowSecurity { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }

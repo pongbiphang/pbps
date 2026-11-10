@@ -315,6 +315,7 @@ pub fn render_partitioned(
                     && own_columns.is_none_or(std::collections::BTreeMap::is_empty)
                     && !t.unlogged
                     && t.storage_parameters.is_empty()
+                    && t.description.is_none()
                 {
                     let bound = match bound {
                         Some(pbps_model::PartitionBound::Range { from, to }) => {
@@ -346,6 +347,10 @@ pub fn render_partitioned(
                         Some(pbps_model::PartitionBound::Default) | None => {
                             s.push_str("    default: true\n");
                         }
+                    }
+                    // The partition's own comment (#2729), beside its bound.
+                    if let Some(d) = &t.description {
+                        let _ = writeln!(s, "    description: {}", scalar(d.raw()));
                     }
                     // After the bound, before what names them, as a table's
                     // columns come first.
@@ -2489,6 +2494,28 @@ indexes:
         assert!(crate::load_table_str(Path::new("t.yml"), &bad).is_err());
     }
 
+    /// A partition's comment is its own (#2729): written under its entry and read back as the
+    /// partition's, never the parent's, `""` included. Negatives: a partition with none stays
+    /// on one line and has none; the parent's `description:` is not copied to it.
+    #[test]
+    fn a_partitions_own_description_round_trips_under_its_entry() {
+        let yaml = "table: app.ev\ndescription: parent events\ncolumns:\n  ts: {type: date, nullable: false}\n\npartition_by: [ts]\n\npartitions:\n  ev_old:\n    from: [MINVALUE]\n    to: [\"2025-01-01\"]\n    description: first partition\n  ev_plain: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n  ev_rest:\n    default: true\n    description: \"\"\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            &t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .1
+        };
+        let text = |t: &pbps_model::Table| t.description.as_ref().map(|d| d.raw().to_owned());
+        assert_eq!(text(own("ev_old")).as_deref(), Some("first partition"));
+        assert_eq!(text(own("ev_rest")).as_deref(), Some(""));
+        assert_eq!(text(own("ev_plain")), None);
+        assert_eq!(text(&t.table).as_deref(), Some("parent events"));
+    }
+
     /// A partition's persistence and storage parameters are written under
     /// its entry, last, and read back as its own, spelled as a table's
     /// (#1580). One with neither stays on one line.
@@ -3221,6 +3248,60 @@ mod strategy_tests {
 
     fn load(text: &str) -> crate::LoadedTable {
         crate::load_table_str(Path::new("t.yml"), text).expect("should load")
+    }
+
+    /// A description is a comment's bytes (#2729): the writer and the loader return exactly
+    /// what was declared, for the texts a comment holds in practice, `""` included (it is
+    /// managed as no comment, so it must survive and not read as an absent key). Negative: an
+    /// absent key stays absent.
+    #[test]
+    fn descriptions_round_trip_byte_for_byte_and_empty_is_not_absent() {
+        let hundred_kb = "line of text that is long enough\n".repeat(3_200);
+        assert!(hundred_kb.len() >= 100_000);
+        let texts = [
+            "",
+            "plain",
+            "it's a \"quote\" and a \\ backslash",
+            "line one\r\nline two\r\n",
+            "tab\there",
+            "  leading and trailing  ",
+            "trailing newline\n",
+            "\nleading newline",
+            "中文 \u{1F600} e\u{301}",
+            "yes",
+            "null",
+            "- a list item",
+            "key: value",
+            "# not a comment",
+            "---",
+            hundred_kb.as_str(),
+        ];
+        for text in texts {
+            let mut t = load("table: app.t\ncolumns:\n  a: {type: int}\n");
+            t.table.description = Some(text.into());
+            t.table.columns["a"].description = Some(text.into());
+            let again = load(&render(&t.name, &t.table, &t.intents, t.strategy.as_ref()));
+            assert_eq!(
+                again.table.description.as_ref().map(pbps_model::Text::raw),
+                Some(text)
+            );
+            assert_eq!(
+                again.table.columns["a"]
+                    .description
+                    .as_ref()
+                    .map(pbps_model::Text::raw),
+                Some(text)
+            );
+        }
+        let none = load("table: app.t\ncolumns:\n  a: {type: int}\n");
+        let again = load(&render(
+            &none.name,
+            &none.table,
+            &none.intents,
+            none.strategy.as_ref(),
+        ));
+        assert!(again.table.description.is_none());
+        assert!(again.table.columns["a"].description.is_none());
     }
 
     const WITH_STRATEGY: &str =

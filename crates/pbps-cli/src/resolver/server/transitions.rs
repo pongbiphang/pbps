@@ -647,6 +647,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }
             | Change::DropRole { .. }

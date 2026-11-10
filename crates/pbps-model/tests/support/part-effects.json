@@ -307,6 +307,18 @@
     }
   },
   {
+    "name": "SetComment",
+    "change": {
+      "op": "set_comment",
+      "target": {
+        "kind": "column",
+        "uid": "c_aaaaaa",
+        "column": "app.t.n"
+      },
+      "text": "a count"
+    }
+  },
+  {
     "name": "CreatePolicy/select-public",
     "change": {
       "op": "create_policy",

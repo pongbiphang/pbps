@@ -125,6 +125,7 @@ fn reference_uses<'a>(
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }

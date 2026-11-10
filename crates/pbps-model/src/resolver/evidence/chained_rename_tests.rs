@@ -55,6 +55,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }

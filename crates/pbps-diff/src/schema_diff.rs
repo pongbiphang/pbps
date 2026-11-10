@@ -1742,6 +1742,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -1803,6 +1804,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -1930,6 +1932,12 @@ pub(crate) fn diff_partial_rebuilding(
             dialect,
             &mut errs,
         );
+    }
+    // Descriptions are comments only where the engine holds them; elsewhere they stay the
+    // free text they were (#2729).
+    if dialect.holds_descriptions() {
+        let comments = crate::comments::changes(base, declared, &changes);
+        changes.extend(comments);
     }
     crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
@@ -2067,6 +2075,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -2130,6 +2139,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
@@ -3419,6 +3429,7 @@ fn recreate_referenced_foreign_keys(
             | Change::AlterColumnExpression { .. }
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetComment { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }
@@ -4036,6 +4047,7 @@ fn recreate_retyped_dependents(
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
@@ -6171,6 +6183,7 @@ fn refuse_computed_dependencies(
                     | Change::AddComputedColumn { .. }
                     | Change::DropComputedColumn { .. }
                     | Change::SetColumnDeprecated { .. }
+                    | Change::SetComment { .. }
                     | Change::SetPrimaryKey { .. }
                     | Change::SetIndexStorageParameters { .. }
                     | Change::SetTablePersistence { .. }
@@ -7504,6 +7517,7 @@ fn dependency_rank(
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::CreatePolicy { .. }
@@ -8568,6 +8582,10 @@ fn order_key(c: &Change) -> u8 {
         // the indexes and checks of class 13 that may be over it (#1174).
         Change::AddComputedColumn { .. } => COLUMN_ALTERATIONS,
         Change::SetColumnDeprecated { .. } => 10,
+        // A comment is metadata too, on the object as the plan leaves it: after its
+        // create (7, 8), alterations (9) and every rename (1), under its final name
+        // (DEC-2729.1, measured: a drop and a create lose a comment, a rename keeps it).
+        Change::SetComment { .. } => 10,
         // Metadata too: no statement reads a storage parameter, and it runs
         // under the table's final name (DEC-1441.1).
         Change::SetStorageParameters { .. } => 10,

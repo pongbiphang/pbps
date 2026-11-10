@@ -62,9 +62,9 @@ pub use pbps_db::catalog::Spellings;
 
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
-    RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
-    RawOtherGrant, RawOwner, RawPolicy, RawRole, RawSerial, RawSharedDependency, RawTable,
-    assemble,
+    RawDefaultAcl, RawDescription, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule,
+    RawModuleArg, RawOtherGrant, RawOwner, RawPolicy, RawRole, RawSerial, RawSharedDependency,
+    RawTable, assemble,
 };
 
 /// Complete catalog evidence for one baseline refusal, never schema identity.
@@ -1413,6 +1413,7 @@ fn batch_query(identity: &str) -> String {
         ("tables", "SELECT * FROM pbps_read_tables".to_owned(), "schema_name, table_name"),
         ("policies", policies_query().to_owned(), "table_oid, policy_name"),
         ("columns", columns_query(), "table_oid, attnum"),
+        ("descriptions", DESCRIPTIONS.to_owned(), "table_oid, attnum"),
         ("constraints", constraints_query(), "table_oid, name"),
         ("indexes", indexes_query(), "table_oid, name"),
         ("modules", modules_query(), "schema_name, name, oid"),
@@ -1446,6 +1447,14 @@ fn batch_query(identity: &str) -> String {
         tables_query()
     )
 }
+
+/// The comments of the tables the pull reads and of their columns (#2729). `attnum` 0 is the
+/// table's own. A dropped column's comment goes with the column, and an extension member is
+/// not in `pbps_read_tables`, so its comment is never read (the package owns it).
+const DESCRIPTIONS: &str = "SELECT d.objoid::int8 AS table_oid, d.objsubid::int4 AS attnum,
+            d.description::text AS description
+       FROM pg_catalog.pg_description d JOIN pbps_read_tables t ON t.oid = d.objoid::int8
+      WHERE d.classoid = 'pg_catalog.pg_class'::regclass";
 
 /// Direct catalog access is deliberate: pg_policies can still answer after
 /// pg_policy SELECT was revoked. An unreadable part must fail the whole batch.
@@ -1670,6 +1679,18 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                 });
             }
         }
+    }
+    // Every field is decoded: an unreadable comment is an error, never "no comment".
+    for row in batch
+        .get("descriptions")
+        .ok_or_else(|| missing("descriptions"))?
+    {
+        raw.descriptions.push(RawDescription {
+            oid: number(row, "table_oid")?,
+            subid: i32::try_from(number(row, "attnum")?)
+                .map_err(|_| DbError::BadRow("a comment on a column number out of range".into()))?,
+            text: text(row, "description")?,
+        });
     }
     for row in batch.get("tables").ok_or_else(|| missing("tables"))? {
         raw.tables.push(RawTable {
@@ -5400,6 +5421,7 @@ mod tests {
             "owners",
             "census",
             "unheld_properties",
+            "descriptions",
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }
@@ -5424,6 +5446,43 @@ mod tests {
             vec![serde_json::json!({"system_identifier": null, "database_oid": 42})],
         );
         assert!(decode_batch(&batch).unwrap().3.is_none());
+    }
+
+    /// A comment is read from the tables the pull reads and nowhere else (an extension
+    /// member is not among them, so the package keeps its own), and one that cannot be decoded
+    /// is an error, never "no comment" (#2729).
+    #[test]
+    fn comments_are_read_from_the_tables_the_pull_reads_and_an_unreadable_one_is_an_error() {
+        assert!(DESCRIPTIONS.contains("JOIN pbps_read_tables t ON t.oid = d.objoid"));
+        assert!(DESCRIPTIONS.contains("pg_catalog.pg_class'::regclass"));
+        let mut batch = empty_catalog_batch();
+        batch.insert(
+            "descriptions".into(),
+            vec![serde_json::json!({"table_oid": 7, "attnum": 0, "description": "a table"})],
+        );
+        let raw = decode_batch(&batch).unwrap().0;
+        assert_eq!(raw.descriptions.len(), 1);
+        assert_eq!(
+            (
+                raw.descriptions[0].oid,
+                raw.descriptions[0].subid,
+                raw.descriptions[0].text.as_str()
+            ),
+            (7, 0, "a table")
+        );
+        // Negatives: a row without its text, without its column number, and a missing part.
+        for broken in [
+            serde_json::json!({"table_oid": 7, "attnum": 0}),
+            serde_json::json!({"table_oid": 7, "attnum": 0, "description": null}),
+            serde_json::json!({"table_oid": 7, "description": "x"}),
+        ] {
+            let mut batch = empty_catalog_batch();
+            batch.insert("descriptions".into(), vec![broken.clone()]);
+            assert!(decode_batch(&batch).is_err(), "{broken}");
+        }
+        let mut batch = empty_catalog_batch();
+        batch.remove("descriptions");
+        assert!(decode_batch(&batch).is_err());
     }
 
     #[test]

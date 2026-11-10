@@ -173,6 +173,7 @@ impl RoleMapping {
             | Change::SetPartitionNotNull { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }

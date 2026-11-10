@@ -846,6 +846,10 @@ macro_rules! list_or_spec {
 /// (#1632), written as a table's.
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
+// A parse-time value, one per partition entry and dropped as soon as the table is converted:
+// boxing it would change nothing a reader sees, and every match on it would unbox (#2729 added
+// a field and tipped the size difference over the lint's limit).
+#[allow(clippy::large_enum_variant)]
 pub enum PartitionDto {
     /// `default`.
     Default(String),
@@ -914,6 +918,10 @@ pub struct PartitionEntryDto {
     /// it has of its own.
     #[serde(default)]
     pub default: bool,
+    /// The partition's own comment (#2729): a partition takes none from its parent, so the
+    /// parent's `description:` is not it. As a table's: absent is unmanaged, `""` is no comment.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Constraint name to check expression, the partition's own.
     #[serde(default)]
     pub checks: BTreeMap<pbps_model::ObjectLocalName, String>,

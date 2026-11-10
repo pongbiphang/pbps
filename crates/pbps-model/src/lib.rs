@@ -100,9 +100,9 @@ pub mod zone;
 
 pub use change::{
     AddedRole, CatalogObject, CellAfter, Change, ChangeSet, ColumnField, ColumnPromise,
-    DetachedKind, DetachedName, Dropped, IndexPart, ModuleAfter, NumberingKind, Part, PartAfter,
-    PartChange, PartDefinition, PermissionChange, PlannedChange, Presence, Provenance,
-    PublicAccess, RiskClass, RoutineOrigin, RowAfter, RowSecurityOrigin,
+    CommentTarget, DetachedKind, DetachedName, Dropped, IndexPart, ModuleAfter, NumberingKind,
+    Part, PartAfter, PartChange, PartDefinition, PermissionChange, PlannedChange, Presence,
+    Provenance, PublicAccess, RiskClass, RoutineOrigin, RowAfter, RowSecurityOrigin,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
@@ -131,7 +131,8 @@ pub use partitions::Partitions;
 pub use plan::{
     DeclaredTypeBefore, DeclaredTypePin, ExtensionChangePin, ExtensionDropPin, ExtensionPin,
     PlanBaseline, PlanMode, PlanOrigin, ProviderKind, ProviderPin, RoutinePin, RoutinePins,
-    SavedPlan, TypePin, TypeProvider, TypeRoutine, state_checksum, wire_fingerprint,
+    SavedPlan, TypePin, TypeProvider, TypeRoutine, drift_checksum, state_checksum,
+    wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{ColumnShape, Rebuild, RebuildIdentities};

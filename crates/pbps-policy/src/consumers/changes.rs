@@ -304,6 +304,7 @@ pub(super) fn classify(
         | Change::SetExtensionSchema { .. }
         | Change::AddComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetComment { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }

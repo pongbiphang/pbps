@@ -80,6 +80,14 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
             | Change::SetColumnDeprecated { uid, column, .. } => {
                 columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone())))
             }
+            Change::SetComment {
+                target: pbps_model::CommentTarget::Table { uid, table },
+                ..
+            } => tables.push((i, uid.clone(), Some(table.clone()), Some(table.clone()))),
+            Change::SetComment {
+                target: pbps_model::CommentTarget::Column { uid, column },
+                ..
+            } => columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone()))),
             Change::CreateRole { uid, name } => {
                 roles.push((i, uid.clone(), None, Some(name.clone())))
             }

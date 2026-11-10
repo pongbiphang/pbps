@@ -3885,6 +3885,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 102,
+  "x-pbps-schema-version": 104,
   "x-pbps-tool-version": "0.0.0"
 }

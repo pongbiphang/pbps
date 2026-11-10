@@ -715,7 +715,15 @@ impl Operation {
             | Change::AlterColumnType { uid, .. }
             | Change::AlterColumnNullability { uid, .. }
             | Change::AlterColumnNumbering { uid, .. }
-            | Change::SetColumnDeprecated { uid, .. } => column(uid),
+            | Change::SetColumnDeprecated { uid, .. }
+            | Change::SetComment {
+                target: crate::CommentTarget::Column { uid, .. },
+                ..
+            } => column(uid),
+            Change::SetComment {
+                target: crate::CommentTarget::Table { uid, .. },
+                ..
+            } => ObjectKey::Table(recorded(uid)),
             Change::AlterColumnDefault { uid, .. } | Change::AlterColumnExpression { uid, .. } => {
                 ObjectKey::Default(ColumnKey::Recorded(recorded(uid)))
             }
@@ -964,6 +972,9 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             // an instance the declaration holds (#1889).
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            // A comment is an attribute of an object that stands: it starts and
+            // ends nothing (DEC-2729.1).
+            | Change::SetComment { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }

@@ -77,7 +77,8 @@ async function fixture() {
     const plan = '計畫 preview.json';
     await cli(['plan', '--no-dev', '--out', join(dir, plan)]);
     const explanation = await report(['explain', '--plan', join(dir, plan)]);
-    expect(explanation.result).toBe('ok'); expect(explanation.data.change_count).toBe(1);
+    // The table and its declared description plan as a create and a comment (DEC-2729.1).
+    expect(explanation.result).toBe('ok'); expect(explanation.data.change_count).toBe(2);
     expect(explanation.data.applyable).toBe(false);
     await command('git', ['add', '.'], {cwd: dir});
     await command('git', ['commit', '-qm', 'Record browser fixture'], {cwd: dir});

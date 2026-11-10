@@ -330,6 +330,17 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::SetColumnDeprecated { uid, column, .. } => {
             Column(Transition::new(step, uid, kept(column), kept(column)))
         }
+        Change::SetComment {
+            target: crate::CommentTarget::Column { uid, column },
+            ..
+        } => Column(Transition::new(step, uid, kept(column), kept(column))),
+        Change::SetComment {
+            target: crate::CommentTarget::Table { uid, table },
+            ..
+        } => Table(
+            Transition::new(step, uid, Some(table.clone()), Some(table.clone())),
+            ColumnLife::Keep,
+        ),
         Change::CreateRole { uid, name } => {
             Role(Transition::new(step, uid, None, Some(name.clone())))
         }
