@@ -639,8 +639,13 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
         let path = project.ids_dir().join(rel);
         match file {
             Some(file) => write_atomic(&path, &ids_tree::render(file))?,
-            None => std::fs::remove_file(&path)
-                .with_context(|| format!("cannot remove `{}`", path.display()))?,
+            None => {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("cannot remove `{}`", path.display()))?;
+                // The directories its last member leaves empty go too, as the
+                // write's own removals do.
+                crate::ids_store::prune_emptied_parents(&path, &project.ids_dir());
+            }
         }
         println!(
             "{} {}",

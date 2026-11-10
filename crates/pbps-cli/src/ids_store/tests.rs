@@ -550,6 +550,76 @@ fn a_move_that_turns_an_identity_directory_into_a_file_is_applied() {
 }
 
 #[test]
+fn an_empty_directory_at_a_destination_is_removed_not_reported_as_content() {
+    let project = project("empty-dir-destination");
+    // Empty directories, nested, stand where `dbo/customer.json` goes.
+    let in_the_way = project.ids_dir().join("dbo/customer.json");
+    std::fs::create_dir_all(in_the_way.join("a/b")).unwrap();
+    std::fs::create_dir_all(in_the_way.join("c")).unwrap();
+    plan(&project, &customer(), &customer_declared())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(in_the_way.is_file());
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    // The config is written, and nothing is left beside the file.
+    let config = std::fs::read_to_string(project.config_file()).unwrap();
+    assert!(config.contains("ids_dir: .pbps/ids"), "{config}");
+    assert_eq!(names_in(&project.ids_dir().join("dbo")), ["customer.json"]);
+}
+
+#[test]
+fn a_directory_holding_a_file_at_a_destination_still_stops_the_write() {
+    let project = project("full-dir-destination");
+    let in_the_way = project.ids_dir().join("dbo/customer.json");
+    std::fs::create_dir_all(in_the_way.join("a")).unwrap();
+    std::fs::write(in_the_way.join("a/keep.txt"), "mine").unwrap();
+    // The reader refuses a stray entry before a write is planned or the
+    // directory moved; either way the file is never lost.
+    let outcome = plan(&project, &customer(), &customer_declared()).and_then(|w| w.apply());
+    assert!(outcome.is_err());
+    let kept: Vec<_> = walk_files(&project.ids_dir());
+    assert!(
+        kept.iter().any(|f| f.ends_with("keep.txt")),
+        "the file survives: {kept:?}"
+    );
+    assert!(
+        !project.config_file().exists() || {
+            !std::fs::read_to_string(project.config_file())
+                .unwrap()
+                .contains("ids_dir")
+        }
+    );
+}
+
+#[test]
+fn remove_empty_tree_keeps_a_tree_with_any_entry_and_removes_only_empty_ones() {
+    let dir = project("empty-tree").ids_dir();
+    std::fs::create_dir_all(dir.join("x/y")).unwrap();
+    assert!(remove_empty_tree(&dir.join("x")).unwrap());
+    assert!(!dir.join("x").exists());
+    std::fs::create_dir_all(dir.join("p/q")).unwrap();
+    std::fs::write(dir.join("p/q/f"), "").unwrap();
+    assert!(!remove_empty_tree(&dir.join("p")).unwrap());
+    assert!(dir.join("p/q/f").is_file());
+    // Unreadable is an error, never "empty".
+    assert!(remove_empty_tree(&dir.join("missing")).is_err());
+}
+
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
 fn an_old_file_nothing_removes_is_kept_aside_and_named() {
     let project = project("aside-kept");
     let dir = project.ids_dir();

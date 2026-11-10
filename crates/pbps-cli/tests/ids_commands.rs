@@ -984,3 +984,39 @@ fn resolve_refuses_a_conflicted_entry_that_is_not_a_json_file() {
         text(&out)
     );
 }
+
+#[test]
+fn resolve_prunes_the_directories_a_removal_emptied() {
+    use std::io::Write as _;
+    let p = conflicted();
+    p.write(
+        "schema/dbo/customer.yml",
+        &CUSTOMER.replace("full_name", "display_name"),
+    );
+    // A file one side deleted and the other left alone is deleted; its
+    // directories go with it.
+    let gone = ".pbps/ids/gone/deeper/status.json";
+    p.write(gone, &p.read(".pbps/ids/types/status.json"));
+    let blob = String::from_utf8(p.git(&["hash-object", "-w", gone]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut index = Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&p.0)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    index
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("100644 {blob} 1\t{gone}\n100644 {blob} 3\t{gone}\n").as_bytes())
+        .unwrap();
+    assert!(index.wait().unwrap().success());
+    let out = p.pbps(&["ids", "resolve"]);
+    assert!(text(&out).contains("removed"), "{}", text(&out));
+    assert!(!p.0.join(".pbps/ids/gone").exists(), "{}", text(&out));
+    // Directories that still hold something stay.
+    assert!(p.0.join(".pbps/ids/dbo").is_dir());
+}

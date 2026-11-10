@@ -487,14 +487,16 @@ impl TreeWrite {
             // something stays. That covers a case-only directory rename
             // (`Sales/` to `sales/`, one directory on a case-insensitive
             // filesystem): the placed files are in it, so `remove_dir` refuses.
-            let mut parent = path.parent();
-            // Raw is right: `path` comes from `self.dir` (or an aside beside
-            // such a path), so the prefix is `self.dir` as spelled.
-            while let Some(dir) = parent.filter(|d| *d != self.dir && d.starts_with(&self.dir)) {
-                if std::fs::remove_dir(dir).is_err() {
-                    break;
-                }
-                parent = dir.parent();
+            prune_emptied_parents(&path, &self.dir);
+        }
+        // A directory that stood at a destination is empty when it held only
+        // empty directories: that is nothing to account for, so it goes. What
+        // is left of anything else stays and is reported below. One place
+        // decides it, so no caller has to know the shape.
+        for (_, aside) in &asides {
+            if std::fs::symlink_metadata(aside).is_ok_and(|m| m.is_dir()) {
+                remove_empty_tree(aside)
+                    .with_context(|| format!("cannot inspect `{}`", aside.display()))?;
             }
         }
         // An aside nothing removed holds a file the write did not account for:
@@ -512,6 +514,42 @@ impl TreeWrite {
         }
         Ok(())
     }
+}
+
+/// Removes the directories `path` sat in, from the nearest up, while they are
+/// empty, and stops below `root`. One that still holds something stays, which
+/// is how a case-only directory rename (one directory on a case-insensitive
+/// filesystem) keeps the files placed in it.
+pub(crate) fn prune_emptied_parents(path: &Path, root: &Path) {
+    let mut parent = path.parent();
+    // Raw is right: `path` comes from `root` (or an aside beside such a path),
+    // so the prefix is `root` as spelled.
+    while let Some(dir) = parent.filter(|d| *d != root && d.starts_with(root)) {
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        parent = dir.parent();
+    }
+}
+
+/// Removes `dir` when it holds nothing but empty directories, however deep, and
+/// says whether it did. A file, a symlink or any other entry keeps the whole
+/// tree as it is (`Ok(false)`); an entry that cannot be read is an error, never
+/// "empty".
+pub(crate) fn remove_empty_tree(dir: &Path) -> std::io::Result<bool> {
+    let mut empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            empty &= remove_empty_tree(&path)?;
+        } else {
+            empty = false;
+        }
+    }
+    if empty {
+        std::fs::remove_dir(dir)?;
+    }
+    Ok(empty)
 }
 
 /// Where `path` is now: under its aside when it, or a directory above it, was
