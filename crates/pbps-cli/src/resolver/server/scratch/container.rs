@@ -58,8 +58,13 @@ pub async fn with_started<T>(
     // later run can tell from them that the owner is gone (#2410).
     let token = format!("{:032x}", rand::random::<u128>());
     recovery::sweep(&token).await;
-    let (container, ready) =
-        Container::start_ready(driver, image, &token, &mut Anonymous(token.clone())).await?;
+    let (container, ready) = Box::pin(Container::start_ready(
+        driver,
+        image,
+        &token,
+        &mut Anonymous(token.clone()),
+    ))
+    .await?;
     let (outcome, keeper) = match ready {
         Ok(()) => match recovery::Keeper::open(driver, &container.connection, &token).await {
             Ok(keeper) => (run(&container.connection).await, Some(keeper)),
@@ -112,7 +117,8 @@ impl Held {
         // while it holds the container is recovered by the next one.
         let token = owner.token();
         recovery::sweep(&token).await;
-        let (container, ready) = Container::start_ready(driver, image, &token, owner).await?;
+        let (container, ready) =
+            Box::pin(Container::start_ready(driver, image, &token, owner)).await?;
         let kept = match ready {
             Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
             Err(error) => Err(error),
@@ -289,11 +295,17 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
                 ProduceError::Acquire(format!("before starting {} again: {why}", self.image))
             })?;
         }
-        Container::start(self.driver, self.image, self.token, &mut *self.owner).await
+        Box::pin(Container::start(
+            self.driver,
+            self.image,
+            self.token,
+            &mut *self.owner,
+        ))
+        .await
     }
 
     async fn wait(&mut self, container: Container) -> (Container, Result<(), startup::NotReady>) {
-        let waited = container.wait_ready(self.driver).await;
+        let waited = Box::pin(container.wait_ready(self.driver)).await;
         (container, waited)
     }
 
@@ -411,12 +423,12 @@ impl Container {
         token: &str,
         owner: &mut impl Owner,
     ) -> Result<(Self, Result<(), ProduceError>), ProduceError> {
-        let started = startup::started_ready(&mut Starting {
+        let started = Box::pin(startup::started_ready(&mut Starting {
             driver,
             image,
             token,
             owner,
-        })
+        }))
         .await?;
         if let Some(first) = &started.first_crash {
             // Reported before it is forgotten, as DEC-958.1 does for the

@@ -280,11 +280,13 @@ pub(super) trait Launch {
     async fn discard(&mut self, container: Self::Container) -> Result<(), Vec<String>>;
 }
 
+/// Every await below is boxed: the container start composes into a future large
+/// enough that an unoptimized test stack overflowed once this was added.
 pub(super) async fn started_ready<L: Launch>(
     launch: &mut L,
 ) -> Result<Started<L::Container>, ProduceError> {
-    let first = launch.start(false).await?;
-    let (first, waited) = launch.wait(first).await;
+    let first = Box::pin(launch.start(false)).await?;
+    let (first, waited) = Box::pin(launch.wait(first)).await;
     let crash = match waited {
         Ok(()) => {
             return Ok(Started {
@@ -302,8 +304,10 @@ pub(super) async fn started_ready<L: Launch>(
         }
         Err(NotReady::Crashed(report)) => report,
     };
-    launch.discard(first).await.map_err(ProduceError::Cleanup)?;
-    let second = match launch.start(true).await {
+    Box::pin(launch.discard(first))
+        .await
+        .map_err(ProduceError::Cleanup)?;
+    let second = match Box::pin(launch.start(true)).await {
         Ok(second) => second,
         Err(ProduceError::Acquire(why)) => {
             return Err(ProduceError::Acquire(format!(
@@ -312,7 +316,7 @@ pub(super) async fn started_ready<L: Launch>(
         }
         Err(other) => return Err(other),
     };
-    let (second, waited) = launch.wait(second).await;
+    let (second, waited) = Box::pin(launch.wait(second)).await;
     let ready = match waited {
         Ok(()) => Ok(()),
         Err(NotReady::Crashed(report) | NotReady::Failed(report)) => {
