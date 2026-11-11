@@ -241,7 +241,7 @@ fn scheduled_scene(
                 before,
                 after: &s.ids,
             },
-            module_deps: &Default::default(),
+            annotations: &Default::default(),
         },
         &Facts::default(),
         &Postgres::new().with_server_version(version),

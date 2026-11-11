@@ -130,7 +130,7 @@ fn dependent_meetings_keep_the_complete_canonical_changes_order_and_spellings() 
                                 before,
                                 after: &s.ids,
                             },
-                            module_deps: &Default::default(),
+                            annotations: &Default::default(),
                         },
                         &Facts::default()
                             .with_module_dependents(&dependents)

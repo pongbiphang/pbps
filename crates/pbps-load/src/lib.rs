@@ -453,14 +453,10 @@ fn collect_files(
             LoadedFile::Module(m) => {
                 let m = *m;
                 if !m.depends_on.is_empty() {
-                    let references = pbps_model::object_ref::ObjectDeps::from_legacy(
-                        &[(m.id.clone(), m.depends_on)].into(),
-                    );
-                    loaded.hints.module_deps.extend(
-                        references
-                            .to_legacy()
-                            .expect("only legacy annotations are loaded"),
-                    );
+                    loaded
+                        .hints
+                        .annotations
+                        .declare_module(m.id.clone(), m.depends_on);
                 }
                 if m.public_execute {
                     loaded.hints.public_execute.insert(m.id.clone());

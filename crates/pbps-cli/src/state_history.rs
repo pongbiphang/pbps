@@ -315,18 +315,17 @@ pub fn cmd_diff(
     let (mut before, mut after) = comparison_schemas(&from.snapshot, &to.snapshot);
     pbps_dialect::name_read_sequences(&mut before, dialect.as_ref());
     pbps_dialect::name_read_sequences(&mut after, dialect.as_ref());
-    let mut hints = pbps_model::Hints {
-        module_deps: to.snapshot.module_deps.clone(),
-        ..Default::default()
-    };
+    let mut hints = pbps_model::Hints::default();
+    hints.annotations.declared =
+        pbps_model::object_ref::ObjectDeps::from_legacy(&to.snapshot.module_deps);
     // Reproduce the plan's guard payloads from the saved catalog, while the
     // overlay above keeps authored SQL for semantic comparison (DEC-2456.1).
     hints.record_row_defaults(&from.snapshot.schema);
-    for (id, deps) in &from.snapshot.module_deps {
-        if !after.modules.contains_key(id) {
-            hints.module_deps.insert(id.clone(), deps.clone());
-        }
-    }
+    hints
+        .annotations
+        .record(pbps_model::object_ref::ObjectDeps::from_legacy(
+            &from.snapshot.module_deps,
+        ));
     // Baseline and forced snapshots record what was observed, which can hold
     // columns without identities and retain identities for missing columns.
     // Match absent identities by name without changing either recorded UID.

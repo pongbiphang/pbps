@@ -7,7 +7,7 @@ use pbps_diff::{
         CanonicalPlan, DiffPlan,
         deployment::{
             Sources,
-            schedule::{Declarations, Facts, diff_annotated},
+            schedule::{Declarations, Facts, schedule},
         },
     },
 };
@@ -162,23 +162,40 @@ impl Fixture {
         engine: &E,
     ) -> Result<CanonicalPlan<E>, String> {
         let before = Side { schema: base, ids };
-        diff_annotated(
+        let mut hints = pbps_model::Hints::default();
+        hints.annotations.recorded = baseline.clone();
+        hints.annotations.declared = goal.clone();
+        let planned = pbps_diff::diff(
             before,
+            Side {
+                schema: &self.schema,
+                ids: &self.ids,
+            },
+            engine,
+            &hints,
+        )
+        .map_err(|errors| {
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        schedule(
+            planned,
             &Declarations {
                 schema: &self.schema,
                 sources: Sources {
                     before,
                     after: &self.ids,
                 },
-                module_deps: &Default::default(),
+                annotations: &hints.annotations,
             },
-            &Default::default(),
-            baseline,
-            goal,
             &Facts::default(),
             engine,
         )
         .map(|s| s.changes)
+        .map_err(|e| e.to_string())
     }
 }
 

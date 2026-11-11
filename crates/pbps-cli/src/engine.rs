@@ -1623,7 +1623,7 @@ pub(crate) async fn order_created_object_names<S: Clone>(
             ids: declared.sources.after,
         },
         &pbps_mssql::Mssql,
-        declared.module_deps,
+        &declared.module_deps(),
         &facts,
         precedence,
     )
@@ -3921,7 +3921,7 @@ pub async fn account_for_module_dependents<
     mut changes: PlanningPlan<S>,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
-    deps: &pbps_model::ModuleDeps,
+    deps: &pbps_model::object_ref::Annotations,
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
@@ -3929,7 +3929,7 @@ pub async fn account_for_module_dependents<
     let declarations = crate::dependents::schedule::Declarations {
         schema: declared,
         sources,
-        module_deps: deps,
+        annotations: deps,
     };
     // The members of the roles this plan drops, which the caller read when
     // there were any: every connected plan goes through the schedule once,

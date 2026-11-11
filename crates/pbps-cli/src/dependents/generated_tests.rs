@@ -28,6 +28,10 @@ fn ordinary_with_dependencies(
     deps: &ModuleDeps,
     dialect: &(dyn crate::certified_fixture::FixtureEmission + 'static),
 ) -> Result<ChangeSet, String> {
+    let annotations = pbps_model::object_ref::Annotations {
+        declared: pbps_model::object_ref::ObjectDeps::from_legacy(deps),
+        ..Default::default()
+    };
     let empty = Schema::default();
     let before_ids = IdsFile::default();
     let cs = pbps_diff::diff(
@@ -38,7 +42,7 @@ fn ordinary_with_dependencies(
         pbps_diff::Side { schema, ids },
         dialect,
         &pbps_model::Hints {
-            module_deps: deps.clone(),
+            annotations: annotations.clone(),
             ..Default::default()
         },
     )
@@ -54,7 +58,7 @@ fn ordinary_with_dependencies(
                 },
                 after: ids,
             },
-            module_deps: deps,
+            annotations: &annotations,
         },
         &super::schedule::Facts::default(),
         dialect,

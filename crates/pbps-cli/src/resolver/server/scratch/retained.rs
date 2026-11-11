@@ -55,7 +55,7 @@ impl Comparison<'_> {
                     before,
                     after: &new_ids,
                 },
-                module_deps: &self.hints.module_deps,
+                annotations: &self.hints.annotations,
             },
             &Default::default(),
             &pg,

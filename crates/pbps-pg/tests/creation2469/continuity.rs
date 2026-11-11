@@ -1,7 +1,7 @@
 use super::*;
 use pbps_diff::order::deployment::{
     Sources,
-    schedule::{Declarations, Facts, diff_annotated},
+    schedule::{Declarations, Facts, schedule},
 };
 use pbps_model::{Schema, ValueSource};
 
@@ -17,19 +17,29 @@ fn compile<E: Dialect>(
         schema: base,
         ids: &f.ids,
     };
-    diff_annotated(
+    let mut hints = pbps_model::Hints::default();
+    hints.annotations.recorded = before.clone();
+    hints.annotations.declared = goal.clone();
+    let planned = pbps_diff::diff(
         before_side,
+        pbps_diff::Side {
+            schema: desired,
+            ids: &f.ids,
+        },
+        engine,
+        &hints,
+    )
+    .unwrap();
+    schedule(
+        planned,
         &Declarations {
             schema: desired,
             sources: Sources {
                 before: before_side,
                 after: &f.ids,
             },
-            module_deps: &Default::default(),
+            annotations: &hints.annotations,
         },
-        &Default::default(),
-        before,
-        goal,
         &Facts::default(),
         engine,
     )

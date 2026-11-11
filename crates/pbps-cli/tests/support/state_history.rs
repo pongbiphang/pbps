@@ -334,7 +334,9 @@ pub fn recovery(server: &str, pg: bool) {
     assert!(
         loaded
             .hints
-            .module_deps
+            .annotations
+            .declared
+            .modules()
             .values()
             .any(|deps| !deps.is_empty())
     );

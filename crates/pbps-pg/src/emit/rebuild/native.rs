@@ -311,10 +311,15 @@ async fn exercise(
         desired.roles.insert(role.into(), grant);
     }
     let hints = Hints {
-        module_deps: cases::module_edges()
-            .into_iter()
-            .filter(|(id, _)| before.modules.contains_key(id))
-            .collect(),
+        annotations: pbps_model::object_ref::Annotations {
+            declared: pbps_model::object_ref::ObjectDeps::from_legacy(
+                &cases::module_edges()
+                    .into_iter()
+                    .filter(|(id, _)| before.modules.contains_key(id))
+                    .collect(),
+            ),
+            ..Default::default()
+        },
         public_execute: before
             .modules
             .iter()

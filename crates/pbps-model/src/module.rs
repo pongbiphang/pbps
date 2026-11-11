@@ -1133,8 +1133,9 @@ pub struct Hints {
 
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
-    /// Per-module creation-order edges (ADR-0002).
-    pub module_deps: ModuleDeps,
+    /// Creation-order annotations (ADR-0002, #2469): what the declarations
+    /// say, and what the state recorded, apart.
+    pub annotations: crate::object_ref::Annotations,
     /// The routines whose declaration opts back in to `PUBLIC` execution
     /// (ADR-0010 §5).
     pub public_execute: PublicExecute,

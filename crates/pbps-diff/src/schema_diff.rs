@@ -267,6 +267,11 @@ pub enum DiffError {
         change: &'static str,
     },
 
+    /// The typed `depends_on:` annotations of a plan cannot be bound to the
+    /// objects of its two states (#2469). The words are the registry's.
+    #[error("{0}")]
+    Annotations(String),
+
     /// A `data:` block on a table whose primary key cannot key its rows
     /// (ADR-0004). `validate` says the same thing against the file and the
     /// line; this is here so that a differ reached another way never quietly
@@ -684,9 +689,25 @@ pub(crate) fn rebuilding_by(
     screen: Screen,
     read_back: Option<&Schema>,
 ) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(
+    let mut d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
+    // Only an extended input takes the general route, and only then can an
+    // annotation edge discharge a refusal that a module-only plan keeps: a
+    // module-only plan never builds the contract, which needs the identity of
+    // every table of both states that an offline plan may not hold.
+    let extended = hints.annotations.is_extended();
+    let mut deferred = Vec::new();
+    if extended {
+        d.errors.retain(|error| {
+            if matches!(error, DiffError::ComputedFunctionChanged { .. }) {
+                deferred.push(error.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
     if d.errors.is_empty() {
         // The resolver's intermediate plan is not an order anything runs: its
         // final one is observed where it is made.
@@ -694,7 +715,31 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        Ok(finish_diff(base, declared, dialect, d.changes))
+        let plan = finish_diff(base, declared, dialect, d.changes);
+        if !extended {
+            return Ok(plan);
+        }
+        let mut plan = plan
+            .with_annotations(
+                pbps_model::operation::Snapshot {
+                    schema: base.schema,
+                    ids: base.ids,
+                },
+                pbps_model::operation::Snapshot {
+                    schema: declared.schema,
+                    ids: declared.ids,
+                },
+                &hints.annotations.recorded,
+                &hints.annotations.declared,
+                if dialect.rebuilds_modules() {
+                    pbps_model::operation::ModuleEdits::Rebuilt
+                } else {
+                    pbps_model::operation::ModuleEdits::InPlace
+                },
+            )
+            .map_err(|why| vec![DiffError::Annotations(why)])?;
+        plan.defer(deferred);
+        Ok(plan)
     } else {
         Err(d.errors)
     }
@@ -893,8 +938,11 @@ pub(crate) fn diff_partial_rebuilding(
             errors: crate::extensions::differences(base, declared, dialect.name()),
         };
     }
+    // The passes below read module-to-module edges; the other references are
+    // the transient contract's (`rebuilding_by`).
+    let module_deps = hints.annotations.modules(declared.schema);
     let mut errs: Vec<DiffError> =
-        pbps_model::module::dependency_cycles(declared.schema, &hints.module_deps)
+        pbps_model::module::dependency_cycles(declared.schema, &module_deps)
             .into_iter()
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
@@ -1968,12 +2016,12 @@ pub(crate) fn diff_partial_rebuilding(
     };
     let create_rank = rank_of(&pbps_model::module::creation_order_with(
         &declared.schema.modules,
-        &hints.module_deps,
+        &module_deps,
         &lexis,
     ));
     let drop_rank = rank_of(&pbps_model::module::creation_order_with(
         &base.schema.modules,
-        &hints.module_deps,
+        &module_deps,
         &lexis,
     ));
     // The tiebreaker within an ordering class is the table name, then the

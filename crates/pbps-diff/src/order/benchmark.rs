@@ -203,7 +203,10 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         .expect("resolve the desired state")
         .ids;
     let hints = |declared: &ModuleDeps| Hints {
-        module_deps: declared.clone(),
+        annotations: pbps_model::object_ref::Annotations {
+            declared: pbps_model::object_ref::ObjectDeps::from_legacy(declared),
+            ..Default::default()
+        },
         ..Hints::default()
     };
     let base = crate::Side {

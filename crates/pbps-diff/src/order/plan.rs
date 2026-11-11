@@ -118,7 +118,7 @@ impl<D: ?Sized> std::fmt::Debug for Canonical<D> {
 /// let ids = pbps_model::IdsFile::default();
 /// let result = schedule(propose(pbps_model::ChangeSet::default()), &Declarations {
 ///     schema: &schema, sources: Sources { before: Side { schema: &schema, ids: &ids }, after: &ids },
-///     module_deps: &Default::default(),
+///     annotations: &Default::default(),
 /// }, &Facts::default(), dialect).unwrap();
 /// let _ = result.changes.ordered(pbps_model::PlanMode::Transactional, dialect);
 /// }
@@ -236,6 +236,16 @@ impl<S> PlanningPlan<S> {
             &self, before, after, base, goal, modules,
         )?));
         Ok(self)
+    }
+    /// Keep refusals the annotation edges may still discharge once the plan is
+    /// scheduled (`deployment::schedule`). A plan without a contract has none.
+    pub(crate) fn defer(&mut self, errors: Vec<crate::DiffError>) {
+        if let Some(contract) = &mut self.annotations {
+            std::sync::Arc::make_mut(contract).deferred = errors;
+        }
+    }
+    pub(crate) fn deferred(&self) -> &[crate::DiffError] {
+        self.annotations.as_ref().map_or(&[], |a| &a.deferred)
     }
     /// Order this plan, wherever its effects are read, by what the run
     /// captured. An empty capture is none.

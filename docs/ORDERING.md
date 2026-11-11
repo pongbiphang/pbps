@@ -1003,9 +1003,10 @@ Typed library annotations can select portable table creation boundaries through
 that hook. Existing recipes and typed Changes preserve column order and legal
 engine groups; the current settlement projects the resulting hard edges. A
 placeholder column supplies existence only until its final generation installer.
-Empty demand retains the prior expansion bytes. `schedule::diff_annotated`
-performs comparison, annotation validation and canonical scheduling atomically,
-so a computed-call class-order refusal can only yield to a completed hard order.
+Empty demand retains the prior expansion bytes. The production differ builds
+the annotation contract only when some reference is not module to module
+(DEC-2469.6) and defers a computed-call class-order refusal until `schedule`
+has settled the order, so it can only yield to a completed hard order.
 Connected SQL Server calls still require catalog-collation capability checks.
 
 A demanded ordinary-column suffix is resolved by the engine creation recipe,

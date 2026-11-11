@@ -415,3 +415,5 @@ fn every_reference_kind_uses_the_same_boundary_projection() {
 }
 
 mod survival;
+
+mod production;

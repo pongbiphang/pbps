@@ -153,7 +153,11 @@ impl Rule<'_> {
             ops.as_slice(),
             &self.effects(&ops)?,
             &order::Baseline::of(before, &owners),
-            &self.input.hints.module_deps,
+            &self
+                .input
+                .hints
+                .annotations
+                .modules(self.input.desired.schema),
         );
         let (names, skipped) = slots::verify(
             ops.as_slice(),
@@ -251,7 +255,11 @@ impl Expansion for Rule<'_> {
             ops.as_slice(),
             &self.effects(&ops)?,
             &order::Baseline::of(before, &owners),
-            &self.input.hints.module_deps,
+            &self
+                .input
+                .hints
+                .annotations
+                .modules(self.input.desired.schema),
             order::Checks::ALL,
         );
         if !graph.unmet.is_empty() || !graph.ambiguous.is_empty() {

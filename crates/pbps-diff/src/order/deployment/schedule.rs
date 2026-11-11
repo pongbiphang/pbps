@@ -39,8 +39,17 @@ pub struct Declarations<'a> {
     pub schema: &'a Schema,
     /// The baseline the plan departs from and the identities the plan ends in.
     pub sources: Sources<'a>,
-    /// The `depends_on:` edges the identifier scan cannot see.
-    pub module_deps: &'a ModuleDeps,
+    /// The `depends_on:` annotations the identifier scan cannot see.
+    pub annotations: &'a pbps_model::object_ref::Annotations,
+}
+
+impl Declarations<'_> {
+    /// The module-to-module edges the ordering passes read, derived once from
+    /// the annotations (DEC-2469.6); the other references are the transient
+    /// contract's, not theirs.
+    pub fn module_deps(&self) -> ModuleDeps {
+        self.annotations.modules(self.schema)
+    }
 }
 
 /// What a module drop's catalog dependents are, per dropped module, deepest
@@ -207,69 +216,27 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Compares and schedules declarations with typed dependency annotations.
-/// Unlike `diff` followed by `schedule`, this can discharge an added computed
-/// column's class-order refusal: no intermediate deferred plan escapes.
+/// Judges the refusals the differ deferred for a plan with annotations, now
+/// that its order has settled. A SQL Server computed column that may call a
+/// function the plan alters or creates is refused unless the plan orders the
+/// function's installation before the column's: a typed annotation can state
+/// that, and a module-only plan defers nothing (it never builds the contract).
 /// Catalog collation checks still judge new calls on the connected path.
 // Only the creation/function transitions below grant this capability.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub fn diff_annotated<D: Dialect>(
-    base: crate::Side<'_>,
-    declared: &Declarations<'_>,
-    hints: &pbps_model::Hints,
-    before: &pbps_model::object_ref::ObjectDeps,
-    goal: &pbps_model::object_ref::ObjectDeps,
-    facts: &Facts<'_>,
-    dialect: &D,
-) -> Result<Scheduled<crate::order::Differ, D>, String> {
-    let after = crate::Side {
-        schema: declared.schema,
-        ids: declared.sources.after,
-    };
-    let mut diff = crate::diff_partial(base, after, dialect, hints);
-    let mut deferred = Vec::new();
-    diff.errors.retain(|error| {
-        if let crate::DiffError::ComputedFunctionChanged { .. } = error {
-            deferred.push(error.clone());
-            false
-        } else {
-            true
-        }
-    });
-    if !diff.errors.is_empty() {
-        return Err(diff
-            .errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"));
+fn discharge_deferred<S>(
+    cs: &PlanningPlan<S>,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), String> {
+    if cs.deferred().is_empty() {
+        return Ok(());
     }
-    let input = crate::schema_diff::finish_diff(base, after, dialect, diff.changes)
-        .with_annotations(
-            pbps_model::operation::Snapshot {
-                schema: base.schema,
-                ids: base.ids,
-            },
-            pbps_model::operation::Snapshot {
-                schema: after.schema,
-                ids: after.ids,
-            },
-            before,
-            goal,
-            if dialect.rebuilds_modules() {
-                pbps_model::operation::ModuleEdits::Rebuilt
-            } else {
-                pbps_model::operation::ModuleEdits::InPlace
-            },
-        )?;
-    let result = schedule(input, declared, facts, dialect).map_err(|e| e.to_string())?;
-    let edges: BTreeSet<_> = result
-        .changes
+    let edges: BTreeSet<_> = cs
         .annotation_edges()?
         .iter()
         .map(|e| (e.before, e.after))
         .collect();
-    let changes = &result.changes.changes().changes;
+    let changes = &cs.changes().changes;
     let mut owners = BTreeMap::new();
     let mut transitions: BTreeMap<String, Vec<_>> = BTreeMap::new();
     for (at, p) in changes.iter().enumerate() {
@@ -304,11 +271,9 @@ pub fn diff_annotated<D: Dialect>(
         }
     }
     let mut checked_pairs = BTreeSet::new();
-    for error in deferred {
+    for error in cs.deferred() {
         let crate::DiffError::ComputedFunctionChanged {
-            ref computed,
-            ref function,
-            ..
+            computed, function, ..
         } = error
         else {
             unreachable!()
@@ -335,7 +300,7 @@ pub fn diff_annotated<D: Dialect>(
             return Err(error.to_string());
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Finishes the order of `changes`: every pass that reorders a plan after the
@@ -373,6 +338,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
 ) -> Result<Scheduled<S, D>, Refusal> {
     crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
         .map_err(Refusal)?;
+    let module_deps = declared.module_deps();
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
     crate::order::generated::inline_contexts(&mut cs, dialect);
     // Explicit operation proposals use this route too; they carry the same
@@ -409,7 +375,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
             None => {}
         }
         let ids = [declared.sources.after, declared.sources.before.ids];
-        split += split_new_tables(&mut cs, &ids, declared.module_deps, dialect)
+        split += split_new_tables(&mut cs, &ids, &module_deps, dialect)
             .map_err(Refusal::module_passes)?;
         let releases = match facts.module_dependents {
             Some(found) => {
@@ -496,7 +462,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         moved += after_the_rebuilds(
             &mut cs,
             &releases,
-            declared.module_deps,
+            &module_deps,
             declared.schema,
             handovers,
             dialect,
@@ -523,17 +489,12 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
             split += crate::order::generated::expand(
                 &mut cs,
                 declared.sources.after,
-                declared.module_deps,
+                &module_deps,
                 dialect,
             )
             .map_err(Refusal::module_passes)?;
-            crate::order::generated::settle(
-                &mut cs,
-                declared.schema,
-                declared.module_deps,
-                dialect,
-            )
-            .map_err(Refusal::module_passes)?;
+            crate::order::generated::settle(&mut cs, declared.schema, &module_deps, dialect)
+                .map_err(Refusal::module_passes)?;
         }
         if let Some(found) = facts.module_dependents {
             // Explicit SQL Server routine drops have the same DEFAULT obligations.
@@ -582,7 +543,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
             ids: declared.sources.after,
         },
         dialect,
-        declared.module_deps,
+        &module_deps,
         facts.membership_catalog(),
     )
     .map_err(Refusal)?;
@@ -638,7 +599,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
             ids: declared.sources.after,
         },
         dialect,
-        declared.module_deps,
+        &module_deps,
         &cs,
         crate::order::shadow::Stage::Differ,
         None,
@@ -656,6 +617,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     )
     .map_err(Refusal)?;
     cs.boundaries.ensure(&cs).map_err(Refusal)?;
+    discharge_deferred(&cs, dialect).map_err(Refusal)?;
     Ok(Scheduled {
         changes: crate::order::plan::state::<_, S::Output>(cs),
         added,
@@ -768,7 +730,7 @@ fn keep_handover_dependents(
         operations.as_slice(),
         &effects.effects,
         &edges::Baseline::of(before, &owners).with_symbolic(effects.symbolic.clone()),
-        declared.module_deps,
+        &declared.module_deps(),
         edges::Checks::ALL,
     );
     let dependencies = Schedule::of_graph(&graph, operations.as_slice());
@@ -802,7 +764,7 @@ fn policy_release_schedule(
             schema: declared.schema,
             ids: declared.sources.after,
         },
-        declared.module_deps,
+        &declared.module_deps(),
         dialect,
     )
     .map_err(Refusal)?;

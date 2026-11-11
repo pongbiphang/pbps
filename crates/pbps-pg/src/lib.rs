@@ -3116,7 +3116,7 @@ mod tests {
                     },
                     after: &ids,
                 },
-                module_deps: &Default::default(),
+                annotations: &Default::default(),
             };
             let diff = pbps_diff::diff(
                 declarations.sources.before,

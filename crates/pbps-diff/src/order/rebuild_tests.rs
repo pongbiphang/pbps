@@ -163,7 +163,7 @@ fn rebuild_swap_uses_shared_slots_with_distinct_reserved_holders() {
 fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
     let schema = Schema::default();
     let ids = pbps_model::IdsFile::default();
-    let deps = ModuleDeps::new();
+    let deps = pbps_model::object_ref::Annotations::default();
     let declared = deployment::schedule::Declarations {
         schema: &schema,
         sources: deployment::Sources {
@@ -173,7 +173,7 @@ fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
             },
             after: &ids,
         },
-        module_deps: &deps,
+        annotations: &deps,
     };
     for change in
         fixture::changes()

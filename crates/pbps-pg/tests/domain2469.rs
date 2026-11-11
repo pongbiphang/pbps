@@ -145,7 +145,7 @@ fn empty_domain_demand_keeps_changes_proof_and_sql_bytes() {
             before,
             after: &f.ids,
         },
-        module_deps: &Default::default(),
+        annotations: &Default::default(),
     };
     let plain = pbps_diff::order::deployment::schedule::schedule(
         input,
