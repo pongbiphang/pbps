@@ -18772,6 +18772,95 @@ async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
     db.drop().await;
 }
 
+/// A memory-optimized table whose indexes are only hash or nonclustered is
+/// still pulled (#1227): its base row is a heap row on no `sys.data_spaces` row
+/// (`data_space_id = 0`, measured on 17.0), which reads as the in-memory space,
+/// neither a scheme nor an unreadable placement. A review feared such a table
+/// has no base row at all and would be left out as unreadable; the premise
+/// below is the measurement that it does have one, and the pull is what would
+/// change if the engine ever stopped answering it. A disk table is the control.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_memory_optimized_table_with_only_a_hash_key_is_pulled_not_left_out() {
+    let mut db = TestDb::create("memopt1227").await;
+    let name = db.name.clone();
+    db.conn
+        .execute(&format!(
+            "ALTER DATABASE [{name}] ADD FILEGROUP mo CONTAINS MEMORY_OPTIMIZED_DATA;
+             ALTER DATABASE [{name}] ADD FILE (NAME='{name}_mo',
+                 FILENAME='/var/opt/mssql/data/{name}_mo') TO FILEGROUP mo;"
+        ))
+        .await
+        .expect("add a memory-optimized filegroup");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.mo_hash (id int NOT NULL
+                 PRIMARY KEY NONCLUSTERED HASH WITH (BUCKET_COUNT = 64), v int NULL)
+                 WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_AND_DATA);
+             CREATE TABLE dbo.mo_nc (id int NOT NULL PRIMARY KEY NONCLUSTERED, v int NULL)
+                 WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY);
+             CREATE TABLE dbo.plain_cpk (id int NOT NULL PRIMARY KEY, v int NULL);",
+        )
+        .await
+        .expect("create the tables");
+
+    // The premise: no clustered index, a heap row on data space 0, and no
+    // `sys.data_spaces` row for it, for the memory-optimized tables only.
+    let bases = db
+        .conn
+        .query(
+            "SELECT t.name AS tbl, CONVERT(int, t.is_memory_optimized) AS mo,
+                    b.index_id, b.data_space_id,
+                    CONVERT(int, CASE WHEN ds.data_space_id IS NULL THEN 0 ELSE 1 END) AS has_space
+               FROM sys.tables t
+               JOIN sys.indexes b ON b.object_id = t.object_id AND b.index_id IN (0, 1)
+               LEFT JOIN sys.data_spaces ds ON ds.data_space_id = b.data_space_id
+              ORDER BY t.name",
+        )
+        .await
+        .expect("read the bases");
+    let seen: Vec<(String, i32, i32, i32, i32)> = bases
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("tbl").unwrap().unwrap().to_owned(),
+                r.try_get::<i32>("mo").unwrap().unwrap(),
+                r.try_get::<i32>("index_id").unwrap().unwrap(),
+                r.try_get::<i32>("data_space_id").unwrap().unwrap(),
+                r.try_get::<i32>("has_space").unwrap().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("mo_hash".to_owned(), 1, 0, 0, 0),
+            ("mo_nc".to_owned(), 1, 0, 0, 0),
+            ("plain_cpk".to_owned(), 0, 1, 1, 1),
+        ]
+    );
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let declared: Vec<_> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(|t| t.name.to_string())
+        .collect();
+    let said = format!("{:?} {:?}", pulled.limitations, pulled.catalog_notices);
+    assert_eq!(declared, ["mo_hash", "mo_nc", "plain_cpk"], "{said}");
+    // Neither unreadable nor partitioned, and no filegroup notice for them.
+    assert!(!said.contains("cannot be read"), "{said}");
+    assert!(!said.contains("partition"), "{said}");
+    assert!(
+        !said.contains("mo_hash") || !said.contains("filegroup"),
+        "{said}"
+    );
+    db.drop().await;
+}
+
 #[cfg(test)]
 mod certified_fixture {
     include!(concat!(
