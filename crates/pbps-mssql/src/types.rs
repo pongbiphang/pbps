@@ -22,25 +22,19 @@
 //! of adopting it. What they may not do (be a key, be indexed) is caught by
 //! `validate`.
 
+use pbps_dialect::types::{ArgShape, Excess, MaxWord, Omitted, ScaleRange, TypeTable, Unknown};
 use pbps_dialect::{DialectError, TypeChangeRisk};
 use pbps_model::{ColumnType, TypeArg};
 
 pub const DIALECT: &str = "mssql";
 
-/// What kind of argument list a type takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArgShape {
-    /// No arguments at all: `int`, `bit`, `date`.
-    None,
-    /// One length, `max` permitted: `varchar(100)`, `nvarchar(max)`.
-    Length { max_len: i64, allows_max: bool },
-    /// One optional precision: `datetime2(3)`, `time(7)`.
-    Precision { max: i64, default: i64 },
-    /// Optional precision and scale: `decimal(18, 2)`.
-    PrecisionScale,
-    /// `float(n)`, which SQL Server collapses to either `real` or `float(53)`.
-    FloatPrecision,
-}
+/// `time`, `datetime2` and `datetimeoffset`: seven digits of fractional
+/// seconds, which an omitted precision also means.
+const DATETIME_PRECISION: ArgShape = ArgShape::Precision {
+    max: 7,
+    omitted: Omitted::Fill(7),
+    excess: Excess::Refused,
+};
 
 /// Every type name SQL Server will accept in a column definition, with the shape
 /// of its argument list. Aliases are resolved before this table is consulted.
@@ -51,62 +45,78 @@ const CATALOGUE: &[(&str, ArgShape)] = &[
     ("smallint", ArgShape::None),
     ("int", ArgShape::None),
     ("bigint", ArgShape::None),
-    ("decimal", ArgShape::PrecisionScale),
+    (
+        "decimal",
+        ArgShape::Scale {
+            max_precision: 38,
+            scale: ScaleRange::UpToPrecision,
+            omitted: Omitted::Fill(18),
+        },
+    ),
     ("smallmoney", ArgShape::None),
     ("money", ArgShape::None),
     // Approximate numerics.
     ("real", ArgShape::None),
-    ("float", ArgShape::FloatPrecision),
+    ("float", ArgShape::Engine),
     // Date and time.
     ("date", ArgShape::None),
-    ("time", ArgShape::Precision { max: 7, default: 7 }),
+    ("time", DATETIME_PRECISION),
     ("smalldatetime", ArgShape::None),
     ("datetime", ArgShape::None),
-    ("datetime2", ArgShape::Precision { max: 7, default: 7 }),
-    ("datetimeoffset", ArgShape::Precision { max: 7, default: 7 }),
+    ("datetime2", DATETIME_PRECISION),
+    ("datetimeoffset", DATETIME_PRECISION),
     // Character strings. `char`/`nchar` are fixed length, `varchar`/`nvarchar`
-    // variable; only the variable ones accept `max`.
+    // variable; only the variable ones accept `max`. SQL Server's own default
+    // for an omitted length in a column definition is 1 -- surprising, but
+    // silently guessing something friendlier would make the declaration
+    // disagree with the database, so every row below fills in 1.
     (
         "char",
         ArgShape::Length {
-            max_len: 8000,
-            allows_max: false,
+            max: 8000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Refused,
         },
     ),
     (
         "varchar",
         ArgShape::Length {
-            max_len: 8000,
-            allows_max: true,
+            max: 8000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Allowed,
         },
     ),
     (
         "nchar",
         ArgShape::Length {
-            max_len: 4000,
-            allows_max: false,
+            max: 4000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Refused,
         },
     ),
     (
         "nvarchar",
         ArgShape::Length {
-            max_len: 4000,
-            allows_max: true,
+            max: 4000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Allowed,
         },
     ),
     // Binary strings.
     (
         "binary",
         ArgShape::Length {
-            max_len: 8000,
-            allows_max: false,
+            max: 8000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Refused,
         },
     ),
     (
         "varbinary",
         ArgShape::Length {
-            max_len: 8000,
-            allows_max: true,
+            max: 8000,
+            omitted: Omitted::Fill(1),
+            max_word: MaxWord::Allowed,
         },
     ),
     // Everything else.
@@ -145,24 +155,14 @@ const ALIASES: &[(&str, &str)] = &[
     ("rowversion", "timestamp"),
 ];
 
-fn shape_of(base: &str) -> Option<ArgShape> {
-    CATALOGUE.iter().find(|(n, _)| *n == base).map(|(_, s)| *s)
-}
-
-fn canonical_base(base: &str) -> &str {
-    ALIASES
-        .iter()
-        .find(|(a, _)| *a == base)
-        .map(|(_, c)| *c)
-        .unwrap_or(base)
-}
-
-fn unknown(ty: &ColumnType) -> DialectError {
-    DialectError::UnknownType {
-        dialect: DIALECT,
-        ty: ty.raw().to_string(),
-    }
-}
+/// The shared form of the two tables above, which the lookup and the
+/// argument filling read.
+const TABLE: TypeTable = TypeTable {
+    dialect: DIALECT,
+    catalogue: CATALOGUE,
+    aliases: ALIASES,
+    unknown: Unknown::Refuse,
+};
 
 fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     DialectError::BadTypeArity {
@@ -207,112 +207,32 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             "SQL Server type arguments must follow the complete type name",
         ));
     }
-    // `ColumnType` already lowercases and squeezes whitespace inside arguments,
-    // but a multi-word base name such as `national  character` can still carry
-    // runs of spaces.
-    let base_words: Vec<&str> = ty.base.split_whitespace().collect();
-    let base = base_words.join(" ");
-    let base = canonical_base(&base).to_owned();
-    let Some(shape) = shape_of(&base) else {
-        return Err(unknown(ty));
-    };
+    let found = TABLE.lookup(ty)?;
 
-    let args = match shape {
-        ArgShape::None => {
-            if !ty.args.is_empty() {
-                return Err(arity(ty, format!("`{base}` takes no arguments")));
-            }
-            Vec::new()
-        }
+    // `float(n)` is not stored as written: 1..=24 becomes `real` and
+    // 25..=53 becomes `float(53)`. Normalizing to what is stored is what
+    // stops `float(30)` from looking like a change every single run.
+    if found.shape == ArgShape::Engine {
+        return resolve_float(ty);
+    }
 
-        ArgShape::Length {
-            max_len,
-            allows_max,
-        } => match ty.args.as_slice() {
-            // SQL Server's own default for an omitted length in a column
-            // definition is 1 — surprising, but silently guessing something
-            // friendlier would make the declaration disagree with the database.
-            [] => vec![TypeArg::Int(1)],
-            [TypeArg::Max] if allows_max => vec![TypeArg::Max],
-            [TypeArg::Max] => {
-                return Err(arity(ty, format!("`{base}` has no `max` form")));
-            }
-            [TypeArg::Int(n)] if *n >= 1 && *n <= max_len => vec![TypeArg::Int(*n)],
-            [TypeArg::Int(n)] => {
-                return Err(arity(
-                    ty,
-                    format!("the length must be between 1 and {max_len}, got {n}"),
-                ));
-            }
-            _ => return Err(arity(ty, format!("`{base}` takes one length"))),
-        },
-
-        ArgShape::Precision { max, default } => match ty.args.as_slice() {
-            [] => vec![TypeArg::Int(default)],
-            [TypeArg::Int(n)] if *n >= 0 && *n <= max => vec![TypeArg::Int(*n)],
-            [TypeArg::Int(n)] => {
-                return Err(arity(
-                    ty,
-                    format!("the precision must be between 0 and {max}, got {n}"),
-                ));
-            }
-            _ => return Err(arity(ty, format!("`{base}` takes one precision"))),
-        },
-
-        ArgShape::PrecisionScale => match ty.args.as_slice() {
-            [] => vec![TypeArg::Int(18), TypeArg::Int(0)],
-            [TypeArg::Int(p)] => {
-                check_decimal(ty, *p, 0)?;
-                vec![TypeArg::Int(*p), TypeArg::Int(0)]
-            }
-            [TypeArg::Int(p), TypeArg::Int(s)] => {
-                check_decimal(ty, *p, *s)?;
-                vec![TypeArg::Int(*p), TypeArg::Int(*s)]
-            }
-            _ => {
-                return Err(arity(
-                    ty,
-                    format!("`{base}` takes a precision and an optional scale"),
-                ));
-            }
-        },
-
-        // `float(n)` is not stored as written: 1..=24 becomes `real` and
-        // 25..=53 becomes `float(53)`. Normalizing to what is stored is what
-        // stops `float(30)` from looking like a change every single run.
-        ArgShape::FloatPrecision => match ty.args.as_slice() {
-            [] => return Ok(ColumnType::new("float", vec![TypeArg::Int(53)])),
-            [TypeArg::Int(n)] if (1..=24).contains(n) => {
-                return Ok(ColumnType::simple("real"));
-            }
-            [TypeArg::Int(n)] if (25..=53).contains(n) => vec![TypeArg::Int(53)],
-            [TypeArg::Int(n)] => {
-                return Err(arity(
-                    ty,
-                    format!("the precision of `float` must be between 1 and 53, got {n}"),
-                ));
-            }
-            _ => return Err(arity(ty, "`float` takes one precision")),
-        },
-    };
-
-    Ok(ColumnType::new(base, args))
+    let args = TABLE.fill(ty, &found)?;
+    Ok(ColumnType::new(found.base, args))
 }
 
-fn check_decimal(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
-    if !(1..=38).contains(&p) {
-        return Err(arity(
+fn resolve_float(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    match ty.args.as_slice() {
+        [] => Ok(ColumnType::new("float", vec![TypeArg::Int(53)])),
+        [TypeArg::Int(n)] if (1..=24).contains(n) => Ok(ColumnType::simple("real")),
+        [TypeArg::Int(n)] if (25..=53).contains(n) => {
+            Ok(ColumnType::new("float", vec![TypeArg::Int(53)]))
+        }
+        [TypeArg::Int(n)] => Err(arity(
             ty,
-            format!("the precision of `decimal` must be between 1 and 38, got {p}"),
-        ));
+            format!("the precision of `float` must be between 1 and 53, got {n}"),
+        )),
+        _ => Err(arity(ty, "`float` takes one precision")),
     }
-    if s < 0 || s > p {
-        return Err(arity(
-            ty,
-            format!("the scale of `decimal` must be between 0 and the precision ({p}), got {s}"),
-        ));
-    }
-    Ok(())
 }
 
 /// Whether an expression of this normalized base type takes a `COLLATE`.
