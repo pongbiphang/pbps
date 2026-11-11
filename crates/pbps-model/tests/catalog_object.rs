@@ -16,6 +16,17 @@ fn type_name() -> pbps_model::TypeRef {
     "app.mood".parse().unwrap()
 }
 
+fn search_name() -> pbps_model::SearchRef {
+    "dictionary app.words".parse().unwrap()
+}
+
+fn dictionary() -> Box<pbps_model::SearchObject> {
+    Box::new(pbps_model::SearchObject::Dictionary {
+        template: "pg_catalog.simple".parse().unwrap(),
+        options: Default::default(),
+    })
+}
+
 fn catalog() -> Vec<(Change, CatalogObject)> {
     let role = |s: &str| pbps_model::RoleName::from(s);
     vec![
@@ -65,6 +76,7 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                 requirers: Default::default(),
                 releases: Default::default(),
                 index_releases: Default::default(),
+                search_releases: Default::default(),
             },
             CatalogObject::Extension,
         ),
@@ -125,6 +137,23 @@ fn catalog() -> Vec<(Change, CatalogObject)> {
                 definition: enumeration(),
             },
             CatalogObject::Type,
+        ),
+        (
+            Change::CreateSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: search_name(),
+                definition: dictionary(),
+                unresolved: Vec::new(),
+            },
+            CatalogObject::Search,
+        ),
+        (
+            Change::DropSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: search_name(),
+                definition: dictionary(),
+            },
+            CatalogObject::Search,
         ),
     ]
 }
@@ -214,6 +243,11 @@ fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
             "{change:?}"
         );
         assert_eq!(
+            matches!(change, catalog_change!(search)),
+            kind == CatalogObject::Search,
+            "{change:?}"
+        );
+        assert_eq!(
             matches!(change, catalog_change!(extensions)),
             kind == CatalogObject::Extension,
             "{change:?}"
@@ -223,6 +257,7 @@ fn the_pattern_agrees_with_the_classifier_and_splits_by_kind() {
         assert!(!matches!(change, catalog_change!()), "{change:?}");
         assert!(!matches!(change, catalog_change!(roles)), "{change:?}");
         assert!(!matches!(change, catalog_change!(types)), "{change:?}");
+        assert!(!matches!(change, catalog_change!(search)), "{change:?}");
         assert!(!matches!(change, catalog_change!(extensions)), "{change:?}");
     }
 }

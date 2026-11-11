@@ -831,6 +831,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::SetComment { .. }
         | crate::change_family!(roles)
         | crate::change_family!(extensions)
+        | crate::change_family!(search)
         | crate::change_family!(permissions) => return None,
     };
     Some((vec![owner], opening, closing))

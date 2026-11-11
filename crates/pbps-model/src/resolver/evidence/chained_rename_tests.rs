@@ -31,6 +31,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
         | crate::change_family!(extensions)
+        | crate::change_family!(search)
         | Change::AttachPartition { .. }
         | Change::DropTable { .. }
         | Change::AddColumn { .. }

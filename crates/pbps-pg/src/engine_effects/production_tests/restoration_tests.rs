@@ -62,6 +62,7 @@ fn inspect(
         ObjectKey::Default(key) => (key, Attribute::Default),
         ObjectKey::Column(key) => (key, Attribute::NotNull),
         other @ (ObjectKey::Type(_)
+        | ObjectKey::Search(_)
         | ObjectKey::Table(_)
         | ObjectKey::Role(_)
         | ObjectKey::Extension(_)

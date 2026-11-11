@@ -225,6 +225,7 @@ impl<'a> Allocation<'a> {
                     | Namespace::Table(_, _)
                     | Namespace::Routines(_)
                     | Namespace::Roles
+                    | Namespace::Search(..)
                     | Namespace::Extensions => None,
                 };
                 if schema == Some(&leaf.schema) {

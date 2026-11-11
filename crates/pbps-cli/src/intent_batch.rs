@@ -4,22 +4,26 @@ use anyhow::{Context as _, ensure};
 use clap::{ArgAction, Args};
 use pbps_model::{ColumnRef, Intent, Reason};
 
-pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, drop-extension, move-rows or rebuild-table accept --reason - too.";
+pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, drop-extension, drop-search, move-rows or rebuild-table accept --reason - too.";
 
 /// The reason options. Only their second value is audit text, so only there
 /// can `-` stand for stdin.
-const REASON_FLAGS: [&str; 5] = [
+const REASON_FLAGS: [&str; 6] = [
     "--drop-type",
     "--drop",
     "--drop-table",
     "--drop-role",
     DROP_EXTENSION_FLAG,
+    DROP_SEARCH_FLAG,
 ];
 
 /// The batch spelling of `pbps drop-extension`. The clap field below, the
 /// reports and the command are tied to [`crate::report::DROP_EXTENSION`] by a
 /// test, so the name is changed in one place and the test names the rest.
 const DROP_EXTENSION_FLAG: &str = "--drop-extension";
+
+/// The batch spelling of `pbps drop-search`, tied to [`crate::report::DROP_SEARCH`] the same way.
+const DROP_SEARCH_FLAG: &str = "--drop-search";
 
 #[derive(Args)]
 #[group(required = true, multiple = true)]
@@ -51,6 +55,10 @@ pub struct BatchArgs {
     /// Drop an installed extension with its own nonblank audit reason
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["EXTENSION", "REASON"])]
     drop_extension: Vec<String>,
+    /// Drop a text search configuration or dictionary, named `config app.docs` or
+    /// `dictionary app.words`, with its own nonblank audit reason
+    #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["SEARCH", "REASON"])]
+    drop_search: Vec<String>,
 }
 
 /// The command boundary cannot ask resolution to record an empty answer.
@@ -92,6 +100,7 @@ impl BatchArgs {
             ("--drop-table", &self.drop_table),
             ("--drop-role", &self.drop_role),
             (DROP_EXTENSION_FLAG, &self.drop_extension),
+            (DROP_SEARCH_FLAG, &self.drop_search),
         ];
         let mut piped = 0;
         for (flag, values) in options {
@@ -170,6 +179,10 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
         },
         DROP_EXTENSION_FLAG => Intent::DropExtension {
             name: first.to_owned().into(),
+            reason: second.parse()?,
+        },
+        DROP_SEARCH_FLAG => Intent::DropSearch {
+            name: first.parse().map_err(anyhow::Error::msg)?,
             reason: second.parse()?,
         },
         _ => unreachable!("only the declared pair options reach this parser"),
@@ -367,6 +380,48 @@ mod tests {
             .parse_with(unread)
             .unwrap_err();
         assert!(error.to_string().contains("hyphen-leading"), "{error:#}");
+    }
+
+    /// A text search drop travels in a batch like a package's: its reason may come from
+    /// stdin, a blank one is refused, and a name that is not `config <name>` or
+    /// `dictionary <name>` is (DEC-2728.2).
+    #[test]
+    fn a_text_search_drop_travels_in_a_batch_with_its_own_reason_and_a_bad_name_is_refused() {
+        let parsed = batch(&["--drop-search", "config app.docs", "-"])
+            .parse_with(|| Ok("retired".parse().unwrap()))
+            .unwrap()
+            .into_vec();
+        assert_eq!(
+            parsed,
+            vec![Intent::DropSearch {
+                name: "config app.docs".parse().unwrap(),
+                reason: "retired".parse().unwrap(),
+            }]
+        );
+        for reason in ["", " "] {
+            assert!(parse_pair(DROP_SEARCH_FLAG, "dictionary app.words", reason).is_err());
+        }
+        for name in ["app.docs", "view app.docs", "config"] {
+            assert!(parse_pair(DROP_SEARCH_FLAG, name, "why").is_err(), "{name}");
+        }
+        use clap::CommandFactory as _;
+        assert_eq!(
+            DROP_SEARCH_FLAG,
+            format!("--{}", crate::report::DROP_SEARCH)
+        );
+        assert!(
+            crate::Cli::command()
+                .find_subcommand(crate::report::DROP_SEARCH)
+                .is_some()
+        );
+        let said = crate::report::blockers(&[pbps_diff::Blocker::DropSearchNeedsReason {
+            name: "config app.docs".parse().unwrap(),
+        }]);
+        assert!(
+            said.contains("pbps drop-search 'config app.docs' --reason")
+                || said.contains("pbps drop-search \"config app.docs\" --reason"),
+            "{said}"
+        );
     }
 
     /// The command's name lives in one constant. The batch flag, the single

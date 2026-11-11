@@ -595,6 +595,15 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 live_ids.types.remove(&type_statement.uid);
             }
         }
+        if let Some(search) = &stmt.search {
+            if search.created {
+                live_ids
+                    .search
+                    .insert(search.uid.clone(), search.name.clone());
+            } else {
+                live_ids.search.remove(&search.uid);
+            }
+        }
         if let Some(installed) = &stmt.extension {
             match installed.phase {
                 pbps_dialect::ExtensionPhase::Drop => {

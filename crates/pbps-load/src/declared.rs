@@ -67,10 +67,10 @@ impl Loaded {
                 Declaration::Table(_)
                 | Declaration::Role(_)
                 | Declaration::Type(_)
+                | Declaration::Search(_)
                 | Declaration::Extension(_) => true,
-                // Text search objects take identities with the next part (#2728), and
-                // sequences with the part that creates one (#2721).
-                Declaration::Search(_) | Declaration::Sequence(_) | Declaration::Module(_) => false,
+                // Sequences take identities with the part that creates one (#2721).
+                Declaration::Sequence(_) | Declaration::Module(_) => false,
             };
             if !kind_has_ids {
                 continue;

@@ -1371,6 +1371,7 @@ mod tests {
             requirers: Default::default(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         };
         let statements = crate::emit::emit(&pg, &drop, Default::default()).unwrap();
         assert_eq!(statements.len(), 1);
@@ -1485,6 +1486,108 @@ mod tests {
             order,
             ["module app.marked()", "package zzz", "package aaa"],
             "{order:?}"
+        );
+    }
+
+    /// A configuration that maps a dictionary of a package, retired with the package, is
+    /// dropped first, though the package sorts first by name: only the release says so
+    /// (DEC-2728.2). Negative: retiring only the package is refused, naming the configuration.
+    #[test]
+    fn a_configuration_retired_with_its_packages_dictionary_is_dropped_before_the_package() {
+        use pbps_model::{
+            Change, IdsFile, Schema, SearchObject, SearchRef, Tombstone, Uid, UidKind,
+        };
+        let pg = crate::Postgres::new();
+        let name: SearchRef = "config app.docs".parse().unwrap();
+        let search_uid = Uid::generate(UidKind::Search);
+        let object = SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec!["ext.intdict".parse().unwrap()])].into(),
+        };
+        let mut held = Schema {
+            extensions: [("aaa".into(), wanted("ext", "1.0"))].into(),
+            ..Default::default()
+        };
+        held.search.insert(name.clone(), object.clone());
+        let mut held_ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "aaa".into())].into(),
+            ..Default::default()
+        };
+        held_ids.search.insert(search_uid.clone(), name.clone());
+        let tombstone = |was: &str| Tombstone {
+            require: None,
+            was: was.into(),
+            dropped_at: "2026-11-13".into(),
+            reason: "retired".into(),
+            operator: "test".into(),
+        };
+        let mut gone_ids = IdsFile::default();
+        gone_ids
+            .tombstones
+            .insert("e_000001".parse().unwrap(), tombstone("aaa"));
+        gone_ids
+            .tombstones
+            .insert(search_uid.clone(), tombstone("config app.docs"));
+        let hints = pbps_model::Hints {
+            extension_drops: [(
+                "aaa".into(),
+                pbps_model::ExtensionDropFacts {
+                    outside: Default::default(),
+                    blockers: [ProviderMember {
+                        class: "text search configuration".into(),
+                        names: vec!["app".into(), "docs".into()],
+                        args: Vec::new(),
+                    }]
+                    .into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let diff = |desired: &Schema, ids: &IdsFile| {
+            pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &held,
+                    ids: &held_ids,
+                },
+                pbps_diff::Side {
+                    schema: desired,
+                    ids,
+                },
+                &pg,
+                &hints,
+            )
+        };
+        let planned = diff(&Schema::default(), &gone_ids).unwrap();
+        let order: Vec<&str> = planned
+            .changes()
+            .changes
+            .iter()
+            .map(|p| {
+                if matches!(p.change, Change::DropSearch { .. }) {
+                    "search"
+                } else if matches!(p.change, Change::DropExtension { .. }) {
+                    "package"
+                } else {
+                    panic!("{:?}", p.change)
+                }
+            })
+            .collect();
+        assert_eq!(order, ["search", "package"], "{order:?}");
+        // Negative: the configuration stays, so the engine would refuse, and the plan says so.
+        let mut kept = Schema::default();
+        kept.search.insert(name.clone(), object);
+        let mut kept_ids = IdsFile::default();
+        kept_ids.search.insert(search_uid, name);
+        kept_ids
+            .tombstones
+            .insert("e_000001".parse().unwrap(), tombstone("aaa"));
+        let refused = diff(&kept, &kept_ids).unwrap_err();
+        let said: Vec<String> = refused.iter().map(ToString::to_string).collect();
+        assert!(
+            said.iter()
+                .any(|m| m.contains("text search configuration app.docs")),
+            "{said:?}"
         );
     }
 

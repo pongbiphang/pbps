@@ -113,3 +113,26 @@ fn a_recorded_sequence_that_is_gone_or_changed_is_named_once_and_an_unrecorded_o
     let (named, other) = found(&recorded, &held(&[("app.kept", 1), ("app.made_later", 1)]));
     assert!((named.is_empty(), other) == (true, 0), "{named:?} {other}");
 }
+
+/// A drift comparison leaves out a text search object no recorded identity names, and
+/// still compares one that is named: a change to a managed one is reported by name
+/// (DEC-2728.1, DEC-2728.2).
+#[test]
+fn a_text_search_object_without_an_identity_is_not_compared_and_a_managed_one_is() {
+    let mut ids = IdsFile::default();
+    ids.search.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Search),
+        name("app.kept"),
+    );
+    let mut live = Schema::default();
+    live.search
+        .insert(name("app.kept"), dictionary("pg_catalog.synonym"));
+    live.search
+        .insert(name("app.made_later"), dictionary("pg_catalog.simple"));
+    only_managed_search_objects(&ids, &mut live);
+    // Negative: the managed object stays in, changed, so the differ names it.
+    assert_eq!(live.search.keys().collect::<Vec<_>>(), [&name("app.kept")]);
+    // Nothing is managed in a state that recorded no search identity: nothing is compared.
+    only_managed_search_objects(&IdsFile::default(), &mut live);
+    assert!(live.search.is_empty());
+}

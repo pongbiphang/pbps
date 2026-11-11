@@ -40,6 +40,9 @@ pub struct Managed {
     /// Declared enums and domains: types the project creates, which a view
     /// or routine reaches through a column or by name.
     types: BTreeSet<(String, String)>,
+    /// Declared text search configurations and dictionaries, each in a namespace of
+    /// its own (DEC-2728.2).
+    search: BTreeSet<(pbps_model::SearchKind, String, String)>,
 }
 
 impl Managed {
@@ -60,6 +63,13 @@ impl Managed {
             managed
                 .types
                 .insert((name.schema().to_owned(), name.name().to_owned()));
+        }
+        for name in schema.search.keys() {
+            managed.search.insert((
+                name.kind,
+                name.name.schema().to_owned(),
+                name.name.name().to_owned(),
+            ));
         }
         for (id, module) in &schema.modules {
             let key = (id.schema().to_owned(), id.name().to_owned());
@@ -170,6 +180,13 @@ impl Managed {
                 self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
             }
             "pg_type" => self.relations.contains(&key) || self.types.contains(&key),
+            "pg_ts_config" => self
+                .search
+                .contains(&(pbps_model::SearchKind::Config, key.0, key.1)),
+            "pg_ts_dict" => {
+                self.search
+                    .contains(&(pbps_model::SearchKind::Dictionary, key.0, key.1))
+            }
             _ => false,
         }
     }
@@ -938,6 +955,31 @@ mod tests {
     use super::super::manifest::Input;
     use super::*;
     use serde_json::json;
+
+    /// An externals file that creates a text search object the project declares is in the
+    /// managed set, by kind and schema: a configuration is not the dictionary of its name,
+    /// and another schema's object is another object (DEC-2728.2).
+    #[test]
+    fn a_declared_text_search_object_is_in_the_managed_set_by_its_kind() {
+        let mut schema = pbps_model::Schema::default();
+        schema.search.insert(
+            "config app.docs".parse().unwrap(),
+            pbps_model::SearchObject::Config {
+                parser: "pg_catalog.\"default\"".parse().unwrap(),
+                mappings: Default::default(),
+            },
+        );
+        let managed = Managed::from_schema(&schema);
+        let object = |class: &str, schema: &str, name: &str| ObjectIdentity {
+            class: class.into(),
+            name: vec![schema.into(), name.into()],
+            signature: Vec::new(),
+        };
+        assert!(managed.names(&object("pg_ts_config", "app", "docs")));
+        assert!(!managed.names(&object("pg_ts_dict", "app", "docs")));
+        assert!(!managed.names(&object("pg_ts_config", "other", "docs")));
+        assert!(!managed.names(&object("pg_ts_config", "app", "elsewhere")));
+    }
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL 16 and 18"]
