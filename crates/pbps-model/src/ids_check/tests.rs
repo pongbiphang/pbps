@@ -109,6 +109,7 @@ fn every_code_has_a_distinct_stable_text() {
         Code::LegacyLayout,
         Code::LegacyBesideTree,
         Code::NotCanonical,
+        Code::NameTooLong,
         Code::InvalidMapping,
     ];
     let texts: BTreeSet<&str> = all.iter().map(|c| c.as_str()).collect();
@@ -548,4 +549,129 @@ fn a_split_model_never_trips_any_check() {
             .collect();
         assert_eq!(run(&files, &declared, false), vec![], "{files:#?}");
     }
+}
+
+// ---------------------------------------------- the mirror at the limit ---
+
+fn yml(stem_len: usize) -> String {
+    format!("schema/dbo/{}.yml", "x".repeat(stem_len))
+}
+
+#[test]
+fn a_yml_declaration_at_255_bytes_has_a_256_byte_mirror_and_is_too_long() {
+    let yaml = yml(251);
+    assert_eq!(yaml.rsplit('/').next().unwrap().len(), 255);
+    let Mirror::TooLong(e) = mirrored(LAYOUT, &yaml) else {
+        panic!("a 256-byte mirror must not be offered");
+    };
+    assert_eq!((e.needs, e.excess()), (256, 1));
+    let found = run(
+        &BTreeMap::new(),
+        &[decl(&yaml, UidKind::Table, "dbo.x")],
+        false,
+    );
+    let f = only(found, Code::NameTooLong);
+    assert_eq!(f.path, yaml);
+    assert_eq!(
+        f.message,
+        format!(
+            "the identity file for {yaml} would have a name of 256 {NAME_UNIT}, over the limit of 255"
+        )
+    );
+    assert_eq!(
+        f.remedy,
+        "shorten the declaration's file name by at least 1"
+    );
+}
+
+#[test]
+fn the_remedy_counts_how_much_shorter_the_name_has_to_be() {
+    let Mirror::TooLong(e) = mirrored(LAYOUT, &yml(260)) else {
+        panic!("too long")
+    };
+    assert_eq!(
+        e.remedy(),
+        "shorten the declaration's file name by at least 10"
+    );
+}
+
+#[test]
+fn a_yml_stem_of_250_bytes_mirrors_to_exactly_the_limit_and_fits() {
+    let yaml = yml(250);
+    assert_eq!(
+        mirrored(LAYOUT, &yaml),
+        Mirror::Fits(format!("dbo/{}.json", "x".repeat(250)))
+    );
+    assert_eq!(
+        run(
+            &BTreeMap::new(),
+            &[decl(&yaml, UidKind::Table, "dbo.x")],
+            false
+        )
+        .iter()
+        .filter(|f| f.code == Code::NameTooLong)
+        .count(),
+        0
+    );
+}
+
+#[test]
+fn a_yaml_declaration_never_grows_by_mirroring() {
+    // `.yaml` and `.json` are the same length: a 255-byte `.yaml` name fits.
+    let yaml = format!("schema/dbo/{}.yaml", "x".repeat(250));
+    assert_eq!(yaml.rsplit('/').next().unwrap().len(), 255);
+    assert!(matches!(mirrored(LAYOUT, &yaml), Mirror::Fits(_)));
+}
+
+#[test]
+fn a_file_that_is_not_a_declaration_is_not_called_too_long() {
+    let long = format!("schema/dbo/{}.txt", "x".repeat(300));
+    assert_eq!(mirrored(LAYOUT, &long), Mirror::NotDeclaration);
+    assert_eq!(
+        mirrored(LAYOUT, &format!("elsewhere/{}.yml", "x".repeat(300))),
+        Mirror::NotDeclaration
+    );
+    assert_eq!(mirrored(LAYOUT, "schema/.yml"), Mirror::NotDeclaration);
+}
+
+#[test]
+fn only_the_last_component_counts_toward_the_limit() {
+    // A long directory path with a short name is a short file name.
+    let dir = "d".repeat(200);
+    let yaml = format!("schema/{dir}/{dir}/t.yml");
+    assert_eq!(
+        mirrored(LAYOUT, &yaml),
+        Mirror::Fits(format!("{dir}/{dir}/t.json"))
+    );
+}
+
+#[test]
+fn a_too_long_declaration_is_reported_once_and_not_also_as_missing_its_file() {
+    let yaml = yml(251);
+    let found = run(
+        &BTreeMap::new(),
+        &[decl(&yaml, UidKind::Table, "dbo.x")],
+        false,
+    );
+    assert_eq!(codes(&found), vec![Code::NameTooLong], "{found:#?}");
+}
+
+#[test]
+fn a_name_is_counted_in_the_file_systems_unit() {
+    // `é` is 2 bytes and 1 UTF-16 code unit; `😀` is 4 bytes and 2.
+    #[cfg(not(windows))]
+    assert_eq!((name_len("aé😀"), name_len("a")), (7, 1));
+    #[cfg(windows)]
+    assert_eq!((name_len("aé😀"), name_len("a")), (4, 1));
+}
+
+#[test]
+fn a_non_ascii_stem_is_measured_in_the_file_systems_unit_not_in_characters() {
+    // 126 two-byte characters + ".json" = 257 bytes, but 131 UTF-16 units.
+    let yaml = format!("schema/dbo/{}.yml", "é".repeat(126));
+    let verdict = mirrored(LAYOUT, &yaml);
+    #[cfg(not(windows))]
+    assert!(matches!(verdict, Mirror::TooLong(_)), "{verdict:?}");
+    #[cfg(windows)]
+    assert!(matches!(verdict, Mirror::Fits(_)), "{verdict:?}");
 }

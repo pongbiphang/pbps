@@ -1631,6 +1631,42 @@ Four rules, one per cause (#2806, #2816, #2817).
   first rename used to leave the asides and the created directories made
   before it, and now puts the tree back as it was.
 
-Not decided here: a declaration name within 4 bytes of the limit has no mirror
-of the same stem (`<stem>.json` is one byte longer than `<stem>.yml`); that is
-a separate choice.
+A declaration name within 4 bytes of the limit has no mirror of the same stem
+(`<stem>.json` is one byte longer than `<stem>.yml`); DEC-2817.2 decides it.
+
+<a id="dec-2817-2"></a>
+
+**DEC-2817.2. A declaration whose identity file name would not fit is refused, with the file and the limit named; the mirror is never hashed.**
+`<stem>.yml` mirrors to `<stem>.json`, one unit longer, so a `.yml` declaration
+whose own name is at the limit (a 251-byte ASCII stem, a 255-byte name) has a
+256-byte mirror. `.yaml` is as long as `.json` and is never affected. Only the
+last path component counts; a long directory path is not a long file name.
+
+- **Refused, not renamed.** `ids_check::mirrored` is the one derivation and
+  returns three outcomes apart: not a declaration, a mirror that fits, a mirror
+  that does not (`NameTooLong`). `validate` reports the last as
+  `ids.name-too-long` on the declaration, and `Dirs::mirrored` returns the same
+  words as an error, so `plan` and every other command that places an identity file
+  stop before they write anything. Both say how long the identity file's name would be, the
+  limit and how much shorter the declaration's file name has to be.
+- **Why not a hashed mirror name.** The rule "the identity file mirrors the
+  declaration" stays literal: a reader, a reviewer and a merge find a file by
+  its declaration's name. The user gets a named remedy instead of the operating
+  system's "File name too long". And a refusal can be relaxed later without
+  breaking a project, while a project that has been given a hashed name cannot
+  have it taken back.
+- **Counted as the file system counts.** The limit is 255 (`NAME_LIMIT`, the
+  common file systems), in bytes, except on Windows, where it is UTF-16 code
+  units: NTFS stores names that way, so counting bytes there would refuse a
+  non-ASCII name it accepts, which is a valid project. The file system is not
+  probed.
+- **`validate` runs the tree check with no tree yet.** The checks that need only
+  the declarations (this one, a path two declarations share) used to wait for
+  `plan` to write the first identity file, so `validate` called a project valid
+  that `plan` then refused.
+- **Not covered.** A file system with a lower limit (eCryptfs, 143 bytes) still
+  answers with its own error; this rule does not know of it.
+
+Pinned by the 251, 250 and `.yaml` cases in `pbps-model`, the unit-counting test
+under each platform, and the CLI test that plans a 250-byte stem and refuses a
+251-byte one.

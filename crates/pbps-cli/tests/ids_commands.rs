@@ -1068,3 +1068,73 @@ fn resolve_prunes_the_directories_a_removal_emptied() {
     // Directories that still hold something stay.
     assert!(p.0.join(".pbps/ids/dbo").is_dir());
 }
+
+// ------------------------------------------------- the mirror at the limit ---
+
+/// A declaration whose own name is `stem.len() + 4` bytes. Linux accepts a
+/// 255-byte name, and `Project` lives in the temp directory, so no path limit
+/// is in play. Windows is skipped (`MAX_PATH` passes in a 255-char name, and
+/// the rule's unit there is UTF-16, pinned in the model).
+#[cfg(unix)]
+fn long_declaration_project(stem_len: usize) -> (Project, String) {
+    let p = Project::new();
+    p.write("pbps.yml", "dialect: postgres\n");
+    let yaml = format!("schema/dbo/{}.yml", "x".repeat(stem_len));
+    p.write(&yaml, CUSTOMER);
+    (p, yaml)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declaration_whose_identity_file_name_would_pass_255_bytes_is_refused_before_anything_is_written()
+ {
+    // 251 + ".yml" = 255 bytes: a valid declaration; its mirror is 256.
+    let (p, yaml) = long_declaration_project(251);
+    // The code is what scripts match on; the human text carries the facts.
+    assert_refused(
+        &p.pbps(&["validate", "--format", "json"]),
+        "ids.name-too-long",
+    );
+    let out = p.pbps(&["validate"]);
+    assert_refused(&out, "256 bytes");
+    let shown = text(&out);
+    assert!(shown.contains(&yaml), "{shown}");
+    assert!(shown.contains("256 bytes"), "{shown}");
+    assert!(shown.contains("limit of 255"), "{shown}");
+    assert!(
+        shown.contains("shorten the declaration's file name by at least 1"),
+        "{shown}"
+    );
+    // The writing commands stop with the same facts and leave the tree absent.
+    for args in [&["plan", "--no-dev"][..], &["plan", "--check"][..]] {
+        let out = p.pbps(args);
+        assert_refused(&out, "256 bytes, over the limit of 255");
+        assert!(
+            text(&out).contains("shorten the declaration's file name by at least 1"),
+            "{args:?}: {}",
+            text(&out)
+        );
+        assert!(!p.has(".pbps"), "{args:?} wrote under .pbps");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declaration_whose_identity_file_name_is_exactly_255_bytes_plans_writes_and_reads_back() {
+    // 250 + ".yml" = 254-byte declaration, 255-byte identity file: the longest
+    // name that fits.
+    let (p, _) = long_declaration_project(250);
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    let name = format!("dbo/{}.json", "x".repeat(250));
+    assert_eq!(name.rsplit('/').next().unwrap().len(), 255);
+    let ids_file = p.read(&format!(".pbps/ids/{name}"));
+    assert!(
+        ids_file.contains("\"table\": \"dbo.customer\""),
+        "{ids_file}"
+    );
+    assert_ok(&p.pbps(&["validate"]));
+    // And it reads back: a second plan leaves the tree as it is.
+    let before = tree_of(&p);
+    assert_ok(&p.pbps(&["plan", "--no-dev"]));
+    assert_eq!(tree_of(&p), before);
+}

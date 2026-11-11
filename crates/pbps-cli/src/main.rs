@@ -3984,8 +3984,11 @@ fn validate_inspected(
     }
     // The tree against the declarations it mirrors: an identity file whose
     // declaration is gone (a merge that deleted the YAML must also carry the
-    // drop), a name that disagrees, a duplicate. Design §4.2.
-    if let (Ok(Some(_)), Ok(l)) = (&ids, &loaded) {
+    // drop), a name that disagrees, a duplicate. Design §4.2. It runs with no
+    // tree yet too: the checks that need only the declarations (a path two
+    // declarations share, a name too long to mirror) must not wait for `plan`
+    // to write the first file and then refuse it (DEC-2817.2).
+    if let (Ok(_), Ok(l)) = (&ids, &loaded) {
         findings.extend(ids_store::validator_findings(project, l));
     }
 

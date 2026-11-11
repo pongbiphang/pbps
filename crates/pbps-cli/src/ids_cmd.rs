@@ -14,7 +14,7 @@ use clap::Subcommand;
 use pbps_config::{Config, Project};
 use pbps_load::{DeclaredPaths, Loaded, load_schema_dir, read_ids_tree};
 use pbps_model::diagnostic::Declaration as Source;
-use pbps_model::ids_check::{self, Declaration, Input, Layout};
+use pbps_model::ids_check::{self, Declaration, Input, Layout, Mirror};
 use pbps_model::ids_merge::{self, YamlView};
 use pbps_model::ids_tree::{self, Placement};
 use pbps_model::{IdsFile, Intent, Uid, UidKind};
@@ -86,10 +86,18 @@ impl Dirs {
             ids_dir: &self.ids,
         }
     }
-    /// The ids path (relative to the ids directory) of a declaration file.
+    /// The ids path (relative to the ids directory) of a declaration file. A
+    /// declaration whose identity file name would not fit is refused here, with
+    /// the facts `validate` reports for it, before any command writes
+    /// (DEC-2817.2).
     pub(crate) fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
-        ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema))
-            .with_context(|| format!("`{rel_yaml}` is not a .yml or .yaml declaration"))
+        match ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema)) {
+            Mirror::Fits(path) => Ok(path),
+            Mirror::TooLong(e) => bail!("{e}; {}", e.remedy()),
+            Mirror::NotDeclaration => {
+                bail!("`{rel_yaml}` is not a .yml or .yaml declaration")
+            }
+        }
     }
 }
 
