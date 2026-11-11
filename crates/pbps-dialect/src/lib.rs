@@ -3638,6 +3638,21 @@ pub trait Dialect {
         }]
     }
 
+    /// Standalone sequences (#2721). A dialect that does not hold them refuses the
+    /// declaration by name; `schema` is the whole project, so the name can be checked against
+    /// the tables and views that share its namespace.
+    fn validate_sequence(
+        &self,
+        _name: &pbps_model::ObjectName,
+        _definition: &pbps_model::Sequence,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
+        vec![DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "declared standalone sequences".into(),
+        }]
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see

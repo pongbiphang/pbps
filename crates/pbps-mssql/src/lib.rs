@@ -771,6 +771,16 @@ impl Dialect for Mssql {
         validate::search(name)
     }
 
+    /// SQL Server has sequences, and this tool does not manage them yet (#2721).
+    fn validate_sequence(
+        &self,
+        name: &pbps_model::ObjectName,
+        _definition: &pbps_model::Sequence,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
+        validate::sequence(name)
+    }
+
     /// A SQL Server database role is scoped to the database this connection
     /// names, so it is the tool's to create, rename and drop (ADR-0005) —
     /// today's answer, kept (ADR-0010 §3, DECISIONS 211).

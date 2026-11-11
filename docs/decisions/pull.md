@@ -1361,3 +1361,63 @@ table, which would change pinned output and add no information.
 
 Not tied mechanically: that an engine marked `refused` for a declaration
 really refuses it. Each dialect's validation tests pin that separately.
+
+<a id="dec-2721-1"></a>
+
+**DEC-2721.1. A standalone sequence is held, declared and pulled, its current value is never schema, and nothing plans one yet.**
+A sequence no column owns was named by the census and left out of the pull, and a column
+defaulting from one was refused as a limitation, so a pulled project could not be
+bootstrapped: its table's default named an object the declarations did not hold (#2721).
+This part reads and declares them. Creating, dropping, altering and renaming one arrive in
+the parts that follow, and SQL Server's sequences in the last.
+
+- **A model kind of its own.** `Schema.sequences` is keyed by the sequence's name and holds
+  `Sequence { ty, start, increment, options }`, with the `SequenceOptions` a column's sequence
+  already has: a bound is `None` where it is the engine's for the type and direction. One
+  file per sequence, `<schema>.<name>.sequence.yml`, leading key `sequence:`. A sequence and a
+  table share PostgreSQL's relation namespace, so `validate` refuses a table or a view of the
+  same name, and the file name cannot collide with a table's (a dot inside a name is encoded).
+  There is no owner field: role ownership is not modelled anywhere.
+- **The current value is not schema.** `last_value` and `is_called` change on every `nextval`;
+  anything that read them into the model, an identity, a checksum or a comparison would make
+  each insert a change. The pull reads `pg_sequence` only, never `pg_sequences`, and its query is
+  tested to name neither column. `start` is where a restart would begin, which a later plan will
+  state without a `RESTART`; no part of a plan moves a counter. A test advances the sequence and
+  requires an empty plan.
+- **What is held.** A permanent sequence in a project's schema, owned by no column and by no
+  package, with no `.` in its schema or name. One a column owns (`OWNED BY`, an identity, a
+  `serial`) is part of that column, as before. An `UNLOGGED` sequence and a package's are not
+  held and stay named by the census; a temporary sequence belongs to one session and is already
+  outside the census (DEC-2681.1). One SQL text decides "held" for the pull, the census and the
+  default-sequence limitation, so a sequence is named exactly when it is not read.
+- **What goes away, and how it is decided.** For a held sequence the census notice and the
+  "defaults from the sequence ..., which it does not own" limitation are gone, in the catalog
+  read. They are not conditional on the declarations, because the catalog read is one function
+  of the database that every connected command shares, and the declarations are known to none
+  of them. The consequence is stated plainly: a held sequence that the project does not declare
+  is, like a text search object (DEC-2728.1), not this project's, and a table default calling it
+  raises no limitation. Naming it again would need the sequence to take an identity, which is
+  the part that creates one. A default over a sequence the model cannot hold is still named.
+- **Validation** (`pbps-pg`, offline): a smallint, integer or bigint, with the engine's own
+  rules for the start, the increment and the options as a column's sequence has them (a bound
+  spelled as its default is refused so each sequence has one spelling), and a name the engine
+  would not truncate. SQL Server refuses the file by name (`validate_sequence`), so it is never
+  ignored.
+- **The differ refuses every difference by name**, attribute by attribute, as it did for
+  exclusions and text search: a declared sequence the target lacks, or holds with another type,
+  start, increment, bound, cycle or cache. There is no `Change` and no plan bump. A sequence the
+  target has and the declarations do not is left alone.
+- **No identity record yet, so no drift.** A new `UidKind::Sequence` (`q_`) exists so that a
+  rename can be recorded intent, but the section of the identity mapping and the tree file that
+  hold it arrive with the part that creates a sequence: until something can mint one, an
+  identity would be dead state. The scoped read therefore keeps every sequence the database
+  holds, and the state checksum leaves them out, for the reason DEC-2728.1 gives: one the
+  recorded state does not hold would otherwise read as drift on every database that had a
+  sequence before they were held. `verify` compares only the sequences the record holds, so a
+  recorded one that changed is still named. The snapshot records them (state 44).
+- **Coverage (#168).** `pg_sequence` was already held per column; the census row for a
+  standalone sequence is now held by the same macro the pull uses.
+
+Formats: state moves to 44 (a snapshot may hold `sequences`; an older one truthfully holds
+none), and schema set 106 gains the `sequence:` file kind in the declaration schema. The plan
+does not move, and neither does the identity file.

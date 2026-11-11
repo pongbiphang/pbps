@@ -247,6 +247,10 @@ ALLOWED = {
         None,
         "writes the text search declaration YAML, quoting each value with fmt's `scalar`",
     ),
+    "crates/pbps-load/src/sequence.rs": (
+        None,
+        "writes the sequence declaration YAML, quoting each value with fmt's `scalar`",
+    ),
     "crates/pbps-docs/src/html.rs": (
         None,
         "writes the HTML document, escaping each value with its own `esc`",

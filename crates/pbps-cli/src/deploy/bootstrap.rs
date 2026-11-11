@@ -97,6 +97,8 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
         types,
         // Text search objects take identities with the next part (#2728).
         search: _,
+        // Nor do sequences, until the part that creates one (#2721).
+        sequences: _,
         modules: _,
         roles,
         extensions,
@@ -157,6 +159,7 @@ pub(super) fn refuse_nonempty_bootstrap(
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -165,6 +168,11 @@ pub(super) fn refuse_nonempty_bootstrap(
         .keys()
         .map(|name| name.shown().to_string())
         .chain(search.keys().map(|name| name.shown().to_string()))
+        .chain(
+            sequences
+                .keys()
+                .map(|name| format!("sequence `{}`", name.shown())),
+        )
         .chain(modules.keys().map(|id| id.shown().to_string()))
         // PostgreSQL cluster roles with no managed grants are prerequisites,
         // rather than objects bootstrap creates (DECISIONS 211).

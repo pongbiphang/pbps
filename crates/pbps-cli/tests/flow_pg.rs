@@ -48,6 +48,8 @@ mod domain_defaults2537;
 
 #[path = "support/managed_types.rs"]
 mod managed_types;
+#[path = "support/sequences2721.rs"]
+mod sequences2721;
 #[path = "support/text_search2728.rs"]
 mod text_search2728;
 
@@ -6453,6 +6455,9 @@ fn a_sequence_or_index_at_a_new_tables_name_refuses_the_plan() {
     let adopted = |case: &str| {
         let d = Demo::new(&format!("relation-namespace-occupant-{case}"));
         succeeds(d.run(&["pull", "--db", connection]));
+        // The pull declares the sequence (#2721). This case is about an occupant the project
+        // does not declare, so the declaration is taken out again before the adoption.
+        std::fs::remove_file(d.dir.join("schema/app.s.sequence.yml")).unwrap();
         d.commit();
         succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
         d

@@ -98,6 +98,8 @@ mod drop_requirements2400;
 mod index_gist2448;
 #[path = "support/index_policy2448.rs"]
 mod index_policy2448;
+#[path = "support/sequences2721.rs"]
+mod sequences2721;
 #[path = "support/text_search2728.rs"]
 mod text_search2728;
 
@@ -2366,7 +2368,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE {s}.unenforced (
                  id integer, CONSTRAINT unenforced_ck CHECK (id > 0) NOT ENFORCED);
-             CREATE SEQUENCE {s}.loose;
+             -- Unlogged, so the model cannot hold it (#2721): a plain standalone sequence is held,
+             -- and a default over one is no longer a limitation.
+             CREATE UNLOGGED SEQUENCE {s}.loose;
              CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
              CREATE TABLE {s}.published (id integer PRIMARY KEY, code integer NOT NULL);
              CREATE UNIQUE INDEX published_code ON {s}.published (code);
@@ -4600,7 +4604,7 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
 /// that read in another database, and read back the same. A `serial` added
 /// to a table holding rows numbers them from its declared start, and the
 /// next plan is empty (#1631, DEC-1631.1). A sequence another column also
-/// calls, and one no column owns, are still named rather than held, and so
+/// calls, and an unlogged one no column owns, are still named rather than held, and so
 /// is a second sequence a held `serial` owns and its default does not use.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
@@ -4622,7 +4626,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
              CREATE UNLOGGED TABLE {s}.u (id serial);
              CREATE TABLE {s}.shared (id serial);
              CREATE TABLE {s}.sharer (id integer NOT NULL DEFAULT nextval('{s}.shared_id_seq'));
-             CREATE SEQUENCE {s}.loose;
+             CREATE UNLOGGED SEQUENCE {s}.loose;
              CREATE TABLE {s}.loose_t (id integer NOT NULL DEFAULT nextval('{s}.loose'));
              CREATE TABLE {s}.extra (id serial);
              CREATE SEQUENCE {s}.extra_more OWNED BY {s}.extra.id;"

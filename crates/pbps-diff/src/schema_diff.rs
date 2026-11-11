@@ -57,6 +57,11 @@ pub enum DiffError {
         name: pbps_model::SearchRef,
         reason: String,
     },
+    #[error("sequence `{}`: {reason} (DEC-2721.1)", .name.shown())]
+    SequenceRefused {
+        name: pbps_model::ObjectName,
+        reason: String,
+    },
     #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
     ExtensionLifecycleUnsupported {
         name: pbps_model::ObjectLocalName,
@@ -952,6 +957,7 @@ pub(crate) fn diff_partial_rebuilding(
         dialect.name(),
     ));
     diff_search(base.schema, declared.schema, &mut errs);
+    diff_sequences(base.schema, declared.schema, dialect, &mut errs);
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
         errs.push(DiffError::ConversionsUnsupported {
             count: declared.ids.conversions.len(),
@@ -6742,6 +6748,86 @@ fn diff_search(
             reason: reason.to_owned(),
         });
     }
+}
+
+/// Standalone sequences, by name (DEC-2721.1). **Every difference is refused here, by
+/// name**: this part reads and holds them and plans nothing for them. Creating one arrives
+/// in the next part, and altering, renaming or dropping one after it, so a plan that would
+/// leave a declaration unmet is refused rather than made without the change that says so.
+/// A sequence the target has and the declarations do not is not this project's, and is left
+/// alone. The counter is not compared: it is in no field of either side.
+fn diff_sequences(
+    base: &pbps_model::Schema,
+    declared: &pbps_model::Schema,
+    dialect: &(impl Dialect + ?Sized),
+    errs: &mut Vec<DiffError>,
+) {
+    // Spellings of one type (`int`, `integer`) are one type to the engine.
+    let normal = |sequence: &pbps_model::Sequence| {
+        let mut sequence = sequence.clone();
+        if let Ok(ty) = dialect.normalize_type(&sequence.ty) {
+            sequence.ty = ty;
+        }
+        sequence
+    };
+    for (name, now) in &declared.sequences {
+        let reason = match base.sequences.get(name) {
+            None => {
+                "the target has none; creating one arrives with the next part of #2721".to_owned()
+            }
+            Some(was) => {
+                let (was, now) = (normal(was), normal(now));
+                let differing = sequence_differences(&was, &now);
+                if differing.is_empty() {
+                    continue;
+                }
+                format!(
+                    "it differs from the target's ({}); changing one arrives in a later part of \
+                     #2721, and for now it stands as the target holds it",
+                    differing.join("; ")
+                )
+            }
+        };
+        errs.push(DiffError::SequenceRefused {
+            name: name.clone(),
+            reason,
+        });
+    }
+}
+
+/// What differs between the target's sequence and the declared one, attribute by attribute,
+/// each as `name: declared where the target has held`. A bound or a cache that is `None` is
+/// the engine's default, and is said so.
+fn sequence_differences(was: &pbps_model::Sequence, now: &pbps_model::Sequence) -> Vec<String> {
+    fn bound(value: Option<i64>) -> String {
+        value.map_or_else(|| "the engine's default".to_owned(), |v| v.to_string())
+    }
+    let mut out = Vec::new();
+    let mut note = |what: &str, declared: String, held: String| {
+        if declared != held {
+            out.push(format!("{what}: declared {declared}, target has {held}"));
+        }
+    };
+    note(
+        "type",
+        now.ty.shown().to_string(),
+        was.ty.shown().to_string(),
+    );
+    note("start", now.start.to_string(), was.start.to_string());
+    note(
+        "increment",
+        now.increment.to_string(),
+        was.increment.to_string(),
+    );
+    note("min", bound(now.options.min), bound(was.options.min));
+    note("max", bound(now.options.max), bound(was.options.max));
+    note(
+        "cycle",
+        now.options.cycle.to_string(),
+        was.options.cycle.to_string(),
+    );
+    note("cache", bound(now.options.cache), bound(was.options.cache));
+    out
 }
 
 /// A table's exclusion constraints, by name (DEC-2448.3). Adding one is a
@@ -29268,5 +29354,65 @@ mod meeting_shape_tests {
                 .contains("text search configuration `app.same`")),
             "{errs:?}"
         );
+    }
+
+    /// A standalone sequence the declarations hold is compared with the target's and every
+    /// difference is refused by name, since nothing plans them yet (DEC-2721.1): one the
+    /// target lacks, one it holds differently, said attribute by attribute. An identical
+    /// one is no difference, a spelling of the same type is not one, and one only the
+    /// target has is not this project's.
+    #[test]
+    fn every_difference_in_a_standalone_sequence_is_refused_by_name_and_an_undeclared_one_is_left_alone()
+     {
+        let sequence = |ty: &str, start: i64, increment: i64| pbps_model::Sequence {
+            ty: ColumnType::simple(ty),
+            start,
+            increment,
+            options: Default::default(),
+        };
+        let mut base = Schema::default();
+        let mut declared = Schema::default();
+        for (name, held) in [
+            ("app.same", sequence("bigint", 1, 1)),
+            // Only the target has it: not this project's.
+            ("app.theirs", sequence("bigint", 1, 1)),
+        ] {
+            base.sequences.insert(name.parse().unwrap(), held);
+        }
+        declared
+            .sequences
+            .insert("app.same".parse().unwrap(), sequence("bigint", 1, 1));
+        let mut errs = Vec::new();
+        diff_sequences(&base, &declared, &MinimalDialect, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        // Changed in two attributes, and absent from the target.
+        base.sequences
+            .insert("app.changed".parse().unwrap(), sequence("integer", 1, 1));
+        let mut wanted = sequence("integer", 100, 1);
+        wanted.options.cycle = true;
+        declared
+            .sequences
+            .insert("app.changed".parse().unwrap(), wanted);
+        declared
+            .sequences
+            .insert("app.new".parse().unwrap(), sequence("bigint", 1, 1));
+        diff_sequences(&base, &declared, &MinimalDialect, &mut errs);
+        let said: Vec<String> = errs.iter().map(ToString::to_string).collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter().any(|m| m.contains("sequence `app.changed`")
+                && m.contains("start: declared 100, target has 1")
+                && m.contains("cycle: declared true, target has false")
+                && !m.contains("type:")
+                && !m.contains("increment:")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("sequence `app.new`") && m.contains("creating one")),
+            "{said:?}"
+        );
+        // Negative: nothing about the counter can differ, because no field holds it.
+        assert!(said.iter().all(|m| !m.contains("last_value")), "{said:?}");
     }
 }

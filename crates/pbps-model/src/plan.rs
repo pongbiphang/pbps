@@ -856,6 +856,10 @@ pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
     // The plan still compares the declarations with the target; the objects join this
     // fingerprint with the identities that say which of them are managed.
     canonical.search.clear();
+    // The same for standalone sequences (DEC-2721.1): until they take identities, one the
+    // database holds that the recorded state does not is not drift, and what a sequence
+    // holds beyond its declaration (the counter) is in no checksum at all.
+    canonical.sequences.clear();
     #[derive(serde::Serialize)]
     struct Fingerprint<'a> {
         schema: &'a Schema,
@@ -1061,6 +1065,35 @@ mod tests {
     /// did not made a hand-made drop-and-re-add of one column — which comes
     /// back last — into drift the differ could not name and no plan could
     /// resolve (DECISIONS 238).
+    /// A standalone sequence does not move the state checksum (DEC-2721.1), for the reason
+    /// text search objects do not: until it has an identity, the sequences a database holds
+    /// are not the recorded state's to answer for, and a database with some would read as
+    /// drifted. A change to anything else still does.
+    #[test]
+    fn sequences_do_not_move_the_state_checksum_and_a_table_still_does() {
+        let bare = schema_with("nvarchar(255)");
+        let mut with_sequence = bare.clone();
+        with_sequence.sequences.insert(
+            "app.order_no".parse().unwrap(),
+            crate::Sequence {
+                ty: crate::ColumnType::simple("bigint"),
+                start: 1,
+                increment: 1,
+                options: Default::default(),
+            },
+        );
+        let ids = IdsFile::default();
+        assert_eq!(
+            state_checksum(&bare, &ids),
+            state_checksum(&with_sequence, &ids)
+        );
+        // Negative: a column change under the same sequence still moves it.
+        assert_ne!(
+            state_checksum(&schema_with("nvarchar(100)"), &ids),
+            state_checksum(&with_sequence, &ids)
+        );
+    }
+
     #[test]
     fn column_order_does_not_change_the_state_checksum() {
         let ids = ids_with("t_a1b2c3");

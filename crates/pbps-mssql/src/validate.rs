@@ -31,6 +31,17 @@ pub(crate) fn search(name: &pbps_model::SearchRef) -> Vec<DialectError> {
     ))]
 }
 
+/// A declared standalone sequence. SQL Server has them, but this tool does not read or plan
+/// them yet (they arrive with the SQL Server part of #2721), so the file is refused by name
+/// and the remedy rather than ignored. The loader is dialect-blind and cannot refuse it.
+pub(crate) fn sequence(name: &pbps_model::ObjectName) -> Vec<DialectError> {
+    vec![invalid(format!(
+        "`{}` declares a standalone sequence; this tool does not manage SQL Server sequences \
+         yet (they arrive with a later part of #2721), so remove the file",
+        name.shown()
+    ))]
+}
+
 fn invalid(message: impl Into<String>) -> DialectError {
     DialectError::Invalid {
         dialect: DIALECT,
@@ -3658,6 +3669,39 @@ mod tests {
                 .validate_table(&"dbo.t".parse().unwrap(), &pbps_model::Table::default())
                 .iter()
                 .all(|e| !e.to_string().contains("text_search"))
+        );
+    }
+
+    /// A declared standalone sequence is refused for SQL Server by name, with the remedy: the
+    /// engine has them, this tool does not manage them yet, and ignoring the file would let a
+    /// project believe it was held (#2721).
+    #[test]
+    fn a_sequence_declaration_is_refused_for_sql_server_by_name() {
+        use pbps_dialect::Dialect;
+        let dialect = crate::Mssql;
+        let sequence = pbps_model::Sequence {
+            ty: pbps_model::ColumnType::simple("bigint"),
+            start: 1,
+            increment: 1,
+            options: Default::default(),
+        };
+        let name: pbps_model::ObjectName = "dbo.order_no".parse().unwrap();
+        let said: Vec<String> = dialect
+            .validate_sequence(&name, &sequence, &pbps_model::Schema::default())
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("dbo.order_no") && said[0].contains("remove the file"),
+            "{said:?}"
+        );
+        // Negative: the same dialect still validates a table that has no sequence file.
+        assert!(
+            dialect
+                .validate_table(&"dbo.t".parse().unwrap(), &pbps_model::Table::default())
+                .iter()
+                .all(|e| !e.to_string().contains("sequence"))
         );
     }
 }

@@ -16,8 +16,10 @@ pub mod fmt;
 mod managed_types;
 pub mod project;
 mod search;
+mod sequence;
 pub use extensions::{LoadedExtension, load_extension_str, render_extension};
 pub use search::{LoadedSearch, load_search_str, render_search};
+pub use sequence::{LoadedSequence, load_sequence_str, render_sequence};
 
 use std::path::Path;
 
@@ -106,6 +108,7 @@ pub enum LoadedFile {
     Dependency(Box<LoadedDependency>),
     Type(Box<LoadedType>),
     Search(Box<LoadedSearch>),
+    Sequence(Box<LoadedSequence>),
     Table(Box<LoadedTable>),
     Module(Box<LoadedModule>),
     Role(Box<LoadedRole>),
@@ -171,6 +174,9 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     if probe.text_search_config.is_some() || probe.text_search_dictionary.is_some() {
         return load_search_str(path, text).map(|s| LoadedFile::Search(Box::new(s)));
     }
+    if probe.sequence.is_some() {
+        return load_sequence_str(path, text).map(|s| LoadedFile::Sequence(Box::new(s)));
+    }
     if probe.table.is_some() {
         return load_table_str(path, text).map(|t| LoadedFile::Table(Box::new(t)));
     }
@@ -188,7 +194,7 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
         path: path.to_owned(),
         message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:`, \
                   `trigger:`, `extension:`, `role:`, `enum:`, `domain:`, `text_search_config:`, \
-                  `text_search_dictionary:` or `dependency:`"
+                  `text_search_dictionary:`, `sequence:` or `dependency:`"
             .to_owned(),
     }])
 }
@@ -294,6 +300,11 @@ fn collect_files(
         std::collections::BTreeMap::new();
     let mut seen_search: std::collections::BTreeMap<pbps_model::SearchRef, std::path::PathBuf> =
         std::collections::BTreeMap::new();
+    // A sequence is in the relation namespace with tables and views, but whether a sequence
+    // and a table may share a name is the engine's answer, as for modules: the dialect's
+    // `validate_sequence` asks it. Here only the same sequence declared twice is refused.
+    let mut seen_sequences: std::collections::BTreeMap<pbps_model::ObjectName, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
     let mut seen_dependencies: std::collections::BTreeMap<
         pbps_model::dependency::DependencyName,
         std::path::PathBuf,
@@ -372,6 +383,23 @@ fn collect_files(
                 );
                 seen_search.insert(s.name.clone(), path);
                 loaded.schema.search.insert(s.name, s.definition);
+                continue;
+            }
+            LoadedFile::Sequence(s) => {
+                if let Some(first) = seen_sequences.get(&s.name) {
+                    errs.push(already(
+                        &path,
+                        &format!("sequence `{}`", s.name.shown()),
+                        first,
+                    ));
+                    continue;
+                }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Sequence(s.name.clone()),
+                    path.clone(),
+                );
+                seen_sequences.insert(s.name.clone(), path);
+                loaded.schema.sequences.insert(s.name, s.definition);
                 continue;
             }
             LoadedFile::Table(t) => {
@@ -468,6 +496,7 @@ fn collect_files(
             | LoadedFile::Role(_)
             | LoadedFile::Type(_)
             | LoadedFile::Search(_)
+            | LoadedFile::Sequence(_)
             | LoadedFile::Dependency(_) => {}
         }
     }
@@ -1726,6 +1755,44 @@ indexes:
         assert_eq!(render_role(&r.name, &r.role, &[]), "role: app_reader\n");
     }
 
+    /// A `sequence:` file is told by its leading key, loads into `Schema.sequences` with its
+    /// source recorded, and the same sequence in two files is one declaration twice. A key
+    /// the model has nowhere to put is refused (the counter above all).
+    #[test]
+    fn a_sequence_file_is_told_by_its_leading_key_and_declared_twice_is_refused() {
+        let file = |name: &str, text: &str| (std::path::PathBuf::from(name), text.to_owned());
+        let loaded = load_schema_files(&[
+            file(
+                "a.yml",
+                "sequence: app.order_no\ntype: integer\nstart: 100\n",
+            ),
+            file("b.yml", "table: app.t\ncolumns:\n  id: {type: integer}\n"),
+        ])
+        .unwrap();
+        let name: pbps_model::ObjectName = "app.order_no".parse().unwrap();
+        assert_eq!(loaded.schema.sequences[&name].start, 100);
+        assert!(
+            loaded
+                .sources
+                .contains_key(&pbps_model::diagnostic::Declaration::Sequence(name.clone()))
+        );
+        assert_eq!(loaded.schema.tables.len(), 1);
+        let twice = load_schema_files(&[
+            file("a.yml", "sequence: app.order_no\n"),
+            file("c.yml", "sequence: app.order_no\nstart: 5\n"),
+        ])
+        .unwrap_err();
+        assert!(
+            twice[0].to_string().contains("sequence `app.order_no`")
+                && twice[0].to_string().contains("already declared"),
+            "{twice:?}"
+        );
+        // Negative: the counter has no field, so a file that sets it is refused by name.
+        let errs =
+            load_file_str(Path::new("s.yml"), "sequence: app.s\nlast_value: 7\n").unwrap_err();
+        assert!(errs[0].to_string().contains("last_value"), "{errs:?}");
+    }
+
     #[test]
     fn a_role_with_a_dotted_name_loads_and_an_unknown_permission_is_refused() {
         // `[app.reader]` is a legal principal name; a role is not in a
@@ -1738,6 +1805,7 @@ indexes:
             | LoadedFile::Extension(_)
             | LoadedFile::Type(_)
             | LoadedFile::Search(_)
+            | LoadedFile::Sequence(_)
             | LoadedFile::Dependency(_)) => {
                 panic!("not a role: {other:?}")
             }

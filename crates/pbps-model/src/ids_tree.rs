@@ -729,7 +729,9 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             UidKind::Role => Body::Role(name),
             UidKind::Type => Body::Type(name),
             UidKind::Extension => Body::Extension(name),
-            _ => continue,
+            // A column's tombstone lives in its table's file, below; a sequence's has no
+            // file yet, and the pass below refuses it by name.
+            UidKind::Column | UidKind::Sequence => continue,
         };
         objects.push((uid.clone(), body, Some(tomb.clone())));
     }
@@ -809,6 +811,10 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
                     .push((uid.clone(), Rec::Dead(tomb.clone())));
             }
             UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Extension => {}
+            // A sequence takes its identity record with the part that creates it
+            // (DEC-2721.1); until then no file can hold one, and dropping it here would
+            // lose it without a word.
+            UidKind::Sequence => return Err(no_path(uid)),
         }
     }
     for (child, parent) in &placement.children {

@@ -432,6 +432,8 @@ pub struct RawCatalog {
     pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
     /// Held text search configurations and dictionaries (#2728).
     pub search: BTreeMap<pbps_model::SearchRef, pbps_model::SearchObject>,
+    /// Held standalone sequences (#2721). Never their current value.
+    pub sequences: BTreeMap<pbps_model::ObjectName, pbps_model::Sequence>,
     pub extensions: BTreeMap<pbps_model::ObjectLocalName, pbps_model::Extension>,
     pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
@@ -814,6 +816,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     };
     pulled.schema.types = raw.types.clone();
     pulled.schema.search = raw.search.clone();
+    pulled.schema.sequences = raw.sequences.clone();
     pulled.schema.extensions = raw.extensions.clone();
     // A comment is its object's own: a partition's is not its parent's (measured on 16
     // and 18: `PARTITION OF` copies nothing), so the key is the object and the column.
@@ -2493,7 +2496,7 @@ fn survives_the_declaration(ty: &ColumnType) -> bool {
 
 /// The `CACHE` a sequence has when nothing asks for one — **measured**, and the
 /// one a plan that recreates an identity would get.
-const DEFAULT_SEQUENCE_CACHE: i64 = 1;
+pub(crate) const DEFAULT_SEQUENCE_CACHE: i64 = 1;
 
 /// A table's replica identity, from `relreplident` and the index marked
 /// `indisreplident`, as the object of `table` that owns that index (#1444).
@@ -2734,7 +2737,7 @@ fn held_serial(
 /// DEC-1921.1): a bound that is the engine's default for the column's type
 /// and the direction counted is `None`, and so is a cache of one. `None`
 /// where the type has no integer range, which no numbering column has.
-fn sequence_options(
+pub(crate) fn sequence_options(
     ty: &pbps_model::ColumnType,
     increment: i64,
     min: i64,

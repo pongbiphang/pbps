@@ -158,7 +158,9 @@ use schemars::JsonSchema;
 /// Version 43 records an exclusion key's operator qualified by the schema of the package
 /// that provides it (DEC-2447.14); an older build would refuse the snapshot, and every older
 /// snapshot truthfully holds only operators of `pg_catalog`.
-pub const CURRENT_VERSION: u32 = 43;
+/// Version 44 records standalone sequences (DEC-2721.1); every older snapshot truthfully
+/// holds none.
+pub const CURRENT_VERSION: u32 = 44;
 
 /// The oldest snapshot version this build reads as its own.
 ///

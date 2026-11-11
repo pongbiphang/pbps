@@ -3520,6 +3520,7 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
                 | pbps_model::diagnostic::Declaration::Extension(_)
                 | pbps_model::diagnostic::Declaration::Type(_)
                 | pbps_model::diagnostic::Declaration::Search(_)
+                | pbps_model::diagnostic::Declaration::Sequence(_)
                 | pbps_model::diagnostic::Declaration::Role(_)) => other,
             };
             (owner, path)
@@ -3597,6 +3598,7 @@ fn declaration_problems_with_sources(
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -3625,6 +3627,14 @@ fn declaration_problems_with_sources(
     for (name, definition) in search {
         for error in dialect.validate_search(name, definition, schema) {
             out.push(("dialect.rejected", format!("{}: {error}", name.shown())));
+        }
+    }
+    for (name, definition) in sequences {
+        for error in dialect.validate_sequence(name, definition, schema) {
+            out.push((
+                "dialect.rejected",
+                format!("sequence `{}`: {error}", name.shown()),
+            ));
         }
     }
     // Three layers, all reported in the same pass: the loader checks shape, the
@@ -4255,6 +4265,9 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Search(s)) => {
                 declared.search.insert(s.name, s.definition);
             }
+            Ok(pbps_load::LoadedFile::Sequence(s)) => {
+                declared.sequences.insert(s.name, s.definition);
+            }
             Ok(pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_))
             | Err(_) => {}
         }
@@ -4451,6 +4464,11 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Search(s) => {
                 declared.search.insert(s.name.clone(), s.definition.clone());
             }
+            pbps_load::LoadedFile::Sequence(s) => {
+                declared
+                    .sequences
+                    .insert(s.name.clone(), s.definition.clone());
+            }
             pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_) => {}
         }
     }
@@ -4493,10 +4511,15 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     absorbed,
                 )
             }
-            // A text search object carries no rename intent in this part (#2728).
+            // A text search object carries no rename intent in this part (#2728), nor does
+            // a sequence (#2721): a rename is recorded intent with the part that adds it.
             pbps_load::LoadedFile::Search(s) => {
                 (pbps_load::render_search(&s.name, &s.definition), Vec::new())
             }
+            pbps_load::LoadedFile::Sequence(s) => (
+                pbps_load::render_sequence(&s.name, &s.definition),
+                Vec::new(),
+            ),
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).

@@ -800,6 +800,7 @@ fn columns_query() -> String {
     // A partition's identity belongs to its parent: 18 copies attidentity but
     // no sequence dependency, while 16 copies neither (DEC-1681.1). Match by
     // name, since dropped columns can leave the two attnums different.
+    let held_sequence = crate::sequence::held!("sq");
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty,
@@ -833,6 +834,9 @@ fn columns_query() -> String {
                JOIN pg_catalog.pg_namespace sn ON sn.oid = sq.relnamespace
               WHERE dd.classid = 'pg_attrdef'::regclass
                 AND dd.objid = d.oid
+                -- A sequence the model holds (#2721) is declared beside the table, so a
+                -- default over it is no longer a fact the model cannot hold.
+                AND NOT {held_sequence}
                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend od
                                  WHERE od.classid = 'pg_class'::regclass
                                    AND od.objid = sq.oid
@@ -1422,6 +1426,7 @@ fn batch_query(identity: &str) -> String {
         ("extensions", crate::extension_provider::INSTALLED.to_owned(), "name"),
         ("types", crate::user_types::managed_query(), "schema, name"),
         ("search", crate::search::query(), "kind, schema, name"),
+        ("sequences", crate::sequence::query(), "schema, name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
         ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
         ("routine_args", grant_routine_args_query(), "oid, pos"),
@@ -1658,6 +1663,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         crate::search::decode(batch.get("search").ok_or_else(|| missing("search"))?)?;
     raw.search = search;
     warnings.extend(limits);
+    raw.sequences =
+        crate::sequence::decode(batch.get("sequences").ok_or_else(|| missing("sequences"))?)?;
     for row in batch.get("types").ok_or_else(|| missing("types"))? {
         // Without these query columns there is no identity to attribute a
         // limitation to. Their failure still means the query and reader differ.
@@ -5409,6 +5416,7 @@ mod tests {
             "module_args",
             "types",
             "search",
+            "sequences",
             "extensions",
             "roles",
             "grants",

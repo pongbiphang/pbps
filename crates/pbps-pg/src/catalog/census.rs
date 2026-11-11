@@ -44,7 +44,9 @@ pub(super) const QUERY: &str = concat!(
     SELECT 'pg_catalog.pg_class'::regclass, c.oid, 'standalone sequence', EXISTS (
         SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::regclass
          AND d.objid = c.oid AND d.refclassid = 'pg_catalog.pg_class'::regclass
-         AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i'))
+         AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i')) OR "#,
+    crate::sequence::held!("c"),
+    r#"
       FROM pg_catalog.pg_class c WHERE c.relkind = 'S'
     UNION ALL
     SELECT 'pg_catalog.pg_operator'::regclass, oid, 'operator', false FROM pg_catalog.pg_operator

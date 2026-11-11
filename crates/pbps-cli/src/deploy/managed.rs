@@ -610,6 +610,14 @@ pub(super) fn only_recorded_search_objects(recorded: &Schema, live: &mut Schema)
         .retain(|name, _| recorded.search.contains_key(name));
 }
 
+/// The same for standalone sequences (DEC-2721.1): a sequence the database holds that the
+/// record does not is not drift, and one the record holds that changed is still reported by
+/// name. The counter is in neither side, so advancing it is no difference at all.
+pub(super) fn only_recorded_sequences(recorded: &Schema, live: &mut Schema) {
+    live.sequences
+        .retain(|name, _| recorded.sequences.contains_key(name));
+}
+
 /// The informational line that ends a plan when the database holds comments no declaration
 /// manages (DEC-2729.1): a note, not a change.
 pub(super) fn undeclared_comments_note(count: usize) -> String {
