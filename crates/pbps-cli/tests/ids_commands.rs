@@ -923,7 +923,7 @@ fn a_file_and_a_directory_at_one_identity_path_are_named_before_anything_is_writ
     }
     assert_eq!(tree_of(&p), before, "nothing was written");
     // No aside is left behind.
-    assert!(!p.0.join(".pbps/ids/.a.json.aside").exists());
+    assert!(!p.0.join(".pbps/ids/.pbps-aside0").exists());
 }
 
 #[test]

@@ -109,31 +109,52 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
     Ok((loaded, paths))
 }
 
-/// A name beside `path` for a temp file or an aside (`.<name>.<kind>`, then
-/// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
-/// `reserved`, the planned destinations and their ancestors, which a later step
-/// of the same write may still create. The pick is added to `reserved`.
-/// `tail` ends the name, for one the reader must still take (`.json`).
+/// A name beside `path` for a temp file, an aside or a respelling step
+/// (`.pbps-<kind>0`, then `.pbps-<kind>1`, ...) that nothing uses: not on disk,
+/// and not in `reserved`, the planned destinations and their ancestors, which a
+/// later step of the same write may still create. The pick is added to
+/// `reserved`. `tail` ends the name, for one the reader must still take
+/// (`.json`).
+///
+/// The name does not embed `path`'s own: a file name may be 255 bytes, and a
+/// name built by adding to a declaration's mirror (`.<name>.respell0.json`)
+/// passes that limit for a long one. These only have to be unused and in the
+/// same directory, so their length is constant.
+///
+/// Only "not found" means free. A candidate that cannot be inspected (a
+/// directory without search permission, an I/O error) is an error naming it:
+/// reading it as unused would send the write on to a create or rename that
+/// fails for the same reason, or worse, onto an entry nobody looked at.
 pub(crate) fn unused_sibling(
     path: &Path,
     kind: &str,
     tail: &str,
     reserved: &mut BTreeSet<String>,
     key: crate::ids_store::PathKey,
-) -> PathBuf {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
+) -> anyhow::Result<PathBuf> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    let mut n = 0;
+    let mut n = 0usize;
     loop {
-        let suffix = if n == 0 { String::new() } else { n.to_string() };
-        let candidate = parent.join(format!(".{name}.{kind}{suffix}{tail}"));
-        if !reserved.contains(&key.path(&candidate))
-            && std::fs::symlink_metadata(&candidate).is_err()
-        {
-            reserved.insert(key.path(&candidate));
-            return candidate;
+        let candidate = parent.join(format!(".pbps-{kind}{n}{tail}"));
+        if reserved.contains(&key.path(&candidate)) {
+            n += 1;
+            continue;
         }
-        n += 1;
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                reserved.insert(key.path(&candidate));
+                return Ok(candidate);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot tell whether `{}` is in use, so it is not taken for a {kind} file",
+                        candidate.display()
+                    )
+                });
+            }
+            Ok(_) => n += 1,
+        }
     }
 }
 
@@ -142,7 +163,7 @@ pub(crate) fn unused_sibling(
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default());
+    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default())?;
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
     let result = std::fs::write(&tmp, text)
@@ -275,7 +296,17 @@ pub(crate) fn aside(was: &str, uid: &Uid) -> String {
         || numbered("com")
         || numbered("lpt");
     let guard = if device { "_" } else { "" };
-    format!("{guard}{safe}.{uid}.json")
+    let readable = format!("{guard}{safe}.{uid}.json");
+    // The same limit and fallback as `pull`'s declaration names: an object name
+    // near 255 bytes would otherwise name a file the filesystem refuses. The
+    // uid keeps the hashed name unique and the reader takes a file by its
+    // content, so the name carries no meaning. `~` is not in `safe`'s alphabet
+    // (it becomes `_`), so no readable name can take a hashed one.
+    if readable.len() <= crate::declaration_file::NAME_BUDGET {
+        return readable;
+    }
+    let stem = crate::declaration_file::hashed_stem(&[was.as_bytes(), b"\0aside"]);
+    format!("{stem}.{uid}.json")
 }
 
 /// Where the declarations say each identity lives: the mirrored path of the

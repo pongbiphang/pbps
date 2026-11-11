@@ -1240,6 +1240,8 @@ fn a_migration_in_the_working_tree_composes_without_the_tracked_legacy_file() {
 #[test]
 fn an_entry_the_loader_refuses_inside_the_identity_tree_is_refused_through_compose() {
     for (name, make) in [
+        (".pbps-tmp0", "file"),
+        (".pbps-aside0", "file"),
         (".dbo.t.json.tmp", "file"),
         ("notes.txt", "file"),
         ("alias.json", "link"),

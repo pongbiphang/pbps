@@ -1273,10 +1273,14 @@ mod identity_admission_tests {
         let names: Vec<String> = [
             ".pbps/ids/t.json",
             ".pbps/ids/sub/dbo.t.t_aaaaaa.1.json",
+            // The respelling step's middle name: a crash between its two
+            // renames leaves it, and the reader takes it for an identity file.
+            ".pbps/ids/.pbps-respell0.json",
             // Not identity files: a temp file, an aside left by a crash, a file
             // elsewhere that merely ends in .json, a sibling directory.
+            ".pbps/ids/.pbps-tmp0",
+            ".pbps/ids/.pbps-aside0",
             ".pbps/ids/.t.json.tmp",
-            ".pbps/ids/.t.json.aside",
             "schema/t.json",
             ".pbps/ids2/t.json",
         ]
@@ -1286,11 +1290,13 @@ mod identity_admission_tests {
         known_identity_files(&mut known, ".pbps/ids", &names);
         assert!(known.contains("repository/.pbps/ids/t.json"));
         assert!(known.contains("repository/.pbps/ids/sub/dbo.t.t_aaaaaa.1.json"));
+        assert!(known.contains("repository/.pbps/ids/.pbps-respell0.json"));
         // The directories above an admitted file come with it.
         assert!(known.contains("repository/.pbps/ids/sub"));
         for stray in [
+            "repository/.pbps/ids/.pbps-tmp0",
+            "repository/.pbps/ids/.pbps-aside0",
             "repository/.pbps/ids/.t.json.tmp",
-            "repository/.pbps/ids/.t.json.aside",
             "repository/schema/t.json",
             "repository/.pbps/ids2/t.json",
         ] {

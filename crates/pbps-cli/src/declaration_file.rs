@@ -63,14 +63,11 @@ fn escape_reserved_stem(encoded: String) -> String {
 /// so a hand-written role file elsewhere still loads.
 pub fn role_path(dir: &Path, name: &pbps_model::RoleName) -> anyhow::Result<PathBuf> {
     let readable = format!("{}.yml", escape_reserved_stem(component(name.raw())));
-    let file = if readable.len() <= 240 {
+    let file = if readable.len() <= NAME_BUDGET {
         readable
     } else {
-        let mut hasher = Sha256::new();
-        hasher.update(name.raw().as_bytes());
-        hasher.update([0]);
-        hasher.update(b"role");
-        format!("~pbps-{:x}.yml", hasher.finalize())
+        let stem = hashed_stem(&[name.raw().as_bytes(), b"\0role"]);
+        format!("{stem}.yml")
     };
     let roles = dir.join("roles");
     let path = roles.join(&file);
@@ -85,6 +82,24 @@ pub fn extension_path(dir: &Path, name: &pbps_model::ObjectLocalName) -> PathBuf
     dir.join("extensions").join(format!("{encoded}.yml"))
 }
 
+/// The longest file name the tree writes for a name it derives. A file name may
+/// be 255 bytes on the common filesystems; the margin leaves room for a suffix
+/// added later (`.json` beside a `.yml`, a numbered aside).
+pub(crate) const NAME_BUDGET: usize = 240;
+
+/// `~pbps-<sha256 hex>`: the stem a name too long for [`NAME_BUDGET`] falls back
+/// to. `parts` are hashed as one byte string, so a caller keeps its own domain
+/// tag and separators. `~` is deliberately outside `component`'s safe alphabet
+/// (a literal one becomes `%7E`) and the identity-tree asides replace it, so no
+/// readable name can ever occupy this namespace.
+pub(crate) fn hashed_stem(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    format!("~pbps-{:x}", hasher.finalize())
+}
+
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     filename_of(&name.schema, &name.name, kind)
 }
@@ -95,13 +110,11 @@ pub fn type_path(dir: &Path, name: &pbps_model::TypeRef) -> anyhow::Result<PathB
         escape_reserved_stem(component(name.schema())),
         component(name.name())
     );
-    let file = if readable.len() <= 240 {
+    let file = if readable.len() <= NAME_BUDGET {
         readable
     } else {
-        let mut hasher = Sha256::new();
-        hasher.update(name.raw().to_string().as_bytes());
-        hasher.update(b"\0type");
-        format!("~pbps-{:x}.type.yml", hasher.finalize())
+        let raw = name.raw().to_string();
+        format!("{}.type.yml", hashed_stem(&[raw.as_bytes(), b"\0type"]))
     };
     Ok(dir.join(file))
 }
@@ -119,13 +132,11 @@ pub fn search_path(dir: &Path, name: &pbps_model::SearchRef) -> anyhow::Result<P
         escape_reserved_stem(component(name.name.schema())),
         component(name.name.name())
     );
-    let file = if readable.len() <= 240 {
+    let file = if readable.len() <= NAME_BUDGET {
         readable
     } else {
-        let mut hasher = Sha256::new();
-        hasher.update(name.raw().to_string().as_bytes());
-        hasher.update(b"\0search");
-        format!("~pbps-{:x}.{suffix}", hasher.finalize())
+        let raw = name.raw().to_string();
+        format!("{}.{suffix}", hashed_stem(&[raw.as_bytes(), b"\0search"]))
     };
     Ok(dir.join(file))
 }
@@ -178,20 +189,22 @@ fn filename_of(schema: &str, name: &str, kind: Option<ModuleKind>) -> String {
     // SQL Server identifiers can be long Unicode strings. Percent-encoding all
     // their bytes may exceed a filesystem's 255-byte filename limit; in that
     // rare case a full SHA-256 keeps the name deterministic and collision-safe.
-    if readable.len() <= 240 {
+    if readable.len() <= NAME_BUDGET {
         return readable;
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(schema.as_bytes());
-    hasher.update([0]);
-    hasher.update(name.as_bytes());
-    hasher.update([0]);
-    hasher.update(kind.map(ModuleKind::as_str).unwrap_or("table").as_bytes());
+    let kind_name = kind.map(ModuleKind::as_str).unwrap_or("table");
     // `~` is deliberately outside `component`'s safe alphabet (a literal one
     // becomes `%7E`), so no readable schema/object pair can ever occupy this
     // hashed namespace.
-    format!("~pbps-{hash:x}{kind_suffix}.yml", hash = hasher.finalize())
+    let stem = hashed_stem(&[
+        schema.as_bytes(),
+        b"\0",
+        name.as_bytes(),
+        b"\0",
+        kind_name.as_bytes(),
+    ]);
+    format!("{stem}{kind_suffix}.yml")
 }
 
 /// Returns a declaration path whose parent is exactly `directory`.
@@ -427,7 +440,7 @@ mod tests {
         let dir = Path::new("schema");
         let name = ObjectName::new("資料".repeat(128), "表".repeat(128));
         let generated = path(dir, &name, None).unwrap();
-        assert!(generated.file_name().unwrap().len() <= 240);
+        assert!(generated.file_name().unwrap().len() <= NAME_BUDGET);
         assert_eq!(generated.parent(), Some(dir));
     }
 
@@ -515,6 +528,6 @@ mod tests {
             b.to_string_lossy().ends_with(".textsearch-dictionary.yml"),
             "{b:?}"
         );
-        assert!(a.file_name().unwrap().len() <= 240);
+        assert!(a.file_name().unwrap().len() <= NAME_BUDGET);
     }
 }

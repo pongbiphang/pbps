@@ -24,6 +24,26 @@ pub(super) fn fault_now() -> bool {
     })
 }
 
+thread_local! {
+    /// Counts set-asides down; the one that reaches 1 fails.
+    static ASIDES_UNTIL_FAULT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Makes the `n`th set-aside of this thread fail.
+fn fail_set_aside_number(n: usize) {
+    ASIDES_UNTIL_FAULT.with(|c| c.set(n));
+}
+
+pub(super) fn set_aside_fault_now() -> bool {
+    ASIDES_UNTIL_FAULT.with(|c| match c.get() {
+        0 => false,
+        n => {
+            c.set(n - 1);
+            n == 1
+        }
+    })
+}
+
 fn project(tag: &str) -> Project {
     let root = std::env::temp_dir().join(format!("pbps-ids-store-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -626,24 +646,24 @@ fn an_old_file_nothing_removes_is_kept_aside_and_named() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.json"), "old").unwrap();
     // An unrelated file already has the aside's name: it must not be replaced.
-    std::fs::write(dir.join(".a.json.aside"), "other").unwrap();
+    std::fs::write(dir.join(".pbps-aside0"), "other").unwrap();
     let write = TreeWrite {
         dir: dir.clone(),
         files: [("a.json/a.json".to_owned(), "new".to_owned())].into(),
         ..TreeWrite::default()
     };
     let e = write.apply().unwrap_err().to_string();
-    assert!(e.contains(".a.json.aside1"), "{e}");
+    assert!(e.contains(".pbps-aside1"), "{e}");
     assert_eq!(
         std::fs::read_to_string(dir.join("a.json/a.json")).unwrap(),
         "new"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join(".a.json.aside1")).unwrap(),
+        std::fs::read_to_string(dir.join(".pbps-aside1")).unwrap(),
         "old"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join(".a.json.aside")).unwrap(),
+        std::fs::read_to_string(dir.join(".pbps-aside0")).unwrap(),
         "other"
     );
 }
@@ -821,19 +841,19 @@ fn a_rollback_that_cannot_restore_an_aside_says_where_it_is() {
     // The original path is occupied by a directory that is not empty, so the
     // aside cannot be renamed back onto it.
     std::fs::write(dir.join("a.json/foreign"), "x").unwrap();
-    std::fs::write(dir.join(".a.json.aside"), "old").unwrap();
+    std::fs::write(dir.join(".pbps-aside0"), "old").unwrap();
     let left = roll_back(
         &[],
         &[dir.join("a.json")],
-        &[(dir.join("a.json"), dir.join(".a.json.aside"))],
+        &[(dir.join("a.json"), dir.join(".pbps-aside0"))],
     )
     .unwrap_err();
-    assert!(left.contains(".a.json.aside"), "{left}");
+    assert!(left.contains(".pbps-aside0"), "{left}");
     assert!(left.contains("rename it back"), "{left}");
     assert!(left.contains("could not remove"), "{left}");
     // Nothing was deleted on the way.
     assert_eq!(
-        std::fs::read_to_string(dir.join(".a.json.aside")).unwrap(),
+        std::fs::read_to_string(dir.join(".pbps-aside0")).unwrap(),
         "old"
     );
     assert!(dir.join("a.json/foreign").exists());
@@ -961,7 +981,7 @@ fn a_staged_write_that_fails_after_creating_its_file_leaves_no_temp_file_when_a_
         removals: vec!["a.json".to_owned()],
         ..TreeWrite::default()
     };
-    // The second write creates `a.json/.b.json.tmp` half-way and fails.
+    // The second write creates `a.json/.pbps-tmp0` half-way and fails.
     fail_write_number(2);
     let error = write.apply().unwrap_err();
     assert!(format!("{error:#}").contains("injected"), "{error:#}");
@@ -1011,13 +1031,13 @@ fn a_config_write_that_fails_leaves_no_temp_file() {
 
 #[test]
 fn a_destination_named_like_a_temp_file_does_not_collide_with_it() {
-    // `-a.yml` and `.-a.json.tmp/b.yml` mirror to `-a.json` and
-    // `.-a.json.tmp/b.json`. `-` sorts before `.`, so `-a.json` is staged first
+    // `-a.yml` and `.pbps-tmp0/b.yml` mirror to `-a.json` and
+    // `.pbps-tmp0/b.json`. `-` sorts before `.`, so `-a.json` is staged first
     // and its temp file would take exactly the name of the next destination's
     // directory. (The other order is caught by the disk alone.)
     for (tag, first, second) in [
-        ("temp-name", "-a.yml", ".-a.json.tmp/b.yml"),
-        ("temp-name-reverse", "a.yml", ".a.json.tmp/b.yml"),
+        ("temp-name", "-a.yml", ".pbps-tmp0/b.yml"),
+        ("temp-name-reverse", "a.yml", ".pbps-tmp0/b.yml"),
     ] {
         let project = project(tag);
         let paths = declared(&[
@@ -1042,12 +1062,12 @@ fn a_destination_named_like_an_aside_does_not_collide_with_it() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("-a.json"), "old").unwrap();
     // `-a.json` becomes a directory (its old file goes aside first) while
-    // another destination is the directory `.-a.json.aside`.
+    // another destination is the directory `.pbps-aside0`.
     let write = TreeWrite {
         dir: dir.clone(),
         files: [
             ("-a.json/x.json".to_owned(), "x".to_owned()),
-            (".-a.json.aside/c.json".to_owned(), "c".to_owned()),
+            (".pbps-aside0/c.json".to_owned(), "c".to_owned()),
         ]
         .into(),
         removals: vec!["-a.json".to_owned()],
@@ -1056,11 +1076,11 @@ fn a_destination_named_like_an_aside_does_not_collide_with_it() {
     write.apply().unwrap();
     assert_eq!(
         names_in(&dir),
-        ["-a.json", ".-a.json.aside"],
+        ["-a.json", ".pbps-aside0"],
         "the old file was removed from wherever it was set aside"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join(".-a.json.aside/c.json")).unwrap(),
+        std::fs::read_to_string(dir.join(".pbps-aside0/c.json")).unwrap(),
         "c"
     );
     assert_eq!(
@@ -1070,15 +1090,19 @@ fn a_destination_named_like_an_aside_does_not_collide_with_it() {
 }
 
 #[test]
-fn ordinary_moves_keep_the_plain_temp_and_aside_names() {
+fn temp_names_are_a_fixed_stem_and_a_counter_whatever_the_destination_is_called() {
     let mut reserved = BTreeSet::new();
     let path = Path::new("/ids/a.json");
     let key = PathKey::default();
     let first = crate::ids_cmd::unused_sibling(path, "tmp", "", &mut reserved, key);
-    assert_eq!(first, Path::new("/ids/.a.json.tmp"));
+    assert_eq!(first.unwrap(), Path::new("/ids/.pbps-tmp0"));
     // The same name twice in one write gets the next one.
     let second = crate::ids_cmd::unused_sibling(path, "tmp", "", &mut reserved, key);
-    assert_eq!(second, Path::new("/ids/.a.json.tmp1"));
+    assert_eq!(second.unwrap(), Path::new("/ids/.pbps-tmp1"));
+    // Another destination does not change the stem, so the length is constant.
+    let long = Path::new("/ids").join(format!("{}.json", "x".repeat(246)));
+    let third = crate::ids_cmd::unused_sibling(&long, "tmp", "", &mut reserved, key);
+    assert_eq!(third.unwrap(), Path::new("/ids/.pbps-tmp2"));
 }
 
 // ------------------------------------------------ the path key (#2770) ----
@@ -1344,7 +1368,7 @@ fn a_rename_through_a_free_name_refuses_a_name_that_is_taken_and_puts_the_entry_
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("Customer.json"), "mine").unwrap();
     std::fs::write(dir.join("other.json"), "theirs").unwrap();
-    let via = dir.join(".Customer.json.respell.json");
+    let via = dir.join(".pbps-respell0.json");
     // Where the wanted name is another entry (an alias the key does not
     // model), a plain rename would replace it without a word.
     let err =
@@ -1417,13 +1441,14 @@ fn a_respelling_interrupted_halfway_reads_back_and_the_next_plan_finishes_it() {
             &mut BTreeSet::new(),
             PathKey::folding(),
         )
+        .unwrap()
     };
     // A file.
     let before = declared(&[("dbo.customer", "Customer.yml", &["id", "name"])]);
     let project = written("fold-rename-crash", &customer(), &before);
     let dir = project.ids_dir();
     let via = middle(&dir.join("Customer.json"));
-    assert_eq!(via, dir.join(".Customer.json.respell.json"));
+    assert_eq!(via, dir.join(".pbps-respell0.json"));
     std::fs::rename(dir.join("Customer.json"), &via).unwrap();
     assert_eq!(read_opt(&project).unwrap(), Some(customer()));
     let after = declared(&[("dbo.customer", "customer.yml", &["id", "name"])]);
@@ -1492,10 +1517,10 @@ fn generated_names_avoid_a_planned_path_that_differs_only_in_case_when_case_fold
     // The write plans `<dest>` as a directory; its file `<file>` stages a temp
     // file that would take the directory's name in another case.
     for (file, dest) in [
-        ("-a.json", ".-A.json.tmp/b.json"),
-        ("-A.json", ".-a.json.tmp/b.json"),
+        ("-a.json", ".PBPS-tmp0/b.json"),
+        ("-A.json", ".pbps-TMP0/b.json"),
     ] {
-        for (key, expect) in [(PathKey::folding(), "tmp1"), (PathKey::default(), "tmp")] {
+        for (key, expect) in [(PathKey::folding(), "tmp1"), (PathKey::default(), "tmp0")] {
             let write = TreeWrite {
                 dir: PathBuf::from("/ids"),
                 files: [
@@ -1513,10 +1538,11 @@ fn generated_names_avoid_a_planned_path_that_differs_only_in_case_when_case_fold
                 "",
                 &mut reserved,
                 key,
-            );
+            )
+            .unwrap();
             assert_eq!(
                 tmp.file_name().unwrap().to_string_lossy(),
-                format!(".{file}.{expect}"),
+                format!(".pbps-{expect}"),
                 "{file} {dest} {key:?}"
             );
         }
@@ -1594,7 +1620,7 @@ fn a_removal_is_redirected_to_an_aside_made_under_the_other_spelling_when_case_f
             // the removal finds nothing and the aside is reported, not lost.
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains("a.json"), "{error}");
-            assert!(dir.join(".A.json.aside").exists(), "the old file is kept");
+            assert!(dir.join(".pbps-aside0").exists(), "the old file is kept");
         }
     }
 }
@@ -1603,14 +1629,14 @@ fn a_removal_is_redirected_to_an_aside_made_under_the_other_spelling_when_case_f
 fn the_redirect_compares_components_by_key() {
     let asides = [(
         PathBuf::from("/ids/A.json"),
-        PathBuf::from("/ids/.A.json.aside"),
+        PathBuf::from("/ids/.pbps-aside0"),
     )];
     let at = |p: &str, key| redirected(Path::new(p), &asides, key);
     let fold = PathKey::folding();
-    assert_eq!(at("/ids/a.json", fold), Path::new("/ids/.A.json.aside"));
+    assert_eq!(at("/ids/a.json", fold), Path::new("/ids/.pbps-aside0"));
     assert_eq!(
         at("/ids/a.JSON/b.json", fold),
-        Path::new("/ids/.A.json.aside/b.json")
+        Path::new("/ids/.pbps-aside0/b.json")
     );
     // Not under it: a sibling that merely shares a prefix.
     assert_eq!(at("/ids/a.json2", fold), Path::new("/ids/a.json2"));
@@ -1877,4 +1903,347 @@ fn the_protected_inputs_of_an_unreadable_tree_are_an_error_never_fewer_files() {
     std::fs::write(project.ids_dir().join("notes.txt"), "x").unwrap();
     let error = format!("{:#}", protected(&project).unwrap_err());
     assert!(error.contains("notes.txt"), "{error}");
+}
+
+// ------------------------------------------- one owner for a write (#2806) ----
+
+/// A directory `a.json` is displaced by the file `a.json` (a move the other way
+/// round), and `b.json` is a second new file, so two temp files are staged.
+fn directory_becomes_file(dir: &Path) -> TreeWrite {
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    std::fs::write(dir.join("a.json/a.json"), "old").unwrap();
+    TreeWrite {
+        dir: dir.to_owned(),
+        files: [
+            ("a.json".to_owned(), "new".to_owned()),
+            ("b.json".to_owned(), "new too".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json/a.json".to_owned()],
+        ..TreeWrite::default()
+    }
+}
+
+#[test]
+fn a_failed_set_aside_of_a_displaced_directory_leaves_no_staged_file() {
+    let project = project("set-aside-fails");
+    let dir = project.ids_dir();
+    let write = directory_becomes_file(&dir);
+    let before = listing(&dir);
+    // The only set-aside is the displaced directory's, in the second loop,
+    // after both temp files exist.
+    fail_set_aside_number(1);
+    let error = format!("{:#}", write.apply().unwrap_err());
+    assert!(error.contains("cannot move"), "{error}");
+    assert!(error.contains("injected"), "{error}");
+    assert!(!error.contains("could not be undone"), "{error}");
+    assert_eq!(listing(&dir), before, "no staged entry is left");
+    // The tree still reads (a stray `.tmp` would have refused it).
+    assert_eq!(read_ids_tree(&dir).unwrap().len(), 1);
+    // Negative: the same write, unarmed, goes through.
+    write.apply().unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "new");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.json")).unwrap(),
+        "new too"
+    );
+}
+
+#[test]
+fn a_failure_after_the_first_placed_file_keeps_it_and_undoes_only_what_is_pending() {
+    let project = project("fails-after-first-placement");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    std::fs::write(dir.join("a.json/a.json"), "old a").unwrap();
+    std::fs::create_dir_all(dir.join("c.json")).unwrap();
+    std::fs::write(dir.join("c.json/c.json"), "old c").unwrap();
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json".to_owned(), "new a".to_owned()),
+            ("c.json".to_owned(), "new c".to_owned()),
+        ]
+        .into(),
+        removals: vec!["a.json/a.json".to_owned(), "c.json/c.json".to_owned()],
+        ..TreeWrite::default()
+    };
+    // `a.json` is placed (its directory set aside first); the second
+    // set-aside, for `c.json`, fails.
+    fail_set_aside_number(2);
+    let error = format!("{:#}", write.apply().unwrap_err());
+    // The placed file's aside is not pending, so the undo does not try to
+    // put it back over the file.
+    assert!(!error.contains("could not be undone"), "{error}");
+    // The placed file stays, with the old copy beside it, as after a crash.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.json")).unwrap(),
+        "new a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".pbps-aside0/a.json")).unwrap(),
+        "old a"
+    );
+    // What was pending is as it was: no temp file, the directory in place.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("c.json/c.json")).unwrap(),
+        "old c"
+    );
+    assert_eq!(names_in(&dir), [".pbps-aside0", "a.json", "c.json"]);
+}
+
+#[test]
+fn a_write_that_succeeds_keeps_every_file_after_the_guard_drops() {
+    let project = project("guard-commits");
+    let dir = project.ids_dir();
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("new/a.json".to_owned(), "a".to_owned()),
+            ("b.json".to_owned(), "b".to_owned()),
+        ]
+        .into(),
+        ..TreeWrite::default()
+    };
+    write.apply().unwrap();
+    // The directory the write created is not taken away with the guard.
+    assert_eq!(names_in(&dir), ["b.json", "new"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("new/a.json")).unwrap(),
+        "a"
+    );
+    // A guard dropped unsettled undoes, one that was committed does not.
+    let kept = dir.join("kept.json");
+    let lost = dir.join("lost.json");
+    std::fs::write(&kept, "k").unwrap();
+    std::fs::write(&lost, "l").unwrap();
+    let mut committed = Staged::default();
+    committed.temp(&kept);
+    committed.commit();
+    drop(committed);
+    let mut dropped = Staged::default();
+    dropped.temp(&lost);
+    drop(dropped);
+    assert!(kept.exists(), "a committed write keeps its files");
+    assert!(
+        !lost.exists(),
+        "an unsettled one takes its staged file away"
+    );
+}
+
+#[test]
+fn an_undo_that_fails_is_reported_with_the_error_that_caused_it() {
+    let project = project("guard-undo-fails");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(dir.join("a.json")).unwrap();
+    std::fs::write(dir.join("a.json/foreign"), "x").unwrap();
+    std::fs::write(dir.join(".pbps-aside0"), "old").unwrap();
+    let mut staged = Staged::default();
+    staged.created([dir.join("a.json")]);
+    staged
+        .asides
+        .push((dir.join("a.json"), dir.join(".pbps-aside0")));
+    let error = format!(
+        "{:#}",
+        staged
+            .settle::<()>(Err(anyhow::anyhow!("the original failure")))
+            .unwrap_err()
+    );
+    assert!(error.contains("the original failure"), "{error}");
+    assert!(error.contains("could not be undone"), "{error}");
+    assert!(error.contains(".pbps-aside0"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".pbps-aside0")).unwrap(),
+        "old"
+    );
+}
+
+// ---------------------------------- a name that cannot be inspected (#2816) ----
+
+#[cfg(unix)]
+#[test]
+fn a_sibling_that_cannot_be_inspected_is_an_error_naming_it_and_an_absent_one_is_picked() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project("sibling-uninspectable").ids_dir();
+    std::fs::create_dir_all(dir.join("closed")).unwrap();
+    let path = dir.join("closed/a.json");
+    let pick = |path: &Path| {
+        crate::ids_cmd::unused_sibling(path, "tmp", "", &mut BTreeSet::new(), PathKey::default())
+    };
+    // Negative: a candidate that is not there is picked.
+    assert_eq!(pick(&path).unwrap(), dir.join("closed/.pbps-tmp0"));
+    // The directory cannot be searched, so nothing in it can be looked at.
+    std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let probe = std::fs::symlink_metadata(dir.join("closed/.pbps-tmp0"));
+    if probe.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        return;
+    }
+    let error = format!("{:#}", pick(&path).unwrap_err());
+    // The caller sees it too: the atomic write stops before it creates anything.
+    let written = format!("{:#}", write_atomic(&path, "x").unwrap_err());
+    std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    for shown in [&error, &written] {
+        assert!(shown.contains("closed/.pbps-tmp0"), "{shown}");
+        assert!(shown.contains("cannot tell whether"), "{shown}");
+    }
+    assert_eq!(names_in(&dir.join("closed")), Vec::<String>::new());
+}
+
+// ------------------------------------------- names that fit (#2817) ----
+
+/// A declaration stem of this many bytes mirrors to `<stem>.json`.
+fn long_stem(len: usize) -> String {
+    "x".repeat(len)
+}
+
+#[test]
+fn a_declaration_with_a_246_byte_stem_plans_and_writes_its_identity_file() {
+    let stem = long_stem(246);
+    let file = format!("{stem}.json");
+    let paths = declared(&[("dbo.customer", &format!("{stem}.yml"), &["id", "name"])]);
+    let project = project("long-stem");
+    // The staging name used to be `.<251 bytes>.tmp` (256 bytes).
+    plan(&project, &customer(), &paths)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(names_in(&project.ids_dir()), std::slice::from_ref(&file));
+    assert_eq!(read_opt(&project).unwrap(), Some(customer()));
+    assert!(plan(&project, &customer(), &paths).unwrap().is_empty());
+    // Negative: an ordinary name is written as before.
+    let project = written("short-stem", &customer(), &customer_declared());
+    assert_eq!(names_in(&project.ids_dir()), ["dbo"]);
+}
+
+#[test]
+fn a_move_of_a_file_to_a_directory_with_a_long_name_sets_the_old_file_aside_under_a_name_that_fits()
+{
+    let name = format!("{}.json", long_stem(246));
+    let project = project("long-set-aside");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&name), "old").unwrap();
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [(format!("{name}/x.json"), "new".to_owned())].into(),
+        removals: vec![name.clone()],
+        ..TreeWrite::default()
+    };
+    // The aside used to be `.<name>.aside` (257 bytes).
+    write.apply().unwrap();
+    assert_eq!(names_in(&dir), std::slice::from_ref(&name));
+    assert_eq!(
+        std::fs::read_to_string(dir.join(&name).join("x.json")).unwrap(),
+        "new"
+    );
+}
+
+#[test]
+fn a_respelling_of_a_long_name_goes_through_a_name_that_fits() {
+    let project = project("long-respell");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // Where names are distinct (Linux) `Xxx.json` is another entry than
+    // `xxx.json`; the folding key makes the write treat it as the old spelling.
+    let old = format!("X{}.json", long_stem(245));
+    let wanted = format!("x{}.json", long_stem(245));
+    std::fs::write(dir.join(&old), "mine").unwrap();
+    let write = TreeWrite {
+        dir: dir.clone(),
+        respell: vec![wanted.clone()],
+        key: PathKey::folding(),
+        ..TreeWrite::default()
+    };
+    // The middle name used to be `.<old>.respell.json` (265 bytes).
+    write.apply().unwrap();
+    assert_eq!(names_in(&dir), std::slice::from_ref(&wanted));
+    assert_eq!(std::fs::read_to_string(dir.join(&wanted)).unwrap(), "mine");
+}
+
+#[test]
+fn a_dropped_object_with_a_long_name_goes_aside_to_a_name_that_fits_and_reads_back() {
+    let uid: Uid = T.parse().unwrap();
+    let was = format!("dbo.{}", long_stem(250));
+    let name = crate::ids_cmd::aside(&was, &uid);
+    assert!(name.len() <= 240, "{} bytes", name.len());
+    assert!(
+        name.starts_with("~pbps-") && name.ends_with(".t_aaaaaa.json"),
+        "{name}"
+    );
+    // The table is dropped and another is declared at its path, so its file
+    // is kept under the aside name; the filesystem takes it and it reads back.
+    let before = ids(json!({"version": 1, "tables": {T: &was}}));
+    let project = written(
+        "long-aside",
+        &before,
+        &declared(&[(&was, "dbo/c.yml", &[])]),
+    );
+    let after = ids(json!({
+        "version": 1,
+        "tables": {"t_bbbbbb": "dbo.other"},
+        "tombstones": {
+            T: {"was": &was, "dropped_at": "2026-11-06", "reason": "r", "operator": "o"},
+        },
+    }));
+    let paths = declared(&[("dbo.other", "dbo/c.yml", &[])]);
+    plan(&project, &after, &paths).unwrap().apply().unwrap();
+    assert_eq!(
+        tree(&project).keys().collect::<Vec<_>>(),
+        [&"dbo/c.json".to_owned(), &name]
+    );
+    assert_eq!(read_opt(&project).unwrap(), Some(after.clone()));
+    assert!(plan(&project, &after, &paths).unwrap().is_empty());
+}
+
+#[test]
+fn aside_names_keep_their_readable_form_up_to_the_limit_and_are_hashed_past_it() {
+    let uid: Uid = T.parse().unwrap();
+    let suffix = ".t_aaaaaa.json".len();
+    // Exactly at the limit is still today's name.
+    let at_limit = "n".repeat(240 - suffix);
+    assert_eq!(
+        crate::ids_cmd::aside(&at_limit, &uid),
+        format!("{at_limit}.t_aaaaaa.json")
+    );
+    // One byte more is hashed, deterministically, and differently per name.
+    let past = "n".repeat(240 - suffix + 1);
+    let other = format!("m{}", &past[1..]);
+    let (a, b) = (
+        crate::ids_cmd::aside(&past, &uid),
+        crate::ids_cmd::aside(&other, &uid),
+    );
+    assert!(
+        a.starts_with("~pbps-") && a.ends_with(".t_aaaaaa.json"),
+        "{a}"
+    );
+    assert_eq!(a, crate::ids_cmd::aside(&past, &uid));
+    assert_ne!(a, b);
+    // A `~` in the object name is replaced, so no readable name is a hashed one.
+    assert_eq!(
+        crate::ids_cmd::aside("~pbps-x", &uid),
+        "_pbps-x.t_aaaaaa.json"
+    );
+}
+
+#[test]
+fn the_names_a_write_derives_are_refused_or_read_by_the_rules_they_always_had() {
+    let dir = project("derived-name-rules").ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.json"), "{}").unwrap();
+    // A staging name and an aside are not identity files: the reader refuses a
+    // tree that holds one, and names it.
+    for stray in [".pbps-tmp0", ".pbps-aside0", ".pbps-aside12"] {
+        std::fs::write(dir.join(stray), "x").unwrap();
+        let error = read_ids_tree(&dir).unwrap_err().to_string();
+        assert!(error.contains(stray), "{stray}: {error}");
+        std::fs::remove_file(dir.join(stray)).unwrap();
+    }
+    // The respelling step's name is one, so a crash between its two renames
+    // reads back (`a_respelling_interrupted_halfway_reads_back...`).
+    assert!(ids_tree::is_identity_file(".pbps-respell0.json"));
+    assert!(!ids_tree::is_identity_file(".pbps-tmp0"));
+    assert!(!ids_tree::is_identity_file(".pbps-aside0"));
+    assert_eq!(read_ids_tree(&dir).unwrap().len(), 1);
 }
