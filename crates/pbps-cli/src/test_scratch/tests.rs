@@ -769,6 +769,39 @@ mod recovery {
     }
 
     #[tokio::test]
+    async fn restarted_returns_the_journal_to_pending_without_the_crashed_containers_ids() {
+        let d = Dir::new();
+        let created = record(&run('a'), State::Created, Some(&id('b')));
+        assert_eq!(created.volumes, ["vol1"], "the fixture records a volume");
+        let mut journal = Journal {
+            dir: &d.dir,
+            record: created,
+            _lock: d.dir.lock(&run('a')).unwrap(),
+        };
+        let mut owner = RunOwner {
+            location: super::super::journal::location(d.dir.path()).unwrap(),
+            journal: &mut journal,
+        };
+        owner.restarted().await.unwrap();
+        let on_disk = d.dir.read(&run('a')).unwrap().unwrap();
+        assert_eq!(on_disk.state, State::Pending);
+        assert_eq!(on_disk.container.id, None, "the crashed container is gone");
+        assert!(on_disk.volumes.is_empty());
+        assert_eq!(
+            on_disk.container.name,
+            record(&run('a'), State::Pending, None).container.name,
+            "the same name and token are reused for the second container"
+        );
+        // The second container is then recorded exactly as the first was.
+        owner.before_create().await.unwrap();
+        assert!(owner.created("not-an-id").await.is_err());
+        assert_eq!(
+            d.dir.read(&run('a')).unwrap().unwrap().state,
+            State::Pending
+        );
+    }
+
+    #[tokio::test]
     async fn a_start_that_reported_leftovers_keeps_its_record_whatever_the_listing_says() {
         use pbps_cli::resolver::server::ProduceError;
         let d = Dir::new();

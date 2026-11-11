@@ -4025,7 +4025,9 @@ named with the declaration that could bind it, #1517), a missing fingerprint key
 target the publication recheck found changed after the run
 (`resolver.recheck`) are finding refusals (exit `2`).
 Connection, metadata-read, image-acquisition and startup failures, and an
-analysis scope that cannot be established, are `unanswerable` (exit `1`). A
+analysis scope that cannot be established, are `unanswerable` (exit `1`); a
+SQL Server scratch that crashes while starting is started once more first
+(DEC-2762.1), and a second crash is the startup failure. A
 required question with no resolver selected is not refused: the existing
 protection keeps deciding (DEC-1515.1). Both
 preserve existing output files and publish no partial deployment artifacts.

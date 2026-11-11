@@ -233,6 +233,18 @@ impl ContainerOwner for RunOwner<'_, '_> {
             .map_err(|e| e.to_string())
     }
 
+    async fn restarted(&mut self) -> Result<(), String> {
+        // The crashed container is confirmed gone, so the record says what it
+        // said before the first `docker run`; `before_create` writes it next.
+        self.journal
+            .advance(|r| {
+                r.container.id = None;
+                r.volumes.clear();
+                r.state = State::Pending;
+            })
+            .map_err(|e| e.to_string())
+    }
+
     async fn created(&mut self, id: &str) -> Result<(), String> {
         if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!("the runtime returned `{id}` as the container id"));

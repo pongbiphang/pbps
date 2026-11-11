@@ -2267,10 +2267,13 @@ permissive ALL policy and explicit TRUE policy admitted different rows.
 - The `live` job's SQL Server service container has crashed at startup twice, on
   two different commits: the failing step is `wait for SQL Server`, both cargo
   steps are **skipped**, and a re-run of the same commit passed both times. Read
-  the job's step list before blaming the diff. **The cause is still unproven** —
-  it looks resource-shaped (`errno 11`, core dump, 2-CPU runner), not
-  image-shaped. That step now prints the container's own log on failure, which
-  the raw job output otherwise buries under teardown noise.
+  the job's step list before blaming the diff. The cause is **CPU starvation**
+  at engine start-up (#2762: 0 of 30 starts crash on an idle host, 2 of 30 under
+  32 busy loops, 4 of 6 when six start together under that load); `errno 11` in
+  the crash header is stale noise from non-blocking `flock`, not the cause. The
+  product's own scratch now starts once more after such a crash (DEC-2762.1).
+  That step prints the container's own log on failure, which the raw job
+  output otherwise buries under teardown noise.
 - The Windows runner's Docker service can stay stopped after its boot-time
   Hyper-V switch creation fails
   ([actions/runner-images#13729](https://github.com/actions/runner-images/issues/13729)).
