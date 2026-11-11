@@ -1,6 +1,7 @@
 //! `plan --db`: planning against a connected database.
 
 use super::*;
+use crate::engine::PlanSession as _;
 
 /// Advisory only: a reused name supplies no identity intent (SPEC 14.3).
 pub(crate) fn type_replacement_warnings(
@@ -28,7 +29,8 @@ pub(crate) fn type_replacement_warnings(
 /// A standing `NOT VALID` check of a declared domain compares equal to its
 /// declaration, as the model holds no validation (DECISIONS 251, DEC-1635.4);
 /// the plan says so and names the statement that validates it (DEC-1635.8).
-pub(super) async fn domain_check_not_valid_warnings(
+pub(super) async fn domain_check_not_valid_warnings<D: crate::engine::PlanSession>(
+    dialect: &D,
     conn: &mut Conn,
     recorded: &Schema,
     json: bool,
@@ -40,7 +42,7 @@ pub(super) async fn domain_check_not_valid_warnings(
     {
         return Ok(Vec::new());
     }
-    let standing = crate::engine::standing_not_valid_domain_checks(conn).await?;
+    let standing = dialect.standing_not_valid_domain_checks(conn).await?;
     Ok(standing
         .into_iter()
         .filter(|found| recorded.types.contains_key(&found.domain))
@@ -340,23 +342,24 @@ pub(super) async fn plan_db_selected(
         let mut scratch = resolver_selection
             .as_ref()
             .map(|selection| crate::resolution::Entry::new(selection, project, target));
-        dependencies = crate::engine::compare_dependencies(&mut conn, &loaded.dependencies).await?;
-        let initial_types = crate::engine::seal_type_pins(
-            &mut conn,
-            &[&loaded.schema],
-            &Default::default(),
-            &project.config.trusted_roles,
-            project.config.pin_type_routines,
-        )
-        .await?;
-        let type_routines_need_review = !crate::engine::type_input_routines(
-            &mut conn, &initial_types.types, &project.config.trusted_roles,
-            project.config.pin_type_routines, false,
-        ).await?.is_empty();
+        dependencies = dialect.compare_dependencies(&mut conn, &loaded.dependencies).await?;
+        // What the engine keeps for itself from the type prerequisites sealed
+        // here to the misspelling probe below.
+        let mut plan_state = Default::default();
+        dialect
+            .seal_declared_type_pins(
+                &mut plan_state,
+                &mut conn,
+                &loaded.schema,
+                &project.config.trusted_roles,
+                project.config.pin_type_routines,
+            )
+            .await?;
         let mut findings = checkout_findings;
 
         let role_renames =
-            crate::engine::external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
+            dialect
+                .external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
                 .await?
                 .renames;
         let recorded_snapshot = entry.snapshot.clone();
@@ -400,15 +403,15 @@ pub(super) async fn plan_db_selected(
             pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
             &loaded.hints,
         );
-        let refused = refuse_misspelt_with_probe(
-            &mut conn,
-            &loaded.schema,
-            &probe_schema,
-            &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
-            &mut unasked,
-            type_routines_need_review,
-        )
-        .await;
+        let misspelt = dialect
+            .misspelt(
+                &plan_state,
+                &mut conn,
+                &probe_schema,
+                &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
+            )
+            .await;
+        let refused = refuse_misspelt_read(misspelt, &loaded.schema, &mut unasked);
         // In the envelope, not beside it: a warning-only result of a
         // read-only command stays in its one JSON report (SPEC §9.8; #1660).
         for w in unasked {
@@ -436,7 +439,10 @@ pub(super) async fn plan_db_selected(
         // the rename then planned none of its deletes.
         let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
         let declared_data = declared_live.data_scopes();
-        refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
+        let spelled = dialect
+            .schema_spellings(&mut conn, &schemas_wanted(&loaded.schema))
+            .await;
+        refuse_wrongly_spelt(spelled, &loaded.schema)?;
         // A key the declarations renamed a label to is held by the row under
         // the label it had (DEC-2346.2).
         let mut to_read = pbps_model::data::read_scopes(&recorded_data, &declared_data);
@@ -510,11 +516,10 @@ pub(super) async fn plan_db_selected(
         // it failed the apply's own postcondition.
         let declared =
             declarations_as_compared(&loaded.schema, managed.database_collation.as_deref());
-        crate::engine::refuse_unknown_collations(&mut conn, &declared).await?;
+        dialect.refuse_unknown_collations(&mut conn, &declared).await?;
         // A key to a declared history under another spelling of its name,
         // which only the database's collation can join (#1625).
-        crate::engine::refuse_history_references_alike(&mut conn, &declared, dialect.as_ref())
-            .await?;
+        dialect.refuse_history_references_alike(&mut conn, &declared).await?;
         // And now that the default is known, an absent collation facing a
         // named one on a foreign key is decidable (#1247 review).
         let mismatched =
@@ -577,8 +582,7 @@ pub(super) async fn plan_db_selected(
         // principal must be planned onto the new one, not rejected as drift.
         // Newly managed roles also start from their actual grants. Both sets
         // remain in the pinned baseline and the differ's input (421).
-        let missing_roles = crate::engine::reconcile_cluster_roles(
-            conn.driver(),
+        let missing_roles = dialect.reconcile_cluster_roles(
             &recorded_snapshot.ids,
             &recorded_ids,
             &role_renames,
@@ -651,9 +655,8 @@ pub(super) async fn plan_db_selected(
         // the differ chooses their optional scan CHECK (DEC-2126.1). Its key
         // carries that choice through re-derivation, sealing, apply and resume.
         if staged {
-            dialect = crate::engine::staged_attach_dialect(
+            dialect = dialect.staged_attach_dialect(
                 &mut conn,
-                &dialect,
                 pbps_diff::Side { schema: &read_back, ids: &recorded_ids },
                 pbps_diff::Side { schema: &declared, ids: &resolved.ids },
             ).await?;
@@ -688,19 +691,20 @@ pub(super) async fn plan_db_selected(
         // writes the swap that carries it (DEC-1635.7, DEC-1635.9). So is
         // which domains an array holds, which PostgreSQL refuses a new check
         // on in place and a rebuild takes instead.
-        crate::engine::type_rebuild_hints(
-            &mut conn,
-            &base,
-            &declared,
-            &recorded_ids,
-            &resolved.ids,
-            &mut hints,
-        )
-        .await?;
+        dialect
+            .type_rebuild_hints(
+                &mut conn,
+                &base,
+                &declared,
+                &recorded_ids,
+                &resolved.ids,
+                &mut hints,
+            )
+            .await?;
         // SQL Server's computed columns that stand throughout are judged by
         // the catalog's edges below (`order_computed_by_edges`), under the
         // database's collation, not by the text screen (#1460).
-        let screen = crate::engine::computed_column_screen(conn.driver());
+        let screen = dialect.computed_column_screen();
         // plan_base uses the declared mode to compare newly managed rows.
         // Carry the takeover separately so matching rows still reach the
         // checksum/approval gate and the ordinary ledger write (DEC-1803.1).
@@ -747,16 +751,17 @@ pub(super) async fn plan_db_selected(
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
-        crate::engine::retained_expression_hints(
-            scratch.as_mut(),
-            &mut conn,
-            target,
-            pbps_diff::Side { schema: &base, ids: &recorded_ids },
-            pbps_diff::Side { schema: &declared, ids: &resolved.ids },
-            &read_back,
-            &mut hints,
-        )
-        .await?;
+        dialect
+            .retained_expression_hints(
+                scratch.as_mut(),
+                &mut conn,
+                target,
+                pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+                &read_back,
+                &mut hints,
+            )
+            .await?;
         // The modules a rebuilt enum's columns carry, found in the planning
         // transaction and kept for every plan that follows it.
         let enum_dependents = std::cell::RefCell::new(std::collections::BTreeSet::new());
@@ -786,18 +791,18 @@ pub(super) async fn plan_db_selected(
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
         findings.extend(type_replacement_warnings(&recorded_ids, &resolved.ids, cs.changes(), json));
-        findings.extend(domain_check_not_valid_warnings(&mut conn, &base, json).await?);
+        findings.extend(domain_check_not_valid_warnings(&dialect, &mut conn, &base, json).await?);
 
-        let prerequisite_types = crate::engine::seal_plan_type_pins(
-            &mut conn,
-            pbps_diff::Side { schema: &base, ids: &recorded_ids },
-            pbps_diff::Side { schema: &declared, ids: &resolved.ids }, &cs,
-            &project.config.trusted_roles, project.config.pin_type_routines,
-        ).await?;
-        let needs_review = !crate::engine::type_input_routines(
-            &mut conn, &prerequisite_types.types, &project.config.trusted_roles,
-            project.config.pin_type_routines, false,
-        ).await?.is_empty();
+        let needs_review = dialect
+            .seal_plan_type_review(
+                &mut conn,
+                pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+                &cs,
+                &project.config.trusted_roles,
+                project.config.pin_type_routines,
+            )
+            .await?;
         // DEC-1515.1's three cases, decided from this ordinary plan before any
         // pass asks the catalog about it: case 2 then opens nothing a
         // resolver owns, and case 3 hands the resolver the plan it re-derives.
