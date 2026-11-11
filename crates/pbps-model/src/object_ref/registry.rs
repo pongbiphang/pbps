@@ -251,24 +251,30 @@ impl Annotations {
 
     /// What the registry finds wrong with the declared annotations that the
     /// module-only checks (`module::check_dependencies`, `dependency_cycles`)
-    /// cannot say: every finding that involves a reference that is not a
-    /// module. Module-to-module findings are left to those functions, whose
-    /// text callers and tests already pin.
+    /// cannot say.
+    ///
+    /// # Why the module-only subset is subtracted, not a rule per kind
+    ///
+    /// The legacy findings are exactly what the registry yields for the
+    /// module-to-module subset alone, so those are removed (one occurrence
+    /// each) from the findings over the whole set. Classifying by the failing
+    /// reference instead hid `table::app.t -> module::app.missing`: the missing
+    /// target is a module, yet no legacy check ever sees an edge whose owner is
+    /// a table. A module edge and a mixed edge that fail on the same target
+    /// each keep their own report.
     pub fn extended_problems(&self, schema: &Schema) -> Vec<Problem> {
-        let module = |r: &ObjectRef| r.module_id().is_some();
-        Registry::new(schema)
+        let registry = Registry::new(schema);
+        let mut legacy =
+            registry.validate(&ObjectDeps::from_legacy(&self.declared.modules()), None);
+        registry
             .validate(&self.declared, None)
             .into_iter()
-            .filter(|problem| match problem {
-                Problem::UnknownOwner(r)
-                | Problem::UnknownTarget(r)
-                | Problem::MissingPart(r)
-                | Problem::WrongSelector(r)
-                | Problem::Ambiguous(r)
-                | Problem::DuplicateOwner(r)
-                | Problem::SelfDependency(r) => !module(r),
-                Problem::Cycle(legs) => legs.iter().any(|(a, b)| !module(a) || !module(b)),
-                Problem::OutsideDatabase(_) | Problem::Unrecorded { .. } => true,
+            .filter(|problem| match legacy.iter().position(|l| l == problem) {
+                Some(at) => {
+                    legacy.swap_remove(at);
+                    false
+                }
+                None => true,
             })
             .collect()
     }

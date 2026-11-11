@@ -1052,3 +1052,44 @@ fn only_findings_about_non_module_references_are_extended_problems() {
     };
     assert!(modules_only.extended_problems(&schema).is_empty());
 }
+
+#[test]
+fn an_edge_is_extended_by_its_endpoints_not_by_which_reference_failed() {
+    let schema = fixture();
+    let unknown = |problems: &[Problem], name: &str| {
+        problems
+            .iter()
+            .filter(|p| matches!(p, Problem::UnknownTarget(r) if r.shown().to_string() == name))
+            .count()
+    };
+    // A table owner and a missing module: no module check sees the edge.
+    let mixed = Annotations {
+        declared: dependencies(&[("table::app.t", &["module::app.ghost"])]),
+        ..Default::default()
+    };
+    let problems = mixed.extended_problems(&schema);
+    assert_eq!(unknown(&problems, "module::app.ghost"), 1, "{problems:?}");
+    // The module edge to the same target is the module checks' report; the
+    // mixed edge keeps its own, so exactly one finding is extended.
+    let both = Annotations {
+        declared: dependencies(&[
+            ("module::app.v", &["module::app.ghost"]),
+            ("table::app.t", &["module::app.ghost"]),
+        ]),
+        ..Default::default()
+    };
+    let problems = both.extended_problems(&schema);
+    assert_eq!(unknown(&problems, "module::app.ghost"), 1, "{problems:?}");
+    // Negative: module-only input gives none, a module-only cycle included.
+    let modules_only = Annotations {
+        declared: dependencies(&[
+            (
+                "module::app.v",
+                &["module::app.ghost", "module::app.f(integer)"],
+            ),
+            ("module::app.f(integer)", &["module::app.v"]),
+        ]),
+        ..Default::default()
+    };
+    assert!(modules_only.extended_problems(&schema).is_empty());
+}

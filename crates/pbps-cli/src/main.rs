@@ -6938,6 +6938,13 @@ mod tests {
         assert!(
             annotation_findings(&schema, &deps(&[("module::app.v", "module::app.w")])).is_empty()
         );
+        // A table that depends on a missing module is nobody's module edge:
+        // the registry reports it, once, under the same code.
+        let mixed = annotation_findings(&schema, &deps(&[("table::app.t", "module::app.ghost")]));
+        assert!(
+            matches!(mixed.as_slice(), [("schema.unknown-dependency", why)] if why.contains("module::app.ghost")),
+            "{mixed:?}"
+        );
     }
 
     /// Everything keyed by a routine identity is rewritten together, or the
