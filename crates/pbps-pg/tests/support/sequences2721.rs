@@ -203,6 +203,7 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
                 CREATE TEMP SEQUENCE temp_s; \
                 CREATE SEQUENCE \"dotted.name\"").await;
         let held = db.held().await;
+        // Sorted as text here, so the expectation does not depend on the map's key order.
         let mut names: Vec<String> = held.keys().map(|k| k.raw().to_string()).collect();
         names.sort();
         assert_eq!(
@@ -210,8 +211,8 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
             [
                 "app.Mixed Case",
                 "app.big",
-                "app.counted",
                 "app.countdown",
+                "app.counted",
                 "app.plain"
             ],
             "the model's sequences and nothing a column or a package owns"

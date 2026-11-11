@@ -131,10 +131,12 @@ fn what_the_model_does_not_hold_is_left_out_and_named_and_an_owned_sequence_is_n
         let f = fixture(server, &format!("sequences2721-left-{slug}"));
         on_server(
             f.target(),
+            // Names the fixture's own tables (`t`, `country`, `f`, `v`) do not take.
             "CREATE UNLOGGED SEQUENCE app.lonely; CREATE SEQUENCE app.plain; \
-             CREATE TABLE app.t (id integer DEFAULT nextval('app.lonely')); \
-             CREATE TABLE app.s (id serial); \
-             CREATE TABLE app.o (id integer); CREATE SEQUENCE app.o_seq OWNED BY app.o.id",
+             CREATE TABLE app.lonely_user (id integer DEFAULT nextval('app.lonely')); \
+             CREATE TABLE app.serial_user (id serial); \
+             CREATE TABLE app.owner_tbl (id integer); \
+             CREATE SEQUENCE app.owned_seq OWNED BY app.owner_tbl.id",
         );
         let out = pull(&f);
         let notes = said(&out);
@@ -151,11 +153,11 @@ fn what_the_model_does_not_hold_is_left_out_and_named_and_an_owned_sequence_is_n
         assert_eq!(names, ["app.plain.sequence.yml"], "{notes}");
         // Negative: the owned ones are no standalone sequence and are not named as one.
         assert!(
-            !notes.contains("standalone sequence `app.s_id_seq`")
-                && !notes.contains("standalone sequence `app.o_seq`"),
+            !notes.contains("standalone sequence `app.serial_user_id_seq`")
+                && !notes.contains("standalone sequence `app.owned_seq`"),
             "{notes}"
         );
-        let serial = std::fs::read_to_string(f.d.dir.join("schema/app.s.yml")).unwrap();
+        let serial = std::fs::read_to_string(f.d.dir.join("schema/app.serial_user.yml")).unwrap();
         assert!(serial.contains("serial"), "{serial}");
     });
 }
