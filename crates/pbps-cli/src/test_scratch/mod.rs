@@ -16,8 +16,6 @@ mod record;
 mod removal;
 mod runtime;
 
-use std::fs::File;
-
 use pbps_config::resolver::PullPolicy;
 use pbps_db::Driver;
 
@@ -28,7 +26,7 @@ use pbps_cli::resolver::server::scratch::container::{Held, Owner as ContainerOwn
 pub(crate) use reconcile::Reconciliation;
 pub(crate) use record::StateDir;
 use record::default_dir;
-use record::{Container, Record, State, VERSION};
+use record::{Container, Record, RunLock, State, VERSION};
 use removal::{RUN_LABEL, failure, ours, remove_run};
 use runtime::{Docker, Runtime};
 
@@ -191,7 +189,7 @@ struct Journal<'a> {
     dir: &'a StateDir,
     record: Record,
     /// Held for the whole run; the kernel releases it when the process dies.
-    _lock: File,
+    _lock: RunLock,
 }
 
 impl Journal<'_> {
