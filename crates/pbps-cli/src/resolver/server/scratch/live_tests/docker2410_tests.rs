@@ -286,7 +286,9 @@ async fn a_sweep_that_loses_the_identity_read_to_another_remover_keeps_only_that
         !volumes.is_empty(),
         "the image's data directory is a volume"
     );
-    docker(&["kill", &name]);
+    // Not killed: a running container that never connected is kept inside the
+    // grace by every other shard's unconfined sweep, so nobody but the second
+    // remover below can take it, or its volumes, before this test does.
     // The other remover finishes between the listing and the identity read:
     // container and volumes, as `docker rm --force --volumes` does.
     let report = swept_losing_the_identity_read(&token(), &dead, async |name| {
@@ -337,8 +339,8 @@ async fn a_remover_that_leaves_a_volume_behind_fails_the_absence_check() {
         "the image's data directory is a volume"
     );
     let _volumes = MadeVolumes(volumes.clone());
-    docker(&["kill", &name]);
-    // The other remover takes the container but not its volumes.
+    // Not killed, for the reason above: only the second remover may take it.
+    // That remover takes the container but not its volumes.
     let report = swept_losing_the_identity_read(&token(), &dead, async |name| {
         docker(&["rm", "--force", name]);
     })
