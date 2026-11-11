@@ -1160,3 +1160,54 @@ tests in `pipe_tests` compile only on Windows and were not run on the
 machine that wrote this entry. SSPI authentication, the TLS handshake over a
 pipe and a real LocalDB are unmeasured until the Windows qualification in the
 second half of #2271.
+
+<a id="dec-2798-1"></a>
+
+**DEC-2798.1. The operations every engine must provide are a trait in
+`pbps-db`; everything else stays a routed function until it has a class
+(#2798).** DECISIONS 417 chose free `async fn`s routed by an exhaustive `match`
+in `pbps-cli::engine`, because a trait in `pbps-dialect` taking a `Conn` is a
+dependency cycle, and because a `match` per question gives the same
+completeness. Both reasons still hold. What changed is the count: the module
+now holds about 130 functions that choose by engine, and a third engine would
+add an arm to each, including the 51 that exist only for one engine's object
+kinds and answer `Ok(())` or empty on the other.
+
+Measured on the tree after #2801, 16 of the 130 are operations no engine can
+plan or apply without: the ledger and the lock, the catalog read, the row read
+and staged execution. None has an engine crate's type in its signature; all
+their types already live in `pbps-db`. Those are `pbps_db::engine::Engine`,
+implemented by `pbps_pg::engine::PostgresEngine` and
+`pbps_mssql::engine::MssqlEngine`, and chosen once by `pbps-cli::engine::of`.
+The CLI's functions for them keep their names and delegate, so no caller
+changed.
+
+- **In `pbps-db`, not `pbps-dialect`.** `pbps-db` owns `Conn` and the result
+  types and both engine crates already depend on it, so there is no cycle, and
+  the pure half (`validate`, offline `plan`) still takes only `pbps-dialect`.
+- **`dyn` with boxed futures.** The engine is chosen at run time from the
+  connection. `futures-util`'s `BoxFuture` is already a dependency of
+  `pbps-db`; no dependency was added. The futures are `Send` because both
+  engines' are, and the trait is `Send + Sync` so the engines can be statics.
+- **No default bodies.** Every method here is required, so an engine that
+  lacks one does not compile: the completeness the `match` gave is kept.
+- **`Read` moved to `pbps-db`.** It is a parameter of the catalog read. An
+  engine with no difference between a snapshot read and a read inside the
+  building transaction treats both alike, as SQL Server does.
+
+The other functions are not moved by this entry. Capabilities an engine may
+leave refused, and the steps that belong to one engine, get their own shape in
+later steps of #2798; until then they stay routed functions with exhaustive
+matches.
+
+Rejected:
+- **A method for each of the 130.** Every engine would carry the list of every
+  other engine's object kinds.
+- **A generic parameter in place of `dyn`.** The engine is not known until the
+  connection is open, so every command would be generic over it or would
+  `match` once and duplicate its body.
+
+Pinned by `a_third_engine_implements_the_trait_through_a_trait_object` in
+`crates/pbps-db/src/engine.rs` (an engine that uses only `pbps-db` and
+`pbps-model` types), and `of_answers_with_the_engine_of_the_driver_asked_for`
+and `the_two_engines_are_told_apart_by_name` in `crates/pbps-cli/src/engine.rs`.

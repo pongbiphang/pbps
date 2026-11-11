@@ -37,6 +37,7 @@ pub mod doctor;
 pub mod drop_requirements;
 pub mod edition;
 pub mod emit;
+pub mod engine;
 pub mod estimate;
 mod generated;
 pub mod ident;

@@ -4388,7 +4388,9 @@ pub trait Dialect {
 This is a sketch of the pure dialect surface. Connection-bound introspection,
 rename-impact queries and the planned resolver operations are free async
 functions in the engine crates, routed by `pbps-cli::engine`, not methods on
-`Dialect`. [ARCHITECTURE.md](ARCHITECTURE.md) records the current boundaries.
+`Dialect`. The operations every engine must provide (the ledger and the lock,
+the catalog read, staged execution) are the `Engine` trait in `pbps-db`
+(DEC-2798.1). [ARCHITECTURE.md](ARCHITECTURE.md) records the current boundaries.
 
 `pbps-model`, `pbps-diff` and `pbps-load` are entirely dialect-agnostic. Adding a
 database is work with clearly drawn boundaries.

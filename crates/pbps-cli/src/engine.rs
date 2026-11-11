@@ -14,6 +14,11 @@
 //! out and every `match` is exhaustive, so a third engine is a compile error
 //! in every function below until it has an answer for each (DECISIONS 417).
 //!
+//! The operations every engine must provide to plan and apply (the ledger and
+//! the lock, the catalog read, staged execution) are the exception: they are
+//! the methods of `pbps_db::engine::Engine`, chosen once by [`of`], and the
+//! functions for them delegate (#2798).
+//!
 //! # What an answer means
 //!
 //! The shapes come from `pbps-db` (`catalog`, `impact`, `doctor`, `ledger`),
@@ -38,6 +43,43 @@ use pbps_db::doctor::Ask;
 use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
+
+/// The engine a connection over `driver` is to, for the operations every
+/// engine must provide (`pbps_db::engine::Engine`).
+///
+/// The one `match` for those operations; the functions below delegate through
+/// it, so a third engine is a compile error here and nowhere else for them
+/// (#2798). Operations only some engines have still match on the driver
+/// themselves, until they move behind the trait too.
+pub(crate) fn of(driver: Driver) -> &'static dyn pbps_db::engine::Engine {
+    static MSSQL: pbps_mssql::engine::MssqlEngine = pbps_mssql::engine::MssqlEngine;
+    static POSTGRES: pbps_pg::engine::PostgresEngine = pbps_pg::engine::PostgresEngine;
+    match driver {
+        Driver::Mssql => &MSSQL,
+        Driver::Postgres => &POSTGRES,
+    }
+}
+
+#[cfg(test)]
+mod of_tests {
+    use super::*;
+
+    #[test]
+    fn of_answers_with_the_engine_of_the_driver_asked_for() {
+        for driver in [Driver::Mssql, Driver::Postgres] {
+            assert_eq!(of(driver).driver(), driver);
+        }
+    }
+
+    #[test]
+    fn the_two_engines_are_told_apart_by_name() {
+        assert_ne!(
+            of(Driver::Mssql).name(),
+            of(Driver::Postgres).name(),
+            "error messages name the engine, so two engines sharing a name would blur them"
+        );
+    }
+}
 
 // Choices of engine that the commands used to make for themselves, gathered
 // here so that this file stays the one place that names an engine (#2798).
@@ -80,11 +122,9 @@ pub async fn execute_staged_statement(
     conn: &mut Conn,
     statement: &pbps_dialect::Statement,
 ) -> Result<(), DbError> {
-    match conn.driver() {
-        // SQL Server's emitted DDL has no non-transactional build artifact.
-        Driver::Mssql => conn.execute(&statement.sql).await,
-        Driver::Postgres => pbps_pg::staged::execute(conn, statement).await,
-    }
+    of(conn.driver())
+        .execute_staged_statement(conn, statement)
+        .await
 }
 
 /// Binds and vets every recorded conversion's expression, before the
@@ -347,10 +387,7 @@ pub async fn operational_cost(
 // ---------------------------------------------------------------------------
 
 pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::is_initialized(conn).await,
-        Driver::Postgres => pbps_pg::state::is_initialized(conn).await,
-    }
+    of(conn.driver()).is_initialized(conn).await
 }
 
 /// The temporary CHECKs a staged attach left on its tables, which `baseline`
@@ -397,44 +434,29 @@ fn scan_check_removal_note(check: &pbps_dialect::ScanCheck) -> String {
 }
 
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::latest(conn).await,
-        Driver::Postgres => pbps_pg::state::latest(conn).await,
-    }
+    of(conn.driver()).latest(conn).await
 }
 
 pub async fn deployed_revision(
     conn: &mut Conn,
     observed_id: i64,
 ) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::deployed_revision(conn, observed_id).await,
-        Driver::Postgres => pbps_pg::state::deployed_revision(conn, observed_id).await,
-    }
+    of(conn.driver()).deployed_revision(conn, observed_id).await
 }
 
 pub async fn has_applied_plan(conn: &mut Conn, checksum: &str) -> Result<bool, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::has_applied_plan(conn, checksum).await,
-        Driver::Postgres => pbps_pg::state::has_applied_plan(conn, checksum).await,
-    }
+    of(conn.driver()).has_applied_plan(conn, checksum).await
 }
 
 pub async fn entry(
     conn: &mut Conn,
     id: Option<i64>,
 ) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::entry(conn, id).await,
-        Driver::Postgres => pbps_pg::state::entry(conn, id).await,
-    }
+    of(conn.driver()).entry(conn, id).await
 }
 
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::timeline(conn, limit).await,
-        Driver::Postgres => pbps_pg::state::timeline(conn, limit).await,
-    }
+    of(conn.driver()).timeline(conn, limit).await
 }
 
 /// The opaque evidence reader is reachable only through this connected seam.
@@ -457,17 +479,11 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
             id: 0,
             message: format!("the snapshot's identity mapping is inconsistent: {error}"),
         })?;
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::record(conn, snapshot).await,
-        Driver::Postgres => pbps_pg::state::record(conn, snapshot).await,
-    }
+    of(conn.driver()).record(conn, snapshot).await
 }
 
 pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::prune(conn, keep).await,
-        Driver::Postgres => pbps_pg::state::prune(conn, keep).await,
-    }
+    of(conn.driver()).prune(conn, keep).await
 }
 
 /// Takes the lock for `operator`, recording which process holds it (#1188).
@@ -477,10 +493,8 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
 /// "locked by" refusal give an operator to check before overriding a lock
 /// that, by design, never expires (DECISIONS 285, DEC-1188.1).
 pub async fn lock(conn: &mut Conn, operator: &str) -> Result<(), LedgerError> {
-    let application_name = match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::session_application_name(conn).await?,
-        Driver::Postgres => pbps_pg::state::session_application_name(conn).await?,
-    };
+    let engine = of(conn.driver());
+    let application_name = engine.session_application_name(conn).await?;
     let host = crate::host_name();
     let ci_job = crate::ci_job();
     let holder = pbps_db::LockHolder {
@@ -491,24 +505,15 @@ pub async fn lock(conn: &mut Conn, operator: &str) -> Result<(), LedgerError> {
         application_name: &application_name,
     }
     .render();
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::lock(conn, &holder).await,
-        Driver::Postgres => pbps_pg::state::lock(conn, &holder).await,
-    }
+    engine.lock(conn, &holder).await
 }
 
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::unlock(conn).await,
-        Driver::Postgres => pbps_pg::state::unlock(conn).await,
-    }
+    of(conn.driver()).unlock(conn).await
 }
 
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::lock_holder(conn).await,
-        Driver::Postgres => pbps_pg::state::lock_holder(conn).await,
-    }
+    of(conn.driver()).lock_holder(conn).await
 }
 
 /// Renders a failed deployment's error chain the way anything written
@@ -705,26 +710,9 @@ pub fn truncate_reason(driver: Driver, text: &str) -> String {
 // The catalog
 // ---------------------------------------------------------------------------
 
-/// Where a catalog read runs, which the command knows and no engine can
-/// guess from the connection alone.
-///
-/// The two engines differ here in a way the seam had to learn from a live
-/// run (DECISIONS 418): SQL Server reads its catalog the same way inside and
-/// outside a transaction, and PostgreSQL's pull takes a transaction of its
-/// own and refuses to be asked inside somebody else's (253) — while the
-/// apply's read-back *must* run inside the transaction that built what it
-/// reads (147). So the command says which it is, and a mismatch is refused by
-/// the engine that can tell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Read {
-    /// Outside any transaction. PostgreSQL takes its own `REPEATABLE READ
-    /// READ ONLY` snapshot for it and refuses if one is open.
-    Snapshot,
-    /// Inside the transaction this command opened for a plan's statements, to
-    /// record what they built before it commits. PostgreSQL reads under a
-    /// savepoint and refuses if no transaction is open.
-    InsideOwnTransaction,
-}
+// The enum moved to `pbps-db` with the trait whose methods take it; callers
+// keep spelling it `engine::Read`.
+pub use pbps_db::engine::Read;
 
 /// A PostgreSQL closing catalog view is one statement, while declared rows
 /// are read separately. Revalidate their managed projection before recording.
@@ -736,13 +724,7 @@ pub fn needs_readback_revalidation(driver: Driver, read: Read) -> bool {
 }
 
 pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> {
-    match (conn.driver(), read) {
-        (Driver::Mssql, _) => pbps_mssql::catalog::introspect(conn).await,
-        (Driver::Postgres, Read::Snapshot) => pbps_pg::catalog::introspect(conn).await,
-        (Driver::Postgres, Read::InsideOwnTransaction) => {
-            pbps_pg::catalog::introspect_within_transaction(conn).await
-        }
-    }
+    of(conn.driver()).introspect(conn, read).await
 }
 
 /// The connected database's default collation, where the engine's model has
@@ -941,15 +923,9 @@ pub async fn read_rows(
     scopes: &BTreeMap<TableName, RowScope>,
     read: Read,
 ) -> Result<ObservedRows, RowsError> {
-    match (conn.driver(), read) {
-        (Driver::Mssql, _) => pbps_mssql::catalog::read_rows(conn, schema, scopes).await,
-        (Driver::Postgres, Read::Snapshot) => {
-            pbps_pg::catalog::read_rows(conn, schema, scopes).await
-        }
-        (Driver::Postgres, Read::InsideOwnTransaction) => {
-            pbps_pg::catalog::read_rows_within_transaction(conn, schema, scopes).await
-        }
-    }
+    of(conn.driver())
+        .read_rows(conn, schema, scopes, read)
+        .await
 }
 
 /// Every declared value the engine would not read back as written, and every
@@ -3998,37 +3974,6 @@ pub async fn check_module_rebuilds(
                 message: format!("{} module rebuild(s) checked for catalog state a replacement cannot preserve", rebuilt.len()),
             })
         }
-    }
-}
-
-/// Complete physical evidence for future table-root expansion; this grants no admission.
-#[allow(
-    dead_code,
-    reason = "PR2c consumes these facts; PR4 alone grants admission"
-)]
-pub async fn catalog_dependents(
-    conn: &mut Conn,
-    root: &pbps_diff::order::catalog::graph::Root,
-    source: pbps_diff::Side<'_>,
-) -> anyhow::Result<pbps_diff::order::catalog::graph::Catalog> {
-    anyhow::ensure!(
-        conn.driver() == Driver::Postgres,
-        "{root:?}: complete dependency evidence requires PostgreSQL; SQL Server rebuild is refused"
-    );
-    Ok(pbps_pg::modules::dependencies::collect(conn, root, source).await?)
-}
-
-/// Complete naming domains for a rebuild, never a permissive offline default.
-#[allow(dead_code)] // PR2c.2b.2 connects this seam; admission stays refused.
-pub async fn rebuild_names(
-    conn: &mut Conn,
-    schemas: &std::collections::BTreeSet<String>,
-) -> anyhow::Result<pbps_diff::order::catalog::graph::Naming> {
-    match conn.driver() {
-        Driver::Postgres => Ok(pbps_pg::partition_index::collect_names(conn, schemas).await?),
-        Driver::Mssql => anyhow::bail!(
-            "rebuild namespace occupancy requires PostgreSQL; SQL Server rebuild is refused"
-        ),
     }
 }
 
