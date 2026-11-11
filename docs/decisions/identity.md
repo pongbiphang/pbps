@@ -1582,19 +1582,30 @@ does not model, and macOS, which CI does not run.
 
 <a id="dec-2817-1"></a>
 
-**DEC-2817.1. Names the identity write makes for itself are fixed stems and a counter, a long dropped object's aside is hashed, only "not found" means absent, and a write that fails before its first placed file undoes everything.**
+**DEC-2817.1. Names the identity write makes for itself are a fixed stem, a counter and a digest of the entry's name, a long dropped object's aside is hashed, only "not found" means absent, and a write that fails before its first placed file undoes everything.**
 Four rules, one per cause (#2806, #2816, #2817).
 
 - **Transient names are not derived from the destination.** A staging file, a
-  set-aside and the middle name of a respelling are `.pbps-tmp<n>`,
-  `.pbps-aside<n>` and `.pbps-respell<n>.json`, in the destination's directory.
-  A name built by adding to a declaration's mirror (`.<name>.respell.json`)
-  passes 255 bytes for a declaration of 246 bytes or more, and the write stops
-  with "File name too long". These names only have to be unused, in that
-  directory, and, for the respelling, still read as an identity file; a stem
-  and a counter has a constant length and does all three. The counter always
-  shows. The reader's rule is unchanged (`*.json` is an identity file), so the
-  first two are still refused or skipped as before and the third is still read.
+  set-aside and the middle name of a respelling are
+  `.pbps-tmp<n>-<digest>`, `.pbps-aside<n>-<digest>` and
+  `.pbps-respell<n>-<digest>.json`, in the destination's directory. A name built
+  by adding to a declaration's mirror (`.<name>.respell.json`) passes 255 bytes
+  for a declaration of 246 bytes or more, and the write stops with "File name
+  too long". These names only have to be unused, in that directory, and, for
+  the respelling, still read as an identity file; a stem and a counter has a
+  constant length and does all three. The counter always shows. The digest is
+  the first 16 hex characters of the SHA-256 of the kind and the raw file name
+  of the entry the name is made for (the destination, the entry set aside, the
+  source of a respelling). Without it every destination in a directory would
+  get `.pbps-tmp0`, and two writes of different files at the same time would
+  both see it absent, write it, and one would rename the other's bytes into its
+  own file; on `master` the name carried the destination's own, so only two
+  writes of the same file could share one. The digest keeps that, at a constant
+  length, and `<n>` still tells apart names taken on disk or in the write. Two
+  writes of the same file are still not told apart; that was so before and is
+  not closed here. The reader's rule is unchanged (`*.json` is an identity
+  file), so the first two are still refused or skipped as before and the third
+  is still read.
 - **A dropped object's aside is bounded like `pull`'s names.** When
   `<object name>.<uid>.json` would pass 240 bytes (the budget of
   `declaration_file`), the name is `~pbps-<hash>.<uid>.json`, with the hash of

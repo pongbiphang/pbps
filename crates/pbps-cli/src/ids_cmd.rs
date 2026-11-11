@@ -110,16 +110,25 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
 }
 
 /// A name beside `path` for a temp file, an aside or a respelling step
-/// (`.pbps-<kind>0`, then `.pbps-<kind>1`, ...) that nothing uses: not on disk,
-/// and not in `reserved`, the planned destinations and their ancestors, which a
-/// later step of the same write may still create. The pick is added to
-/// `reserved`. `tail` ends the name, for one the reader must still take
-/// (`.json`).
+/// (`.pbps-<kind><n>-<digest><tail>`, `n` counting from 0) that nothing uses:
+/// not on disk, and not in `reserved`, the planned destinations and their
+/// ancestors, which a later step of the same write may still create. The pick
+/// is added to `reserved`. `tail` ends the name, for one the reader must still
+/// take (`.json`).
 ///
-/// The name does not embed `path`'s own: a file name may be 255 bytes, and a
-/// name built by adding to a declaration's mirror (`.<name>.respell0.json`)
-/// passes that limit for a long one. These only have to be unused and in the
-/// same directory, so their length is constant.
+/// `digest` is the first 16 hex characters of the SHA-256 of `kind` and
+/// `path`'s file name (its raw bytes, not a lossy string). It makes the name
+/// distinct per entry: a name that was only a stem and a counter would be
+/// `.pbps-tmp0` for every destination in the directory, so two writes of
+/// different files made at the same time would both see it absent, write it,
+/// and one would rename the other's bytes into its own file. `n` is still what
+/// tells apart names that are taken on disk or in `reserved`.
+///
+/// The name does not embed `path`'s own name, only its digest, so its length
+/// is bounded whatever `path` is called: `.pbps-` (6) + `kind` + `n` (at most
+/// 20 digits) + `-` + 16 + `tail`. A file name may be 255 bytes, and a name
+/// built by adding to a declaration's mirror (`.<name>.respell0.json`) passes
+/// that limit for a long one.
 ///
 /// Only "not found" means free. A candidate that cannot be inspected (a
 /// directory without search permission, an I/O error) is an error naming it:
@@ -133,9 +142,10 @@ pub(crate) fn unused_sibling(
     key: crate::ids_store::PathKey,
 ) -> anyhow::Result<PathBuf> {
     let parent = path.parent().unwrap_or(Path::new("."));
+    let digest = name_digest(path, kind);
     let mut n = 0usize;
     loop {
-        let candidate = parent.join(format!(".pbps-{kind}{n}{tail}"));
+        let candidate = parent.join(format!(".pbps-{kind}{n}-{digest}{tail}"));
         if reserved.contains(&key.path(&candidate)) {
             n += 1;
             continue;
@@ -153,6 +163,18 @@ pub(crate) fn unused_sibling(
         }
         n += 1;
     }
+}
+
+/// The 16 hex characters that tell the transient names of different entries
+/// apart: the SHA-256 of the kind and the entry's file name as the operating
+/// system spells it. A name that is not UTF-8 is hashed as it is, so two such
+/// names do not fall together through a lossy conversion.
+fn name_digest(path: &Path, kind: &str) -> String {
+    let name = path.file_name().unwrap_or_default().as_encoded_bytes();
+    let mut digest =
+        crate::declaration_file::digest_hex(&[b"pbps-transient\0", kind.as_bytes(), b"\0", name]);
+    digest.truncate(16);
+    digest
 }
 
 /// Writes through a temporary name in the same directory, so a crash leaves

@@ -410,7 +410,7 @@ impl TreeWrite {
     ///
     /// A move can turn a file into a directory (`a.json` becomes
     /// `a.json/a.json`) or back. The old path then blocks the new one, so it
-    /// is first renamed to a sibling `.pbps-aside<n>`, which is not a `.json`
+    /// is first renamed to a sibling `.pbps-aside<n>-<digest>`, which is not a `.json`
     /// file: a crash with an aside left makes the next read refuse and name
     /// that entry, which holds the only copy of the old file and is renamed
     /// back by hand. A crash before the aside leaves the tree as it was; after
@@ -431,7 +431,8 @@ impl TreeWrite {
         let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
         // Names a temp file or an aside must not take: every planned
         // destination and each of its ancestors (a declaration may be called
-        // `.pbps-tmp0/b.yml`), on top of what already exists on disk.
+        // like the temp file of another: `.pbps-tmp0-<digest>/b.yml`), on top
+        // of what already exists on disk.
         let key = self.key;
         let mut reserved = self.reserved_names();
         for (rel, text) in &self.files {
@@ -854,8 +855,9 @@ impl Staged {
         &self.asides
     }
 
-    /// Renames `path` to an unused `.pbps-aside<n>` sibling and records the
-    /// pair.
+    /// Renames `path` to an unused `.pbps-aside<n>-<digest>` sibling (the
+    /// digest is of `path`'s name, so another entry's aside has another name)
+    /// and records the pair.
     fn set_aside(
         &mut self,
         path: &Path,

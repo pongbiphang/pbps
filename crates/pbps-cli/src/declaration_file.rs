@@ -93,11 +93,17 @@ pub(crate) const NAME_BUDGET: usize = 240;
 /// (a literal one becomes `%7E`) and the identity-tree asides replace it, so no
 /// readable name can ever occupy this namespace.
 pub(crate) fn hashed_stem(parts: &[&[u8]]) -> String {
+    format!("~pbps-{}", digest_hex(parts))
+}
+
+/// The SHA-256 of `parts` taken as one byte string, in lower-case hex (64
+/// characters). The one hasher of every name the tree derives from another.
+pub(crate) fn digest_hex(parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
     }
-    format!("~pbps-{:x}", hasher.finalize())
+    format!("{:x}", hasher.finalize())
 }
 
 fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
