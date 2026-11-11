@@ -85,6 +85,10 @@ mod of_tests {
 // here so that this file stays the one place that names an engine (#2798).
 mod collected;
 pub(crate) use collected::*;
+// What each engine is where the answer is a value, not a connected operation:
+// one `Profile` per engine, read by the functions below that need no connection
+// (#2798).
+mod profile;
 
 /// A scratch baseline may assume only package state the scratch actually holds.
 pub async fn require_scratch_extensions(
@@ -265,10 +269,7 @@ pub async fn operational_cost(
         Ok(names) => names,
         Err(error) => {
             return CostReport::Unavailable {
-                engine: match conn.driver() {
-                    Driver::Mssql => "sqlserver",
-                    Driver::Postgres => "postgres",
-                },
+                engine: profile::profile(conn.driver()).cost_report_engine,
                 reason: format!("operational_cost could not establish plan identities: {error}"),
             };
         }
@@ -700,10 +701,7 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
 /// other — because each column's width is measured the engine's way, so the
 /// cut is the engine's too.
 pub fn truncate_reason(driver: Driver, text: &str) -> String {
-    match driver {
-        Driver::Mssql => pbps_mssql::state::truncate_reason(text),
-        Driver::Postgres => pbps_pg::state::truncate_reason(text),
-    }
+    (profile::profile(driver).truncate_reason)(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -717,10 +715,8 @@ pub use pbps_db::engine::Read;
 /// A PostgreSQL closing catalog view is one statement, while declared rows
 /// are read separately. Revalidate their managed projection before recording.
 pub fn needs_readback_revalidation(driver: Driver, read: Read) -> bool {
-    matches!(
-        (driver, read),
-        (Driver::Postgres, Read::InsideOwnTransaction)
-    )
+    profile::profile(driver).revalidates_read_inside_own_transaction
+        && matches!(read, Read::InsideOwnTransaction)
 }
 
 pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> {
@@ -3459,110 +3455,22 @@ pub async fn lock_read_gap(driver: Driver, connection: &str) -> pbps_db::doctor:
 pub fn lock_remedy(driver: Driver, gap: Option<pbps_db::doctor::LockReadGap>) -> LockRemedy {
     use pbps_db::doctor::LockReadGap;
     let gap = gap.unwrap_or(LockReadGap::Unexplained);
-    let (noun, principal) = match driver {
-        Driver::Mssql => ("user", crate::report::placeholder("database user")),
-        Driver::Postgres => ("role", crate::report::placeholder("database role")),
-    };
+    let facts = profile::profile(driver);
+    let noun = facts.lock_principal_noun;
+    let principal = crate::report::placeholder(facts.lock_principal_placeholder);
     let how = format!(
         "run the remedy as a principal allowed to grant it, with {principal} (quotes \
          included) replaced by this {noun}'s name quoted as an identifier, then rerun doctor"
     );
     let next = "if the lock is still unreadable after that, doctor names the next grant";
-    match (driver, gap) {
-        (Driver::Postgres, LockReadGap::SchemaUsage) => LockRemedy {
-            why: format!(
-                "this role may not use schema {schema}, which holds the ledger; {how}; {next}",
-                schema = pbps_pg::state::LEDGER_SCHEMA
-            ),
-            statement: Some(format!(
-                "GRANT USAGE ON SCHEMA {} TO {principal};",
-                pbps_pg::state::LEDGER_SCHEMA
-            )),
-        },
-        (Driver::Postgres, LockReadGap::TableSelect) => LockRemedy {
-            why: format!(
-                "{} exists and this role may not read it; {how}",
-                pbps_pg::state::LOCK_TABLE
-            ),
-            statement: Some(format!(
-                "GRANT SELECT ON TABLE {} TO {principal};",
-                pbps_pg::state::LOCK_TABLE
-            )),
-        },
-        // Measured on 2025 RTM: without any permission on it the table is
-        // invisible, and whether it lacks only `SELECT` cannot be told. The
-        // object's own `VIEW DEFINITION` makes it visible and nothing else:
-        // the database-wide grant would also show every other schema's
-        // objects and module definitions, which the narrower grants of
-        // DECISIONS 505 keep hidden (review of #1641).
-        (Driver::Mssql, LockReadGap::Hidden) => LockRemedy {
-            why: format!(
-                "this user cannot see {table} at all, so what it lacks on it cannot be told \
-                 yet; {how}; {next}; the statement fails if {table} does not exist, and then \
-                 the database is not initialized as pbps expects",
-                table = pbps_mssql::state::LOCK_TABLE
-            ),
-            statement: Some(format!(
-                "GRANT VIEW DEFINITION ON OBJECT::{} TO {principal};",
-                pbps_mssql::state::LOCK_TABLE
-            )),
-        },
-        (Driver::Mssql, LockReadGap::TableSelect) => LockRemedy {
-            why: format!(
-                "{} exists and this user may not read it; {how}; a DENY through a role this \
-                 user is in overrides the grant, and leaves the lock unreadable",
-                pbps_mssql::state::LOCK_TABLE
-            ),
-            statement: Some(format!(
-                "GRANT SELECT ON OBJECT::{} TO {principal};",
-                pbps_mssql::state::LOCK_TABLE
-            )),
-        },
-        (Driver::Postgres, _) => LockRemedy {
-            why: format!(
-                "nothing this role can see explains it: check that the connection names the \
-                 role that deploys and that {} is intact, then rerun doctor",
-                pbps_pg::state::LOCK_TABLE
-            ),
-            statement: None,
-        },
-        (Driver::Mssql, _) => LockRemedy {
-            why: format!(
-                "nothing this user can see explains it: check what the login is mapped to in \
-                 this database and that {} is intact, then rerun doctor",
-                pbps_mssql::state::LOCK_TABLE
-            ),
-            statement: None,
-        },
-    }
+    (facts.lock_remedy)(gap, &how, next, &principal)
 }
 
 /// What to check when `doctor` could not read the account's permissions, in
 /// this engine's words. Advice, not a statement: which read failed is not
 /// carried this far, so no single grant is known to be the repair (#822).
 pub fn permission_read_advice(driver: Driver) -> String {
-    match driver {
-        Driver::Mssql => "check that this user has VIEW DEFINITION in this database and what \
-                          the login is mapped to, then rerun doctor"
-            .to_owned(),
-        // The read asks `has_*_privilege` and the system catalogs, which
-        // every role may read unless someone revoked it; the other way it
-        // fails is a connection that is not the role meant to deploy. But
-        // once the project has recorded identities (tables, columns or a
-        // tombstone), `pbps_pg::doctor::permissions` first reads the last
-        // recorded state, and that read needs the ledger's own grants: a
-        // role without them was sent to the catalogs, which were fine
-        // (#820). Named conditionally, because which read failed is not
-        // carried this far, and the table may not exist at all.
-        Driver::Postgres => format!(
-            "check that the connection names the role that deploys and that it can read the \
-             system catalogs (`pg_catalog`); once this project has recorded identities, doctor \
-             also reads its last recorded state, which needs USAGE on schema {} and, where that \
-             table exists, SELECT on {}",
-            pbps_pg::state::LEDGER_SCHEMA,
-            pbps_pg::state::STATE_TABLE
-        ),
-    }
+    (profile::profile(driver).permission_read_advice)()
 }
 
 /// Whether `strategy: online` depends on something only a connection can read.
@@ -3576,10 +3484,7 @@ pub fn permission_read_advice(driver: Driver) -> String {
 /// Telling a PostgreSQL user their plan was unverified because of an edition
 /// question their engine does not have was the defect (#1614).
 pub const fn online_depends_on_the_edition(driver: Driver) -> bool {
-    match driver {
-        Driver::Mssql => true,
-        Driver::Postgres => false,
-    }
+    profile::profile(driver).online_depends_on_the_edition
 }
 
 /// What `doctor` says when it could not read what this server can do, in this
@@ -3594,17 +3499,7 @@ pub const fn online_depends_on_the_edition(driver: Driver) -> bool {
 /// check whenever a plan is made against the server, so the message says that
 /// rather than promising a later query will answer.
 pub fn capabilities_unknown_message(driver: Driver, cause: &str) -> String {
-    match driver {
-        Driver::Mssql => format!(
-            "this server's version or edition could not be read ({cause}), so whether it \
-             accepts `CREATE OR ALTER` and online index operations is undetermined"
-        ),
-        Driver::Postgres => format!(
-            "this PostgreSQL server's version could not be read ({cause}), so doctor cannot \
-             report it; what the version decides (`MAINTAIN` grants, changing a generated \
-             column's expression) is checked again when a plan is made against this server"
-        ),
-    }
+    (profile::profile(driver).capabilities_unknown_message)(cause)
 }
 
 // ---------------------------------------------------------------------------
@@ -3618,20 +3513,7 @@ pub fn capabilities_unknown_message(driver: Driver, cause: &str) -> String {
 /// neither `carried` nor a note of its own beyond the one about what no
 /// catalog can see, which it says only under an advisory list, as before.
 pub fn impact_notes(driver: Driver, report: &ImpactReport) -> Vec<String> {
-    match driver {
-        Driver::Mssql => {
-            if report.advisory.is_empty() {
-                Vec::new()
-            } else {
-                vec![
-                    "Nothing outside the database is visible here: applications and \
-                     downstream consumers need a human's checklist."
-                        .to_owned(),
-                ]
-            }
-        }
-        Driver::Postgres => pbps_pg::impact::notes(report),
-    }
+    (profile::profile(driver).impact_notes)(report)
 }
 
 /// Every rename in a plan, as the objects they are renamed *from* — the name
