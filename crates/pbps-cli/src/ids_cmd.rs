@@ -14,7 +14,7 @@ use clap::Subcommand;
 use pbps_config::{Config, Project};
 use pbps_load::{DeclaredPaths, Loaded, load_schema_dir, read_ids_tree};
 use pbps_model::diagnostic::Declaration as Source;
-use pbps_model::ids_check::{self, Declaration, Input, Layout};
+use pbps_model::ids_check::{self, Declaration, Input, Layout, Mirror};
 use pbps_model::ids_merge::{self, YamlView};
 use pbps_model::ids_tree::{self, Placement};
 use pbps_model::{IdsFile, Intent, Uid, UidKind};
@@ -86,10 +86,18 @@ impl Dirs {
             ids_dir: &self.ids,
         }
     }
-    /// The ids path (relative to the ids directory) of a declaration file.
+    /// The ids path (relative to the ids directory) of a declaration file. A
+    /// declaration whose identity file name would not fit is refused here, with
+    /// the facts `validate` reports for it, before any command writes
+    /// (DEC-2817.2).
     pub(crate) fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
-        ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema))
-            .with_context(|| format!("`{rel_yaml}` is not a .yml or .yaml declaration"))
+        match ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema)) {
+            Mirror::Fits(path) => Ok(path),
+            Mirror::TooLong(e) => bail!("{e}; {}", e.remedy()),
+            Mirror::NotDeclaration => {
+                bail!("`{rel_yaml}` is not a .yml or .yaml declaration")
+            }
+        }
     }
 }
 
@@ -109,32 +117,72 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
     Ok((loaded, paths))
 }
 
-/// A name beside `path` for a temp file or an aside (`.<name>.<kind>`, then
-/// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
-/// `reserved`, the planned destinations and their ancestors, which a later step
-/// of the same write may still create. The pick is added to `reserved`.
-/// `tail` ends the name, for one the reader must still take (`.json`).
+/// A name beside `path` for a temp file, an aside or a respelling step
+/// (`.pbps-<kind><n>-<digest><tail>`, `n` counting from 0) that nothing uses:
+/// not on disk, and not in `reserved`, the planned destinations and their
+/// ancestors, which a later step of the same write may still create. The pick
+/// is added to `reserved`. `tail` ends the name, for one the reader must still
+/// take (`.json`).
+///
+/// `digest` is the first 16 hex characters of the SHA-256 of `kind` and
+/// `path`'s file name (its raw bytes, not a lossy string). It makes the name
+/// distinct per entry: a name that was only a stem and a counter would be
+/// `.pbps-tmp0` for every destination in the directory, so two writes of
+/// different files made at the same time would both see it absent, write it,
+/// and one would rename the other's bytes into its own file. `n` is still what
+/// tells apart names that are taken on disk or in `reserved`.
+///
+/// The name does not embed `path`'s own name, only its digest, so its length
+/// is bounded whatever `path` is called: `.pbps-` (6) + `kind` + `n` (at most
+/// 20 digits) + `-` + 16 + `tail`. A file name may be 255 bytes, and a name
+/// built by adding to a declaration's mirror (`.<name>.respell0.json`) passes
+/// that limit for a long one.
+///
+/// Only "not found" means free. A candidate that cannot be inspected (a
+/// directory without search permission, an I/O error) is an error naming it:
+/// reading it as unused would send the write on to a create or rename that
+/// fails for the same reason, or worse, onto an entry nobody looked at.
 pub(crate) fn unused_sibling(
     path: &Path,
     kind: &str,
     tail: &str,
     reserved: &mut BTreeSet<String>,
     key: crate::ids_store::PathKey,
-) -> PathBuf {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
+) -> anyhow::Result<PathBuf> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    let mut n = 0;
+    let digest = name_digest(path, kind);
+    let mut n = 0usize;
     loop {
-        let suffix = if n == 0 { String::new() } else { n.to_string() };
-        let candidate = parent.join(format!(".{name}.{kind}{suffix}{tail}"));
-        if !reserved.contains(&key.path(&candidate))
-            && std::fs::symlink_metadata(&candidate).is_err()
+        let candidate = parent.join(format!(".pbps-{kind}{n}-{digest}{tail}"));
+        if reserved.contains(&key.path(&candidate)) {
+            n += 1;
+            continue;
+        }
+        // Only "not found" means free (`ids_store::entry`): a candidate that
+        // cannot be looked at is an error naming it, since reading it as unused
+        // would send the write on to a create or rename that fails for the
+        // same reason, or onto an entry nobody looked at.
+        if crate::ids_store::entry(&candidate)
+            .with_context(|| format!("cannot choose a name for a {kind} file"))?
+            .is_none()
         {
             reserved.insert(key.path(&candidate));
-            return candidate;
+            return Ok(candidate);
         }
         n += 1;
     }
+}
+
+/// The 16 hex characters that tell the transient names of different entries
+/// apart: the SHA-256 of the kind and the entry's file name as the operating
+/// system spells it. A name that is not UTF-8 is hashed as it is, so two such
+/// names do not fall together through a lossy conversion.
+fn name_digest(path: &Path, kind: &str) -> String {
+    let name = path.file_name().unwrap_or_default().as_encoded_bytes();
+    let mut digest =
+        crate::declaration_file::digest_hex(&[b"pbps-transient\0", kind.as_bytes(), b"\0", name]);
+    digest.truncate(16);
+    digest
 }
 
 /// Writes through a temporary name in the same directory, so a crash leaves
@@ -142,7 +190,7 @@ pub(crate) fn unused_sibling(
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default());
+    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default())?;
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
     let result = std::fs::write(&tmp, text)
@@ -275,7 +323,17 @@ pub(crate) fn aside(was: &str, uid: &Uid) -> String {
         || numbered("com")
         || numbered("lpt");
     let guard = if device { "_" } else { "" };
-    format!("{guard}{safe}.{uid}.json")
+    let readable = format!("{guard}{safe}.{uid}.json");
+    // The same limit and fallback as `pull`'s declaration names: an object name
+    // near 255 bytes would otherwise name a file the filesystem refuses. The
+    // uid keeps the hashed name unique and the reader takes a file by its
+    // content, so the name carries no meaning. `~` is not in `safe`'s alphabet
+    // (it becomes `_`), so no readable name can take a hashed one.
+    if readable.len() <= crate::declaration_file::NAME_BUDGET {
+        return readable;
+    }
+    let stem = crate::declaration_file::hashed_stem(&[was.as_bytes(), b"\0aside"]);
+    format!("{stem}.{uid}.json")
 }
 
 /// Where the declarations say each identity lives: the mirrored path of the
@@ -676,7 +734,7 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
     // shows here as findings, with `pbps plan` as the remedy.
     let tree = read_tree(project)?;
     let declared = declarations(&dirs, &loaded, &paths);
-    let legacy = std::fs::symlink_metadata(project.ids_file()).is_ok();
+    let legacy = crate::ids_store::legacy_present(project)?;
     let findings = ids_check::check(&Input {
         layout: dirs.layout(),
         declared: &declared,

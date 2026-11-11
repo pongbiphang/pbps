@@ -38,7 +38,7 @@ use crate::ids_cmd::{Dirs, declared_placement, new_config_text, shown, write_ato
 
 // ------------------------------------------------------------------ read ----
 
-fn legacy_present(project: &Project) -> anyhow::Result<bool> {
+pub(crate) fn legacy_present(project: &Project) -> anyhow::Result<bool> {
     let path = project.ids_file();
     match std::fs::symlink_metadata(&path) {
         Ok(_) => Ok(true),
@@ -410,100 +410,93 @@ impl TreeWrite {
     ///
     /// A move can turn a file into a directory (`a.json` becomes
     /// `a.json/a.json`) or back. The old path then blocks the new one, so it
-    /// is first renamed to a sibling `.<name>.aside`, which is not a `.json`
+    /// is first renamed to a sibling `.pbps-aside<n>-<digest>`, which is not a `.json`
     /// file: a crash with an aside left makes the next read refuse and name
     /// that entry, which holds the only copy of the old file and is renamed
     /// back by hand. A crash before the aside leaves the tree as it was; after
     /// the new files are in place it leaves both copies; the aside is deleted
     /// together with the removals, last.
     pub(crate) fn apply(&self) -> anyhow::Result<()> {
-        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
-        let mut asides: Vec<(PathBuf, PathBuf)> = Vec::new();
-        // Every directory this write creates, outermost first: only those are
-        // taken away again on a failure.
-        let mut created: Vec<PathBuf> = Vec::new();
+        let mut staged = Staged::default();
+        let result = self.stage_and_place(&mut staged);
+        staged.settle(result)
+    }
+
+    /// The body of [`apply`](Self::apply). Everything it stages is recorded in
+    /// `staged`, which takes it away again if this returns an error before the
+    /// first file is placed, and takes away only what is still pending after it.
+    /// Nothing here undoes anything, so a `?` added later cannot skip the undo.
+    fn stage_and_place(&self, staged: &mut Staged) -> anyhow::Result<()> {
+        // Each temp file and the destination it is renamed to.
+        let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
         // Names a temp file or an aside must not take: every planned
         // destination and each of its ancestors (a declaration may be called
-        // `.a.json.tmp/b.yml`), on top of what already exists on disk.
+        // like the temp file of another: `.pbps-tmp0-<digest>/b.yml`), on top
+        // of what already exists on disk.
         let key = self.key;
         let mut reserved = self.reserved_names();
-        let result = (|| -> anyhow::Result<()> {
-            for (rel, text) in &self.files {
-                let path = self.dir.join(rel);
-                let parent = path.parent().unwrap_or(Path::new("."));
-                // An ancestor that is a file today is about to be a directory.
-                let mut ancestor = self.dir.clone();
-                for part in Path::new(rel)
-                    .parent()
-                    .into_iter()
-                    .flat_map(Path::components)
-                {
-                    ancestor.push(part);
-                    if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| !m.is_dir()) {
-                        set_aside(&ancestor, &mut asides, &mut reserved, key)?;
-                    }
+        for (rel, text) in &self.files {
+            let path = self.dir.join(rel);
+            let parent = path.parent().unwrap_or(Path::new("."));
+            // An ancestor that is a file today is about to be a directory.
+            let mut ancestor = self.dir.clone();
+            for part in Path::new(rel)
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+            {
+                ancestor.push(part);
+                if entry(&ancestor)?.is_some_and(|m| !m.is_dir()) {
+                    staged.set_aside(&ancestor, &mut reserved, key)?;
                 }
-                let mut missing: Vec<PathBuf> = parent
-                    .ancestors()
-                    // Raw is right: `parent` was built by joining onto `self.dir`.
-                    .take_while(|d| d.starts_with(&self.dir) && !d.exists())
-                    .map(Path::to_path_buf)
-                    .collect();
-                missing.reverse();
-                created.extend(missing);
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot create `{}`", parent.display()))?;
-                let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", "", &mut reserved, key);
-                // Recorded before the write: `write` can create the file and
-                // then fail (no space, an I/O error), and the rollback must
-                // find what the call may have left.
-                staged.push((tmp.clone(), path));
-                write_staged(&tmp, text)
-                    .with_context(|| format!("cannot write `{}`", tmp.display()))?;
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            // Back to the tree as it was: the temp files, then the directories
-            // this write created (they are empty by then), then the asides.
-            return Err(match roll_back(&staged, &created, &asides) {
-                Ok(()) => e,
-                Err(left) => e.context(left),
-            });
+            let mut missing: Vec<PathBuf> = Vec::new();
+            // Raw is right: `parent` was built by joining onto `self.dir`.
+            for d in parent.ancestors().take_while(|d| d.starts_with(&self.dir)) {
+                // A link is followed, as `exists` did: a symlink to a
+                // directory is a directory this write does not create.
+                if followed(d)?.is_some() {
+                    break;
+                }
+                missing.push(d.to_path_buf());
+            }
+            missing.reverse();
+            // Recorded before the create: `create_dir_all` can make some of
+            // them and then fail.
+            staged.created(missing);
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create `{}`", parent.display()))?;
+            let tmp = crate::ids_cmd::unused_sibling(&path, "tmp", "", &mut reserved, key)?;
+            // Recorded before the write: `write` can create the file and then
+            // fail (no space, an I/O error), and the undo must find what the
+            // call may have left.
+            staged.temp(&tmp);
+            files.push((tmp.clone(), path));
+            write_staged(&tmp, text)
+                .with_context(|| format!("cannot write `{}`", tmp.display()))?;
         }
-        for (tmp, path) in &staged {
+        for (tmp, path) in &files {
             // A directory the new file takes the place of (a move the other
             // way round).
-            let mut displaced = None;
-            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-                set_aside(path, &mut asides, &mut reserved, key)?;
-                displaced = asides.last().cloned();
+            if entry(path)?.is_some_and(|m| m.is_dir()) {
+                staged.set_aside(path, &mut reserved, key)?;
             }
-            if let Err(e) = std::fs::rename(tmp, path) {
-                let e =
-                    anyhow::Error::new(e).context(format!("cannot replace `{}`", path.display()));
-                // The files placed so far stay (both copies of what moved, as
-                // after a crash); the rest of the temp files go, and the
-                // directory this file was to replace is put back.
-                let pending: Vec<_> = staged
-                    .iter()
-                    // Raw is right: `tmp` is this very generated path, not a spelling of it.
-                    .skip_while(|(t, _)| t != tmp)
-                    .cloned()
-                    .collect();
-                let back: Vec<_> = displaced.into_iter().collect();
-                return Err(match roll_back(&pending, &[], &back) {
-                    Ok(()) => e,
-                    Err(left) => e.context(left),
-                });
-            }
+            std::fs::rename(tmp, path)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("cannot replace `{}`", path.display()))?;
+            // From here the file stays whatever follows (both copies of what
+            // moved, as after a crash); the rest of the temp files go, and the
+            // directory the next file was to replace is put back.
+            staged.placed(tmp);
         }
-        let placed: Vec<&PathBuf> = staged.iter().map(|(_, path)| path).collect();
+        staged.commit();
+        let placed: Vec<&PathBuf> = files.iter().map(|(_, path)| path).collect();
+        let asides = staged.asides();
         for rel in &self.removals {
             // What was set aside is removed where it went. The aside was made
             // under the spelling of the new path, the removal carries the old
             // one: they are compared by key.
-            let path = redirected(&self.dir.join(rel), &asides, key);
+            let path = redirected(&self.dir.join(rel), asides, key);
             // A path that is the very file this write just placed is not an old
             // copy. The plan never removes a path with the key of one it
             // places; this asks the filesystem about the aliases the key does
@@ -523,15 +516,22 @@ impl TreeWrite {
         // empty directories: that is nothing to account for, so it goes. What
         // is left of anything else stays and is reported below. One place
         // decides it, so no caller has to know the shape.
-        for (_, aside) in &asides {
-            if std::fs::symlink_metadata(aside).is_ok_and(|m| m.is_dir()) {
+        for (_, aside) in asides {
+            if entry(aside)?.is_some_and(|m| m.is_dir()) {
                 remove_empty_tree(aside)
                     .with_context(|| format!("cannot inspect `{}`", aside.display()))?;
             }
         }
         // An aside nothing removed holds a file the write did not account for:
         // keep it, and say where it is.
-        if let Some((orig, aside)) = asides.iter().find(|(_, a)| a.exists()) {
+        let mut left = None;
+        for (orig, aside) in asides {
+            if entry(aside)?.is_some() {
+                left = Some((orig, aside));
+                break;
+            }
+        }
+        if let Some((orig, aside)) = left {
             bail!(
                 "`{}` was moved aside to `{}` and holds something this write did not remove; \
                  check it and delete or restore it",
@@ -602,7 +602,7 @@ impl TreeWrite {
                 continue;
             }
             let from = parent.join(found);
-            let via = crate::ids_cmd::unused_sibling(&from, "respell", ".json", reserved, key);
+            let via = crate::ids_cmd::unused_sibling(&from, "respell", ".json", reserved, key)?;
             rename_through(&from, &via, &wanted)?;
             eprintln!(
                 "note: `{}` is now spelled `{}`, as its declaration is",
@@ -659,6 +659,32 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
             )),
         }
     })
+}
+
+/// What `path` is, not followed through a link, or `None` when the filesystem
+/// says it is not there. Only "not found" means absent: an entry that cannot be
+/// looked at (a directory above it without search permission, an I/O error) is
+/// an error naming it, never "nothing there". A write that read it as absent
+/// would go on to create or rename over something nobody saw.
+pub(crate) fn entry(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    absent_is_none(std::fs::symlink_metadata(path), path)
+}
+
+/// [`entry`] through a link: what a link points at, `None` for a link whose
+/// target is not there.
+fn followed(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    absent_is_none(std::fs::metadata(path), path)
+}
+
+fn absent_is_none(
+    found: std::io::Result<std::fs::Metadata>,
+    path: &Path,
+) -> anyhow::Result<Option<std::fs::Metadata>> {
+    match found {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect `{}`", path.display())),
+    }
 }
 
 /// Removes the directories `path` sat in, from the nearest up, while they are
@@ -765,17 +791,168 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Owns what one write has staged and takes it away again when it is dropped
+/// unless [`commit`](Self::commit) was called: the temp files, the directories
+/// the write created, the entries it moved aside and, for `init`, the claim on
+/// a directory. An early return cannot skip the undo, because there is no call
+/// to forget (#2806: two `?` between "something is staged" and "the write is
+/// whole" returned without one).
+///
+/// The write has two stages. Until the first file is placed everything is
+/// undone. After it the placed files stay (both copies of what moved, as after
+/// a crash, and the next read names the duplicate), so [`placed`](Self::placed)
+/// moves the directories and asides made so far out of reach of the undo, and
+/// only what is still pending is undone.
+#[derive(Default)]
+pub(crate) struct Staged {
+    /// Temp files, from the moment they may exist.
+    temps: Vec<PathBuf>,
+    /// Directories this write created, outermost first.
+    created: Vec<PathBuf>,
+    /// `(original, aside)`: what was renamed out of the way.
+    asides: Vec<(PathBuf, PathBuf)>,
+    /// A directory created to claim it, removed with whatever it then holds.
+    claim: Option<PathBuf>,
+    /// How many of `created` and `asides` the last placed file made permanent.
+    kept_created: usize,
+    kept_asides: usize,
+    /// Set once the write is whole or the undo ran; the drop then does nothing.
+    settled: bool,
+}
+
+impl Staged {
+    /// A temp file the write is about to create.
+    pub(crate) fn temp(&mut self, tmp: &Path) {
+        self.temps.push(tmp.to_owned());
+    }
+
+    /// Directories the write is about to create, outermost first.
+    pub(crate) fn created(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
+        self.created.extend(dirs);
+    }
+
+    /// The directory the write is about to create to claim a place.
+    pub(crate) fn claim(&mut self, dir: &Path) {
+        self.claim = Some(dir.to_owned());
+    }
+
+    /// `tmp` has been renamed to its destination: it is no longer pending, and
+    /// what was made before it stays.
+    fn placed(&mut self, tmp: &Path) {
+        // Raw is right: `tmp` is this very generated path, not a spelling of it.
+        self.temps.retain(|t| t != tmp);
+        self.kept_created = self.created.len();
+        self.kept_asides = self.asides.len();
+    }
+
+    /// The write is whole: nothing is undone any more.
+    pub(crate) fn commit(&mut self) {
+        self.settled = true;
+    }
+
+    /// The pairs set aside so far, in order.
+    fn asides(&self) -> &[(PathBuf, PathBuf)] {
+        &self.asides
+    }
+
+    /// Renames `path` to an unused `.pbps-aside<n>-<digest>` sibling (the
+    /// digest is of `path`'s name, so another entry's aside has another name)
+    /// and records the pair.
+    fn set_aside(
+        &mut self,
+        path: &Path,
+        reserved: &mut BTreeSet<String>,
+        key: PathKey,
+    ) -> anyhow::Result<()> {
+        let aside = crate::ids_cmd::unused_sibling(path, "aside", "", reserved, key)?;
+        rename_aside(path, &aside).with_context(|| aside_context(path))?;
+        self.asides.push((path.to_owned(), aside));
+        Ok(())
+    }
+
+    /// Ends the write with `result`: a success commits, a failure is undone and
+    /// carries what the undo could not take away, so the caller sees both.
+    pub(crate) fn settle<T>(mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match result {
+            Ok(value) => {
+                self.commit();
+                Ok(value)
+            }
+            Err(error) => Err(match self.undo() {
+                Ok(()) => error,
+                Err(left) => error.context(left),
+            }),
+        }
+    }
+
+    /// Takes away what is still pending, once.
+    fn undo(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.settled, true) {
+            return Ok(());
+        }
+        let mut left = Vec::new();
+        if let Err(e) = roll_back(
+            &self.temps,
+            &self.created[self.kept_created..],
+            &self.asides[self.kept_asides..],
+        ) {
+            left.push(e);
+        }
+        // Last: nothing else can reach the claimed place while the rest is undone.
+        if let Some(dir) = self.claim.take()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            left.push(format!("could not remove `{}`: {e}", dir.display()));
+        }
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(left.join("; "))
+        }
+    }
+}
+
+/// A backstop for an owner that was dropped without settling (a panic): the
+/// write is undone, and what could not be is said on stderr, as there is no
+/// caller to hand it to.
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Err(left) = self.undo() {
+            eprintln!("error: {left}");
+        }
+    }
+}
+
+/// Renames one entry out of the way. Under test a fault can be armed
+/// (`tests::fail_set_aside_number`) that fails the rename, as a permission or
+/// I/O error would; no permission bit makes a same-directory rename fail.
+fn rename_aside(path: &Path, aside: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::set_aside_fault_now() {
+        return Err(std::io::Error::other("injected: cannot rename"));
+    }
+    std::fs::rename(path, aside)
+}
+
+fn aside_context(path: &Path) -> String {
+    format!(
+        "cannot move `{}` aside to make room for the identity file that takes its place",
+        path.display()
+    )
+}
+
 /// Undoes a write that failed part-way: removes the temp files and the
 /// directories the write created (innermost first, and only if empty), then
 /// renames each aside back. A step that cannot be undone is not ignored: the
 /// error says what is left where, which is what the next read's refusal names.
 fn roll_back(
-    staged: &[(PathBuf, PathBuf)],
+    temps: &[PathBuf],
     created: &[PathBuf],
     asides: &[(PathBuf, PathBuf)],
 ) -> Result<(), String> {
     let mut left = Vec::new();
-    for (tmp, _) in staged {
+    for tmp in temps {
         if let Err(e) = std::fs::remove_file(tmp)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -806,24 +983,6 @@ fn roll_back(
             left.join("; ")
         ))
     }
-}
-
-/// Renames `path` to an unused `.<name>.aside` sibling and records the pair.
-fn set_aside(
-    path: &Path,
-    asides: &mut Vec<(PathBuf, PathBuf)>,
-    reserved: &mut BTreeSet<String>,
-    key: PathKey,
-) -> anyhow::Result<()> {
-    let aside = crate::ids_cmd::unused_sibling(path, "aside", "", reserved, key);
-    std::fs::rename(path, &aside).with_context(|| {
-        format!(
-            "cannot move `{}` aside to make room for the identity file that takes its place",
-            path.display()
-        )
-    })?;
-    asides.push((path.to_owned(), aside));
-    Ok(())
 }
 
 /// What the tree on disk holds, by uid.

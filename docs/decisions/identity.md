@@ -1579,3 +1579,94 @@ maintainer chose the respelling.
 
 Not covered: two names that differ only in Unicode normalisation, which the key
 does not model, and macOS, which CI does not run.
+
+<a id="dec-2817-1"></a>
+
+**DEC-2817.1. Names the identity write makes for itself are a fixed stem, a counter and a digest of the entry's name, a long dropped object's aside is hashed, only "not found" means absent, and a write that fails before its first placed file undoes everything.**
+Four rules, one per cause (#2806, #2816, #2817).
+
+- **Transient names are not derived from the destination.** A staging file, a
+  set-aside and the middle name of a respelling are
+  `.pbps-tmp<n>-<digest>`, `.pbps-aside<n>-<digest>` and
+  `.pbps-respell<n>-<digest>.json`, in the destination's directory. A name built
+  by adding to a declaration's mirror (`.<name>.respell.json`) passes 255 bytes
+  for a declaration of 246 bytes or more, and the write stops with "File name
+  too long". These names only have to be unused, in that directory, and, for
+  the respelling, still read as an identity file; a stem and a counter has a
+  constant length and does all three. The counter always shows. The digest is
+  the first 16 hex characters of the SHA-256 of the kind and the raw file name
+  of the entry the name is made for (the destination, the entry set aside, the
+  source of a respelling). Without it every destination in a directory would
+  get `.pbps-tmp0`, and two writes of different files at the same time would
+  both see it absent, write it, and one would rename the other's bytes into its
+  own file; on `master` the name carried the destination's own, so only two
+  writes of the same file could share one. The digest keeps that, at a constant
+  length, and `<n>` still tells apart names taken on disk or in the write. Two
+  writes of the same file are still not told apart; that was so before and is
+  not closed here. The reader's rule is unchanged (`*.json` is an identity
+  file), so the first two are still refused or skipped as before and the third
+  is still read.
+- **A dropped object's aside is bounded like `pull`'s names.** When
+  `<object name>.<uid>.json` would pass 240 bytes (the budget of
+  `declaration_file`), the name is `~pbps-<hash>.<uid>.json`, with the hash of
+  the object's last name and a tag, from the helper `declaration_file` uses.
+  `~` is outside the characters an aside keeps (it becomes `_`), so no readable
+  name can take a hashed one. Files are paired with their object by the uid
+  inside, never by name (SPEC §4.2), so the readable name is a courtesy, not a
+  key. Ordinary names keep today's aside names, so no existing tree is renamed.
+- **Only "not found" means absent.** `ids_store::entry` is the one look at an
+  entry: `NotFound` is `None`, any other error is returned naming the path.
+  `unused_sibling` and the sites of the write that ask whether an entry is a
+  file or a directory use it. Reading an entry that could not be looked at as
+  "nothing there" sends the write on to a create or rename over something
+  nobody saw. A symlink is followed only where it was (the directories the
+  write has to create).
+- **A write has one owner for what it staged.** `Staged` undoes the temp files,
+  the directories the write created, the asides and, for `init`, the claim when
+  it is dropped unless the write was committed, so an early return cannot skip
+  the undo. The rule it enforces: until the first file is placed everything is
+  undone, including the asides and the created directories; after it, the
+  placed files stay (both copies of what moved, as after a crash) and only what
+  is still pending is undone. The first part is a change: a failure of the
+  first rename used to leave the asides and the created directories made
+  before it, and now puts the tree back as it was.
+
+A `.yml` declaration whose own name is at the limit has no mirror of the same
+stem (`<stem>.json` is one byte longer than `<stem>.yml`); DEC-2817.2 decides it.
+
+<a id="dec-2817-2"></a>
+
+**DEC-2817.2. A declaration whose identity file name would not fit is refused, with the file and the limit named; the mirror is never hashed.**
+`<stem>.yml` mirrors to `<stem>.json`, one unit longer, so a `.yml` declaration
+whose own name is at the limit (a 251-byte ASCII stem, a 255-byte name) has a
+256-byte mirror. `.yaml` is as long as `.json` and is never affected. Only the
+last path component counts; a long directory path is not a long file name.
+
+- **Refused, not renamed.** `ids_check::mirrored` is the one derivation and
+  returns three outcomes apart: not a declaration, a mirror that fits, a mirror
+  that does not (`NameTooLong`). `validate` reports the last as
+  `ids.name-too-long` on the declaration, and `Dirs::mirrored` returns the same
+  words as an error, so `plan` and every other command that places an identity file
+  stop before they write anything. Both say how long the identity file's name would be, the
+  limit and how much shorter the declaration's file name has to be.
+- **Why not a hashed mirror name.** The rule "the identity file mirrors the
+  declaration" stays literal: a reader, a reviewer and a merge find a file by
+  its declaration's name. The user gets a named remedy instead of the operating
+  system's "File name too long". And a refusal can be relaxed later without
+  breaking a project, while a project that has been given a hashed name cannot
+  have it taken back.
+- **Counted as the file system counts.** The limit is 255 (`NAME_LIMIT`, the
+  common file systems), in bytes, except on Windows, where it is UTF-16 code
+  units: NTFS stores names that way, so counting bytes there would refuse a
+  non-ASCII name it accepts, which is a valid project. The file system is not
+  probed.
+- **`validate` runs the tree check with no tree yet.** The checks that need only
+  the declarations (this one, a path two declarations share) used to wait for
+  `plan` to write the first identity file, so `validate` called a project valid
+  that `plan` then refused.
+- **Not covered.** A file system with a lower limit (eCryptfs, 143 bytes) still
+  answers with its own error; this rule does not know of it.
+
+Pinned by the 251, 250 and `.yaml` cases in `pbps-model`, the unit-counting test
+under each platform, and the CLI test that plans a 250-byte stem and refuses a
+251-byte one.

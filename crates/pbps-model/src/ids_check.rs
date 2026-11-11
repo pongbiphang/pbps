@@ -36,6 +36,9 @@ pub enum Code {
     LegacyLayout,
     LegacyBesideTree,
     NotCanonical,
+    /// A declaration whose identity file name would pass the file system's
+    /// limit (DEC-2817.2).
+    NameTooLong,
     /// `IdsFile::validate` refused the assembled mapping for a reason that has
     /// no code of its own (an orphan column, a bad rebuild, ...).
     InvalidMapping,
@@ -60,6 +63,7 @@ impl Code {
             Code::LegacyLayout => "ids.legacy-layout",
             Code::LegacyBesideTree => "ids.legacy-beside-tree",
             Code::NotCanonical => "ids.not-canonical",
+            Code::NameTooLong => "ids.name-too-long",
             Code::InvalidMapping => "ids.invalid-mapping",
         }
     }
@@ -105,14 +109,107 @@ pub struct Input<'a> {
     pub legacy_file: bool,
 }
 
+/// The longest file name the common file systems accept (ext4, APFS, NTFS,
+/// XFS, Btrfs), counted by [`name_len`]. A file system with a lower limit
+/// still answers with its own error; probing for it is out of scope.
+pub const NAME_LIMIT: usize = 255;
+
+/// What [`name_len`] counts, for a message.
+#[cfg(windows)]
+const NAME_UNIT: &str = "UTF-16 code units";
+#[cfg(not(windows))]
+const NAME_UNIT: &str = "bytes";
+
+/// A file name's length as the file system counts it: UTF-16 code units on
+/// Windows (NTFS stores names that way, so bytes would refuse a non-ASCII
+/// name it accepts, i.e. a valid project), bytes elsewhere.
+pub fn name_len(name: &str) -> usize {
+    #[cfg(windows)]
+    {
+        name.encode_utf16().count()
+    }
+    #[cfg(not(windows))]
+    {
+        name.len()
+    }
+}
+
+/// A declaration whose identity file could not be named: `<stem>.yml` mirrors
+/// to `<stem>.json`, one unit longer, so a `.yml` name at the limit has no
+/// mirror. The mirror is refused rather than renamed (DEC-2817.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameTooLong {
+    /// The declaration, as it was given to [`mirrored`].
+    pub yaml: String,
+    /// The length of the identity file's name, in [`name_len`] units.
+    pub needs: usize,
+}
+
+impl NameTooLong {
+    /// How much shorter the declaration's own file name has to be.
+    pub fn excess(&self) -> usize {
+        self.needs - NAME_LIMIT
+    }
+
+    pub fn remedy(&self) -> String {
+        format!(
+            "shorten the declaration's file name by at least {}",
+            self.excess()
+        )
+    }
+}
+
+impl std::fmt::Display for NameTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the identity file for {} would have a name of {} {NAME_UNIT}, over the limit of {NAME_LIMIT}",
+            Escaped(&self.yaml),
+            self.needs
+        )
+    }
+}
+
+/// What a declaration path mirrors to. The three outcomes stay apart so no
+/// caller can build a mirror name without meeting the length rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mirror {
+    /// Not a `.yml` or `.yaml` file under the schema directory.
+    NotDeclaration,
+    /// The ids path, relative to the ids directory.
+    Fits(String),
+    /// A declaration whose identity file name does not fit.
+    TooLong(NameTooLong),
+}
+
 /// The ids path (relative to the ids directory) a declaration file mirrors:
-/// `<schema_dir>/<rel>/<name>.yml` is `<rel>/<name>.json` (design §3.2).
-pub fn mirrored(layout: Layout<'_>, yaml: &str) -> Option<String> {
-    let rel = yaml.strip_prefix(layout.schema_dir)?.strip_prefix('/')?;
-    let stem = rel
+/// `<schema_dir>/<rel>/<name>.yml` is `<rel>/<name>.json` (design §3.2). Only
+/// the last component counts toward the length: a long directory path is not
+/// a long file name.
+pub fn mirrored(layout: Layout<'_>, yaml: &str) -> Mirror {
+    let Some(rel) = yaml
+        .strip_prefix(layout.schema_dir)
+        .and_then(|r| r.strip_prefix('/'))
+    else {
+        return Mirror::NotDeclaration;
+    };
+    let Some(stem) = rel
         .strip_suffix(".yml")
-        .or_else(|| rel.strip_suffix(".yaml"))?;
-    (!stem.is_empty()).then(|| format!("{stem}.json"))
+        .or_else(|| rel.strip_suffix(".yaml"))
+        .filter(|s| !s.is_empty())
+    else {
+        return Mirror::NotDeclaration;
+    };
+    let path = format!("{stem}.json");
+    let needs = name_len(path.rsplit('/').next().unwrap_or(&path));
+    if needs > NAME_LIMIT {
+        Mirror::TooLong(NameTooLong {
+            yaml: yaml.to_owned(),
+            needs,
+        })
+    } else {
+        Mirror::Fits(path)
+    }
 }
 
 /// Checks the whole tree. Findings come back sorted by path and code, so a
@@ -317,10 +414,19 @@ impl Run<'_> {
         let mut declared: BTreeMap<String, &Declaration> = BTreeMap::new();
         for d in input.declared {
             match mirrored(self.layout, &d.yaml) {
-                Some(rel) => {
+                Mirror::Fits(rel) => {
                     declared.entry(rel).or_insert(d);
                 }
-                None => self.add(
+                // Reported once, here. Such a declaration has no ids path, so
+                // it is left out of the pairing below: a "has no identity file"
+                // finding for a file that cannot exist would bury the cause.
+                Mirror::TooLong(e) => self.add(
+                    Code::NameTooLong,
+                    d.yaml.clone(),
+                    e.to_string(),
+                    &e.remedy(),
+                ),
+                Mirror::NotDeclaration => self.add(
                     Code::Malformed,
                     d.yaml.clone(),
                     format!(
@@ -393,7 +499,8 @@ impl Run<'_> {
     fn collisions(&mut self, input: &Input<'_>) {
         let mut by_ids: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for d in input.declared {
-            if let Some(rel) = mirrored(self.layout, &d.yaml) {
+            // A declaration with no mirror was reported by `declarations`.
+            if let Mirror::Fits(rel) = mirrored(self.layout, &d.yaml) {
                 by_ids.entry(rel).or_default().push(&d.yaml);
             }
         }
@@ -434,7 +541,10 @@ impl Run<'_> {
         let declared = input
             .declared
             .iter()
-            .filter_map(|d| mirrored(self.layout, &d.yaml));
+            .filter_map(|d| match mirrored(self.layout, &d.yaml) {
+                Mirror::Fits(rel) => Some(rel),
+                Mirror::NotDeclaration | Mirror::TooLong(_) => None,
+            });
         for rel in declared.chain(input.ids.keys().cloned()) {
             let shown = self.shown(&rel);
             folded

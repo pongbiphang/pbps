@@ -671,7 +671,9 @@ fn commit(root: &Path, stage: &Path) -> anyhow::Result<()> {
 
 /// Claims `final_ids` by creating it, then installs the staged tree's files into
 /// it. The directory is created even when the tree is empty: the claim is the
-/// point. On failure after the claim, the directory is removed again.
+/// point. On any failure after the claim the directory is removed again: the
+/// guard owns the claim, so a step added between the claim and the end cannot
+/// leave it behind (a retry of `init` would refuse it as existing user data).
 fn claim_identity_dir(staged: &Path, final_ids: &Path) -> anyhow::Result<()> {
     if let Some(parent) = final_ids.parent() {
         std::fs::create_dir_all(parent)
@@ -688,11 +690,16 @@ fn claim_identity_dir(staged: &Path, final_ids: &Path) -> anyhow::Result<()> {
         };
         anyhow::Error::new(e).context(what)
     })?;
-    let mut files = Vec::new();
-    if staged.is_dir() {
-        collect_files(staged, &mut files)?;
-    }
+    // Only a directory this call created is claimed; one that already existed
+    // was refused above and is never removed.
+    let mut guard = crate::ids_store::Staged::default();
+    guard.claim(final_ids);
     let result = (|| -> anyhow::Result<()> {
+        let mut files = Vec::new();
+        if staged.is_dir() {
+            collect_files(staged, &mut files)
+                .with_context(|| format!("cannot list the staged `{}`", staged.display()))?;
+        }
         for source in &files {
             let rel = source.strip_prefix(staged)?;
             let destination = final_ids.join(rel);
@@ -703,10 +710,7 @@ fn claim_identity_dir(staged: &Path, final_ids: &Path) -> anyhow::Result<()> {
         }
         Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(final_ids);
-    }
-    result
+    guard.settle(result)
 }
 
 /// Installs one staged file without ever replacing an existing destination.
@@ -1018,6 +1022,67 @@ mod tests {
             "user config\n"
         );
         assert!(!stage.exists(), "staging must be discarded on the race");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_releases_its_claim_when_the_staged_tree_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("pbps-init-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("stage/ids");
+        let closed = staged.join("sub");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::write(closed.join("x.json"), "x").unwrap();
+        std::fs::write(staged.join("y.json"), "y").unwrap();
+        let final_ids = root.join(".pbps/ids");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&closed).is_ok() {
+            // Root ignores permission bits, so the listing cannot be made to fail.
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let error = claim_identity_dir(&staged, &final_ids).unwrap_err();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            format!("{error:#}").contains("cannot list the staged"),
+            "{error:#}"
+        );
+        assert!(!final_ids.exists(), "the claim is released");
+        // A second init is not refused as existing user data, and installs.
+        claim_identity_dir(&staged, &final_ids).unwrap();
+        assert!(final_ids.join("sub/x.json").is_file());
+        assert!(final_ids.join("y.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_claim_that_succeeds_keeps_the_directory_and_its_files() {
+        let root = std::env::temp_dir().join(format!("pbps-init-claim-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("stage/ids");
+        std::fs::create_dir_all(staged.join("sub")).unwrap();
+        std::fs::write(staged.join("sub/x.json"), "x").unwrap();
+        let final_ids = root.join(".pbps/ids");
+        claim_identity_dir(&staged, &final_ids).unwrap();
+        assert!(final_ids.join("sub/x.json").is_file());
+        // An empty tree still claims the directory.
+        let empty = root.join("none");
+        let claimed = root.join("other/ids");
+        claim_identity_dir(&empty, &claimed).unwrap();
+        assert!(claimed.is_dir());
+        // Negative: a directory that is already there is refused and kept.
+        let error = claim_identity_dir(&staged, &final_ids).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("refusing to replace"),
+            "{error:#}"
+        );
+        assert!(
+            final_ids.join("sub/x.json").is_file(),
+            "the refusal removes nothing"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
