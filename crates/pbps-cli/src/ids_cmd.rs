@@ -1,10 +1,10 @@
 //! `pbps ids migrate | fmt | resolve` (#2600, design §5, §6.1).
 //!
-//! Three commands that act on the identity tree and nothing else. No other
-//! command reads the tree yet: `plan`, `validate` and the rest keep using
-//! `schema.ids.json` until the read and write switch. Nothing here chooses an
-//! identity for the user: `resolve` merges by uid and refuses what the resolved
-//! YAML cannot decide, and there is no `--take`.
+//! Three commands that act on the identity tree. `migrate` is the only one that
+//! also touches the old single file, because moving off it is its job; the
+//! reading and writing every other command does goes through `ids_store`.
+//! Nothing here chooses an identity for the user: `resolve` merges by uid and
+//! refuses what the resolved YAML cannot decide, and there is no `--take`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

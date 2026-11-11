@@ -324,7 +324,7 @@ fn fmt_refuses_a_malformed_file_and_rewrites_none() {
 // ---------------------------------------------------------------- resolve ---
 
 /// A project in git where two branches renamed the same column differently.
-/// The merge is left in progress: the YAML and the ids file both conflict.
+/// The merge is left in progress: the YAML and the identity file both conflict.
 fn conflicted() -> Project {
     conflicted_in("")
 }

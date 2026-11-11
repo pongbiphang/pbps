@@ -121,9 +121,10 @@ pub fn load_database_dirs(
 ///
 /// Identities come from the database's tree when it holds files, else from
 /// `schema.ids.json`, which is optional only when genuinely absent, never
-/// unreadable. Both at once are refused: until the switch to the tree (#2600)
-/// the old file is the one in use, and a tree beside it would be read by no
-/// one while looking authoritative.
+/// unreadable. Both at once are refused, as the single-database reader refuses
+/// them: a tree beside the old file is a migration that did not finish, and
+/// guessing which of the two is current could mint fresh uids for objects the
+/// other one names.
 pub fn load_databases(
     databases: &DatabaseMap<DatabaseDirs>,
 ) -> Result<LoadedDatabases, ProjectLoadError> {

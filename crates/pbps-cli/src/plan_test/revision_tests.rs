@@ -64,7 +64,7 @@ impl Repo {
     }
 
     /// `pbps.yml` and one declaration per table; `ids` brings the identity
-    /// file up to date with them, as `plan` would.
+    /// tree up to date with them, as `plan` would.
     fn declare(&self, tables: Tables<'_>, ids: bool) {
         self.write("pbps.yml", "dialect: postgres\n");
         let dir = self.project.join("schema");
@@ -87,13 +87,28 @@ impl Repo {
         }
     }
 
-    fn refresh_ids(&self) {
-        let loaded = pbps_load::load_schema_dir(&self.project.join("schema")).unwrap();
-        let path = self.project.join("schema.ids.json");
-        let current: pbps_model::IdsFile = std::fs::read_to_string(&path)
+    /// The identities the project holds now: its tree, else the legacy file
+    /// of a project not yet migrated, else none. A test that wants to know
+    /// what a revision should read back asks here instead of re-deriving it.
+    fn current_ids(&self) -> pbps_model::IdsFile {
+        let tree = pbps_load::read_ids_tree(&self.project.join(".pbps/ids")).unwrap();
+        if !tree.is_empty() {
+            return pbps_model::ids_tree::assemble(&tree).unwrap();
+        }
+        std::fs::read_to_string(self.project.join("schema.ids.json"))
             .ok()
             .map(|text| serde_json::from_str(&text).unwrap())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Brings the identities up to date with the declarations, as `plan`
+    /// would, and leaves them as the tree under `.pbps/ids`: the layout every
+    /// project has had since the switch, so the tests below meet the reader a
+    /// real project meets. A legacy file left from an earlier step goes, so a
+    /// project is never accidentally in both layouts.
+    fn refresh_ids(&self) {
+        let loaded = pbps_load::load_schema_dir(&self.project.join("schema")).unwrap();
+        let current = self.current_ids();
         let ctx = pbps_diff::Context {
             operator: "t".into(),
             today: "2026-01-01".into(),
@@ -106,11 +121,64 @@ impl Repo {
             &ctx,
         )
         .expect("the test declarations resolve");
-        std::fs::write(
-            path,
-            format!("{}\n", serde_json::to_string_pretty(&resolved.ids).unwrap()),
-        )
-        .unwrap();
+        let _ = std::fs::remove_file(self.project.join("schema.ids.json"));
+        self.write_tree(&resolved.ids);
+    }
+
+    /// `ids` as the identity tree of the declarations in `schema/`, in the
+    /// canonical bytes `plan` writes: each object in the file its declaration
+    /// mirrors, columns in YAML order. Whatever tree was there goes.
+    fn write_tree(&self, ids: &pbps_model::IdsFile) {
+        self.write_tree_in(ids, "schema", ".pbps/ids");
+    }
+
+    /// [`Repo::write_tree`] for a project that keeps its declarations and its
+    /// identities somewhere else, each as `pbps.yml` spells it.
+    fn write_tree_in(&self, ids: &pbps_model::IdsFile, schema: &str, tree: &str) {
+        let schema_dir = self.project.join(schema);
+        let loaded = pbps_load::load_schema_dir(&schema_dir).unwrap();
+        let declared = loaded.declared_paths(&schema_dir).unwrap();
+        let dirs = crate::ids_cmd::Dirs {
+            schema: schema.to_owned(),
+            ids: tree.to_owned(),
+        };
+        let mut placement = crate::ids_cmd::declared_placement(&dirs, ids, &declared).unwrap();
+        // A dropped object keeps a file no declaration names: where `migrate`
+        // puts it.
+        for (uid, tombstone) in &ids.tombstones {
+            if matches!(
+                uid.kind(),
+                pbps_model::UidKind::Table
+                    | pbps_model::UidKind::Role
+                    | pbps_model::UidKind::Type
+                    | pbps_model::UidKind::Extension
+            ) {
+                placement
+                    .paths
+                    .insert(uid.clone(), crate::ids_cmd::aside(&tombstone.was, uid));
+            }
+        }
+        let files = pbps_model::ids_tree::split(ids, &placement).unwrap();
+        let _ = std::fs::remove_dir_all(self.project.join(tree));
+        for (rel, text) in files {
+            self.write(&format!("{tree}/{rel}"), text);
+        }
+    }
+
+    /// Neither layout: no tree and no legacy file.
+    fn clear_identities(&self) {
+        let _ = std::fs::remove_dir_all(self.project.join(".pbps/ids"));
+        let _ = std::fs::remove_file(self.project.join("schema.ids.json"));
+    }
+
+    /// The layout before `pbps ids migrate`: the same identities as the single
+    /// file `schema.ids.json`, and no tree. Only a test whose subject is the
+    /// legacy file, which history still reads, wants this; everything else
+    /// meets the tree.
+    fn legacy_layout(&self) {
+        let ids = self.current_ids();
+        self.clear_identities();
+        self.write("schema.ids.json", legacy_text(&ids));
     }
 
     /// The manifest at `tests/pbps-tests.yml`, with a fixture and an assertion file.
@@ -148,6 +216,11 @@ impl Drop for Repo {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The single-file form of a mapping, as `pbps` wrote it before the tree.
+fn legacy_text(ids: &pbps_model::IdsFile) -> String {
+    format!("{}\n", serde_json::to_string_pretty(ids).unwrap())
 }
 
 fn columns_first<'a>(tables: Tables<'a>, name: &str) -> &'a str {
@@ -496,26 +569,20 @@ fn a_dialect_that_differs_from_the_manifest_is_refused_per_revision() {
 /// unfinished migration and refused, not read as either.
 #[test]
 fn a_revision_is_read_from_its_identity_tree_or_its_legacy_file_and_never_from_both() {
-    let (repo, c1, _) = standard();
-    let legacy_path = repo.project.join("schema.ids.json");
-    let legacy_text = std::fs::read_to_string(&legacy_path).unwrap();
-    let legacy: pbps_model::IdsFile = serde_json::from_str(&legacy_text).unwrap();
-    // `pbps ids migrate`, by hand: the same mapping as files, the old file gone.
-    let mut placement = pbps_model::ids_tree::Placement::default();
-    for (uid, name) in &legacy.tables {
-        placement
-            .paths
-            .insert(uid.clone(), name.raw().to_string() + ".json");
-    }
-    std::fs::remove_file(&legacy_path).unwrap();
-    for (rel, text) in pbps_model::ids_tree::split(&legacy, &placement).unwrap() {
-        repo.write(&format!(".pbps/ids/{rel}"), text);
-    }
+    let repo = Repo::new("");
+    repo.declare(ORDERS, true);
+    // The pin predates the migration: its identities are the single file.
+    repo.legacy_layout();
+    let c1 = repo.commit("one");
+    // The migration: the same mapping carried into files, the old file gone.
+    repo.declare(MORE, true);
+    let migrated_ids = repo.current_ids();
+    assert!(!repo.project.join("schema.ids.json").exists());
     let migrated = repo.commit("migrated");
     repo.manifest(&migrated, &[("f", &c1)], None);
     let inputs = repo.validate().unwrap();
     assert_eq!(
-        inputs.revisions[&migrated].ids, legacy,
+        inputs.revisions[&migrated].ids, migrated_ids,
         "read from the tree"
     );
     assert_eq!(
@@ -523,9 +590,9 @@ fn a_revision_is_read_from_its_identity_tree_or_its_legacy_file_and_never_from_b
         1,
         "the pre-migration pin is read from its legacy file"
     );
-    assert_eq!(inputs.candidate.ids, legacy);
+    assert_eq!(inputs.candidate.ids, migrated_ids);
 
-    repo.write("schema.ids.json", &legacy_text);
+    repo.write("schema.ids.json", legacy_text(&migrated_ids));
     let both = repo.commit("both layouts");
     repo.manifest(&both, &[("f", &c1)], None);
     let found = refused(repo.validate());
@@ -543,7 +610,6 @@ fn a_revision_is_read_from_its_identity_tree_or_its_legacy_file_and_never_from_b
 #[test]
 fn a_revision_with_a_damaged_identity_tree_is_refused() {
     let (repo, c1, _) = standard();
-    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
     repo.write(".pbps/ids/app.orders.json", "{}");
     let damaged = repo.commit("damaged");
     repo.manifest(&damaged, &[("f", &c1)], None);
@@ -566,27 +632,13 @@ fn a_revision_with_a_damaged_identity_tree_is_refused() {
 fn a_revision_with_an_identity_tree_entry_that_is_not_a_json_file_is_refused() {
     for stray in ["app.orders.json.aside", "app.orders.txt"] {
         let (repo, c1, _) = standard();
-        let legacy_path = repo.project.join("schema.ids.json");
-        let legacy: pbps_model::IdsFile =
-            serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();
-        let mut placement = pbps_model::ids_tree::Placement::default();
-        for (uid, name) in &legacy.tables {
-            placement
-                .paths
-                .insert(uid.clone(), name.raw().to_string() + ".json");
-        }
-        std::fs::remove_file(&legacy_path).unwrap();
-        let files = pbps_model::ids_tree::split(&legacy, &placement).unwrap();
-        for (rel, text) in &files {
-            repo.write(&format!(".pbps/ids/{rel}"), text);
-        }
         // Negative: the plain tree passes.
         let plain = repo.commit("plain tree");
         repo.manifest(&plain, &[("f", &c1)], None);
         assert!(repo.validate().is_ok(), "{stray}: the tree itself is fine");
+        let text = std::fs::read_to_string(repo.project.join(".pbps/ids/app.orders.json")).unwrap();
         // The same valid JSON under a name that is not an identity file's.
-        let (_, text) = files.iter().next().unwrap();
-        repo.write(&format!(".pbps/ids/{stray}"), text);
+        repo.write(&format!(".pbps/ids/{stray}"), &text);
         let bad = repo.commit("stray entry");
         repo.manifest(&bad, &[("f", &c1)], None);
         let found = refused(repo.validate());
@@ -606,7 +658,7 @@ fn a_revision_with_an_identity_tree_entry_that_is_not_a_json_file_is_refused() {
 #[test]
 fn a_revision_whose_identity_directory_is_a_file_is_refused() {
     let (repo, c1, _) = standard();
-    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.clear_identities();
     repo.write(".pbps/ids", "not a directory");
     let bad = repo.commit("file where the tree should be");
     repo.manifest(&bad, &[("f", &c1)], None);
@@ -623,8 +675,8 @@ fn a_revision_whose_identity_directory_is_a_file_is_refused() {
 #[test]
 fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusals() {
     let (repo, c1, _) = standard();
-    // Absent, with objects declared: the identity file records nothing.
-    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    // Absent, with objects declared: no identity file records anything.
+    repo.clear_identities();
     let absent = repo.commit("no ids");
     repo.manifest(&absent, &[("f", &c1)], None);
     let found = refused(repo.validate());
@@ -668,8 +720,9 @@ fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusal
     );
 
     // Two tables claiming one name: this tool wrote a file it cannot have.
-    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.clear_identities();
     repo.refresh_ids();
+    repo.legacy_layout();
     let mut ids: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(repo.project.join("schema.ids.json")).unwrap(),
     )
@@ -697,7 +750,9 @@ fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusal
 
     // A damaged object is unreadable, which `baseline::ids_from` would read
     // as an empty file (#1814); here it is a refusal that says so.
+    repo.clear_identities();
     repo.refresh_ids();
+    repo.legacy_layout();
     let healthy = repo.commit("healthy");
     let blob = repo.git(&["rev-parse", &format!("{healthy}:schema.ids.json")]);
     let object = repo
@@ -846,6 +901,8 @@ fn declaration_policies_bind_the_candidate_and_not_an_older_pin() {
 #[test]
 fn problems_at_several_revisions_arrive_in_one_pass() {
     let (repo, c1, _) = standard();
+    // The legacy file alone, so its fault is the one reported.
+    repo.clear_identities();
     repo.write("schema.ids.json", "{not json");
     let bad_base = repo.commit("bad base");
     repo.write("pbps.yml", "dialect: mssql\n");
@@ -892,12 +949,65 @@ fn a_project_below_the_repository_root_names_its_files_relative_to_itself() {
         .collect();
     assert_eq!(
         committed,
-        BTreeSet::from(["pbps.yml", "schema.ids.json", "schema/app.orders.yml"])
+        BTreeSet::from([
+            ".pbps/ids/app.orders.json",
+            "pbps.yml",
+            "schema/app.orders.yml"
+        ])
     );
 }
 
 #[test]
-fn declarations_kept_beside_the_project_are_named_with_a_climb() {
+fn declarations_and_identity_files_kept_beside_the_project_are_named_with_a_climb() {
+    let repo = Repo::new("apps/db");
+    repo.write(
+        "pbps.yml",
+        "dialect: postgres\nschema_dir: ../shared/schema\nids_dir: ../shared/ids\n",
+    );
+    repo.write(
+        "../shared/schema/app.orders.yml",
+        "table: app.orders\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    let loaded = pbps_load::load_schema_dir(&repo.project.join("../shared/schema")).unwrap();
+    let ctx = pbps_diff::Context {
+        operator: "t".into(),
+        today: "2026-01-01".into(),
+    };
+    let ids = pbps_diff::resolve_with_annotations(
+        &loaded.schema,
+        &Default::default(),
+        &loaded.intents,
+        0,
+        &ctx,
+    )
+    .unwrap()
+    .ids;
+    repo.write_tree_in(&ids, "../shared/schema", "../shared/ids");
+    let c1 = repo.commit("one");
+    repo.manifest(&c1, &[], None);
+    let inputs = repo.validate().unwrap();
+    let paths: BTreeSet<_> = inputs
+        .identity
+        .files
+        .iter()
+        .filter(|f| f.role == Role::Declaration || f.role == Role::Ids)
+        .map(|f| f.path.as_str())
+        .collect();
+    assert!(
+        paths.contains("../shared/schema/app.orders.yml")
+            && paths.contains("../shared/ids/app.orders.json"),
+        "{paths:?}"
+    );
+    assert_eq!(
+        inputs.candidate.ids, ids,
+        "read from the tree beside the project"
+    );
+}
+
+/// The legacy file may be kept anywhere `ids_file` says; history still reads
+/// it there.
+#[test]
+fn a_legacy_identity_file_kept_beside_the_project_is_named_with_a_climb() {
     let repo = Repo::new("apps/db");
     repo.write(
         "pbps.yml",
@@ -981,12 +1091,25 @@ fn reverify_passes_when_nothing_moved_and_names_each_kind_of_movement() {
     assert!(change_of(&inputs).contains(&("schema/app.orders.yml".into(), "was removed".into())));
     std::fs::write(&path, original).unwrap();
     inputs.reverify().unwrap();
-    // The identity file.
-    let ids = repo.project.join("schema.ids.json");
+    // An identity file of the tree: changed, removed, added. Each is named by
+    // its own path, and putting it back is a pass again.
+    let ids = repo.project.join(".pbps/ids/app.orders.json");
     let text = std::fs::read_to_string(&ids).unwrap();
     std::fs::write(&ids, format!("{text} ")).unwrap();
-    assert!(change_of(&inputs).contains(&("schema.ids.json".into(), "changed".into())));
-    std::fs::write(&ids, text).unwrap();
+    assert!(change_of(&inputs).contains(&(".pbps/ids/app.orders.json".into(), "changed".into())));
+    std::fs::write(&ids, &text).unwrap();
+    inputs.reverify().unwrap();
+    std::fs::remove_file(&ids).unwrap();
+    assert!(
+        change_of(&inputs).contains(&(".pbps/ids/app.orders.json".into(), "was removed".into()))
+    );
+    std::fs::write(&ids, &text).unwrap();
+    inputs.reverify().unwrap();
+    let extra = repo.project.join(".pbps/ids/app.extra.json");
+    std::fs::write(&extra, &text).unwrap();
+    assert!(change_of(&inputs).contains(&(".pbps/ids/app.extra.json".into(), "was added".into())));
+    std::fs::remove_file(&extra).unwrap();
+    inputs.reverify().unwrap();
     // HEAD moves.
     repo.write("elsewhere.txt", "x");
     repo.commit("another");
@@ -1149,7 +1272,9 @@ fn a_submodule_is_refused_wherever_it_stands_among_the_inputs_never_read_as_noth
         ("schema/vendored.yml", "declaration-named"),
         ("schema/vendor", "plain"),
         ("schema/nested/vendor", "nested"),
-        ("schema.ids.json", "identity file"),
+        ("schema.ids.json", "legacy identity file"),
+        (".pbps/ids/app.orders.json", "identity file"),
+        (".pbps/ids/nested/new.json", "nested identity file"),
         ("pbps.yml", "configuration"),
     ] {
         repo.git(&["rm", "-q", "--cached", "-r", "--ignore-unmatch", path]);
@@ -1180,6 +1305,153 @@ fn a_symlink_to_a_directory_is_refused_whatever_it_is_called() {
         at(&found, &linked).iter().any(
             |p| matches!(p, RevisionProblem::NotRegular { path, .. } if path == "schema/views")
         ),
+        "{found:?}"
+    );
+}
+
+/// A symlink among the identity files is not an identity file and not nothing:
+/// a revision that has one is refused by its path, and so is a working tree
+/// that has one, live or dangling.
+#[cfg(unix)]
+#[test]
+fn a_symlink_among_the_identity_files_is_refused_in_a_revision_and_in_the_working_tree() {
+    let (repo, c1, c2) = standard();
+    // Negative: the tree as it stands validates.
+    repo.validate().unwrap();
+    let file = repo.project.join(".pbps/ids/app.orders.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    repo.write("elsewhere.json", &text);
+    std::os::unix::fs::symlink("../../elsewhere.json", &file).unwrap();
+    let linked = repo.commit("an identity file that is a link");
+    repo.manifest(&linked, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &linked).iter().any(|p| matches!(
+            p,
+            RevisionProblem::NotRegular { path, what }
+                if path == ".pbps/ids/app.orders.json" && what.contains("120000")
+        )),
+        "the revision: {found:?}"
+    );
+    assert!(
+        found.iter().any(|r| matches!(
+            r,
+            Refusal::At {
+                revision: Revision::Working,
+                problem: RevisionProblem::Unreadable { path, reason },
+            } if path == ".pbps/ids" && reason.contains("app.orders.json")
+        )),
+        "the working tree: {found:?}"
+    );
+    // Dangling, the target gone: still a refusal, not an empty tree.
+    std::fs::remove_file(repo.project.join("elsewhere.json")).unwrap();
+    let found = refused(repo.validate());
+    assert!(
+        found.iter().any(|r| matches!(
+            r,
+            Refusal::At {
+                revision: Revision::Working,
+                problem: RevisionProblem::Unreadable { path, .. },
+            } if path == ".pbps/ids"
+        )),
+        "dangling: {found:?}"
+    );
+    // The commit before it, with a regular file, is still read.
+    repo.git(&["reset", "-q", "--hard", &c2.to_string()]);
+    repo.manifest(&c2, &[("f", &c1)], None);
+    repo.validate().unwrap();
+}
+
+/// The `pbps test` reader reports every fault of an identity tree as the one
+/// problem `IdsInconsistent` and carries the tree's own sentence as its reason
+/// (a decided mapping, not an oversight: the legacy file's `IdsMalformed` and
+/// `IdsUnsupportedVersion` do not exist for a tree). The reasons still tell
+/// the faults apart.
+#[test]
+fn a_tree_file_with_another_format_or_broken_json_is_refused_with_its_own_reason() {
+    type Damage = fn(&str) -> String;
+    let cases: [(&str, Damage, &str, &str); 2] = [
+        (
+            "another layout format",
+            |text| text.replacen("\"format\": 1", "\"format\": 2", 1),
+            "is layout format 2",
+            "is not a valid identity file",
+        ),
+        (
+            "broken json",
+            |_| "{".to_owned(),
+            "is not a valid identity file",
+            "is layout format",
+        ),
+    ];
+    for (label, damage, expected, other) in cases {
+        let (repo, c1, _) = standard();
+        let path = repo.project.join(".pbps/ids/app.orders.json");
+        let good = std::fs::read_to_string(&path).unwrap();
+        // Negative: the damage changes something, and the file before it reads.
+        assert_ne!(damage(&good), good, "{label}");
+        repo.validate().unwrap();
+        repo.write(".pbps/ids/app.orders.json", damage(&good));
+        let bad = repo.commit(label);
+        repo.manifest(&bad, &[("f", &c1)], None);
+        let found = refused(repo.validate());
+        let here = at(&found, &bad);
+        let reasons: Vec<&str> = here
+            .iter()
+            .filter_map(|p| {
+                if let RevisionProblem::IdsInconsistent { path, reason } = p
+                    && path == ".pbps/ids"
+                {
+                    Some(reason.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(reasons.len(), 1, "{label}: {here:?}");
+        assert!(reasons[0].contains(expected), "{label}: {}", reasons[0]);
+        assert!(!reasons[0].contains(other), "{label}: {}", reasons[0]);
+        assert!(
+            !here.iter().any(|p| matches!(
+                p,
+                RevisionProblem::IdsMalformed { .. }
+                    | RevisionProblem::IdsUnsupportedVersion { .. }
+            )),
+            "{label}: a tree has no legacy problem kinds: {here:?}"
+        );
+    }
+}
+
+/// An object git cannot read under `.pbps/ids` is an unreadable tree, never an
+/// empty one that would let every identity read as new.
+#[test]
+fn an_unreadable_object_among_the_identity_files_is_refused_not_read_as_nothing() {
+    let (repo, c1, _) = standard();
+    // A blob no other commit shares, so only this revision is damaged.
+    let file = repo.project.join(".pbps/ids/app.orders.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    repo.write(".pbps/ids/app.orders.json", format!("{text}\n"));
+    let healthy = repo.commit("healthy");
+    repo.manifest(&healthy, &[("f", &c1)], None);
+    // Negative: before the damage the revision reads.
+    repo.validate().unwrap();
+    let blob = repo.git(&["rev-parse", &format!("{healthy}:.pbps/ids/app.orders.json")]);
+    let object = repo
+        .dir
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&object, permissions).unwrap();
+    std::fs::write(&object, b"damaged").unwrap();
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &healthy)
+            .iter()
+            .any(|p| matches!(p, RevisionProblem::Unreadable { path, .. } if path == ".pbps/ids")),
         "{found:?}"
     );
 }
@@ -1255,7 +1527,11 @@ fn d2b1_1165_partial_revision_refusals_keep_every_available_hash_and_resolved_co
         (Role::Manifest, Revision::Working, "tests/pbps-tests.yml"),
         (Role::Fixture, Revision::Working, "tests/f.sql"),
         (Role::Config, Revision::Working, "pbps.yml"),
-        (Role::Ids, Revision::Commit(old), "schema.ids.json"),
+        (
+            Role::Ids,
+            Revision::Commit(old),
+            ".pbps/ids/app.orders.json",
+        ),
     ] {
         assert!(
             observed.files.iter().any(|f| f.role == role

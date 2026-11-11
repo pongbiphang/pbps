@@ -543,3 +543,41 @@ fn a_symlink_or_file_in_place_of_the_tree_directory_is_refused_not_read_as_absen
     std::fs::remove_file(&alpha).unwrap();
     assert!(load_databases(&databases).is_ok());
 }
+
+/// The entries inside the tree, not only the directory itself: a link named
+/// like an identity file must not read as the file it points at (or as nothing
+/// when it points nowhere), because the tree is the project's whole identity.
+#[cfg(unix)]
+#[test]
+fn a_symlink_among_the_tree_entries_is_refused_live_dangling_or_to_a_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = Dir::new();
+    let tree = dir.0.join("tree");
+    std::fs::create_dir_all(tree.join("nested")).unwrap();
+    std::fs::write(tree.join("a.json"), "a").unwrap();
+    std::fs::write(tree.join("nested/b.json"), "b").unwrap();
+    // Negative: the plain tree reads, nested files by their relative path.
+    let files = pbps_load::read_ids_tree(&tree).unwrap();
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a.json", "nested/b.json"]
+    );
+    for (name, make) in [
+        ("live.json", tree.join("a.json")),
+        ("dangling.json", dir.0.join("gone")),
+        ("directory.json", tree.join("nested")),
+    ] {
+        let link = tree.join("nested").join(name);
+        symlink(&make, &link).unwrap();
+        let error = pbps_load::read_ids_tree(&tree).unwrap_err().to_string();
+        assert!(
+            error.contains(name) && error.contains("is not a directory or"),
+            "{name}: {error}"
+        );
+        std::fs::remove_file(&link).unwrap();
+        assert!(
+            pbps_load::read_ids_tree(&tree).is_ok(),
+            "{name}: removing the link restores the read"
+        );
+    }
+}

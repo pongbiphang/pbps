@@ -206,7 +206,8 @@ fn a_database_project_puts_each_identity_tree_under_ids_dir_by_database_name() {
         let project = Project::load_project(&dir.config(&config)).unwrap();
         for (db, paths) in project.database_paths().unwrap().iter() {
             assert_eq!(paths.ids_dir, dir.0.join(base).join(db.raw()));
-            // The legacy file keeps its place until the switch.
+            // The retired single file keeps its per-database place, for the
+            // loader that still falls back to it.
             assert_eq!(paths.ids_file, paths.schema_dir.join("schema.ids.json"));
         }
     }
