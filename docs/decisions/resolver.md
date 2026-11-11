@@ -6401,10 +6401,13 @@ The retry happens once: a second crash fails the run with both reports.
 PostgreSQL, a running server that never answers, an exit with no dump, a
 vanished container and a failed `docker logs` fail as before.
 
-*The first crash stays on record.* A retry that succeeds prints one `note:`
-line with the first start's report on stderr before it moves on; a retry that
-fails carries the first report in the error (`test.infrastructure`,
-`resolver` acquisition). A journaled owner is told through `Owner::restarted`
+*The first crash stays on record.* One `note:` line with the first start's
+report is printed on stderr when the crash is seen, before the container, and
+its log with it, is removed; so a removal that fails, a second start that fails
+and a cancelled retry all leave it reported. A retry that fails also carries the
+first report in the error (`test.infrastructure`, `resolver` acquisition).
+A failed `docker logs` is an unreadable log, not evidence of a crash, even when
+it printed a dump's name before it failed. A journaled owner is told through `Owner::restarted`
 after the removal is confirmed and puts its record back to `Pending` without
 the crashed container's id and volumes, so the record never names a container
 that is gone and the next `before_create` writes it as it did the first time.

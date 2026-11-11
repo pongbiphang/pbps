@@ -131,6 +131,24 @@ async fn runtime_output(
     .map_err(|error| format!("cannot run docker {}: {error}", args[0]))
 }
 
+/// The container's log as text, or why it could not be read. A `docker logs`
+/// that failed may still have printed a partial log naming a dump, and a
+/// partial read must not authorise a second start (DEC-2762.1).
+fn log_text(out: &std::process::Output) -> Result<String, String> {
+    if !out.status.success() {
+        return Err(format!(
+            "docker logs failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
 fn startup_diagnostic(text: &str, password: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
@@ -209,13 +227,7 @@ pub(super) async fn ready(connection: &str, id: &str, password: &str) -> Result<
         match readiness(&observed, started.elapsed()) {
             Poll::Exited => {
                 let logs = runtime_output(&["logs", id], runtime_budget(started)).await;
-                let text = logs.map(|out| {
-                    format!(
-                        "{}{}",
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr)
-                    )
-                });
+                let text = logs.and_then(|out| log_text(&out));
                 return Err(after_exit(
                     &observed,
                     text.as_deref().map_err(String::as_str),
@@ -257,9 +269,6 @@ pub(super) async fn ready(connection: &str, id: &str, password: &str) -> Result<
 pub(super) struct Started<C> {
     pub container: C,
     pub ready: Result<(), ProduceError>,
-    /// The first container's report when a second was started, whatever its
-    /// outcome: the crash stays on record even when the retry succeeds.
-    pub first_crash: Option<String>,
 }
 
 /// What [`started_ready`] drives; a trait rather than closures because an
@@ -276,6 +285,10 @@ pub(super) trait Launch {
     /// Waits for the server and hands the container back.
     async fn wait(&mut self, container: Self::Container)
     -> (Self::Container, Result<(), NotReady>);
+    /// Puts the first container's crash report on record. Called before
+    /// `discard`: the removal takes the log with it, and a removal that fails,
+    /// a second start that fails or a cancelled retry must not lose it.
+    fn crashed(&mut self, report: &str);
     /// Removes the container and confirms it gone.
     async fn discard(&mut self, container: Self::Container) -> Result<(), Vec<String>>;
 }
@@ -292,18 +305,17 @@ pub(super) async fn started_ready<L: Launch>(
             return Ok(Started {
                 container: first,
                 ready: Ok(()),
-                first_crash: None,
             });
         }
         Err(NotReady::Failed(why)) => {
             return Ok(Started {
                 container: first,
                 ready: Err(ProduceError::Acquire(why)),
-                first_crash: None,
             });
         }
         Err(NotReady::Crashed(report)) => report,
     };
+    launch.crashed(&crash);
     Box::pin(launch.discard(first))
         .await
         .map_err(ProduceError::Cleanup)?;
@@ -328,7 +340,6 @@ pub(super) async fn started_ready<L: Launch>(
     Ok(Started {
         container: second,
         ready,
-        first_crash: Some(crash),
     })
 }
 
@@ -568,6 +579,7 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
         waits: std::collections::VecDeque<Result<(), NotReady>>,
         starts: Vec<bool>,
         discarded: Vec<u32>,
+        reported: Vec<String>,
         made: u32,
         second_start_fails: bool,
         removal_fails: bool,
@@ -585,6 +597,9 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
         }
         async fn wait(&mut self, container: u32) -> (u32, Result<(), NotReady>) {
             (container, self.waits.pop_front().expect("scripted"))
+        }
+        fn crashed(&mut self, report: &str) {
+            self.reported.push(report.to_owned());
         }
         async fn discard(&mut self, container: u32) -> Result<(), Vec<String>> {
             self.discarded.push(container);
@@ -609,7 +624,7 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
         let started = started_ready(&mut run).await.unwrap();
         assert_eq!(started.container, 2, "the caller gets the second container");
         assert!(started.ready.is_ok());
-        assert_eq!(started.first_crash.as_deref(), Some("crash one"));
+        assert_eq!(run.reported, ["crash one"], "the crash is put on record");
         assert_eq!(run.starts, [false, true]);
         assert_eq!(
             run.discarded,
@@ -642,7 +657,7 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
             ..Script::default()
         };
         let started = started_ready(&mut ready).await.unwrap();
-        assert!(started.ready.is_ok() && started.first_crash.is_none());
+        assert!(started.ready.is_ok() && ready.reported.is_empty());
         assert_eq!((ready.starts.len(), ready.discarded.len()), (1, 0));
 
         let mut failed = Script {
@@ -657,7 +672,7 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
                 .to_string()
                 .contains("did not accept connections")
         );
-        assert!(started.first_crash.is_none());
+        assert!(failed.reported.is_empty());
         assert_eq!((failed.starts.len(), failed.discarded.len()), (1, 0));
     }
 
@@ -678,6 +693,11 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
             [false],
             "a name that may still be held is not reused"
         );
+        assert_eq!(
+            run.reported,
+            ["crash one"],
+            "the crash is on record even though its removal failed"
+        );
     }
 
     #[tokio::test]
@@ -696,5 +716,36 @@ Successfully captured dump: /var/opt/mssql/log/core.sqlservr.11_10_2026_18_39_54
             error.contains("no port") && error.contains("crash one"),
             "{error}"
         );
+        assert_eq!(run.reported, ["crash one"]);
+    }
+
+    #[cfg(unix)]
+    fn finished(code: i32, stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"daemon unreachable".to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_docker_logs_is_unreadable_even_when_it_printed_a_dump_name() {
+        let partial = finished(1, "core.sqlservr");
+        let error = log_text(&partial).unwrap_err();
+        assert!(error.contains("daemon unreachable"), "{error}");
+        // The same text from a command that succeeded is the log.
+        let text = log_text(&finished(0, "core.sqlservr")).unwrap();
+        assert!(text.contains("core.sqlservr"));
+        // And the partial read is a plain failure, not a retryable crash.
+        let observed = Observed::Stopped(RuntimeState {
+            running: false,
+            exit_code: 1,
+            oom_killed: false,
+            error: String::new(),
+        });
+        let after = after_exit(&observed, Err(error.as_str()), "pw");
+        assert!(matches!(after, NotReady::Failed(_)), "{after:?}");
     }
 }

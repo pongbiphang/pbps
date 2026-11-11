@@ -309,6 +309,14 @@ impl<O: Owner> startup::Launch for Starting<'_, O> {
         (container, waited)
     }
 
+    fn crashed(&mut self, report: &str) {
+        // Reported before the container and its log are removed, as DEC-958.1
+        // does for the fixture: the retry must not hide that the engine crashed.
+        eprintln!(
+            "note: SQL Server crashed while starting; starting it once more (DEC-2762.1). The first start:\n{report}"
+        );
+    }
+
     async fn discard(&mut self, container: Container) -> Result<(), Vec<String>> {
         container.remove().await
     }
@@ -430,13 +438,6 @@ impl Container {
             owner,
         }))
         .await?;
-        if let Some(first) = &started.first_crash {
-            // Reported before it is forgotten, as DEC-958.1 does for the
-            // fixture: the retry must not hide that the engine crashed.
-            eprintln!(
-                "note: SQL Server crashed while starting and was started once more (DEC-2762.1); the first start:\n{first}"
-            );
-        }
         Ok((started.container, started.ready))
     }
 
