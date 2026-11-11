@@ -785,35 +785,12 @@ fn module_kind(code: &str) -> &str {
 ///
 /// The engine stores `([amount]>=(0))`, so the bracketed form is the one that
 /// actually appears — but a definition written without brackets keeps the bare
-/// name, and both have to match. Bare matching is bounded by the characters
-/// around it so that `amount` does not match `amount_paid`.
+/// name, and both have to match. The name is matched as a whole identifier, so
+/// that `amount` does not match `amount_paid`, and not as a part of a
+/// delimited one either: `[Order Details Extended]` is no mention of
+/// `Order Details` (#2436).
 fn mentions(definition: &str, column: &str) -> bool {
-    let Some(first) = column.chars().next() else {
-        return false;
-    };
-    if definition.contains(&format!("[{column}]")) {
-        return true;
-    }
-    let mut from = 0;
-    while let Some(offset) = definition[from..].find(column) {
-        let start = from + offset;
-        let end = start + column.len();
-        // A UTF-8 continuation byte is not a delimiter. Share the SQL Server
-        // lexer's character rule so every scan agrees on where a name ends.
-        let before_ok = !definition[..start]
-            .chars()
-            .next_back()
-            .is_some_and(pbps_model::module::is_regular_identifier_continue);
-        let after_ok = !definition[end..]
-            .chars()
-            .next()
-            .is_some_and(pbps_model::module::is_regular_identifier_continue);
-        if before_ok && after_ok {
-            return true;
-        }
-        from = start + first.len_utf8();
-    }
-    false
+    pbps_dialect::Dialect::lexicon(&crate::Mssql).names_exactly(definition, column)
 }
 
 #[cfg(test)]
@@ -1009,6 +986,20 @@ mod tests {
         assert!(!mentions("amount_paid >= 0", "amount"));
         assert!(!mentions("net_amount >= 0", "amount"));
         assert!(!mentions("@amount >= 0", "amount"));
+    }
+
+    /// A delimited name is one name: the Northwind case, where a column
+    /// `Order Details` sits inside a longer delimited one (#2436).
+    #[test]
+    fn a_longer_delimited_name_is_not_a_match() {
+        assert!(mentions("([Order Details]>(0))", "Order Details"));
+        assert!(mentions("(\"Order Details\">(0))", "Order Details"));
+        assert!(!mentions("([Order Details Extended]>(0))", "Order Details"));
+        assert!(!mentions("(\"My Order Details\">(0))", "Order Details"));
+        assert!(mentions("([a]]b]>(0))", "a]b"));
+        assert!(!mentions("([a]]b]>(0))", "a"));
+        // Exact, as the stored form is the engine's own spelling.
+        assert!(!mentions("([ORDER DETAILS]>(0))", "Order Details"));
     }
 
     #[test]

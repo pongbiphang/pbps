@@ -2397,6 +2397,7 @@ fn code_only(definition: &str) -> String {
 /// rule for where a word ends.
 const LEXIS: pbps_model::module::Lexis<'static> = pbps_model::module::Lexis {
     code_only: &code_only,
+    quoted_identifiers: crate::LEXICON.quoted_identifiers,
     continues_ident: pbps_dialect::continues_ident,
     reserved: crate::types::is_reserved,
     // These scans ask whether a definition *mentions* a name, for a report

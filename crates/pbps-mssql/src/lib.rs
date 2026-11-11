@@ -833,6 +833,57 @@ mod order_observation_tests;
 mod tests {
     use super::*;
 
+    /// A delimited name is one name (#2436): `[Order Details Extended]` is
+    /// no reference to `Order Details`, whichever delimiter, qualified or not,
+    /// and the escaped closer is one character of the name it is in.
+    #[test]
+    fn a_delimited_name_is_found_only_as_the_whole_identifier() {
+        let d = Mssql;
+        for text in [
+            "[Order Details]",
+            "\"Order Details\"",
+            "SELECT * FROM [Order Details] AS o",
+            "[ORDER details]",
+        ] {
+            assert!(d.may_name(text, "Order Details"), "{text}");
+        }
+        for text in [
+            "[Order Details Extended]",
+            "\"Order Details Extended\"",
+            "[My Order Details]",
+            "SELECT * FROM [Order Details Extended] AS o",
+            "Order Details",
+        ] {
+            assert!(!d.may_name(text, "Order Details"), "{text}");
+        }
+        assert!(d.may_name("[a]]b]", "a]b") && d.may_name("\"a\"\"b\"", "a\"b"));
+        assert!(!d.may_name("[a]]b]", "a") && !d.may_name("\"a\"\"b\"", "b"));
+        for text in [
+            "[dbo].[Order Details]",
+            "dbo.[Order Details] o",
+            "[DBO].[ORDER details]",
+        ] {
+            assert!(d.may_name_qualified(text, "dbo", "Order Details"), "{text}");
+        }
+        for text in [
+            "[dbo].[Order Details Extended]",
+            "dbo.[Order Details Extended]",
+            "[dbo].[My Order Details]",
+        ] {
+            assert!(
+                !d.may_name_qualified(text, "dbo", "Order Details"),
+                "{text}"
+            );
+            assert!(
+                !d.may_name_qualified_exact(text, "dbo", "Order Details"),
+                "{text}"
+            );
+        }
+        assert!(d.may_name_qualified_exact("[dbo].[Order Details]", "dbo", "Order Details"));
+        assert!(!d.may_name_qualified_exact("[dbo].[order details]", "dbo", "Order Details"));
+        assert!(d.may_name_qualified("[d]]o].[a]]b]", "d]o", "a]b"));
+    }
+
     /// SQL Server has no RANGE partitions to extend (#1789): it refuses by
     /// name, rather than answering with an empty series that would read as
     /// "nothing to add".

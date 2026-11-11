@@ -332,6 +332,7 @@ impl Reconstruction {
                                         &ObjectName::new(schema, name),
                                         &pbps_model::module::Lexis {
                                             code_only: &|s| crate::LEXICON.code_only(s),
+                                            quoted_identifiers: crate::LEXICON.quoted_identifiers,
                                             continues_ident: crate::LEXICON.identifier_continues,
                                             reserved: crate::LEXICON.reserved,
                                             bare_rank: &pbps_model::module::every_schema,

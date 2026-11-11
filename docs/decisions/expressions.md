@@ -1309,3 +1309,33 @@ the measured builds, not every engine version or Azure deployment.
 Keep the current parser, gates and formats unchanged. Revisit a bounded,
 version-gated addition when a concrete mapping justifies it. Table-valued regex
 functions remain excluded as subqueries; CLR and execution hooks are not remedies.
+
+<a id="dec-2436-1"></a>
+
+**DEC-2436.1. A name is found as a whole identifier, never as a part of one.**
+The scan behind `may_name` and `may_name_qualified` compared substrings and
+looked only at the characters either side, so `[Order Details Extended]` read
+as naming `Order Details`: a space does not continue an identifier. It now
+tokenizes the code once (`code_tokens`) and compares whole names, with a
+delimited identifier's doubled closer undoubled, under the same fold as before.
+Three choices are not obvious:
+
+- A name that needs delimiting is found only delimited. `Order Details` written
+  bare is two words and names nothing; the engine refuses it too.
+- The delimiter pairs are the engine's (`Lexicon::quoted_identifiers`). `[` is
+  SQL Server's quote and PostgreSQL's subscript, so `a[idx + 1]` still names
+  `idx` there. The qualified scan used to drop every `[`, `]` and `"`, which
+  also read `[a]]b]` as `ab`; it now reads `a]b`.
+- Words still end at `continues_ident`, not at the engine's own rule, so
+  `@amount` still names `amount` (a false yes costs a second plan,
+  DEC-1316.1). Only the stored-definition reader in `pbps-mssql/impact.rs`,
+  which reads the engine's spelling, uses the engine's rule (`names_exactly`).
+
+The module-ordering scan in `pbps-model` (`references_in`) read the same way
+and drew a false module-to-module edge from `[Order Details Extended]` to
+`Order Details`. It now reads the same tokens. `code_tokens` lives in
+`pbps-model`, the crate below the dialects, so that both scans share it
+without `pbps-model` depending on `pbps-dialect`; `Lexis` carries the
+engine's delimiter pairs (`quoted_identifiers`) the way `Lexicon` does. A dot
+beside a name still makes it part of a longer path (`sales.dbo.v`), and a
+reserved word is still a reference only where it is delimited (DECISIONS 316).
