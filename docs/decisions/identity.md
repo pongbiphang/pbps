@@ -1631,8 +1631,8 @@ Four rules, one per cause (#2806, #2816, #2817).
   first rename used to leave the asides and the created directories made
   before it, and now puts the tree back as it was.
 
-A declaration name within 4 bytes of the limit has no mirror of the same stem
-(`<stem>.json` is one byte longer than `<stem>.yml`); DEC-2817.2 decides it.
+A `.yml` declaration whose own name is at the limit has no mirror of the same
+stem (`<stem>.json` is one byte longer than `<stem>.yml`); DEC-2817.2 decides it.
 
 <a id="dec-2817-2"></a>
 
