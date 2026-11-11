@@ -2127,6 +2127,104 @@ fn any_language_roots_require_source_review_and_the_saved_opt_in() {
     }
 }
 
+const REVIEWED_ROOT: &str = "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN RETURN lower($1) = 'x'; END $$";
+
+/// A routine awaiting review is known to the misspelling probe from the first
+/// read of the declarations: the probe stores a typed constant, which can run
+/// that routine, so it leaves a partition's own default unasked and says that
+/// source review is why (DEC-2181.2). Without the review the probe would ask
+/// the volatility of the input path instead and give another reason.
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn a_type_routine_awaiting_review_leaves_a_partition_default_unasked_for_review() {
+    let own = OwnDatabase::new(&server(), "review_probe");
+    let db = own.connection();
+    let d = root_demo(db, "review-probe", REVIEWED_ROOT);
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        "table: app.ev\ncolumns:\n  k: {type: integer, nullable: false}\n  v: {type: integer, default: \"1\"}\n\
+         partition_by: [k]\npartitions:\n  ev_a:\n    from: [\"0\"]\n    to: [\"10\"]\n    columns:\n      v: {default: \"7\"}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    opt_in(&d, db, true);
+    let unasked = |report: &serde_json::Value| -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "plan.partition-default-unasked")
+            .map(|f| f["message"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let report = json_output(succeeds(d.run(&["plan", "--db", db, "--format", "json"])));
+    let warnings = unasked(&report);
+    assert_eq!(warnings.len(), 1, "{report}");
+    assert!(
+        warnings[0].contains(
+            "partition app.ev_a column `v`: input-path routines require source review of the \
+             saved plan before this probe"
+        ),
+        "{}",
+        warnings[0]
+    );
+    assert!(!warnings[0].contains("non-immutable"), "{}", warnings[0]);
+}
+
+/// A plan that needs the resolver is refused while a routine on a type's
+/// input path still awaits review, before any scratch is acquired: the
+/// resolver would run it unreviewed (DEC-2181.2). The same plan with no
+/// resolver selected is an ordinary plan and pins the routine.
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn a_resolver_required_plan_is_refused_while_a_type_routine_awaits_review() {
+    let own = OwnDatabase::new(&server(), "resolver_review");
+    let db = own.connection();
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; {REVIEWED_ROOT}; CREATE DOMAIN app.checked AS varchar CHECK (app.root(VALUE))"
+        ),
+    );
+    let d = Demo::new("resolver-review");
+    d.keyed(db);
+    d.table(&declarations(""));
+    std::fs::write(
+        d.dir.join("schema/v.yml"),
+        "view: app.v\ndefinition: SELECT id FROM app.t\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", db]));
+    // A column in front of `id` is a change the kept view over `id` cannot be
+    // rebound across without the resolver.
+    d.table(
+        "table: app.t\ncolumns:\n  n: {type: app.checked, default: \"'X'\"}\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    leave_with_untrusted_role(db, "resolver-review", "app.root(varchar)");
+    opt_in(&d, db, true);
+    // Negative: no resolver selected, an ordinary plan.
+    succeeds(d.run(&["plan", "--db", db]));
+    let config = d.dir.join("pbps.yml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "{text}\nresolve_with: scratch\nresolvers:\n  scratch:\n    kind: server\n    url_env: PBPS_FLOW_PG_UNUSED\n"
+        ),
+    )
+    .unwrap();
+    refused_plan(
+        &d,
+        db,
+        "resolver execution would run unreviewed type routines",
+    );
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 18"]
 fn io_coercion_roots_require_source_review_on_postgres_18() {

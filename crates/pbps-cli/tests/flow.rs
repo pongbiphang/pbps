@@ -14489,6 +14489,94 @@ fn a_schema_name_the_database_spells_differently_is_refused() {
     );
 }
 
+/// `plan --db` asks the engine how it spells a declared schema before it
+/// plans (DECISIONS 142), not only `bootstrap`: a schema the declarations
+/// write as `DBO`, which the database holds as `dbo`, is refused by name
+/// instead of being granted and revoked again by every plan after. The
+/// database's own spelling plans as no change.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_connected_plan_refuses_a_schema_name_the_database_spells_differently() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "schemacase-plan");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("schemacase-plan-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::fs::create_dir_all(d.dir.join("schema").join("roles")).unwrap();
+    let role_file = d.dir.join("schema").join("roles").join("reporting.yml");
+    let role = |target: &str| format!("role: reporting\ngrants:\n  schema::{target}: [select]\n");
+    std::fs::write(&role_file, role("dbo")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Negative: the database's own spelling plans as no change.
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    std::fs::write(&role_file, role("DBO")).unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`DBO` (granted to role `reporting`) is written `dbo` by the database"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// `trusted_roles` and `pin_type_routines` belong to PostgreSQL's type input
+/// routines, which SQL Server has none of. A connected plan that sets either
+/// is refused by name, before it reads the database further, rather than
+/// planned as if the setting were honoured.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_connected_sql_server_plan_refuses_the_postgresql_only_type_settings_by_name() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "typesettings");
+    let connection = own.connection().to_owned();
+
+    let d = Demo::new("typesettings-live");
+    d.table(
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    // Negative: neither setting, and the plan is the empty one.
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    let config = d.dir.join("pbps.yml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    for (setting, message) in [
+        (
+            "trusted_roles: [reporting]\n",
+            "trusted_roles is supported only on PostgreSQL",
+        ),
+        (
+            "pin_type_routines: true\n",
+            "pin_type_routines is supported only on PostgreSQL",
+        ),
+    ] {
+        std::fs::write(&config, format!("{original}{setting}")).unwrap();
+        d.commit();
+        let o = d.run(&["plan", "--db", &connection]);
+        assert_ne!(code(&o), 0, "{setting}: {}", stdout(&o));
+        assert!(stderr(&o).contains(message), "{setting}: {}", stderr(&o));
+    }
+}
+
 /// Users, roles and application roles share one namespace in SQL Server; a
 /// role declared under a user's name looked free to the managed set and
 /// `CREATE ROLE` failed after everything ordered before it had run. Refused
