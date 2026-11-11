@@ -194,6 +194,7 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`, `intent` (repeatable rename/drop pairs),
 `move-rows` (`--max-rows` / `--reason`),
+`ids migrate`, `ids fmt` (`--check`), `ids resolve`,
 `partitions extend` (`--every` / `--until` / `--from`),
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind declaration|config|envelope`), `completions`,
@@ -202,6 +203,13 @@ takes `--format human|json`; `--no-input` is global. The envelope those
 commands emit has a published schema of its own (`schema --kind envelope`,
 `schemas/envelope.schema.json`), and a test validates each command's real
 output against it.
+
+Identities are kept as one file per declaration under `ids_dir` (default
+`.pbps/ids`), mirroring the YAML tree (SPEC 5). The single `schema.ids.json` is
+the earlier layout: every command that reads identities refuses a project that
+still has it and says to run `pbps ids migrate`, and only history (`--since`,
+`pbps test` revisions) still reads it. The layout, its `ids.*` validator codes
+and the sync `plan` performs are DEC-2600.1 and DEC-2600.6 to DEC-2600.10.
 
 Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
 (`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with` / `--assert`), `apply` (`--plan` /

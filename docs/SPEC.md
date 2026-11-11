@@ -116,7 +116,7 @@ Three persistent artifacts with strictly separated responsibilities:
 | Artifact | Location | Contents | Maintained by |
 |---|---|---|---|
 | `schema/*.yml` | git | Desired state: tables, columns, constraints, indexes | Humans |
-| `schema.ids.json` | git | Identity ledger: uid to name, plus tombstones | The tool |
+| `.pbps/ids/**/*.json` | git | Identity ledger: uid to name, plus tombstones, one file per declaration (5) | The tool |
 | `__pbps_state` table | Each environment's database | That environment's verified state snapshot plus the audit ledger | The tool |
 
 **Why the identity file goes into git**: rename intent has to survive until every
@@ -139,7 +139,7 @@ passing and no environment-mapping strategy.
 # pbps.yml
 dialect: mssql
 schema_dir: schema/
-ids_file: schema.ids.json
+ids_dir: .pbps/ids
 ```
 
 `schema_dir` is a subdirectory of the project, never the project root itself
@@ -149,6 +149,28 @@ root, other tools' YAML) could never load. `schema_dir: .`, `..` and their
 equivalents are refused by name when the project loads, and so is a historical
 config that names one when a baseline is read from git (#739). A sibling such
 as `../shared/schema` is fine.
+
+`ids_dir` is the directory of the identity files (5), relative to the project
+root like `schema_dir`; it defaults to `.pbps/ids`. The same spelling rule
+applies: it must not be the project root or a directory above it, and it must
+not be `schema_dir` or a directory that holds it, because identity files read
+as declarations (or declarations among identity files) would defeat the point
+of keeping them apart (DEC-2600.7). The first time pbps writes identity files
+into a project that never named the key, it adds `ids_dir` to `pbps.yml`, even
+when the value is the default. A pbps that does not know the key then stops at
+the config with an unknown-field error, instead of finding no `schema.ids.json`,
+reading the project as one with no identities and minting new uids for every
+object (DEC-2600.7).
+
+`ids_file` is the retired key. It named the single identity file of the earlier
+layout, and it stays only so that `pbps ids migrate` can find that file where a
+project had moved it (5.4). A config that names `ids_dir` and also gives
+`ids_file` any value but its default `schema.ids.json` is refused when it is
+parsed: the pair has no meaning, and nothing could say which is authoritative.
+The default value is not counted as naming it, because a config written out and
+read back always carries it. A project whose identities are still in the file
+`ids_file` names is in the earlier layout, and the commands that read identities
+refuse it until `pbps ids migrate` has moved them (5.4).
 
 `partition_runway:` sets how far ahead of its rows a RANGE-partitioned table's
 partitions must run before `doctor` warns that they are running out (9.5): a
@@ -1320,9 +1342,19 @@ reachable are gone, and rolls back on any difference. The plan is sealed in plan
 format 61. A drop is planned only against a database, and a rehearsal is not
 required for it.
 
-## 5. The identity file (`schema.ids.json`)
+## 5. The identity files
+
+The identity of every table, column, role, type and extension is a uid, and
+what the uid currently means is a name. Both live in git, in files the tool owns
+and users do not edit. There are two forms of the same information: the
+**mapping** that a plan, a state snapshot and every command hold in memory
+(5.1), and the **files** that carry it on disk, one per declaration. The mapping
+did not change when the files were split; only where it is kept did.
 
 ### 5.1 Format
+
+**The mapping.** This is the model a saved plan and a state snapshot embed. Its
+version is `1` and nothing about the files changes it:
 
 ```json
 {
@@ -1372,14 +1404,120 @@ The optional `roles` map holds `r_` uids and unqualified role names; the optiona
 evolutions under version 1: a file without either section loads with that map
 empty. Type definitions stay in YAML, never in the ids map.
 
-A 200-column project is 200 lines of `uid: name`, and a rename's diff is:
+**The files.** On disk the mapping is split into one file per declaration file,
+under `ids_dir` (4.1, default `.pbps/ids`). Splitting is what makes a merge
+conflict only where the YAML conflicts (5.3, 5.5): two branches that change
+different declarations change different identity files.
 
-```diff
--    "c_p3n8vd": "dbo.customer.customer_name",
-+    "c_p3n8vd": "dbo.customer.full_name",
+- **Which file.** A declaration at `<schema_dir>/<dir>/<name>.yml` (or `.yaml`)
+  has its identity file at `<ids_dir>/<dir>/<name>.json`. File names carry no
+  meaning in the YAML (4.2), and the identity file follows the YAML file's name,
+  never the table's: renaming the table in `table:` leaves the path alone and
+  changes one line of the identity file, and moving or renaming the YAML file
+  moves the identity file. Tables, roles, types and extensions each have a file
+  of their own, because each is its own declaration file. A module has no
+  identity and no identity file (4.5). A partitioned table's children are
+  declared in the parent's file (4.3), so their records live in the parent's
+  identity file.
+- **A table file** has a fixed header and then one section per kind of record.
+  The header lines come in this order: `_generated`, `format`, `uid` (the
+  table's uid), `table` (its current qualified name, as the YAML spells it) and,
+  for a dropped table only, `dropped`. The `columns` section follows, then
+  `partitions`, `moves`, `conversions` and `rebuilds`, each written only when it
+  has records. A section holds one record per line, in a fixed order, with a
+  blank line after the opening brace and after every record, and ends with the
+  entry `"_end": true`. The `columns` records follow the **order of the columns
+  in the YAML**; a live column is `"c_uid": "local_name"` (the table part of its
+  name comes from `table`), and the tombstone of a dropped column stays where the
+  column was, as one line holding the tombstone of the mapping:
+
+```json
+{
+  "_generated": "This file is written by pbps and records the identity of one declaration file. Do not edit it by hand: change the YAML declaration and run `pbps plan`. After a git merge conflict, resolve the YAML first, then run `pbps ids resolve`; `pbps ids fmt` restores the canonical form. This line is a wire constant and never changes: its length keeps git's rename detection working for small files in a merge.",
+  "format": 1,
+  "uid": "t_aaaaaa",
+  "table": "dbo.customer",
+  "columns": {
+
+    "c_aaaaa1": "customer_id",
+
+    "c_aaaaa2": "full_name",
+
+    "c_aaaaa3": {"was": "dbo.customer.national_id", "dropped_at": "2026-08-30", "reason": "REG-2026-042 PII erasure", "operator": "leon"},
+
+    "c_aaaaa4": "email",
+
+    "_end": true
+
+  },
+  "conversions": {
+
+    "c_aaaaa4": {"from": "text", "to": "citext", "using": "lower(email)", "allowed_at": "2026-09-01", "operator": "leon"},
+
+    "_end": true
+
+  }
+}
 ```
 
-One name changing under one uid — an unambiguous rename signal in an MR review.
+- **A role, type or extension file** has the same header, then one line naming
+  the object under the key `role`, `type` or `extension`, and a `dropped` line
+  when it is dropped. It has no sections: there is no record list.
+- **Where the other records live.** `moves` (6.5) are keyed by the partition's
+  uid and live in the file that holds the partition's record, its parent's, or in
+  the partition's own file once it stands alone. `conversions` (6.6) live in the
+  file of the table that owns the column. A `rebuilds` record lives in the file
+  of the table the rebuild produced. A row requirement (`require`, 6.7) is a
+  field of the tombstone it is sealed with, so it sits on that tombstone's line
+  in `columns`, or in the `dropped` line of a dropped table.
+- **`format` and `_generated`.** `format` is the layout version of the file,
+  `1`. It is a separate number from the mapping's `version` on purpose: changing
+  the layout bumps one, changing what the mapping means bumps the other.
+  `_generated` is the same 400-byte line in every file and every version. It
+  tells a reader the file is the tool's, and it is also padding: git keeps a
+  rename or a move paired only while the two sides are at least half alike, and
+  a small file is smaller than the edits that travel with a move (5.5). Changing
+  one byte of it would rewrite every file, so it is a constant.
+- **Canonical bytes.** LF line ends, two-space indent, exactly the spacing above,
+  a trailing newline; strings escaped by the standard JSON rules, non-ASCII kept
+  as UTF-8. The blank lines and the closing `_end` entry are there for merging:
+  two edits to neighbouring records do not share a hunk, and an edit to the last
+  record cannot touch the line before it. The loader checks structure, not
+  spacing, because a merge can leave one blank line more or fewer and a deploy
+  must not stop for whitespace. `pbps ids fmt` rewrites files to the canonical
+  bytes, and `plan --check` reports a tree whose bytes are not (6.2).
+- **What the loader refuses.** Invalid JSON, a repeated key, an unknown field, a
+  uid whose prefix does not match where it stands, a `format` other than `1`,
+  conflict markers, a section with no `_end` entry or one that is not last, a
+  dropped file that still holds live columns or partitions, one uid in two files,
+  and any entry in the tree that is not a regular `.json` file or a directory
+  (a symlink is refused, never read as nothing). Most have a distinct `ids.*`
+  code (5.3).
+
+**A dropped object keeps its file.** Dropping a table writes a `dropped` header
+line holding its tombstone and turns its columns into tombstones in place; the
+file stays where it was. A dropped file may still hold the tombstones of
+partition children it retired, but no live column or partition (DEC-2600.1,
+DEC-2600.9). If a live declaration later takes the path of a dropped file, the
+dropped file is sent aside to `<ids_dir>/<name>.<uid>.json`, where `<name>` is
+the object's last name with every character other than ASCII letters, digits,
+`.` and `-` replaced by `_` (a name too long for a file name is replaced by a
+digest of it), and `<name>.<uid>.<n>.json` if that name is taken. A dropped
+object the tree never held, such as one a migrated project had no declaration
+for, gets the same name. Nothing reads the name, only the file's contents.
+
+**A moved declaration takes its identity file along.** When a declaration's YAML
+file moves or is renamed, `plan` writes the identity file at the path the
+declaration now mirrors and removes the old one. The two are paired by uid, which
+the name or a `renamed_from` has already matched. New files are put in place
+before old ones are removed, so a crash leaves both copies and never neither; the
+next read names the duplicate uid, and the remedy is to delete the old file
+(DEC-2600.9).
+
+**Partitions.** A child's record is in the `partitions` section of its parent's
+file, and a retired child is a tombstone record there. A table that becomes a
+partition, stops being one, or changes parent has its record moved between files,
+and its own file is created or removed with it (DEC-2600.1, DEC-2600.9).
 
 ### 5.2 UID rules
 
@@ -1399,16 +1537,135 @@ version by version. This is also why `StateSnapshot` carries `ids`.
 
 ### 5.3 Cross-branch conflicts
 
-Two branches doing different things to one column both edit the same uid's line in
-the ids file, which is a **git merge conflict** and stops right there. No separate
-"referential integrity between annotations" checking rules are needed.
+Each declaration has an identity file of its own, and each record in it is a
+line of its own with a blank line on either side (5.1). Two branches that change
+different declarations change different files, and two that change different
+columns of one table change records that do not share a hunk, so git merges them
+without help. A merge conflicts in an identity file where it conflicts in the
+YAML: two branches doing different things to one column both edit that column's
+one record, which is a **git merge conflict** and stops right there. No separate
+"referential integrity between annotations" checking rules are needed. How far
+that claim was measured, and where it was not, is in 5.5.
 
-There is one hole a line-level conflict does not catch: two branches **each add a
+There is one hole a conflict does not catch: two branches **each add a
 column with the same name**. Each hands out a different random uid, the two land
-on different lines of the ids file, and git will likely auto-merge them cleanly —
-leaving two uids pointing at one name, a silently corrupted identity mapping.
-`validate` therefore must include the rule: **one name may not map to more than
-one uid**. On violation it fails and asks a human to decide which uid survives.
+in different records, and git will likely auto-merge them cleanly — leaving two
+uids pointing at one name, a silently corrupted identity mapping. `validate`
+therefore includes the rule: **one name may not map to more than one uid**. On
+violation it fails (`ids.duplicate-name`, naming both files) and asks a human to
+decide which uid survives (DEC-2600.6).
+
+`validate` checks the whole tree, not the first fault, and reports each finding
+under a stable `ids.*` code that never changes meaning. The codes cover a file
+that does not parse (`ids.malformed`, `ids.conflict-markers`,
+`ids.sentinel-missing`, `ids.format`), a uid in two files (`ids.duplicate-uid`),
+a mapping that is inconsistent (`ids.duplicate-name`, `ids.invalid-mapping`), a
+file and a declaration that do not match (`ids.orphan`, `ids.name-mismatch`,
+`ids.dropped-but-declared`, `ids.live-column-in-dropped`), two declarations that
+would share one file (`ids.path-collision`, `ids.case-collision`), a declaration
+whose identity file name would not fit (`ids.name-too-long`) and a project in
+the earlier layout (`ids.legacy-layout`, `ids.legacy-beside-tree`, 5.4). A
+declaration with no identity file yet (`ids.yaml-without-ids`) is what `plan`
+creates, and a file that is not canonical (`ids.not-canonical`) is what
+`pbps ids fmt --check` reports, so `validate` leaves those two to them
+(DEC-2600.9).
+
+When a merge does leave identity files unmerged, resolve the YAML conflicts
+first, because the resolved YAML is what decides a clash, then run
+`pbps ids resolve`. It merges each unmerged identity file **by uid**: a record
+one side changed takes that side, an identical change is taken once, and two
+different changes to one record are decided by the name the resolved YAML
+declares or else refused, naming the uid, both sides and the command that states
+the intent. It never picks a side, and it has no `--take ours|theirs`: choosing a
+side by hand is how a duplicate name gets in (DEC-2600.8). It stages nothing; you
+`git add` the identity directory and commit.
+
+### 5.4 Moving a project to the identity files
+
+A project whose identities are still in the single file `schema.ids.json` is
+refused by every command that reads identities, with the remedy:
+
+> this project still keeps its identities in `<path>`; run `pbps ids migrate` to
+> move them into the identity tree `<ids_dir>`
+
+A project that has both the old file and a tree is an unfinished migration and is
+refused too:
+
+> `<path>` and the identity tree `<ids_dir>` both exist, so an earlier
+> `pbps ids migrate` did not finish; run it again
+
+`validate` reports the same two states as `ids.legacy-layout` ("schema.ids.json
+is the old layout; this pbps reads `.pbps/ids/`") and `ids.legacy-beside-tree`
+("both schema.ids.json and `.pbps/ids/` exist"). A project with neither is a new
+project.
+
+`pbps ids migrate` writes each object into the file at the path its declaration
+mirrors (a dropped object with no declaration goes aside, as in 5.1), checks
+that the tree reads back to the very mapping it came from, replaces `ids_file`
+by `ids_dir` in `pbps.yml`, and deletes `schema.ids.json`. It stages nothing:
+review `git diff` and commit it as one change. If it is interrupted, running it
+again finishes the work. It refuses an identity that has neither a declaration
+nor a tombstone, because it cannot tell where its file belongs. Plans and state
+snapshots made before the migration stay valid, since they embed the mapping and
+not the file.
+
+An earlier pbps stops at `pbps.yml` once the migrated project names `ids_dir`
+(4.1). The single file is still read in exactly one place, history, and that
+reader stays until 1.0 (DEC-2600.9). `--since <rev>`, `validate --since` and the
+revisions of `pbps test` read a revision's identity tree if it has one and its
+`schema.ids.json` otherwise, and refuse a revision that has both. Nothing else
+reads the old file.
+
+### 5.5 Identity files and merging
+
+The claim that the layout in 5.1 is meant to support: **a merge of two branches
+conflicts in an identity file only where it conflicts in the YAML.** This is the
+reason for one file per declaration, for the record layout, for the constant
+header and for giving roles, types and extensions a file each. There is no merge
+driver; nothing here depends on one. What was measured, and what was not:
+
+- **Simulated merges.** The merges were run with `git merge-tree --write-tree`
+  on generated projects, with identity files in the layout above, for branches
+  that change different parts of a project. Over 12,000 ordinary pairs and
+  25,200 move-and-rename pairs the identity files conflicted in none where the
+  YAML merged cleanly, with one exception: a table of a few columns moved or
+  renamed together with a column drop in one commit. The constant header closed
+  it: in the worst edit mix tried (a table rename, a file rename or move, one
+  column dropped, one added and one renamed in a single commit, for tables of 3
+  to 10 columns) a 400-byte header left no conflict in 200 pairs per size and
+  variant, and the least similarity git reported for the renamed file was 70%
+  against the 50% it needs. Without the header, tables up to 8 columns in that
+  mix conflicted in 35–60% of pairs while the YAML merged. Cells had 100 trials
+  in each of two placements.
+- **Roles, types and extensions.** A single file shared by all of them conflicted
+  where the YAML did not: two branches each adding a role conflicted in 38%, 25%,
+  6% and 1.8% of pairs when the file held 3, 10, 30 and 100 roles. That is why
+  each has a file of its own. The one-file-each layout was reasoned from the
+  tables' result, not run again.
+- **The hosted merge queue.** One throwaway repository with a merge-queue
+  ruleset, 40 tables, 4 roles, 3 types and 2 extensions, and 11 pull requests
+  that each changed the YAML and its identity file together (a column added at
+  the end and in the middle, dropped and renamed; a table added, dropped and
+  moved; a role and a type added). Ten merged without conflict and the final tree
+  was identical to the local `git merge-tree` result. The eleventh renamed the
+  same column as another differently; the queue removed it with `merge_conflict`,
+  as predicted. A real disagreement still surfaces as a conflict.
+
+What was **not** measured, and so is not claimed:
+
+- the sections `partitions`, `moves`, `conversions` and `rebuilds`, and the
+  aside name of a dropped file: they follow the same record rules, but no merges
+  were run on them;
+- a still larger single commit on a small table: one on a table of 3 columns can
+  fall below git's 50% and be read as a delete and an add, and the identity file
+  may then conflict although the YAML merges. No clean merge was wrong in the
+  2,400 pairs of the header run, and the validator checks the merged tree, but a
+  larger commit was not tried;
+- a single edit mix per cell, 100 trials, two placements; five-branch sequences,
+  `git rebase` (which has its own rename detection), forges other than the one
+  tried, and merge queues configured differently;
+- identity conflicts are not gone, only confined to where the YAML conflicts,
+  and the same-name hole in 5.3 remains for `validate` to catch.
 
 ---
 
@@ -1421,7 +1678,8 @@ partition's rows** into a new range partition (6.5). A fourth is needed to
 plan one PostgreSQL change: **what a column's values become** when its type
 changes in a way the engine will not convert by itself (6.6).
 
-There are three equivalent inputs, all of which converge on the ids file.
+There are three equivalent inputs, all of which converge on the identity files
+(5).
 
 ### 6.1 CLI commands (the primary interface)
 
@@ -1480,21 +1738,59 @@ columns:
   full_name:
     type: nvarchar(100)
     nullable: false
-    renamed_from: customer_name    # transient: pbps plan absorbs it into the ids
-                                   # file; pbps fmt strips it once redundant
+    renamed_from: customer_name    # transient: pbps plan absorbs it into the
+                                   # identity files; pbps fmt strips it once
+                                   # redundant
 ```
 
-`pbps plan` reads it and writes the fact into the ids file. This is the escape
-hatch for **an editor and nothing else**.
+`pbps plan` reads it and writes the fact into the identity files. This is the
+escape hatch for **an editor and nothing else**.
 
-The side effects are deliberately split: **`plan` writes only the ids file** (a
-tool-owned artifact) and **never rewrites the user's YAML**. Removing the
-annotation line is `pbps fmt`'s job — a `renamed_from` whose fact is already in
-the ids file is redundant, and canonicalization strips it. An annotation left in
-place is harmless: one that agrees with the ids file is a no-op, not an error
-(intent is idempotent). `plan --check` in CI is strictly read-only; when an
-annotation exists whose fact is not yet in the ids file, it fails with a
-copy-pastable instruction (run `pbps plan` locally, commit the ids file).
+The side effects are deliberately split: **`plan` writes only the identity
+files** (tool-owned artifacts) and **never rewrites the user's YAML**. Removing
+the annotation line is `pbps fmt`'s job — a `renamed_from` whose fact is already
+in the identity files is redundant, and canonicalization strips it. An
+annotation left in place is harmless: one that agrees with the identity files is
+a no-op, not an error (intent is idempotent).
+
+What `plan` writes is the whole tree, brought in line with the declarations
+(DEC-2600.9). It decides every file it will write, move, send aside or remove,
+and every refusal, before it writes any, and it proves that the result reads
+back to the mapping it was made from:
+
+- a new table, role, type or extension gets a file at the path its YAML mirrors;
+- a new column is recorded after its YAML predecessor, a renamed or retired one
+  in place;
+- a declaration whose YAML moved or was renamed takes its identity file to the
+  path it now mirrors (5.1);
+- a dropped object keeps its file, which goes aside if a live declaration takes
+  its path (5.1);
+- a table that becomes, stops being or changes parent as a partition has its
+  record moved between files;
+- an identity that no longer exists in the mapping, such as a rebuild's source
+  once the rebuild is withdrawn, loses its file.
+
+Files are written beside their final names and renamed into place, then the old
+ones are removed, and `pbps.yml` is written last, so a crash leaves a moved file
+in both places and never in neither. A write that would leave a live declaration
+with no place for its file, or two live declarations for one file, is refused
+and nothing is written. Where the filesystem ignores case, a declaration renamed
+only in case asks its identity file to follow; `plan` writes it under the
+spelling the disk has and then changes the spelling in a last step. Git does not
+see such a rename on those filesystems, so `plan` prints the two commands that
+tell it (`git rm -r -q --cached <dir>`, then `git add <dir>`) (DEC-2600.10).
+
+`plan --check` in CI is strictly read-only. It asks whether the tree on disk is
+what the mapping and the declarations say it should be, and fails with
+`identity.stale` (remedy `pbps plan`) when a file would be created, rewritten,
+moved or removed: not only a changed mapping, but also a declaration that moved
+since the tree was written, or bytes that are not canonical. Likewise, when an
+annotation exists whose fact is not yet recorded, it fails with a
+copy-pastable instruction (run `pbps plan` locally, commit the identity
+directory). A plan that cannot be made is refused by name rather than reported
+as stale, because running `pbps plan` would not help. `plan --check` does not
+repeat `validate`'s findings (5.3). `deploy` asks the same question of its
+in-memory declarations by comparing the mappings, not the files.
 
 ### 6.3 Interactive prompt
 
@@ -1594,8 +1890,9 @@ locked, is in no file and no catalog. So it is intent:
 pbps move-rows app.events_2030 --max-rows 50000 --reason "no CDC reads app.events"
 ```
 
-The command records one entry in the ids file's `moves`, against the new
-partition's uid, with the bound, the reason, who allowed it and when. Like the
+The command records one entry in the `moves` of the identity files (5.1),
+against the new partition's uid, with the bound, the reason, who allowed it and
+when. Like the
 other commands of 6.1 it needs no database connection, and allowing the same
 bound and reason again changes nothing. It is refused for a table that is not a
 range partition whose parent declares a DEFAULT partition, where no row can
@@ -1629,8 +1926,9 @@ question to ask. The plan report says, for each such partition, how many rows
 it may take or that it may take none. An entry for a partition that already
 exists is never consulted, since no plan creates it again.
 
-To withdraw permission, remove that partition UID's entry from `moves` in the
-identity file and commit the withdrawal with the declarations.
+To withdraw permission, remove that partition UID's entry from the `moves`
+section of the identity file that holds it and commit the withdrawal with the
+declarations.
 
 ### 6.6 Converting a column's values
 
@@ -1653,7 +1951,8 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
   example it never takes for an answer. Without a terminal, and under
   `plan --check`, `plan` fails with the finding `plan.conversion-required` and the
   command. No flag of `plan` or `apply` can supply it (14.3).
-- **Recorded** in the ids file's `conversions`, by the column's uid, with the
+- **Recorded** in the `conversions` of the identity file of the column's table
+  (5.1), by the column's uid, with the
   `from` and `to` types as the dialect spells them, the expression verbatim, who
   recorded it and when. It follows the column through a rename and is in the
   plan's checksum.
@@ -2406,7 +2705,7 @@ Review and commit those files, run `plan --db` or `plan --env`, and apply the
 checksum-pinned approved plan (14.1). Export requires a current-version snapshot
 and refuses existing declarations unless `--force` authorizes replacement,
 including removing stale declaration files. It validates the staged output before
-writing the project and leaves `schema.ids.json` unchanged, preserving every
+writing the project and leaves the identity files unchanged, preserving every
 later rename and drop intent. Record any new intent through the existing commands.
 These commands read the ledger without changing the database. Recovery restores
 recorded structure and declared reference data, not lost business rows (14.3).
@@ -2419,12 +2718,15 @@ recorded structure and declared reference data, not lost business rows (14.3).
 
 | Command | Purpose |
 |---|---|
-| `pbps plan` | Resolve identity ambiguities, update the identity file, and compare against a baseline to produce a change plan |
+| `pbps plan` | Resolve identity ambiguities, update the identity files, and compare against a baseline to produce a change plan |
 | `pbps plan --base <file>` | Use a state snapshot file as the baseline instead (for environments without git) |
-| `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
+| `pbps plan --check` | CI mode: fail only when intent is missing or the identity files are not what `plan` would write (6.2), never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps partitions extend <table> --every <step> --until <end> [--from <start>]` | Declare a PostgreSQL RANGE-partitioned table's next partitions in its file, from the last declared range to an end the user states; reads no clock and no database, writes no identity (see 4.3) |
-| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` / `convert` | Record intent into the ids file |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` / `convert` | Record intent into the identity files |
+| `pbps ids migrate` | Move a project's identities from the single file `schema.ids.json` into the identity files, replace `ids_file` by `ids_dir` in `pbps.yml` and delete the old file (5.4). It checks that the files read back to the same mapping, stages nothing, and finishes the work if run again after an interruption |
+| `pbps ids fmt` / `ids fmt --check` | Rewrite every identity file to its canonical bytes without changing its meaning; if any file cannot be read, none is rewritten. `--check` lists the files that differ and exits non-zero without writing |
+| `pbps ids resolve` | After the YAML conflicts are resolved, merge the identity files git left unmerged, by uid, and write canonical bytes. It never picks a side, refuses what the resolved YAML cannot decide, and stages nothing (5.3) |
 | `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |
@@ -4870,7 +5172,7 @@ around the typed plan and its checksum.
 | Discover the declaration format while typing | Users move between YAML and this document, and a misspelled key is found only by running `validate` | Ship versioned JSON Schemas for `pbps.yml` and the declarations, **generated from the loader's own types** so the two cannot drift, plus a `pbps schema` exporter for air-gapped editors, shell completions and generated man pages | **P0** |
 | Apply organization-specific safety rules | Built-in validation cannot express local naming, size or change-window rules | A declarative `policies:` block selects built-in rules and severities. Suppression requires a rule id, a reason and an optional expiry; no embedded code in v1 (14.3). `validate --since` evaluates only changed objects, so a large estate can adopt it gradually. The block is a new format surface and gets an ADR before it is built, as reference data and roles did | **P1** |
 | Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
-| Recover from a change that applied successfully and turned out to be wrong | A historical schema must become reviewed declarations with current identity intent preserved | Built: `pbps state list`, `state show <id>`, `state diff <id> [<id>]` and `state export <id>`. Recovery is `export` → review and commit → `plan --db` or `--env` → ordinary approved `apply`. Export preserves `schema.ids.json`, writes recorded reference data but restores no business rows, and requires the current snapshot version. Historical `public_execute` is not recorded: `state diff` omits its policy-derived changes, and exported PostgreSQL routines omit it and keep the closed default; both commands note the limit. There is no one-step rollback or bypass around the gate (14.3) | **P1** |
+| Recover from a change that applied successfully and turned out to be wrong | A historical schema must become reviewed declarations with current identity intent preserved | Built: `pbps state list`, `state show <id>`, `state diff <id> [<id>]` and `state export <id>`. Recovery is `export` → review and commit → `plan --db` or `--env` → ordinary approved `apply`. Export preserves the identity files, writes recorded reference data but restores no business rows, and requires the current snapshot version. Historical `public_execute` is not recorded: `state diff` omits its policy-derived changes, and exported PostgreSQL routines omit it and keep the closed default; both commands note the limit. There is no one-step rollback or bypass around the gate (14.3) | **P1** |
 | Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed — delivered in [CI.md](CI.md). A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet. Every change is classified through the selected dialect's `Dialect::change_risks`, which starts from `Change::intrinsic_risks_with` under that engine's identifier boundary, and its findings are attached to `PlannedChange::risks`. Saved-plan validation re-derives them the same way (DEC-399.1). Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
