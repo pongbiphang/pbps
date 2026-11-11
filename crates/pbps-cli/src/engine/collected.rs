@@ -138,10 +138,7 @@ pub(crate) async fn type_rebuild_hints(
 /// under the database's collation. PostgreSQL has no computed-column edges to
 /// read, so its are judged by the text screen (#1460).
 pub(crate) fn computed_column_screen(driver: Driver) -> pbps_diff::Screen {
-    match driver {
-        Driver::Mssql => pbps_diff::Screen::Catalog,
-        Driver::Postgres => pbps_diff::Screen::Text,
-    }
+    profile::profile(driver).computed_column_screen
 }
 
 /// Asks the resolver's scratch to compare the expressions a plan retains,
@@ -272,17 +269,15 @@ pub(crate) async fn table_expression_notes(
 /// so the plan is refused by name and with a count before anything is written
 /// (DEC-1635.7, DEC-1635.9). SQL Server has neither enums nor domains.
 pub(crate) fn counts_rows_an_enum_retype_strands(driver: Driver, changes: &ChangeSet) -> bool {
-    match driver {
-        Driver::Postgres => changes.changes.iter().any(|p| {
+    profile::profile(driver).counts_stranded_rows_at_plan_time
+        && changes.changes.iter().any(|p| {
             matches!(&p.change, pbps_model::Change::EnumRebuild {
                 step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
             } if match values.as_ref() {
                 pbps_model::ValueChange::Cast { from, to, .. } => from != to,
                 pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
             })
-        }),
-        Driver::Mssql => false,
-    }
+        })
 }
 
 /// Whether planning vets declared domain `CHECK` and `DEFAULT` code on the
@@ -290,10 +285,7 @@ pub(crate) fn counts_rows_an_enum_retype_strands(driver: Driver, changes: &Chang
 ///
 /// PostgreSQL has domains and does; SQL Server has none.
 pub(crate) fn vets_declared_domain_code(driver: Driver) -> bool {
-    match driver {
-        Driver::Postgres => true,
-        Driver::Mssql => false,
-    }
+    profile::profile(driver).vets_declared_domain_code
 }
 
 /// Recounts, where the plan runs, the dependents of the enums it rebuilds: a
@@ -388,12 +380,9 @@ pub(crate) async fn table_expressions_left_unjudged(
 ///
 /// PostgreSQL has one; SQL Server does not yet (#619, #620).
 pub(crate) fn refuse_externals_draft_unsupported(driver: Driver) -> anyhow::Result<()> {
-    match driver {
-        Driver::Postgres => Ok(()),
-        Driver::Mssql => anyhow::bail!(
-            "`pbps resolver externals` reads a PostgreSQL target; SQL Server has no binding \
-             adapter yet (#619, #620)"
-        ),
+    match profile::profile(driver).externals_draft_refusal {
+        None => Ok(()),
+        Some(refusal) => anyhow::bail!(refusal),
     }
 }
 
@@ -440,10 +429,7 @@ pub(crate) fn scratch_base_bootstrap<D: crate::emission::Engine>(
 /// do what. PostgreSQL's compiles the base's statements later, from the
 /// lowering.
 pub(crate) fn scratch_compiles_base_namespace(driver: Driver) -> bool {
-    match driver {
-        Driver::Mssql => true,
-        Driver::Postgres => false,
-    }
+    profile::profile(driver).scratch_compiles_base_namespace
 }
 
 /// How a target's refused or failed read of its engine lineage identity is
@@ -452,12 +438,7 @@ pub(crate) fn scratch_compiles_base_namespace(driver: Driver) -> bool {
 /// PostgreSQL's refusal is the deployment role's to fix and names the grant;
 /// SQL Server's `family_guid` read has no such remedy and is unanswerable.
 pub(crate) fn target_identity_unread(driver: Driver, error: DbError) -> crate::resolution::Refused {
-    match driver {
-        Driver::Postgres => crate::resolution::identity_unread(error),
-        Driver::Mssql => crate::resolution::Refused::Unanswerable(anyhow::anyhow!(
-            "the target's master family_guid could not be read: {error}"
-        )),
-    }
+    (profile::profile(driver).target_identity_unread)(error)
 }
 
 /// Whether the resolver's scratch may share the target's instance, which
@@ -471,22 +452,16 @@ pub(crate) fn same_instance_consent(
     profile: &pbps_config::resolver::ResolverProfile,
 ) -> pbps_model::resolver::SameInstance {
     use pbps_config::resolver::ResolverProfile;
-    match (driver, profile) {
-        (Driver::Mssql, profile) => {
-            let choice = match profile {
-                ResolverProfile::Server { same_instance, .. } => same_instance.unwrap_or_default(),
-                ResolverProfile::Docker { .. } => pbps_config::resolver::SameInstance::Refuse,
-            };
-            match choice {
-                pbps_config::resolver::SameInstance::Refuse => {
-                    pbps_model::resolver::SameInstance::Refused
-                }
-                pbps_config::resolver::SameInstance::Allow => {
-                    pbps_model::resolver::SameInstance::Allowed
-                }
-            }
-        }
-        (Driver::Postgres, _) => pbps_model::resolver::SameInstance::NotApplicable,
+    if !super::profile::profile(driver).scratch_may_share_the_instance {
+        return pbps_model::resolver::SameInstance::NotApplicable;
+    }
+    let choice = match profile {
+        ResolverProfile::Server { same_instance, .. } => same_instance.unwrap_or_default(),
+        ResolverProfile::Docker { .. } => pbps_config::resolver::SameInstance::Refuse,
+    };
+    match choice {
+        pbps_config::resolver::SameInstance::Refuse => pbps_model::resolver::SameInstance::Refused,
+        pbps_config::resolver::SameInstance::Allow => pbps_model::resolver::SameInstance::Allowed,
     }
 }
 
