@@ -140,21 +140,18 @@ pub(crate) fn unused_sibling(
             n += 1;
             continue;
         }
-        match std::fs::symlink_metadata(&candidate) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                reserved.insert(key.path(&candidate));
-                return Ok(candidate);
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "cannot tell whether `{}` is in use, so it is not taken for a {kind} file",
-                        candidate.display()
-                    )
-                });
-            }
-            Ok(_) => n += 1,
+        // Only "not found" means free (`ids_store::entry`): a candidate that
+        // cannot be looked at is an error naming it, since reading it as unused
+        // would send the write on to a create or rename that fails for the
+        // same reason, or onto an entry nobody looked at.
+        if crate::ids_store::entry(&candidate)
+            .with_context(|| format!("cannot choose a name for a {kind} file"))?
+            .is_none()
+        {
+            reserved.insert(key.path(&candidate));
+            return Ok(candidate);
         }
+        n += 1;
     }
 }
 
@@ -707,7 +704,7 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
     // shows here as findings, with `pbps plan` as the remedy.
     let tree = read_tree(project)?;
     let declared = declarations(&dirs, &loaded, &paths);
-    let legacy = std::fs::symlink_metadata(project.ids_file()).is_ok();
+    let legacy = crate::ids_store::legacy_present(project)?;
     let findings = ids_check::check(&Input {
         layout: dirs.layout(),
         declared: &declared,

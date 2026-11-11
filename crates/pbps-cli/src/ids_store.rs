@@ -38,7 +38,7 @@ use crate::ids_cmd::{Dirs, declared_placement, new_config_text, shown, write_ato
 
 // ------------------------------------------------------------------ read ----
 
-fn legacy_present(project: &Project) -> anyhow::Result<bool> {
+pub(crate) fn legacy_present(project: &Project) -> anyhow::Result<bool> {
     let path = project.ids_file();
     match std::fs::symlink_metadata(&path) {
         Ok(_) => Ok(true),
@@ -445,16 +445,20 @@ impl TreeWrite {
                 .flat_map(Path::components)
             {
                 ancestor.push(part);
-                if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| !m.is_dir()) {
+                if entry(&ancestor)?.is_some_and(|m| !m.is_dir()) {
                     staged.set_aside(&ancestor, &mut reserved, key)?;
                 }
             }
-            let mut missing: Vec<PathBuf> = parent
-                .ancestors()
-                // Raw is right: `parent` was built by joining onto `self.dir`.
-                .take_while(|d| d.starts_with(&self.dir) && !d.exists())
-                .map(Path::to_path_buf)
-                .collect();
+            let mut missing: Vec<PathBuf> = Vec::new();
+            // Raw is right: `parent` was built by joining onto `self.dir`.
+            for d in parent.ancestors().take_while(|d| d.starts_with(&self.dir)) {
+                // A link is followed, as `exists` did: a symlink to a
+                // directory is a directory this write does not create.
+                if followed(d)?.is_some() {
+                    break;
+                }
+                missing.push(d.to_path_buf());
+            }
             missing.reverse();
             // Recorded before the create: `create_dir_all` can make some of
             // them and then fail.
@@ -473,7 +477,7 @@ impl TreeWrite {
         for (tmp, path) in &files {
             // A directory the new file takes the place of (a move the other
             // way round).
-            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            if entry(path)?.is_some_and(|m| m.is_dir()) {
                 staged.set_aside(path, &mut reserved, key)?;
             }
             std::fs::rename(tmp, path)
@@ -512,14 +516,21 @@ impl TreeWrite {
         // is left of anything else stays and is reported below. One place
         // decides it, so no caller has to know the shape.
         for (_, aside) in asides {
-            if std::fs::symlink_metadata(aside).is_ok_and(|m| m.is_dir()) {
+            if entry(aside)?.is_some_and(|m| m.is_dir()) {
                 remove_empty_tree(aside)
                     .with_context(|| format!("cannot inspect `{}`", aside.display()))?;
             }
         }
         // An aside nothing removed holds a file the write did not account for:
         // keep it, and say where it is.
-        if let Some((orig, aside)) = asides.iter().find(|(_, a)| a.exists()) {
+        let mut left = None;
+        for (orig, aside) in asides {
+            if entry(aside)?.is_some() {
+                left = Some((orig, aside));
+                break;
+            }
+        }
+        if let Some((orig, aside)) = left {
             bail!(
                 "`{}` was moved aside to `{}` and holds something this write did not remove; \
                  check it and delete or restore it",
@@ -647,6 +658,32 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
             )),
         }
     })
+}
+
+/// What `path` is, not followed through a link, or `None` when the filesystem
+/// says it is not there. Only "not found" means absent: an entry that cannot be
+/// looked at (a directory above it without search permission, an I/O error) is
+/// an error naming it, never "nothing there". A write that read it as absent
+/// would go on to create or rename over something nobody saw.
+pub(crate) fn entry(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    absent_is_none(std::fs::symlink_metadata(path), path)
+}
+
+/// [`entry`] through a link: what a link points at, `None` for a link whose
+/// target is not there.
+fn followed(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    absent_is_none(std::fs::metadata(path), path)
+}
+
+fn absent_is_none(
+    found: std::io::Result<std::fs::Metadata>,
+    path: &Path,
+) -> anyhow::Result<Option<std::fs::Metadata>> {
+    match found {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect `{}`", path.display())),
+    }
 }
 
 /// Removes the directories `path` sat in, from the nearest up, while they are

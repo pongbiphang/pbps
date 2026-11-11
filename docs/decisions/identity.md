@@ -1579,3 +1579,47 @@ maintainer chose the respelling.
 
 Not covered: two names that differ only in Unicode normalisation, which the key
 does not model, and macOS, which CI does not run.
+
+<a id="dec-2817-1"></a>
+
+**DEC-2817.1. Names the identity write makes for itself are fixed stems and a counter, a long dropped object's aside is hashed, only "not found" means absent, and a write that fails before its first placed file undoes everything.**
+Four rules, one per cause (#2806, #2816, #2817).
+
+- **Transient names are not derived from the destination.** A staging file, a
+  set-aside and the middle name of a respelling are `.pbps-tmp<n>`,
+  `.pbps-aside<n>` and `.pbps-respell<n>.json`, in the destination's directory.
+  A name built by adding to a declaration's mirror (`.<name>.respell.json`)
+  passes 255 bytes for a declaration of 246 bytes or more, and the write stops
+  with "File name too long". These names only have to be unused, in that
+  directory, and, for the respelling, still read as an identity file; a stem
+  and a counter has a constant length and does all three. The counter always
+  shows. The reader's rule is unchanged (`*.json` is an identity file), so the
+  first two are still refused or skipped as before and the third is still read.
+- **A dropped object's aside is bounded like `pull`'s names.** When
+  `<object name>.<uid>.json` would pass 240 bytes (the budget of
+  `declaration_file`), the name is `~pbps-<hash>.<uid>.json`, with the hash of
+  the object's last name and a tag, from the helper `declaration_file` uses.
+  `~` is outside the characters an aside keeps (it becomes `_`), so no readable
+  name can take a hashed one. Files are paired with their object by the uid
+  inside, never by name (SPEC §4.2), so the readable name is a courtesy, not a
+  key. Ordinary names keep today's aside names, so no existing tree is renamed.
+- **Only "not found" means absent.** `ids_store::entry` is the one look at an
+  entry: `NotFound` is `None`, any other error is returned naming the path.
+  `unused_sibling` and the sites of the write that ask whether an entry is a
+  file or a directory use it. Reading an entry that could not be looked at as
+  "nothing there" sends the write on to a create or rename over something
+  nobody saw. A symlink is followed only where it was (the directories the
+  write has to create).
+- **A write has one owner for what it staged.** `Staged` undoes the temp files,
+  the directories the write created, the asides and, for `init`, the claim when
+  it is dropped unless the write was committed, so an early return cannot skip
+  the undo. The rule it enforces: until the first file is placed everything is
+  undone, including the asides and the created directories; after it, the
+  placed files stay (both copies of what moved, as after a crash) and only what
+  is still pending is undone. The first part is a change: a failure of the
+  first rename used to leave the asides and the created directories made
+  before it, and now puts the tree back as it was.
+
+Not decided here: a declaration name within 4 bytes of the limit has no mirror
+of the same stem (`<stem>.json` is one byte longer than `<stem>.yml`); that is
+a separate choice.

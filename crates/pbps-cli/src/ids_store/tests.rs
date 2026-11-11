@@ -2086,7 +2086,7 @@ fn a_sibling_that_cannot_be_inspected_is_an_error_naming_it_and_an_absent_one_is
     std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o755)).unwrap();
     for shown in [&error, &written] {
         assert!(shown.contains("closed/.pbps-tmp0"), "{shown}");
-        assert!(shown.contains("cannot tell whether"), "{shown}");
+        assert!(shown.contains("cannot inspect"), "{shown}");
     }
     assert_eq!(names_in(&dir.join("closed")), Vec::<String>::new());
 }
@@ -2246,4 +2246,44 @@ fn the_names_a_write_derives_are_refused_or_read_by_the_rules_they_always_had() 
     assert!(!ids_tree::is_identity_file(".pbps-tmp0"));
     assert!(!ids_tree::is_identity_file(".pbps-aside0"));
     assert_eq!(read_ids_tree(&dir).unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_uninspectable_ancestor_stops_the_write_with_an_error_naming_it_and_leaves_the_tree_as_it_was()
+{
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project("ancestor-uninspectable").ids_dir();
+    std::fs::create_dir_all(dir.join("d/e")).unwrap();
+    std::fs::write(dir.join("d/e/old.json"), "old").unwrap();
+    let before = listing(&dir);
+    let write = TreeWrite {
+        dir: dir.clone(),
+        // `a.json` is staged first, so there is a temp file to take away.
+        files: [
+            ("a.json".to_owned(), "a".to_owned()),
+            ("d/e/x.json".to_owned(), "x".to_owned()),
+        ]
+        .into(),
+        ..TreeWrite::default()
+    };
+    // `d` cannot be searched, so `d/e` cannot be looked at: not "absent".
+    std::fs::set_permissions(dir.join("d"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::symlink_metadata(dir.join("d/e")).is_ok() {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(dir.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let error = format!("{:#}", write.apply().unwrap_err());
+    std::fs::set_permissions(dir.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains("d/e"), "{error}");
+    assert!(!error.contains("could not be undone"), "{error}");
+    assert_eq!(listing(&dir), before, "the staged temp file is gone");
+    // Negative: with the directory searchable again the same write goes through.
+    write.apply().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("d/e/x.json")).unwrap(),
+        "x"
+    );
 }
