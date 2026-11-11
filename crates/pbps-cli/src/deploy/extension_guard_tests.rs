@@ -91,6 +91,7 @@ fn a_dropped_package_stands_as_pinned_until_its_statement_and_is_gone_at_the_clo
                 requirers: Default::default(),
                 releases: Default::default(),
                 index_releases: Default::default(),
+                search_releases: Default::default(),
             },
         )],
     };

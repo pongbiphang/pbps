@@ -696,6 +696,36 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Type(Recorded(uid.clone())));
                 self.type_releases(name);
             }
+            // A configuration maps dictionaries, so each one the plan holds is
+            // final before it (DEC-2728.2). One the plan does not declare is the
+            // engine's or a package's: a package standing in its schema is waited
+            // for, as for any object a package provides (`package_input`).
+            Change::CreateSearch { definition, .. } => {
+                for dictionary in definition.dictionaries() {
+                    if let Some(uid) = self.after.ids.search_uid(&dictionary) {
+                        self.requires(Requirement::Is(
+                            ObjectKey::Search(Recorded(uid.clone())),
+                            Incarnation::Final,
+                        ));
+                    } else {
+                        self.package_input(dictionary.name.schema());
+                    }
+                }
+            }
+            // The reverse: a dictionary leaves only once every configuration of
+            // the baseline that maps it is gone, as the engine's RESTRICT demands.
+            Change::DropSearch { uid, name, .. } => {
+                self.exists(ObjectKey::Search(Recorded(uid.clone())));
+                for (other, definition) in &self.before.schema.search {
+                    if let Some(user) = self.before.ids.search_uid(other)
+                        && definition.dictionaries().contains(name)
+                    {
+                        self.requires(Requirement::Absent(ObjectKey::Search(Recorded(
+                            user.clone(),
+                        ))));
+                    }
+                }
+            }
             // One column of the rebuild: a retype in everything but its type
             // reference (DEC-1635.7). Its writes to the type's resource keep
             // it after the replacement's creation and before the swap.
@@ -1557,6 +1587,7 @@ impl Cx<'_> {
                 requirers,
                 releases,
                 index_releases,
+                search_releases,
                 ..
             } => {
                 self.exists(ObjectKey::Extension(Recorded(uid.clone())));
@@ -1567,6 +1598,14 @@ impl Cx<'_> {
                 }
                 for id in releases {
                     self.requires(Requirement::Absent(ObjectKey::Module(id.clone())));
+                }
+                // So is a configuration that maps a dictionary the package provides.
+                for name in search_releases {
+                    if let Some(uid) = self.before.ids.search_uid(name) {
+                        self.requires(Requirement::Absent(ObjectKey::Search(Recorded(
+                            uid.clone(),
+                        ))));
+                    }
                 }
                 // An index that blocks the removal is dropped first (DEC-2447.14).
                 for (table, name) in index_releases {
@@ -2775,6 +2814,14 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
             .filter(|(_, name)| before.schema.types.contains_key(*name))
             .map(|(uid, _)| ObjectKey::Type(Recorded(uid.clone()))),
     );
+    held.extend(
+        before
+            .ids
+            .search
+            .iter()
+            .filter(|(_, name)| before.schema.search.contains_key(*name))
+            .map(|(uid, _)| ObjectKey::Search(Recorded(uid.clone()))),
+    );
     held.extend(before.schema.modules.keys().cloned().map(ObjectKey::Module));
     held.extend(
         before
@@ -2805,6 +2852,7 @@ pub fn holds_unknown(key: &ObjectKey) -> bool {
         ObjectKey::Table(_)
         | ObjectKey::Column(ColumnKey::Recorded(_))
         | ObjectKey::Type(_)
+        | ObjectKey::Search(_)
         | ObjectKey::Role(_)
         | ObjectKey::Extension(_)
         | ObjectKey::Default(_)

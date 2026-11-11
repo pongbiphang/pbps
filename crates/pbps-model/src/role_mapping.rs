@@ -143,6 +143,7 @@ impl RoleMapping {
             | crate::change_family!(type_values)
             | crate::change_family!(types)
             | crate::change_family!(extensions)
+            | crate::change_family!(search)
             | crate::change_family!(tables)
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }

@@ -130,6 +130,32 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         vec![],
         None,
     );
+    // A text search object touches no table, and writes no row (DEC-2728.2).
+    let search = pbps_model::SearchObject::Dictionary {
+        template: "pg_catalog.simple".parse().unwrap(),
+        options: Default::default(),
+    };
+    pin(
+        Change::CreateSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: "dictionary app.words".parse().unwrap(),
+            definition: Box::new(search.clone()),
+            unresolved: Vec::new(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
+        Change::DropSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: "dictionary app.words".parse().unwrap(),
+            definition: Box::new(search),
+        },
+        vec![],
+        vec![],
+        None,
+    );
     pin(
         Change::RenameType {
             uid: type_uid,
@@ -759,6 +785,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             requirers: Default::default(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         },
         vec![],
         vec![],

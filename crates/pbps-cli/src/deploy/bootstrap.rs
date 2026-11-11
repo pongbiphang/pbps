@@ -95,8 +95,7 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
     let Schema {
         tables,
         types,
-        // Text search objects take identities with the next part (#2728).
-        search: _,
+        search,
         modules: _,
         roles,
         extensions,
@@ -116,6 +115,12 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
                 .keys()
                 .filter(|name| ids.role_uid(name).is_none())
                 .map(|name| format!("role {}", name.shown())),
+        )
+        .chain(
+            search
+                .keys()
+                .filter(|name| ids.search_uid(name).is_none())
+                .map(|name| name.shown().to_string()),
         )
         .chain(
             types
@@ -385,6 +390,7 @@ pub(super) async fn bootstrap_async(
                 extension_drops: Default::default(),
                 extension_updates: Default::default(),
                 extension_moves: Default::default(),
+                target_read: false,
                 strategies: Default::default(),
                 annotations: loaded.hints.annotations.clone(),
                 // Carried for the same reason, and one more: it is what decides

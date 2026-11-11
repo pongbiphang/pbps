@@ -148,6 +148,9 @@ pub fn drops(
         })
         .flatten()
         .collect();
+    // The text search objects the plan drops (DEC-2728.2): a configuration that maps a
+    // dictionary of the package blocks its removal until it is gone.
+    let removed_search = crate::schema_diff::dropped_search(base, desired);
     let (mut changes, mut errors) = (Vec::new(), Vec::new());
     for (name, (uid, definition)) in &dropped {
         let Some(facts) = facts.get(*name) else {
@@ -159,6 +162,7 @@ pub fn drops(
         let (mut requirers, mut releases, mut found) =
             (BTreeSet::new(), BTreeSet::new(), Vec::new());
         let mut index_releases = BTreeSet::new();
+        let mut search_releases = BTreeSet::new();
         for member in &facts.outside {
             match member.module(removed.iter().copied()) {
                 Some(id) => {
@@ -166,6 +170,9 @@ pub fn drops(
                 }
                 None if member.index(&removed_indexes).is_some() => {
                     index_releases.extend(member.index(&removed_indexes).cloned());
+                }
+                None if let Some(name) = member.search(removed_search.iter().copied()) => {
+                    search_releases.insert(name.clone());
                 }
                 None => found.push(format!(
                     "`{member}` depends on the package, so the engine would delete it too, and this plan does not drop it"
@@ -189,6 +196,8 @@ pub fn drops(
                 releases.insert(id.clone());
             } else if let Some(index) = member.index(&removed_indexes) {
                 index_releases.insert(index.clone());
+            } else if let Some(name) = member.search(removed_search.iter().copied()) {
+                search_releases.insert(name.clone());
             } else {
                 found.push(format!(
                     "`{member}` depends on the package and this plan does not remove it, so the engine would refuse"
@@ -209,6 +218,7 @@ pub fn drops(
             requirers,
             releases,
             index_releases,
+            search_releases,
         });
     }
     (changes, errors)
@@ -1314,6 +1324,7 @@ mod tests {
                 requirers,
                 releases,
                 index_releases: _,
+                search_releases: _,
             },
         ] = changes.as_slice()
         else {
@@ -1450,6 +1461,53 @@ mod tests {
         assert!(
             matches!(changes.as_slice(), [pbps_model::Change::DropExtension { releases, .. }] if releases.len() == 1)
         );
+    }
+
+    /// A text search configuration that maps a dictionary of the package and is retired
+    /// with it is carried and waited for; one the declarations keep is refused by name
+    /// (DEC-2728.2). Negative: a dictionary of the same name is not the configuration.
+    #[test]
+    fn a_text_search_object_the_plan_drops_is_carried_and_one_it_keeps_is_refused() {
+        use pbps_model::{SearchObject, SearchRef, Uid, UidKind};
+        let name: SearchRef = "config app.docs".parse().unwrap();
+        let object = SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec!["ext.intdict".parse().unwrap()])].into(),
+        };
+        let blocker = member("text search configuration", &["app", "docs"]);
+        let mut w = world(&["dict_int"], &["dict_int"], &[]);
+        let search_uid = Uid::generate(UidKind::Search);
+        w.base.search.insert(name.clone(), object.clone());
+        w.base_ids.search.insert(search_uid.clone(), name.clone());
+        // Retired with the package: the configuration is carried.
+        let (changes, errors) = w.drops(&facts("dict_int", &[], std::slice::from_ref(&blocker)));
+        assert!(errors.is_empty(), "{errors:?}");
+        let [
+            pbps_model::Change::DropExtension {
+                search_releases, ..
+            },
+        ] = changes.as_slice()
+        else {
+            panic!("{changes:?}")
+        };
+        assert_eq!(search_releases.iter().collect::<Vec<_>>(), [&name]);
+        // Negative: kept by the declarations, the package's removal is refused, naming it.
+        w.desired.search.insert(name.clone(), object);
+        w.desired_ids.search.insert(search_uid, name);
+        let (changes, errors) = w.drops(&facts("dict_int", &[], std::slice::from_ref(&blocker)));
+        assert!(changes.is_empty());
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("text search configuration app.docs"),
+            "{errors:?}"
+        );
+        // And a dictionary of that name is not the configuration the plan drops.
+        w.desired.search.clear();
+        w.desired_ids.search.clear();
+        let other = member("text search dictionary", &["app", "docs"]);
+        let (changes, errors) = w.drops(&facts("dict_int", &[], &[other]));
+        assert!(changes.is_empty() && !errors.is_empty(), "{errors:?}");
     }
 
     /// An index of a table the plan keeps that it also drops, and that blocks the package's

@@ -2634,6 +2634,8 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | pbps_model::Change::CreateType { .. }
             | pbps_model::Change::DropType { .. }
             | pbps_model::Change::RenameType { .. }
+            | pbps_model::Change::CreateSearch { .. }
+            | pbps_model::Change::DropSearch { .. }
             | pbps_model::Change::CreateExtension { .. }
             | pbps_model::Change::DropExtension { .. }
             | pbps_model::Change::UpdateExtension { .. }

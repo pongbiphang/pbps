@@ -16,10 +16,29 @@ use pbps_db::catalog::{Limitation, LimitationTarget};
 use pbps_dialect::DialectError;
 use pbps_model::{Schema, SearchKind, SearchObject, SearchRef, TypeRef};
 
+/// The one definition of the engine's own parser and templates this model holds
+/// (measured identical on 16 and 18, `measure` test). The pull's SQL, the census and
+/// `validate` all read these literals, so a name is held by all three or by none: a
+/// namespace test alone held a `pg_catalog` object that a declaration of it then refused.
+macro_rules! builtin_parser {
+    () => {
+        "default"
+    };
+}
+macro_rules! builtin_templates {
+    () => {
+        "simple,synonym,thesaurus,ispell,snowball"
+    };
+}
+pub(crate) use {builtin_parser, builtin_templates};
+
 /// The built-in parser, which this model holds alone.
-pub const PARSER: &str = "default";
-/// The built-in templates (measured identical on 16 and 18, `measure` test).
-pub const TEMPLATES: &[&str] = &["simple", "synonym", "thesaurus", "ispell", "snowball"];
+pub const PARSER: &str = builtin_parser!();
+
+/// The built-in templates.
+pub fn templates() -> Vec<&'static str> {
+    builtin_templates!().split(',').collect()
+}
 /// The token types of the built-in parser: the aliases a mapping may name.
 pub const TOKEN_ALIASES: &[&str] = &[
     "asciiword",
@@ -62,7 +81,10 @@ macro_rules! dictionary_held {
              AND EXISTS (SELECT 1 FROM pg_catalog.pg_ts_template t \
                WHERE t.oid = ",
             $d,
-            ".dicttemplate AND t.tmplnamespace = 'pg_catalog'::pg_catalog.regnamespace))"
+            ".dicttemplate AND t.tmplnamespace = 'pg_catalog'::pg_catalog.regnamespace \
+                AND t.tmplname = ANY (pg_catalog.string_to_array('",
+            $crate::search::builtin_templates!(),
+            "', ','))))"
         )
     };
 }
@@ -82,7 +104,10 @@ macro_rules! config_held {
              AND EXISTS (SELECT 1 FROM pg_catalog.pg_ts_parser p \
                WHERE p.oid = ",
             $c,
-            ".cfgparser AND p.prsnamespace = 'pg_catalog'::pg_catalog.regnamespace) \
+            ".cfgparser AND p.prsnamespace = 'pg_catalog'::pg_catalog.regnamespace \
+                AND p.prsname = '",
+            $crate::search::builtin_parser!(),
+            "') \
              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_ts_config_map m \
                JOIN pg_catalog.pg_ts_dict md ON md.oid = m.mapdict \
               WHERE m.mapcfg = ",
@@ -323,6 +348,105 @@ fn invalid(message: String) -> DialectError {
     }
 }
 
+/// `"schema"."name"`.
+fn qualified(name: &TypeRef) -> Result<String, DialectError> {
+    Ok(format!(
+        "{}.{}",
+        crate::quote(name.schema())?,
+        crate::quote(name.name())?
+    ))
+}
+
+/// The statements that create `definition` under `name`, qualified throughout so that no
+/// search path decides what they mean. A dictionary is one `CREATE`; a configuration is its
+/// `CREATE` and one `ADD MAPPING` per group of token types that share their dictionaries, so
+/// the catalog ends with the declared rows in the engine's own order (measured: the order of
+/// the groups does not matter, the order inside one does).
+pub(crate) fn create(
+    uid: &pbps_model::Uid,
+    name: &SearchRef,
+    definition: &SearchObject,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    let target = qualified(&name.name)?;
+    let statement = |sql: String| pbps_dialect::Statement::new(sql);
+    let mut statements = match definition {
+        SearchObject::Dictionary { template, options } => {
+            let mut items = vec![format!("TEMPLATE = {}", qualified(template)?)];
+            for (key, value) in options {
+                items.push(format!(
+                    "{} = {}",
+                    crate::quote(key)?,
+                    crate::emit::literal(value)
+                ));
+            }
+            vec![statement(format!(
+                "CREATE TEXT SEARCH DICTIONARY {target} ({});",
+                items.join(", ")
+            ))]
+        }
+        SearchObject::Config { parser, mappings } => {
+            let mut out = vec![statement(format!(
+                "CREATE TEXT SEARCH CONFIGURATION {target} (PARSER = {});",
+                qualified(parser)?
+            ))];
+            let mut groups: Vec<(&Vec<TypeRef>, Vec<&String>)> = Vec::new();
+            for (alias, dictionaries) in mappings {
+                match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
+                    Some((_, aliases)) => aliases.push(alias),
+                    None => groups.push((dictionaries, vec![alias])),
+                }
+            }
+            for (dictionaries, aliases) in groups {
+                let tokens = aliases
+                    .iter()
+                    .map(|alias| crate::quote(alias))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                let with = dictionaries
+                    .iter()
+                    .map(qualified)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                out.push(statement(format!(
+                    "ALTER TEXT SEARCH CONFIGURATION {target} ADD MAPPING FOR {tokens} WITH {with};"
+                )));
+            }
+            out
+        }
+    };
+    // The first statement is the one that brings the object into being.
+    if let Some(first) = statements.first_mut() {
+        first.search = Some(pbps_dialect::SearchStatement {
+            uid: uid.clone(),
+            name: name.clone(),
+            created: true,
+        });
+    }
+    Ok(statements)
+}
+
+/// `DROP TEXT SEARCH ... RESTRICT`: the engine refuses it while anything depends on the
+/// object, and no `IF EXISTS` hides one the target lost (DEC-2728.2).
+pub(crate) fn drop(
+    uid: &pbps_model::Uid,
+    name: &SearchRef,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    let word = match name.kind {
+        SearchKind::Config => "CONFIGURATION",
+        SearchKind::Dictionary => "DICTIONARY",
+    };
+    let mut statement = pbps_dialect::Statement::new(format!(
+        "DROP TEXT SEARCH {word} {} RESTRICT;",
+        qualified(&name.name)?
+    ));
+    statement.search = Some(pbps_dialect::SearchStatement {
+        uid: uid.clone(),
+        name: name.clone(),
+        created: false,
+    });
+    Ok(vec![statement])
+}
+
 /// What the engine would refuse, or this model does not hold, before a plan is made: the
 /// parser and template, the token aliases and the dictionaries a mapping names. A
 /// dictionary the project does not declare is the target's to resolve (a system or a
@@ -347,6 +471,13 @@ pub(crate) fn validate(
                 )));
             }
             for (alias, dictionaries) in mappings {
+                if dictionaries.is_empty() {
+                    found.push(invalid(format!(
+                        "{} maps `{}` to no dictionary; leave the token type out instead",
+                        name.shown(),
+                        pbps_model::escape::Escaped(alias)
+                    )));
+                }
                 if !TOKEN_ALIASES.contains(&alias.as_str()) {
                     found.push(invalid(format!(
                         "{} maps `{}`, which is not a token type of the built-in parser",
@@ -368,13 +499,25 @@ pub(crate) fn validate(
             }
         }
         SearchObject::Dictionary { template, options } => {
-            if !held(template, TEMPLATES) {
+            if !held(template, &templates()) {
                 found.push(invalid(format!(
                     "{} names the template `{}`, which is created by C functions or by an \
                      extension; this tool holds only the built-in ones ({})",
                     name.shown(),
                     template.shown(),
-                    TEMPLATES.join(", ")
+                    templates().join(", ")
+                )));
+            }
+            // The only free text these objects emit: PostgreSQL text cannot hold a NUL, so
+            // the statement would reach the engine and fail there, after earlier steps.
+            if let Some((key, _)) = options
+                .iter()
+                .find(|(k, v)| k.contains('\0') || v.contains('\0'))
+            {
+                found.push(invalid(format!(
+                    "{} has an option ({}) with a NUL byte, which PostgreSQL text cannot hold",
+                    name.shown(),
+                    pbps_model::escape::Escaped(key)
                 )));
             }
             if let Some(key) = options.keys().find(|k| k.trim().is_empty()) {
@@ -557,7 +700,7 @@ mod tests {
             mappings: [("asciiword".into(), vec![t("app.d"), t("pg_catalog.simple")])].into(),
         };
         assert!(found(&config, &ok).is_empty());
-        for template in TEMPLATES {
+        for template in templates() {
             let object = SearchObject::Dictionary {
                 template: t(&format!("pg_catalog.{template}")),
                 options: Default::default(),
@@ -642,5 +785,193 @@ mod tests {
         assert!(query.contains(dictionary_held!("d")) && query.contains(config_held!("c")));
         assert!(config_held!("c").contains(dictionary_held!("md")));
         assert!(query.contains("ts_token_type(c.cfgparser)"));
+    }
+
+    fn emitted(change: &pbps_model::Change) -> Vec<pbps_dialect::Statement> {
+        crate::emit::emit(&crate::Postgres::new(), change, Default::default()).unwrap()
+    }
+
+    fn create_change(name: &str, definition: SearchObject) -> pbps_model::Change {
+        pbps_model::Change::CreateSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            name: name.parse().unwrap(),
+            definition: Box::new(definition),
+            unresolved: Vec::new(),
+        }
+    }
+
+    /// A dictionary is one `CREATE` that names its template and writes each option as a
+    /// quoted value; a configuration is its `CREATE` and one `ADD MAPPING` per group of token
+    /// types that share their dictionaries, every name qualified so no search path decides
+    /// anything. The first statement carries the identity a staged apply records.
+    #[test]
+    fn a_dictionary_and_a_configuration_emit_qualified_statements_and_mapping_groups() {
+        let dictionary = create_change(
+            "dictionary app.words",
+            SearchObject::Dictionary {
+                template: t("pg_catalog.snowball"),
+                options: [
+                    ("language".to_owned(), "english".to_owned()),
+                    ("stopwords".to_owned(), "it's".to_owned()),
+                ]
+                .into(),
+            },
+        );
+        let sql = emitted(&dictionary);
+        assert_eq!(sql.len(), 1);
+        assert_eq!(
+            sql[0].sql,
+            "CREATE TEXT SEARCH DICTIONARY \"app\".\"words\" (TEMPLATE = \"pg_catalog\".\"snowball\", \"language\" = 'english', \"stopwords\" = 'it''s');"
+        );
+        let carried = sql[0].search.as_ref().unwrap();
+        assert!(carried.created && carried.name.raw().to_string() == "dictionary app.words");
+        let config = create_change(
+            "config app.docs",
+            SearchObject::Config {
+                parser: t("pg_catalog.\"default\""),
+                mappings: [
+                    (
+                        "asciiword".to_owned(),
+                        vec![t("app.words"), t("pg_catalog.simple")],
+                    ),
+                    (
+                        "word".to_owned(),
+                        vec![t("app.words"), t("pg_catalog.simple")],
+                    ),
+                    ("email".to_owned(), vec![t("pg_catalog.simple")]),
+                ]
+                .into(),
+            },
+        );
+        let sql: Vec<_> = emitted(&config).into_iter().map(|s| s.sql).collect();
+        assert_eq!(
+            sql,
+            [
+                "CREATE TEXT SEARCH CONFIGURATION \"app\".\"docs\" (PARSER = \"pg_catalog\".\"default\");",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ADD MAPPING FOR \"asciiword\", \"word\" WITH \"app\".\"words\", \"pg_catalog\".\"simple\";",
+                "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" ADD MAPPING FOR \"email\" WITH \"pg_catalog\".\"simple\";",
+            ]
+        );
+        // A configuration with no mapping is only its `CREATE`.
+        let bare = create_change(
+            "config app.bare",
+            SearchObject::Config {
+                parser: t("pg_catalog.\"default\""),
+                mappings: Default::default(),
+            },
+        );
+        assert_eq!(emitted(&bare).len(), 1);
+    }
+
+    /// A drop is `RESTRICT` with no `IF EXISTS`: the engine refuses it while anything names the
+    /// object, and a lost object is an error and not a silent success (DEC-2728.2). The
+    /// statement says it removes the object.
+    #[test]
+    fn a_drop_is_restrict_and_never_if_exists() {
+        for (name, word) in [
+            ("config app.docs", "CONFIGURATION"),
+            ("dictionary app.words", "DICTIONARY"),
+        ] {
+            let object = if word == "DICTIONARY" {
+                SearchObject::Dictionary {
+                    template: t("pg_catalog.simple"),
+                    options: Default::default(),
+                }
+            } else {
+                SearchObject::Config {
+                    parser: t("pg_catalog.\"default\""),
+                    mappings: Default::default(),
+                }
+            };
+            let sql = emitted(&pbps_model::Change::DropSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: name.parse().unwrap(),
+                definition: Box::new(object),
+            });
+            assert_eq!(sql.len(), 1);
+            let expected = format!(
+                "DROP TEXT SEARCH {word} \"app\".\"{}\" RESTRICT;",
+                name.split('.').nth(1).unwrap()
+            );
+            assert_eq!(sql[0].sql, expected);
+            assert!(!sql[0].search.as_ref().unwrap().created);
+        }
+    }
+
+    /// Validation refuses a token type that maps no dictionary, which the engine cannot
+    /// express and a pull never produces: it would be a difference no plan could close.
+    #[test]
+    fn a_token_mapped_to_no_dictionary_is_invalid() {
+        let name: SearchRef = "config app.docs".parse().unwrap();
+        let object = SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: [("word".to_owned(), vec![])].into(),
+        };
+        let found = validate(&name, &object, &Schema::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].to_string().contains("no dictionary"));
+        let fine = SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: [("word".to_owned(), vec![t("pg_catalog.simple")])].into(),
+        };
+        assert!(validate(&name, &fine, &Schema::default()).is_empty());
+    }
+
+    /// A NUL in an option name or value is refused at validation, by name: PostgreSQL text
+    /// cannot hold one, so the statement would otherwise fail at execution. Negative: the
+    /// same options without it, and an escaped backslash, are held.
+    #[test]
+    fn a_nul_in_a_dictionary_option_is_refused_by_name() {
+        let name: SearchRef = "dictionary app.d".parse().unwrap();
+        let with = |key: &str, value: &str| SearchObject::Dictionary {
+            template: t("pg_catalog.synonym"),
+            options: [(key.to_owned(), value.to_owned())].into(),
+        };
+        for object in [with("synonyms", "a\0b"), with("a\0b", "x")] {
+            let said = found(&name, &object);
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].contains("NUL byte") && said[0].contains("app.d"),
+                "{said:?}"
+            );
+        }
+        assert!(found(&name, &with("synonyms", "a\\0b")).is_empty());
+        assert!(found(&name, &with("synonyms", "ab")).is_empty());
+    }
+
+    /// The pull holds a parser and a template by the same test `validate` applies: the SQL
+    /// names the validator's list and no other, not the namespace alone. A `pg_catalog`
+    /// parser or template outside the list is neither pulled nor accepted in a declaration,
+    /// so the pull cannot write a file that validation then refuses. Negative: names that
+    /// share the namespace but are not built in are in neither.
+    #[test]
+    fn the_pull_and_validate_hold_the_same_parser_and_templates() {
+        let sql_list = |sql: &str| -> Vec<String> {
+            let from = sql.find("string_to_array('").expect("a list") + "string_to_array('".len();
+            let to = from + sql[from..].find('\'').unwrap();
+            sql[from..to].split(',').map(str::to_owned).collect()
+        };
+        let templates_pulled = sql_list(dictionary_held!("d"));
+        assert_eq!(templates_pulled, templates());
+        assert!(config_held!("c").contains(&format!("p.prsname = '{PARSER}'")));
+        let dictionary: SearchRef = "dictionary app.d".parse().unwrap();
+        let config: SearchRef = "config app.c".parse().unwrap();
+        let over = |template: &str| SearchObject::Dictionary {
+            template: t(&format!("pg_catalog.{template}")),
+            options: Default::default(),
+        };
+        for template in &templates_pulled {
+            assert!(found(&dictionary, &over(template)).is_empty(), "{template}");
+        }
+        for custom in ["mytmpl", "simple2", "unaccent"] {
+            assert!(!templates_pulled.iter().any(|n| n == custom));
+            assert!(!found(&dictionary, &over(custom)).is_empty(), "{custom}");
+        }
+        let parser = |name: &str| SearchObject::Config {
+            parser: t(&format!("pg_catalog.\"{name}\"")),
+            mappings: Default::default(),
+        };
+        assert!(found(&config, &parser(PARSER)).is_empty());
+        assert!(!found(&config, &parser("myparser")).is_empty());
     }
 }

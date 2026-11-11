@@ -11,23 +11,25 @@ fn name(text: &str) -> SearchRef {
     SearchRef::new(SearchKind::Dictionary, text.parse().unwrap())
 }
 
-/// A drift comparison leaves out a text search object the record does not hold, and
-/// still compares one it does: a change to a recorded one is named (DEC-2728.1).
+/// A drift comparison leaves out a text search object no recorded identity names, and
+/// still compares one that is named: a change to a managed one is reported by name
+/// (DEC-2728.1, DEC-2728.2).
 #[test]
-fn a_text_search_object_the_record_lacks_is_not_compared_and_a_recorded_one_is() {
-    let mut recorded = Schema::default();
-    recorded
-        .search
-        .insert(name("app.kept"), dictionary("pg_catalog.simple"));
-    let mut live = recorded.clone();
-    live.search
-        .insert(name("app.made_later"), dictionary("pg_catalog.simple"));
-    only_recorded_search_objects(&recorded, &mut live);
-    assert_eq!(live, recorded, "the unrecorded object is left out");
-    // Negative: a recorded object that changed stays in, so the differ names it.
+fn a_text_search_object_without_an_identity_is_not_compared_and_a_managed_one_is() {
+    let mut ids = IdsFile::default();
+    ids.search.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Search),
+        name("app.kept"),
+    );
+    let mut live = Schema::default();
     live.search
         .insert(name("app.kept"), dictionary("pg_catalog.synonym"));
-    only_recorded_search_objects(&recorded, &mut live);
-    assert_ne!(live, recorded);
-    assert!(live.search.contains_key(&name("app.kept")));
+    live.search
+        .insert(name("app.made_later"), dictionary("pg_catalog.simple"));
+    only_managed_search_objects(&ids, &mut live);
+    // Negative: the managed object stays in, changed, so the differ names it.
+    assert_eq!(live.search.keys().collect::<Vec<_>>(), [&name("app.kept")]);
+    // Nothing is managed in a state that recorded no search identity: nothing is compared.
+    only_managed_search_objects(&IdsFile::default(), &mut live);
+    assert!(live.search.is_empty());
 }

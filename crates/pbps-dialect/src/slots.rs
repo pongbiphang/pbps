@@ -41,6 +41,9 @@ pub enum Namespace {
     Roles,
     /// Extensions, which are named once per database and belong to no schema.
     Extensions,
+    /// A schema's text search configurations, or its dictionaries: two namespaces, both apart
+    /// from the types and the relations (DEC-2728.2).
+    Search(pbps_model::SearchKind, String),
 }
 
 /// Which of a table's own namespaces a name is in.
@@ -69,6 +72,9 @@ impl std::fmt::Display for SlotKey {
             Namespace::Table(table, space) => write!(f, "{} ({space:?}) on {table:?}", self.name),
             Namespace::Roles => write!(f, "role {}", self.name),
             Namespace::Extensions => write!(f, "extension {}", self.name),
+            Namespace::Search(kind, schema) => {
+                write!(f, "{schema}.{} ({})", self.name, kind.engine_word())
+            }
         }
     }
 }
@@ -433,6 +439,7 @@ pub fn slots(dialect: &(impl Dialect + ?Sized), address: &Address) -> Vec<SlotKe
         NameKind::Column => vec![table(TableSpace::Columns)],
         NameKind::Role => vec![Namespace::Roles],
         NameKind::Extension => vec![Namespace::Extensions],
+        NameKind::Search(kind) => vec![Namespace::Search(kind, address.schema.clone())],
     };
     namespaces.dedup();
     namespaces

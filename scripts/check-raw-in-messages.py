@@ -256,7 +256,7 @@ ALLOWED = {
         "writes the Markdown document, which is a file, not a terminal message",
     ),
     "crates/pbps-cli/src/report.rs": (
-        10,
+        11,
         "Canonical command arguments are passed to shell_arg, which quotes them or substitutes "
         "a non-executable placeholder.",
     ),

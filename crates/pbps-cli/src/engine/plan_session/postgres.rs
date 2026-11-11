@@ -280,6 +280,7 @@ impl PlanSession for pbps_pg::Postgres {
         hints: &mut pbps_model::Hints,
     ) -> anyhow::Result<()> {
         let types: Vec<_> = base.types.keys().cloned().collect();
+        hints.target_read = true;
         hints.enum_comments = pbps_pg::type_rebuild::comments(conn, &types).await?;
         let domains: Vec<_> = base
             .types

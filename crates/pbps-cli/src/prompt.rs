@@ -55,6 +55,7 @@ pub enum ChoiceKind {
     DropTable(TableName),
     DropRole(pbps_model::RoleName),
     DropExtension(pbps_model::ObjectLocalName),
+    DropSearch(pbps_model::SearchRef),
     DropType(pbps_model::TypeRef),
 }
 
@@ -239,6 +240,10 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             ),
             kind: ChoiceKind::DropExtension(name.clone()),
         }),
+        Blocker::DropSearchNeedsReason { name } => out.push(Choice {
+            label: format!("{} was dropped (you will be asked why)", name.shown()),
+            kind: ChoiceKind::DropSearch(name.clone()),
+        }),
         // A stale or misspelled annotation. There is nothing to choose: the
         // remedy is to edit the file, and offering an option here would invite
         // the user to confirm a typo into the identity file.
@@ -360,6 +365,10 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
             ChoiceKind::DropExtension(name) => Intent::DropExtension {
                 name: name.clone(),
                 reason: reason(&mut lines, &format!("extension {}", name.shown()))?,
+            },
+            ChoiceKind::DropSearch(name) => Intent::DropSearch {
+                name: name.clone(),
+                reason: reason(&mut lines, &name.shown().to_string())?,
             },
         });
     }
@@ -495,6 +504,9 @@ fn question(b: &Blocker) -> String {
                 "extension {} disappeared from the declarations",
                 name.shown()
             )
+        }
+        Blocker::DropSearchNeedsReason { name } => {
+            format!("{} disappeared from the declarations", name.shown())
         }
         Blocker::UnusedIntent { intent } => format!("{intent:?}"),
         Blocker::ConflictingRenameIntents { name, intents, .. } => {

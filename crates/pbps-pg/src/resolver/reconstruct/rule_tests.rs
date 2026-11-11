@@ -224,6 +224,115 @@ fn a_created_type_precedes_what_names_it() {
     assert_eq!(order.len(), changes.len(), "{order:?}");
 }
 
+fn search(name: &str, definition: pbps_model::SearchObject) -> Change {
+    let name: pbps_model::SearchRef = name.parse().unwrap();
+    let uid = Uid::derived(UidKind::Search, &name.raw().to_string(), 0);
+    Change::CreateSearch {
+        uid,
+        name,
+        definition: Box::new(definition),
+        unresolved: Vec::new(),
+    }
+}
+
+fn dictionary_of(template: &str) -> pbps_model::SearchObject {
+    pbps_model::SearchObject::Dictionary {
+        template: template.parse().unwrap(),
+        options: Default::default(),
+    }
+}
+
+fn config_mapping(dictionary: &str) -> pbps_model::SearchObject {
+    pbps_model::SearchObject::Config {
+        parser: "pg_catalog.\"default\"".parse().unwrap(),
+        mappings: [("asciiword".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+    }
+}
+
+/// An expression names a configuration by a string literal (`'app.docs'::regconfig`), which
+/// the engine resolves when the generated column is created (42704 while it is absent), so
+/// the configuration precedes the column, and a dictionary precedes the configuration that
+/// maps it, wherever the plan listed them (DEC-2728.2).
+#[test]
+fn a_created_text_search_object_precedes_what_names_it_by_a_literal() {
+    let mut docs = Table::default();
+    docs.columns
+        .insert("body".into(), Column::new("text".parse().unwrap()));
+    docs.columns.insert(
+        "tsv".into(),
+        Column {
+            value_source: ValueSource::Generated(Generated {
+                expression: "to_tsvector('app.docs', body)".into(),
+                stored: true,
+            }),
+            ..Column::new("tsvector".parse().unwrap())
+        },
+    );
+    let mut plain = Table::default();
+    plain.columns.insert("id".into(), int());
+    let changes = [
+        create("docs", docs),
+        create("plain", plain),
+        search("config app.docs", config_mapping("app.words")),
+        search("dictionary app.words", dictionary_of("pg_catalog.simple")),
+    ];
+    let order = order(&changes, Some(180_000));
+    let config = "text search configuration `app.docs`";
+    let words = "text search dictionary `app.words`";
+    assert!(at(&order, words) < at(&order, config), "{order:?}");
+    assert!(
+        at(&order, config) < at(&order, "table app.docs"),
+        "{order:?}"
+    );
+    // Negative: a table that names neither keeps its place ahead of them.
+    assert!(
+        at(&order, "table app.plain") < at(&order, config),
+        "{order:?}"
+    );
+}
+
+/// A delimited name is one name: `'app."docs ext"'` names `docs ext`, not `docs`, so the
+/// configuration of the shorter name gets no edge to the reader of the longer one and
+/// stays where the plan put it (#2436).
+#[test]
+fn a_longer_delimited_name_draws_no_edge_from_a_shorter_text_search_object() {
+    let mut reader = Table::default();
+    reader
+        .columns
+        .insert("body".into(), Column::new("text".parse().unwrap()));
+    reader.columns.insert(
+        "tsv".into(),
+        Column {
+            value_source: ValueSource::Generated(Generated {
+                expression: "to_tsvector('app.\"docs ext\"', body)".into(),
+                stored: true,
+            }),
+            ..Column::new("tsvector".parse().unwrap())
+        },
+    );
+    let changes = [
+        create("reader", reader),
+        search(
+            "config app.\"docs ext\"",
+            config_mapping("pg_catalog.simple"),
+        ),
+        search("config app.docs", config_mapping("pg_catalog.simple")),
+    ];
+    let order = order(&changes, Some(180_000));
+    let (long, short) = (
+        "text search configuration `app.\"docs ext\"`",
+        "text search configuration `app.docs`",
+    );
+    assert!(
+        at(&order, long) < at(&order, "table app.reader"),
+        "{order:?}"
+    );
+    assert!(
+        at(&order, "table app.reader") < at(&order, short),
+        "{order:?}"
+    );
+}
+
 /// A parent's `SET DEFAULT` reaches every partition and replaces its own
 /// (measured on 16 and 18), so a partition's own default follows it even
 /// when the parent's waits for a function and the partition's does not.

@@ -209,8 +209,8 @@ pub const RECORDS: &[Record] = &[
         census: &["text search configuration", "text search dictionary"],
         planned: Some(Planned {
             label: "Text search configurations and dictionaries (a user's, over the built-in \
-                    parser and templates, are held and pulled, DEC-2728.1; create, alter, rename \
-                    and drop next)",
+                    parser and templates, are held and pulled, DEC-2728.1; create and drop \
+                    planned, DEC-2728.2; alter and rename next)",
             today: "partly held",
             tracking: "#2728",
         }),

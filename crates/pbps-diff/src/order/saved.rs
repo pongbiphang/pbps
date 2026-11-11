@@ -551,6 +551,42 @@ pub fn validate_saved_plan(
             refuse!("type lifecycle payload disagrees with its declared evidence");
         }
     }
+    // A text search payload is held to the identity mapping the plan carries and to the
+    // dialect's own checks, so a hand-edited saved plan cannot create what the
+    // declarations never held or drop what they still do (DEC-2728.2).
+    for step in &plan.changes.changes {
+        if let pbps_model::Change::CreateSearch {
+            uid,
+            name,
+            definition,
+            ..
+        } = &step.change
+        {
+            if uid.kind() != pbps_model::UidKind::Search
+                || plan.ids.search.get(uid) != Some(name)
+                || name.kind != definition.kind()
+            {
+                refuse!(
+                    "text search payload disagrees with the identity mapping for {}",
+                    name.shown()
+                );
+            }
+            if let Some(error) = dialect
+                .validate_search(name, definition, &pbps_model::Schema::default())
+                .into_iter()
+                .next()
+            {
+                return Err(AdmissionError::from_error(error));
+            }
+        } else if let pbps_model::Change::DropSearch { uid, name, .. } = &step.change
+            && (uid.kind() != pbps_model::UidKind::Search || plan.ids.search.contains_key(uid))
+        {
+            refuse!(
+                "text search drop of {} disagrees with the identity mapping",
+                name.shown()
+            );
+        }
+    }
     if !crate::enum_labels::valid_steps(&plan.changes, &plan.declared_type_pins) {
         refuse!("enum label steps disagree with their pinned intermediate definitions");
     }

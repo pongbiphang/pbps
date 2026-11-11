@@ -39,9 +39,11 @@ pub(crate) fn managed_limitations(
                 .types
                 .values()
                 .any(|t| t.schema() == name.schema && t.name() == name.name),
-            // A text search object has no identity yet (#2728), so none is inside the
-            // managed set: its omission is named by the census and not reported here.
-            pbps_db::catalog::LimitationTarget::Search(_) => false,
+            // Managed once the identity file records it (DEC-2728.2); an object it does
+            // not record is named by the census and not reported here.
+            pbps_db::catalog::LimitationTarget::Search(name) => {
+                ids.search.values().any(|s| s == name)
+            }
             pbps_db::catalog::LimitationTarget::Relation(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
@@ -478,8 +480,10 @@ pub(crate) fn unmanaged_objects(
                         .types
                         .values()
                         .any(|t| t.schema() == name.schema && t.name() == name.name),
-                    // Unreadable, and with no identity to be managed by (#2728): outside.
-                    pbps_db::catalog::LimitationTarget::Search(_) => true,
+                    // Unreadable: outside unless the identity file records it.
+                    pbps_db::catalog::LimitationTarget::Search(name) => {
+                        !ids.search.values().any(|s| s == name)
+                    }
                     pbps_db::catalog::LimitationTarget::Relation(_)
                     | pbps_db::catalog::LimitationTarget::SharedModule(_)
                     | pbps_db::catalog::LimitationTarget::Module(_)

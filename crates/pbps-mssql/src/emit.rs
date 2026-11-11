@@ -316,6 +316,12 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             feature: format!("exclusion constraint {}", name.shown()),
         }),
+        Change::CreateSearch { name, .. } | Change::DropSearch { name, .. } => {
+            Err(DialectError::Unsupported {
+                dialect: crate::types::DIALECT,
+                feature: format!("{}", name.shown()),
+            })
+        }
         Change::CreateExtension { name, .. }
         | Change::DropExtension { name, .. }
         | Change::UpdateExtension { name, .. }
@@ -2446,6 +2452,7 @@ mod tests {
                 requirers: Default::default(),
                 releases: Default::default(),
                 index_releases: Default::default(),
+                search_releases: Default::default(),
             },
             Change::UpdateExtension {
                 uid: "e_aaaaaa".parse().unwrap(),
@@ -2473,6 +2480,34 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("extension citext"), "{error}");
+        }
+    }
+
+    /// SQL Server has no text search objects of this kind: neither the create nor the drop is
+    /// ever emitted, whatever a plan carries (DEC-2728.2).
+    #[test]
+    fn a_text_search_create_or_drop_is_unsupported_on_sql_server() {
+        let definition = pbps_model::SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        };
+        for change in [
+            Change::CreateSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: "dictionary app.words".parse().unwrap(),
+                definition: Box::new(definition.clone()),
+                unresolved: Vec::new(),
+            },
+            Change::DropSearch {
+                uid: "s_aaaaaa".parse().unwrap(),
+                name: "dictionary app.words".parse().unwrap(),
+                definition: Box::new(definition.clone()),
+            },
+        ] {
+            let error = super::emit(&change, Strategy::default())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("text search dictionary"), "{error}");
         }
     }
 

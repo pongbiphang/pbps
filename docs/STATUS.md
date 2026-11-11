@@ -517,7 +517,7 @@ How each kind is handled today:
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare and add held, DEC-2448.3; drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
-| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create, alter, rename and drop next) | partly held | #2728 |
+| Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create and drop planned, DEC-2728.2; alter and rename next) | partly held | #2728 |
 <!-- /generated:postgres-planned -->
 
 ### Silent today (bugs)

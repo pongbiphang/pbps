@@ -1069,6 +1069,7 @@ pub(crate) fn plan_keyed(
             .map(|n| shown(&n.shown()))
             .or_else(|| after.roles.get(uid).map(|n| shown(&n.shown())))
             .or_else(|| after.types.get(uid).map(|n| shown(&n.shown())))
+            .or_else(|| after.search.get(uid).map(|n| shown(&n.shown())))
             .or_else(|| after.extensions.get(uid).map(|n| shown(&n.shown())))
             .or_else(|| {
                 after
@@ -1085,11 +1086,16 @@ pub(crate) fn plan_keyed(
         .keys()
         .chain(after.roles.keys())
         .chain(after.types.keys())
+        .chain(after.search.keys())
         .chain(after.extensions.keys())
         .chain(after.tombstones.keys().filter(|u| {
             matches!(
                 u.kind(),
-                UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Extension
+                UidKind::Table
+                    | UidKind::Role
+                    | UidKind::Type
+                    | UidKind::Search
+                    | UidKind::Extension
             )
         }))
         .cloned()
@@ -1508,11 +1514,16 @@ pub(crate) fn write_ids_tree(project: &Project, ids: &IdsFile) {
         .keys()
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
+        .chain(ids.search.keys())
         .chain(ids.extensions.keys())
         .chain(ids.tombstones.keys().filter(|u| {
             matches!(
                 u.kind(),
-                UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Extension
+                UidKind::Table
+                    | UidKind::Role
+                    | UidKind::Type
+                    | UidKind::Search
+                    | UidKind::Extension
             )
         }));
     for uid in uids {

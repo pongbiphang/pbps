@@ -288,7 +288,11 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
     }
     println!(
         "migrated {} identities into {} file(s) under {}; review `git diff` and commit",
-        ids.tables.len() + ids.roles.len() + ids.types.len() + ids.extensions.len(),
+        ids.tables.len()
+            + ids.roles.len()
+            + ids.types.len()
+            + ids.search.len()
+            + ids.extensions.len(),
         files.len(),
         dirs.ids
     );
@@ -351,6 +355,7 @@ pub(crate) fn declared_placement(
     }
     let (tables, roles) = (invert(&ids.tables), invert(&ids.roles));
     let (types, extensions) = (invert(&ids.types), invert(&ids.extensions));
+    let search = invert(&ids.search);
     let mut placement = Placement::default();
     for (source, file) in &paths.files {
         let uid = match source {
@@ -358,8 +363,8 @@ pub(crate) fn declared_placement(
             Source::Role(n) => roles.get(n),
             Source::Type(n) => types.get(n),
             Source::Extension(n) => extensions.get(n),
-            // Text search objects take identities with the next part (#2728).
-            Source::Module(_) | Source::Search(_) => None,
+            Source::Search(n) => search.get(n),
+            Source::Module(_) => None,
         };
         // A declaration the old file never knew gets its identity from `plan`.
         let Some(uid) = uid else { continue };
@@ -413,6 +418,12 @@ fn place(
             .map(|(_, n)| format!("type {}", n.shown())),
     );
     missing.extend(
+        ids.search
+            .iter()
+            .filter(|(u, _)| !placed(u))
+            .map(|(_, n)| n.shown().to_string()),
+    );
+    missing.extend(
         ids.extensions
             .iter()
             .filter(|(u, _)| !placed(u))
@@ -430,7 +441,7 @@ fn place(
     for (uid, tomb) in &ids.tombstones {
         if matches!(
             uid.kind(),
-            UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Extension
+            UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Search | UidKind::Extension
         ) {
             placement.paths.insert(uid.clone(), aside(&tomb.was, uid));
         }
@@ -564,7 +575,8 @@ fn named(source: &Source) -> Option<(UidKind, String)> {
         Source::Role(n) => Some((UidKind::Role, n.raw().to_owned())),
         Source::Type(n) => Some((UidKind::Type, n.raw().to_string())),
         Source::Extension(n) => Some((UidKind::Extension, n.raw().to_owned())),
-        Source::Module(_) | Source::Search(_) => None,
+        Source::Search(n) => Some((UidKind::Search, n.raw().to_string())),
+        Source::Module(_) => None,
     }
 }
 

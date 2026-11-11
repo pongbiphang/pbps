@@ -951,7 +951,6 @@ pub(crate) fn diff_partial_rebuilding(
         declared,
         dialect.name(),
     ));
-    diff_search(base.schema, declared.schema, &mut errs);
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
         errs.push(DiffError::ConversionsUnsupported {
             count: declared.ids.conversions.len(),
@@ -1008,6 +1007,7 @@ pub(crate) fn diff_partial_rebuilding(
         crate::extensions::moves(base, declared, dialect.name(), &hints.extension_moves);
     changes.extend(extension_moves);
     errs.extend(extension_move_errors);
+    changes.extend(diff_search(base, declared, hints.target_read, &mut errs));
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -2603,6 +2603,7 @@ pub(crate) fn diff_partial_rebuilding(
         if matches!(
             c,
             Change::CreateType { .. }
+                | Change::CreateSearch { .. }
                 | Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild {
@@ -2895,6 +2896,50 @@ pub(crate) fn diff_partial_rebuilding(
         })
         .max()
         .unwrap_or(0);
+    // A dictionary is created before the configuration that maps it, and the configuration
+    // dropped before the dictionary (DEC-2728.2): the depth of the references among the
+    // objects the plan holds on each side. An object created here that maps a dictionary a
+    // package may provide starts behind the packages of this plan (the effects:
+    // `package_input`), and what maps it sits one rank behind that, so the floor is composed
+    // into the depth, not added to the sort key afterwards.
+    let created_search: BTreeSet<&pbps_model::SearchRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateSearch { name, .. } = &p.change {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let search_depths = |schema: &Schema, floor: isize| -> BTreeMap<pbps_model::SearchRef, isize> {
+        let start = |name: &pbps_model::SearchRef, object: &pbps_model::SearchObject| {
+            if floor > 0
+                && created_search.contains(name)
+                && object.dictionaries().iter().any(|d| {
+                    d.name.schema() != "pg_catalog" && declared.ids.search_uid(d).is_none()
+                })
+            {
+                floor
+            } else {
+                0
+            }
+        };
+        schema
+            .search
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    search_depth(schema, name, &start, &mut BTreeSet::new()),
+                )
+            })
+            .collect()
+    };
+    let (search_rank, drop_search_rank) = (
+        search_depths(declared.schema, package_floor),
+        search_depths(base.schema, 0),
+    );
     crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
@@ -2911,6 +2956,11 @@ pub(crate) fn diff_partial_rebuilding(
                 // Behind the packages of this plan it requires, or that require
                 // it for a drop (DEC-2447.6, DEC-2447.8).
                 extension_rank.get(uid).copied().unwrap_or(0)
+            } else if let Change::CreateSearch { name, .. } = &p.change {
+                // Behind the packages and the dictionaries of this plan it maps.
+                search_rank.get(name).copied().unwrap_or(0)
+            } else if let Change::DropSearch { name, .. } = &p.change {
+                -drop_search_rank.get(name).copied().unwrap_or(0)
             } else if let Change::SetExtensionSchema { uid, .. } = &p.change {
                 // One rank behind the package's own update, whose result the
                 // move starts from: the two rewrite one package, and the draft
@@ -6717,31 +6767,158 @@ fn diff_constraints(
     diff_constraints_by(name, base, declared, changes, errs, &IndexMethod::policy);
 }
 
-/// Text search configurations and dictionaries, by kind and name (DEC-2728.1).
-/// **Every difference is refused here, by name**: this part reads and holds them and plans
-/// nothing for them. Creating one arrives in the next part, and changing, renaming or
-/// dropping one after it, so a plan that would leave a declaration unmet, or give an
-/// object up, is refused rather than made without the change that says so. An object the
-/// target has and the declarations do not is not this project's, and is left alone.
+/// The text search objects a plan drops: a baseline identity the declarations no longer
+/// hold, whose name the baseline schema has. The one definition of "dropped" that the
+/// differ's reference check and a package's drop analysis both read (DEC-2728.2).
+pub(crate) fn dropped_search<'a>(
+    base: Side<'a>,
+    declared: Side<'_>,
+) -> std::collections::BTreeSet<&'a pbps_model::SearchRef> {
+    base.ids
+        .search
+        .iter()
+        .filter(|(uid, name)| {
+            base.schema.search.contains_key(*name) && !declared.ids.search.contains_key(*uid)
+        })
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// Text search configurations and dictionaries, by kind and name (DEC-2728.1, DEC-2728.2).
+/// A declared object the target lacks is created and one the declarations gave up is
+/// dropped, both by recorded identity. **A difference in a standing one is refused here, by
+/// name**: changing, renaming or re-parsing one arrives in the parts that follow, so a plan
+/// that would leave a declaration unmet is refused rather than made without the change that
+/// says so. An object the target has and the declarations do not, with no identity recorded,
+/// is not this project's and is left alone.
 fn diff_search(
-    base: &pbps_model::Schema,
-    declared: &pbps_model::Schema,
+    base: Side<'_>,
+    declared: Side<'_>,
+    target_read: bool,
     errs: &mut Vec<DiffError>,
-) {
-    for (name, now) in &declared.search {
-        let reason = match base.search.get(name) {
-            Some(was) if was == now => continue,
-            Some(_) => {
-                "changing one arrives in a later part of #2728; for now it stands as the \
-                        target holds it"
-            }
-            None => "creating one arrives with the next part of #2728",
-        };
+) -> Vec<Change> {
+    let mut changes = Vec::new();
+    let mut refuse = |name: &pbps_model::SearchRef, reason: &str| {
         errs.push(DiffError::SearchRefused {
             name: name.clone(),
             reason: reason.to_owned(),
         });
+    };
+    // The objects this plan drops: a reference resolves only to one the plan keeps. The
+    // baseline holding it is no answer, since the drop comes after the create (class 18)
+    // and the engine's RESTRICT would refuse it while anything still maps it.
+    let dropped = dropped_search(base, declared);
+    for (name, now) in &declared.schema.search {
+        let retired: Vec<String> = now
+            .dictionaries()
+            .iter()
+            .filter(|used| dropped.contains(used))
+            .map(|used| used.shown().to_string())
+            .collect();
+        if !retired.is_empty() {
+            refuse(
+                name,
+                &format!(
+                    "uses {}, which this plan drops; keep it declared, or leave the mapping out",
+                    retired.join(", ")
+                ),
+            );
+            continue;
+        }
+        // The identity first, as for a package: a name the base holds under one recorded
+        // identity and the declarations under another is an object retired and declared
+        // again before the drop reached the target. Equal definitions would skip the create
+        // while the drop of the old identity still came, leaving a declared object dropped.
+        if base.schema.search.contains_key(name)
+            && let (Some(was), Some(now)) =
+                (base.ids.search_uid(name), declared.ids.search_uid(name))
+            && was != now
+        {
+            refuse(
+                name,
+                "was retired and is declared again before the drop reached the target; drop it \
+                 in one plan and declare the name again in the next",
+            );
+            continue;
+        }
+        match base.schema.search.get(name) {
+            Some(was) if was == now => {}
+            Some(_) => refuse(
+                name,
+                "changing one arrives in a later part of #2728; for now it stands as the \
+                 target holds it",
+            ),
+            None => {
+                match declared.ids.search_uid(name) {
+                    None => refuse(
+                        name,
+                        "has no recorded identity; run `pbps plan` to record it",
+                    ),
+                    Some(uid)
+                        if base.ids.search.get(uid).is_some_and(|was| {
+                            was != name && base.schema.search.contains_key(was)
+                        }) =>
+                    {
+                        refuse(name, "renaming one arrives in a later part of #2728");
+                    }
+                    Some(uid) => {
+                        // A dictionary the project neither declares nor the target holds, in a
+                        // schema no package of the project provides and that is not the
+                        // engine's own, is one the engine would refuse at `ADD MAPPING`.
+                        // Against the target that is a refusal. Offline the baseline only
+                        // stands for the target, and a dictionary made on the database
+                        // outside pbps is not in it, so the plan goes on and says on its
+                        // line that the database settles it (DEC-2728.2).
+                        let missing: Vec<pbps_model::SearchRef> = now
+                            .dictionaries()
+                            .into_iter()
+                            .filter(|used| {
+                                !declared.schema.search.contains_key(used)
+                                    && !base.schema.search.contains_key(used)
+                                    && used.name.schema() != "pg_catalog"
+                                    && !declared
+                                        .schema
+                                        .extensions
+                                        .values()
+                                        .any(|package| package.schema == used.name.schema())
+                            })
+                            .collect();
+                        if missing.is_empty() || !target_read {
+                            changes.push(Change::CreateSearch {
+                                uid: uid.clone(),
+                                name: name.clone(),
+                                definition: Box::new(now.clone()),
+                                unresolved: missing,
+                            });
+                        } else {
+                            let shown: Vec<_> =
+                                missing.iter().map(|m| m.shown().to_string()).collect();
+                            refuse(
+                                name,
+                                &format!(
+                                    "uses {}, which the project does not declare and the target \
+                                 does not hold; declare it, or leave the mapping out",
+                                    shown.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
+    for (uid, name) in &base.ids.search {
+        if let Some(definition) = base.schema.search.get(name)
+            && !declared.ids.search.contains_key(uid)
+        {
+            changes.push(Change::DropSearch {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Box::new(definition.clone()),
+            });
+        }
+    }
+    changes
 }
 
 /// A table's exclusion constraints, by name (DEC-2448.3). Adding one is a
@@ -7516,6 +7693,32 @@ pub(crate) fn member_depth(planned: &[PlannedChange]) -> BTreeMap<pbps_model::Ro
     depth
 }
 
+/// How many dictionaries deep `name` is among the text search objects of `schema`, at least
+/// what `start` gives it: a dictionary mapping or naming none is 0. A cycle is the engine's
+/// to refuse, so a reference back to an object being measured counts nothing.
+fn search_depth(
+    schema: &Schema,
+    name: &pbps_model::SearchRef,
+    start: &dyn Fn(&pbps_model::SearchRef, &pbps_model::SearchObject) -> isize,
+    seen: &mut BTreeSet<pbps_model::SearchRef>,
+) -> isize {
+    if !seen.insert(name.clone()) {
+        return 0;
+    }
+    let depth = schema.search.get(name).map_or(0, |object| {
+        object
+            .dictionaries()
+            .iter()
+            .filter(|used| schema.search.contains_key(*used))
+            .map(|used| 1 + search_depth(schema, used, start, seen))
+            .max()
+            .unwrap_or(0)
+            .max(start(name, object))
+    });
+    seen.remove(name);
+    depth
+}
+
 /// Where a change sorts *within* its ordering class.
 ///
 /// Modules, reference rows and foreign keys each have a dependency order among
@@ -7575,6 +7778,9 @@ fn dependency_rank(
         }
         Change::DropType { name, .. } => -drop_type_rank.get(name).copied().unwrap_or(0),
         Change::CreateTable { .. }
+        // Ranked by their depth where the sort key is built (`search_rank`).
+        | Change::CreateSearch { .. }
+        | Change::DropSearch { .. }
         | Change::CreateExtension { .. }
         | Change::DropExtension { .. }
         | Change::UpdateExtension { .. }
@@ -8530,6 +8736,10 @@ fn order_key(c: &Change) -> u8 {
         // the plan may use, so it goes with the type creates; the order among
         // packages is the `requires` edge, not this number (DEC-2447.6).
         | Change::CreateType { .. }
+        // Created before the tables, defaults, indexes and checks that name them by a
+        // string literal, and a dictionary before the configuration that maps it
+        // (DEC-2728.2).
+        | Change::CreateSearch { .. }
         | Change::CreateExtension { .. }
         | Change::UpdateExtension { .. }
         | Change::SetExtensionSchema { .. } => 7,
@@ -8557,7 +8767,7 @@ fn order_key(c: &Change) -> u8 {
         Change::EnumRebuild { .. } => COLUMN_ALTERATIONS,
         // After every module this plan drops and the packages it requires
         // are gone: late, like the type drops (DEC-2447.8).
-        Change::DropType { .. } | Change::DropExtension { .. } => 18,
+        Change::DropType { .. } | Change::DropSearch { .. } | Change::DropExtension { .. } => 18,
         Change::RenameType { .. } => 1,
         // A policy releases its bindings before module and column teardown.
         Change::DropPolicy { .. } => 0,
@@ -10156,6 +10366,123 @@ mod tests {
                 .changes
                 .iter()
                 .any(|p| matches!(p.change, Change::CreateExtension { .. }))
+        );
+    }
+
+    /// A configuration that maps a dictionary a package provides waits for the plan's create
+    /// of that package, as a column of the package's type does, whatever the identities the
+    /// run happened to mint: both are class 7, and `ADD MAPPING` fails on a dictionary that
+    /// does not exist yet (DEC-2728.2). Negative: a configuration over the engine's own
+    /// dictionary draws no such edge, so with the same package in the plan it sorts before
+    /// it at least once in as many runs.
+    #[test]
+    fn a_configuration_over_a_package_dictionary_waits_for_the_packages_create_every_time() {
+        use pbps_model::SearchObject;
+        let config = |dictionary: &str| SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+        };
+        let planned = |dictionary: &str| {
+            let mut declared = Schema::default();
+            declared
+                .search
+                .insert("config app.docs".parse().unwrap(), config(dictionary));
+            declared.extensions.insert(
+                "zz_dict".into(),
+                pbps_model::Extension {
+                    schema: "zz".into(),
+                    version: "1.0".into(),
+                },
+            );
+            let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+            let position = |wanted: fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            (
+                position(|c| matches!(c, Change::CreateExtension { .. })),
+                position(|c| matches!(c, Change::CreateSearch { .. })),
+            )
+        };
+        for _ in 0..40 {
+            let (package, config) = planned("zz.zz_dictionary");
+            assert!(package < config);
+        }
+        assert!(
+            (0..40).any(|_| {
+                let (package, config) = planned("pg_catalog.simple");
+                config < package
+            }),
+            "an engine dictionary has no reason to wait for a package"
+        );
+    }
+
+    /// The package floor reaches what maps a dictionary that waits for the package, not only
+    /// that dictionary: package, then the thesaurus over the package's dictionary, then the
+    /// configuration over the thesaurus, whatever the identities the run minted (ready round
+    /// 1). Negative: the same chain over an engine dictionary has no package to follow, so
+    /// the thesaurus is free to sort before the package in some run.
+    #[test]
+    fn the_package_floor_reaches_what_maps_a_dictionary_that_waits_for_the_package() {
+        use pbps_model::SearchObject;
+        let planned = |sub: &str| {
+            let mut declared = Schema::default();
+            declared.search.insert(
+                "dictionary app.thes".parse().unwrap(),
+                SearchObject::Dictionary {
+                    template: "pg_catalog.thesaurus".parse().unwrap(),
+                    options: [
+                        ("dictfile".to_owned(), "words".to_owned()),
+                        ("dictionary".to_owned(), sub.to_owned()),
+                    ]
+                    .into(),
+                },
+            );
+            declared.search.insert(
+                "config app.docs".parse().unwrap(),
+                SearchObject::Config {
+                    parser: "pg_catalog.\"default\"".parse().unwrap(),
+                    mappings: [("word".to_owned(), vec!["app.thes".parse().unwrap()])].into(),
+                },
+            );
+            declared.extensions.insert(
+                "zz_dict".into(),
+                pbps_model::Extension {
+                    schema: "zz".into(),
+                    version: "1.0".into(),
+                },
+            );
+            let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+            let position = |wanted: fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            (
+                position(|c| matches!(c, Change::CreateExtension { .. })),
+                position(|c| {
+                    matches!(c, Change::CreateSearch { name, .. }
+                        if name.kind == pbps_model::SearchKind::Dictionary)
+                }),
+                position(|c| {
+                    matches!(c, Change::CreateSearch { name, .. }
+                        if name.kind == pbps_model::SearchKind::Config)
+                }),
+            )
+        };
+        for _ in 0..40 {
+            let (package, thesaurus, config) = planned("zz.zz_dictionary");
+            assert!(package < thesaurus && thesaurus < config);
+        }
+        assert!(
+            (0..40).any(|_| {
+                let (package, thesaurus, _) = planned("pg_catalog.simple");
+                thesaurus < package
+            }),
+            "an engine dictionary has no reason to wait for a package"
         );
     }
 
@@ -29196,27 +29523,43 @@ mod meeting_shape_tests {
             }
         }
     }
-    /// A text search object the declarations hold is compared with the target's and every
-    /// difference is refused by name, since nothing plans them yet (DEC-2728.1): one the
-    /// target lacks, one it holds differently. An identical one is no difference, and one
-    /// only the target has is not this project's.
+    /// A text search object the declarations hold is compared with the target's by recorded
+    /// identity (DEC-2728.2): one the target lacks is created, one the declarations gave up
+    /// is dropped, and a difference in a standing one is refused by name. An identical one
+    /// is no difference, and one only the target has, with no identity, is not this
+    /// project's.
     #[test]
-    fn every_difference_in_a_text_search_object_is_refused_and_an_unmanaged_one_is_left_alone() {
-        use pbps_model::{SearchKind, SearchObject, SearchRef};
+    fn text_search_objects_are_created_and_dropped_by_identity_and_a_standing_difference_is_refused()
+     {
+        use pbps_model::{SearchKind, SearchObject, SearchRef, Uid, UidKind};
         let name = |kind, text: &str| SearchRef::new(kind, text.parse().unwrap());
         let dictionary = |template: &str| SearchObject::Dictionary {
             template: template.parse().unwrap(),
             options: Default::default(),
         };
-        let mut base = Schema::default();
-        let mut declared = Schema::default();
+        let (mut base, mut declared) = (Schema::default(), Schema::default());
+        let (mut base_ids, mut declared_ids) = (IdsFile::default(), IdsFile::default());
+        let hold = |schema: &mut Schema, ids: &mut IdsFile, uid: &Uid, n: &SearchRef, d| {
+            schema.search.insert(n.clone(), d);
+            ids.search.insert(uid.clone(), n.clone());
+        };
         let same = name(SearchKind::Dictionary, "app.same");
-        base.search
-            .insert(same.clone(), dictionary("pg_catalog.simple"));
-        declared
-            .search
-            .insert(same, dictionary("pg_catalog.simple"));
-        // Only the target has it: not this project's.
+        let uid = Uid::generate(UidKind::Search);
+        hold(
+            &mut base,
+            &mut base_ids,
+            &uid,
+            &same,
+            dictionary("pg_catalog.simple"),
+        );
+        hold(
+            &mut declared,
+            &mut declared_ids,
+            &uid,
+            &same,
+            dictionary("pg_catalog.simple"),
+        );
+        // Only the target has it, and records no identity for it: not this project's.
         base.search.insert(
             name(SearchKind::Config, "app.theirs"),
             SearchObject::Config {
@@ -29224,49 +29567,570 @@ mod meeting_shape_tests {
                 mappings: Default::default(),
             },
         );
-        let mut errs = Vec::new();
-        diff_search(&base, &declared, &mut errs);
-        assert!(errs.is_empty(), "{errs:?}");
-        // Changed, and absent from the target.
-        let changed = name(SearchKind::Dictionary, "app.changed");
-        base.search
-            .insert(changed.clone(), dictionary("pg_catalog.simple"));
-        declared
-            .search
-            .insert(changed, dictionary("pg_catalog.synonym"));
-        declared.search.insert(
-            name(SearchKind::Dictionary, "app.new"),
+        let diffed =
+            |base: &Schema, base_ids: &IdsFile, declared: &Schema, declared_ids: &IdsFile| {
+                let mut errs = Vec::new();
+                let changes = diff_search(
+                    Side {
+                        schema: base,
+                        ids: base_ids,
+                    },
+                    Side {
+                        schema: declared,
+                        ids: declared_ids,
+                    },
+                    true,
+                    &mut errs,
+                );
+                (
+                    changes,
+                    errs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                )
+            };
+        let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(
+            changes.is_empty() && errs.is_empty(),
+            "{changes:?} {errs:?}"
+        );
+        // A declared object the target lacks is created under its recorded uid.
+        let new = name(SearchKind::Dictionary, "app.new");
+        let new_uid = Uid::generate(UidKind::Search);
+        hold(
+            &mut declared,
+            &mut declared_ids,
+            &new_uid,
+            &new,
             dictionary("pg_catalog.simple"),
         );
-        diff_search(&base, &declared, &mut errs);
-        let said: Vec<String> = errs.iter().map(ToString::to_string).collect();
-        assert_eq!(said.len(), 2, "{said:?}");
+        let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(changes.as_slice(),
+            [Change::CreateSearch { uid, name, .. }] if uid == &new_uid && name == &new));
+        // A declaration the baseline holds, then gives up, is dropped.
+        declared.search.remove(&same);
+        declared_ids.search.remove(&uid);
+        let (changes, _) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(changes.iter().any(|c| matches!(c,
+            Change::DropSearch { uid: u, name, .. } if u == &uid && name == &same)));
+        // The target's own object with no identity is never dropped.
         assert!(
-            said.iter()
-                .any(|m| m.contains("app.changed") && m.contains("changing one")),
-            "{said:?}"
+            !changes.iter().any(
+                |c| matches!(c, Change::DropSearch { name, .. } if name.name.name() == "theirs")
+            )
+        );
+        // A standing difference, a missing identity and a rename are refused by name.
+        declared
+            .search
+            .insert(same.clone(), dictionary("pg_catalog.synonym"));
+        declared_ids.search.insert(uid.clone(), same.clone());
+        let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(
+            !changes
+                .iter()
+                .any(|c| matches!(c, Change::DropSearch { .. }))
         );
         assert!(
-            said.iter()
-                .any(|m| m.contains("app.new") && m.contains("creating one")),
-            "{said:?}"
+            errs.iter()
+                .any(|m| m.contains("app.same") && m.contains("changing one")),
+            "{errs:?}"
         );
+        let loose = name(SearchKind::Dictionary, "app.loose");
+        declared
+            .search
+            .insert(loose, dictionary("pg_catalog.simple"));
+        let (_, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("app.loose") && m.contains("no recorded identity")),
+            "{errs:?}"
+        );
+        let renamed = name(SearchKind::Dictionary, "app.renamed");
+        declared.search.remove(&same);
+        declared
+            .search
+            .insert(renamed.clone(), dictionary("pg_catalog.simple"));
+        declared_ids.search.insert(uid.clone(), renamed);
+        let (changes, errs) = diffed(&base, &base_ids, &declared, &declared_ids);
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("app.renamed") && m.contains("renaming one")),
+            "{errs:?}"
+        );
+        assert!(!changes.iter().any(
+            |c| matches!(c, Change::CreateSearch { name, .. } if name.name.name() == "renamed")
+        ));
         // Two kinds of one name are two objects: the configuration is absent though the
         // dictionary of that name is held.
-        declared.search.insert(
-            name(SearchKind::Config, "app.same"),
+        let config = name(SearchKind::Config, "app.same");
+        let config_uid = Uid::generate(UidKind::Search);
+        hold(
+            &mut declared,
+            &mut declared_ids,
+            &config_uid,
+            &config,
             SearchObject::Config {
                 parser: "pg_catalog.\"default\"".parse().unwrap(),
                 mappings: Default::default(),
             },
         );
-        let mut errs = Vec::new();
-        diff_search(&base, &declared, &mut errs);
+        let (changes, _) = diffed(&base, &base_ids, &declared, &declared_ids);
         assert!(
-            errs.iter().any(|e| e
-                .to_string()
-                .contains("text search configuration `app.same`")),
-            "{errs:?}"
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::CreateSearch { name, .. } if name == &config))
         );
+    }
+}
+
+/// Text search objects through the whole differ: creation and drop order by depth, the
+/// recorded reason a drop needs, and the dictionary a mapping must be able to name
+/// (DEC-2728.2).
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+mod search_tests {
+    use super::*;
+    use crate::identity::Context;
+    use pbps_dialect::MinimalDialect;
+    use pbps_model::{Column, Intent, SearchObject, SearchRef};
+
+    fn ctx() -> Context {
+        Context {
+            operator: "leon".into(),
+            today: "2026-11-11".into(),
+        }
+    }
+
+    fn name(text: &str) -> SearchRef {
+        text.parse().unwrap()
+    }
+
+    fn words() -> SearchObject {
+        SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        }
+    }
+
+    fn mapping(dictionary: &str) -> SearchObject {
+        SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("asciiword".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+        }
+    }
+
+    /// The schema with a configuration `app.docs` over `app.words`, whose subjects sort the
+    /// other way (`config` before `dictionary`), and a table that follows them both.
+    fn world() -> Schema {
+        let mut schema = Schema::default();
+        schema
+            .search
+            .insert(name("config app.docs"), mapping("app.words"));
+        schema.search.insert(name("dictionary app.words"), words());
+        schema.tables.insert(
+            "app.t".parse().unwrap(),
+            Table {
+                columns: [("body".into(), Column::new("text".parse().unwrap()))]
+                    .into_iter()
+                    .collect(),
+                ..Table::default()
+            },
+        );
+        schema
+    }
+
+    fn plan(
+        base: (&Schema, &IdsFile),
+        declared: (&Schema, &IdsFile),
+    ) -> Result<ChangeSet, Vec<DiffError>> {
+        plan_against(base, declared, false)
+    }
+
+    /// `target_read` is a connected plan: the base is what the database holds.
+    fn plan_against(
+        base: (&Schema, &IdsFile),
+        declared: (&Schema, &IdsFile),
+        target_read: bool,
+    ) -> Result<ChangeSet, Vec<DiffError>> {
+        diff(
+            Side {
+                schema: base.0,
+                ids: base.1,
+            },
+            Side {
+                schema: declared.0,
+                ids: declared.1,
+            },
+            &MinimalDialect,
+            &Hints {
+                target_read,
+                ..Hints::default()
+            },
+        )
+        .map(|plan| plan.changes().clone())
+    }
+
+    fn positions(changes: &ChangeSet, wanted: &[&str]) -> Vec<usize> {
+        wanted
+            .iter()
+            .map(|text| {
+                changes
+                    .changes
+                    .iter()
+                    .position(|p| p.change.subject() == *text)
+                    .unwrap_or_else(|| panic!("{text} is not planned: {changes:?}"))
+            })
+            .collect()
+    }
+
+    /// A dictionary is created before the configuration that maps it though the subjects sort
+    /// the other way, and both before the table, in class 7. The drop is the reverse, in
+    /// class 18, after the table's. Negative: neither is planned when the target holds them.
+    #[test]
+    fn a_dictionary_is_created_first_and_dropped_last() {
+        let declared = world();
+        let declared_ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let empty = (&Schema::default(), &IdsFile::default());
+        let created = plan(empty, (&declared, &declared_ids)).unwrap();
+        let at = positions(
+            &created,
+            &["dictionary app.words", "config app.docs", "app.t"],
+        );
+        assert!(at[0] < at[1] && at[1] < at[2], "{created:?}");
+        assert!(
+            plan((&declared, &declared_ids), (&declared, &declared_ids))
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        // Dropped: the configuration, then the dictionary, after the table.
+        let bare = Schema {
+            tables: declared.tables.clone(),
+            ..Schema::default()
+        };
+        let mut kept = declared_ids.clone();
+        kept.search.clear();
+        let dropped = plan((&declared, &declared_ids), (&bare, &kept)).unwrap();
+        let at = positions(&dropped, &["config app.docs", "dictionary app.words"]);
+        assert!(at[0] < at[1], "{dropped:?}");
+    }
+
+    /// A drop needs a recorded reason, and with one it is planned and the identity becomes a
+    /// tombstone. Negative: an intent that names nothing is not accepted for it.
+    #[test]
+    fn a_text_search_drop_without_its_recorded_reason_is_refused() {
+        let declared = world();
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let base = Side {
+            schema: &declared,
+            ids: &ids,
+        };
+        let none = Schema {
+            tables: declared.tables.clone(),
+            ..Schema::default()
+        };
+        let refused =
+            crate::identity::resolve_with_baseline(&none, &ids, &[], 0, base, &ctx()).unwrap_err();
+        assert!(
+            refused
+                .iter()
+                .filter(|b| matches!(b, crate::Blocker::DropSearchNeedsReason { .. }))
+                .count()
+                == 2,
+            "{refused:?}"
+        );
+        let reason: pbps_model::Reason = "no longer searched".parse().unwrap();
+        let intents: Vec<Intent> = ["config app.docs", "dictionary app.words"]
+            .into_iter()
+            .map(|text| Intent::DropSearch {
+                name: name(text),
+                reason: reason.clone(),
+            })
+            .collect();
+        let resolved =
+            crate::identity::resolve_with_baseline(&none, &ids, &intents, 0, base, &ctx()).unwrap();
+        assert_eq!(resolved.dropped_search.len(), 2);
+        assert!(resolved.ids.search.is_empty());
+        assert_eq!(resolved.ids.tombstones.len(), 2);
+        let wrong = [Intent::DropSearch {
+            name: name("config app.other"),
+            reason,
+        }];
+        assert!(
+            crate::identity::resolve(&declared, &ids, &wrong, &ctx()).is_err(),
+            "an intent that matches nothing is an unused intent"
+        );
+    }
+
+    /// A table's missing reason and a search object's are one answer: a connected plan names
+    /// both remedies at once, as the checkout does, and does not make the user plan again to
+    /// learn the second. Negative: the table is named once, not once per source.
+    #[test]
+    fn a_connected_plan_names_the_table_and_the_search_remedies_together() {
+        let declared = world();
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let base = Side {
+            schema: &declared,
+            ids: &ids,
+        };
+        let refused =
+            crate::identity::resolve_with_baseline(&Schema::default(), &ids, &[], 0, base, &ctx())
+                .unwrap_err();
+        let count = |f: fn(&crate::Blocker) -> bool| refused.iter().filter(|b| f(b)).count();
+        assert_eq!(
+            count(|b| matches!(b, crate::Blocker::DropTableNeedsReason { .. })),
+            declared.tables.len(),
+            "{refused:?}"
+        );
+        assert_eq!(
+            count(|b| matches!(b, crate::Blocker::DropSearchNeedsReason { .. })),
+            2,
+            "{refused:?}"
+        );
+    }
+
+    /// A reference resolves only to a dictionary the plan keeps. The target holding one the
+    /// plan drops is no answer: the create runs before the drop (class 7, class 18), and
+    /// `DROP TEXT SEARCH ... RESTRICT` fails while anything maps it, so a plan that adds a
+    /// configuration over it, or leaves one standing over it, is refused at plan by name, offline
+    /// and connected alike. Negative: the same configuration over a dictionary the plan keeps is
+    /// planned.
+    #[test]
+    fn a_mapping_to_a_dictionary_the_plan_drops_is_refused_and_one_it_keeps_is_not() {
+        let dictionary = name("dictionary app.words");
+        let docs = name("config app.docs");
+        let mut base = Schema::default();
+        base.search.insert(dictionary.clone(), words());
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        // The dictionary is given up and a new configuration maps it.
+        let mut declared = Schema::default();
+        declared.search.insert(docs.clone(), mapping("app.words"));
+        let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        for target_read in [false, true] {
+            let refused = plan_against((&base, &base_ids), (&declared, &declared_ids), target_read)
+                .unwrap_err();
+            let said: Vec<String> = refused.iter().map(ToString::to_string).collect();
+            assert!(
+                said.len() == 1
+                    && said[0].contains("app.docs")
+                    && said[0].contains("app.words")
+                    && said[0].contains("drops"),
+                "{target_read}: {said:?}"
+            );
+        }
+        // A configuration that stands over it is refused the same way.
+        let mut standing = base.clone();
+        standing.search.insert(docs.clone(), mapping("app.words"));
+        let standing_ids = crate::resolve(&standing, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut kept_config = Schema::default();
+        kept_config
+            .search
+            .insert(docs.clone(), mapping("app.words"));
+        let mut ids = standing_ids.clone();
+        let words_uid = ids.search_uid(&dictionary).unwrap().clone();
+        ids.search.remove(&words_uid);
+        let refused =
+            plan_against((&standing, &standing_ids), (&kept_config, &ids), true).unwrap_err();
+        assert!(
+            refused
+                .iter()
+                .any(|e| e.to_string().contains("app.words") && e.to_string().contains("drops")),
+            "{refused:?}"
+        );
+        // Negative: the dictionary kept (declared, with its identity) and a new configuration
+        // over it plan fine.
+        let mut kept = Schema::default();
+        kept.search.insert(dictionary.clone(), words());
+        kept.search.insert(docs.clone(), mapping("app.words"));
+        let kept_ids = crate::resolve(&kept, &base_ids, &[], &ctx()).unwrap().ids;
+        for target_read in [false, true] {
+            let created =
+                plan_against((&base, &base_ids), (&kept, &kept_ids), target_read).unwrap();
+            assert!(
+                created.changes.iter().any(
+                    |p| matches!(&p.change, Change::CreateSearch { name, .. } if *name == docs)
+                ),
+                "{created:?}"
+            );
+        }
+    }
+
+    /// An object retired and declared again before the drop reached the target is refused by
+    /// name, as a package is: resolution gives the new declaration a new identity and keeps the
+    /// old one's tombstone, and an equal definition would skip the create while the drop of the
+    /// old identity still came (ready round 1). Offline and connected alike. Negative: the same
+    /// declaration under its recorded identity plans nothing, and a name the target holds with
+    /// no recorded identity at all is still adopted.
+    #[test]
+    fn an_object_retired_and_declared_again_before_its_drop_lands_is_refused() {
+        let dictionary = name("dictionary app.words");
+        let mut base = Schema::default();
+        base.search.insert(dictionary.clone(), words());
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let old = base_ids.search_uid(&dictionary).unwrap().clone();
+        let again = |uid: &str| {
+            let mut ids = IdsFile::default();
+            ids.search.insert(uid.parse().unwrap(), dictionary.clone());
+            ids.tombstones.insert(
+                old.clone(),
+                pbps_model::Tombstone {
+                    require: None,
+                    was: dictionary.raw().to_string(),
+                    dropped_at: "2026-11-12".into(),
+                    reason: "retired".into(),
+                    operator: "test".into(),
+                },
+            );
+            ids
+        };
+        for target_read in [false, true] {
+            let refused =
+                plan_against((&base, &base_ids), (&base, &again("s_zzzzzz")), target_read)
+                    .unwrap_err();
+            assert!(
+                refused.iter().any(|e| {
+                    let said = e.to_string();
+                    said.contains("app.words") && said.contains("declared again")
+                }),
+                "{target_read}: {refused:?}"
+            );
+        }
+        // Negative: the recorded identity itself plans nothing.
+        let same = plan_against((&base, &base_ids), (&base, &base_ids), true).unwrap();
+        assert!(same.is_empty(), "{same:?}");
+        // Negative: an object the target holds with no recorded identity is adopted.
+        let adopted = plan_against(
+            (&base, &IdsFile::default()),
+            (&base, &again("s_zzzzzz")),
+            true,
+        )
+        .unwrap();
+        assert!(
+            !adopted
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::DropSearch { .. })),
+            "{adopted:?}"
+        );
+    }
+
+    /// A configuration over a package's dictionary, with the package given up, is refused when
+    /// planned against the database: the package is no longer declared, so its schema resolves
+    /// nothing. (Retiring the configuration with it is the release rule's, DEC-2728.2.)
+    #[test]
+    fn a_mapping_to_the_dictionary_of_a_dropped_package_is_refused_against_the_target() {
+        let mut declared = Schema::default();
+        declared
+            .search
+            .insert(name("config app.docs"), mapping("ext.intdict"));
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let refused = plan_against(
+            (&Schema::default(), &IdsFile::default()),
+            (&declared, &ids),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .iter()
+                .any(|e| e.to_string().contains("ext.intdict")),
+            "{refused:?}"
+        );
+    }
+
+    /// Against the database, a mapping to a dictionary neither declared nor held by the
+    /// target is refused at plan by name; one in `pg_catalog` is the engine's and is not.
+    #[test]
+    fn a_mapping_to_a_missing_dictionary_is_refused_against_the_target() {
+        let mut declared = Schema::default();
+        declared
+            .search
+            .insert(name("config app.docs"), mapping("app.nope"));
+        declared
+            .search
+            .insert(name("config app.fine"), mapping("pg_catalog.simple"));
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let errors = plan_against(
+            (&Schema::default(), &IdsFile::default()),
+            (&declared, &ids),
+            true,
+        )
+        .unwrap_err();
+        let said: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("app.docs") && said[0].contains("app.nope"),
+            "{said:?}"
+        );
+        // The target holding the dictionary is the one thing that settles it.
+        let mut held = Schema::default();
+        held.search.insert(name("dictionary app.nope"), words());
+        let held_ids = IdsFile::default();
+        let created = plan_against((&held, &held_ids), (&declared, &ids), true).unwrap();
+        assert!(
+            created.changes.iter().all(|p| matches!(
+                &p.change,
+                Change::CreateSearch { unresolved, .. } if unresolved.is_empty()
+            )),
+            "{created:?}"
+        );
+    }
+
+    /// Offline the baseline only stands for the target, and a dictionary made on the database
+    /// outside pbps is not in it: the plan goes on and the create names what it could not
+    /// check, for the plan against the database to settle (DEC-2728.2). Negative: a
+    /// dictionary the project declares and the engine's own are checked and
+    /// leave nothing to say.
+    #[test]
+    fn a_mapping_to_an_unknown_dictionary_is_an_advisory_offline() {
+        let mut declared = Schema::default();
+        declared
+            .search
+            .insert(name("config app.docs"), mapping("app.nope"));
+        declared
+            .search
+            .insert(name("config app.fine"), mapping("pg_catalog.simple"));
+        declared
+            .search
+            .insert(name("config app.own"), mapping("app.mine"));
+        declared.search.insert(name("dictionary app.mine"), words());
+        let ids = crate::resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let planned = plan((&Schema::default(), &IdsFile::default()), (&declared, &ids)).unwrap();
+        let unresolved = |subject: &str| -> Vec<SearchRef> {
+            let subject = name(subject);
+            planned
+                .changes
+                .iter()
+                .find_map(|p| match &p.change {
+                    Change::CreateSearch {
+                        name, unresolved, ..
+                    } if *name == subject => Some(unresolved.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{} not planned: {planned:?}", subject.raw()))
+        };
+        assert_eq!(unresolved("config app.docs"), [name("dictionary app.nope")]);
+        assert!(unresolved("config app.fine").is_empty());
+        assert!(unresolved("config app.own").is_empty());
+        assert!(unresolved("dictionary app.mine").is_empty());
     }
 }

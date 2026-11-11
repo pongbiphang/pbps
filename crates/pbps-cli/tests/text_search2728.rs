@@ -23,6 +23,28 @@ impl Project {
         std::fs::write(self.0.join("schema").join(name), text).unwrap();
     }
 
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(BIN)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["--no-input", "--project"])
+            .arg(&self.0)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn git(&self, args: &[&str]) {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.name=t", "-c", "user.email=t@e.f"])
+            .arg("-C")
+            .arg(&self.0)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", said(&out));
+    }
+
     fn validate(&self) -> Output {
         Command::new(BIN)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -95,6 +117,11 @@ fn a_text_search_declaration_that_cannot_be_held_is_refused_by_name() {
             "text_search_dictionary: app.d\ntemplate: ext.mytemplate\n",
             "built-in ones",
         ),
+        (
+            "nul",
+            "text_search_dictionary: app.d\ntemplate: pg_catalog.synonym\noptions:\n  synonyms: \"a\\u0000b\"\n",
+            "NUL byte",
+        ),
     ] {
         let p = Project::new(case, "postgres");
         p.file("x.yml", file);
@@ -134,4 +161,95 @@ fn sql_server_refuses_either_text_search_file_by_name() {
     );
     let out = none.validate();
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+}
+
+/// Giving up several declared objects is answered by one batch: `--drop-search` names the
+/// canonical `<kind> <name>` spelling beside `--drop-table`, a typo matches nothing and is
+/// refused, and recording the same batch again changes nothing.
+#[test]
+fn a_batch_records_the_drop_of_a_table_and_of_both_kinds_of_search_object() {
+    let p = Project::new("drops", "postgres");
+    p.file("app.russian.textsearch-dictionary.yml", DICTIONARY);
+    p.file("app.russian.textsearch-config.yml", CONFIG);
+    p.file(
+        "app.t.yml",
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    p.git(&["init", "-q"]);
+    let out = p.run(&["plan", "--no-dev"]);
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-qm", "declared"]);
+    for name in [
+        "app.russian.textsearch-dictionary.yml",
+        "app.russian.textsearch-config.yml",
+        "app.t.yml",
+    ] {
+        std::fs::remove_file(p.0.join("schema").join(name)).unwrap();
+    }
+    // Negative: a typo matches nothing and is refused.
+    let out = p.run(&["intent", "--drop-search", "config app.nope", "retired"]);
+    assert_ne!(out.status.code(), Some(0), "{}", said(&out));
+    let batch = [
+        "intent",
+        "--drop-table",
+        "app.t",
+        "retired",
+        "--drop-search",
+        "config app.russian",
+        "retired",
+        "--drop-search",
+        "dictionary app.russian",
+        "retired",
+    ];
+    let out = p.run(&batch);
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    // All three are recorded: the same batch has nothing left to change.
+    let out = p.run(&batch);
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(said(&out).contains("unchanged"), "{}", said(&out));
+    // And the plan from the commit that declared them drops them, the table first.
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-qm", "retired"]);
+    let out = p.run(&["plan", "--since", "HEAD~1"]);
+    let text = said(&out);
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    assert!(
+        at("drop table app.t") < at("drop text search configuration")
+            && at("drop text search configuration") < at("drop text search dictionary"),
+        "{text}"
+    );
+}
+
+/// A mapping to a dictionary the project does not declare may name one made on the
+/// database outside pbps, which an offline plan cannot see: the plan goes on and the create's
+/// line says the plan against the database settles it. Negative: a mapping over a declared
+/// dictionary and over the engine's own says nothing of the kind.
+#[test]
+fn an_offline_plan_says_which_dictionary_it_could_not_check() {
+    const ADVISORY: &str = "resolved when planned against the database";
+    let p = Project::new("advisory", "postgres");
+    p.file(
+        "app.docs.textsearch-config.yml",
+        "text_search_config: app.docs\nparser: pg_catalog.\"default\"\n\
+         mappings:\n  asciiword: [app.elsewhere, pg_catalog.simple]\n",
+    );
+    let out = p.run(&["plan", "--no-dev"]);
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(
+        said(&out).contains("app.elsewhere") && said(&out).contains(ADVISORY),
+        "{}",
+        said(&out)
+    );
+    // Declared: nothing to resolve.
+    p.file(
+        "app.elsewhere.textsearch-dictionary.yml",
+        "text_search_dictionary: app.elsewhere\ntemplate: pg_catalog.simple\n",
+    );
+    let out = p.run(&["plan", "--no-dev"]);
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(!said(&out).contains(ADVISORY), "{}", said(&out));
 }

@@ -600,14 +600,14 @@ pub(super) fn moved_time_zone(
     }
 }
 
-/// Text search objects have no identity yet, so a drift comparison cannot tell a project's
-/// object from another's: one the database holds that the recorded state does not is not
-/// drift (as an unmanaged type is not), and the differ would otherwise read it as a creation
-/// it cannot express. Only the objects the record holds are compared, so one of them that
-/// changed is still reported by name (DEC-2728.1).
-pub(super) fn only_recorded_search_objects(recorded: &Schema, live: &mut Schema) {
+/// A drift comparison cannot tell a project's text search object from another's except by
+/// its identity: one the database holds that no recorded identity names is not drift (as an
+/// unmanaged type is not), and the differ would otherwise read it as a creation it cannot
+/// express. Only the objects a recorded identity names are compared, so one of them that
+/// changed is still reported by name, as the fingerprint sees it (DEC-2728.1, DEC-2728.2).
+pub(super) fn only_managed_search_objects(recorded: &IdsFile, live: &mut Schema) {
     live.search
-        .retain(|name, _| recorded.search.contains_key(name));
+        .retain(|name, _| recorded.search_uid(name).is_some());
 }
 
 /// The informational line that ends a plan when the database holds comments no declaration

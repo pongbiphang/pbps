@@ -145,6 +145,7 @@ fn name_of(body: &Body) -> (&'static str, &str) {
         Body::Table(t) => ("table", &t.table),
         Body::Role(n) => ("role", n),
         Body::Type(n) => ("type", n),
+        Body::Search(n) => ("search", n),
         Body::Extension(n) => ("extension", n),
     }
 }

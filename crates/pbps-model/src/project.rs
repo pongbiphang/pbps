@@ -204,6 +204,7 @@ fn ids_uids(ids: &IdsFile) -> impl Iterator<Item = &Uid> {
         .chain(ids.columns.keys())
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
+        .chain(ids.search.keys())
         .chain(ids.extensions.keys())
         .chain(ids.tombstones.keys())
 }
@@ -243,6 +244,26 @@ mod tests {
         for name in ["alpha", "beta", "e_aaaaaa"] {
             assert!(error.contains(name), "{error}");
         }
+    }
+
+    #[test]
+    fn a_text_search_uid_of_any_database_is_reserved_too() {
+        let held: Uid = "s_aaaaaa".parse().unwrap();
+        let fresh: Uid = "s_bbbbbb".parse().unwrap();
+        let files = DatabaseMap::new([(
+            "a".parse().unwrap(),
+            IdsFile {
+                search: [(held.clone(), "dictionary app.d".parse().unwrap())].into(),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let mut pool = UidReservations::from_files(&files).unwrap();
+        assert!(pool.contains(&held));
+        let mut draws = [held.clone(), fresh.clone()].into_iter();
+        assert_eq!(pool.allocate_with(|| draws.next().unwrap()), fresh);
+        // Negative: a uid nobody holds is not reserved.
+        assert!(!pool.contains(&"s_cccccc".parse().unwrap()));
     }
 
     #[test]
