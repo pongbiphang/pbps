@@ -1620,6 +1620,16 @@ impl ExclusionTiming {
 }
 
 impl ExclusionConstraint {
+    /// The texts of this constraint that are expressions: its predicate and
+    /// its expression keys, as [`Index`] reads them for the ordering that
+    /// puts a function ahead of what calls it.
+    pub fn expression_texts(&self) -> impl Iterator<Item = &str> {
+        self.filter
+            .as_deref()
+            .into_iter()
+            .chain(self.keys.iter().filter_map(|k| k.key.key.expression()))
+    }
+
     /// The columns this constraint's keys, payload and predicate name, where
     /// every key is a column; an expression or a predicate is text the model
     /// does not parse, so `None` there.

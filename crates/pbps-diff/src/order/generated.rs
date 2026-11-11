@@ -1016,6 +1016,11 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
             .into_iter()
             .chain(index.columns.iter().filter_map(|c| c.key.expression()))
             .collect(),
+        // A drop (`to: None`) reads no text: nothing it names is built.
+        Change::SetExclusion { to, .. } => to
+            .iter()
+            .flat_map(|constraint| constraint.expression_texts())
+            .collect(),
         Change::InsertRow {
             defaults,
             types: row,
@@ -1058,7 +1063,6 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
-        | Change::SetExclusion { .. }
         | Change::AddForeignKey { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }

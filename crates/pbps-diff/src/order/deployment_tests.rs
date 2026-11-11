@@ -334,3 +334,88 @@ fn indexed_creation_names_keep_foreign_keys_parents_and_row_types_hard() {
         assert!(inferred_need(&empty, &provider, &TypedCreation::of(&empty)));
     }
 }
+
+/// An exclusion constraint added ahead of the function its key expression or
+/// predicate calls is moved behind that function, as an expression index is.
+/// Left in place, a valid plan would add the constraint before the routine
+/// exists and fail at apply.
+#[test]
+fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
+    use pbps_model::{
+        ExclusionConstraint, ExclusionKey, ExclusionTiming, IndexColumn, IndexKey, IndexMethod,
+        Module, ModuleKind, OperatorRef,
+    };
+    let exclusion = |key: IndexColumn, filter: Option<&str>, to: bool| {
+        PlannedChange::new(Change::SetExclusion {
+            table: TableName::new("app", "booking"),
+            name: "xc".into(),
+            from: None,
+            to: to.then(|| {
+                Box::new(ExclusionConstraint {
+                    method: IndexMethod::Gist,
+                    keys: vec![ExclusionKey {
+                        key,
+                        operator: OperatorRef::symbol("&&").unwrap(),
+                    }],
+                    include: Vec::new(),
+                    filter: filter.map(str::to_owned),
+                    storage_parameters: Default::default(),
+                    timing: ExclusionTiming::Immediate,
+                })
+            }),
+        })
+    };
+    let function = || {
+        PlannedChange::new(Change::CreateModule {
+            id: "app.slot(integer)".parse().unwrap(),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                description: None,
+                options: Default::default(),
+            }),
+        })
+    };
+    // How many steps the pass moves, and whether the function ends up first.
+    let moved = |constraint: PlannedChange| {
+        let mut plan = crate::order::propose(ChangeSet {
+            changes: vec![constraint, function()],
+        });
+        let count = after_the_rebuilds(
+            &mut plan,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &Schema::default(),
+            Schedule::new(2),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let first = matches!(
+            plan.changes().changes[0].change,
+            Change::CreateModule { .. }
+        );
+        (count, first)
+    };
+    let call = IndexColumn {
+        key: IndexKey::Expression("app.slot(a)".into()),
+        descending: false,
+        opclass: None,
+        collation: None,
+    };
+    assert_eq!(moved(exclusion(call.clone(), None, true)), (1, true));
+    assert_eq!(
+        moved(exclusion(
+            IndexColumn::column("a"),
+            Some("app.slot(a) > 0"),
+            true
+        )),
+        (1, true)
+    );
+    // Negative: a constraint that calls no function the plan creates stays.
+    assert_eq!(
+        moved(exclusion(IndexColumn::column("a"), Some("a > 0"), true)),
+        (0, false)
+    );
+    // Negative: a drop is not an addition and calls nothing.
+    assert_eq!(moved(exclusion(call, None, false)), (0, false));
+}
