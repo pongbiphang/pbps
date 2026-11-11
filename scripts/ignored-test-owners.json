@@ -1100,6 +1100,8 @@
         "type_refs::existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays",
         "type_refs::type_files_differing_only_in_case_refuse_pull_before_any_project_write",
         "type_refs::missing_and_shell_types_refuse_before_bootstrap_creates_a_ledger_or_table",
+        "type_refs::a_resolver_required_plan_is_refused_while_a_type_routine_awaits_review",
+        "type_refs::a_type_routine_awaiting_review_leaves_a_partition_default_unasked_for_review",
         "type_refs::bootstrap_scripts_refuse_type_references_on_postgres_16",
         "type_refs::bootstrap_scripts_refuse_type_references_on_postgres_18",
         "type_refs::empty_apply_checks_referenced_type_prerequisites_on_postgres_16",
