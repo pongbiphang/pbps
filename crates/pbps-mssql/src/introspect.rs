@@ -375,8 +375,23 @@ fn versioning(
             expected = expected.shown(),
         ));
     }
-    if !h.base.placement.on_a_filegroup() {
-        return layout("has rows on a partition scheme, or on storage that cannot be read");
+    // Name the object that holds the history's rows, as the main table's
+    // limitation does (DEC-1227.1), and keep a scheme apart from a placement
+    // nobody could read: the first is established, the second is not.
+    match h.base.placement {
+        Placement::Filegroup | Placement::OffDefaultFilegroup => {}
+        Placement::PartitionScheme => {
+            return layout(&format!(
+                "has its rows ({}) on a partition scheme",
+                h.base.owner()
+            ));
+        }
+        Placement::Unreadable => {
+            return layout(&format!(
+                "has rows ({}) whose storage placement cannot be read",
+                h.base.owner()
+            ));
+        }
     }
     if index.iter().any(|i| {
         i.kind != IndexKind::Clustered
@@ -5196,10 +5211,43 @@ mod tests {
             base_of(1, Some("ix_t_history"), false, Placement::PartitionScheme);
         let p = assemble(&history_side);
         assert!(p.schema.tables.is_empty(), "{:?}", p.schema.tables.keys());
+        // The notice names the object that holds the history's rows.
         assert!(
-            details(&p).contains("history table hist.t_history has rows on a partition scheme"),
+            details(&p).contains(
+                "history table hist.t_history has its rows (clustered index `ix_t_history`) \
+                 on a partition scheme"
+            ),
             "{}",
             details(&p)
+        );
+
+        // Negative: a history base nobody could read is not called partitioned,
+        // and is still named by its holder.
+        let mut unseen = versioned_pair();
+        unseen.tables[1].base = base_of(1, Some("ix_t_history"), false, Placement::Unreadable);
+        let said = details(&assemble(&unseen));
+        assert!(
+            said.contains(
+                "history table hist.t_history has rows (clustered index `ix_t_history`) \
+                 whose storage placement cannot be read"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("on a partition scheme"), "{said}");
+
+        // Negative: a history on an off-default filegroup is no obstacle.
+        let mut off = versioned_pair();
+        off.tables[1].base = base_of(
+            1,
+            Some("ix_t_history"),
+            false,
+            Placement::OffDefaultFilegroup,
+        );
+        assert!(
+            assemble(&off)
+                .schema
+                .tables
+                .contains_key(&TableName::new("dbo", "t"))
         );
     }
 

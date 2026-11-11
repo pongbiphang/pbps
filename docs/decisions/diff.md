@@ -9645,7 +9645,10 @@ space the login cannot see is a third answer, neither a filegroup nor a scheme:
 the table or member is left out with a limitation that says the placement cannot
 be read, and is never declared as ordinary. A table left out for that reason is
 named as such to its dependents (a foreign key, a default, a check, a module),
-not as a partitioned table, which nobody has established. A memory-optimized table has no
+not as a partitioned table, which nobody has established. A history table whose rows are on a
+scheme, or on a placement that cannot be read, is named with the object that holds
+its rows (its clustered index), as the current table is, and the two reasons stay
+apart. A memory-optimized table has no
 `sys.data_spaces` row (`data_space_id = 0`, measured on 17.0) and is no scheme.
 
 **A filegroup other than the database's default is declared and noticed.**
