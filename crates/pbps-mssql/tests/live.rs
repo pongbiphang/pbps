@@ -2954,7 +2954,13 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
              CREATE TABLE dbo.p_heap (id int NOT NULL);
              CREATE TABLE dbo.p_cpk (id int NOT NULL, v int NOT NULL,
                  CONSTRAINT pk_p_cpk PRIMARY KEY CLUSTERED (id));
-             CREATE INDEX ix_p_cpk ON dbo.p_cpk (v);",
+             CREATE INDEX ix_p_cpk ON dbo.p_cpk (v);
+             -- Indexed views: one index on fgx, one on the default.
+             CREATE TABLE dbo.v_base (id int NOT NULL, v int NOT NULL);
+             EXEC(N'CREATE VIEW dbo.v_off WITH SCHEMABINDING AS SELECT id, v FROM dbo.v_base');
+             EXEC(N'CREATE VIEW dbo.v_on WITH SCHEMABINDING AS SELECT id, v FROM dbo.v_base');
+             CREATE UNIQUE CLUSTERED INDEX ux_v_off ON dbo.v_off (id) ON fgx;
+             CREATE UNIQUE CLUSTERED INDEX ux_v_on ON dbo.v_on (id);",
         )
         .await
         .expect("create the tables");
@@ -2964,8 +2970,8 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
             .query(
                 "SELECT o.name AS tbl, ISNULL(i.name, N'(heap)') AS idx, ds.name AS fg,
                         CONVERT(int, f.is_default) AS dflt
-                   FROM sys.tables o
-                   JOIN sys.indexes i ON i.object_id = o.object_id
+                   FROM sys.objects o
+                   JOIN sys.indexes i ON i.object_id = o.object_id AND o.type IN ('U', 'V')
                    JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
                    JOIN sys.filegroups f ON f.data_space_id = ds.data_space_id
                   ORDER BY o.name, i.index_id;",
@@ -2998,6 +3004,8 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
         ("n_mem.ix_n_mem_plain", "PRIMARY", true),
         ("p_heap.(heap)", "PRIMARY", true),
         ("p_cpk.ix_p_cpk", "PRIMARY", true),
+        ("v_off.ux_v_off", "fgx", false),
+        ("v_on.ux_v_on", "PRIMARY", true),
     ] {
         assert_eq!(placed[obj], (fg.to_owned(), default), "premise: {obj}");
     }
@@ -3014,7 +3022,14 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
     };
     assert_eq!(
         declared(&first),
-        ["n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap"]
+        ["n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base"]
+    );
+    // Both views are declared, with their indexes.
+    assert_eq!(
+        first.schema.modules.len(),
+        2,
+        "{:?}",
+        first.unmanaged_modules
     );
     // Declared as they were, not omitted and not a managed-set limitation.
     let n_mem = &first.schema.tables[&TableName::new("dbo", "n_mem")];
@@ -3036,6 +3051,11 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
              the target's default filegroup"
                 .to_owned(),
             format!("dbo.n_mem: index `ix_n_mem`, unique constraint `uq_n_mem` {tail}"),
+            // One for the view, not one per index or per column.
+            "dbo.v_off: index `ux_v_off` sits on a filegroup other than the database's \
+             default; the declarations do not hold a filegroup, so a bootstrap places it on \
+             the target's default filegroup"
+                .to_owned(),
         ]
     );
 
@@ -3069,11 +3089,13 @@ async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
     assert_eq!(
         declared(&second),
         [
-            "d_cpk", "d_heap", "n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap"
+            "d_cpk", "d_heap", "n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base"
         ]
     );
     let all = second.catalog_notices.join("\n");
-    for noticed in ["n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap"] {
+    for noticed in [
+        "n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base", "v_off", "v_on",
+    ] {
         assert!(
             all.contains(&format!("dbo.{noticed}: ")),
             "{noticed}: {all}"
@@ -4649,16 +4671,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("ck_plain_temporal_fn")
-            && limitation
-                .detail
-                .contains("omitted temporal, ledger or partitioned object or module")
+            && limitation.detail.contains(
+                "omitted temporal, ledger, partitioned or unreadable-placement object or module",
+            )
     }));
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("df_plain_temporal_fn")
-            && limitation
-                .detail
-                .contains("omitted temporal, ledger or partitioned object or module")
+            && limitation.detail.contains(
+                "omitted temporal, ledger, partitioned or unreadable-placement object or module",
+            )
     }));
     assert!(
         pulled.schema.tables[&TableName::new("dbo", "plain")]

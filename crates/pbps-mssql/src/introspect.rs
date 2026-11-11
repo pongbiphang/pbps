@@ -1323,7 +1323,7 @@ fn left_out_columns_phrase(columns: &BTreeSet<&str>) -> String {
 /// different table; the reason names that object, then any key or index of
 /// the table that sits on a scheme of its own, so each is reported even
 /// though the loops below never reach an omitted table.
-fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<String> {
+fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<(&'static str, String)> {
     let also: BTreeSet<String> = raw
         .key_columns
         .iter()
@@ -1363,14 +1363,22 @@ fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<String> {
     };
     match t.base.placement {
         Placement::Filegroup | Placement::OffDefaultFilegroup => None,
-        Placement::PartitionScheme => Some(format!(
-            "its rows are on a partition scheme ({}), which the declarations cannot hold, and \
-             bootstrap would build the table unpartitioned{also}",
-            t.base.owner(),
+        Placement::PartitionScheme => Some((
+            "partitioned table",
+            format!(
+                "its rows are on a partition scheme ({}), which the declarations cannot hold, \
+                 and bootstrap would build the table unpartitioned{also}",
+                t.base.owner(),
+            ),
         )),
-        Placement::Unreadable => Some(format!(
-            "where its rows are stored cannot be read, so it cannot be told whether they are \
-             on a partition scheme{also}"
+        // Not a partitioned table: it is unknown whether it is one, and a
+        // dependent's reason must not claim it is (#1227).
+        Placement::Unreadable => Some((
+            "table whose storage placement cannot be read",
+            format!(
+                "where its rows are stored cannot be read, so it cannot be told whether they \
+                 are on a partition scheme{also}"
+            ),
         )),
     }
 }
@@ -1423,14 +1431,18 @@ fn filegroup_notice(
     if what.is_empty() {
         return None;
     }
-    Some(format!(
-        "{}: {} {} on a filegroup other than the database's default; the declarations do not \
-         hold a filegroup, so a bootstrap places {} on the target's default filegroup",
-        table.shown(),
+    Some(filegroup_message(&table.shown().to_string(), &what))
+}
+
+/// The one wording of the notice, for a table and for a view alike.
+fn filegroup_message(object: &str, what: &[String]) -> String {
+    format!(
+        "{object}: {} {} on a filegroup other than the database's default; the declarations do \
+         not hold a filegroup, so a bootstrap places {} on the target's default filegroup",
         what.join(", "),
         if what.len() == 1 { "sits" } else { "sit" },
         if what.len() == 1 { "it" } else { "them" },
-    ))
+    )
 }
 
 /// Assembles the raw catalog rows into a [`Schema`].
@@ -1527,8 +1539,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
         // Before the temporal answer, which would otherwise accept a
         // system-versioned table and with it a history that goes with it.
-        if let Some(why) = base_obstacle(raw, t) {
-            omitted_tables.insert(name.clone(), "partitioned table");
+        if let Some((kind, why)) = base_obstacle(raw, t) {
+            omitted_tables.insert(name.clone(), kind);
             unavailable_object_ids.insert(t.object_id);
             push_limitation(
                 &mut warnings,
@@ -1713,7 +1725,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal, ledger or partitioned object or module; the default was left out too",
+                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal, ledger, partitioned or unreadable-placement object or module; the default was left out too",
                     c.name,
                     constraint_name = constraint_name.shown(),
                 ),
@@ -2340,7 +2352,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}: check constraint `{}` depends on an omitted temporal, ledger or partitioned object or module; the check constraint was left out too",
+                    "{table_name}: check constraint `{}` depends on an omitted temporal, ledger, partitioned or unreadable-placement object or module; the check constraint was left out too",
                     c.name.shown()
                 ),
             );
@@ -2392,7 +2404,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         };
     }
 
-    let mut filegroup_notices: BTreeMap<TableName, String> = BTreeMap::new();
+    let mut filegroup_notices: BTreeMap<String, String> = BTreeMap::new();
     let mut schema = Schema::default();
     for (id, table) in tables {
         // A table whose every column was unsupported must not be declared as an
@@ -2411,7 +2423,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
         let name = names.remove(&id).unwrap();
         if let Some(notice) = filegroup_notice(raw, id, &name, off_default.remove(&id)) {
-            filegroup_notices.insert(name.clone(), notice);
+            filegroup_notices.insert(name.shown().to_string(), notice);
         }
         schema.tables.insert(name, table);
     }
@@ -2439,7 +2451,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
         if unavailable_object_ids.contains(&m.object_id) {
             unmanageable(
-                "it has a create-time-bound dependency on a temporal, ledger or partitioned table or another omitted module",
+                "it has a create-time-bound dependency on a temporal, ledger, partitioned or unreadable-placement table or another omitted module",
             );
             continue;
         }
@@ -2558,6 +2570,26 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                  (the tool would read it back as a different module)",
             );
             continue;
+        }
+        // An index of a view on a filegroup other than the default: the
+        // declarations hold none, as for a table's (DEC-1227.1). One notice per
+        // view, and only for a view that is declared.
+        if m.kind == ModuleKind::View {
+            let off: BTreeSet<String> = raw
+                .index_columns
+                .iter()
+                .filter(|i| {
+                    i.object_id == m.object_id && i.placement == Placement::OffDefaultFilegroup
+                })
+                .map(|i| format!("index `{}`", i.index_name.shown()))
+                .collect();
+            if !off.is_empty() {
+                let what: Vec<String> = off.into_iter().collect();
+                filegroup_notices.insert(
+                    name.shown().to_string(),
+                    filegroup_message(&name.shown().to_string(), &what),
+                );
+            }
         }
         schema.modules.insert(
             id,
@@ -5081,6 +5113,62 @@ mod tests {
         );
     }
 
+    /// A dependent of a table left out for an unreadable placement says so; it
+    /// is not told the table is partitioned, which nobody knows (#1227). The
+    /// partitioned table keeps its own word, and a module over either is
+    /// inventoried with a reason that names both.
+    #[test]
+    fn a_dependent_of_an_unreadable_table_is_not_told_it_is_partitioned() {
+        let mut raw = RawCatalog::default();
+        let mut unseen = raw_table(1, "dbo", "unseen");
+        unseen.base = RawBase::unreadable();
+        let mut parted = raw_table(2, "dbo", "parted");
+        parted.base = base_of(1, Some("pk_parted"), true, Placement::PartitionScheme);
+        let child = raw_table(3, "dbo", "child");
+        raw.tables.extend([unseen, parted, child]);
+        for id in 1..=3 {
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        for (name, referenced, table) in [("fk_unseen", 1, "unseen"), ("fk_parted", 2, "parted")] {
+            raw.foreign_key_columns.push(RawForeignKeyColumn {
+                object_id: 3,
+                constraint_name: name.into(),
+                ref_schema: "dbo".into(),
+                ref_table: table.into(),
+                ref_object_id: referenced,
+                ref_key: None,
+                column: "id".into(),
+                ref_column: "id".into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+        }
+        let said = details(&assemble(&raw));
+        assert!(
+            said.contains(
+                "foreign key `fk_unseen` references table whose storage placement cannot be \
+                 read dbo.unseen"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("foreign key `fk_parted` references partitioned table dbo.parted"),
+            "{said}"
+        );
+        // Negative: neither word leaks onto the other's dependent.
+        assert!(
+            !said.contains("references partitioned table dbo.unseen"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("table whose storage placement cannot be read dbo.parted"),
+            "{said}"
+        );
+    }
+
     /// A system-versioned table whose rows sit on a partition scheme goes
     /// with its history; a history on one takes its table; an ordinary pair
     /// is untouched (DEC-1227.1).
@@ -5238,7 +5326,9 @@ mod tests {
         assert!(p.schema.modules.is_empty());
         assert_eq!(p.unmanaged_modules.len(), 1);
         assert!(
-            p.unmanaged_modules[0].why.contains("partitioned table"),
+            p.unmanaged_modules[0]
+                .why
+                .contains("partitioned or unreadable-placement table"),
             "{:?}",
             p.unmanaged_modules[0]
         );
@@ -6022,7 +6112,7 @@ mod module_tests {
                 && limitation.detail.contains("ck_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal, ledger or partitioned object or module")
+                    .contains("omitted temporal, ledger, partitioned or unreadable-placement object or module")
         }));
     }
 
@@ -6073,7 +6163,7 @@ mod module_tests {
                 && limitation.detail.contains("df_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal, ledger or partitioned object or module")
+                    .contains("omitted temporal, ledger, partitioned or unreadable-placement object or module")
         }));
     }
 
@@ -6189,6 +6279,108 @@ mod module_tests {
         assert_eq!(ix.include, ["b".into()]);
         assert!(!ix.unique);
         assert!(options.indexes[&pbps_model::ObjectLocalName::from("ux_v")].unique);
+    }
+
+    /// An index of an indexed view on a filegroup other than the default is
+    /// declared and drawn into ONE notice for the view, as a table's are
+    /// (DEC-1227.1). A view on the default draws none, and neither does a view
+    /// that is not declared.
+    #[test]
+    fn an_indexed_view_on_an_off_default_filegroup_is_noticed_once() {
+        let view = |name: &str, id: i32, definition: &str| {
+            let mut m = module("dbo", name, ModuleKind::View, Some(definition));
+            m.object_id = id;
+            m
+        };
+        let mut raw = catalog_with(vec![
+            view(
+                "v_off",
+                100,
+                "CREATE VIEW dbo.v_off WITH SCHEMABINDING AS SELECT id, a, b FROM dbo.t",
+            ),
+            view(
+                "v_on",
+                101,
+                "CREATE VIEW dbo.v_on WITH SCHEMABINDING AS SELECT id, a FROM dbo.t",
+            ),
+        ]);
+        let mut clustered = view_index(
+            100,
+            "ux_off",
+            "id",
+            IndexKind::Clustered,
+            (true, false, false),
+        );
+        clustered.placement = Placement::OffDefaultFilegroup;
+        let mut second = view_index(
+            100,
+            "ix_off",
+            "a",
+            IndexKind::Nonclustered,
+            (false, false, false),
+        );
+        second.placement = Placement::OffDefaultFilegroup;
+        let mut second_column = view_index(
+            100,
+            "ix_off",
+            "b",
+            IndexKind::Nonclustered,
+            (false, false, false),
+        );
+        second_column.placement = Placement::OffDefaultFilegroup;
+        raw.index_columns = vec![
+            clustered,
+            second,
+            second_column,
+            view_index(
+                100,
+                "ix_plain",
+                "b",
+                IndexKind::Nonclustered,
+                (false, false, false),
+            ),
+            view_index(
+                101,
+                "ux_on",
+                "id",
+                IndexKind::Clustered,
+                (true, false, false),
+            ),
+        ];
+        let p = assemble(&raw);
+        assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
+        assert_eq!(p.schema.modules.len(), 2);
+        assert!(p.limitations.is_empty(), "{:?}", p.limitations);
+        assert_eq!(
+            p.catalog_notices,
+            [
+                "dbo.v_off: index `ix_off`, index `ux_off` sit on a filegroup other than the \
+              database's default; the declarations do not hold a filegroup, so a bootstrap \
+              places them on the target's default filegroup"
+            ]
+        );
+
+        // Negative: a view that is not declared (its index is filtered, which
+        // a declaration cannot hold) draws no notice for the index it lost.
+        let mut raw = catalog_with(vec![view(
+            "v_lost",
+            100,
+            "CREATE VIEW dbo.v_lost WITH SCHEMABINDING AS SELECT id, a FROM dbo.t",
+        )]);
+        let mut lost = view_index(100, "ux", "id", IndexKind::Clustered, (true, false, false));
+        lost.placement = Placement::OffDefaultFilegroup;
+        let mut filtered = view_index(
+            100,
+            "ix",
+            "a",
+            IndexKind::Nonclustered,
+            (false, false, false),
+        );
+        filtered.filter = Some("a > 0".to_owned());
+        raw.index_columns = vec![lost, filtered];
+        let p = assemble(&raw);
+        assert!(p.schema.modules.is_empty(), "{:?}", p.schema.modules.keys());
+        assert!(p.catalog_notices.is_empty(), "{:?}", p.catalog_notices);
     }
 
     /// An index the model cannot hold keeps the whole view unmanaged: managing

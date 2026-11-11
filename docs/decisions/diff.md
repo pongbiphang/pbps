@@ -9643,7 +9643,9 @@ partition are schemes. The heap, which `INDEX_COLUMNS` never lists, is read with
 the clustered index through `index_id IN (0, 1)`, one row per table. A data
 space the login cannot see is a third answer, neither a filegroup nor a scheme:
 the table or member is left out with a limitation that says the placement cannot
-be read, and is never declared as ordinary. A memory-optimized table has no
+be read, and is never declared as ordinary. A table left out for that reason is
+named as such to its dependents (a foreign key, a default, a check, a module),
+not as a partitioned table, which nobody has established. A memory-optimized table has no
 `sys.data_spaces` row (`data_space_id = 0`, measured on 17.0) and is no scheme.
 
 **A filegroup other than the database's default is declared and noticed.**
@@ -9657,8 +9659,9 @@ notice is printed instead, as #168's notices are (DEC-2444.1): `pull` shows it a
 a warning, and a connected `plan` as the nonfatal `plan.unheld-object`. It is no
 managed-set limitation and no `note()`. The notice is read from the object's own
 data space with `sys.filegroups.is_default = 0`, is grouped per table (its base
-rows, each declared key or index, and its history table), and says that a
-bootstrap places them on the target's default filegroup. An object on the
+rows, each declared key or index, and its history table) or per indexed view
+(its declared indexes), and says that a bootstrap places them on the target's
+default filegroup. An object on the
 source's **default** filegroup draws nothing, even when the default is not
 PRIMARY (measured: after `MODIFY FILEGROUP ... DEFAULT`, objects created without
 `ON` land on it, and the objects left on PRIMARY are the ones noticed). A
