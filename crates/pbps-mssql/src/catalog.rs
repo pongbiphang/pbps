@@ -10,8 +10,8 @@ use pbps_db::{Conn, DbError, FromColumn, Row};
 use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
-    ColumnReader, IndexKind, Pulled, RawCatalog, RawCheck, RawCheckColumn, RawColumn,
-    RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawObjectDependency,
+    ColumnReader, IndexKind, Placement, Pulled, RawBase, RawCatalog, RawCheck, RawCheckColumn,
+    RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawObjectDependency,
     RawReadColumn, RawTable, Securable, assemble,
 };
 
@@ -202,9 +202,33 @@ SELECT c.object_id, c.name, ty.name AS type_name,
          ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
  ORDER BY c.object_id, c.column_id;";
 
-/// `rows_partitioned` says whether the table's rows (its heap or clustered
-/// index) sit on a partition scheme, which no declaration can say (#1209
-/// review).
+/// Where each table's rows sit: the heap (index 0) or the clustered index
+/// (index 1), and the kind of data space it is on (#1227). A table has exactly
+/// one such row, so this adds none and loses none; the joins are LEFT ones so
+/// that a row the login cannot see reads as `NULL`, which the assembler keeps
+/// apart from a filegroup and from a partition scheme.
+const TABLE_BASES: &str = "\
+SELECT t.object_id, b.name AS base_name, b.type AS base_type,
+       b.is_primary_key, b.is_unique_constraint,
+       CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN b.data_space_id = 0 THEN N'FX' END
+            WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
+            ELSE ds.type END AS space_type
+  FROM sys.tables t
+  LEFT JOIN sys.indexes b ON b.object_id = t.object_id AND b.index_id IN (0, 1)
+  LEFT JOIN sys.data_spaces ds ON ds.data_space_id = b.data_space_id
+  LEFT JOIN sys.filegroups fg ON fg.data_space_id = ds.data_space_id
+ WHERE t.is_ms_shipped = 0;";
+
+/// `space_type` is the data space of the key's own backing index (`ki`):
+/// `PS` for a partition scheme, `FG` for the database's default filegroup,
+/// `FGN` for any other filegroup (`sys.filegroups.is_default = 0`, DEC-1227.1;
+/// `NULL` where that row is not visible, which is unreadable rather than the
+/// default), `FX` for the in-memory
+/// space of a memory-optimized table, whose rows carry `data_space_id = 0` and
+/// no `sys.data_spaces` row (measured on 17.0) and are no scheme, and `NULL`
+/// where no data space row is visible. It is the key's own, not its table's: a
+/// key can sit on a partition scheme beside ordinary rows, or on a filegroup
+/// beside partitioned ones (#1227).
 ///
 /// `ki.type` travels for the same reason it does in `INDEX_COLUMNS`: the
 /// declarations spell neither `CLUSTERED` nor `NONCLUSTERED` on a key, so a
@@ -214,14 +238,14 @@ const KEY_COLUMNS: &str = "\
 SELECT kc.parent_object_id AS object_id, kc.name,
        CONVERT(bit, CASE WHEN kc.type = 'PK' THEN 1 ELSE 0 END) AS is_primary,
        col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type,
-       CONVERT(bit, CASE WHEN EXISTS (
-           SELECT 1 FROM sys.indexes b
-             JOIN sys.data_spaces bd ON bd.data_space_id = b.data_space_id
-            WHERE b.object_id = kc.parent_object_id AND b.index_id IN (0, 1) AND bd.type = 'PS')
-         THEN 1 ELSE 0 END) AS rows_partitioned
+       CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN ki.data_space_id = 0 THEN N'FX' END
+            WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
+            ELSE ds.type END AS space_type
   FROM sys.key_constraints kc
   JOIN sys.indexes ki
     ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
+  LEFT JOIN sys.data_spaces ds ON ds.data_space_id = ki.data_space_id
+  LEFT JOIN sys.filegroups fg ON fg.data_space_id = ds.data_space_id
   JOIN sys.index_columns ic
     ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
   JOIN sys.columns col
@@ -336,16 +360,18 @@ END CATCH;";
 /// (4), columnstore (5, 6), hash (7) — answered "not clustered" and was adopted
 /// as the ordinary rowstore index it is not. The code is what lets the
 /// assembler say which kind it left out.
+///
+/// `space_type` is the index's own data space, as in `KEY_COLUMNS` (#1227).
 const INDEX_COLUMNS: &str = "\
 SELECT i.object_id, i.name, i.is_unique, i.type AS index_type, i.is_disabled, i.ignore_dup_key,
        i.filter_definition,
        col.name AS column_name, ic.is_included_column, ic.is_descending_key,
-       CONVERT(bit, CASE WHEN EXISTS (
-           SELECT 1 FROM sys.indexes b
-             JOIN sys.data_spaces bd ON bd.data_space_id = b.data_space_id
-            WHERE b.object_id = i.object_id AND b.index_id IN (0, 1) AND bd.type = 'PS')
-         THEN 1 ELSE 0 END) AS rows_partitioned
+       CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN i.data_space_id = 0 THEN N'FX' END
+            WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
+            ELSE ds.type END AS space_type
   FROM sys.indexes i
+  LEFT JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
+  LEFT JOIN sys.filegroups fg ON fg.data_space_id = ds.data_space_id
   JOIN sys.index_columns ic
     ON ic.object_id = i.object_id AND ic.index_id = i.index_id
   JOIN sys.columns col
@@ -543,7 +569,28 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
                 .zip(opt::<&str>(&row, "period_end")?.map(str::to_owned)),
             compression: opt::<u8>(&row, "min_compression")?
                 .zip(opt::<u8>(&row, "max_compression")?),
+            // Filled below; a table the base query does not answer for stays
+            // unreadable rather than reading as an ordinary one (#1227).
+            base: RawBase::unreadable(),
         });
+    }
+    let mut bases = BTreeMap::new();
+    for row in conn.query(TABLE_BASES).await? {
+        bases.insert(
+            get::<i32>(&row, "object_id")?,
+            RawBase {
+                name: opt::<&str>(&row, "base_name")?.map(|n| n.to_owned().into()),
+                index_type: opt::<u8>(&row, "base_type")?,
+                is_primary: opt::<bool>(&row, "is_primary_key")?.unwrap_or(false),
+                is_unique_constraint: opt::<bool>(&row, "is_unique_constraint")?.unwrap_or(false),
+                placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
+            },
+        );
+    }
+    for t in &mut raw.tables {
+        if let Some(base) = bases.remove(&t.object_id) {
+            t.base = base;
+        }
     }
 
     for row in conn.query(&columns).await? {
@@ -576,7 +623,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_disabled: get(&row, "is_disabled")?,
             ignore_dup_key: get(&row, "ignore_dup_key")?,
             index_type: get(&row, "index_type")?,
-            rows_partitioned: get(&row, "rows_partitioned")?,
+            placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
 
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned().into(),
@@ -653,7 +700,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             column: get::<&str>(&row, "column_name")?.to_owned(),
             is_included: get(&row, "is_included_column")?,
             is_descending: get(&row, "is_descending_key")?,
-            rows_partitioned: get(&row, "rows_partitioned")?,
+            placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
         });
     }
 

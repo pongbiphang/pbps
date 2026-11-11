@@ -65,6 +65,100 @@ pub struct RawTable {
     /// The lowest and highest `data_compression` of the table's rows (its
     /// heap or clustered index), over its partitions.
     pub compression: Option<(u8, u8)>,
+    /// Where the table's rows sit: its heap or its clustered index (#1227).
+    pub base: RawBase,
+}
+
+/// What kind of data space an observation sits on (`sys.data_spaces.type`).
+///
+/// Four answers, because a declaration holds no data space and each answer
+/// is a different thing to say: the database's default filegroup is the
+/// engine's own placement and draws nothing; another filegroup is declared as
+/// it is and noticed, because bootstrap places it on the target's default
+/// (DEC-1227.1); a partition scheme is a layout bootstrap would silently
+/// build as an unpartitioned one, so it is left out; and a row the login
+/// cannot see is none of those and must not read as the first (#1227).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    #[default]
+    Filegroup,
+    /// A filegroup that is not the database's default (`is_default = 0`).
+    OffDefaultFilegroup,
+    PartitionScheme,
+    Unreadable,
+}
+
+impl Placement {
+    /// By the catalog query's `space_type`: `PS`, a partition scheme; `FGN`, a
+    /// filegroup other than the default; `NULL`, no data space row (or no
+    /// `is_default`) visible; anything else (`FG`, `FX`), not a scheme.
+    pub fn from_data_space(code: Option<&str>) -> Self {
+        match code {
+            Some("PS") => Self::PartitionScheme,
+            Some("FGN") => Self::OffDefaultFilegroup,
+            None => Self::Unreadable,
+            Some(_) => Self::Filegroup,
+        }
+    }
+
+    /// Whether a declaration can stand for the object: it sits on a
+    /// filegroup, the default or not.
+    pub fn on_a_filegroup(self) -> bool {
+        matches!(self, Self::Filegroup | Self::OffDefaultFilegroup)
+    }
+}
+
+/// The heap or clustered index that holds a table's rows.
+#[derive(Debug, Clone)]
+pub struct RawBase {
+    /// The clustered index's name; `None` for a heap, and where unreadable.
+    pub name: Option<pbps_model::ObjectLocalName>,
+    /// `sys.indexes.type` of the row: zero a heap, one clustered, five a
+    /// clustered columnstore. `None` where the table has no such row.
+    pub index_type: Option<u8>,
+    pub is_primary: bool,
+    pub is_unique_constraint: bool,
+    pub placement: Placement,
+}
+
+impl RawBase {
+    /// A table whose base the catalog did not answer for.
+    pub fn unreadable() -> Self {
+        Self {
+            name: None,
+            index_type: None,
+            is_primary: false,
+            is_unique_constraint: false,
+            placement: Placement::Unreadable,
+        }
+    }
+
+    /// An ordinary heap, for fixtures that do not care where rows sit.
+    pub fn heap() -> Self {
+        Self {
+            name: None,
+            index_type: Some(0),
+            is_primary: false,
+            is_unique_constraint: false,
+            placement: Placement::Filegroup,
+        }
+    }
+
+    /// The object holding the rows, as a limitation names it.
+    fn owner(&self) -> String {
+        let name = self.name.as_ref().map(|n| n.shown().to_string());
+        match (self.index_type, name) {
+            (Some(0), _) => "a heap".to_owned(),
+            (Some(1), Some(n)) if self.is_primary => format!("clustered primary key `{n}`"),
+            (Some(1), Some(n)) if self.is_unique_constraint => {
+                format!("clustered unique constraint `{n}`")
+            }
+            (Some(1), Some(n)) => format!("clustered index `{n}`"),
+            (Some(5), Some(n)) => format!("clustered columnstore index `{n}`"),
+            (Some(code), Some(n)) => format!("index `{n}` ({})", index_type_name(code)),
+            _ => "a heap or clustered index that cannot be read".to_owned(),
+        }
+    }
 }
 
 /// What each table with a period, or with a column the engine writes or
@@ -281,13 +375,16 @@ fn versioning(
             expected = expected.shown(),
         ));
     }
+    if !h.base.placement.on_a_filegroup() {
+        return layout("has rows on a partition scheme, or on storage that cannot be read");
+    }
     if index.iter().any(|i| {
         i.kind != IndexKind::Clustered
             || i.is_unique
             || i.filter.is_some()
             || i.is_disabled
             || i.ignore_dup_key
-            || i.rows_partitioned
+            || !i.placement.on_a_filegroup()
     }) {
         return layout(&format!(
             "has `{expected}` with options of its own",
@@ -366,9 +463,8 @@ pub struct RawKeyColumn {
     /// nonclustered rowstore, anything else a kind a key declaration cannot
     /// spell either.
     pub index_type: u8,
-    /// The table's rows sit on a partition scheme (its heap or its clustered
-    /// index does), which no declaration can say.
-    pub rows_partitioned: bool,
+    /// The data space of the key's own backing index (#1227).
+    pub placement: Placement,
     pub object_id: i32,
     pub constraint_name: pbps_model::ObjectLocalName,
     pub is_primary: bool,
@@ -512,8 +608,8 @@ fn indexed_view(
         if i.is_unique && i.ignore_dup_key {
             return Err(why("has IGNORE_DUP_KEY"));
         }
-        if i.rows_partitioned {
-            return Err(why("is on a partition scheme"));
+        if let Some(gap) = placement_gap(i.placement) {
+            return Err(why(gap));
         }
         if i.filter.is_some() {
             return Err(why("is filtered"));
@@ -552,19 +648,40 @@ fn indexed_view(
 /// unmodelled write behavior is left out by the rule every unique index
 /// follows; a disabled one of any kind is too, because disabling the
 /// clustered index makes the table's rows unreadable, and a declaration has no
-/// way to say so (#1178). So is a partitioned one: the declarations hold no
-/// partition scheme, and bootstrap would build the table unpartitioned (#1209
-/// review).
+/// way to say so (#1178). A clustered index on a partition scheme is not a
+/// case of this: its table's rows sit there, so the whole table is left out
+/// (DEC-1227.1).
 fn clustered_index_left_out(i: &RawIndexColumn) -> bool {
-    i.is_disabled || (i.is_unique && i.ignore_dup_key) || i.rows_partitioned
+    i.is_disabled || (i.is_unique && i.ignore_dup_key)
 }
 
-/// Why a layout this reader adopts since #1178 — a clustered UNIQUE
-/// constraint or index, or a nonclustered primary key — cannot be declared on
-/// a table whose rows are partitioned. The shapes it adopted before keep their
-/// older reading; that gap is its own issue.
-const PARTITIONED: &str = "the table's rows are on a partition scheme, which the declarations \
-     cannot hold, and bootstrap would build the table unpartitioned";
+/// Why a data space is one no declaration can hold, where it is. The words
+/// serve a view's index and a table's key or index alike.
+fn placement_gap(placement: Placement) -> Option<&'static str> {
+    match placement {
+        Placement::Filegroup | Placement::OffDefaultFilegroup => None,
+        Placement::PartitionScheme => Some("is on a partition scheme"),
+        Placement::Unreadable => Some("has a storage placement that cannot be read"),
+    }
+}
+
+/// The limitation for a key or index that sits on a data space of its own the
+/// declarations cannot hold, on a table whose base rows they can (DEC-1227.1).
+/// Bootstrap would build it without that placement.
+fn member_placement_limitation(
+    table: &str,
+    kind: &str,
+    name: &pbps_model::ObjectLocalName,
+    placement: Placement,
+) -> Option<String> {
+    placement_gap(placement).map(|gap| {
+        format!(
+            "{table}: {kind} `{}` {gap}, which the declarations cannot hold; bootstrap would \
+             build it without that placement, so it was left out of the declarations",
+            name.shown(),
+        )
+    })
+}
 
 /// How an unmodelled index type is named to the operator.
 ///
@@ -596,8 +713,8 @@ pub struct RawIndexColumn {
     pub column: String,
     pub is_included: bool,
     pub is_descending: bool,
-    /// The table's rows sit on a partition scheme; see [`RawKeyColumn`].
-    pub rows_partitioned: bool,
+    /// The data space of the index itself; see [`RawKeyColumn`].
+    pub placement: Placement,
 }
 
 /// One view, procedure, function or trigger, as `sys.objects` and
@@ -1199,6 +1316,123 @@ fn left_out_columns_phrase(columns: &BTreeSet<&str>) -> String {
     }
 }
 
+/// Why a table's base rows cannot be declared, where they cannot (DEC-1227.1):
+/// they sit on a partition scheme, which no declaration holds, so bootstrap
+/// would build the table unpartitioned. The whole table goes, not just the
+/// object holding them, because a heap or key declared in its place is a
+/// different table; the reason names that object, then any key or index of
+/// the table that sits on a scheme of its own, so each is reported even
+/// though the loops below never reach an omitted table.
+fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<String> {
+    let also: BTreeSet<String> = raw
+        .key_columns
+        .iter()
+        .filter(|k| k.object_id == t.object_id && k.placement == Placement::PartitionScheme)
+        .map(|k| {
+            let kind = if k.is_primary {
+                "primary key"
+            } else {
+                "unique constraint"
+            };
+            (
+                k.constraint_name.clone(),
+                format!("{kind} `{}`", k.constraint_name.shown()),
+            )
+        })
+        .chain(
+            raw.index_columns
+                .iter()
+                .filter(|i| i.object_id == t.object_id && i.placement == Placement::PartitionScheme)
+                .map(|i| {
+                    (
+                        i.index_name.clone(),
+                        format!("index `{}`", i.index_name.shown()),
+                    )
+                }),
+        )
+        .filter(|(name, _)| t.base.name.as_ref() != Some(name))
+        .map(|(_, what)| what)
+        .collect();
+    let also = if also.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; also on a partition scheme: {}",
+            also.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
+    match t.base.placement {
+        Placement::Filegroup | Placement::OffDefaultFilegroup => None,
+        Placement::PartitionScheme => Some(format!(
+            "its rows are on a partition scheme ({}), which the declarations cannot hold, and \
+             bootstrap would build the table unpartitioned{also}",
+            t.base.owner(),
+        )),
+        Placement::Unreadable => Some(format!(
+            "where its rows are stored cannot be read, so it cannot be told whether they are \
+             on a partition scheme{also}"
+        )),
+    }
+}
+
+/// The one notice for a declared table whose rows, keys or indexes sit on a
+/// filegroup that is not the database's default (DEC-1227.1). The declarations
+/// hold no filegroup, so a bootstrap places each on the target's default; the
+/// object is kept, since refusing it would block adopting a database that uses
+/// filegroups for placement. A key or index is named only when the declarations
+/// kept it, and a history table counts with its table.
+fn filegroup_notice(
+    raw: &RawCatalog,
+    id: i32,
+    table: &TableName,
+    members: Option<BTreeSet<String>>,
+) -> Option<String> {
+    let current = raw.tables.iter().find(|t| t.object_id == id)?;
+    let mut what: Vec<String> = Vec::new();
+    if current.base.placement == Placement::OffDefaultFilegroup {
+        what.push(format!("its base ({})", current.base.owner()));
+    }
+    // The clustered base is also a key or an index of the table; once is enough.
+    let base_labels: Vec<String> = current
+        .base
+        .name
+        .iter()
+        .flat_map(|n| {
+            ["primary key", "unique constraint", "index"]
+                .map(|kind| format!("{kind} `{}`", n.shown()))
+        })
+        .collect();
+    what.extend(
+        members
+            .into_iter()
+            .flatten()
+            .filter(|m| !base_labels.contains(m)),
+    );
+    let history = current
+        .history_table_id
+        .filter(|_| current.temporal_type == 2)
+        .and_then(|h| raw.tables.iter().find(|t| t.object_id == h));
+    if let Some(h) = history
+        && (h.base.placement == Placement::OffDefaultFilegroup
+            || raw.index_columns.iter().any(|i| {
+                i.object_id == h.object_id && i.placement == Placement::OffDefaultFilegroup
+            }))
+    {
+        what.push("its history table".to_owned());
+    }
+    if what.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}: {} {} on a filegroup other than the database's default; the declarations do not \
+         hold a filegroup, so a bootstrap places {} on the target's default filegroup",
+        table.shown(),
+        what.join(", "),
+        if what.len() == 1 { "sits" } else { "sit" },
+        if what.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 /// Assembles the raw catalog rows into a [`Schema`].
 ///
 /// Rows referring to an object id that is not in `tables` are ignored: the
@@ -1267,7 +1501,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if t.temporal_type == 1 {
             unavailable_object_ids.insert(t.object_id);
             let current = histories.get(&t.object_id);
-            if current.is_some_and(|c| temporal.get(&c.object_id).is_some_and(Result::is_ok)) {
+            if current.is_some_and(|c| {
+                temporal.get(&c.object_id).is_some_and(Result::is_ok)
+                    && base_obstacle(raw, c).is_none()
+            }) {
                 continue;
             }
             omitted_tables.insert(name.clone(), "temporal history table");
@@ -1285,6 +1522,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 Some(&name),
                 format!("{name}: {why}", name = name.shown()),
+            );
+            continue;
+        }
+        // Before the temporal answer, which would otherwise accept a
+        // system-versioned table and with it a history that goes with it.
+        if let Some(why) = base_obstacle(raw, t) {
+            omitted_tables.insert(name.clone(), "partitioned table");
+            unavailable_object_ids.insert(t.object_id);
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                Some(&name),
+                format!(
+                    "{name}: {why}; the table was left out of the declarations",
+                    name = name.shown()
+                ),
             );
             continue;
         }
@@ -1460,7 +1713,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal or ledger object or module; the default was left out too",
+                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal, ledger or partitioned object or module; the default was left out too",
                     c.name,
                     constraint_name = constraint_name.shown(),
                 ),
@@ -1617,7 +1870,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 && k.index_type == 1
                 && (k.is_disabled
                     || k.ignore_dup_key
-                    || k.rows_partitioned
                     || keys_over_left_out.contains_key(&(k.object_id, k.constraint_name.clone())))
         })
         .map(|k| (k.object_id, k.constraint_name.clone()))
@@ -1643,6 +1895,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut clustered_on: BTreeMap<i32, Clustered> = BTreeMap::new();
     let mut nonclustered_primary: BTreeSet<i32> = BTreeSet::new();
 
+    // What of each declared table sits on a filegroup other than the default:
+    // declared as it is, and named in one notice per table (DEC-1227.1).
+    let mut off_default: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
     let mut unsupported_keys = BTreeSet::new();
     for k in &raw.key_columns {
         let Some(table) = tables.get_mut(&k.object_id) else {
@@ -1711,24 +1966,26 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             continue;
         }
-        // The two key layouts this reader adopts since #1178, on a table
-        // whose rows are partitioned.
-        if k.rows_partitioned && k.index_type == if k.is_primary { 2 } else { 1 } {
+        // The key's own data space, where the table's base rows are
+        // declarable (a table whose rows sit on a partition scheme is not
+        // assembled at all, DEC-1227.1). Read after the layout checks so a
+        // key they already name keeps its reason.
+        if let Some(detail) = member_placement_limitation(
+            &name_of(k.object_id, &names),
+            if k.is_primary {
+                "primary key"
+            } else {
+                "unique constraint"
+            },
+            &k.constraint_name,
+            k.placement,
+        ) {
             if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
-                let kind = if k.is_primary {
-                    "nonclustered primary key"
-                } else {
-                    "clustered unique constraint"
-                };
                 push_limitation(
                     &mut warnings,
                     &mut limitations,
                     names.get(&k.object_id),
-                    format!(
-                        "{}: {kind} `{}`: {PARTITIONED}, so it was left out of the declarations",
-                        name_of(k.object_id, &names),
-                        k.constraint_name.shown(),
-                    ),
+                    detail,
                 );
             }
             continue;
@@ -1760,6 +2017,17 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 clustered_on.insert(k.object_id, Clustered::Unique(k.constraint_name.clone()));
             }
             _ => {}
+        }
+        if k.placement == Placement::OffDefaultFilegroup {
+            off_default.entry(k.object_id).or_default().insert(format!(
+                "{} `{}`",
+                if k.is_primary {
+                    "primary key"
+                } else {
+                    "unique constraint"
+                },
+                k.constraint_name.shown()
+            ));
         }
         if k.is_primary {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
@@ -1835,19 +2103,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     &mut warnings,
                     &mut limitations,
                     names.get(&i.object_id),
-                    if i.rows_partitioned {
-                        format!(
-                            "{}: clustered index `{}`: {PARTITIONED}, so it was left out of the declarations",
-                            name_of(i.object_id, &names),
-                            i.index_name.shown(),
-                        )
-                    } else {
-                        format!(
-                            "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
-                            name_of(i.object_id, &names),
-                            i.index_name.shown(),
-                        )
-                    },
+                    format!(
+                        "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
+                        name_of(i.object_id, &names),
+                        i.index_name.shown(),
+                    ),
                 );
             }
             continue;
@@ -1876,8 +2136,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             continue;
         }
+        if let Some(detail) = member_placement_limitation(
+            &name_of(i.object_id, &names),
+            if i.is_unique { "unique index" } else { "index" },
+            &i.index_name,
+            i.placement,
+        ) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    detail,
+                );
+            }
+            continue;
+        }
         if i.kind == IndexKind::Clustered {
             clustered_on.insert(i.object_id, Clustered::Index(i.index_name.clone()));
+        }
+        if i.placement == Placement::OffDefaultFilegroup {
+            off_default
+                .entry(i.object_id)
+                .or_default()
+                .insert(format!("index `{}`", i.index_name.shown()));
         }
         let index = table
             .indexes
@@ -2058,7 +2340,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}: check constraint `{}` depends on an omitted temporal or ledger object or module; the check constraint was left out too",
+                    "{table_name}: check constraint `{}` depends on an omitted temporal, ledger or partitioned object or module; the check constraint was left out too",
                     c.name.shown()
                 ),
             );
@@ -2110,6 +2392,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         };
     }
 
+    let mut filegroup_notices: BTreeMap<TableName, String> = BTreeMap::new();
     let mut schema = Schema::default();
     for (id, table) in tables {
         // A table whose every column was unsupported must not be declared as an
@@ -2126,7 +2409,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
             continue;
         }
-        schema.tables.insert(names.remove(&id).unwrap(), table);
+        let name = names.remove(&id).unwrap();
+        if let Some(notice) = filegroup_notice(raw, id, &name, off_default.remove(&id)) {
+            filegroup_notices.insert(name.clone(), notice);
+        }
+        schema.tables.insert(name, table);
     }
 
     // Modules (ADR-0002). Each one either becomes part of the desired state or
@@ -2152,7 +2439,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
         if unavailable_object_ids.contains(&m.object_id) {
             unmanageable(
-                "it has a create-time-bound dependency on a temporal or ledger table or another omitted module",
+                "it has a create-time-bound dependency on a temporal, ledger or partitioned table or another omitted module",
             );
             continue;
         }
@@ -2234,7 +2521,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .is_some_and(|parent| omitted_tables.contains_key(parent)))
         {
             unmanageable(
-                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, the ledger, or another omitted module, which pbps cannot express",
+                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, the ledger, a partition scheme, or another omitted module, which pbps cannot express",
             );
             continue;
         }
@@ -2526,7 +2813,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         database_collation: Some(raw.database_collation.clone()),
         schema,
         onboarding_notices,
-        catalog_notices: Vec::new(),
+        catalog_notices: filegroup_notices.into_values().collect(),
         extension_notices: BTreeMap::new(),
         provided_types: BTreeMap::new(),
         provided_classes: BTreeMap::new(),
@@ -2573,6 +2860,7 @@ mod tests {
             retention: None,
             period: None,
             compression: None,
+            base: RawBase::heap(),
         }
     }
 
@@ -2643,7 +2931,7 @@ mod tests {
             column: column.into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         RawCatalog {
             tables: vec![current, history],
@@ -2801,7 +3089,7 @@ mod tests {
                 "a partitioned history",
                 |r| {
                     for i in &mut r.index_columns {
-                        i.rows_partitioned = true;
+                        i.placement = Placement::PartitionScheme;
                     }
                 },
                 "with options of its own",
@@ -3290,7 +3578,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "id".into(),
-                rows_partitioned: false,
+                placement: Placement::Filegroup,
             }],
             ..Default::default()
         }
@@ -3710,7 +3998,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "email".into(),
-                rows_partitioned: false,
+                placement: Placement::Filegroup,
             },
             RawKeyColumn {
                 is_disabled: false,
@@ -3720,7 +4008,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "id".into(),
-                rows_partitioned: false,
+                placement: Placement::Filegroup,
             },
         ];
         let p = assemble(&raw);
@@ -3888,7 +4176,7 @@ mod tests {
             constraint_name: name.into(),
             is_primary,
             column: column.into(),
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         }
     }
 
@@ -3915,7 +4203,7 @@ mod tests {
             column: "code".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         raw.index_columns = vec![
             index(1, "ux_p_code", IndexKind::Unmodelled(7), false),
@@ -4032,7 +4320,7 @@ mod tests {
             column: column.into(),
             is_included,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         raw.index_columns = vec![
             index("ix_hidden", "hidden", false),
@@ -4222,7 +4510,7 @@ mod tests {
             column: column.into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         raw.index_columns = vec![
             index("ix_c", "c", None),
@@ -4330,7 +4618,7 @@ mod tests {
             column: "code".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         });
         for (name, ref_object_id, ref_table, ref_key, ref_column) in [
             ("fk_child_h", 1, "h", "pk_h", "id"),
@@ -4430,7 +4718,7 @@ mod tests {
             column: "email".into(),
             is_included: false,
             is_descending: true,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         raw.index_columns.push(base.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -4467,7 +4755,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         raw.index_columns.push(customer_index.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -4504,7 +4792,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         let mut raw = one_table_catalog();
         raw.key_columns[0].index_type = 2;
@@ -4539,64 +4827,421 @@ mod tests {
         assert_eq!(t.clustered, Some(Clustered::Heap));
     }
 
-    /// The layouts this reader adopts since #1178 are left out on a table
-    /// whose rows are partitioned: declared, bootstrap would build the table
-    /// unpartitioned (#1209 review). A nonclustered key beside a partitioned
-    /// clustered index is on partitioned rows too, whatever filegroup it is
-    /// on, and goes for that reason.
-    #[test]
-    fn a_layout_on_partitioned_rows_is_left_out() {
-        let mut raw = RawCatalog::default();
-        for (id, name) in [(1, "x"), (2, "u"), (3, "h"), (4, "plain")] {
-            raw.tables.push(raw_table(id, "dbo", name));
-            raw.columns.push(raw_column(id, "id", "int"));
+    fn base_of(
+        index_type: u8,
+        name: Option<&str>,
+        is_primary: bool,
+        placement: Placement,
+    ) -> RawBase {
+        RawBase {
+            name: name.map(Into::into),
+            index_type: Some(index_type),
+            is_primary,
+            is_unique_constraint: false,
+            placement,
         }
-        let mut pk_x = key(1, "pk_x", true, 2, "id");
-        pk_x.rows_partitioned = true;
-        let mut uq_u = key(2, "uq_u", false, 1, "id");
-        uq_u.rows_partitioned = true;
-        let mut pk_h = key(3, "pk_h", true, 2, "id");
-        pk_h.rows_partitioned = true;
-        raw.key_columns = vec![pk_x, uq_u, pk_h, key(4, "pk_plain", true, 2, "id")];
-        raw.index_columns.push(RawIndexColumn {
+    }
+
+    fn ix(object_id: i32, name: &str, is_unique: bool, placement: Placement) -> RawIndexColumn {
+        RawIndexColumn {
             is_disabled: false,
             ignore_dup_key: false,
-            object_id: 1,
-            index_name: "cx_x".into(),
-            is_unique: false,
-            kind: IndexKind::Clustered,
+            object_id,
+            index_name: name.into(),
+            is_unique,
+            kind: IndexKind::Nonclustered,
             filter: None,
             column: "id".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: true,
-        });
-        let p = assemble(&raw);
-        let t = |name: &str| &p.schema.tables[&TableName::new("dbo", name)];
-        assert!(t("x").indexes.is_empty());
-        assert_eq!(t("x").primary_key, None);
-        assert!(t("u").unique.is_empty());
-        assert_eq!(t("h").primary_key, None);
-        for table in ["x", "u", "h"] {
-            assert_eq!(t(table).clustered, None, "{table}");
+            placement,
         }
-        let said = p
-            .limitations
+    }
+
+    fn details(p: &Pulled) -> String {
+        p.limitations
             .iter()
             .map(|l| l.detail.clone())
             .collect::<Vec<_>>()
-            .join("\n");
-        for name in ["cx_x", "uq_u", "pk_h", "pk_x"] {
+            .join("\n")
+    }
+
+    /// A table whose base rows sit on a partition scheme is left out whole
+    /// and the pull names the object holding them (DEC-1227.1). Declared in
+    /// its place, a heap, a key or an index would be a different table:
+    /// bootstrap builds it unpartitioned and nothing compares unequal after.
+    /// Every kind of base owner is a case, and a foreign key into the table
+    /// goes with it.
+    #[test]
+    fn a_table_on_a_partition_scheme_is_left_out_whole_and_names_its_owner() {
+        let mut raw = RawCatalog::default();
+        let bases = [
+            (
+                1,
+                "cpk",
+                base_of(1, Some("pk_cpk"), true, Placement::PartitionScheme),
+            ),
+            (
+                2,
+                "heap",
+                base_of(0, None, false, Placement::PartitionScheme),
+            ),
+            (
+                3,
+                "cx",
+                base_of(1, Some("cx_cx"), false, Placement::PartitionScheme),
+            ),
+            (
+                4,
+                "plain",
+                base_of(1, Some("pk_plain"), true, Placement::Filegroup),
+            ),
+            (
+                5,
+                "cci",
+                base_of(5, Some("cci_cci"), false, Placement::PartitionScheme),
+            ),
+        ];
+        for (id, name, base) in bases {
+            let mut t = raw_table(id, "dbo", name);
+            t.base = base;
+            raw.tables.push(t);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        raw.key_columns = vec![
+            key(1, "pk_cpk", true, 1, "id"),
+            key(4, "pk_plain", true, 1, "id"),
+        ];
+        // The heap's nonclustered primary key is on a scheme of its own too.
+        let mut pk_heap = key(2, "pk_heap", true, 2, "id");
+        pk_heap.placement = Placement::PartitionScheme;
+        raw.key_columns.push(pk_heap);
+        let mut child = raw_table(6, "dbo", "child");
+        child.base = base_of(0, None, false, Placement::Filegroup);
+        raw.tables.push(child);
+        raw.columns.push(raw_column(6, "id", "int"));
+        raw.foreign_key_columns.push(RawForeignKeyColumn {
+            object_id: 6,
+            constraint_name: "fk_child_cpk".into(),
+            ref_schema: "dbo".into(),
+            ref_table: "cpk".into(),
+            ref_object_id: 1,
+            ref_key: Some("pk_cpk".into()),
+            column: "id".into(),
+            ref_column: "id".into(),
+            on_delete: 0,
+            on_update: 0,
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
+        });
+        let p = assemble(&raw);
+        let said = details(&p);
+        for gone in ["cpk", "heap", "cx", "cci"] {
             assert!(
-                said.contains(&format!(
-                    "`{name}`: the table's rows are on a partition scheme"
-                )),
-                "{name}: {said}"
+                !p.schema.tables.contains_key(&TableName::new("dbo", gone)),
+                "{gone}: {said}"
             );
         }
-        // Negative: the same nonclustered key on unpartitioned rows is kept.
-        assert_eq!(t("plain").clustered, Some(Clustered::Heap));
-        assert_eq!(p.limitations.len(), 4, "{said}");
+        for (table, owner) in [
+            ("cpk", "(clustered primary key `pk_cpk`)"),
+            ("heap", "(a heap)"),
+            ("cx", "(clustered index `cx_cx`)"),
+            ("cci", "(clustered columnstore index `cci_cci`)"),
+        ] {
+            assert!(
+                said.contains(&format!(
+                    "dbo.{table}: its rows are on a partition scheme {owner}"
+                )),
+                "{table}: {said}"
+            );
+        }
+        // Negative: the same shape on a filegroup is declared as it is today.
+        let plain = &p.schema.tables[&TableName::new("dbo", "plain")];
+        assert!(plain.primary_key.is_some());
+        // The heap's key on a scheme of its own is named with it; the owner
+        // is reported once, and the foreign key is no orphan.
+        assert!(
+            said.contains("also on a partition scheme: primary key `pk_heap`"),
+            "{said}"
+        );
+        assert_eq!(said.matches("dbo.cpk: its rows").count(), 1, "{said}");
+        let child = &p.schema.tables[&TableName::new("dbo", "child")];
+        assert!(child.foreign_keys.is_empty());
+        assert!(
+            said.contains("references partitioned table dbo.cpk"),
+            "{said}"
+        );
+    }
+
+    /// A key or index on a partition scheme of its own, over ordinary base
+    /// rows, is left out alone: the table stays with its supported siblings,
+    /// and a foreign key bound to the member goes with it (DEC-1227.1).
+    #[test]
+    fn a_member_on_its_own_partition_scheme_is_left_out_and_the_table_kept() {
+        let mut raw = RawCatalog::default();
+        for (id, name) in [(1, "t"), (2, "u"), (3, "child")] {
+            let mut t = raw_table(id, "dbo", name);
+            t.base = base_of(1, Some("cx_base"), false, Placement::Filegroup);
+            raw.tables.push(t);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let mut uq = key(1, "uq_t", false, 2, "id");
+        uq.placement = Placement::PartitionScheme;
+        let mut pk_heap = key(2, "pk_u", true, 2, "id");
+        pk_heap.placement = Placement::PartitionScheme;
+        raw.key_columns = vec![uq, pk_heap];
+        raw.index_columns = vec![
+            ix(1, "ix_ps", false, Placement::PartitionScheme),
+            ix(1, "ix_fg", false, Placement::Filegroup),
+            ix(1, "ux_ps", true, Placement::PartitionScheme),
+            // The same name on another table is another index.
+            ix(2, "ix_ps", false, Placement::PartitionScheme),
+        ];
+        raw.foreign_key_columns.push(RawForeignKeyColumn {
+            object_id: 3,
+            constraint_name: "fk_child_ux".into(),
+            ref_schema: "dbo".into(),
+            ref_table: "t".into(),
+            ref_object_id: 1,
+            ref_key: Some("ux_ps".into()),
+            column: "id".into(),
+            ref_column: "id".into(),
+            on_delete: 0,
+            on_update: 0,
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
+        });
+        let p = assemble(&raw);
+        let said = details(&p);
+        let t = &p.schema.tables[&TableName::new("dbo", "t")];
+        assert!(t.unique.is_empty(), "{said}");
+        assert_eq!(
+            t.indexes.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+            ["ix_fg"]
+        );
+        let u = &p.schema.tables[&TableName::new("dbo", "u")];
+        assert_eq!(u.primary_key, None);
+        assert!(u.indexes.is_empty());
+        for what in [
+            "dbo.t: unique constraint `uq_t` is on a partition scheme",
+            "dbo.t: index `ix_ps` is on a partition scheme",
+            "dbo.t: unique index `ux_ps` is on a partition scheme",
+            "dbo.u: primary key `pk_u` is on a partition scheme",
+            "dbo.u: index `ix_ps` is on a partition scheme",
+            "foreign key `fk_child_ux` references unique index `ux_ps` of dbo.t",
+        ] {
+            assert!(said.contains(what), "{what}: {said}");
+        }
+        // Negative: nothing says the tables or the filegroup index went.
+        assert!(!said.contains("ix_fg"), "{said}");
+        assert!(
+            !said.contains("its rows are on a partition scheme"),
+            "{said}"
+        );
+    }
+
+    /// A placement the catalog did not answer for is not a filegroup and not
+    /// a scheme: it is reported as unreadable, for a table's rows and for a
+    /// member alike, and never declared as ordinary (#1227).
+    #[test]
+    fn an_unreadable_placement_is_neither_a_filegroup_nor_a_scheme() {
+        let mut raw = RawCatalog::default();
+        let mut gone = raw_table(1, "dbo", "gone");
+        gone.base = RawBase::unreadable();
+        let kept = raw_table(2, "dbo", "kept");
+        raw.tables.extend([gone, kept]);
+        raw.columns
+            .extend([raw_column(1, "id", "int"), raw_column(2, "id", "int")]);
+        raw.index_columns
+            .push(ix(2, "ix_unseen", false, Placement::Unreadable));
+        let p = assemble(&raw);
+        let said = details(&p);
+        assert!(!p.schema.tables.contains_key(&TableName::new("dbo", "gone")));
+        assert!(
+            said.contains("dbo.gone: where its rows are stored cannot be read"),
+            "{said}"
+        );
+        assert!(
+            p.schema.tables[&TableName::new("dbo", "kept")]
+                .indexes
+                .is_empty()
+        );
+        assert!(
+            said.contains(
+                "dbo.kept: index `ix_unseen` has a storage placement that cannot be read"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("is on a partition scheme"), "{said}");
+        assert!(
+            !said.contains("its rows are on a partition scheme"),
+            "{said}"
+        );
+    }
+
+    /// A system-versioned table whose rows sit on a partition scheme goes
+    /// with its history; a history on one takes its table; an ordinary pair
+    /// is untouched (DEC-1227.1).
+    #[test]
+    fn a_versioned_pair_with_a_partitioned_side_is_left_out_whole() {
+        let ok = assemble(&versioned_pair());
+        assert!(ok.schema.tables.contains_key(&TableName::new("dbo", "t")));
+
+        let mut current_side = versioned_pair();
+        current_side.tables[0].base = base_of(1, Some("pk_t"), true, Placement::PartitionScheme);
+        let p = assemble(&current_side);
+        let said = details(&p);
+        assert!(p.schema.tables.is_empty(), "{said}");
+        assert!(
+            said.contains("dbo.t: its rows are on a partition scheme"),
+            "{said}"
+        );
+        assert!(
+            said.contains("hist.t_history: the history table of dbo.t, which was left out"),
+            "{said}"
+        );
+
+        let mut history_side = versioned_pair();
+        history_side.tables[1].base =
+            base_of(1, Some("ix_t_history"), false, Placement::PartitionScheme);
+        let p = assemble(&history_side);
+        assert!(p.schema.tables.is_empty(), "{:?}", p.schema.tables.keys());
+        assert!(
+            details(&p).contains("history table hist.t_history has rows on a partition scheme"),
+            "{}",
+            details(&p)
+        );
+    }
+
+    /// The three answers a data space type gives (#1227): only `PS` is a
+    /// scheme, no row at all is unreadable, and the in-memory space of a
+    /// memory-optimized table (`FX`, measured with `data_space_id = 0`) is
+    /// neither, so such a table keeps the reading it had.
+    #[test]
+    fn only_a_partition_scheme_or_a_missing_data_space_stops_a_declaration() {
+        for (code, expected) in [
+            (Some("PS"), Placement::PartitionScheme),
+            (Some("FG"), Placement::Filegroup),
+            (Some("FGN"), Placement::OffDefaultFilegroup),
+            (Some("FX"), Placement::Filegroup),
+            (None, Placement::Unreadable),
+        ] {
+            assert_eq!(Placement::from_data_space(code), expected, "{code:?}");
+        }
+        let mut raw = RawCatalog::default();
+        let mut t = raw_table(1, "dbo", "mem");
+        t.base = base_of(0, None, false, Placement::from_data_space(Some("FX")));
+        raw.tables.push(t);
+        raw.columns.push(raw_column(1, "id", "int"));
+        assert!(
+            assemble(&raw)
+                .schema
+                .tables
+                .contains_key(&TableName::new("dbo", "mem"))
+        );
+    }
+
+    /// A table, key or index on a filegroup that is not the database's default
+    /// is declared as it is and named in ONE report-only notice per table; one
+    /// on the default filegroup, or on none the catalog could not read, draws
+    /// none (DEC-1227.1). The notice is no limitation: a managed table must
+    /// stay adoptable.
+    #[test]
+    fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
+        let mut raw = RawCatalog::default();
+        for (id, name, base) in [
+            (
+                1,
+                "heap",
+                base_of(0, None, false, Placement::OffDefaultFilegroup),
+            ),
+            (
+                2,
+                "cpk",
+                base_of(1, Some("pk_cpk"), true, Placement::OffDefaultFilegroup),
+            ),
+            (3, "plain", base_of(0, None, false, Placement::Filegroup)),
+            (4, "members", base_of(0, None, false, Placement::Filegroup)),
+        ] {
+            let mut t = raw_table(id, "dbo", name);
+            t.base = base;
+            raw.tables.push(t);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let mut uq = key(4, "uq_m", false, 2, "id");
+        uq.placement = Placement::OffDefaultFilegroup;
+        // The clustered base is a key of its table too, and is named once.
+        let mut pk = key(2, "pk_cpk", true, 1, "id");
+        pk.placement = Placement::OffDefaultFilegroup;
+        raw.key_columns = vec![uq, pk, key(3, "uq_p", false, 2, "id")];
+        raw.index_columns = vec![
+            ix(4, "ix_a", false, Placement::OffDefaultFilegroup),
+            ix(4, "ix_b", false, Placement::OffDefaultFilegroup),
+            ix(4, "ix_c", false, Placement::Filegroup),
+            ix(3, "ix_p", false, Placement::Filegroup),
+        ];
+        let p = assemble(&raw);
+        for name in ["heap", "cpk", "plain", "members"] {
+            assert!(
+                p.schema.tables.contains_key(&TableName::new("dbo", name)),
+                "{name} is still declared"
+            );
+        }
+        assert!(p.limitations.is_empty(), "{}", details(&p));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.catalog_notices.len(), 3, "{:?}", p.catalog_notices);
+        let all = p.catalog_notices.join("\n");
+        for what in [
+            "dbo.cpk: its base (clustered primary key `pk_cpk`) sits on a filegroup other than the \
+             database's default; the declarations do not hold a filegroup, so a bootstrap \
+             places it on the target's default filegroup",
+            "dbo.heap: its base (a heap) sits",
+            "dbo.members: index `ix_a`, index `ix_b`, unique constraint `uq_m` sit on a \
+             filegroup other than the database's default",
+        ] {
+            assert!(all.contains(what), "{what}: {all}");
+        }
+        // Negative: the default filegroup and an unnoticed index say nothing.
+        assert!(!all.contains("dbo.plain") && !all.contains("ix_c"), "{all}");
+    }
+
+    /// A module bound at creation to a table left out for its partitioning
+    /// is inventoried with it, not declared against a table the declarations
+    /// do not list.
+    #[test]
+    fn a_module_over_a_partitioned_table_is_inventoried_with_it() {
+        let mut raw = RawCatalog::default();
+        let mut t = raw_table(1, "dbo", "t");
+        t.base = base_of(0, None, false, Placement::PartitionScheme);
+        raw.tables.push(t);
+        raw.columns.push(raw_column(1, "id", "int"));
+        raw.modules.push(RawModule {
+            object_id: 100,
+            parent_object_id: None,
+            schema: "dbo".into(),
+            name: "v".into(),
+            kind: ModuleKind::View,
+            definition: Some("CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id FROM dbo.t".into()),
+            parent: None,
+            requires_bound_references: true,
+            schema_bound: true,
+            clr: false,
+            default_set_options: true,
+        });
+        raw.object_dependencies.push(RawObjectDependency {
+            referencing_object_id: 100,
+            referenced_object_id: 1,
+        });
+        let p = assemble(&raw);
+        assert!(p.schema.modules.is_empty());
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert!(
+            p.unmanaged_modules[0].why.contains("partitioned table"),
+            "{:?}",
+            p.unmanaged_modules[0]
+        );
     }
 
     /// Negative: a disabled clustered index leaves the table's rows
@@ -4617,7 +5262,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         });
         let p = assemble(&raw);
         let t = &p.schema.tables[&TableName::new("dbo", "customer")];
@@ -4658,7 +5303,7 @@ mod tests {
             column: "email".into(),
             is_included: false,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         };
         let mut raw = one_table_catalog();
         raw.index_columns.push(column("cci", 5));
@@ -4786,7 +5431,7 @@ mod tests {
                 is_descending: false,
                 is_disabled: false,
                 ignore_dup_key: false,
-                rows_partitioned: false,
+                placement: Placement::Filegroup,
             });
             raw.read_columns.push(RawReadColumn {
                 object_id: 1,
@@ -4868,6 +5513,7 @@ mod module_tests {
                 retention: None,
                 period: None,
                 compression: None,
+                base: RawBase::heap(),
             }],
             columns: vec![RawColumn {
                 object_id: 1,
@@ -5376,7 +6022,7 @@ mod module_tests {
                 && limitation.detail.contains("ck_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal or ledger object or module")
+                    .contains("omitted temporal, ledger or partitioned object or module")
         }));
     }
 
@@ -5427,7 +6073,7 @@ mod module_tests {
                 && limitation.detail.contains("df_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal or ledger object or module")
+                    .contains("omitted temporal, ledger or partitioned object or module")
         }));
     }
 
@@ -5502,7 +6148,7 @@ mod module_tests {
             column: column.into(),
             is_included: included,
             is_descending: false,
-            rows_partitioned: false,
+            placement: Placement::Filegroup,
         }
     }
 
