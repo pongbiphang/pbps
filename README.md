@@ -120,8 +120,8 @@ files rather than overwriting them.
 
 A module is one file, like a table; the leading key is both the kind and the
 name. Modules carry no data, so they carry no identity: they never appear in
-`schema.ids.json`, and a rename is a lossless drop plus add whose audit trail is
-the commit that did it.
+the identity files under `.pbps/ids`, and a rename is a lossless drop plus add
+whose audit trail is the commit that did it.
 
 ```yaml
 # schema/dbo.active_customer.view.yml
@@ -167,11 +167,13 @@ failed-attempt auditing cannot change what an existing deployment hook receives.
 
 ### Merging parallel schema branches
 
-Merge the YAML and `schema.ids.json`, resolve conflicts, then commit the result.
-One connected plan compares all merged declarations against the target. Git
-conflicts on different edits to the same UID's line; `validate` rejects two UIDs
-naming one object. When coalescing identical additions, retain the identity
-already deployed. When Git provenance is available, the
+Merge the YAML and the identity files under `.pbps/ids`, resolve conflicts, then
+commit the result. If git leaves identity files unmerged, resolve the YAML
+first and run `pbps ids resolve`, which merges them by UID and never picks a
+side. One connected plan compares all merged declarations against the target.
+Git conflicts on different edits to the same UID's record; `validate` rejects
+two UIDs naming one object. When coalescing identical additions, retain the
+identity already deployed. When Git provenance is available, the
 [deployed-commit ancestry guard](docs/decisions/plan.md#dec-2397-1) requires HEAD
 to contain the target's deployed commit before management removals. A statement
 failure in transactional apply rolls back the whole plan.
@@ -226,8 +228,11 @@ Late-bound references in PL/pgSQL bodies can still pass rehearsal, apply and
 `verify`, then fail on the first call. Exercise application entry points in your
 own tests, including SQL Server's [procedure references deferred until execution](docs/RESOLVER-MSSQL.md#1-what-binds-at-creation-and-where-it-is-recorded).
 
-UID-aware Git merging for `schema.ids.json` is tracked in
-[#2600](https://github.com/pongbiphang/pbps/issues/2600).
+Each declaration has an identity file of its own, so a merge conflicts in the
+identity files only where it conflicts in the YAML. There is no merge driver.
+[SPEC 5.5](docs/SPEC.md#55-identity-files-and-merging) says what was measured
+and what was not. A project that still keeps one `schema.ids.json` moves to
+the identity files with `pbps ids migrate`.
 
 ## What pbps deliberately does not do
 

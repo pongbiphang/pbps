@@ -2672,3 +2672,58 @@ every statement that cites the name before it against the old object.
 the statements that cite the name, not after the statements that retire the
 old object. The restores come after the swap; the drops of what blocks it come
 before the retypes.
+
+## A small file that is renamed and edited in one commit is a delete and an add
+
+Git pairs a renamed or moved file with its old self only while the two are at
+least half alike. A merge relies on the pairing: with it, one branch's rename
+and the other's edit of the same file combine; without it, the old path looks
+deleted by one branch and edited by the other, and the merge stops with a
+conflict. An identity file is small, and one commit that renames the table,
+moves its YAML file, drops a column, adds one and renames another can change
+more than half of a file for a table with a few columns. Measured with
+`git merge-tree` on generated projects, without any padding that mix put the
+identity file below the threshold, and conflicted while the YAML merged cleanly,
+in 35–60% of pairs for tables of up to eight columns (#2600).
+
+A constant header line fixes it by making every file larger than the edits. A
+header of 120 bytes held, with four points of margin in the worst case. The
+`_generated` line is 400 bytes, which kept the smallest similarity measured at
+70% across the table sizes tried.
+
+**The shape:** a property of a file's size, not of its content, decides whether
+a merge treats an edit as an edit or as a delete and an add, and the edits that
+travel with a move are fixed by what users do, not by the file.
+
+**The rule.** The `_generated` line is padding on purpose, and a wire constant:
+shortening it, "tidying" its wording, or making it vary per file all move every
+identity file's similarity. The test
+`generated_line_is_exactly_400_bytes_without_characters_json_would_escape`
+pins the length. A new file kind that small files can have, and that moves with
+a YAML file, carries the same line. A larger single commit on a three-column
+table can still fall below the threshold; SPEC 5.5 says so.
+
+## One shared record file puts back the conflicts the YAML does not have
+
+The first layout kept roles, types and extensions together in one global file
+beside the table files. Each of them is a YAML file of its own, so two branches
+that add different roles never touch the same YAML line, but in a shared file two
+additions that land in the same gap between records conflict. Measured with
+records sorted by uid (declaration order does not exist across separate YAML
+files), two branches each adding one role conflicted in 38%, 25%, 6% and 1.8% of
+pairs when the file held 3, 10, 30 and 100 roles, and an add beside another
+branch's rename or drop conflicted in up to 25%. The blank lines and
+the `_end` entry cannot help: neither side has a declaration position to anchor
+to. Two renames or two drops of different roles did not conflict.
+
+**The shape:** a file that holds records of declarations the YAML keeps in
+separate files reintroduces, for those records, the conflicts that splitting the
+YAML removed.
+
+**The rule.** An identity record lives in the file of the declaration it
+identifies, and a new kind of identity gets a file that mirrors its
+declaration, never a shared list. The exceptions are those the YAML makes itself:
+a partition's record is in its parent's file because the YAML declares the
+partition there (SPEC 5.1). Roles, types and extensions are one file each for
+this reason. Before adding any record that spans declarations, measure two
+branches that each add one.

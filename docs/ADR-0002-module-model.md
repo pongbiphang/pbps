@@ -32,7 +32,7 @@ measure, but as a principled line:
 | Data-bearing (tables, columns) | Identity tracking: uids, tombstones, human intent | Explicit intent, recorded in the ids file | Tombstone with a reason |
 | Definition-is-the-object — "modules" (views, procs, functions, triggers) | The declared definition is the desired state | Drop + add (lossless, documented) | Git history |
 
-Modules never appear in `schema.ids.json`.
+Modules never appear in the identity files.
 
 ([ADR-0005](ADR-0005-roles-and-grants.md) later sharpened this criterion to
 "does drop + add destroy state that lives only in the environment?" — the
