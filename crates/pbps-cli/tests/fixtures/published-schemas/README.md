@@ -87,3 +87,4 @@ DECISIONS 465).
 - `102/` words the `opclass:` of an index key and the `operator:` of an exclusion key for the class and operator of a managed package, qualified by the package's schema (#2447 PR G2). It also holds #2728's text search file kinds (`100/`).
 - `104/` adds a partition entry's own `description:`, its comment (#2729 PR A).
 - `105/` renames `doctor`'s `identity_file` to `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a, DEC-2600.9).
+- `106/` adds the `sequence:` declaration file: a standalone sequence's type, start, increment and options (#2721 PR A).
