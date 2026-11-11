@@ -71,7 +71,7 @@ pub fn offline(pg: bool) {
     assert!(!applied.exists() && !attempt.exists());
 
     // An invalid identity file still refuses before overwriting the script.
-    std::fs::write(d.dir.join("schema.ids.json"), "{").unwrap();
+    crate::idtree::write_raw(&d.dir, "bad.json", "{");
     let before = std::fs::read(&path).unwrap();
     let refused = run(&d, &["bootstrap", "--sql", path.to_str().unwrap()]);
     assert_eq!(
@@ -83,7 +83,7 @@ pub fn offline(pg: bool) {
     );
     assert_eq!(stdout(&refused), "");
     assert!(
-        stderr(&refused).contains("schema.ids.json"),
+        stderr(&refused).contains(".pbps/ids"),
         "{}",
         stderr(&refused)
     );
@@ -150,7 +150,7 @@ pub fn connected(server: &str, pg: bool) {
         .split("`: ")
         .next()
         .unwrap();
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     let refused = run(&d, &["bootstrap", "--db", connection]);
     assert_eq!(
         code(&refused),
@@ -165,7 +165,7 @@ pub fn connected(server: &str, pg: bool) {
         stderr(&refused)
     );
     assert!(!applied.exists() && !attempt.exists());
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
 
     d.table(&declaration(pg, "  label: {type: varchar(20)}\n"));
     ok(run(&d, &["plan", "--no-dev"]));

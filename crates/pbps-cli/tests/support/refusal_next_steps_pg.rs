@@ -20,8 +20,8 @@ fn partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_c
     assert!(!stdout(&clean).contains("#2296"));
     assert!(!stderr(&clean).contains("#2296"));
 
-    let ids_path = d.dir.join("schema.ids.json");
-    let ids = std::fs::read(&ids_path).unwrap();
+    let ids_path = d.dir.clone();
+    let ids = crate::idtree::snapshot(&ids_path);
     d.table(
         &base
             .replace("  bucket:", "  extra: {type: integer}\n  bucket:")
@@ -48,7 +48,7 @@ fn partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_c
     assert!(stderr(&transition).contains("issue #2296"));
     assert!(!stderr(&transition).contains("issue #2298"));
 
-    std::fs::write(&ids_path, ids).unwrap();
+    crate::idtree::restore(&ids_path, &ids);
 
     // A changed partition bound is still refused, but key-rebuild support
     // does not track that shape and must not be advertised for it.

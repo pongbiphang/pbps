@@ -86,3 +86,4 @@ DECISIONS 465).
 - `100/` adds the `text_search_config:` and `text_search_dictionary:` declaration files: a text search configuration (parser and per-token mappings) and a dictionary (template and options) (#2728 PR A).
 - `102/` words the `opclass:` of an index key and the `operator:` of an exclusion key for the class and operator of a managed package, qualified by the package's schema (#2447 PR G2). It also holds #2728's text search file kinds (`100/`).
 - `104/` adds a partition entry's own `description:`, its comment (#2729 PR A).
+- `105/` renames `doctor`'s `identity_file` to `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a, DEC-2600.9).

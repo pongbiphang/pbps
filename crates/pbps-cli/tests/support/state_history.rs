@@ -316,7 +316,7 @@ pub fn recovery(server: &str, pg: bool) {
             .len(),
         0
     );
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     let exported = json(ok(d.run(&[
         "state", "export", &id2, "--db", connection, "--force", "--format", "json",
     ])));
@@ -363,7 +363,7 @@ pub fn recovery(server: &str, pg: bool) {
         default_row.get("label").is_none(),
         "recorded omitted cells stay omitted"
     );
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     d.commit();
     assert!(plan(&d, connection, "roundtrip.json").changes.is_empty());
 
@@ -374,8 +374,8 @@ pub fn recovery(server: &str, pg: bool) {
     if pg {
         assert!(stdout(&human).contains("Snapshots do not record historical public_execute"));
     }
-    assert!(stdout(&human).contains("schema.ids.json is unchanged"));
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert!(stdout(&human).contains("the identity files are unchanged"));
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     ok(d.run(&["fmt", "--check"]));
     d.commit();
     let backward = plan(&d, connection, "backward.json");
@@ -577,7 +577,7 @@ pub fn refusals(server: &str, pg: bool) {
     // Force removes stale declarations, but never neighboring project files.
     assert!(!d.dir.join("schema/product.yml").exists());
     assert!(d.dir.join("pbps.yml").is_file());
-    assert!(d.dir.join("schema.ids.json").is_file());
+    assert!(crate::idtree::exists(&d.dir));
 }
 
 struct Login {
@@ -757,7 +757,7 @@ pub fn hostile_names(server: &str, pg: bool) {
             .values()
             .any(|t| t["columns"].as_object().unwrap().contains_key(hostile))
     );
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     ok(d.run(&["state", "export", &id, "--db", connection, "--force"]));
     let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
     assert!(
@@ -767,7 +767,7 @@ pub fn hostile_names(server: &str, pg: bool) {
             .values()
             .any(|t| t.columns.contains_key(hostile))
     );
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     ok(d.run(&["fmt", "--check"]));
     d.git(&["add", "-A"]);
     d.git(&["commit", "--allow-empty", "-qm", "review exported state"]);
@@ -808,9 +808,9 @@ pub fn identities(server: &str, pg: bool) {
             .iter()
             .any(|p| matches!(p.change, pbps_model::Change::RenameColumn { .. }))
     );
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     ok(d.run(&["state", "export", &first, "--db", connection, "--force"]));
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     let refused = d.run(&["plan", "--db", connection, "--no-input", "--format", "json"]);
     assert_eq!(
         code(&refused),
@@ -914,7 +914,7 @@ pub fn retained_column_ids(server: &str, pg: bool) {
                 .is_empty()
         );
         assert_eq!(project_bytes(&d.dir), before);
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         ok(d.run(&["state", "export", &id, "--db", connection, "--force"]));
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
         assert!(
@@ -922,7 +922,7 @@ pub fn retained_column_ids(server: &str, pg: bool) {
                 .columns
                 .contains_key("recorded")
         );
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     }
 }
 
@@ -1100,8 +1100,8 @@ pub fn non_utf8_paths(server: &str, pg: bool) {
     let root = d.dir.join(std::ffi::OsStr::from_bytes(b"project-\xff"));
     std::fs::create_dir_all(root.join("schema")).unwrap();
     std::fs::copy(d.dir.join("pbps.yml"), root.join("pbps.yml")).unwrap();
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
-    std::fs::write(root.join("schema.ids.json"), &ids).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
+    crate::idtree::restore(&root, &ids);
     let stale = root
         .join("schema")
         .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
@@ -1130,7 +1130,7 @@ pub fn non_utf8_paths(server: &str, pg: bool) {
     );
     assert!(!stale.exists());
     pbps_load::load_schema_dir(&root.join("schema")).unwrap();
-    assert_eq!(std::fs::read(root.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&root), ids);
     assert_eq!(records(connection, pg), entries);
 }
 

@@ -381,6 +381,17 @@ fn keyed<V>(
         .collect()
 }
 
+/// What an entry of the identity tree must be, said the same way by every reader
+/// (the working tree, a revision, git's index): a regular file named `*.json`.
+/// `parse` does not look at names, so each reader asks this first, and a
+/// refusal is never a skip.
+pub const IDENTITY_FILE_RULE: &str = "a regular .json file";
+
+/// Whether the tree path `path` names an identity file.
+pub fn is_identity_file(path: &str) -> bool {
+    path.ends_with(".json")
+}
+
 /// Reads one file strictly. Spacing is not checked: blank lines carry no
 /// meaning, and a merge may leave one more or fewer.
 pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {

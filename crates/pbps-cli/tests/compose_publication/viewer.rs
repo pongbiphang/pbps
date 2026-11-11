@@ -696,9 +696,10 @@ fn another_projects_receipt_never_blocks_a_preview_from_the_same_base() {
     // so both projects share one base.
     let other = f.repo.root.join("other");
     fs::create_dir_all(other.join("schema")).unwrap();
-    for name in ["pbps.yml", "schema.ids.json", "schema/t.yml"] {
+    for name in ["pbps.yml", "schema/t.yml"] {
         fs::copy(f.repo.project.join(name), other.join(name)).unwrap();
     }
+    crate::idtree::restore(&other, &crate::idtree::snapshot(&f.repo.project));
     git(&f.repo.root, &["add", "other"]);
     git(&f.repo.root, &["commit", "-qm", "second project"]);
     git(&f.repo.root, &["push", "-q", "origin", "master"]);

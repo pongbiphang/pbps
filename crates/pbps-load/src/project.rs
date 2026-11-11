@@ -275,11 +275,17 @@ pub fn read_ids_tree(dir: &Path) -> Result<BTreeMap<String, String>, ProjectLoad
             let kind = entry.file_type().map_err(|e| io(&path, e))?;
             if kind.is_dir() {
                 pending.push((path, format!("{rel}/")));
-            } else if kind.is_file() && name.ends_with(".json") {
+            } else if kind.is_file() && pbps_model::ids_tree::is_identity_file(&name) {
                 let text = std::fs::read_to_string(&path).map_err(|e| io(&path, e))?;
                 files.insert(rel, text);
             } else {
-                return Err(refuse(&path, "is not a directory or a regular .json file"));
+                return Err(refuse(
+                    &path,
+                    &format!(
+                        "is not a directory or {}",
+                        pbps_model::ids_tree::IDENTITY_FILE_RULE
+                    ),
+                ));
             }
         }
     }

@@ -29,11 +29,7 @@ impl Fixture {
             },
         )
         .unwrap();
-        std::fs::write(
-            project.ids_file(),
-            serde_json::to_vec(&resolved.ids).unwrap(),
-        )
-        .unwrap();
+        crate::ids_store::write(&project, &resolved.ids).unwrap();
         Self(project)
     }
     fn declarations(&self) -> Declarations {
@@ -62,7 +58,7 @@ fn bootstrap_consumes_the_loaded_declarations_and_ids_without_rereading_them() {
         );
         let declarations = fixture.declarations();
         std::fs::write(fixture.path("schema/t.yml"), "not a declaration").unwrap();
-        std::fs::write(fixture.0.ids_file(), "not an identity file").unwrap();
+        std::fs::write(fixture.0.ids_dir().join("t.json"), "not an identity file").unwrap();
         let path = fixture.path("bootstrap.sql");
         let built = crate::deploy::bootstrap(
             &fixture.0,
@@ -219,14 +215,10 @@ fn connected_planning_and_apply_use_in_memory_inputs_without_a_plan_file() {
                 },
             )
             .unwrap();
-            std::fs::write(
-                fixture.0.ids_file(),
-                serde_json::to_vec(&resolved.ids).unwrap(),
-            )
-            .unwrap();
+            crate::ids_store::write(&fixture.0, &resolved.ids).unwrap();
             let declarations = fixture.declarations();
             std::fs::write(path, "not a declaration").unwrap();
-            std::fs::write(fixture.0.ids_file(), "not an identity file").unwrap();
+            std::fs::write(fixture.0.ids_dir().join("t.json"), "not an identity file").unwrap();
             let result = crate::deploy::plan_db(
                 &fixture.0,
                 &target,

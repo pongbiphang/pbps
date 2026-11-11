@@ -83,14 +83,9 @@ fn declarations_stay_outside_ids_and_invalid_dialects_and_types_are_named() {
         &declaration("otherdb", "customers", "table", COLUMNS),
     );
     success(demo.run(&["plan", "--no-dev"]));
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(demo.ids_path()).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&demo.dir);
     assert_eq!(ids.tables.len(), 1);
-    assert!(
-        !std::fs::read_to_string(demo.ids_path())
-            .unwrap()
-            .contains("otherdb")
-    );
+    assert!(!crate::idtree::text(&demo.dir).contains("otherdb"));
     success(demo.run(&["fmt"]));
     success(demo.run(&["fmt", "--check"]));
     for (dialect, columns, expected) in [
@@ -119,7 +114,7 @@ fn assert_offline_dependency_refusal(slug: &str, dialect: &str, columns: &str) {
         if current_ids {
             success(demo.run(&["plan", "--no-dev"]));
         }
-        let before = current_ids.then(|| std::fs::read(demo.ids_path()).unwrap());
+        let before = current_ids.then(|| crate::idtree::snapshot(&demo.dir));
         std::fs::write(demo.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
         write(
             &demo,
@@ -183,8 +178,8 @@ fn assert_offline_dependency_refusal(slug: &str, dialect: &str, columns: &str) {
                 assert!(!plan_path.exists());
                 assert!(!sql_path.exists());
                 match &before {
-                    Some(bytes) => assert_eq!(std::fs::read(demo.ids_path()).unwrap(), *bytes),
-                    None => assert!(!demo.ids_path().exists()),
+                    Some(bytes) => assert_eq!(crate::idtree::snapshot(&demo.dir), *bytes),
+                    None => assert!(!crate::idtree::dir(&demo.dir).exists()),
                 }
             }
         }
@@ -240,13 +235,13 @@ fn offline_plans_keep_valid_dependencies_as_uncompared_previews() {
             .unwrap()
             .contains("CREATE TABLE [dbo].[t]")
     );
-    let before = std::fs::read(demo.ids_path()).unwrap();
+    let before = crate::idtree::snapshot(&demo.dir);
     for args in [
         vec!["plan", "--check"],
         vec!["plan", "--check", "--format", "json"],
     ] {
         success(demo.run(&args));
-        assert_eq!(std::fs::read(demo.ids_path()).unwrap(), before);
+        assert_eq!(crate::idtree::snapshot(&demo.dir), before);
     }
 }
 

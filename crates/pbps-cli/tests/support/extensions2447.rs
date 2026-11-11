@@ -106,8 +106,7 @@ fn exact_installed_packages_round_trip_and_native_changes_are_named_drift() {
         assert_eq!(loaded.schema.tables.len(), 1);
         assert!(loaded.schema.modules.is_empty());
         assert!(loaded.schema.types.is_empty());
-        let ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
         assert_eq!(ids.extensions.len(), 3);
         assert!(
             ids.extensions
@@ -142,14 +141,13 @@ fn exact_installed_packages_round_trip_and_native_changes_are_named_drift() {
         assert!(plan.changes.is_empty());
         succeeds(approved_apply(&d, connection, &saved, &[]));
         succeeds(d.run(&["verify", "--db", connection]));
-        let first = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let first = crate::idtree::snapshot(&d.dir);
         succeeds(d.run(&["pull", "--force", "--db", connection]));
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), first);
+        assert_eq!(crate::idtree::snapshot(&d.dir), first);
         // The two pulls below mint identities for the tables they read and remove
         // them again; the files go back as they were, so that the checks after
         // them compare what they always compared.
-        let ids_file = d.dir.join("schema.ids.json");
-        let ids_before = std::fs::read(&ids_file).unwrap();
+        let ids_before = crate::idtree::snapshot(&d.dir);
         // A table of a type a managed package provides is read as a reference to
         // it (DEC-2447.12); a base type no package owns still is not.
         on_server(connection, "CREATE TABLE ext.user_provider(c ext.citext)");
@@ -181,7 +179,7 @@ fn exact_installed_packages_round_trip_and_native_changes_are_named_drift() {
         );
         on_server(connection, "DROP TABLE ext.user_base");
         on_server(connection, "DROP TYPE public.mytxt CASCADE");
-        std::fs::write(&ids_file, ids_before).unwrap();
+        crate::idtree::restore(&d.dir, &ids_before);
         for name in ["ext.user_provider.yml", "ext.user_base.yml"] {
             let _ = std::fs::remove_file(d.dir.join("schema").join(name));
         }
@@ -205,7 +203,7 @@ fn exact_installed_packages_round_trip_and_native_changes_are_named_drift() {
             "{message}"
         );
         assert_ne!(code(&d.run(&["pull", "--force", "--db", connection])), 0);
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), first);
+        assert_eq!(crate::idtree::snapshot(&d.dir), first);
     });
 }
 
@@ -889,11 +887,9 @@ fn bootstrap_sql_checks_exact_packages_on_the_replay_target_before_ddl() {
 fn extension_ids(
     d: &Demo,
 ) -> std::collections::BTreeMap<pbps_model::Uid, pbps_model::ObjectLocalName> {
-    serde_json::from_slice::<pbps_model::IdsFile>(
-        &std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
-    )
-    .unwrap()
-    .extensions
+    serde_json::from_slice::<pbps_model::IdsFile>(&crate::idtree::snapshot(&d.dir))
+        .unwrap()
+        .extensions
 }
 
 #[test]
@@ -1017,7 +1013,7 @@ fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
         succeeds(d.run(&["pull", "--db", connection, "--force"]));
         assert_eq!(extension_ids(&d), selected);
         assert!(extension_file(&d, "citext").exists());
-        let before_ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let before_ids = crate::idtree::snapshot(&d.dir);
         let before = pbps_load::load_schema_dir(&d.dir.join("schema"))
             .unwrap()
             .schema;
@@ -1026,10 +1022,7 @@ fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
             assert_ne!(code(&out), 0);
             assert!(stderr(&out).contains("not installed"), "{}", stderr(&out));
             assert!(stderr(&out).contains(name), "{}", stderr(&out));
-            assert_eq!(
-                std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
-                before_ids
-            );
+            assert_eq!(crate::idtree::snapshot(&d.dir), before_ids);
             assert_eq!(
                 pbps_load::load_schema_dir(&d.dir.join("schema"))
                     .unwrap()
@@ -1053,7 +1046,7 @@ fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
         // Bad declaration history cannot become an empty selection under force.
         let path = extension_file(&authored, "hstore");
         std::fs::write(&path, "extension: hstore\nversion: [broken\n").unwrap();
-        let ids = std::fs::read(authored.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&authored.dir);
         let out = authored.run(&["pull", "--db", connection, "--force"]);
         assert_ne!(code(&out), 0);
         assert!(
@@ -1061,10 +1054,7 @@ fn pull_selects_only_requested_extensions_and_preserves_their_identities() {
             "{}",
             stderr(&out)
         );
-        assert_eq!(
-            std::fs::read(authored.dir.join("schema.ids.json")).unwrap(),
-            ids
-        );
+        assert_eq!(crate::idtree::snapshot(&authored.dir), ids);
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "extension: hstore\nversion: [broken\n"
@@ -1286,8 +1276,7 @@ fn unmanaged_extension_movement_does_not_refuse_an_ordinary_apply() {
         let own = OwnDatabase::new(admin, &slug);
         let connection = own.connection();
         let d = read_back_fixture(connection, &slug, false);
-        let ids: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
         assert!(ids.extensions.is_empty());
         succeeds(extension_during_apply(
             connection,

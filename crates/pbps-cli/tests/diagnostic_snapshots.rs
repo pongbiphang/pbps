@@ -1,6 +1,9 @@
 //! Complete output from the shipped CLI, with semantic assertions beside the goldens.
 //! Update with INSTA_UPDATE=new, then review each .snap.new individually.
 
+#[path = "support/idtree.rs"]
+mod idtree;
+
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -208,7 +211,6 @@ impl Capture {
 fn normalize(text: &str) -> String {
     let mut text = text.replace("\r\n", "\n");
     for path in [
-        "schema.ids.json",
         "schema/dbo.t.yml",
         "schema/dbo.café.yml",
         "schema/a.yml",
@@ -219,7 +221,12 @@ fn normalize(text: &str) -> String {
             &format!("./{path}"),
         );
     }
-    text
+    // `ids_dir` is spelled with `/` in the configuration and `join` does not
+    // rewrite it, so on Windows the project root and the directory meet as
+    // `.\.pbps/ids`: the one path here that is not all backslashes. The
+    // all-backslash spelling is accepted too, for a root given as a native path.
+    text.replace(".\\.pbps/ids", "./.pbps/ids")
+        .replace(".\\.pbps\\ids", "./.pbps/ids")
 }
 
 #[test]
@@ -237,6 +244,13 @@ fn normalization_preserves_diagnostic_content() {
         assert_ne!(normalize(&changed), normalize(text));
     }
     assert_eq!(normalize("unrelated\\path"), "unrelated\\path");
+    assert_eq!(
+        normalize("at `.\\.pbps/ids`;\r\n"),
+        "at `./.pbps/ids`;\n",
+        "the identity directory keeps its configured `/`"
+    );
+    // Negative: a path that merely contains the directory's name is left alone.
+    assert_eq!(normalize("x\\.pbps/ids"), "x\\.pbps/ids");
 }
 
 #[test]
@@ -398,7 +412,7 @@ fn fmt_remedy_is_copyable_and_repairs_the_fixture() {
         std::fs::read_to_string(project.0.join("pbps.yml")).unwrap(),
         "dialect: mssql\n"
     );
-    assert!(!project.0.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&project.0));
 }
 
 #[test]
@@ -438,7 +452,7 @@ fn human_json_routes_keep_command_outcomes() {
                 std::fs::read_to_string(project.0.join("plan.json")).unwrap(),
                 "existing plan\n"
             );
-            assert!(!project.0.join("schema.ids.json").exists());
+            assert!(!crate::idtree::exists(&project.0));
             assert_eq!(
                 std::fs::read(project.0.join("schema/dbo.t.yml")).unwrap(),
                 bytes

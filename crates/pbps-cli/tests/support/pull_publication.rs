@@ -71,8 +71,8 @@ pub fn aliases(server: &str, pg: bool, cased: bool) {
         });
         let expected = pbps_load::load_schema_dir(&dir).unwrap().schema;
         let config = std::fs::read(d.dir.join("pbps.yml")).unwrap();
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
-        std::fs::rename(&output, &old).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
+        crate::idtree::move_declaration(&d.dir, &output, &old);
         // A real case-insensitive filesystem already resolves the generated name
         // to the old entry. On Unix case-sensitive filesystems a symlink exercises
         // the same write-through-then-delete failure, as #2310's export test does.
@@ -109,7 +109,7 @@ pub fn aliases(server: &str, pg: bool, cased: bool) {
         assert!(!std::fs::symlink_metadata(&output).unwrap().is_symlink());
         ok(d.run(&["validate"]));
         assert_eq!(std::fs::read(d.dir.join("pbps.yml")).unwrap(), config);
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         assert_eq!(
             std::fs::read(dir.join("notes.txt")).unwrap(),
             b"keep non-declarations\n"
@@ -139,7 +139,7 @@ pub fn invalid_staging(server: &str, pg: bool) {
     let dir = d.dir.join("schema");
     let output = dir.join(format!("{}.country.yml", schema(pg)));
     let old = dir.join("custom.yml");
-    std::fs::rename(&output, &old).unwrap();
+    crate::idtree::move_declaration(&d.dir, &output, &old);
     #[cfg(unix)]
     std::os::unix::fs::symlink("custom.yml", &output).unwrap();
     std::fs::create_dir(dir.join("empty")).unwrap();
@@ -168,9 +168,10 @@ pub fn invalid_staging(server: &str, pg: bool) {
 
 #[cfg(unix)]
 pub fn protected_aliases(server: &str, pg: bool) {
-    for protected in ["pbps.yml", "schema.ids.json"] {
+    let ids = format!(".pbps/ids/{}.country.json", schema(pg));
+    for (which, protected) in ["pbps.yml", ids.as_str()].into_iter().enumerate() {
         for stale in [false, true] {
-            let name = format!("pull2311_protected_{protected}_{stale}");
+            let name = format!("pull2311_protected_{which}_{stale}");
             let (own, d) = prepared(server, pg, &name);
             let dir = d.dir.join("schema");
             let path = dir.join(if stale {
@@ -201,28 +202,6 @@ pub fn protected_aliases(server: &str, pg: bool) {
             );
         }
     }
-    let (own, d) = prepared(server, pg, "pull2311_ids_filename");
-    let output = format!("schema/{}.country.yml", schema(pg));
-    std::fs::write(
-        d.dir.join("pbps.yml"),
-        format!(
-            "dialect: {}\nids_file: {output}\n",
-            if pg { "postgres" } else { "mssql" }
-        ),
-    )
-    .unwrap();
-    std::fs::rename(d.dir.join("schema.ids.json"), d.dir.join(&output)).unwrap();
-    let before = project_bytes(&d.dir);
-    let refused = d.run(&["pull", "--force", "--db", own.connection()]);
-    assert_eq!(
-        code(&refused),
-        1,
-        "{}{}",
-        stdout(&refused),
-        stderr(&refused)
-    );
-    assert!(stderr(&refused).contains("aliases protected project input"));
-    assert_eq!(project_bytes(&d.dir), before);
 }
 
 pub fn output_directories(server: &str, pg: bool) {
@@ -231,7 +210,7 @@ pub fn output_directories(server: &str, pg: bool) {
         let (own, d) = prepared(server, pg, &format!("pull2311_directory_{linked}"));
         let dir = d.dir.join("schema");
         let output = dir.join(format!("{}.country.yml", schema(pg)));
-        std::fs::rename(&output, dir.join("custom.yml")).unwrap();
+        crate::idtree::move_declaration(&d.dir, &output, &dir.join("custom.yml"));
         let directory = if linked {
             dir.join("directory")
         } else {
@@ -292,14 +271,14 @@ pub fn restrictive_permissions(server: &str, pg: bool) {
         let output = dir.join(format!("{table}.yml"));
         std::fs::set_permissions(&output, std::fs::Permissions::from_mode(mode)).unwrap();
         if linked {
-            std::fs::rename(&output, dir.join("legacy.yml")).unwrap();
+            crate::idtree::move_declaration(&d.dir, &output, &dir.join("legacy.yml"));
             std::os::unix::fs::symlink("legacy.yml", &output).unwrap();
         }
         on_server(
             own.connection(),
             &format!("UPDATE {table} SET label = 'secret-after' WHERE code = 'private'"),
         );
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         ok(d.run(&[
             "pull",
             "--force",
@@ -314,7 +293,7 @@ pub fn restrictive_permissions(server: &str, pg: bool) {
         let text = std::fs::read_to_string(&output).unwrap();
         assert!(text.contains("secret-after"), "{text}");
         assert!(!text.contains("secret-before"), "{text}");
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
         ok(d.run(&["validate"]));
     }
 }
@@ -423,7 +402,7 @@ pub fn restorable_commands(server: &str, pg: bool) {
         .as_i64()
         .unwrap()
         .to_string();
-    std::fs::rename(&output, dir.join("custom.yml")).unwrap();
+    crate::idtree::move_declaration(&d.dir, &output, &dir.join("custom.yml"));
     std::fs::create_dir(&output).unwrap();
     std::fs::write(output.join("notes.txt"), "keep the directory too").unwrap();
     let before = project_bytes(&d.dir);
@@ -457,11 +436,27 @@ pub fn restorable_commands(server: &str, pg: bool) {
         );
     }
     std::fs::remove_dir_all(&output).unwrap();
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
+    let expected_ids = crate::idtree::model(&d.dir);
     ok(d.run(&["state", "export", &id, "--force", "--db", own.connection()]));
     assert_eq!(pbps_load::load_schema_dir(&dir).unwrap().schema, expected);
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
+    // An export writes declarations and never identities, so the file the
+    // custom name had is where it was. The declaration is back at its generated
+    // path, which is a move the project has to be told about: `validate` names
+    // it, and `plan` is the remedy it names.
+    let refused = d.run(&["validate"]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stdout(&refused).contains("no declaration is at its mirrored path")
+            || stderr(&refused).contains("no declaration is at its mirrored path"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    ok(d.run(&["plan"]));
     ok(d.run(&["validate"]));
+    assert_eq!(crate::idtree::model(&d.dir), expected_ids);
 
     // IDs are written after declaration publication. Preparing their parent
     // must not leave a new schema subdirectory behind when publication fails.

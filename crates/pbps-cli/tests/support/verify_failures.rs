@@ -40,9 +40,9 @@ fn verify(d: &Demo, connection: &str, json: bool) -> Output {
     if json {
         cmd.args(["--format", "json"]);
     }
-    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     let out = cmd.output().unwrap();
-    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     out
 }
 

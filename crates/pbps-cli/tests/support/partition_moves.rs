@@ -355,9 +355,8 @@ fn run_profile(
         // Resolve declaration identities using the same public identity entry
         // as the CLI. This creates no execution/order certificate.
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
-        let path = d.dir.join("schema.ids.json");
-        let old: pbps_model::IdsFile =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let path = d.dir.clone();
+        let old: pbps_model::IdsFile = crate::idtree::model(&path);
         let intents: Vec<_> = old
             .tables
             .iter()
@@ -377,7 +376,7 @@ fn run_profile(
             },
         )
         .unwrap();
-        std::fs::write(path, serde_json::to_vec_pretty(&resolved.ids).unwrap()).unwrap();
+        crate::idtree::write(&path, &resolved.ids);
     }
     for command in &p.intents {
         succeeds(d.run(&command.iter().map(String::as_str).collect::<Vec<_>>()));

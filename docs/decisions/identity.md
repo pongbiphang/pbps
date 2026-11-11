@@ -1460,17 +1460,11 @@ read back; a spelling the edit does not understand is refused, not half applied.
 `fmt` rewrites parseable files to canonical bytes and rewrites none when any
 file cannot be read.
 
-Until the switch, a migrated project fails closed. `migrate` deletes
-`schema.ids.json` and only the `ids` commands read the tree, so a reader that
-took "no legacy file" for "no identities" would mint fresh uids for every
-object. Wherever the legacy file is read and found absent, an identity tree in
-the project's `ids_dir` is a refusal naming the directory and #2600 PR 5: the
-working-tree reader, `--since` and the other history readers (a revision with
-the tree and no legacy blob), the `pbps test` revision reader, and `doctor`,
-which no longer calls such a project fresh. A directory with entries, or a path
-that is not a directory, is a tree; only an absent or empty directory is not.
-`migrate` itself reads the legacy file directly, so it can still finish an
-interrupted run. The guard goes away with the legacy reader in the switch.
+Until the switch, a migrated project failed closed: `migrate` deletes
+`schema.ids.json`, and a reader that took "no legacy file" for "no identities"
+would have minted fresh uids for every object, so wherever the legacy file was
+found absent a tree beside it was a refusal. DEC-2600.9 retires that guard
+where the tree is now read.
 
 `resolve` reads the index with `./`-relative paths and `ls-tree` with
 `--full-tree`: git runs in the project directory, and a bare path in a
@@ -1478,3 +1472,110 @@ interrupted run. The guard goes away with the legacy reader in the switch.
 below the root it reads another project's file or none. (A leftover `.tmp` file
 from a write cut off inside the rename is refused by name, like any entry that
 is not an identity file; delete it and run migrate again.)
+
+<a id="dec-2600-9"></a>
+
+**DEC-2600.9. The tree is read everywhere; the write side is the sync of §3.4, which decides every file it writes, moves, sends aside or removes before it writes any.**
+Every reader of identities goes through `ids_store::read_opt`. A project with
+neither a tree nor `schema.ids.json` is fresh (`None`); one with only the legacy
+file is refused with "run `pbps ids migrate`", never read silently; one with
+both is an unfinished migration and refused. The legacy file is read in exactly
+one place: history (`baseline::ids_from` and the `pbps test` revision reader),
+which takes a revision's tree if it has one and its legacy blob otherwise, and
+refuses a revision with both. It stays until 1.0 (design §12 question 3). A
+listing or read that fails is an error, not "no identities". `validate` runs
+the validator over the tree and the declarations and reports its findings,
+including `ids.orphan`; a declaration that has no file yet (`ids.yaml-without-ids`)
+is what `plan` mints, and non-canonical bytes are `ids fmt --check`'s, so those
+two are not `validate`'s. `doctor`'s JSON field `identity_file` is `identity_dir`
+(schema set 105).
+
+The write is `ids_store::plan`, then `TreeWrite::apply`. `plan` decides the whole
+new tree and every refusal before anything is written, and proves the result
+reads back to the mapping it was made from. An identity stays in the file it
+already has, and a new declaration's file goes at the path its YAML mirrors;
+tables, columns (a new one after its YAML predecessor, a tombstone where it
+was), roles, types and extensions are added, renamed and retired in place, and a
+table drop marks its file dropped where it stands. `apply` writes every file
+beside its final name and renames them into place, `pbps.yml` last. The first
+write into a project that never named `ids_dir` names it, so an older pbps stops
+at the config (design §6.2). `init` and `pull` write through the same path, and
+`init` claims the root by creating `.pbps/ids`, which replaces the old
+`schema.ids.json` claim.
+
+A write places each identity in the file it already has, and moves it when its
+declaration moved. A declaration whose YAML moved or was renamed has its file
+written at the path the declaration now mirrors and the old one removed (§3.4
+step 2); the pairing is by uid, which `resolve` has already matched by name or
+`renamed_from`, so `ids.ambiguous-move` cannot arise here. A dropped object keeps
+its file (step 4), and a dropped file whose path a live declaration now wants is
+sent aside to `<name>.<uid>.json` (step 5), as is the dropped file of an object the
+tree never held. A table that becomes, stops being, or changes parent as a
+partition has its record moved between files, its own file removed or created
+(step 6). All of it is decided before `apply` writes: new files are renamed into
+place first and the removals follow, so a crash leaves both copies and never
+neither; the next read names the duplicate uid and the remedy is to delete the
+old file. A move empties no directory that holds something else.
+An identity the new mapping no longer has (a withdrawn rebuild takes its
+replacement's away) has its file removed: the mapping is the resolver's to decide,
+and the proof that the tree reads back to it is what keeps the store honest. Still
+refused, with nothing written: a live declaration with an identity and no file to
+put it in.
+
+`plan --check` and `deploy`'s `identity.stale` ask whether the tree is what the
+mapping and the declarations say it should be (design §3.5): a changed mapping,
+but also a declaration that moved, or bytes that are not canonical, when the
+mapping is unchanged. A plan that cannot be made is stale too, and `plan`
+reports why. `validate` keeps the tree validator's findings (including
+`ids.orphan`); `plan --check` does not repeat them.
+
+<a id="dec-2600-10"></a>
+
+**DEC-2600.10. Where names fold, a file is written under the spelling the disk has, and a change of spelling is one last step: a rename through a free name. Git is the user's to tell, and pbps says how.**
+A declaration renamed only in case (`customer.yml` to `Customer.yml`) asks its
+identity file to follow. On a filesystem that ignores case the two names are one
+file, and the ordinary write (new file into place, old one removed) cannot make
+the change. Measured on a Linux casefold tmpfs: a rename onto another spelling
+of the same name reports success and changes nothing, for a file and for a
+directory; a replacing rename keeps the name that was there; `mkdir -p` of
+another spelling is a no-op. Only a rename through a third name changes the
+spelling. NTFS and APFS were not measured here; a rename through a free name
+works wherever a rename does, so it is the one way taken on every filesystem.
+
+- **The plan.** `PathKey` says which paths are one file. A file whose text
+  changes is written under the spelling the disk has for it and for the
+  directories it is in, so the plan is the same write on every filesystem and
+  the spelling is left to one step. `respell` lists the wanted paths, parents
+  first. A spelling on disk that any declaration asks for stays (two
+  declarations can spell one directory two ways where case is significant);
+  otherwise the smallest asked spelling is taken, so the answer does not depend
+  on which declaration is read first.
+- **The write.** Spellings change last, after `pbps.yml`: nothing waits on a
+  spelling, so a failure there leaves a write that is whole and the next plan is
+  that step alone. The name in the middle ends in `.json`, which the reader
+  takes for a file and for a directory alike, so a crash between the two renames
+  leaves a tree that reads back to the same mapping. The second rename never
+  lands on an entry that is already there; the entry is put back and the write
+  says which rename it could not make.
+- **Git.** Measured with git 2.53 and `core.ignorecase` as `git init` sets it
+  where names fold: `git status` and `git add -A` see no change after a
+  case-only rename, and `git mv` refuses a directory. `git rm -r -q --cached
+  <dir>` followed by `git add <dir>` records every rename. A respelling prints
+  that remedy. `plan --check` on a checkout where case is significant names a
+  pair that differs only in case and prints the same remedy, because `pbps plan`
+  where the rename was made finds nothing left to do.
+- **Windows names.** A path's key reads `\` as `/` on Windows, and an aside
+  name that Windows keeps for a device (`aux.<uid>.json`) gets a leading `_`.
+
+Two other designs were weighed. Comparing paths without regard to case on every
+platform needs no rename, but it gives up "an identity file's path is its
+declaration's path", and it would refuse two declarations that differ only in
+case where the filesystem holds both. Refusing a change of case and asking for
+the rename to be undone is enough for a rename made by hand, since a file's name
+carries no meaning (SPEC §4.2); but `pull` names each file after its object, so
+a table renamed only in case in the database changes the file's name with
+nobody to undo it, and a refusal there has no remedy on that machine. The
+maintainer chose the respelling.
+
+Not covered: two names that differ only in Unicode normalisation, which the key
+does not model, and macOS, which CI does not run.

@@ -908,3 +908,21 @@ fn a_refusal_shows_the_file_s_own_text_escaped() {
         "{message}"
     );
 }
+
+#[test]
+fn an_identity_file_is_named_json_and_nothing_else_is() {
+    assert!(is_identity_file("a.json"));
+    assert!(is_identity_file("dir/sub/a.json"));
+    // Valid identity JSON under any other name is not an identity file.
+    for name in [
+        "a.json.aside",
+        "a.txt",
+        "a.json.tmp",
+        ".a.json.aside1",
+        "a",
+        "json",
+        "a.JSON",
+    ] {
+        assert!(!is_identity_file(name), "{name}");
+    }
+}

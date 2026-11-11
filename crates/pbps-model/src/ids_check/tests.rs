@@ -289,6 +289,28 @@ fn two_declarations_on_one_ids_path_collide() {
 }
 
 #[test]
+fn a_file_and_a_directory_of_one_name_collide_but_a_shared_prefix_does_not() {
+    let mut d = decls();
+    d.push(decl("schema/a.yml", UidKind::Table, "dbo.a"));
+    d.push(decl("schema/a.json/b.yml", UidKind::Table, "dbo.b"));
+    let found = run(&tree(), &d, false);
+    let f = found
+        .iter()
+        .find(|f| f.code == Code::PathCollision)
+        .expect("a file cannot also be a directory");
+    assert!(
+        f.message.contains("schema/a.yml") && f.message.contains("schema/a.json/b.yml"),
+        "{}",
+        f.message
+    );
+    // `a.json` and `a.json2/b.json` share a prefix, not a directory.
+    let mut d = decls();
+    d.push(decl("schema/a.yml", UidKind::Table, "dbo.a"));
+    d.push(decl("schema/a.json2/b.yml", UidKind::Table, "dbo.b"));
+    assert!(!codes(&run(&tree(), &d, false)).contains(&Code::PathCollision));
+}
+
+#[test]
 fn different_paths_do_not_collide() {
     assert!(!codes(&run(&tree(), &decls(), false)).contains(&Code::PathCollision));
 }

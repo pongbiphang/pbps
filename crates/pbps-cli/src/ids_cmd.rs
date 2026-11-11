@@ -6,7 +6,7 @@
 //! identity for the user: `resolve` merges by uid and refuses what the resolved
 //! YAML cannot decide, and there is no `--take`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -60,7 +60,7 @@ pub(crate) fn run(project: &Project, command: IdsCommand) -> anyhow::Result<()> 
 // ---------------------------------------------------------------- shared ----
 
 /// `a/./b/` as `a/b`: the project-relative spelling the validator matches on.
-fn spelled(path: &Path) -> String {
+pub(crate) fn spelled(path: &Path) -> String {
     path.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -68,32 +68,32 @@ fn spelled(path: &Path) -> String {
         .join("/")
 }
 
-struct Dirs {
-    schema: String,
-    ids: String,
+pub(crate) struct Dirs {
+    pub(crate) schema: String,
+    pub(crate) ids: String,
 }
 
 impl Dirs {
-    fn of(project: &Project) -> Self {
+    pub(crate) fn of(project: &Project) -> Self {
         Self {
             schema: spelled(&project.config.schema_dir),
             ids: spelled(&project.config.ids_dir()),
         }
     }
-    fn layout(&self) -> Layout<'_> {
+    pub(crate) fn layout(&self) -> Layout<'_> {
         Layout {
             schema_dir: &self.schema,
             ids_dir: &self.ids,
         }
     }
     /// The ids path (relative to the ids directory) of a declaration file.
-    fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
+    pub(crate) fn mirrored(&self, rel_yaml: &str) -> anyhow::Result<String> {
         ids_check::mirrored(self.layout(), &format!("{}/{rel_yaml}", self.schema))
             .with_context(|| format!("`{rel_yaml}` is not a .yml or .yaml declaration"))
     }
 }
 
-fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
+pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
     let dir = project.schema_dir();
     let loaded = load_schema_dir(&dir).map_err(|errors| {
         anyhow::anyhow!(
@@ -109,18 +109,59 @@ fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)> {
     Ok((loaded, paths))
 }
 
-/// Writes through a temporary name in the same directory, so a crash leaves
-/// either the old file or the new one (design §2.4 rule 4).
-fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+/// A name beside `path` for a temp file or an aside (`.<name>.<kind>`, then
+/// `.<name>.<kind>1`, ...) that nothing uses: not on disk, and not in
+/// `reserved`, the planned destinations and their ancestors, which a later step
+/// of the same write may still create. The pick is added to `reserved`.
+/// `tail` ends the name, for one the reader must still take (`.json`).
+pub(crate) fn unused_sibling(
+    path: &Path,
+    kind: &str,
+    tail: &str,
+    reserved: &mut BTreeSet<String>,
+    key: crate::ids_store::PathKey,
+) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write `{}`", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace `{}`", path.display()))
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut n = 0;
+    loop {
+        let suffix = if n == 0 { String::new() } else { n.to_string() };
+        let candidate = parent.join(format!(".{name}.{kind}{suffix}{tail}"));
+        if !reserved.contains(&key.path(&candidate))
+            && std::fs::symlink_metadata(&candidate).is_err()
+        {
+            reserved.insert(key.path(&candidate));
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
-fn shown(dirs: &Dirs, rel: &str) -> String {
+/// Writes through a temporary name in the same directory, so a crash leaves
+/// either the old file or the new one (design §2.4 rule 4).
+pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default());
+    // A temp file this call made is not left behind when it fails: the reader
+    // refuses a stray entry in the tree.
+    let result = std::fs::write(&tmp, text)
+        .with_context(|| format!("cannot write `{}`", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("cannot replace `{}`", path.display()))
+        });
+    if let Err(e) = result {
+        return Err(match std::fs::remove_file(&tmp) {
+            Ok(()) => e,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => e,
+            Err(left) => e.context(format!("and could not remove `{}`: {left}", tmp.display())),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn shown(dirs: &Dirs, rel: &str) -> String {
     pbps_model::Text::new(format!("{}/{rel}", dirs.ids))
         .shown()
         .to_string()
@@ -169,6 +210,10 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
     // for byte, and the rest are still to come. A crash inside the write loop
     // leaves exactly that. A file it would not write, or would write
     // differently, is somebody's work.
+    // Raw is right here and below: the declarations `place` mirrors were read
+    // from this same filesystem, so two of them cannot differ only in case where
+    // case folds, and `validate` reports `ids.case-collision` for a checkout
+    // moved to one that does.
     for (rel, text) in &tree {
         let why = match files.get(rel) {
             Some(expected) if expected == text => continue,
@@ -204,7 +249,7 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
 
 /// The file name a dropped object keeps when no YAML names its place
 /// (design §3.4 step 5): its last name and its uid.
-fn aside(was: &str, uid: &Uid) -> String {
+pub(crate) fn aside(was: &str, uid: &Uid) -> String {
     let safe: String = was
         .chars()
         .map(|c| {
@@ -215,16 +260,34 @@ fn aside(was: &str, uid: &Uid) -> String {
             }
         })
         .collect();
-    format!("{safe}.{uid}.json")
+    // Windows keeps these names for devices whatever follows the first dot, so
+    // `aux.r_1.json` cannot be created there. A declaration cannot be called
+    // that on Windows either, and its file mirrors it; this name is ours.
+    let stem = safe.split('.').next().unwrap_or_default();
+    let numbered = |port: &str| {
+        stem.len() == 4
+            && stem[..3].eq_ignore_ascii_case(port)
+            && stem.as_bytes()[3].is_ascii_digit()
+    };
+    let device = ["con", "prn", "aux", "nul"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+        || numbered("com")
+        || numbered("lpt");
+    let guard = if device { "_" } else { "" };
+    format!("{guard}{safe}.{uid}.json")
 }
 
-/// Section 6.1 steps 2 and 3: every object's records into the file at its
-/// mirrored path, columns in YAML order.
-fn place(
+/// Where the declarations say each identity lives: the mirrored path of the
+/// file that declares it, a partition child's parent, and a table's columns in
+/// YAML order. Identities with no declaration are simply absent from it; what
+/// to do about them is the caller's (migrate refuses or places them aside,
+/// `plan` keeps the file they already have).
+pub(crate) fn declared_placement(
     dirs: &Dirs,
     ids: &IdsFile,
     paths: &DeclaredPaths,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> anyhow::Result<Placement> {
     fn invert<K: Ord + Clone, V: Ord + Clone>(m: &BTreeMap<K, V>) -> BTreeMap<V, K> {
         m.iter().map(|(k, v)| (v.clone(), k.clone())).collect()
     }
@@ -260,6 +323,17 @@ fn place(
             placement.children.insert(c.clone(), p.clone());
         }
     }
+    Ok(placement)
+}
+
+/// Section 6.1 steps 2 and 3: every object's records into the file at its
+/// mirrored path, columns in YAML order.
+fn place(
+    dirs: &Dirs,
+    ids: &IdsFile,
+    paths: &DeclaredPaths,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut placement = declared_placement(dirs, ids, paths)?;
     let placed =
         |uid: &Uid| placement.paths.contains_key(uid) || placement.children.contains_key(uid);
     let mut missing: Vec<String> = Vec::new();
@@ -310,7 +384,7 @@ fn place(
 /// already says so. Edited as text so comments and order stay, then proved by
 /// reading it back: a spelling the line edit does not understand is refused,
 /// never half-applied.
-fn new_config_text(project: &Project) -> anyhow::Result<Option<String>> {
+pub(crate) fn new_config_text(project: &Project) -> anyhow::Result<Option<String>> {
     let path = project.config_file();
     let old = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read `{}`", path.display()))?;
@@ -438,7 +512,11 @@ fn named(source: &Source) -> Option<(UidKind, String)> {
 
 /// The declarations as the validator wants them: project-relative path, kind,
 /// name, and the `renamed_from` they carry.
-fn declarations(dirs: &Dirs, loaded: &Loaded, paths: &DeclaredPaths) -> Vec<Declaration> {
+pub(crate) fn declarations(
+    dirs: &Dirs,
+    loaded: &Loaded,
+    paths: &DeclaredPaths,
+) -> Vec<Declaration> {
     paths
         .files
         .iter()
@@ -457,6 +535,12 @@ fn declarations(dirs: &Dirs, loaded: &Loaded, paths: &DeclaredPaths) -> Vec<Decl
 fn unmerged(project: &Project, dirs: &Dirs) -> anyhow::Result<BTreeMap<String, [bool; 3]>> {
     let out = crate::baseline::git(project.root(), &["ls-files", "-u", "-z", "--", &dirs.ids])
         .context("cannot list unmerged files (is this a git repository?)")?;
+    let key = crate::ids_store::PathKey::probe(&project.ids_dir()).with_context(|| {
+        format!(
+            "cannot tell whether `{}` is case-sensitive",
+            project.ids_dir().display()
+        )
+    })?;
     let mut stages: BTreeMap<String, [bool; 3]> = BTreeMap::new();
     for entry in out.split('\0').filter(|e| !e.is_empty()) {
         let (meta, path) = entry
@@ -467,7 +551,10 @@ fn unmerged(project: &Project, dirs: &Dirs) -> anyhow::Result<BTreeMap<String, [
             .next()
             .and_then(|s| s.parse().ok())
             .context("unexpected stage")?;
-        if let Some(rel) = path.strip_prefix(&format!("{}/", dirs.ids)) {
+        // By the tree's key: git spells the path as the index has it, the
+        // configuration as the user typed it, and on a case-insensitive
+        // filesystem those may differ in case.
+        if let Some(rel) = key.strip_prefix_str(path, &format!("{}/", dirs.ids)) {
             stages.entry(rel.to_owned()).or_default()[stage - 1] = true;
         }
     }
@@ -511,6 +598,15 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
     let mut refusals: Vec<String> = Vec::new();
     for (rel, present) in unmerged(project, &dirs)? {
         let git_path = format!("{}/{rel}", dirs.ids);
+        // The same rule as every other reader of the tree: a conflicted
+        // `x.json.aside` is refused, not parsed.
+        if !ids_tree::is_identity_file(&rel) {
+            refusals.push(format!(
+                "{git_path}: is not {}",
+                ids_tree::IDENTITY_FILE_RULE
+            ));
+            continue;
+        }
         let stage = |n: usize| -> anyhow::Result<Option<ids_tree::TreeFile>> {
             if !present[n - 1] {
                 return Ok(None);
@@ -560,8 +656,13 @@ fn resolve(project: &Project) -> anyhow::Result<()> {
         let path = project.ids_dir().join(rel);
         match file {
             Some(file) => write_atomic(&path, &ids_tree::render(file))?,
-            None => std::fs::remove_file(&path)
-                .with_context(|| format!("cannot remove `{}`", path.display()))?,
+            None => {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("cannot remove `{}`", path.display()))?;
+                // The directories its last member leaves empty go too, as the
+                // write's own removals do.
+                crate::ids_store::prune_emptied_parents(&path, &project.ids_dir());
+            }
         }
         println!(
             "{} {}",

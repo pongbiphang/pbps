@@ -10,6 +10,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/idtree.rs"]
+mod idtree;
+
 #[path = "support/stand_in.rs"]
 mod stand_in;
 
@@ -762,8 +765,9 @@ impl Demo {
             .unwrap()
     }
 
-    fn ids_path(&self) -> PathBuf {
-        self.dir.join("schema.ids.json")
+    /// The identity tree's directory.
+    fn ids_dir(&self) -> PathBuf {
+        self.dir.join(".pbps/ids")
     }
 }
 
@@ -945,7 +949,10 @@ fn first_run_creates_the_ids_file_and_warns_about_the_empty_baseline() {
 
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(d.ids_path().exists(), "the identity file should be created");
+    assert!(
+        crate::idtree::exists(&d.dir),
+        "the identity tree should be created"
+    );
     assert!(
         stderr(&o).contains("the baseline is empty"),
         "an empty baseline must warn loudly, or it reads as a real plan: {}",
@@ -986,7 +993,7 @@ fn recording_the_intent_resolves_the_rename() {
     d.table(ONE_COLUMN);
     d.run(&["plan"]);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
 
     d.table("table: dbo.t\ncolumns:\n  ident: {type: bigint, nullable: false}\n");
     assert_eq!(code(&d.run(&["rename", "dbo.t.id", "ident"])), 0);
@@ -1001,7 +1008,7 @@ fn recording_the_intent_resolves_the_rename() {
 
     // A rename should touch exactly one line of the identity file; that is what
     // makes it reviewable.
-    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    let after = crate::idtree::text(&d.dir);
     let changed = before
         .lines()
         .zip(after.lines())
@@ -1049,7 +1056,7 @@ fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
     );
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
 
     d.table(
         "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  fresh: {type: int, renamed_from: old}\n  occupied: {type: int}\n",
@@ -1066,7 +1073,7 @@ fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
         stderr(&o)
     );
     assert_eq!(
-        std::fs::read_to_string(d.ids_path()).unwrap(),
+        crate::idtree::text(&d.dir),
         before,
         "a refused command must not record the annotation's different rename"
     );
@@ -1087,7 +1094,7 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
         d.table(&columns("  old: {type: int}\n  occupied: {type: int}\n"));
         assert_eq!(code(&d.run(&["plan"])), 0);
         d.commit();
-        let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+        let ids = crate::idtree::text(&d.dir);
         (d, ids)
     };
 
@@ -1126,7 +1133,7 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
             .contains("decide what becomes of it"),
         "{occupied}"
     );
-    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+    assert_eq!(crate::idtree::text(&d.dir), ids);
 
     // Removing the annotation alone keeps the occupant and answers nothing
     // about the source.
@@ -1134,14 +1141,14 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("--reason"), "{}", stderr(&o));
-    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+    assert_eq!(crate::idtree::text(&d.dir), ids);
 
     // Each complete answer converges.
     // 1. Declare the source again.
     d.table(&columns("  old: {type: int}\n  occupied: {type: int}\n"));
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+    assert_eq!(crate::idtree::text(&d.dir), ids);
 
     // 2. Record its drop with a reason.
     let (d, _) = start("occupied-keep-drop");
@@ -1174,8 +1181,7 @@ fn a_tombstone_keeps_the_operators_whole_name() {
     d.table(ONE_COLUMN);
     let o = d.run(&["drop", "dbo.t.pii", "--reason", "REG-2026-042"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-    let ids: pbps_model::IdsFile =
-        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     let operators: Vec<&str> = ids
         .tombstones
         .values()
@@ -1200,11 +1206,8 @@ fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
         code(&d.run(&["drop", "dbo.t.pii", "--reason", "REG-2026-042"])),
         0
     );
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
-    assert!(
-        ids.contains("tombstones"),
-        "a tombstone should be left: {ids}"
-    );
+    let ids = crate::idtree::text(&d.dir);
+    assert!(ids.contains("\"was\""), "a tombstone should be left: {ids}");
     assert!(
         ids.contains("REG-2026-042"),
         "the tombstone must record the reason: {ids}"
@@ -1236,7 +1239,7 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
     d.table(
         "table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  extra: {type: int}\n",
     );
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
 
     let o = d.run(&["plan", "--check"]);
     assert_eq!(code(&o), FINDING);
@@ -1246,7 +1249,7 @@ fn check_mode_fails_when_the_ids_file_is_stale_and_never_writes() {
         stderr(&o)
     );
     assert_eq!(
-        std::fs::read_to_string(d.ids_path()).unwrap(),
+        crate::idtree::text(&d.dir),
         before,
         "--check must never write a file"
     );
@@ -1398,7 +1401,7 @@ fn init_creates_a_complete_valid_project_without_an_existing_config() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(dir.join("pbps.yml").is_file());
     assert!(dir.join("schema").is_dir());
-    assert!(dir.join("schema.ids.json").is_file());
+    assert!(dir.join(".pbps/ids").is_dir());
     let config = std::fs::read_to_string(dir.join("pbps.yml")).unwrap();
     assert!(config.contains("QA_EAST_CONN"), "{config}");
     assert!(config.contains("config schema 1"), "{config}");
@@ -1572,7 +1575,7 @@ fn init_refuses_existing_files_without_changing_them() {
         "do not touch me\n"
     );
     assert!(!dir.join("pbps.yml").exists());
-    assert!(!dir.join("schema.ids.json").exists());
+    assert!(!dir.join(".pbps").exists());
     assert!(
         std::fs::read_dir(&dir).unwrap().all(|entry| !entry
             .unwrap()
@@ -1601,7 +1604,7 @@ fn init_from_a_missing_connection_variable_leaves_no_project() {
     assert!(err.contains(&var), "{err}");
     assert!(err.contains("Export it"), "{err}");
     assert!(!dir.join("pbps.yml").exists());
-    assert!(!dir.join("schema.ids.json").exists());
+    assert!(!dir.join(".pbps").exists());
     assert!(!dir.join("schema").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1689,8 +1692,7 @@ fn baseline_can_come_from_a_snapshot_file_without_git() {
     d.run(&["plan"]);
 
     // Assemble a state snapshot by hand; Phase 3's pbps snapshot will produce it.
-    let ids: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
     let snap = serde_json::json!({
         "version": 6,
         "kind": "baseline",
@@ -1841,7 +1843,7 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     let d = Demo::new("twoclaims");
     d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  old: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
-    let original_ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let original_ids = crate::idtree::text(&d.dir);
     d.commit();
 
     d.table(
@@ -1866,7 +1868,7 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
 
     // And the plan really is refused, not merely reported: the ids file must
     // not have taken a side.
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     // Opaque random IDs can contain the annotation names as substrings.
     // Equality checks that no identity or name was changed by the refusal.
     assert_eq!(
@@ -1908,7 +1910,7 @@ fn a_command_typo_reports_the_rename_without_inventing_an_annotation() {
     d.table("table: dbo.t\ncolumns:\n  id: {type: int}\n  old: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read(d.ids_path()).unwrap();
+    let before = crate::idtree::snapshot(&d.dir);
     for (args, expected) in [
         (
             vec!["rename", "dbo.t.nosuch", "zzz"],
@@ -1929,7 +1931,7 @@ fn a_command_typo_reports_the_rename_without_inventing_an_annotation() {
         assert!(text.contains(expected), "{text}");
         assert!(!text.contains("renamed_from"), "{text}");
         assert!(text.contains("command") && text.contains("retry"), "{text}");
-        assert_eq!(std::fs::read(d.ids_path()).unwrap(), before);
+        assert_eq!(crate::idtree::snapshot(&d.dir), before);
     }
 }
 
@@ -1943,7 +1945,7 @@ fn a_rename_from_a_newly_declared_name_onto_an_identified_one_writes_nothing() {
     d.table("table: dbo.b\ncolumns:\n  id: {type: int}\n  kept: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read(d.ids_path()).unwrap();
+    let before = crate::idtree::snapshot(&d.dir);
     d.table(
         "table: dbo.b\ncolumns:\n  id: {type: int}\n  kept: {type: int}\n  fresh: {type: int}\n",
     );
@@ -1961,7 +1963,7 @@ fn a_rename_from_a_newly_declared_name_onto_an_identified_one_writes_nothing() {
         let o = d.run(&args);
         assert_eq!(code(&o), FINDING, "{args:?}: {}", stderr(&o));
         assert!(stderr(&o).contains(expected), "{}", stderr(&o));
-        assert_eq!(std::fs::read(d.ids_path()).unwrap(), before, "{args:?}");
+        assert_eq!(crate::idtree::snapshot(&d.dir), before, "{args:?}");
     }
 }
 
@@ -1971,7 +1973,7 @@ fn annotation_and_command_conflicts_name_operations_without_claiming_two_annotat
     d.table("table: dbo.t\ncolumns:\n  old: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read(d.ids_path()).unwrap();
+    let before = crate::idtree::snapshot(&d.dir);
     d.table("table: dbo.t\ncolumns:\n  aaa: {type: int, renamed_from: old}\n  zzz: {type: int}\n");
     let o = d.run(&["rename", "dbo.t.old", "zzz"]);
     assert_eq!(code(&o), FINDING, "{}", stderr(&o));
@@ -1985,7 +1987,7 @@ fn annotation_and_command_conflicts_name_operations_without_claiming_two_annotat
         "{text}"
     );
     assert!(!text.contains("zzz renamed_from"), "{text}");
-    assert_eq!(std::fs::read(d.ids_path()).unwrap(), before);
+    assert_eq!(crate::idtree::snapshot(&d.dir), before);
     // Correcting the command to agree with the annotation is a valid intent.
     let o = d.run(&["rename", "dbo.t.old", "aaa"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -1997,7 +1999,7 @@ fn derived_column_conflicts_are_conditional_in_plan_text_and_json_without_record
     d.table("table: dbo.old\ncolumns:\n  x: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let ids = std::fs::read(d.ids_path()).unwrap();
+    let ids = crate::idtree::snapshot(&d.dir);
     d.table("table: dbo.a\nrenamed_from: dbo.old\ncolumns:\n  p: {type: int, renamed_from: x}\n  q: {type: int, renamed_from: x}\n");
     let b = d.dir.join("schema/dbo.z.yml");
     std::fs::write(
@@ -2039,7 +2041,7 @@ fn derived_column_conflicts_are_conditional_in_plan_text_and_json_without_record
             .unwrap()
             .contains("provisional table identity")
     );
-    assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
 
     // The same column contradiction is unconditional once the table identity
     // is no longer contested. Fixing both contradictions finally records it.
@@ -2054,7 +2056,7 @@ fn derived_column_conflicts_are_conditional_in_plan_text_and_json_without_record
             .unwrap()
             .contains("provisional")
     );
-    assert_eq!(std::fs::read(d.ids_path()).unwrap(), ids);
+    assert_eq!(crate::idtree::snapshot(&d.dir), ids);
     d.table("table: dbo.a\nrenamed_from: dbo.old\ncolumns:\n  p: {type: int, renamed_from: x}\n  q: {type: int}\n");
     let out = d.run(&["plan", "--no-input"]);
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
@@ -2119,8 +2121,7 @@ fn fmt_strips_a_table_rename_whose_source_name_another_file_reuses() {
     d.commit();
 
     // The rename, absorbed into the ids file by plan.
-    std::fs::remove_file(d.dir.join("schema/dbo.old.yml")).unwrap();
-    let renamed = d.dir.join("schema/dbo.new.yml");
+    let renamed = d.dir.join("schema/dbo.old.yml");
     std::fs::write(
         &renamed,
         "table: dbo.new\nrenamed_from: dbo.old\ncolumns:\n  id: {type: int}\n",
@@ -2132,7 +2133,7 @@ fn fmt_strips_a_table_rename_whose_source_name_another_file_reuses() {
 
     // A fresh table under the vacated name, in a file of its own.
     std::fs::write(
-        d.dir.join("schema/dbo.old.yml"),
+        d.dir.join("schema/dbo.fresh.yml"),
         old("  code: {type: int}\n"),
     )
     .unwrap();
@@ -2202,10 +2203,14 @@ fn validate_rejects_one_name_mapped_to_two_uids() {
     assert_eq!(code(&d.run(&["validate"])), 0);
 
     // Simulate the auto-merge: a second uid pointing at the same column name.
-    let mut ids: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
-    ids["columns"]["c_zzzzzz"] = serde_json::json!("dbo.t.id");
-    std::fs::write(d.ids_path(), ids.to_string()).unwrap();
+    let file = d.ids_dir().join("dbo.t.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let text = text.replacen(
+        "    \"_end\": true",
+        "    \"c_zzzzzz\": \"id\",\n\n    \"_end\": true",
+        1,
+    );
+    std::fs::write(&file, text).unwrap();
 
     let o = d.run(&["validate"]);
     assert_eq!(
@@ -2722,7 +2727,7 @@ fn pull_refuses_dotted_engine_names_before_writing_declarations_or_ids() {
         assert!(error.contains(&format!("rename the {kind}")), "{error}");
         assert!(error.contains("pull could not mint identities"), "{error}");
         assert_eq!(std::fs::read_dir(d.dir.join("schema")).unwrap().count(), 0);
-        assert!(!d.ids_path().exists());
+        assert!(!d.ids_dir().exists());
         assert_eq!(
             std::fs::read(d.dir.join("pbps.yml")).unwrap(),
             config_before
@@ -2751,8 +2756,7 @@ fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
     let child = std::fs::read_to_string(d.dir.join("schema/dbo.child.yml")).unwrap();
     assert!(parent.contains("ix.parent"), "{parent}");
     assert!(child.contains("fk.parent"), "{child}");
-    let ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(d.ids_path()).unwrap()).unwrap();
+    let ids: pbps_model::IdsFile = crate::idtree::model(&d.dir);
     assert_eq!(ids.tables.len(), 2);
     assert_eq!(ids.columns.len(), 2);
     let validate = d.run(&["validate"]);
@@ -6648,11 +6652,10 @@ fn pull_refuses_to_overwrite_existing_declarations() {
 #[test]
 fn pull_refuses_to_overwrite_role_identities() {
     let d = Demo::new("pull-refuse-roles");
-    std::fs::write(
-        d.ids_path(),
-        "{\"version\":1,\"tables\":{},\"columns\":{},\"roles\":{\"r_aaaaaa\":\"app_reader\"}}\n",
-    )
-    .unwrap();
+    let mut ids = pbps_model::IdsFile::default();
+    ids.roles
+        .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
+    crate::idtree::write(&d.dir, &ids);
     let o = d.run(&[
         "pull",
         "--db",
@@ -7330,7 +7333,7 @@ fn docs_html_keeps_roles_and_grants_for_both_dialects() {
         assert_eq!(code(&saved), 0, "{}", stderr(&saved));
         assert_eq!(std::fs::read_to_string(path).unwrap(), html);
         assert!(stdout(&saved).is_empty());
-        assert!(!d.ids_path().exists());
+        assert!(!d.ids_dir().exists());
         std::fs::remove_file(role).unwrap();
         std::fs::remove_file(empty_role).unwrap();
         let without_roles = d.run(&["docs", "--format", "html"]);
@@ -7367,7 +7370,7 @@ fn docs_names_the_formats_it_has() {
 fn docs_works_before_the_ids_file_exists() {
     let d = Demo::new("docs-no-ids");
     d.table(ONE_COLUMN);
-    assert!(!d.ids_path().exists());
+    assert!(!d.ids_dir().exists());
     let o = d.run(&["docs", "--format", "erd"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).starts_with("erDiagram"), "{}", stdout(&o));
@@ -7866,9 +7869,7 @@ fn a_removed_module_drops_without_intent_but_needs_approval() {
     assert!(stdout(&o).contains("- drop view"), "{}", stdout(&o));
     assert!(stdout(&o).contains("--allow destructive"), "{}", stdout(&o));
     assert!(
-        !std::fs::read_to_string(d.ids_path())
-            .unwrap()
-            .contains("active_t"),
+        !crate::idtree::text(&d.dir).contains("active_t"),
         "a module must never enter the identity file"
     );
 }
@@ -8387,7 +8388,7 @@ fn init_from_a_real_database_produces_a_valid_project() {
         .output()
         .unwrap();
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
-    assert!(dir.join("schema.ids.json").is_file());
+    assert!(dir.join(".pbps/ids").is_dir());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8475,10 +8476,10 @@ fn an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped() {
     let d = Demo::new("idsescaped");
     d.table(ONE_COLUMN);
     assert_eq!(code(&d.run(&["plan"])), 0);
-    let good = std::fs::read_to_string(d.ids_path()).unwrap();
+    let good = crate::idtree::text(&d.dir);
     let field = "x\n\u{1b}[31mred\r\u{202e}";
     let shown = "x\\n\\u{1b}[31mred\\r\\u{202e}";
-    let hostile = serde_json::to_string(&serde_json::json!({"version": 1, field: 1})).unwrap();
+    let hostile = serde_json::to_string(&serde_json::json!({"format": 1, field: 1})).unwrap();
     let assert_one_line = |o: &Output, what: &str, expected: &str| {
         assert_eq!(code(o), 1, "{what}: {}", stderr(o));
         let e = stderr(o);
@@ -8493,16 +8494,20 @@ fn an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped() {
     };
 
     // The working tree's file.
-    std::fs::write(d.ids_path(), &hostile).unwrap();
-    assert_one_line(&d.run(&["plan"]), "working tree", "is malformed: ");
+    crate::idtree::write_raw(&d.dir, "dbo.t.json", &hostile);
+    assert_one_line(
+        &d.run(&["plan"]),
+        "working tree",
+        "is not a valid identity file: ",
+    );
 
     // The revision the baseline reads.
     d.commit();
-    std::fs::write(d.ids_path(), &good).unwrap();
+    crate::idtree::restore(&d.dir, good.as_bytes());
     assert_one_line(
         &d.run(&["plan"]),
         "baseline revision",
-        "the identity file at `HEAD` is malformed: ",
+        "the identity tree at `HEAD` is inconsistent: ",
     );
 
     // Negative: the same project plans once the file decodes in both places.
@@ -9246,7 +9251,7 @@ fn doctor_reports_the_project_and_never_writes() {
     );
     // Nothing this command does may create the identity file: it is the command
     // someone runs when they are not yet sure what they are pointed at.
-    assert!(!d.ids_path().exists(), "doctor must not write");
+    assert!(!d.ids_dir().exists(), "doctor must not write");
 }
 
 /// `doctor` runs `validate` rather than a second copy of it, so a broken
@@ -10444,7 +10449,7 @@ fn a_terminal_turns_the_prompt_on_and_the_answer_is_recorded() {
     );
     assert_eq!(code(&out), 0, "{text}");
 
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     assert!(ids.contains("full_name"), "{ids}");
     // And the recorded answer must be a rename, not a drop-and-add: a tombstone
     // here would mean the prompt wrote something other than what was chosen.
@@ -10460,7 +10465,7 @@ fn without_a_terminal_nothing_is_asked_and_no_input_changes_nothing() {
     d.table("table: dbo.t\ncolumns:\n  customer_name: {type: nvarchar(50)}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
     d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
 
     for args in [&["plan"][..], &["--no-input", "plan"][..]] {
@@ -10472,7 +10477,7 @@ fn without_a_terminal_nothing_is_asked_and_no_input_changes_nothing() {
             stderr(&o)
         );
         assert_eq!(
-            std::fs::read_to_string(d.ids_path()).unwrap(),
+            crate::idtree::text(&d.dir),
             before,
             "{args:?}: an unanswered question must record nothing"
         );
@@ -10779,7 +10784,7 @@ fn the_prompt_keeps_asking_until_every_ambiguity_is_answered() {
         "{text}"
     );
 
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     assert!(
         ids.contains("full_name") && ids.contains("postcode"),
         "{ids}"
@@ -10802,7 +10807,7 @@ fn stopping_part_way_through_the_loop_still_records_nothing() {
     ));
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
     d.table(concat!(
         "table: dbo.t\n",
         "columns:\n",
@@ -10817,7 +10822,7 @@ fn stopping_part_way_through_the_loop_still_records_nothing() {
     );
     assert_eq!(code(&out), FINDING, "{}", stdout(&out));
     assert_eq!(
-        std::fs::read_to_string(d.ids_path()).unwrap(),
+        crate::idtree::text(&d.dir),
         before,
         "an unfinished answer must record nothing"
     );
@@ -10859,7 +10864,7 @@ fn a_terminal_asks_for_the_conversion_and_the_typed_expression_is_recorded() {
         text.contains("type text -> integer USING nullif(amount, '')::integer"),
         "the plan is made from the answer: {text}"
     );
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     assert!(
         ids.contains(r#""using": "nullif(amount, '')::integer""#),
         "{ids}"
@@ -10876,7 +10881,7 @@ fn a_blank_answer_records_nothing_and_the_example_is_not_a_default() {
     d.table("table: dbo.t\ncolumns:\n  amount: {type: text}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
     d.table("table: dbo.t\ncolumns:\n  amount: {type: integer}\n");
 
     let out = pty::run(&format!("{BIN} --project {} plan", d.dir.display()), b"\n");
@@ -10887,7 +10892,7 @@ fn a_blank_answer_records_nothing_and_the_example_is_not_a_default() {
         text.contains("pbps convert dbo.t.amount --using -"),
         "{text}"
     );
-    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), before);
+    assert_eq!(crate::idtree::text(&d.dir), before);
 }
 
 // ---- Third review round ----
@@ -11392,9 +11397,8 @@ fn a_renamed_role_whose_grants_also_change_counts_once() {
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
 
-    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     d.files(&[(
-        "reader.role.yml",
+        "app_reader.role.yml",
         "role: reader\ngrants:\n  dbo.customer: [select, insert]\n",
     )]);
     assert_eq!(code(&d.run(&["rename-role", "app_reader", "reader"])), 0);
@@ -11520,7 +11524,7 @@ fn explain_reports_a_locked_target_rather_than_a_ready_one() {
 fn plan_json_emits_an_envelope_when_the_identity_file_is_unreadable() {
     let d = Demo::new("planids");
     d.table(ONE_COLUMN);
-    std::fs::write(d.ids_path(), "{ this is not json").unwrap();
+    crate::idtree::write_raw(&d.dir, "dbo.t.json", "{ this is not json");
 
     let o = d.run(&["plan", "--check", "--format", "json"]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
@@ -11533,7 +11537,7 @@ fn plan_json_emits_an_envelope_when_the_identity_file_is_unreadable() {
         v["findings"][0]["location"]["file"]
             .as_str()
             .unwrap()
-            .ends_with("schema.ids.json"),
+            .ends_with(".pbps/ids"),
         "{v}"
     );
 }
@@ -15429,7 +15433,7 @@ fn a_declared_role_is_created_then_granted_and_the_widening_is_not_gated() {
     assert!(out.contains("grant-widen"), "labelled: {out}");
     assert!(!out.contains("--allow"), "but not gated: {out}");
     // And the role has identity: an `r_` uid in the file.
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     assert!(ids.contains("\"r_"), "{ids}");
     assert!(ids.contains("app_reader"), "{ids}");
 }
@@ -15464,8 +15468,7 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     d.files(&A_TABLE_AND_A_ROLE);
     assert_eq!(code(&d.run(&["plan"])), 0);
     let uid_before = {
-        let ids: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+        let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
         ids["roles"]
             .as_object()
             .unwrap()
@@ -15476,9 +15479,8 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     };
     d.commit();
 
-    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     d.files(&[(
-        "reader.role.yml",
+        "app_reader.role.yml",
         "role: reader\ngrants:\n  dbo.customer: [select]\n",
     )]);
     let o = d.run(&["plan", "--check"]);
@@ -15501,8 +15503,7 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     // Gated like any rename: the old name is gone, and a module or an
     // application asking `IS_ROLEMEMBER('app_reader')` breaks on the spot.
     assert!(stdout(&o).contains("--allow rename"), "{}", stdout(&o));
-    let ids: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
     assert_eq!(
         ids["roles"][&uid_before], "reader",
         "the uid survives: {ids}"
@@ -15511,7 +15512,7 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     // The other answer: a drop, which needs a reason and leaves a tombstone.
     // Committed first, so the baseline knows the role by its new name.
     d.commit();
-    std::fs::remove_file(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     let o = d.run(&["plan", "--check"]);
     assert_eq!(code(&o), FINDING);
     assert!(stderr(&o).contains("drop-role reader"), "{}", stderr(&o));
@@ -15521,7 +15522,7 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("drop role reader"), "{}", stdout(&o));
     assert!(stdout(&o).contains("--allow revoke"), "{}", stdout(&o));
-    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    let ids = crate::idtree::text(&d.dir);
     assert!(ids.contains("SEC-9 retired"), "{ids}");
 }
 
@@ -15698,19 +15699,18 @@ fn fmt_keeps_a_pending_role_rename_and_strips_an_absorbed_one() {
     let d = Demo::new("rolefmt");
     d.files(&A_TABLE_AND_A_ROLE);
     assert_eq!(code(&d.run(&["plan"])), 0);
-    std::fs::remove_file(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     d.files(&[(
-        "reader.role.yml",
+        "app_reader.role.yml",
         "role: reader\nrenamed_from: app_reader\ngrants:\n  dbo.customer: [view-definition, select]\n",
     )]);
     assert_eq!(code(&d.run(&["fmt"])), 0);
-    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    let text = std::fs::read_to_string(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     assert!(text.contains("renamed_from: app_reader"), "pending: {text}");
     assert!(text.contains("[select, view-definition]"), "sorted: {text}");
 
     assert_eq!(code(&d.run(&["plan"])), 0, "the annotation is the intent");
     assert_eq!(code(&d.run(&["fmt"])), 0);
-    let text = std::fs::read_to_string(d.dir.join("schema").join("reader.role.yml")).unwrap();
+    let text = std::fs::read_to_string(d.dir.join("schema").join("app_reader.role.yml")).unwrap();
     assert!(!text.contains("renamed_from"), "absorbed: {text}");
 }
 
@@ -16657,7 +16657,7 @@ fn a_policy_refusal_leaves_the_identity_file_alone() {
     d.table("table: dbo.t\ncolumns:\n  note: {type: nvarchar(100)}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    let before = crate::idtree::text(&d.dir);
 
     // One revision that both narrows a column — which the rule below refuses —
     // and adds a table, which is what mints a new uid.
@@ -16685,7 +16685,7 @@ fn a_policy_refusal_leaves_the_identity_file_alone() {
         "{v}"
     );
 
-    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    let after = crate::idtree::text(&d.dir);
     assert_eq!(
         before, after,
         "a refused plan must leave the identity file as it found it"
@@ -16696,7 +16696,7 @@ fn a_policy_refusal_leaves_the_identity_file_alone() {
     // guard above is about the refusal and not about the write being broken.
     std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
     assert_eq!(code(&d.run(&["plan"])), 0);
-    let after = std::fs::read_to_string(d.ids_path()).unwrap();
+    let after = crate::idtree::text(&d.dir);
     assert!(after.contains("dbo.u"), "{after}");
 }
 
@@ -16722,7 +16722,7 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
     .unwrap();
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: mssql\nschema_dir: legacy/schema\nids_file: legacy/ids.json\n",
+        "dialect: mssql\nschema_dir: legacy/schema\nids_dir: legacy/ids\n",
     )
     .unwrap();
     assert_eq!(code(&d.run(&["plan"])), 0);
@@ -16735,10 +16735,10 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
         d.dir.join("db/tables/dbo.t.yml"),
     )
     .unwrap();
-    std::fs::rename(d.dir.join("legacy/ids.json"), d.dir.join("db/ids.json")).unwrap();
+    std::fs::rename(d.dir.join("legacy/ids"), d.dir.join("db/ids")).unwrap();
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n",
+        "dialect: mssql\nschema_dir: db/tables\nids_dir: db/ids\n",
     )
     .unwrap();
 
@@ -16775,7 +16775,7 @@ fn a_baseline_is_read_at_the_paths_its_own_revision_used() {
     d.commit();
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: mssql\nschema_dir: db/tables\nids_file: db/ids.json\n\
+        "dialect: mssql\nschema_dir: db/tables\nids_dir: db/ids\n\
          policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^x_\"}\n",
     )
     .unwrap();
@@ -23498,7 +23498,7 @@ mod connected_refusals {
             TABLE.replace("primary_key", "  note: {type: integer}\nprimary_key"),
         )
         .unwrap();
-        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let ids = crate::idtree::snapshot(&d.dir);
         let checked = d.run(&["plan", "--check", "--format", "json"]);
         let offline: serde_json::Value = serde_json::from_str(&stdout(&checked)).unwrap();
 
@@ -23524,7 +23524,7 @@ mod connected_refusals {
         }
         assert!(stderr(&o).is_empty(), "{}", stderr(&o));
         untouched(&plan, &sql);
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
 
         let o = connected(&d, &plan, &sql, false);
         assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
@@ -23534,7 +23534,7 @@ mod connected_refusals {
             stderr(&o)
         );
         untouched(&plan, &sql);
-        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        assert_eq!(crate::idtree::snapshot(&d.dir), ids);
 
         // Once the identity is planned and committed, the same request reaches
         // the database, and a target it cannot reach is still a failure.
@@ -23797,23 +23797,26 @@ fn forced_pull_publishes_drift_without_accepting_it() {
 
 #[test]
 fn forced_pull_refuses_damaged_identity_history_before_connecting() {
+    let orphan = "{\"_generated\": \"x\", \"format\": 1, \"uid\": \"r_aaaaaa\", \
+                  \"table\": \"dbo.t\", \"columns\": {\"_end\": true}}";
     for (name, contents, expected) in [
-        ("malformed", b"not JSON".as_slice(), "malformed"),
+        ("malformed", b"not JSON".as_slice(), "not a valid identity file"),
         (
             "version",
-            b"{\"version\":999,\"tables\":{},\"columns\":{}}".as_slice(),
-            "inconsistent",
+            b"{\"_generated\": \"x\", \"format\": 999, \"uid\": \"t_aaaaaa\", \"table\": \"dbo.t\", \"columns\": {\"_end\": true}}"
+                .as_slice(),
+            "is layout format 999",
         ),
         (
             "orphan",
-            b"{\"version\":1,\"columns\":{\"c_0rphan\":\"dbo.missing.id\"}}".as_slice(),
-            "inconsistent",
+            orphan.as_bytes(),
+            "does not match where it appears",
         ),
         ("unreadable", b"\xff".as_slice(), "cannot read"),
     ] {
         let d = Demo::new(&format!("pull-ids-{name}"));
         d.table(ONE_COLUMN);
-        std::fs::write(d.ids_path(), contents).unwrap();
+        crate::idtree::write_raw(&d.dir, "dbo.t.json", contents);
         let out = d.run(&[
             "pull",
             "--force",
@@ -23823,19 +23826,21 @@ fn forced_pull_refuses_damaged_identity_history_before_connecting() {
         assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
         assert!(stderr(&out).contains(expected), "{}", stderr(&out));
         assert!(
-            stderr(&out).contains("restore the identity file from git"),
+            stderr(&out).contains("restore the identity files from git"),
             "{}",
             stderr(&out)
         );
         assert!(!stderr(&out).contains("cannot connect"), "{}", stderr(&out));
-        assert_eq!(std::fs::read(d.ids_path()).unwrap(), contents);
+        assert_eq!(std::fs::read(d.ids_dir().join("dbo.t.json")).unwrap(), contents);
         assert_eq!(
             std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap(),
             ONE_COLUMN
         );
     }
+    // A path that is not a directory is not "no identities".
     let d = Demo::new("pull-ids-directory");
-    std::fs::create_dir(d.ids_path()).unwrap();
+    std::fs::create_dir_all(d.dir.join(".pbps")).unwrap();
+    std::fs::write(d.ids_dir(), "not a directory").unwrap();
     let out = d.run(&[
         "pull",
         "--force",
@@ -23844,11 +23849,11 @@ fn forced_pull_refuses_damaged_identity_history_before_connecting() {
     ]);
     assert_eq!(code(&out), 1);
     assert!(
-        stderr(&out).contains("cannot read identity file"),
+        stderr(&out).contains("is not a directory"),
         "{}",
         stderr(&out)
     );
-    assert!(d.ids_path().is_dir());
+    assert!(d.ids_dir().is_file());
 }
 
 #[test]
@@ -23858,13 +23863,12 @@ fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
     d.table(ONE_COLUMN);
     let initialized = d.run(&["plan"]);
     assert_eq!(code(&initialized), 0, "{}", stderr(&initialized));
-    let target = d.dir.join("ids-history.json");
-    std::fs::rename(d.ids_path(), &target).unwrap();
-    std::os::unix::fs::symlink("ids-history.json", d.ids_path()).unwrap();
-    let valid = d.run(&["validate"]);
-    assert_eq!(code(&valid), 0, "{}", stderr(&valid));
+    // The tree directory is a link to history that then goes away.
+    let target = d.dir.join("ids-history");
+    std::fs::rename(d.ids_dir(), &target).unwrap();
+    std::os::unix::fs::symlink("../ids-history", d.ids_dir()).unwrap();
     d.commit();
-    std::fs::remove_file(&target).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
 
     let args = [
         "pull",
@@ -23875,15 +23879,15 @@ fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
     let refused = d.run(&args);
     assert_eq!(code(&refused), 1);
     let error = stderr(&refused);
-    assert!(error.contains("cannot read identity file"), "{error}");
+    assert!(error.contains("is not a directory"), "{error}");
     assert!(
-        error.contains("restore the identity file from git"),
+        error.contains("restore the identity files from git"),
         "{error}"
     );
     assert!(!error.contains("cannot connect"), "{error}");
     assert_eq!(
-        std::fs::read_link(d.ids_path()).unwrap(),
-        std::path::Path::new("ids-history.json")
+        std::fs::read_link(d.ids_dir()).unwrap(),
+        std::path::Path::new("../ids-history")
     );
     assert!(!target.exists());
     assert_eq!(
@@ -23892,13 +23896,13 @@ fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
     );
 
     // A genuinely absent entry still reaches the connection for new adoption.
-    std::fs::remove_file(d.ids_path()).unwrap();
+    std::fs::remove_file(d.ids_dir()).unwrap();
     let absent = d.run(&args);
     assert_eq!(code(&absent), 1);
     let error = stderr(&absent);
     assert!(error.contains("cannot connect"), "{error}");
-    assert!(!error.contains("cannot read identity file"), "{error}");
-    assert!(!d.ids_path().exists());
+    assert!(!error.contains("is not a directory"), "{error}");
+    assert!(!d.ids_dir().exists());
 }
 
 #[test]

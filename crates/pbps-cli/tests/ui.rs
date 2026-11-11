@@ -1,4 +1,7 @@
 //! The real binary serves the shell and invokes its own read commands.
+#[path = "support/idtree.rs"]
+mod idtree;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -203,7 +206,7 @@ fn shell_reads_are_public_but_project_reads_require_the_launch_token() {
     assert_eq!(report["command"], "status");
     assert_eq!(report["data"][0]["environment"], "unconfigured");
     assert_eq!(report["data"][0]["state"], "unconfigured");
-    assert!(!viewer.directory.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&viewer.directory));
     let (status, _, body) =
         viewer.request("HEAD", "/api/status", &[("X-Pbps-Token", &viewer.token)]);
     assert_eq!(status, 200);
@@ -328,7 +331,7 @@ fn child_failures_remain_typed_answers_and_docs_use_the_exact_csp_stylesheet() {
     assert!(!headers.contains("unsafe-inline"));
     let before = std::fs::read(viewer.directory.join("schema/t.yml")).unwrap();
     assert!(!before.is_empty());
-    assert!(!viewer.directory.join("schema.ids.json").exists());
+    assert!(!crate::idtree::exists(&viewer.directory));
 }
 
 #[test]
