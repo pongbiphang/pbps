@@ -7,7 +7,11 @@
 //! twenty seconds here, not five minutes.
 
 use super::super::container::{
-    Keeper, swept, swept_alone, swept_with_observation, swept_with_observation_within,
+    Keeper, swept, swept_alone, swept_losing_the_identity_read, swept_with_observation,
+    swept_with_observation_within,
+};
+use super::super::removal_race2807_tests::{
+    accept_kept, confirmed_absent, confirmed_absent_within,
 };
 use super::setting;
 use crate::resolver::server::engine;
@@ -164,18 +168,14 @@ async fn a_container_whose_keeper_connected_and_is_gone_is_removed_at_once() {
             .unwrap(),
     );
     let report = swept(&token()).await;
-    let (still, gone) = (
-        exists(&name),
-        volumes.iter().filter(|v| volume_exists(v)).count(),
-    );
-    // Another run's sweep may have removed it first: what is asked is that it
-    // is gone, at once, and that this sweep did not keep or spare it.
-    assert!(!still, "removed well inside the grace: {report:?}");
-    assert_eq!(gone, 0, "with its volumes: {volumes:?}");
-    assert!(
-        kept_why(&report, &name).is_empty() && !alive(&report, &dead),
-        "{report:?}"
-    );
+    // Another remover on the shared host may have taken it first (#2807): what
+    // is asked is that the container and its volumes are confirmed gone, and
+    // that this sweep neither spared it nor kept it for any other reason.
+    confirmed_absent(&name, &volumes)
+        .await
+        .unwrap_or_else(|why| panic!("{why}: {report:?}"));
+    accept_kept(&kept_why(&report, &name), &name).unwrap_or_else(|why| panic!("{why}: {report:?}"));
+    assert!(!alive(&report, &dead), "{report:?}");
 }
 
 #[tokio::test]
@@ -258,13 +258,101 @@ async fn a_container_that_has_exited_is_removed_at_once() {
     let mut made = Made(Vec::new());
     let dead = token();
     let (name, _) = start(&mut made, &dead).await;
+    // Read before the kill: a remover that wins the race erases the record
+    // these names would come from (DEC-2513.1).
+    let volumes = volumes_of(&name);
     docker(&["kill", &name]);
     let report = swept(&token()).await;
-    assert!(!exists(&name), "{report:?}");
+    // Six PG shards and two SQL Server shards sweep one Docker host, so
+    // another shard's sweep may remove this container between this sweep's
+    // listing and its identity read (#2807). Either outcome is a removal; what
+    // is demanded is that the container and every volume it owned are gone and
+    // that this sweep kept it for no other reason.
+    confirmed_absent(&name, &volumes)
+        .await
+        .unwrap_or_else(|why| panic!("{why}: {report:?}"));
+    accept_kept(&kept_why(&report, &name), &name).unwrap_or_else(|why| panic!("{why}: {report:?}"));
+    assert!(!alive(&report, &dead), "{report:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn a_sweep_that_loses_the_identity_read_to_another_remover_keeps_only_that_warning() {
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let (name, _) = start(&mut made, &dead).await;
+    let volumes = volumes_of(&name);
     assert!(
-        kept_why(&report, &name).is_empty() && !alive(&report, &dead),
+        !volumes.is_empty(),
+        "the image's data directory is a volume"
+    );
+    docker(&["kill", &name]);
+    // The other remover finishes between the listing and the identity read:
+    // container and volumes, as `docker rm --force --volumes` does.
+    let report = swept_losing_the_identity_read(&token(), &dead, async |name| {
+        docker(&["rm", "--force", "--volumes", name]);
+    })
+    .await;
+    let kept = kept_why(&report, &name);
+    assert_eq!(
+        kept.len(),
+        1,
+        "the lost read is a named warning: {report:?}"
+    );
+    assert!(
+        !removed(&report, &name) && accept_kept(&kept, &name).is_ok(),
         "{report:?}"
     );
+    assert!(
+        kept[0].contains("could not be read before removal"),
+        "{kept:?}"
+    );
+    confirmed_absent(&name, &volumes)
+        .await
+        .unwrap_or_else(|why| panic!("{why}: {report:?}"));
+}
+
+/// Removes the volumes a test made, whatever it found.
+struct MadeVolumes(Vec<String>);
+
+impl Drop for MadeVolumes {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            let _ = Command::new("docker")
+                .args(["volume", "rm", "--force", name])
+                .output();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn a_remover_that_leaves_a_volume_behind_fails_the_absence_check() {
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let (name, _) = start(&mut made, &dead).await;
+    let volumes = volumes_of(&name);
+    assert!(
+        !volumes.is_empty(),
+        "the image's data directory is a volume"
+    );
+    let _volumes = MadeVolumes(volumes.clone());
+    docker(&["kill", &name]);
+    // The other remover takes the container but not its volumes.
+    let report = swept_losing_the_identity_read(&token(), &dead, async |name| {
+        docker(&["rm", "--force", name]);
+    })
+    .await;
+    // The warning is the same, because the sweep cannot know the volumes; the
+    // absence check is what must see the survivor.
+    assert!(
+        accept_kept(&kept_why(&report, &name), &name).is_ok(),
+        "{report:?}"
+    );
+    let left = confirmed_absent_within(&name, &volumes, Duration::from_millis(300)).await;
+    let why = left.expect_err("a volume that survived is not confirmed absent");
+    assert!(volumes.iter().all(|v| why.contains(v.as_str())), "{why}");
+    assert!(!why.contains(&format!("the container {name}")), "{why}");
 }
 
 #[tokio::test]

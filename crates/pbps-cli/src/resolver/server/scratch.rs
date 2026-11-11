@@ -528,6 +528,10 @@ pub(super) mod fixtures;
 #[cfg(test)]
 mod live_tests;
 
+// What a sweep may report of a container another remover took first (#2807).
+#[cfg(test)]
+mod removal_race2807_tests;
+
 #[cfg(test)]
 mod mssql_live_tests;
 

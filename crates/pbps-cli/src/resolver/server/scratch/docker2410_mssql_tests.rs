@@ -5,6 +5,7 @@
 
 use super::super::container::{Keeper, seen, swept};
 use super::super::recovery::{self, Report};
+use super::super::removal_race2807_tests::accept_kept;
 use super::*;
 use crate::resolver::server::engine;
 use pbps_db::resolver::Kept;
@@ -190,16 +191,17 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
     assert!(gone, "the server forgot the session");
     assert_eq!(held, Some((true, true)));
     assert_eq!(after, Some((false, true)));
-    // Another run's sweep may have removed it first: it is gone, and this
-    // sweep did not keep it.
-    assert!(
-        removed
-            && !dead
-                .groups
-                .iter()
-                .any(|g| g.kept.iter().any(|k| k.resource.names == [name.clone()])),
-        "{dead:?}"
-    );
+    // Another run's sweep may have removed it first (#2807): it is gone, and
+    // this sweep kept it for no reason but losing the read to that remover.
+    assert!(removed, "{dead:?}");
+    let kept: Vec<String> = dead
+        .groups
+        .iter()
+        .flat_map(|g| &g.kept)
+        .filter(|k| k.resource.names == [name.clone()])
+        .map(|k| k.why.clone())
+        .collect();
+    accept_kept(&kept, &name).unwrap_or_else(|why| panic!("{why}: {dead:?}"));
 }
 
 #[tokio::test]

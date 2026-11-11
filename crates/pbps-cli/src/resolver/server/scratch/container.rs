@@ -15,7 +15,8 @@ pub mod journal;
 mod recovery;
 #[cfg(test)]
 pub(super) use recovery::{
-    Keeper, seen, swept, swept_alone, swept_with_observation, swept_with_observation_within,
+    Keeper, seen, swept, swept_alone, swept_losing_the_identity_read, swept_with_observation,
+    swept_with_observation_within,
 };
 mod startup;
 use pbps_config::resolver::PullPolicy;
