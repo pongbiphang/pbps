@@ -100,6 +100,9 @@ pub(in crate::engine) async fn external_role_renames(
     Ok(ExternalRoleRenames { renames, check })
 }
 
+/// Reconcile only incoming and renamed cluster roles against the same read
+/// used for the baseline checksum. A second presence query could approve a
+/// role that arrived after that read, while the saved baseline still lacks it.
 pub(in crate::engine) fn reconcile_cluster_roles(
     recorded: &IdsFile,
     queried: &IdsFile,
@@ -214,6 +217,10 @@ impl PlanSession for pbps_pg::Postgres {
         Ok(())
     }
 
+    /// Reconcile only incoming and renamed cluster roles against the same read
+    /// used for the baseline checksum. A second presence query could approve a
+    /// role that arrived after that read, while the saved baseline still lacks
+    /// it.
     fn reconcile_cluster_roles(
         &self,
         recorded: &IdsFile,
@@ -225,8 +232,10 @@ impl PlanSession for pbps_pg::Postgres {
         reconcile_cluster_roles(recorded, queried, renames, live, expected)
     }
 
-    /// Preserve the project's dialect and ordinary planning's unknown server
-    /// version.
+    /// A staged plan's table-local name facts, read beside its schema facts.
+    /// Identities map a renamed attaching table back to its current catalog
+    /// name. Preserve the project's dialect and ordinary planning's unknown
+    /// server version.
     async fn staged_attach_dialect(
         &self,
         conn: &mut Conn,
@@ -254,11 +263,13 @@ impl PlanSession for pbps_pg::Postgres {
         ))
     }
 
-    /// A rebuilt enum or domain keeps its comment, which `CREATE TYPE` does not
-    /// copy, and which domains an array holds, which PostgreSQL refuses a new
-    /// check on in place and a rebuild takes instead (DEC-1635.7, DEC-1635.9);
-    /// and the extension facts (#2447). All are facts about the target, read
-    /// before the differ writes the swap that carries them.
+    /// Adds to `hints` the facts about the target that planning a type or an
+    /// extension change needs and the differ cannot see: a rebuilt enum or
+    /// domain keeps its comment, which `CREATE TYPE` does not copy, and which
+    /// domains an array holds, which PostgreSQL refuses a new check on in place
+    /// and a rebuild takes instead (DEC-1635.7, DEC-1635.9), and the extension
+    /// facts (#2447). All are facts about the target, read before the differ
+    /// writes the swap that carries them.
     async fn type_rebuild_hints(
         &self,
         conn: &mut Conn,
@@ -297,8 +308,13 @@ impl PlanSession for pbps_pg::Postgres {
         computed_column_screen(Driver::Postgres)
     }
 
-    /// Without a scratch entry there is nobody to ask, and a database that
-    /// cannot be asked either is left unanswered.
+    /// Asks the resolver's scratch to compare the expressions a plan retains,
+    /// which the engine accepts by parse tree, and records the answers in
+    /// `hints`.
+    ///
+    /// Only PostgreSQL retains expressions this way. Without a scratch entry
+    /// there is nobody to ask, and a database that cannot be asked either is
+    /// left unanswered.
     async fn retained_expression_hints(
         &self,
         scratch: Option<&mut crate::resolution::Entry<'_>>,
@@ -323,6 +339,9 @@ impl PlanSession for pbps_pg::Postgres {
         Ok(())
     }
 
+    /// Reads the `NOT VALID` checks of the domains standing in the database.
+    ///
+    /// PostgreSQL has them.
     async fn standing_not_valid_domain_checks(
         &self,
         conn: &mut Conn,

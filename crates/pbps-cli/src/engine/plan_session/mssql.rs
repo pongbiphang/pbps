@@ -212,6 +212,9 @@ impl PlanSession for pbps_mssql::Mssql {
         Ok(reconcile_cluster_roles())
     }
 
+    /// Adds to `hints` the facts about the target that planning a type or an
+    /// extension change needs and the differ cannot see.
+    ///
     /// SQL Server has no such types or extensions, so it adds nothing.
     async fn type_rebuild_hints(
         &self,
@@ -229,6 +232,8 @@ impl PlanSession for pbps_mssql::Mssql {
         computed_column_screen(Driver::Mssql)
     }
 
+    /// Reads the `NOT VALID` checks of the domains standing in the database.
+    ///
     /// SQL Server has no domains, so it answers none.
     async fn standing_not_valid_domain_checks(
         &self,
