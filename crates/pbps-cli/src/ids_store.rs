@@ -26,7 +26,7 @@
 //! still refused is a live declaration with no place.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use pbps_config::Project;
@@ -678,10 +678,17 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
 /// by `canonicalize`.
 ///
 /// Absent, a directory, a link and unreadable differ. A component that is not
-/// there ends the walk with no refusal, because nothing below it exists. One
+/// there is a directory the write will create, so it is not looked at again;
+/// it is counted. A normal component below it adds one, `..` removes one and
+/// `.` changes nothing. When the count is back at zero (`a/../.pbps` with `a`
+/// absent) the walk looks at the filesystem again from the directory it had
+/// reached, because creating `a` makes `a/..` that directory. A walk that ends
+/// with the count above zero has found no link: nothing below exists. More
+/// `..` than pending components is ordinary inspection of `..`. A component
 /// that cannot be inspected, or whose parent cannot be resolved, is an error
 /// that names it, never "no link". A component that is a file also ends the
-/// walk: the write that follows refuses it with its own message.
+/// walk: the write that follows refuses it with its own message. A refusal
+/// names the link as the user spelled the path.
 pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
     use std::io::ErrorKind::{NotADirectory, NotFound};
     let shown = |path: &Path| pbps_model::escape::Escaped(&path.display().to_string()).to_string();
@@ -694,16 +701,31 @@ pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Resu
         })
         .with_context(|| format!("cannot inspect `{}`", shown(path)))
     };
+    // `at` is the last directory that is really there; `spelled` is the path as
+    // the user wrote it, for the message. They differ after a missing part.
     let mut at = PathBuf::new();
+    let mut spelled = PathBuf::new();
+    // Directories the write will create below `at`. Nothing is inspected while
+    // there are any: a later `..` can leave them, and then `at` is the
+    // directory the write is in, links and all.
+    let mut pending = 0usize;
     for part in ids_dir.components() {
-        let parent = at.clone();
-        at.push(part);
-        match std::fs::symlink_metadata(&at) {
+        spelled.push(part);
+        if pending > 0 {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => pending -= 1,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => pending += 1,
+            }
+            continue;
+        }
+        let probe = at.join(part);
+        match std::fs::symlink_metadata(&probe) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                if real(&parent)?.starts_with(real(root)?) {
+                if real(&at)?.starts_with(real(root)?) {
                     bail!(
                         "`{}` is a symbolic link, so the identity tree `{}` would be written where this project's git does not record it; replace the link with a real directory and run the command again; nothing was written",
-                        shown(&at),
+                        shown(&spelled),
                         shown(ids_dir)
                     );
                 }
@@ -711,8 +733,12 @@ pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Resu
             Ok(meta) if meta.is_dir() => {}
             // A file, or a followed link to one: the write refuses it.
             Ok(_) => return Ok(()),
-            Err(e) if matches!(e.kind(), NotFound | NotADirectory) => return Ok(()),
-            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown(&at))),
+            Err(e) if e.kind() == NotFound => pending = 1,
+            Err(e) if e.kind() == NotADirectory => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown(&probe))),
+        }
+        if pending == 0 {
+            at = probe;
         }
     }
     Ok(())

@@ -1698,12 +1698,24 @@ empty directory outside it).
   give the same answer. `..` and `.` are never links; the parent of the next
   component is resolved by `canonicalize`. A `.pbps` that links back to the root
   is refused: its parent is the root.
-- **Four results.** A link in the project is a refusal that names it. A
-  directory is passed. A component that is not there ends the walk, because
-  nothing below it exists. One that cannot be inspected, or whose parent or the
-  root cannot be resolved when a link needs them, is an error that names it,
-  never "no link". A component that is a file also ends the walk; the write that
-  follows refuses it.
+- **Four results.** A link in the project is a refusal that names it, as the
+  user spelled the path. A directory is passed. A component that is not there
+  is a directory the write will create. One that cannot be inspected, or whose
+  parent or the root cannot be resolved when a link needs them, is an error that
+  names it, never "no link". A component that is a file ends the walk; the write
+  that follows refuses it.
+- **A missing part is counted, not trusted.** The walk does not stop at the
+  first component that is not there: `ids_dir: a/../.pbps/ids` with no `a`
+  makes `create_dir_all` create `a`, and `a/..` is then the directory the walk
+  had reached, with `.pbps` a link in it. So a missing component starts a count
+  of directories the write will create; while it is above zero nothing is
+  inspected, a normal component adds one, `..` removes one and `.` changes
+  nothing. At zero the walk inspects again from the directory it had reached
+  before the missing part, by the rule above. More `..` than the count is
+  inspected as an ordinary `..`. A walk that ends with the count above zero found
+  no link: nothing below exists. A dangling link is a link, so it is judged by
+  the rule and is not a missing part. Reasoned and measured by unit tests; no
+  case for a particular spelling.
 - **Why a link outside the project is followed.** A checkout may live behind a
   link, and `ids_dir: ../shared/ids` may reach a shared directory through one;
   `master` accepts both. Only a link in the project can take the files out of

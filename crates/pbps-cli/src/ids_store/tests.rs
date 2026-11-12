@@ -2649,6 +2649,87 @@ fn an_ids_dir_wholly_outside_the_project_is_accepted_with_links_on_its_way() {
     assert!(error.contains("is a symbolic link"), "{error}");
 }
 
+/// Makes `.pbps` in the project a link to `target`, for the tests
+/// of a missing part followed by `..`.
+#[cfg(unix)]
+fn link_pbps(project: &Project, target: &Path) {
+    std::os::unix::fs::symlink(target, project.root.join(".pbps")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_reached_after_a_missing_part_and_dot_dot_is_refused() {
+    // `create_dir_all` creates `a`, and then `a/..` is the project root again.
+    let (project, outside) = linkable("missing-then-dot-dot", None);
+    link_pbps(&project, &outside);
+    for spelling in ["a/../.pbps/ids", "a/b/../../.pbps/ids", "a/./../.pbps/ids"] {
+        let error = link_refusal(&project.root, &project.root.join(spelling));
+        assert!(error.contains("is a symbolic link"), "{error}");
+        // The user's spelling is named, not the path that was inspected.
+        let link = project.root.join(spelling.trim_end_matches("/ids"));
+        assert!(error.contains(&link.display().to_string()), "{error}");
+    }
+    assert!(
+        !project.root.join("a").exists(),
+        "the check creates nothing"
+    );
+    // A dangling link is a link, not a missing part.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    link_pbps(&project, &project.root.join("gone"));
+    let error = link_refusal(&project.root, &project.root.join(".pbps/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+    // Negative: the link is not on the resolved path of `a/b/../.pbps/ids`,
+    // which is `a/.pbps/ids`, and nothing of `a` exists.
+    refuse_linked_ids_dir(&project.root, &project.root.join("a/b/../.pbps/ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_part_and_dot_dot_before_a_directory_or_nothing_is_accepted() {
+    let (project, _outside) = linkable("missing-then-real", None);
+    let spelled = project.root.join("a/../.pbps/ids");
+    // `.pbps` absent: nothing below it exists.
+    refuse_linked_ids_dir(&project.root, &spelled).unwrap();
+    // `.pbps` a real directory.
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&project.root, &spelled).unwrap();
+    // A walk that ends inside the missing part has found no link.
+    refuse_linked_ids_dir(&project.root, &project.root.join("a/b/ids")).unwrap();
+    // Negative: the same real directory, with a link where `ids` would be.
+    std::os::unix::fs::symlink(&project.root, project.root.join(".pbps/ids")).unwrap();
+    let error = link_refusal(&project.root, &spelled);
+    assert!(error.contains("is a symbolic link"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_part_and_dot_dot_before_a_link_outside_the_project_is_followed() {
+    let (project, outside) = linkable("missing-then-outside-link", None);
+    let real = outside.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, outside.join("linked")).unwrap();
+    // The same spelling as the refused one, but the link's parent is outside.
+    refuse_linked_ids_dir(&project.root, &outside.join("a/../linked/ids")).unwrap();
+    // More `..` than pending components: the second `..` is looked at as it is.
+    let name = outside.file_name().unwrap();
+    let leaves = project.root.join("a/../..").join(name).join("linked/ids");
+    refuse_linked_ids_dir(&project.root, &leaves).unwrap();
+    // Negative: the second `..` leaves the project and the path comes back in,
+    // to a link in the project.
+    link_pbps(&project, &real);
+    let back = project
+        .root
+        .join("a/../..")
+        .join(project.root.file_name().unwrap());
+    let error = link_refusal(&project.root, &back.join(".pbps/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+    // And a link outside the project that leads back into it is refused.
+    std::os::unix::fs::symlink(&project.root, outside.join("home")).unwrap();
+    std::os::unix::fs::symlink(&real, project.root.join("inner")).unwrap();
+    let error = link_refusal(&project.root, &outside.join("home/b/../inner/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_component_outside_the_project_that_cannot_be_inspected_is_an_error() {

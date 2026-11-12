@@ -1180,6 +1180,36 @@ fn migrate_refuses_a_linked_identity_parent_and_changes_nothing() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_a_linked_parent_reached_after_a_missing_part_and_dot_dot() {
+    // `create_dir_all` makes `a`, and `a/..` is then the project, where `.pbps`
+    // is a link.
+    let p = legacy_project_in("proj");
+    p.write(
+        "pbps.yml",
+        "dialect: postgres\nids_file: schema.ids.json\nids_dir: a/../.pbps/ids\n",
+    );
+    let outside = link_ids_parent(&p);
+    let config = p.read("pbps.yml");
+    assert_refused(
+        &p.pbps(&["ids", "migrate"]),
+        "/proj/a/../.pbps` is a symbolic link",
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(!p.has("a"), "the refusal creates no directory");
+    assert_eq!(p.read("pbps.yml"), config);
+    // Negative: with an ordinary `.pbps` the same `ids_dir` migrates.
+    let q = legacy_project_in("proj");
+    q.write(
+        "pbps.yml",
+        "dialect: postgres\nids_file: schema.ids.json\nids_dir: a/../.pbps/ids\n",
+    );
+    std::fs::create_dir(q.0.join(".pbps")).unwrap();
+    assert_ok(&q.pbps(&["ids", "migrate"]));
+    assert!(q.has(".pbps/ids/dbo/customer.json"));
+}
+
 /// An interrupted migration: the tree stands, the old file is gone, and
 /// `pbps.yml` still names `ids_file`.
 #[cfg(unix)]
