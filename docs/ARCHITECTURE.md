@@ -58,6 +58,13 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   *route*, by what the connection turned out to be, and nothing else in the
   crate names either. A third engine is a compile error in every `engine`
   function until it has an answer for each.
+- `plan --db` reaches the engine's steps up to the resolver block through
+  `engine::plan_session::PlanSession`, implemented for the two concrete
+  dialects `with_plan_dialect!` selects: named positions the pipeline calls in
+  a fixed order, an engine-owned state value carried between them, and
+  provided methods that refuse or report `not_applicable` where an engine has
+  no step (DEC-2798.2). The steps from the resolver block on are still routed
+  `engine` functions until they move onto the same trait.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
   PostgreSQL owns their reads and re-exports the shared value types. The

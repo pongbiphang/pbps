@@ -89,6 +89,9 @@ pub(crate) use collected::*;
 // one `Profile` per engine, read by the functions below that need no connection
 // (#2798).
 mod profile;
+// The engine's steps of a connected plan, reached at named positions (#2798).
+mod plan_session;
+pub(crate) use plan_session::PlanSession;
 
 /// A scratch baseline may assume only package state the scratch actually holds.
 pub async fn require_scratch_extensions(
@@ -106,19 +109,6 @@ pub async fn require_scratch_extensions(
     };
     anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
     Ok(())
-}
-
-pub async fn compare_dependencies(
-    conn: &mut Conn,
-    declarations: &pbps_model::dependency::Dependencies,
-) -> anyhow::Result<pbps_model::dependency::PlannedDependencies> {
-    match conn.driver() {
-        Driver::Mssql => Ok(pbps_mssql::dependencies::compare(conn, declarations).await?),
-        Driver::Postgres if declarations.is_empty() => Ok(Default::default()),
-        Driver::Postgres => {
-            anyhow::bail!("PostgreSQL does not support cross-database dependencies")
-        }
-    }
 }
 
 /// Execute one staged DDL statement, including recovery owned by its engine.
@@ -759,30 +749,10 @@ pub async fn partman_maintained(
 /// name and before any statement runs. PostgreSQL declares none: `validate`
 /// refuses the field there.
 pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
-    let names: Vec<String> = schema
-        .tables
-        .values()
-        .flat_map(|t| t.columns.values())
-        .filter_map(|c| c.collation.as_ref().map(|c| c.as_str().to_owned()))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let unknown = match conn.driver() {
-        Driver::Mssql => pbps_mssql::catalog::unknown_collations(conn, &names).await?,
-        Driver::Postgres => Vec::new(),
-    };
-    if !unknown.is_empty() {
-        anyhow::bail!(
-            "this server has no collation named {}; a `COLLATE` naming it would be refused \
-             mid-apply",
-            unknown
-                .iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    match conn.driver() {
+        Driver::Mssql => plan_session::mssql::refuse_unknown_collations(conn, schema).await,
+        Driver::Postgres => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuses a foreign key to a declared history the database reads as one
@@ -799,46 +769,12 @@ pub async fn refuse_history_references_alike(
     schema: &Schema,
     dialect: &dyn pbps_dialect::Dialect,
 ) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Mssql {
-        return Ok(());
+    match conn.driver() {
+        Driver::Mssql => {
+            plan_session::mssql::refuse_history_references_alike(conn, schema, dialect).await
+        }
+        Driver::Postgres => Ok(()),
     }
-    let histories: Vec<&TableName> = schema
-        .tables
-        .values()
-        .filter_map(|t| t.system_time.as_ref()?.versioning.as_ref())
-        .map(|v| &v.history)
-        .collect();
-    // A key to a history as written is the offline check's, already refused.
-    let referenced: BTreeSet<&TableName> = schema
-        .tables
-        .values()
-        .flat_map(|t| t.foreign_keys.values())
-        .map(|fk| &fk.references_table)
-        .filter(|r| !histories.contains(r))
-        .collect();
-    if histories.is_empty() || referenced.is_empty() {
-        return Ok(());
-    }
-    let names: Vec<TableName> = histories
-        .iter()
-        .copied()
-        .chain(referenced)
-        .cloned()
-        .collect();
-    let alike = pbps_mssql::catalog::object_names_alike(conn, &names).await?;
-    let problems = pbps_dialect::history_references_under(schema, dialect, |a, b| {
-        a == b
-            || alike
-                .iter()
-                .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
-    });
-    if !problems.is_empty() {
-        anyhow::bail!(
-            "the declarations have a foreign key the engine refuses (13565):\n  {}",
-            problems.join("\n  ")
-        );
-    }
-    Ok(())
 }
 
 /// Refuses what this server cannot take of a system-versioned table, before
@@ -3578,73 +3514,9 @@ pub async fn external_role_renames(
     declared: &pbps_model::IdsFile,
 ) -> anyhow::Result<ExternalRoleRenames> {
     match conn.driver() {
-        Driver::Mssql => Ok(ExternalRoleRenames {
-            renames: BTreeMap::new(),
-            check: ConnectedCheck {
-                name: "rename_evidence",
-                engine: "SQL Server",
-                status: "not_applicable",
-                message: "SQL Server renames database roles through the typed plan; external cluster-role rename evidence does not apply".into(),
-            },
-        }),
+        Driver::Mssql => Ok(plan_session::mssql::external_role_renames()),
         Driver::Postgres => {
-            let mut renames = BTreeMap::new();
-            for (from, to) in recorded.role_renames(declared) {
-                let evidence = pbps_pg::roles::rename_evidence(conn, from, to).await?;
-                if let Some(error) = pbps_pg::roles::refuse_rename(from, to, evidence) {
-                    anyhow::bail!("rename_evidence (PostgreSQL): {error}");
-                }
-                renames.insert(from.clone(), to.clone());
-            }
-            let check = ConnectedCheck {
-                name: "rename_evidence",
-                engine: "PostgreSQL",
-                status: "passed",
-                message: format!("{} external cluster-role rename(s) confirmed complete", renames.len()),
-            };
-            Ok(ExternalRoleRenames { renames, check })
-        }
-    }
-}
-
-/// Reconcile only incoming and renamed cluster roles against the same read
-/// used for the baseline checksum. A second presence query could approve a
-/// role that arrived after that read, while the saved baseline still lacks it.
-pub fn reconcile_cluster_roles(
-    driver: Driver,
-    recorded: &pbps_model::IdsFile,
-    queried: &pbps_model::IdsFile,
-    renames: &BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
-    live: &Schema,
-    expected: &mut Schema,
-) -> anyhow::Result<ConnectedCheck> {
-    match driver {
-        Driver::Mssql => Ok(ConnectedCheck {
-            name: "missing_roles",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server creates and renames database roles through the typed plan; the external cluster-role presence check does not apply".into(),
-        }),
-        Driver::Postgres => {
-            let mut checked = 0;
-            for to in queried.roles.values().filter(|name| {
-                renames.values().any(|to| to == *name)
-                    || !recorded.roles.values().any(|old| old == *name)
-            }) {
-                let Some(role) = live.roles.get(to) else {
-                    anyhow::bail!("missing_roles (PostgreSQL): declared cluster role `{to}` is missing; create or rename it first, then plan again",
-                        to = to.shown(),
-                    );
-                };
-                expected.roles.insert(to.clone(), role.clone());
-                checked += 1;
-            }
-            Ok(ConnectedCheck {
-                name: "missing_roles",
-                engine: "PostgreSQL",
-                status: "passed",
-                message: format!("{checked} incoming or renamed cluster role(s) present in the queried baseline"),
-            })
+            plan_session::postgres::external_role_renames(conn, recorded, declared).await
         }
     }
 }
@@ -4067,40 +3939,6 @@ pub async fn account_for_module_dependents<
         ),
     };
     Ok((changes, check))
-}
-
-/// A staged plan's table-local name facts, read beside its schema facts.
-/// Identities map a renamed attaching table back to its current catalog name.
-/// Preserve the project's dialect and ordinary planning's unknown server version.
-pub async fn staged_attach_dialect<D: crate::emission::Engine>(
-    conn: &mut Conn,
-    dialect: &D,
-    before: pbps_diff::Side<'_>,
-    after: pbps_diff::Side<'_>,
-) -> anyhow::Result<D> {
-    Ok(match conn.driver() {
-        Driver::Postgres => {
-            let attaching = after
-                .ids
-                .tables
-                .iter()
-                .filter_map(|(uid, name)| {
-                    let table = after.schema.tables.get(name)?;
-                    table.partition_of.as_ref()?;
-                    let live = before.ids.tables.get(uid)?;
-                    let standing = before.schema.tables.get(live)?;
-                    standing
-                        .partition_of
-                        .is_none()
-                        .then(|| (uid.clone(), live.clone()))
-                })
-                .collect();
-            dialect.with_attach_constraint_names(
-                pbps_pg::staged::attach_constraint_names(conn, &attaching).await?,
-            )
-        }
-        Driver::Mssql => dialect.clone(),
-    })
 }
 
 /// The connection's immutable planning capability, before any expansion.
@@ -6421,16 +6259,10 @@ pub async fn seal_type_pins(
 ) -> anyhow::Result<Prerequisites> {
     match conn.driver() {
         Driver::Postgres => {
-            let pins = pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?;
-            type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
-            let providers = pbps_pg::class_pins::seal(conn, schemas, changes).await?;
-            Ok(Prerequisites {
-                types: pins,
-                providers,
-            })
+            plan_session::postgres::seal_type_pins(conn, schemas, changes, trusted, pin_routines)
+                .await
         }
-        Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
-        Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+        Driver::Mssql => plan_session::mssql::seal_type_pins(trusted),
     }
 }
 
@@ -6445,18 +6277,17 @@ pub async fn seal_plan_type_pins(
 ) -> anyhow::Result<Prerequisites> {
     match conn.driver() {
         Driver::Postgres => {
-            let pins =
-                pbps_pg::type_refs::seal_sides(conn, base, desired, changes, trusted).await?;
-            type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
-            let providers =
-                pbps_pg::class_pins::seal(conn, &[base.schema, desired.schema], changes).await?;
-            Ok(Prerequisites {
-                types: pins,
-                providers,
-            })
+            plan_session::postgres::seal_plan_type_pins(
+                conn,
+                base,
+                desired,
+                changes,
+                trusted,
+                pin_routines,
+            )
+            .await
         }
-        Driver::Mssql if trusted.is_empty() => Ok(Prerequisites::default()),
-        Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+        Driver::Mssql => plan_session::mssql::seal_type_pins(trusted),
     }
 }
 
@@ -6555,21 +6386,10 @@ pub async fn type_input_routines(
 ) -> anyhow::Result<BTreeSet<i64>> {
     match conn.driver() {
         Driver::Postgres => {
-            let within = if inside {
-                pbps_pg::pins::Within::CallersTransaction
-            } else {
-                pbps_pg::pins::Within::OwnTransaction
-            };
-            // Where each type is now: a placeholder names a type the plan itself
-            // brings and is not read, and a type its package's move carried is
-            // found under the name the move gave it (DEC-2447.12).
-            let references = pbps_pg::type_refs::current_references(conn, within, pins).await?;
-            let admission =
-                pbps_pg::admission::Admission::new(trusted.iter().cloned(), pin_routines);
-            Ok(pbps_pg::type_refs::input_routines(conn, within, &references, &admission).await?)
+            plan_session::postgres::type_input_routines(conn, pins, trusted, pin_routines, inside)
+                .await
         }
-        Driver::Mssql if !pin_routines && pins.is_empty() => Ok(BTreeSet::new()),
-        Driver::Mssql => anyhow::bail!("pin_type_routines is supported only on PostgreSQL"),
+        Driver::Mssql => plan_session::mssql::type_input_routines(pins, pin_routines),
     }
 }
 

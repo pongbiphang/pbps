@@ -40,20 +40,20 @@ pub(crate) async fn refuse_misspelt(
     unasked: &mut Vec<String>,
     type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    refuse_misspelt_with_probe(conn, schema, schema, at, unasked, type_routines_need_review).await
+    let found = crate::engine::misspelt(conn, schema, at, type_routines_need_review).await;
+    refuse_misspelt_read(found, schema, unasked)
 }
 
-pub(super) async fn refuse_misspelt_with_probe(
-    conn: &mut Conn,
+/// What [`refuse_misspelt`] does with the engine's answer, for a caller that
+/// asked at its own position of the engine (`plan --db`, whose probe schema is
+/// not the declared one and whose engine keeps the review flag itself). The
+/// answer is `found`; `schema` is what gets read back.
+pub(super) fn refuse_misspelt_read(
+    found: Result<pbps_db::catalog::Spellings, pbps_db::catalog::RowsError>,
     schema: &Schema,
-    probe_schema: &Schema,
-    at: &pbps_db::catalog::CatalogNames,
     unasked: &mut Vec<String>,
-    type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    let mut found = crate::engine::misspelt(conn, probe_schema, at, type_routines_need_review)
-        .await
-        .context("cannot ask the engine how it reads the declared rows")?;
+    let mut found = found.context("cannot ask the engine how it reads the declared rows")?;
     unasked.extend(found.defaults_unasked.iter().map(|why| {
         format!(
             "not checked before the plan whether the engine stores it as the parent's \
@@ -445,11 +445,24 @@ pub(crate) async fn refuse_wrongly_spelt_schemas(
     conn: &mut Conn,
     schema: &Schema,
 ) -> anyhow::Result<()> {
+    let wanted = schemas_wanted(schema);
+    let spelled = crate::engine::schema_spellings(conn, &wanted).await;
+    refuse_wrongly_spelt(spelled, schema)
+}
+
+/// The schema names a declaration holds, which the database is asked to spell.
+pub(super) fn schemas_wanted(schema: &Schema) -> std::collections::BTreeSet<String> {
+    schemas_declared(schema).keys().cloned().collect()
+}
+
+/// What [`refuse_wrongly_spelt_schemas`] does with the answer, for a caller
+/// that asked at its own position of the engine.
+pub(super) fn refuse_wrongly_spelt(
+    spelled: Result<std::collections::BTreeMap<String, Option<String>>, pbps_db::DbError>,
+    schema: &Schema,
+) -> anyhow::Result<()> {
     let declared_by = schemas_declared(schema);
-    let wanted: std::collections::BTreeSet<String> = declared_by.keys().cloned().collect();
-    let spelled = crate::engine::schema_spellings(conn, &wanted)
-        .await
-        .context("cannot ask the engine how it spells the declared schemas")?;
+    let spelled = spelled.context("cannot ask the engine how it spells the declared schemas")?;
     let wrong = wrongly_spelt(&spelled, &declared_by);
     if wrong.is_empty() {
         return Ok(());

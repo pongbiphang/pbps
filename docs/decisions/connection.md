@@ -1211,3 +1211,73 @@ Pinned by `a_third_engine_implements_the_trait_through_a_trait_object` in
 `crates/pbps-db/src/engine.rs` (an engine that uses only `pbps-db` and
 `pbps-model` types), and `of_answers_with_the_engine_of_the_driver_asked_for`
 and `the_two_engines_are_told_apart_by_name` in `crates/pbps-cli/src/engine.rs`.
+
+<a id="dec-2798-2"></a>
+
+**DEC-2798.2. `plan --db` reaches an engine's steps at named positions of a
+trait on the concrete dialect, with defaults that refuse or report and never
+pass silently; state that crosses positions is the engine's (#2798).** About
+seventy steps of `plan_db_selected` were calls to `pbps-cli::engine` functions
+that `match` on the driver, or to an engine crate directly. This entry moves
+the ones before the resolver block (the cross-database dependencies, the
+type prerequisites, the external role renames, the two spelling probes, the
+collation and history-name checks, the cluster-role reconciliation, the staged
+dialect, the diff hints and screen, the standing `NOT VALID` domain checks and
+the ordinary plan's type review) onto `engine::plan_session::PlanSession`; the
+positions from the resolver block on are further methods of the same trait
+in later steps.
+
+- **Positions, not phases.** Five generic phases (facts, rewrites, gates,
+  rows) do not hold the steps, because they interleave: a rewrite is followed
+  by a gate that reads the positions it set, a catalog fact can force a second
+  diff that discards an earlier reorder, engine steps rewrite things other than
+  the change set (the declared schema, the baseline, the dialect, the hints),
+  and the schedule changes the change set's type. A position is where a
+  cluster of steps sits today, called there. Two steps share one only when no
+  neutral code between them refuses, prints, pushes a finding or mutates what
+  either reads; a position is also the unit of a default, so steps with
+  different defaults are different positions even when adjacent.
+- **Static dispatch on the concrete dialect.** `with_plan_dialect!` already
+  instantiates the pipeline once per engine, so the trait is implemented for
+  `Postgres` and `Mssql` and bounded by `emission::Engine`, which seals it. One
+  position returns a replaced dialect of its own type (the staged attach
+  names), which a trait object cannot. Native `async fn` in the trait is
+  used (the MSRV allows it); the futures are concrete, so there is no boxing and
+  no `Send` bound, and the composed planning future stays far inside the
+  256 KiB bound of `d2a1165_composed_service_futures_stay_below_256_kib`.
+- **Defaults never lie.** A provided method returns the neutral value when the
+  plan uses nothing the position is about; refuses, naming the engine
+  (`Dialect::name()`) and the feature, when the plan asks for something the
+  engine has no step for (declared dependencies, `trusted_roles`,
+  `pin_type_routines`, a column collation, a system-versioned table, a domain,
+  a type or an extension, an incoming cluster role, a role rename); and
+  answers `not_applicable`, naming the engine, where the output is a
+  `connected_checks` row. A position with no neutral value (the misspelling
+  probe, the schema spellings, the computed-column screen) is required, so an
+  engine that lacks it does not compile. Both existing engines override every
+  provided position whose behaviour or wording differs, with their exact
+  texts, so the generic wording is reachable only by an engine that does not
+  exist yet.
+- **State that crosses positions is the engine's.** `PlanSession::State` is
+  created empty by the pipeline and passed back as an opaque value; the
+  type-routine review flag that the PostgreSQL misspelling probe reads is in
+  it. A fact neutral code reads too (the role renames, the dependencies, the
+  review that gates the resolver) is a return value instead.
+
+The `engine` functions that other commands still call (bootstrap, apply, the
+pins) keep their names and delegate their arms to the same bodies, so each
+body is written once; the ones only `plan --db` called are deleted.
+
+Rejected:
+- **A method for each step, with no positions.** It would not say where the
+  pipeline may call it, and a reader could not tell a reordering from a move.
+- **A boxed `dyn` session.** The staged position returns `Self`, and the
+  lowering brand of `emission::Engine` would be erased.
+- **Unsealing `emission::Engine` for a test stub.** Any type could then reach
+  the lowering brand; the defaults are free functions of the engine's name
+  instead, and are tested directly.
+
+Pinned by the `plan_session::tests` module in
+`crates/pbps-cli/src/engine/plan_session.rs` (the defaults, each with a
+negative case) and by the existing connected-plan tests, which exercise the
+positions of both engines unchanged.

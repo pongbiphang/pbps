@@ -62,76 +62,6 @@ pub(crate) async fn check_declared_type_pins(
     }
 }
 
-/// Reads the `NOT VALID` checks of the domains standing in the database.
-///
-/// PostgreSQL has them. SQL Server has no domains, so it answers none.
-pub(crate) async fn standing_not_valid_domain_checks(
-    conn: &mut Conn,
-) -> anyhow::Result<Vec<pbps_pg::domain_alter::NotValid>> {
-    match conn.driver() {
-        Driver::Postgres => pbps_pg::domain_alter::not_valid(conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
-        Driver::Mssql => Ok(Vec::new()),
-    }
-}
-
-/// Adds to `hints` the facts about the target that planning a type or an
-/// extension change needs and the differ cannot see: a rebuilt enum or domain
-/// keeps its comment, which `CREATE TYPE` does not copy, and which domains an
-/// array holds, which PostgreSQL refuses a new check on in place and a rebuild
-/// takes instead (DEC-1635.7, DEC-1635.9), and the extension facts (#2447).
-///
-/// SQL Server has no such types or extensions, so it adds nothing.
-pub(crate) async fn type_rebuild_hints(
-    conn: &mut Conn,
-    base: &Schema,
-    declared: &Schema,
-    recorded_ids: &IdsFile,
-    resolved_ids: &IdsFile,
-    hints: &mut pbps_model::Hints,
-) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Postgres => {
-            let types: Vec<_> = base.types.keys().cloned().collect();
-            hints.enum_comments = pbps_pg::type_rebuild::comments(conn, &types).await?;
-            let domains: Vec<_> = base
-                .types
-                .iter()
-                .filter(|(_, ty)| matches!(ty, pbps_model::ManagedType::Domain { .. }))
-                .filter_map(|(name, _)| Some((recorded_ids.type_uid(name)?.clone(), name.clone())))
-                .collect();
-            hints.domain_array_holders =
-                pbps_pg::domain_alter::array_holders(conn, &domains).await?;
-            hints.extension_requires =
-                crate::deploy::extension_creates(conn, base, declared, resolved_ids).await?;
-            hints.extension_updates = crate::deploy::extension_update_facts(
-                conn,
-                base,
-                declared,
-                recorded_ids,
-                resolved_ids,
-            )
-            .await?;
-            hints.extension_moves = crate::deploy::extension_move_facts(
-                conn,
-                base,
-                declared,
-                recorded_ids,
-                resolved_ids,
-            )
-            .await?;
-            hints.extension_drops = crate::deploy::extension_drop_facts(
-                conn,
-                &crate::deploy::retired_extensions(base, declared, recorded_ids, resolved_ids),
-            )
-            .await?;
-            Ok(())
-        }
-        Driver::Mssql => Ok(()),
-    }
-}
-
 /// How the differ judges a computed column that stands throughout the plan.
 ///
 /// SQL Server's are judged by the catalog's edges (`order_computed_by_edges`),
@@ -139,40 +69,6 @@ pub(crate) async fn type_rebuild_hints(
 /// read, so its are judged by the text screen (#1460).
 pub(crate) fn computed_column_screen(driver: Driver) -> pbps_diff::Screen {
     profile::profile(driver).computed_column_screen
-}
-
-/// Asks the resolver's scratch to compare the expressions a plan retains,
-/// which the engine accepts by parse tree, and records the answers in `hints`.
-///
-/// Only PostgreSQL retains expressions this way; SQL Server leaves `hints`
-/// as they are. Without a scratch entry there is nobody to ask, and a
-/// database that cannot be asked either is left unanswered.
-pub(crate) async fn retained_expression_hints(
-    scratch: Option<&mut crate::resolution::Entry<'_>>,
-    conn: &mut Conn,
-    target: &crate::db::Target,
-    before: pbps_diff::Side<'_>,
-    after: pbps_diff::Side<'_>,
-    read_back: &Schema,
-    hints: &mut pbps_model::Hints,
-) -> anyhow::Result<()> {
-    match conn.driver() {
-        Driver::Postgres => {
-            if let Some(entry) = scratch {
-                let requests = pbps_diff::retained::candidates(before, after, hints);
-                if !requests.is_empty() && pbps_pg::retained::available(conn, &requests).await {
-                    // Paired binding carries the resolver lifecycle. Keep its future
-                    // separate from the connected planner's other binding phases.
-                    hints.retained_expressions = Box::pin(crate::resolution::retained::compare(
-                        entry, conn, target, before, after, read_back, hints, &requests,
-                    ))
-                    .await?;
-                }
-            }
-            Ok(())
-        }
-        Driver::Mssql => Ok(()),
-    }
 }
 
 /// Refuses a plan that creates a name the database already uses outside the
