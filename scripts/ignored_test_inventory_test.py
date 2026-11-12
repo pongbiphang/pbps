@@ -1241,7 +1241,9 @@ class Win32Prediction(unittest.TestCase):
 
     def test_a_cfg_the_evaluator_cannot_decide_counts_as_compiled_on_windows(self):
         for cfg in ('feature = "slow"', 'any(unix, feature = "slow")', "debug_assertions",
-                    'cfg_attr(unix, cfg(unix))'):
+                    'cfg_attr(unix, cfg(unix))',
+                    # Rust escapes: one the lexer decodes, one it cannot (both spell "windows").
+                    'any(unix, target_os = "wi\\u006edows")', 'any(unix, target_os = "wi\\u{6e}dows")'):
             with self.subTest(cfg):
                 attribute = f"#[{cfg}]" if cfg.startswith("cfg_attr") else f"#[cfg({cfg})]"
                 self.refused(self.crate(f"mod live {{\n    {attribute}\n" + self.TEST + "}\n"))

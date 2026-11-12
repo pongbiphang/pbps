@@ -1174,6 +1174,8 @@ def parse_cfg(tokens, i):
         return None, i
     if i + 1 < len(tokens) and tokens[i] == "=" and isinstance(tokens[i + 1], tuple) and tokens[i + 1][0] == "string":
         value = tokens[i + 1][1]
+        if value.startswith('"'):
+            return None, i + 2   # an escape the lexer could not decode: not compared
         if name in WINDOWS_CFG: return WINDOWS_CFG[name] == value, i + 2
         return None, i + 2
     return WINDOWS_FLAGS.get(name), i
