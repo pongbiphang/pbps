@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -1157,6 +1158,155 @@ class DeploymentServiceOwnership(unittest.TestCase):
         for platform in ("linux", "win32", "darwin"):
             with self.subTest(platform=platform):
                 self.assertEqual(audit.validate(root, inventory, targets, platform), len(cases))
+
+
+class Win32Prediction(unittest.TestCase):
+    """A Linux run predicts what the Windows build's inventory refuses (#2833)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.inventory = {
+            "version": 1,
+            "owners": {"live": {"platform": "linux", "fixture": "Owned test database", "job": "live"},
+                       "native": {"platform": "win32", "fixture": "Native cluster", "job": "native"}},
+            "groups": [],
+        }
+        self.rules = {"version": 1, "rules": [{"target": list(KEY), "prefix": "live::", "owner": "live"}]}
+
+    def crate(self, source, **files):
+        """Write src/lib.rs (and any module files) and return the targets Linux discovery would give."""
+        src = self.root / "src"
+        shutil.rmtree(src, ignore_errors=True)
+        src.mkdir()
+        (src / "lib.rs").write_text(source, encoding="utf-8")
+        for name, text in files.items():
+            path = src / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return {KEY: {"all": {"live::owned"}, "ignored": {"live::owned"}, "root": src / "lib.rs"}}
+
+    def predict(self, targets, platform="linux"):
+        return audit.predict_win32(self.inventory, self.rules, targets, platform)
+
+    def refused(self, targets):
+        with self.assertRaisesRegex(audit.InventoryError, r"^predicted on win32: rule-only case .*live::owned.*"
+                                    r"owner live's platform linux; add an exact legacy entry"):
+            self.predict(targets)
+
+    TEST = "    #[test]\n    #[ignore]\n    fn owned() {}\n"
+
+    def test_a_linux_owned_ignored_test_the_windows_build_compiles_is_refused(self):
+        # The #2793 shape: a new #[ignore] test, no cfg, covered only by a Linux owner's rule.
+        self.refused(self.crate("mod live {\n" + self.TEST + "}\n"))
+
+    def test_the_linux_run_alone_does_not_see_it_and_the_prediction_is_the_difference(self):
+        # Revert witness: without the prediction the same fixture passes the Linux validation.
+        targets = self.crate("mod live {\n" + self.TEST + "}\n")
+        del self.inventory["owners"]["native"]
+        (self.root / ".github/workflows").mkdir(parents=True)
+        (self.root / ".github/workflows/ci.yml").write_text(WORKFLOW, encoding="utf-8")
+        self.assertEqual(audit.validate(self.root, self.inventory, targets, "linux", self.rules), 1)
+        self.refused(targets)
+
+    def test_a_cfg_that_keeps_windows_out_is_accepted_on_the_function_a_module_or_a_module_file(self):
+        on_function = "mod live {\n    #[cfg(unix)]\n" + self.TEST + "}\n"
+        on_module = "#[cfg(unix)]\nmod live {\n" + self.TEST + "}\n"
+        plain = self.TEST.replace("    ", "")
+        for label, build in (
+            ("function", lambda: self.crate(on_function)),
+            ("inline module", lambda: self.crate(on_module)),
+            ("inner attribute of a module file", lambda: self.crate("mod live;\n", **{"live.rs": "#![cfg(unix)]\n" + plain})),
+            ("outer attribute of a module file", lambda: self.crate("#[cfg(unix)]\nmod live;\n", **{"live.rs": plain})),
+            ("a module inside a module file", lambda: self.crate("mod live;\n", **{"live.rs": "#[cfg(unix)]\nmod inner {\n" + self.TEST + "}\n"})),
+        ):
+            with self.subTest(label):
+                targets = build()
+                if label == "a module inside a module file":
+                    targets[KEY]["ignored"] = {"live::inner::owned"}
+                self.assertEqual(self.predict(targets), 0)
+
+    def test_not_windows_and_linux_only_cfgs_are_accepted_and_a_cfg_that_includes_windows_is_not(self):
+        for cfg, accepted in (("not(windows)", True), ("target_os = \"linux\"", True),
+                              ("not(target_os = \"windows\")", True), ("all(unix, test)", True),
+                              ("test", False), ("any(unix, windows)", False), ("not(unix)", False),
+                              ("all(test, not(target_os = \"macos\"))", False)):
+            with self.subTest(cfg):
+                targets = self.crate(f"mod live {{\n    #[cfg({cfg})]\n" + self.TEST + "}\n")
+                if accepted:
+                    self.assertEqual(self.predict(targets), 0)
+                else:
+                    self.refused(targets)
+
+    def test_a_cfg_the_evaluator_cannot_decide_counts_as_compiled_on_windows(self):
+        for cfg in ('feature = "slow"', 'any(unix, feature = "slow")', "debug_assertions",
+                    'cfg_attr(unix, cfg(unix))'):
+            with self.subTest(cfg):
+                attribute = f"#[{cfg}]" if cfg.startswith("cfg_attr") else f"#[cfg({cfg})]"
+                self.refused(self.crate(f"mod live {{\n    {attribute}\n" + self.TEST + "}\n"))
+
+    def test_an_exact_legacy_entry_with_a_win32_capable_owner_is_accepted(self):
+        targets = self.crate("mod live {\n" + self.TEST + "}\n")
+        self.inventory["groups"].append({"target": list(KEY), "owner": "native", "validate_on": "win32",
+                                         "ignored_on": ["win32"], "cases": ["live::owned"]})
+        self.assertEqual(self.predict(targets), 0)
+
+    def test_a_rule_for_an_owner_that_runs_on_win32_is_accepted(self):
+        targets = self.crate("mod live {\n" + self.TEST + "}\n")
+        self.rules["rules"][0]["owner"] = "native"
+        self.assertEqual(self.predict(targets), 0)
+
+    def test_a_case_the_source_does_not_show_is_treated_as_compiled_on_windows(self):
+        # A macro-generated test: its enclosing module is read, the function is not found.
+        refused = self.crate("mod live {\n    generated! { owned }\n}\n")
+        self.refused(refused)
+        # ...unless an enclosing module keeps Windows out.
+        self.assertEqual(self.predict(self.crate("#[cfg(unix)]\nmod live {\n    generated! { owned }\n}\n")), 0)
+
+    def test_a_missing_crate_root_or_module_file_fails_closed(self):
+        targets = self.crate("mod live;\n")
+        self.refused(targets)
+        del targets[KEY]["root"]
+        self.refused(targets)
+
+    def test_a_path_attribute_and_the_directory_rules_find_the_module_file(self):
+        # The cfg sits in the module file itself, so the file must be found to be read.
+        gated = "#![cfg(unix)]\n" + self.TEST.replace("    ", "")
+        shapes = (
+            ('#[path = "support/live.rs"]\nmod live;\n', {"support/live.rs": gated}, "live::owned"),
+            ("mod outer {\n    #[path = \"live.rs\"]\n    mod live;\n}\n", {"outer/live.rs": gated}, "outer::live::owned"),
+            ("mod outer;\n", {"outer.rs": "mod live;\n", "outer/live.rs": gated}, "outer::live::owned"),
+            ("mod outer;\n", {"outer/mod.rs": "mod live;\n", "outer/live.rs": gated}, "outer::live::owned"),
+            ("mod outer {\n    mod live;\n}\n", {"outer/live.rs": gated}, "outer::live::owned"),
+            ("mod live;\n", {"live/mod.rs": gated}, "live::owned"),
+        )
+        for source, files, name in shapes:
+            with self.subTest(source=source, files=sorted(files)):
+                targets = self.crate(source, **files)
+                targets[KEY]["ignored"] = {name}
+                self.rules["rules"][0]["prefix"] = name.rpartition("::")[0] + "::"
+                self.assertEqual(self.predict(targets), 0)
+                # The same shape without the cfg is compiled on Windows.
+                for path, text in files.items():
+                    (self.root / "src" / path).write_text(text.replace("#![cfg(unix)]\n", ""), encoding="utf-8")
+                self.refused_name(targets, name)
+
+    def refused_name(self, targets, name):
+        with self.assertRaisesRegex(audit.InventoryError, "^predicted on win32: .*" + re.escape(name)):
+            self.predict(targets)
+
+    def test_only_a_linux_run_predicts(self):
+        self.assertEqual(self.predict(self.crate("mod live {\n" + self.TEST + "}\n"), platform="win32"), 0)
+
+    def test_the_command_runs_the_prediction_after_the_validation(self):
+        calls = []
+        with patch.object(audit, "discover", return_value={}), \
+                patch.object(audit, "validate", side_effect=lambda *a: calls.append("validate") or 0), \
+                patch.object(audit, "rule_assignments", return_value={}), \
+                patch.object(audit, "predict_win32", side_effect=lambda *a: calls.append("predict") or 0):
+            audit.main()
+        self.assertEqual(calls, ["validate", "predict"])
 
 
 def load_tests(loader, tests, pattern):

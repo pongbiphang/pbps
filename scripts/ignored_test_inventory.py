@@ -84,7 +84,8 @@ def discover(root):
         require(ignored <= all_cases, f"inconsistent ignored listing: {key}")
         dep_info = Path(artifact["executable"]).with_suffix(".d").read_text(encoding="utf-8")
         sources = {(root / path).resolve(strict=True) for path in dep_paths(dep_info)}
-        targets[key] = {"all": all_cases, "ignored": ignored, "sources": sources}
+        targets[key] = {"all": all_cases, "ignored": ignored, "sources": sources,
+                        "root": Path(target["src_path"])}
     require(targets, "Cargo produced no test artifacts")
     return targets
 
@@ -1122,6 +1123,253 @@ def validate(root, inventory, targets, platform, rules=None):
     return len(entries)
 
 
+# --- Predicting the Windows build's inventory from Linux (#2833) ---------------
+#
+# The Windows `quick` job lists the ignored tests of the Windows build and refuses
+# a rule-only case whose owner does not run on win32. A Linux run only lists the
+# Linux binaries, so it cannot see that. Which tests the Windows build compiles is
+# a `cfg` question, answered here from source: the `cfg` attributes of the test
+# function, of every enclosing module (inline or file), and the inner `#![cfg]` of
+# a module file. A `cfg` the evaluator cannot decide counts as compiled on
+# Windows, so the prediction fails closed; the win32 run stays the authority.
+
+# The Windows runner of the `quick` job: windows-latest, MSVC, x86_64.
+WINDOWS_CFG = {"target_os": "windows", "target_family": "windows", "target_env": "msvc",
+               "target_arch": "x86_64", "target_pointer_width": "64", "target_endian": "little",
+               "target_vendor": "pc"}
+WINDOWS_FLAGS = {"windows": True, "unix": False, "test": True}
+
+
+def tri_all(values):
+    if any(value is False for value in values): return False
+    return None if any(value is None for value in values) else True
+
+
+def tri_any(values):
+    if any(value is True for value in values): return True
+    return None if any(value is None for value in values) else False
+
+
+def parse_cfg(tokens, i):
+    """Evaluate one cfg predicate at tokens[i:]; return (True/False/None, next index).
+
+    None is a predicate the evaluator cannot decide (a feature, an unknown name)."""
+    require(i < len(tokens) and isinstance(tokens[i], str) and (tokens[i][0].isalpha() or tokens[i][0] == "_"),
+            "unreadable cfg predicate")
+    name, i = tokens[i], i + 1
+    if i < len(tokens) and tokens[i] == "(":
+        if name == "cfg":
+            raise InventoryError("nested cfg is not a predicate")
+        values, i = [], i + 1
+        while i < len(tokens) and tokens[i] != ")":
+            value, i = parse_cfg(tokens, i)
+            values.append(value)
+            if i < len(tokens) and tokens[i] == ",": i += 1
+        require(i < len(tokens), "unterminated cfg predicate")
+        i += 1
+        if name == "all": return tri_all(values), i
+        if name == "any": return tri_any(values), i
+        if name == "not" and len(values) == 1:
+            return (None if values[0] is None else not values[0]), i
+        return None, i
+    if i + 1 < len(tokens) and tokens[i] == "=" and isinstance(tokens[i + 1], tuple) and tokens[i + 1][0] == "string":
+        value = tokens[i + 1][1]
+        if name in WINDOWS_CFG: return WINDOWS_CFG[name] == value, i + 2
+        return None, i + 2
+    return WINDOWS_FLAGS.get(name), i
+
+
+def attribute_cfg(attributes):
+    """Windows value of the `cfg` attributes on an item: True/False, or None if undecidable."""
+    values = []
+    for tokens in attributes:
+        if tokens[:1] == ["cfg"] and tokens[1:2] == ["("]:
+            try:
+                value, end = parse_cfg(tokens, 2)
+            except InventoryError:
+                values.append(None); continue
+            values.append(value if end < len(tokens) and tokens[end] == ")" else None)
+        elif tokens[:1] == ["cfg_attr"] and "cfg" in tokens[2:]:
+            # cfg_attr can introduce a cfg; the evaluator does not expand it.
+            values.append(None)
+    return tri_all(values)
+
+
+def skip_balanced(tokens, i):
+    """tokens[i] opens a group; return the index after its matching close."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack = [pairs[tokens[i]]]
+    i += 1
+    while stack and i < len(tokens):
+        token = tokens[i]
+        if isinstance(token, str):
+            if token in pairs: stack.append(pairs[token])
+            elif token == stack[-1]: stack.pop()
+        i += 1
+    require(not stack, "unbalanced Rust group")
+    return i
+
+
+ITEM_MODIFIERS = {"pub", "async", "unsafe", "const", "extern", "default", "safe"}
+
+
+def rust_items(tokens, start=0, end=None):
+    """List the modules and functions directly inside tokens[start:end].
+
+    Returns (inner_attributes, items); an item is (kind, name, attributes, body)
+    where body is (start, end) of an inline module or None for `mod x;`."""
+    end = len(tokens) if end is None else end
+    inner, items, i = [], [], start
+    while i < end:
+        attributes = []
+        while i < end and tokens[i] == "#":
+            bang = i + 1 < end and tokens[i + 1] == "!"
+            j = i + 2 if bang else i + 1
+            if j >= end or tokens[j] != "[":
+                i = end; break
+            close = skip_balanced(tokens, j)
+            (inner if bang else attributes).append(tokens[j + 1:close - 1])
+            i = close
+        if i >= end:
+            break
+        j = i
+        while j < end and tokens[j] in ITEM_MODIFIERS:
+            j += 1
+            if j < end and tokens[j] == "(" and tokens[j - 1] == "pub": j = skip_balanced(tokens, j)
+            elif j < end and isinstance(tokens[j], tuple): j += 1
+        kind = tokens[j] if j < end and isinstance(tokens[j], str) else None
+        if kind == "mod" and j + 1 < end:
+            name = tokens[j + 1]
+            if j + 2 < end and tokens[j + 2] == "{":
+                close = skip_balanced(tokens, j + 2)
+                items.append(("mod", name, attributes, (j + 3, close - 1)))
+                i = close
+            else:
+                items.append(("mod", name, attributes, None))
+                i = j + 3
+        elif kind == "fn" and j + 1 < end:
+            name, k = tokens[j + 1], j + 2
+            while k < end and tokens[k] not in ("{", ";"):
+                k = skip_balanced(tokens, k) if tokens[k] in ("(", "[") else k + 1
+            items.append(("fn", name, attributes, None))
+            i = skip_balanced(tokens, k) if k < end and tokens[k] == "{" else k + 1
+        else:
+            # Any other item: to the `;` or the closing brace of its body, at depth 0.
+            braced = kind in ("struct", "enum", "union", "impl", "trait", "macro_rules", "extern", "{") \
+                or (j + 1 < end and tokens[j + 1] == "!")
+            k = j
+            while k < end:
+                token = tokens[k]
+                if token == ";": k += 1; break
+                if token in ("(", "["): k = skip_balanced(tokens, k); continue
+                if token == "{":
+                    k = skip_balanced(tokens, k)
+                    if braced: break
+                    continue
+                k += 1
+            i = max(k, i + 1)
+    return inner, items
+
+
+class RustModules:
+    """The module tree of one crate, read lazily from source."""
+
+    def __init__(self):
+        self.tokens, self.parsed = {}, {}
+
+    def read(self, path):
+        if path not in self.tokens:
+            self.tokens[path] = rust_tokens(path.read_text(encoding="utf-8"))
+        return self.tokens[path]
+
+    def file_module(self, path, directory):
+        """(inner attributes, items, tokens) of a module file; `directory` holds its children."""
+        tokens = self.read(path)
+        if path not in self.parsed:
+            self.parsed[path] = rust_items(tokens)
+        inner, items = self.parsed[path]
+        return inner, items, tokens, directory
+
+    def child_file(self, path_base, directory, path_attribute, name):
+        """Source file of `mod name;`; None if it cannot be found.
+
+        A `#[path]` is relative to the directory of the declaring file plus the
+        names of the inline modules around the declaration (`path_base`)."""
+        if path_attribute is not None:
+            candidate = path_base / path_attribute
+            return (candidate, candidate.parent) if candidate.is_file() else None
+        for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
+            if candidate.is_file():
+                return candidate, (candidate.parent if candidate.name == "mod.rs" else directory / name)
+        return None
+
+    def compiled_on_windows(self, root, name):
+        """False if the Windows build certainly does not compile test `name` of the crate at `root`."""
+        parts = name.split("::")
+        inner, items, tokens, directory = self.file_module(root, root.parent)
+        return self.walk(root.parent, tokens, directory, inner, items, parts, True) is not False
+
+    def walk(self, path_base, tokens, directory, inner, items, parts, inherited):
+        value = tri_all([inherited, attribute_cfg(inner)])
+        if value is False:
+            return False
+        kind = "fn" if len(parts) == 1 else "mod"
+        found = [item for item in items if item[0] == kind and item[1] == parts[0]]
+        if not found:
+            return None   # generated by a macro, or outside what this reads: undecided
+        results = []
+        for _, _, attributes, body in found:
+            here = tri_all([value, attribute_cfg(attributes)])
+            if here is False or kind == "fn":
+                results.append(here); continue
+            if body is not None:   # inline module: children live in a directory named after it
+                if (id(tokens), body) not in self.parsed:
+                    self.parsed[id(tokens), body] = rust_items(tokens, *body)
+                sub_inner, sub_items = self.parsed[id(tokens), body]
+                results.append(self.walk(path_base / parts[0], tokens, directory / parts[0], sub_inner,
+                                         sub_items, parts[1:], here))
+                continue
+            path_attribute = None
+            for attr in attributes:
+                if attr[:2] == ["path", "="] and len(attr) == 3 and isinstance(attr[2], tuple):
+                    path_attribute = attr[2][1]
+            located = self.child_file(path_base, directory, path_attribute, parts[0])
+            if located is None:
+                results.append(None); continue
+            child, child_directory = located
+            sub_inner, sub_items, sub_tokens, _ = self.file_module(child, child_directory)
+            results.append(self.walk(child.parent, sub_tokens, child_directory, sub_inner, sub_items,
+                                     parts[1:], here))
+        return tri_any(results)
+
+
+def predict_win32(inventory, rules, targets, platform):
+    """Refuse, on Linux, a rule-only case that the win32 run would refuse (see above).
+
+    Raises on the first such case, in sorted order, like the win32 run; returns 0."""
+    if platform != "linux":
+        return 0
+    owners = inventory["owners"]
+    legacy = {(*group["target"], name) for group in inventory["groups"] for name in group["cases"]}
+    discovered = {(*key, name) for key, target in targets.items() for name in target["ignored"]}
+    assigned = rule_assignments(owners, rules, legacy | discovered, platform)
+    modules = RustModules()
+    for case in sorted(discovered - legacy):
+        owner = assigned.get(case)
+        if owner is None or owners[owner]["platform"] == "win32":
+            continue
+        root = targets[case[:3]].get("root")
+        if root is not None and not modules.compiled_on_windows(Path(root), case[3]):
+            continue
+        raise InventoryError(
+            f"predicted on win32: rule-only case {case} discovered on win32 cannot be verified on "
+            f"owner {owner}'s platform {owners[owner]['platform']}; "
+            "add an exact legacy entry with the right owner, or a rule for an owner "
+            "that runs on win32 (or keep the test out of the Windows build with a cfg such as "
+            "#[cfg(unix)] on it or on its module)")
+    return 0
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     try:
@@ -1130,6 +1378,7 @@ def main():
         require(isinstance(rules, dict), "ownership rules must be an object")
         targets = discover(root)
         count = validate(root, inventory, targets, sys.platform, rules)
+        predict_win32(inventory, rules, targets, sys.platform)
         legacy = {(*group["target"], name): group["owner"]
                   for group in inventory["groups"] for name in group["cases"]}
         cases = set(legacy) | {(*key, name) for key, target in targets.items() for name in target["ignored"]}

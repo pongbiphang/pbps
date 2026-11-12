@@ -187,6 +187,18 @@ portable successful mutation control. Run the integrated suite on actual
   equivalence and coverage counts; the migration test compares every legacy owner
   with the rule-plus-fallback assignment. Later cleanup may remove covered exact
   entries independently. Current PRs may still append exact entries unchanged.
+- The Linux run also predicts the win32 run's refusal of such a case
+  (`predicted on win32:`, same message). From source it decides whether the
+  Windows build compiles each rule-only `#[ignore]` test it discovers: the `cfg`
+  attributes on the function and on every enclosing `mod`, inline or file, and a
+  module file's inner `#![cfg]`, evaluated for `windows`, `unix`, `target_os` and
+  the other target predicates of the Windows runner. A predicate it cannot decide
+  (a feature, `cfg_attr`) or a test it cannot find in the source (a macro) counts
+  as compiled, so the prediction fails closed. A Linux-owned test the Windows
+  build compiles needs an exact legacy entry with an owner that runs on win32, or
+  a `cfg` that keeps it out of that build (`#[cfg(unix)]` on the test or its
+  module is the usual form). Windows-only tests and Windows-only owners stay with
+  the real win32 run, which remains the authority.
 - Register a new owner if no existing invocation can execute a case; do not assign
   a case to a convenient but unrelated fixture.
 - `validate_on` is the platform where the owner compiles and executes the case.
