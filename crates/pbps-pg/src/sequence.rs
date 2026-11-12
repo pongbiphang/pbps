@@ -18,6 +18,35 @@ use std::collections::BTreeMap;
 use pbps_dialect::DialectError;
 use pbps_model::{ColumnType, ObjectName, Schema, Sequence};
 
+/// Whether the namespace behind `$n` (a `pg_namespace` alias) is a schema the pull reads: a
+/// project's, not a system or a `pg_*` one, and one a declaration can spell. [`schema_is_held`]
+/// is the same question asked of one name in Rust, for `validate`, and a live test puts the
+/// two to the engine side by side.
+macro_rules! held_namespace {
+    ($n:literal) => {
+        concat!(
+            $n,
+            ".nspname NOT IN ('pg_catalog', 'information_schema') \
+             AND pg_catalog.left(",
+            $n,
+            ".nspname, 3) <> 'pg_' AND pg_catalog.strpos(",
+            $n,
+            ".nspname, '.') = 0"
+        )
+    };
+}
+
+/// [`held_namespace`], asked of one name in Rust.
+pub fn schema_is_held(name: &str) -> bool {
+    crate::catalog::a_projects_schema(name) && !name.contains('.')
+}
+
+/// The namespace predicate over a `pg_namespace` alias `hn`, public so a live test can ask the
+/// engine which schemas it keeps.
+pub fn held_namespace_predicate() -> &'static str {
+    held_namespace!("hn")
+}
+
 /// Whether the relation behind `$c` (a `pg_class` alias) is a sequence the pull holds.
 ///
 /// The schema is part of the predicate, not of the pull's query: a system schema, a `pg_*`
@@ -42,9 +71,9 @@ macro_rules! held {
              AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace hn \
                WHERE hn.oid = ",
             $c,
-            ".relnamespace AND hn.nspname NOT IN ('pg_catalog', 'information_schema') \
-                AND pg_catalog.left(hn.nspname, 3) <> 'pg_' \
-                AND pg_catalog.strpos(hn.nspname, '.') = 0) \
+            ".relnamespace AND ",
+            $crate::sequence::held_namespace!("hn"),
+            ") \
              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend o \
                WHERE o.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.objid = ",
             $c,
@@ -57,7 +86,7 @@ macro_rules! held {
         )
     };
 }
-pub(crate) use held;
+pub(crate) use {held, held_namespace};
 
 /// The predicate [`query`], the census and the default-sequence check share, over a `pg_class`
 /// alias `c`. Public so a live test can ask the engine whether it and the pull agree.
@@ -179,17 +208,10 @@ pub(crate) fn validate(
             accepted.end(),
             sequence.start,
         )));
-    } else {
-        let span = i128::from(*accepted.end()) - i128::from(*accepted.start());
-        if i128::from(sequence.increment).abs() > span {
-            found.push(invalid(format!(
-                "sequence `{shown}` has an increment of {} whose magnitude exceeds its span \
-                 {span} for `{}`, so no start can produce a second value",
-                sequence.increment,
-                ty.shown(),
-            )));
-        }
     }
+    // No rule about an increment larger than the span: the engine accepts it (the sequence hands
+    // out its start and then refuses), so a database can hold one, the pull reads it, and
+    // refusing it here would make a pulled declaration fail `validate` (DEC-2721.1).
     if sequence.increment == 0 {
         found.push(invalid(format!(
             "sequence `{shown}` has an increment of 0, which never advances: the engine refuses \
@@ -202,6 +224,15 @@ pub(crate) fn validate(
         if let Err(error) = crate::quote(part) {
             found.push(error);
         }
+    }
+    if !crate::catalog::a_projects_schema(&name.schema) {
+        found.push(invalid(format!(
+            "sequence `{shown}` is declared in `{schema}`, which this dialect's pull never \
+             reads: `pg_catalog`, `information_schema` and every schema whose name begins with \
+             `pg_` are excluded from the managed set, so the engine would create the sequence \
+             and no plan could ever see it again. Declare it in a project schema",
+            schema = pbps_model::escape::Escaped(&name.schema),
+        )));
     }
     if name.schema.contains('.') || name.name.contains('.') {
         found.push(invalid(format!(
@@ -341,7 +372,6 @@ mod tests {
                 "START value (40000)",
             ),
             ("down", sequence("integer", 1, -1), "START value (1)"),
-            ("span", sequence("smallint", 1, 70_000), "magnitude"),
         ] {
             let said = said("app.s", &seq, &schema);
             assert!(
@@ -386,6 +416,60 @@ mod tests {
                 "the query carries a namespace filter of its own ({filter}): {own}"
             );
         }
+    }
+
+    /// What the engine accepts and the pull therefore reads must validate, or a pulled
+    /// declaration could not be used (#2721): a step larger than the type's span is one such
+    /// shape, and the only one the rules here once refused.
+    #[test]
+    fn a_step_the_engine_accepts_beyond_the_types_span_validates() {
+        let schema = Schema::default();
+        assert_eq!(
+            said("app.stride", &sequence("smallint", 1, 40_000), &schema),
+            ""
+        );
+        assert_eq!(
+            said("app.back", &sequence("smallint", -1, -40_000), &schema),
+            ""
+        );
+        // Negative: what the engine refuses still is.
+        assert!(said("app.s", &sequence("smallint", 1, 0), &schema).contains("INCREMENT"));
+    }
+
+    /// A sequence in a schema the pull never reads is refused with the table's reasoning, and
+    /// the Rust question agrees with the SQL predicate's text on every schema it names.
+    #[test]
+    fn a_sequence_in_a_schema_the_pull_never_reads_is_refused() {
+        let schema = Schema::default();
+        for refused in [
+            "pg_catalog.s",
+            "information_schema.s",
+            "pg_toast.s",
+            "pg_temp.s",
+            "pg_custom.s",
+        ] {
+            let said = said(refused, &sequence("bigint", 1, 1), &schema);
+            assert!(
+                said.contains("which this dialect's pull never reads"),
+                "{refused}: {said}"
+            );
+        }
+        // Negatives: a project's schema, one that merely contains `pg`, and a dotted one,
+        // which is refused for its own reason.
+        assert_eq!(said("app.s", &sequence("bigint", 1, 1), &schema), "");
+        assert_eq!(said("mypg_app.s", &sequence("bigint", 1, 1), &schema), "");
+        assert!(schema_is_held("app") && schema_is_held("pgx") && schema_is_held("Public"));
+        assert!(!schema_is_held("pg_x") && !schema_is_held("information_schema"));
+        assert!(!schema_is_held("a.b"));
+        let found = validate(
+            &ObjectName::new("a.b", "s"),
+            &sequence("bigint", 1, 1),
+            &schema,
+        );
+        assert!(
+            found.iter().any(|e| e.to_string().contains("`.`")),
+            "{found:?}"
+        );
     }
 
     #[test]

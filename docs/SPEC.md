@@ -1381,6 +1381,10 @@ cache: 20
   `UNLOGGED` sequence, a package's, and one with a `.` in its schema or name
   are not held: the census names them and the pull leaves them out. A
   temporary sequence belongs to one session and is no part of the database.
+  A sequence declared in `pg_catalog`, `information_schema` or a `pg_*` schema is
+  refused, as a table is: the pull never reads those schemas. What the pull reads
+  always validates, a step larger than the type's span included (the engine
+  accepts one).
   The sequence shares its schema's namespace with tables, views, indexes and
   the indexes behind named keys, so `validate` refuses one of those of the same
   name in the same schema.

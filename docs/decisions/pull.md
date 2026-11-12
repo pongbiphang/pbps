@@ -1401,8 +1401,16 @@ the parts that follow, and SQL Server's sequences in the last.
 - **Validation** (`pbps-pg`, offline): a smallint, integer or bigint, with the engine's own
   rules for the start, the increment and the options as a column's sequence has them (a bound
   spelled as its default is refused so each sequence has one spelling), and a name the engine
-  would not truncate. SQL Server refuses the file by name (`validate_sequence`), so it is never
-  ignored.
+  would not truncate, in a schema the pull reads (the table's and the type's check, and
+  nothing a dotted name could spell). **What the pull reads always validates**: held means
+  held, and nothing between the read and the written files drops a sequence silently. The one
+  rule the first cut had that the engine does not share, a step larger than the type's span
+  (the engine accepts `smallint INCREMENT BY 40000`; it hands out its start and then
+  refuses), is not made for a standalone sequence: refusing it would have made a pulled
+  declaration fail `validate` with the default-sequence limitation already suppressed. A
+  declaration the dialect does refuse is still left out of a pull by name, with the consequence
+  for the defaults that call it, as for any object. SQL Server refuses the file by name
+  (`validate_sequence`), so it is never ignored.
 - **The differ refuses every difference by name**, attribute by attribute, as it did for
   exclusions and text search: a declared sequence the target lacks, or holds with another type,
   start, increment, bound, cycle or cache. There is no `Change` and no plan bump. A sequence the
@@ -1432,7 +1440,9 @@ the parts that follow, and SQL Server's sequences in the last.
 - **One predicate, with the namespace in it.** The exclusion of system and `pg_*` schemas is
   in the predicate the pull, the census and the default-sequence check share, and the pull's
   query carries no filter of its own, so none of them can call a sequence model-owned that
-  the pull does not declare.
+  the pull does not declare. `validate` asks the same question of a declaration's schema in Rust
+  (`schema_is_held`, the table's `a_projects_schema` and no dot), and a live test puts the two
+  to the engine side by side on every schema the cluster has.
 - **Coverage (#168).** `pg_sequence` was already held per column; the census row for a
   standalone sequence is now held by the same macro the pull uses.
 

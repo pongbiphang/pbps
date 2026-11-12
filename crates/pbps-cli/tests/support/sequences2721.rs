@@ -27,7 +27,9 @@ fn fixture(server: &str, slug: &str) -> Fixture {
 const MADE: &str = "\
     CREATE SEQUENCE app.order_no AS integer START 100 INCREMENT 5 MINVALUE 100 MAXVALUE 999999 CYCLE CACHE 20; \
     CREATE SEQUENCE app.plain; \
-    CREATE TABLE app.orders (id integer PRIMARY KEY DEFAULT nextval('app.order_no'), note text)";
+    CREATE SEQUENCE app.stride AS smallint INCREMENT BY 40000; \
+    CREATE TABLE app.orders (id integer PRIMARY KEY DEFAULT nextval('app.order_no'), note text, \
+      step smallint DEFAULT nextval('app.stride'))";
 
 /// The sequence files under `schema/`, by name, with their text.
 fn sequence_files(f: &Fixture) -> BTreeMap<String, String> {
@@ -84,8 +86,12 @@ fn a_database_with_standalone_sequences_pulls_again_with_no_difference_and_advan
         let names: Vec<&str> = files.keys().map(String::as_str).collect();
         assert_eq!(
             names,
-            ["app.order_no.sequence.yml", "app.plain.sequence.yml"],
-            "the sequences the user made, and none a column owns"
+            [
+                "app.order_no.sequence.yml",
+                "app.plain.sequence.yml",
+                "app.stride.sequence.yml"
+            ],
+            "the sequences the user made, a step beyond the type's span included, and none a column owns"
         );
         assert_eq!(
             files["app.order_no.sequence.yml"],
@@ -98,6 +104,10 @@ fn a_database_with_standalone_sequences_pulls_again_with_no_difference_and_advan
         );
         let table = std::fs::read_to_string(f.d.dir.join("schema/app.orders.yml")).unwrap();
         assert!(table.contains("nextval("), "{table}");
+        // What the pull wrote validates: no pulled sequence is dropped on the way, so the
+        // table defaults that call them have something to call.
+        succeeds(f.d.run(&["validate"]));
+        assert!(!said(&out).contains("was left out"), "{}", said(&out));
         // The same bytes the second time.
         pull(&f);
         assert_eq!(sequence_files(&f), files);

@@ -3,7 +3,7 @@
 //! the catalog really holds. Each case runs in a database of its own.
 use super::{sqlstate, text, truth};
 use pbps_db::{Conn, Driver};
-use pbps_pg::sequence::{decode, held_predicate, query};
+use pbps_pg::sequence::{decode, held_namespace_predicate, held_predicate, query, schema_is_held};
 
 const SERVERS: [&str; 2] = ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"];
 
@@ -193,6 +193,7 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
                 CREATE SEQUENCE counted AS integer START 100 INCREMENT 5 MINVALUE 100 MAXVALUE 999999 CYCLE CACHE 20; \
                 CREATE SEQUENCE countdown AS smallint INCREMENT -1; \
                 CREATE SEQUENCE big START 7; \
+                CREATE SEQUENCE stride AS smallint INCREMENT BY 40000; \
                 CREATE SEQUENCE \"Mixed Case\"").await;
         // Not held: owned by a column in each of the three ways, unlogged, a package's, a
         // temporary one (this connection's own session), and one the model cannot spell.
@@ -230,7 +231,8 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
                 "app.big",
                 "app.countdown",
                 "app.counted",
-                "app.plain"
+                "app.plain",
+                "app.stride"
             ],
             "the model's sequences and nothing a column or a package owns"
         );
@@ -252,6 +254,36 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
             "a descending default is no bound"
         );
         assert_eq!(get("big").start, 7);
+        // A step the engine accepts beyond the type's span is read, and validates: what the pull
+        // reads must be usable as a declaration.
+        let stride = get("stride");
+        assert_eq!((stride.start, stride.increment), (1, 40_000));
+        for (name, sequence) in &held {
+            let refused = pbps_dialect::Dialect::validate_sequence(
+                &pbps_pg::Postgres::new(),
+                name,
+                sequence,
+                &pbps_model::Schema::default(),
+            );
+            assert!(refused.is_empty(), "{}: {refused:?}", name.raw());
+        }
+        // The Rust question `validate` asks of a schema is the SQL predicate's, on every schema
+        // the cluster has and on one with a dot in its name.
+        db.run("CREATE SCHEMA \"mypg_app\"").await;
+        let kept = db
+            .one(&format!(
+                "SELECT COALESCE(string_agg(hn.nspname, ',' ORDER BY hn.nspname), '') \
+                 FROM pg_namespace hn WHERE {}",
+                held_namespace_predicate()
+            ))
+            .await;
+        let all = db
+            .one("SELECT string_agg(nspname, ',' ORDER BY nspname) FROM pg_namespace")
+            .await;
+        let in_rust: Vec<&str> = all.split(',').filter(|n| schema_is_held(n)).collect();
+        let in_sql: Vec<&str> = kept.split(',').filter(|n| !n.is_empty()).collect();
+        assert_eq!(in_sql, in_rust, "validate and the pull agree about schemas");
+        assert!(in_sql.contains(&"mypg_app") && !in_sql.contains(&"pg_catalog"));
         db.finish().await;
     }
 }

@@ -385,7 +385,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
     for (name, why) in refused_sequences {
         schema.sequences.remove(&name);
         pulled.warnings.push(format!(
-            "sequence `{name}` was left out: `pbps validate` refuses its declaration — {}",
+            "sequence `{name}` was left out: `pbps validate` refuses its declaration — {}; a \
+             table default that calls it now names an object the declarations do not hold",
             why.join("; "),
             name = name.shown()
         ));
@@ -1250,10 +1251,15 @@ mod tests {
             .schema
             .sequences
             .insert("app.ok".parse().unwrap(), sequence("bigint", 1));
+        pulled.schema.sequences.insert(
+            pbps_model::ObjectName::new("app", "a.b"),
+            sequence("smallint", 1),
+        );
+        // The step beyond a type's span, which the engine accepts, is kept (it validates).
         pulled
             .schema
             .sequences
-            .insert("app.huge".parse().unwrap(), sequence("smallint", 70_000));
+            .insert("app.stride".parse().unwrap(), sequence("smallint", 40_000));
         leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
         let kept: Vec<String> = pulled
             .schema
@@ -1261,10 +1267,10 @@ mod tests {
             .keys()
             .map(|n| n.raw().to_string())
             .collect();
-        assert_eq!(kept, ["app.ok"]);
+        assert_eq!(kept, ["app.ok", "app.stride"]);
         let warned = pulled.warnings.join("\n");
         assert!(
-            warned.contains("sequence `app.huge` was left out") && warned.contains("70000"),
+            warned.contains("sequence `app.a.b` was left out") && warned.contains("`.`"),
             "{warned}"
         );
         // Negative: the kept one raises nothing.
