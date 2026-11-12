@@ -914,9 +914,7 @@ fn surviving_keys(
     pbps_dialect::name_read_sequences(&mut base, crate::dialect_for(declared.dialect).as_ref());
     let mut hints = loaded.hints.clone();
     hints.record_row_defaults(&snapshot.schema);
-    hints
-        .annotations
-        .record(snapshot.object_deps.to_deps());
+    hints.annotations.record(snapshot.object_deps.to_deps());
     // Compared as written, a declared default collation would rebuild its
     // column here and nowhere in the real plan, and the unchanged key around it
     // would lose a demand the delete guard needs (#1511).

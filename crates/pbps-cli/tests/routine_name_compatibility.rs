@@ -14,7 +14,6 @@ use pbps_model::{
 #[path = "../src/declaration_file.rs"]
 mod declaration_file;
 
-
 const NAME: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
@@ -88,10 +87,11 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         ChangeSet { changes },
         ids.clone(),
     );
-    plan.module_deps.insert(view, [routine].into());
+    plan.object_deps =
+        pbps_model::object_ref::ObjectEdges::from_legacy(&[(view, [routine].into())].into());
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.object_deps = pbps_model::object_ref::ObjectEdges::from_legacy(&plan.module_deps);
+    state.object_deps = plan.object_deps.clone();
     state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
@@ -133,7 +133,11 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
                 pbps_load::fmt::render_module(
                     id,
                     module,
-                    plan.module_deps.get(id).unwrap_or(&Default::default()),
+                    plan.object_deps
+                        .to_deps()
+                        .modules()
+                        .get(id)
+                        .unwrap_or(&Default::default()),
                     false,
                 )
             })
@@ -154,26 +158,29 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         std::fs::remove_dir_all(dir).unwrap();
         // Keep the captured artifact bytes at their historical versions;
         // the CLI invocation above still exercises today's applicable plan.
+        // The captured plan carries its edge as `module_deps`, which no current
+        // struct writes (DEC-2469.7), so it is historical input and not output:
+        // its checksum is read from the capture, and that a plan of that format
+        // is refused by its version is pinned in `saved_plan_version.rs`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/name-compatibility/routines")
+            .join(dialect.name());
+        let historical_checksum = std::fs::read_to_string(root.join("plan.sha256")).unwrap();
         plan.version = 42;
         state.version = 25;
-        state.plan_checksum = Some(plan.wire_fingerprint());
+        state.plan_checksum = Some(historical_checksum.clone());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
-            ("plan.json", serde_json::to_string(&plan).unwrap()),
             ("state.sha256", state_checksum(&schema, &state.ids)),
-            ("plan.sha256", plan.wire_fingerprint()),
             ("statements.sql", sql),
             ("filenames.txt", files),
             ("declarations.yml", yaml),
             ("explain.json", String::from_utf8(explain.stdout).unwrap()),
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/name-compatibility/routines")
-            .join(dialect.name());
         for (name, actual) in outputs {
             let expected = std::fs::read_to_string(root.join(name)).unwrap();
             let expected = if name == "explain.json" {
-                expected.replace(&plan.wire_fingerprint(), &current_checksum)
+                expected.replace(&historical_checksum, &current_checksum)
             } else {
                 expected
             };
@@ -187,10 +194,8 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         // `module_deps`, which no current struct can write, so it is read and
         // must convert to the edge the fixture builds (DEC-2469.7).
         assert_eq!(
-            StateSnapshot::from_json(
-                &std::fs::read_to_string(root.join("state.json")).unwrap()
-            )
-            .unwrap(),
+            StateSnapshot::from_json(&std::fs::read_to_string(root.join("state.json")).unwrap())
+                .unwrap(),
             state
         );
         let (_, mut ordinary, _) = artifacts("ordinary", dialect);
