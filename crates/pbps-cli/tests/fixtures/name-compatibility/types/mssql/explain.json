@@ -10,13 +10,13 @@
     "created_at": "2026-10-22T00:00:00Z",
     "baseline": "type-name master fixture",
     "mode": "transactional",
-    "checksum": "ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772",
+    "checksum": "793f5385d12bc57e5d6dc478990396ba2645c64b5ed4c96c7940a60293ec8e6b",
     "change_count": 3,
     "table_count": 1,
     "module_count": 0,
     "role_count": 0,
     "risks": [],
-    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772",
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 793f5385d12bc57e5d6dc478990396ba2645c64b5ed4c96c7940a60293ec8e6b",
     "probes": [],
     "unchecked": [
       {
