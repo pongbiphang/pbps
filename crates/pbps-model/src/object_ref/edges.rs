@@ -134,19 +134,37 @@ impl ObjectEdges {
 
 impl<'de> Deserialize<'de> for ObjectEdges {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        // Each edge is read alone so that a bad one is named by its position;
-        // a bare serde message would say only that something in the list was
-        // wrong.
-        let raw = Vec::<serde_json::Value>::deserialize(d)?;
-        let edges = raw
-            .into_iter()
-            .enumerate()
-            .map(|(at, value)| {
-                serde_json::from_value::<ObjectEdge>(value)
-                    .map_err(|e| D::Error::custom(format!("`object_deps` edge {at}: {e}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_wire(edges).map_err(D::Error::custom)
+        use serde::de::{Error, SeqAccess, Visitor};
+        /// Reads the list one edge at a time, so that a bad one is named by
+        /// its position; a bare serde message would say only that something in
+        /// the list was wrong.
+        ///
+        /// Each edge is read straight from the input and never through a
+        /// generic JSON value. A value keeps the last of two members with one
+        /// name, so a repeated member would be gone before the typed readers
+        /// that refuse it ran.
+        struct Edges;
+        impl<'de> Visitor<'de> for Edges {
+            type Value = Vec<ObjectEdge>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of `object_deps` edges")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut edges = Vec::new();
+                loop {
+                    let at = edges.len();
+                    match seq.next_element::<ObjectEdge>() {
+                        Ok(Some(edge)) => edges.push(edge),
+                        Ok(None) => return Ok(edges),
+                        Err(e) => {
+                            return Err(A::Error::custom(format!("`object_deps` edge {at}: {e}")));
+                        }
+                    }
+                }
+            }
+        }
+        Self::from_wire(d.deserialize_seq(Edges)?).map_err(D::Error::custom)
     }
 }
