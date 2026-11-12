@@ -1252,7 +1252,8 @@ class LiveExecution(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = self.fixture_names(runner, "lane.", ".fixture")
                 self.assertEqual(self.started_names(calls), expected)
-                self.assertEqual({c[2] for c in calls if c[:2] == ["docker", "exec"]},
+                self.assertEqual({c[3] if c[2] == "-i" else c[2]
+                                  for c in calls if c[:2] == ["docker", "exec"]},
                                  set(expected))
                 validators = [c for c in calls if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
                 checked = [c[c.index("--container") + 1] for c in validators]
@@ -1266,7 +1267,8 @@ class LiveExecution(unittest.TestCase):
                                     key, key.removesuffix("_NAME") + "_PORT")
                     self.assertEqual(call[call.index("--port") + 1], ports[port_key])
                 if runner == "pg":
-                    installs = [c[2] for c in calls if c[:2] == ["docker", "exec"]
+                    # `-i` precedes the container: the script arrives on stdin.
+                    installs = [c[3] for c in calls if c[:3] == ["docker", "exec", "-i"]
                                 and "partman" in " ".join(c)]
                     self.assertCountEqual(installs, expected[:2])
                     self.assertTrue(environments)
@@ -1540,7 +1542,8 @@ elif command[:2] != ["docker", "run"] and command[0] != "python3":
                                   if c[:2] == ["docker", "run"]]
                         expected = [scratch] if reuse else [name, scratch]
                         self.assertEqual(starts, expected)
-                        self.assertEqual({c[2] for c in calls if c[:2] == ["docker", "exec"]},
+                        self.assertEqual({c[3] if c[2] == "-i" else c[2]
+                                  for c in calls if c[:2] == ["docker", "exec"]},
                                          {name, scratch})
                         validators = [c[c.index("--container") + 1] for c in calls
                                       if c[0] == "python3"]
@@ -1730,11 +1733,16 @@ elif command[0] != 'sleep':
         # pg_partman (#1533) goes onto the two servers the flow cases use,
         # once each is ready and before any client runs; never the scratch.
         last_probe = max(i for i, c in enumerate(calls) if c[3:4] == ["pg_isready"])
-        installs = [(i, c[2]) for i, c in enumerate(calls)
-                    if c[:2] == ["docker", "exec"] and "partman" in " ".join(c)]
+        installs = [(i, c[3]) for i, c in enumerate(calls)
+                    if c[:3] == ["docker", "exec", "-i"] and "partman" in " ".join(c)]
         # In either order: the two run at once.
         self.assertCountEqual([name for _, name in installs], ["pbps-test-pg", "pbps-test-pg16"])
         self.assertTrue(all(last_probe < i < first_client for i, _ in installs), installs)
+        # Each goes through the shared script, never `apt-get install`, which
+        # would upgrade the server already running in the fixture (#2835).
+        for i, name in installs:
+            self.assertEqual(calls[i][:6], ["docker", "exec", "-i", name, "sh", "-s"], calls[i])
+            self.assertNotIn("apt-get", " ".join(calls[i]))
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],
@@ -1824,6 +1832,66 @@ elif command[0] not in ("cargo", "python3", "sleep"):
             self.cargo_images = [json.loads(line) for line in images.read_text().splitlines()] \
                 if images.exists() else []
             return result, calls
+
+class PartmanInstall(unittest.TestCase):
+    """scripts/install-pg-partman.sh must never move the running server (#2835)."""
+
+    def run_script(self, *, installed=False, server_after="18.6-1"):
+        # The package tools are replaced by logging stubs; the real shell
+        # control flow of the script is what runs.
+        package = "postgresql-18-partman"
+        with tempfile.TemporaryDirectory(prefix="pbps-partman-") as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            work = root / "work"
+            work.mkdir()
+            stub = textwrap.dedent("""\
+                #!/bin/sh
+                echo "$(basename "$0") $*" >> "$PARTMAN_LOG"
+                case "$(basename "$0") $1" in
+                  "dpkg -s") [ -n "$PARTMAN_INSTALLED" ] || exit 1 ;;
+                  "dpkg-query -W")
+                    if [ -e "$PARTMAN_DIR/unpacked" ]; then echo "$2 $PARTMAN_AFTER"
+                    else echo "$2 18.6-1"; fi ;;
+                  "dpkg --force-depends") touch "$PARTMAN_DIR/unpacked" ;;
+                  "apt-get download") touch "$3_1.0_amd64.deb" ;;
+                esac
+                exit 0
+                """)
+            for name in ("dpkg", "dpkg-query", "apt-get"):
+                (bin_dir / name).write_text(stub)
+                (bin_dir / name).chmod(0o755)
+            env = os.environ | {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "TMPDIR": str(work),
+                "PARTMAN_LOG": str(root / "log"),
+                "PARTMAN_DIR": str(root),
+                "PARTMAN_AFTER": server_after,
+                "PARTMAN_INSTALLED": "1" if installed else "",
+            }
+            result = subprocess.run(["sh", str(ROOT / "scripts/install-pg-partman.sh"), package],
+                                    env=env, text=True, capture_output=True)
+            log = (root / "log").read_text().splitlines() if (root / "log").exists() else []
+            return result, log
+
+    def test_unpacks_the_downloaded_package_without_apt_resolving_dependencies(self):
+        result, log = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt-get download -qq postgresql-18-partman", log)
+        self.assertFalse(any(c.startswith("apt-get") and " install" in c for c in log), log)
+        self.assertIn("dpkg --force-depends -i postgresql-18-partman_1.0_amd64.deb", log)
+
+    def test_fails_when_the_server_package_version_moved(self):
+        result, _ = self.run_script(server_after="18.7-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed the server package", result.stderr)
+
+    def test_does_nothing_when_the_package_is_already_installed(self):
+        result, log = self.run_script(installed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in log if not c.startswith("dpkg -s")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -711,14 +711,15 @@ jobs:
       # new one that changed it would fail them, which is the point.
       # Both at once, each `wait`ed on by its own pid so either failing
       # fails the step: the two downloads, not the work, are the cost.
+      # Through scripts/install-pg-partman.sh, never `apt-get install`: apt
+      # would upgrade the pinned server underneath its running process (#2835).
       - name: Install pg_partman on both servers
         if: startsWith(matrix.suite, 'flow-')
         run: |
           set -euo pipefail
           pids=()
           for c in ${{ job.services.postgres.id }}:18 ${{ job.services.postgres-old.id }}:16; do
-            docker exec "${c%%:*}" sh -c "apt-get update -qq && \
-              apt-get install -y -qq --no-install-recommends postgresql-${c##*:}-partman" &
+            docker exec -i "${c%%:*}" sh -s -- "postgresql-${c##*:}-partman" < scripts/install-pg-partman.sh &
             pids+=($!)
           done
           for pid in "${pids[@]}"; do wait "$pid"; done

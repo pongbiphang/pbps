@@ -304,6 +304,10 @@ test('every flow share has the full-list CI entry and both servers and packages'
   assert.ok(installed);
   assert.match(installed, /job\.services\.postgres\.id.*:18/);
   assert.match(installed, /job\.services\.postgres-old\.id.*:16/);
+  // The install must not let apt upgrade the running server (#2835); the
+  // script that does the work is pinned in live_test_runners_test.py.
+  assert.doesNotMatch(installed, /apt-get/);
+  assert.match(installed, /sh -s -- "postgresql-.*-partman" < scripts\/install-pg-partman\.sh/);
   // The job context is available in step env, not job env (GitHub rejects the latter).
   assert.doesNotMatch(block.split('    steps:\n')[0],
     /^\s*PBPS_TEST_PG_(?:OLD_)?CONTAINER:/m);
