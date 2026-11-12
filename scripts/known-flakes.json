@@ -79,20 +79,6 @@
       ],
       "issue": 2652,
       "expires": "2026-12-02"
-    },
-    {
-      "test": "resolver::server::scratch::live_tests::docker2410_tests::a_container_that_has_exited_is_removed_at_once",
-      "cargo": [
-        "test",
-        "--profile",
-        "live-test",
-        "-p",
-        "pbps-cli",
-        "--lib",
-        "--"
-      ],
-      "issue": 2807,
-      "expires": "2026-12-10"
     }
   ]
 }
