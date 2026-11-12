@@ -2014,8 +2014,8 @@ pub fn before_its_partitions_indexes(
     // passing it.
     let mut held: Vec<(usize, usize)> = Vec::new();
     for &(k, j) in adoptions.iter().filter(|(k, j)| j < k) {
-        for c in j + 1..k {
-            if !crossable(&cs.changes[c].change) {
+        for (c, carried) in cs.changes.iter().enumerate().take(k).skip(j + 1) {
+            if !crossable(&carried.change) {
                 schedule.edge(c, k, Source::Effect, OrderReason::Structural);
                 held.push((k, c));
             }

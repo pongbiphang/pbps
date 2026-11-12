@@ -89,10 +89,11 @@ done
 # pg_partman for `partitions: external` (#1533), as ci.yml installs it: the
 # cases create the extension in a database of their own.
 # Both at once, each waited on so either failing stops the run.
+# Through scripts/install-pg-partman.sh, never `apt-get install`: apt would
+# upgrade the pinned server underneath its running process (#2835).
 partman_pids=()
 for fixture in "$NAME:18" "$OLD_NAME:16"; do
-    docker exec "${fixture%%:*}" sh -c "dpkg -s postgresql-${fixture##*:}-partman >/dev/null 2>&1 || \
-        { apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-${fixture##*:}-partman; }" >/dev/null &
+    docker exec -i "${fixture%%:*}" sh -s -- "postgresql-${fixture##*:}-partman" < scripts/install-pg-partman.sh >/dev/null &
     partman_pids+=($!)
 done
 for pid in "${partman_pids[@]}"; do wait "$pid"; done

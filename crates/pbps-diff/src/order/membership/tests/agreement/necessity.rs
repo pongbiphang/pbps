@@ -484,13 +484,13 @@ fn restoration_edges_keep_physical_birth_preconditions() {
 fn restoration_write_order_applies_only_to_the_same_physical_cell() {
     let mut f = base(2);
     member(&mut f, 0, 1);
-    for at in 0..2 {
+    for (at, fx) in f.fx.iter_mut().enumerate().take(2) {
         let mut r = restoration(0, 1, 0);
         if let Clause::Restore(r) = &mut r {
             r.property = properties()[at].clone();
             r.member_of = Some(tables()[0].clone());
         }
-        f.fx[at].symbolic.push(r);
+        fx.symbolic.push(r);
     }
     assert!(f.graph().edges.is_empty());
     sound(&f);
