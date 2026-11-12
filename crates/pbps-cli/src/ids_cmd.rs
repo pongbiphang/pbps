@@ -222,6 +222,11 @@ fn read_tree(project: &Project) -> anyhow::Result<BTreeMap<String, String>> {
 // --------------------------------------------------------------- migrate ----
 
 fn migrate(project: &Project) -> anyhow::Result<()> {
+    // Before any path that writes: the write loop creates `ids_dir` and
+    // `create_dir_all` follows a linked parent out of the project, and the
+    // config write names a tree git does not track. The interrupted-run path
+    // below writes only the config, so it needs the check too (#2804).
+    crate::ids_store::refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     let dirs = Dirs::of(project);
     let tree = read_tree(project)?;
     let Some(ids) = crate::read_legacy_ids_opt(project)? else {
@@ -276,9 +281,6 @@ fn migrate(project: &Project) -> anyhow::Result<()> {
         );
     }
     let config = new_config_text(project)?;
-    // Before the first change on disk: the write loop creates `ids_dir`, and
-    // `create_dir_all` follows a linked parent out of the project (#2804).
-    crate::ids_store::refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     for (rel, text) in &files {
         if tree.get(rel) != Some(text) {
             write_atomic(&project.ids_dir().join(rel), text)?;

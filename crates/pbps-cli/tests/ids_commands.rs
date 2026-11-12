@@ -1180,6 +1180,29 @@ fn migrate_refuses_a_linked_identity_parent_and_changes_nothing() {
     );
 }
 
+/// An interrupted migration: the tree stands, the old file is gone, and
+/// `pbps.yml` still names `ids_file`.
+#[cfg(unix)]
+fn interrupted_migration_in(sub: &str) -> Project {
+    let p = migrated_in(sub);
+    p.write("pbps.yml", "dialect: postgres\nids_file: schema.ids.json\n");
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupted_migrate_with_a_linked_identity_parent_is_refused_and_pbps_yml_is_untouched() {
+    let p = interrupted_migration_in("proj");
+    link_ids_parent(&p);
+    let config = p.read("pbps.yml");
+    assert_refused(&p.pbps(&["ids", "migrate"]), LINK_REFUSAL);
+    assert_eq!(p.read("pbps.yml"), config);
+    // Negative: the same interrupted run behind an ordinary `.pbps` finishes.
+    let q = interrupted_migration_in("proj");
+    assert_ok(&q.pbps(&["ids", "migrate"]));
+    assert!(q.read("pbps.yml").contains("ids_dir: .pbps/ids"));
+}
+
 #[cfg(unix)]
 #[test]
 fn fmt_refuses_a_linked_identity_parent_but_check_still_reads() {
