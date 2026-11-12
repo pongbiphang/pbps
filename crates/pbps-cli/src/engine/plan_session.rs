@@ -17,8 +17,10 @@
 //! declared schema, the recorded baseline, the dialect, the diff hints), and
 //! the change set changes type when the schedule runs. A position is therefore
 //! the place where a cluster of engine steps sits today, called where it sits
-//! today. This module holds the positions before the resolver block; the later
-//! ones are further methods of the same trait.
+//! today. This module holds the positions before the resolver block and the ones
+//! inside the planning transaction (the pre-schedule reads, the schedule, the
+//! catalog reorders and the final-order checks); the later ones are further
+//! methods of the same trait.
 //!
 //! # Rules every position follows
 //!
@@ -84,6 +86,72 @@ pub(crate) struct StandingNotValid {
     pub check: String,
     /// The statement that validates it, for a person to run.
     pub remedy: String,
+}
+
+/// The one admission rule of every site that runs code the plan holds
+/// (DEC-2563.2), shared by the positions that vet.
+///
+/// Its type is still defined in `pbps-pg`; the alias is the single name the
+/// positions use, so that moving it is a change here and in `pins.rs`, not in
+/// every signature. SQL Server's positions ignore it.
+pub(crate) type SiteAdmission = pbps_pg::admission::Admission;
+
+/// The members of the roles a plan drops, as the schedule takes them.
+pub(crate) type RoleMembers = crate::dependents::schedule::RoleMembers;
+
+/// What the positions inside the planning transaction read of the plan
+/// besides its change set: the sides it compares and the facts the pipeline
+/// has settled by then. Copied into every position, so that a position names
+/// what it reads and nothing else of the pipeline's locals.
+#[derive(Clone, Copy)]
+pub(crate) struct Frame<'a> {
+    /// The target's label, for the refusals that name it.
+    pub label: &'a str,
+    /// The recorded state against the identities the plan resolved: what the
+    /// plan changes from.
+    pub recorded: pbps_diff::Side<'a>,
+    /// The declarations as written (spelling already settled by the engine's
+    /// own read) against the same identities.
+    pub written: pbps_diff::Side<'a>,
+    /// The declarations overlaid on the read-back, against the recorded
+    /// identities: the base the differ compared.
+    pub base: pbps_diff::Side<'a>,
+    /// The declarations as compared, against the resolved identities.
+    pub declared: pbps_diff::Side<'a>,
+    /// The hints every diff of this plan was made with.
+    pub hints: &'a pbps_model::Hints,
+    /// The newest recorded snapshot, role renames applied.
+    pub baseline: &'a StateSnapshot,
+}
+
+/// What a position inside the transaction reads before the schedule, which
+/// neutral code then writes into the plan or plans again around.
+#[derive(Debug, Default)]
+pub(crate) struct ScheduleReads {
+    /// The members of every role the plan drops; `None` when it drops none.
+    pub role_members: Option<RoleMembers>,
+    /// The modules the plan must rebuild around the enums it rebuilds and
+    /// does not yet.
+    pub enum_rebuild: BTreeSet<pbps_model::ModuleId>,
+}
+
+/// What the catalog reorders settled, for the neutral code after them.
+#[derive(Debug, Default)]
+pub(crate) struct Ordered {
+    /// Whether the engine verified the order it saved (a table rebuild's
+    /// verifier ran), which the debug observer then does not repeat.
+    pub verified: bool,
+    /// The name facts the order was settled from, for the debug observer.
+    pub facts: Option<pbps_dialect::slots::CatalogFacts>,
+}
+
+/// The rows and the answer of the checks that read the final order.
+#[derive(Debug)]
+pub(crate) struct FinalOrderChecks {
+    pub rebuilds: ConnectedCheck,
+    pub drop_blockers: ConnectedCheck,
+    pub logical_slots: ConnectedCheck,
+    pub numbered_column_fills: ConnectedCheck,
 }
 
 /// The engine's steps of a connected plan, at the positions of the pipeline.
@@ -289,6 +357,171 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     ) -> anyhow::Result<bool> {
         defaults::type_review(self.name(), trusted, pin_routines)
     }
+
+    /// Refuses a name this plan creates that the target already uses outside
+    /// what the project records (#316, #320, #323, DEC-316.1). Asked before
+    /// anything is checked against the plan, and before the planning
+    /// transaction opens.
+    ///
+    /// Neutral when the plan creates no relation name; refuses when it does
+    /// and the engine has no step to ask the namespace. An engine that asks
+    /// it later, with the passes that order the plan, overrides this to
+    /// accept (SQL Server, #1077).
+    fn refuse_occupied_relation_names(
+        &self,
+        changes: &ChangeSet,
+        _scoped: &pbps_diff::Scoped,
+        _unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+        _unmanaged_relations: &[TableName],
+        _label: &str,
+    ) -> anyhow::Result<()> {
+        defaults::occupied_relation_names(self.name(), changes)
+    }
+
+    /// Refuses a plan whose rebuilds need the transaction a staged run does
+    /// not have. Asked once before the planning transaction opens, over the
+    /// plan as given, and again after the passes, over what the dependents
+    /// added (a rebuild the plan now synthesizes needs the transaction as
+    /// much as one it was given).
+    ///
+    /// The table rebuild and the closing `PUBLIC` revoke are refused for every
+    /// engine; the default also refuses a staged module rebuild, because the
+    /// engine has no step that preserves a replaced module's catalog state
+    /// across commits.
+    fn require_transactional_rebuilds(
+        &self,
+        changes: &ChangeSet,
+        staged: bool,
+    ) -> anyhow::Result<()> {
+        defaults::transactional_rebuilds(self.name(), changes, staged)
+    }
+
+    /// Reads the target's names in the planning transaction, orders the
+    /// moves the plan carries after what holds their names, and refuses what
+    /// is left: the names the plan creates or takes, an `UNLOGGED` partition
+    /// under a parent a permanent table references, a table made unlogged
+    /// while a publication names it (#951, #1595, #1489). What it read stays
+    /// in [`Self::State`] for [`Self::order_by_catalog`], which orders and
+    /// checks again once the schedule may have planned the revision afresh.
+    ///
+    /// Neutral when the plan creates or renames no name and makes nothing
+    /// unlogged; refuses when it does and the engine has no step for it.
+    async fn check_names_against_catalog<S: Clone>(
+        &self,
+        _state: &mut Self::State,
+        _conn: &mut Conn,
+        changes: &mut PlanningPlan<S>,
+        _frame: Frame<'_>,
+        _staged: bool,
+    ) -> anyhow::Result<()> {
+        defaults::catalog_names(self.name(), changes)
+    }
+
+    /// Reads, inside the planning transaction and before the schedule, what
+    /// the schedule needs and the plan cannot see: the members of the roles
+    /// it drops, written into the plan by name so the artifact the gate
+    /// approves lists who is removed (ADR-0005), and the modules a rebuilt
+    /// enum's columns carry (DEC-1635.7). A non-empty second answer makes
+    /// the pipeline plan again, so it is returned and not kept.
+    ///
+    /// Neutral when the plan drops no role and rebuilds no enum; refuses
+    /// when it does and the engine has no step for it.
+    async fn read_before_schedule(
+        &self,
+        _conn: &mut Conn,
+        changes: &ChangeSet,
+        _declared: &Schema,
+        _recorded_ids: &IdsFile,
+    ) -> anyhow::Result<ScheduleReads> {
+        defaults::schedule_reads(self.name(), changes)?;
+        Ok(ScheduleReads::default())
+    }
+
+    /// Schedules the plan: reads what depends on every module it drops and
+    /// puts each dependent on the right side of the drop (#314), or expands a
+    /// table rebuild, and brings the plan to its canonical form. Returns the
+    /// scheduled plan and the `module_dependents` (or `blocking_rewrite`)
+    /// row.
+    ///
+    /// `again` plans the same revision again with the given unchanged modules
+    /// rebuilt: a catalog fact read here can force a second diff, and the
+    /// pipeline owns the diff. It refuses when a resolver's answer would be
+    /// dropped by planning again.
+    ///
+    /// Neutral (an `not_applicable` row) when the plan drops no module and
+    /// rebuilds no table; refuses when it does and the engine has no step for
+    /// it.
+    #[allow(clippy::too_many_arguments)]
+    async fn schedule<S: pbps_diff::order::RouteState<Self>>(
+        &self,
+        _state: &mut Self::State,
+        _conn: &mut Conn,
+        _admission: &SiteAdmission,
+        changes: PlanningPlan<S>,
+        frame: Frame<'_>,
+        role_members: Option<&RoleMembers>,
+        _again: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
+    ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
+        defaults::module_dependents(self.name(), &changes)?;
+        let (declarations, read) = defaults::scheduled_inputs(
+            frame.written.schema,
+            crate::dependents::Sources {
+                before: frame.recorded,
+                after: frame.written.ids,
+            },
+            &frame.hints.annotations,
+            role_members,
+        );
+        let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &read, self)?;
+        Ok((
+            scheduled.changes,
+            defaults::not_applicable(self.name(), "module_dependents", "the plan drops no module"),
+        ))
+    }
+
+    /// The passes that order the plan from what the catalog holds, last of
+    /// the passes that order it, so that what they settle is what is checked
+    /// and saved: a generated column's inputs (DEC-1316.1), a computed
+    /// column's function drops (DEC-1431.1, #1459), the names the plan
+    /// creates or moves (#1366), the carried moves again over the same
+    /// reads (#1767), and the verifier of a table rebuild (#1954).
+    ///
+    /// Neutral when the plan has nothing those passes order; refuses when it
+    /// does and the engine has no step for it.
+    async fn order_by_catalog<S: Clone>(
+        &self,
+        _state: &mut Self::State,
+        _conn: &mut Conn,
+        changes: &mut PlanningPlan<S>,
+        frame: Frame<'_>,
+    ) -> anyhow::Result<Ordered> {
+        defaults::ordering_by_catalog(
+            self.name(),
+            frame.base.schema,
+            frame.declared.schema,
+            changes,
+        )?;
+        Ok(Ordered::default())
+    }
+
+    /// The checks that read the final order, in the planning transaction: a
+    /// module rebuild's catalog state, what a dropped or retyped object
+    /// blocks, the logical slots a row move is decoded by, the publications
+    /// and slots a numbered column's fill misses, and the guard that
+    /// authenticates the triggers the plan's row writes meet. The rows are
+    /// returned for neutral code to put in their contract order.
+    ///
+    /// A `not_applicable` row naming the engine for each when the plan asks
+    /// nothing of it; refuses when it does and the engine has no step.
+    async fn check_final_order(
+        &self,
+        _conn: &mut Conn,
+        _admission: &SiteAdmission,
+        changes: &ChangeSet,
+        _frame: Frame<'_>,
+    ) -> anyhow::Result<FinalOrderChecks> {
+        defaults::final_order(self.name(), changes)
+    }
 }
 
 /// What a provided method answers, as functions of the engine's name.
@@ -406,6 +639,357 @@ pub(crate) mod defaults {
 
     pub(crate) fn standing_domain_checks(engine: &str) -> anyhow::Result<Vec<StandingNotValid>> {
         anyhow::bail!("{engine} has no step that reads the NOT VALID checks of its domains")
+    }
+
+    /// Whether the plan creates, takes or moves a name in a namespace the
+    /// target holds: a relation (table, view, index, owned sequence), a type,
+    /// a renamed table or column, or a partition detached under a clone name.
+    #[allow(clippy::wildcard_enum_match_arm)] // The complement names nothing.
+    fn names_a_thing(changes: &ChangeSet) -> bool {
+        !crate::deploy::created_relation_names(changes).is_empty()
+            || !crate::deploy::rename_claims(changes).is_empty()
+            || changes.changes.iter().any(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::CreateType { .. }
+                        | pbps_model::Change::RenameType { .. }
+                        | pbps_model::Change::RenameColumn { .. }
+                        | pbps_model::Change::DetachPartition { .. }
+                )
+            })
+    }
+
+    /// Whether the plan drops a role, whose members the schedule writes in.
+    pub(in crate::engine) fn drops_a_role(changes: &ChangeSet) -> bool {
+        changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+    }
+
+    /// What the schedule is given of the declarations and of the roles the
+    /// plan drops; the catalog facts an engine reads are added to the second.
+    pub(in crate::engine) fn scheduled_inputs<'a>(
+        declared: &'a Schema,
+        sources: crate::dependents::Sources<'a>,
+        deps: &'a pbps_model::object_ref::Annotations,
+        role_members: Option<&'a RoleMembers>,
+    ) -> (
+        crate::dependents::schedule::Declarations<'a>,
+        crate::dependents::schedule::Facts<'a>,
+    ) {
+        let declarations = crate::dependents::schedule::Declarations {
+            schema: declared,
+            sources,
+            annotations: deps,
+        };
+        // The members of the roles this plan drops, which the caller read when
+        // there were any: every connected plan goes through the schedule once,
+        // whichever facts its engine supplies (#1955 review).
+        let read = match role_members {
+            Some(members) => {
+                crate::dependents::schedule::Facts::default().with_role_members(members)
+            }
+            None => crate::dependents::schedule::Facts::default(),
+        };
+        (declarations, read)
+    }
+
+    pub(crate) fn occupied_relation_names(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            crate::deploy::created_relation_names(changes).is_empty(),
+            "{engine} has no step that checks whether a name this plan creates is already in use"
+        );
+        Ok(())
+    }
+
+    /// The refusals every engine makes of a staged run, with `module_check`
+    /// between the first and the last: the order of the three is the order a
+    /// plan met them in. A table rebuild and the revoke that closes a routine
+    /// are the same for every engine; whether a replaced module keeps its
+    /// catalog state across the commits of a staged run is the engine's.
+    pub(in crate::engine) fn staged_rebuilds(
+        changes: &ChangeSet,
+        staged: bool,
+        module_check: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !staged
+                || !changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+            "table rebuild requires transactional mode; --staged is unsupported"
+        );
+        module_check()?;
+        // The `CREATE` and the revoke that closes the routine are two statements,
+        // and a staged run commits each one on its own (DECISIONS 517). Between
+        // those two commits the routine is visible to the whole cluster holding
+        // this engine's default `EXECUTE` to `PUBLIC` — and the revoke sorts with
+        // the grants, after every row the plan writes, so the window is the rest
+        // of the plan rather than an instant. A `SECURITY DEFINER` routine open
+        // for that long is the exposure this revoke exists to prevent, so the
+        // plan is refused rather than run with a gap in it.
+        let closes: Vec<String> = changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                // Only the half whose window is an over-exposure. `Kept`
+                // writes a `GRANT` of its own, but the state between its
+                // `CREATE` and that grant is a routine *less* reachable than the
+                // declaration asks for — a caller sees a permission error, not
+                // somebody else's privileges — so staging it is merely slow.
+                if let pbps_model::Change::PublicExecution {
+                    routine,
+                    access: pbps_model::PublicAccess::Revoked,
+                    ..
+                } = &p.change
+                {
+                    Some(routine.shown().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if staged && !closes.is_empty() {
+            anyhow::bail!(
+                "a staged run commits each statement on its own, so {} would stay executable by \
+                 every principal in the cluster between its `CREATE` and the revoke that closes it \
+                 (DECISIONS 517): {}.\nRemove --staged and plan again, or declare \
+                 `public_execute: true` on the routines that are meant to stay open",
+                if closes.len() == 1 {
+                    "1 routine".to_owned()
+                } else {
+                    format!("{} routines", closes.len())
+                },
+                closes.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transactional_rebuilds(
+        engine: &str,
+        changes: &ChangeSet,
+        staged: bool,
+    ) -> anyhow::Result<()> {
+        staged_rebuilds(changes, staged, || {
+            anyhow::ensure!(
+                !staged || rebuilt_modules(changes).is_empty(),
+                "{engine} has no step that keeps a replaced module's catalog state across the \
+                 commits of a staged run; remove --staged and plan again"
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn catalog_names(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !names_a_thing(changes),
+            "{engine} has no step that reads the target's names to order and check the ones this plan creates or renames"
+        );
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::SetTablePersistence { unlogged: true, .. }
+            )),
+            "{engine} has no step that checks the publications and foreign keys of a table this plan makes unlogged"
+        );
+        Ok(())
+    }
+
+    /// The role members and the enum dependents the schedule needs.
+    pub(crate) fn schedule_reads(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. })),
+            "{engine} has no step that reads the members of a role this plan drops"
+        );
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. })),
+            "{engine} has no step that reads what depends on an enum this plan rebuilds"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn module_dependents(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. })),
+            "{engine} has no step that reads what depends on a module this plan drops"
+        );
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+            "{engine} has no step that plans a table rebuild"
+        );
+        Ok(())
+    }
+
+    /// The passes of [`PlanSession::order_by_catalog`], each refused for the
+    /// thing it orders: a generated column's input retyped or dropped, a
+    /// computed column the plan or the base holds, a name the plan creates or
+    /// moves.
+    pub(crate) fn ordering_by_catalog(
+        engine: &str,
+        base: &Schema,
+        declared: &Schema,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<()> {
+        let generated = |schema: &Schema| {
+            schema.tables.values().any(|t| {
+                t.columns
+                    .values()
+                    .any(|c| matches!(c.value_source, pbps_model::ValueSource::Generated(_)))
+            })
+        };
+        anyhow::ensure!(
+            !(generated(base)
+                && changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::AlterColumnType { .. }
+                        | pbps_model::Change::DropColumn { .. }
+                ))),
+            "{engine} has no step that orders the retype or drop of a column a generated column reads"
+        );
+        anyhow::ensure!(
+            ![base, declared]
+                .iter()
+                .any(|schema| schema.tables.values().any(|t| !t.computed.is_empty()))
+                && !changes.changes.iter().any(|p| matches!(
+                    p.change,
+                    pbps_model::Change::AddComputedColumn { .. }
+                        | pbps_model::Change::DropComputedColumn { .. }
+                )),
+            "{engine} has no step that orders a computed column's dependencies from the catalog"
+        );
+        anyhow::ensure!(
+            !names_a_thing(changes),
+            "{engine} has no step that orders the names this plan creates or moves from the catalog"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn module_rebuilds(
+        engine: &'static str,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<ConnectedCheck> {
+        anyhow::ensure!(
+            rebuilt_modules(changes).is_empty(),
+            "{engine} has no step that checks the catalog state a module rebuild cannot preserve"
+        );
+        Ok(not_applicable(
+            engine,
+            "before_a_rebuild",
+            "the plan rebuilds no module",
+        ))
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)] // The complement drops nothing.
+    pub(crate) fn drop_blockers(
+        engine: &'static str,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<ConnectedCheck> {
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::DropTable { .. }
+                    | pbps_model::Change::DropColumn { .. }
+                    | pbps_model::Change::DropUnique { .. }
+                    | pbps_model::Change::DropIndex { .. }
+                    | pbps_model::Change::DropForeignKey { .. }
+                    | pbps_model::Change::DropCheck { .. }
+                    | pbps_model::Change::AlterColumnType { .. }
+                    | pbps_model::Change::SetPrimaryKey { from: Some(_), .. }
+            )),
+            "{engine} has no step that reads what depends on an object this plan drops or retypes"
+        );
+        Ok(not_applicable(
+            engine,
+            "drop_blockers",
+            "the plan drops and retypes nothing a dependency could block",
+        ))
+    }
+
+    pub(crate) fn logical_slots(
+        engine: &'static str,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<ConnectedCheck> {
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::CreateTable {
+                    beside_default: Some(_),
+                    ..
+                }
+            )),
+            "{engine} has no step that lists the logical slots that would decode the rows a new partition takes from its DEFAULT"
+        );
+        Ok(not_applicable(
+            engine,
+            "logical_slots",
+            "the plan makes no partition beside a DEFAULT",
+        ))
+    }
+
+    pub(crate) fn numbered_column_fills(
+        engine: &'static str,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<ConnectedCheck> {
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                &p.change,
+                pbps_model::Change::AddColumn { column, .. }
+                    if matches!(
+                        column.value_source,
+                        pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Sequence(_)
+                    )
+            )),
+            "{engine} has no step that lists the publications and slots that would miss the numbers a new identity or serial column gives the rows already there"
+        );
+        Ok(not_applicable(
+            engine,
+            "numbered_column_fills",
+            "the plan adds no identity or serial column",
+        ))
+    }
+
+    pub(crate) fn data_writes(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::change_family!(rows))),
+            "{engine} has no step that authenticates the triggers a row write of this plan meets"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn final_order(
+        engine: &'static str,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<FinalOrderChecks> {
+        // The order the checks were asked in.
+        let rebuilds = module_rebuilds(engine, changes)?;
+        let drop_blockers = drop_blockers(engine, changes)?;
+        let logical_slots = logical_slots(engine, changes)?;
+        let numbered_column_fills = numbered_column_fills(engine, changes)?;
+        data_writes(engine, changes)?;
+        Ok(FinalOrderChecks {
+            rebuilds,
+            drop_blockers,
+            logical_slots,
+            numbered_column_fills,
+        })
     }
 
     /// A `connected_checks` row for a check the engine has no step for.
@@ -579,6 +1163,275 @@ mod tests {
             message.contains(THIRD) && message.contains("NOT VALID"),
             "{message}"
         );
+    }
+
+    fn plan(changes: Vec<pbps_model::Change>) -> ChangeSet {
+        ChangeSet {
+            changes: changes
+                .into_iter()
+                .map(pbps_model::PlannedChange::new)
+                .collect(),
+        }
+    }
+
+    fn uid(kind: pbps_model::UidKind, address: &str) -> pbps_model::Uid {
+        pbps_model::Uid::derived(kind, address, 0)
+    }
+
+    fn table_name() -> TableName {
+        TableName::new("app", "t")
+    }
+
+    fn column_named(source: pbps_model::ValueSource) -> pbps_model::Column {
+        let mut column = pbps_model::Column::new("integer".parse().unwrap());
+        column.value_source = source;
+        column
+    }
+
+    #[test]
+    fn a_plan_that_creates_no_name_passes_the_occupied_names_default() {
+        defaults::occupied_relation_names(THIRD, &ChangeSet::default()).unwrap();
+        defaults::catalog_names(THIRD, &ChangeSet::default()).unwrap();
+    }
+
+    #[test]
+    fn a_created_table_is_refused_by_the_name_defaults_naming_the_engine() {
+        let changes = plan(vec![pbps_model::Change::CreateTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            name: table_name(),
+            table: Default::default(),
+            beside_default: None,
+            moves_at_most: None,
+        }]);
+        let message = refusal(defaults::occupied_relation_names(THIRD, &changes));
+        assert!(
+            message.contains(THIRD) && message.contains("name this plan creates"),
+            "{message}"
+        );
+        let message = refusal(defaults::catalog_names(THIRD, &changes));
+        assert!(message.contains(THIRD), "{message}");
+    }
+
+    #[test]
+    fn a_table_made_unlogged_is_refused_by_the_catalog_names_default() {
+        let changes = plan(vec![pbps_model::Change::SetTablePersistence {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            table: table_name(),
+            unlogged: true,
+        }]);
+        let message = refusal(defaults::catalog_names(THIRD, &changes));
+        assert!(
+            message.contains(THIRD) && message.contains("unlogged"),
+            "{message}"
+        );
+        // Made logged again, it asks nothing of the target.
+        let changes = plan(vec![pbps_model::Change::SetTablePersistence {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            table: table_name(),
+            unlogged: false,
+        }]);
+        defaults::catalog_names(THIRD, &changes).unwrap();
+    }
+
+    #[test]
+    fn a_staged_run_is_refused_the_table_rebuild_by_every_engine_and_the_module_rebuild_by_the_default()
+     {
+        defaults::transactional_rebuilds(THIRD, &ChangeSet::default(), true).unwrap();
+        // Not staged: nothing is refused.
+        defaults::transactional_rebuilds(THIRD, &ChangeSet::default(), false).unwrap();
+        // The shared refusals do not depend on the engine's module check.
+        let rebuild = plan(vec![pbps_model::Change::PublicExecution {
+            routine: "app.f(integer)".parse().expect("a routine id"),
+            access: pbps_model::PublicAccess::Revoked,
+            origin: pbps_model::RoutineOrigin::Created,
+        }]);
+        let message = refusal(defaults::transactional_rebuilds(THIRD, &rebuild, true));
+        assert!(message.contains("DECISIONS 517"), "{message}");
+        defaults::transactional_rebuilds(THIRD, &rebuild, false).unwrap();
+    }
+
+    #[test]
+    fn the_engines_module_check_sits_between_the_two_shared_refusals() {
+        // The table rebuild is refused before the engine's check runs, and
+        // the engine's check before the closing revoke: the order a plan
+        // met them in.
+        let mut asked = false;
+        let rebuild = plan(vec![]);
+        defaults::staged_rebuilds(&rebuild, true, || {
+            asked = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(asked);
+        let refused = defaults::staged_rebuilds(&rebuild, true, || anyhow::bail!("module check"));
+        assert_eq!(refusal(refused), "module check");
+    }
+
+    #[test]
+    fn a_dropped_role_or_rebuilt_enum_is_refused_by_the_schedule_reads_default() {
+        defaults::schedule_reads(THIRD, &ChangeSet::default()).unwrap();
+        let drop_role = plan(vec![pbps_model::Change::DropRole {
+            uid: uid(pbps_model::UidKind::Role, "old"),
+            name: pbps_model::RoleName::new("old"),
+            members: Vec::new(),
+        }]);
+        let message = refusal(defaults::schedule_reads(THIRD, &drop_role));
+        assert!(
+            message.contains(THIRD) && message.contains("role"),
+            "{message}"
+        );
+        assert!(defaults::drops_a_role(&drop_role));
+        assert!(!defaults::drops_a_role(&ChangeSet::default()));
+    }
+
+    #[test]
+    fn a_dropped_module_or_table_rebuild_is_refused_by_the_schedule_default() {
+        defaults::module_dependents(THIRD, &ChangeSet::default()).unwrap();
+        let drop_module = plan(vec![pbps_model::Change::DropModule {
+            id: pbps_model::ModuleId::Named(table_name()),
+            kind: pbps_model::ModuleKind::View,
+        }]);
+        let message = refusal(defaults::module_dependents(THIRD, &drop_module));
+        assert!(
+            message.contains(THIRD) && message.contains("module"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_gets_not_applicable_rows_naming_the_engine_from_the_final_order_default() {
+        let checks = defaults::final_order("thirdsql", &ChangeSet::default()).unwrap();
+        for (row, name) in [
+            (&checks.rebuilds, "before_a_rebuild"),
+            (&checks.drop_blockers, "drop_blockers"),
+            (&checks.logical_slots, "logical_slots"),
+            (&checks.numbered_column_fills, "numbered_column_fills"),
+        ] {
+            assert_eq!(row.name, name);
+            assert_eq!(row.status, "not_applicable");
+            assert_eq!(row.engine, "thirdsql");
+            assert!(row.message.contains("thirdsql"), "{}", row.message);
+        }
+    }
+
+    #[test]
+    fn each_final_order_default_refuses_the_thing_it_covers() {
+        let drop_table = plan(vec![pbps_model::Change::DropTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            name: table_name(),
+            detach_from: None,
+        }]);
+        let message = refusal(defaults::drop_blockers(THIRD, &drop_table));
+        assert!(
+            message.contains(THIRD) && message.contains("depends"),
+            "{message}"
+        );
+        let beside = plan(vec![pbps_model::Change::CreateTable {
+            uid: uid(pbps_model::UidKind::Table, "app.d"),
+            name: table_name(),
+            table: Default::default(),
+            beside_default: Some(TableName::new("app", "d")),
+            moves_at_most: None,
+        }]);
+        let message = refusal(defaults::logical_slots(THIRD, &beside));
+        assert!(message.contains("logical slots"), "{message}");
+        let numbered = plan(vec![pbps_model::Change::AddColumn {
+            uid: uid(pbps_model::UidKind::Column, "app.t.n"),
+            table: table_name(),
+            name: "n".into(),
+            column: Box::new(column_named(pbps_model::ValueSource::Identity(
+                pbps_model::Identity::new(1, 1),
+            ))),
+        }]);
+        let message = refusal(defaults::numbered_column_fills(THIRD, &numbered));
+        assert!(message.contains("identity or serial"), "{message}");
+        let insert = plan(vec![pbps_model::Change::SetDataMode {
+            table: table_name(),
+            from: None,
+            to: None,
+        }]);
+        let message = refusal(defaults::data_writes(THIRD, &insert));
+        assert!(
+            message.contains(THIRD) && message.contains("trigger"),
+            "{message}"
+        );
+        // The row checks are asked in order: the first refusal wins.
+        let both = plan(vec![
+            pbps_model::Change::DropTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                detach_from: None,
+            },
+            pbps_model::Change::SetDataMode {
+                table: table_name(),
+                from: None,
+                to: None,
+            },
+        ]);
+        let message = refusal(defaults::final_order(THIRD, &both));
+        assert!(message.contains("depends"), "{message}");
+    }
+
+    #[test]
+    fn the_catalog_ordering_default_passes_an_empty_plan_and_refuses_what_it_orders() {
+        let none = Schema::default();
+        defaults::ordering_by_catalog(THIRD, &none, &none, &ChangeSet::default()).unwrap();
+        let mut computed = Schema::default();
+        computed
+            .tables
+            .entry(table_name())
+            .or_default()
+            .computed
+            .insert(
+                "c".into(),
+                pbps_model::ComputedColumn {
+                    expression: "1".into(),
+                    persisted: false,
+                    not_null: false,
+                },
+            );
+        let message = refusal(defaults::ordering_by_catalog(
+            THIRD,
+            &computed,
+            &none,
+            &ChangeSet::default(),
+        ));
+        assert!(
+            message.contains(THIRD) && message.contains("computed"),
+            "{message}"
+        );
+        let renamed = plan(vec![pbps_model::Change::RenameColumn {
+            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+            table: table_name(),
+            from: "a".into(),
+            to: "b".into(),
+            table_was: None,
+        }]);
+        let message = refusal(defaults::ordering_by_catalog(THIRD, &none, &none, &renamed));
+        assert!(message.contains(THIRD), "{message}");
+        // A drop refuses only where a generated column stands to be read.
+        let retype = plan(vec![pbps_model::Change::DropColumn {
+            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+            column: table_name().column(pbps_model::ColumnName::from("a")),
+        }]);
+        defaults::ordering_by_catalog(THIRD, &none, &none, &retype).unwrap();
+        let mut generated = Schema::default();
+        generated
+            .tables
+            .entry(table_name())
+            .or_default()
+            .columns
+            .insert(
+                "g".into(),
+                column_named(pbps_model::ValueSource::Generated(pbps_model::Generated {
+                    expression: "a * 2".into(),
+                    stored: true,
+                })),
+            );
+        let message = refusal(defaults::ordering_by_catalog(
+            THIRD, &generated, &none, &retype,
+        ));
+        assert!(message.contains("generated column"), "{message}");
     }
 
     #[test]

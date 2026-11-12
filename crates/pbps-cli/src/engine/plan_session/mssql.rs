@@ -11,6 +11,8 @@ use super::*;
 /// default's.
 pub(super) const TRUSTED_ROLES_REFUSAL: &str = "trusted_roles is supported only on PostgreSQL";
 pub(super) const PIN_ROUTINES_REFUSAL: &str = "pin_type_routines is supported only on PostgreSQL";
+/// Only the PostgreSQL differ plans a table rebuild.
+pub(super) const TABLE_REBUILD_REFUSAL: &str = "this engine does not support table rebuilds";
 
 pub(in crate::engine) fn seal_type_pins(
     trusted: &BTreeSet<pbps_model::RoleName>,
@@ -123,6 +125,401 @@ pub(in crate::engine) fn reconcile_cluster_roles() -> ConnectedCheck {
         status: "not_applicable",
         message: "SQL Server creates and renames database roles through the typed plan; the external cluster-role presence check does not apply".into(),
     }
+}
+
+/// The SQL Server body of `engine::account_for_module_dependents`: DEFAULT
+/// holders for explicit routine drops, which is all that SQL Server's `CREATE
+/// OR ALTER` leaves to schedule, along with the members of the roles the plan
+/// drops. It never plans again, so it has no use for `_rediff`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) async fn account_for_module_dependents<
+    S: pbps_diff::order::RouteState<D>,
+    D: crate::emission::Engine,
+>(
+    conn: &mut Conn,
+    changes: PlanningPlan<S>,
+    declared: &pbps_model::Schema,
+    sources: crate::dependents::Sources<'_>,
+    deps: &pbps_model::object_ref::Annotations,
+    role_members: Option<&crate::dependents::schedule::RoleMembers>,
+    dialect: &D,
+    _rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
+) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
+    let (declarations, read) = defaults::scheduled_inputs(declared, sources, deps, role_members);
+    let found = module_dependents(conn, &changes).await?;
+    let read = read.with_module_dependents(&found);
+    let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &read, dialect)?;
+    Ok((
+        scheduled.changes,
+        ConnectedCheck {
+            name: "module_dependents",
+            engine: "SQL Server",
+            status: if found.values().any(|v| !v.is_empty()) {
+                "passed"
+            } else {
+                "not_applicable"
+            },
+            message: if found.is_empty() {
+                "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into()
+            } else {
+                format!(
+                    "{} DEFAULT holder(s) of {} dropped routine(s) accounted for; {} change(s) added",
+                    found.values().map(Vec::len).sum::<usize>(),
+                    found.len(),
+                    scheduled.added
+                )
+            },
+        },
+    ))
+}
+
+/// The SQL Server body of `engine::check_drop_blockers`, which apply also calls.
+pub(in crate::engine) async fn check_drop_blockers(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+    _stored: &pbps_model::Schema,
+    _stored_ids: &pbps_model::IdsFile,
+) -> anyhow::Result<ConnectedCheck> {
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let reports = pbps_mssql::impact::key_drop_blockers(conn, &names).await?;
+    refuse_drop_reports("SQL Server", &reports)?;
+    // Two kinds of question now, and the count says which: a key this
+    // plan drops, and a column it retypes while a key stands on it
+    // (DECISIONS 515). Classified by the change each report points at
+    // rather than by reading its target text, which belongs to the
+    // engine that wrote it.
+    let retypes = reports
+        .iter()
+        .filter(|r| {
+            matches!(
+                changes.changes.get(r.change_index).map(|p| &p.change),
+                Some(pbps_model::Change::AlterColumnType { .. })
+            )
+        })
+        .count();
+    Ok(ConnectedCheck {
+        name: "drop_blockers",
+        engine: "SQL Server",
+        status: "unavailable",
+        message: format!(
+            "{} unique-key drop(s) and {retypes} column retype(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
+            reports.len() - retypes
+        ),
+    })
+}
+
+/// SQL Server has no partition this model moves rows into.
+pub(in crate::engine) fn logical_slots() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "logical_slots",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server has no partition this model moves rows into".to_owned(),
+    }
+}
+
+/// SQL Server has no logical decoding this model reads.
+pub(in crate::engine) fn numbered_column_fills() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "numbered_column_fills",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server has no logical decoding this model reads".to_owned(),
+    }
+}
+
+/// Orders a SQL Server plan's function drops after the computed columns that
+/// call them, with what each is schema-bound to after it, and refuses what
+/// the catalog's expression edges say the engine will not do (#1431,
+/// DEC-1431.1). Reads the edges of the tables and modules the plan touches,
+/// under the names the catalog has them by. PostgreSQL has no computed
+/// columns, and its generated ones are `release_generated_inputs`'s.
+///
+/// Returns which drop waits for which by those edges, for the rename search
+/// that runs after it ([`order_created_object_names`], #1680): empty where
+/// no edge was read.
+// The complement is every change that touches no object an expression edge
+// can name: a computed column, a column it reads, its table, or a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
+    conn: &mut Conn,
+    cs: &mut PlanningPlan<S>,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let catalog = |at, table: &TableName| computed_catalog_table(&names, table, at);
+    let mut objects: Vec<pbps_model::TableName> = Vec::new();
+    for (at, p) in cs.changes.iter().enumerate() {
+        let touched = match &p.change {
+            pbps_model::Change::AddComputedColumn { table, .. }
+            | pbps_model::Change::DropComputedColumn { table, .. }
+            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
+            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                Some(catalog(at, &column.table))
+            }
+            pbps_model::Change::AlterModule { id, .. }
+            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
+            _ => None,
+        };
+        if let Some(object) = touched
+            && !objects.contains(&object)
+        {
+            objects.push(object);
+        }
+    }
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The edges refuse or move only these: a column a computed column of its
+    // own table reads, a function one calls, a computed column a module is
+    // bound to, and drops `release` orders, which takes two. A plan with none
+    // of them, such as one adding a computed column or dropping one view,
+    // needs no edge read and so no grant that makes one complete (#1643
+    // review).
+    let mut inputs: Vec<pbps_model::TableName> = Vec::new();
+    let mut drops = 0;
+    let mut decides = false;
+    for (at, p) in cs.changes.iter().enumerate() {
+        match &p.change {
+            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(at, table)),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                inputs.push(catalog(at, &column.table));
+            }
+            pbps_model::Change::DropComputedColumn { .. } => decides = true,
+            pbps_model::Change::AlterModule { module, .. } => {
+                decides |= module.kind == pbps_model::ModuleKind::Function;
+            }
+            pbps_model::Change::DropModule { kind, .. } => {
+                decides |= *kind == pbps_model::ModuleKind::Function;
+                drops += 1;
+            }
+            pbps_model::Change::DropTable { .. } => drops += 1,
+            _ => {}
+        }
+    }
+    let modules_dropped = cs
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }));
+    decides |= modules_dropped && drops > 1;
+    if !decides {
+        decides = pbps_mssql::catalog::may_hold_computed_columns(conn, &inputs)
+            .await
+            .map_err(|e| {
+                anyhow::Error::new(e)
+                    .context("cannot read whether a changed column's table has computed columns")
+            })?;
+    }
+    if !decides {
+        return Ok(Vec::new());
+    }
+    // An empty read is "no edge" only where no referrer the pass decides by
+    // can be hidden (#1462).
+    let mut targets = pbps_mssql::catalog::ReferrerTargets::default();
+    for (at, p) in cs.changes.iter().enumerate() {
+        match &p.change {
+            pbps_model::Change::AlterModule { id, module }
+                if module.kind == pbps_model::ModuleKind::Function =>
+            {
+                targets.functions.push(id.object_name());
+            }
+            pbps_model::Change::DropModule {
+                id,
+                kind: pbps_model::ModuleKind::Function,
+            } => targets.functions.push(id.object_name()),
+            pbps_model::Change::DropComputedColumn { table, name, .. } => {
+                targets
+                    .computed_columns
+                    .push((catalog(at, table), name.clone()));
+            }
+            _ => {}
+        }
+    }
+    pbps_mssql::catalog::prove_referrers_visible(conn, &targets)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(
+                "cannot prove the catalog shows everything that calls what this plan changes",
+            )
+        })?;
+    let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One group: whether two strings are one name is the collation's, not
+    // the kind of object they name.
+    let spellings: Vec<String> = crate::computed_order::spellings(cs, &edges)
+        .into_iter()
+        .collect();
+    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
+    let alike = crate::computed_order::Alike::from_pairs(
+        pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
+    );
+    crate::computed_order::order_by_edges(cs, ids, &edges, &alike)
+        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))?;
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    Ok(crate::computed_order::drop_precedence(
+        cs, &names, &edges, &alike,
+    ))
+}
+
+/// The SQL Server body of `engine::refuse_added_computed_calls`.
+pub(in crate::engine) async fn refuse_added_computed_calls<S>(
+    conn: &mut Conn,
+    cs: &pbps_diff::order::PlanningPlan<S>,
+    declared: &pbps_model::Schema,
+) -> anyhow::Result<()> {
+    let dialect = pbps_mssql::Mssql;
+    let spellings: Vec<String> =
+        crate::computed_order::added_call_spellings(cs, declared, &dialect)
+            .into_iter()
+            .collect();
+    if spellings.is_empty() {
+        return Ok(());
+    }
+    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
+    let alike = crate::computed_order::Alike::from_pairs(
+        pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone()))
+            // Successful catalog comparison covers every supplied spelling;
+            // the query reports distinct pairs only, not reflexive rows.
+            .chain(spellings.iter().map(|s| (s.clone(), s.clone()))),
+    );
+    crate::computed_order::refuse_added_calls_in(cs, declared, &dialect, &alike)
+        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
+}
+
+/// The SQL Server body of `engine::order_created_object_names`.
+pub(in crate::engine) async fn order_created_object_names<S: Clone>(
+    conn: &mut Conn,
+    cs: &mut PlanningPlan<S>,
+    label: &str,
+    precedence: &[(pbps_model::Change, pbps_model::Change)],
+    declared: &crate::dependents::schedule::Declarations<'_>,
+) -> anyhow::Result<pbps_dialect::slots::CatalogFacts> {
+    // Column renames first: each one may move a generated default, which the
+    // `sys.objects` walk below follows in the order they run (DEC-1366.3).
+    let columns = crate::object_order::renamed_column_names(cs);
+    if !columns.is_empty() {
+        let tables: Vec<&TableName> = columns.iter().map(|(t, _)| t).collect();
+        let grouped: Vec<(usize, String)> = columns
+            .iter()
+            .map(|(t, name)| {
+                let group = tables.iter().position(|u| *u == t).unwrap_or_default();
+                (group, name.raw().to_owned())
+            })
+            .collect();
+        let alike: Vec<_> = pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (columns[a].clone(), columns[b].clone()))
+            .collect();
+        crate::object_order::order_column_renames(cs, &alike, label)?;
+    }
+    let index = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)?;
+    let (mut names, parents) = crate::deploy::object_reads(cs, &index);
+    let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
+    // Where a transfer carries each child of a moved table: a name the
+    // first read could not know to ask until it found the child (#1366).
+    let carried: Vec<TableName> = crate::deploy::carried_destinations(cs, &occupants)
+        .into_iter()
+        .filter(|n| !names.contains(n))
+        .collect();
+    if !carried.is_empty() {
+        occupants.extend(pbps_mssql::catalog::object_name_occupants(conn, &carried, &[]).await?);
+        names.extend(carried);
+    }
+    // An absent row is a free name only where nothing can be hidden
+    // from this login (#1192), so only the names the read found no
+    // row at need the proof. A name holds one object per schema, so
+    // one this login sees leaves no room for a hidden one: a table
+    // dropped and recreated at its own name is not asked. Nor are
+    // `parents`, read for what the walk moves or removes with a
+    // table, so a drop-only plan claims nothing to prove (review of
+    // #1360).
+    let mut schemas: Vec<String> = names
+        .iter()
+        .filter(|n| !occupants.iter().any(|o| &o.wanted == *n))
+        .map(|n| n.schema.clone())
+        .collect();
+    schemas.sort();
+    schemas.dedup();
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
+        .await
+        // As context, never interpolated: a driver frame has to reach
+        // `ledger_safe_reason` intact to be redacted (DECISIONS 455).
+        .map_err(|e| {
+            anyhow::Error::new(e).context("cannot prove the names this plan creates are free")
+        })?;
+    // Which of the plan's own names are one under the database's
+    // collation (#1215).
+    let mut candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
+    // Computed-column reads may be skipped on a module-only plan. Extend this
+    // existing comparison, whose answers the final observer already carries.
+    candidates.extend(pbps_mssql::schema_bound_call_names(
+        cs,
+        declared.sources.before.schema,
+        declared.schema,
+    ));
+    candidates.sort();
+    candidates.dedup();
+    let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
+    let facts = object_slots(&occupants, &candidates, &alike);
+    // Name equality can reveal a dependency that the earlier lexical passes
+    // could not schedule (#2221). Settle it before the final name walk and
+    // observer, using the same comparison and existing release mechanism.
+    *cs = pbps_diff::order::catalog_requirements(
+        cs.clone(),
+        declared.sources.before,
+        pbps_diff::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
+        &pbps_mssql::Mssql,
+        &declared.module_deps(),
+        &facts,
+        precedence,
+    )
+    .map_err(anyhow::Error::msg)?;
+    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)?;
+    Ok(facts)
+}
+
+/// SQL Server keeps a replaced module's state with `CREATE OR ALTER`, so a
+/// staged run needs no transaction for it.
+pub(in crate::engine) fn require_transactional_rebuilds(
+    changes: &ChangeSet,
+    staged: bool,
+) -> anyhow::Result<()> {
+    defaults::staged_rebuilds(changes, staged, || Ok(()))
+}
+
+/// SQL Server's `CREATE OR ALTER` retains module state, so the PostgreSQL
+/// drop and recreate check has nothing to ask.
+pub(in crate::engine) fn check_module_rebuilds() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "before_a_rebuild",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server uses CREATE OR ALTER to retain module state; the PostgreSQL drop/recreate check does not apply".into(),
+    }
+}
+
+pub(in crate::engine) async fn role_members(
+    conn: &mut Conn,
+) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>> {
+    Ok(pbps_mssql::catalog::role_members(conn).await?)
 }
 
 /// Nothing crosses positions for SQL Server: its misspelling probe asks
@@ -253,5 +650,165 @@ impl PlanSession for pbps_mssql::Mssql {
     ) -> anyhow::Result<bool> {
         let pins = seal_type_pins(trusted)?;
         Ok(!type_input_routines(&pins.types, pin_routines)?.is_empty())
+    }
+
+    /// SQL Server's namespace is asked after the passes of the connected
+    /// plan instead, with the walk that also orders it (#1077).
+    fn refuse_occupied_relation_names(
+        &self,
+        _changes: &ChangeSet,
+        _scoped: &pbps_diff::Scoped,
+        _unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+        _unmanaged_relations: &[TableName],
+        _label: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn require_transactional_rebuilds(
+        &self,
+        changes: &ChangeSet,
+        staged: bool,
+    ) -> anyhow::Result<()> {
+        require_transactional_rebuilds(changes, staged)
+    }
+
+    /// SQL Server has no `UNLOGGED` table and no relation namespace this
+    /// position reads: its names are walked once the plan is ordered
+    /// ([`Self::order_by_catalog`]).
+    async fn check_names_against_catalog<S: Clone>(
+        &self,
+        _state: &mut PlanState,
+        _conn: &mut Conn,
+        _changes: &mut PlanningPlan<S>,
+        _frame: Frame<'_>,
+        _staged: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn read_before_schedule(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        _declared: &Schema,
+        _recorded_ids: &IdsFile,
+    ) -> anyhow::Result<ScheduleReads> {
+        // A role this plan drops still has this environment's members, which
+        // the engine will not drop it over. They are read here, for the
+        // schedule to write into the plan by name, so the artifact the gate
+        // approves lists exactly who is removed (ADR-0005) — never found
+        // again at apply time, where nobody would have reviewed them.
+        // Without a role drop there is nothing to ask. SQL Server has no
+        // enum to rebuild.
+        let role_members = if defaults::drops_a_role(changes) {
+            Some(
+                role_members(conn)
+                    .await
+                    .map_err(|e| e.context("cannot read the role memberships"))?,
+            )
+        } else {
+            None
+        };
+        Ok(ScheduleReads {
+            role_members,
+            enum_rebuild: BTreeSet::new(),
+        })
+    }
+
+    async fn schedule<S: pbps_diff::order::RouteState<Self>>(
+        &self,
+        _state: &mut PlanState,
+        conn: &mut Conn,
+        _admission: &SiteAdmission,
+        changes: PlanningPlan<S>,
+        frame: Frame<'_>,
+        role_members: Option<&RoleMembers>,
+        again: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
+    ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
+        anyhow::ensure!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+            "{TABLE_REBUILD_REFUSAL}"
+        );
+        account_for_module_dependents(
+            conn,
+            changes,
+            frame.written.schema,
+            crate::dependents::Sources {
+                before: frame.recorded,
+                after: frame.written.ids,
+            },
+            &frame.hints.annotations,
+            role_members,
+            self,
+            again,
+        )
+        .await
+    }
+
+    async fn order_by_catalog<S: Clone>(
+        &self,
+        _state: &mut PlanState,
+        conn: &mut Conn,
+        changes: &mut PlanningPlan<S>,
+        frame: Frame<'_>,
+    ) -> anyhow::Result<Ordered> {
+        // A computed column's function drops after it, by the catalog's
+        // edges (DEC-1431.1): before the rename walk, which moves a module
+        // drop only between the drops these edges order it among (#1680).
+        let precedence = order_computed_by_edges(conn, changes, frame.written.ids).await?;
+        // What an added computed column calls has no edge yet; its names are
+        // compared under the collation instead (#1459).
+        refuse_added_computed_calls(conn, changes, frame.declared.schema).await?;
+        // Last of the passes that order the plan, so the order it settles
+        // from the catalog is the one checked below and saved (#1366).
+        let facts = order_created_object_names(
+            conn,
+            changes,
+            frame.label,
+            &precedence,
+            &crate::dependents::schedule::Declarations {
+                schema: frame.written.schema,
+                sources: crate::dependents::Sources {
+                    before: frame.recorded,
+                    after: frame.written.ids,
+                },
+                annotations: &frame.hints.annotations,
+            },
+        )
+        .await?;
+        Ok(Ordered {
+            verified: false,
+            facts: Some(facts),
+        })
+    }
+
+    async fn check_final_order(
+        &self,
+        conn: &mut Conn,
+        _admission: &SiteAdmission,
+        changes: &ChangeSet,
+        frame: Frame<'_>,
+    ) -> anyhow::Result<FinalOrderChecks> {
+        let rebuilds = check_module_rebuilds();
+        let drop_blockers = check_drop_blockers(
+            conn,
+            changes,
+            frame.written.ids,
+            frame.recorded.schema,
+            frame.recorded.ids,
+        )
+        .await?;
+        // SQL Server keeps its existing reference-data execution policy, so
+        // no guard is prepared for the rows a plan writes.
+        Ok(FinalOrderChecks {
+            rebuilds,
+            drop_blockers,
+            logical_slots: logical_slots(),
+            numbered_column_fills: numbered_column_fills(),
+        })
     }
 }

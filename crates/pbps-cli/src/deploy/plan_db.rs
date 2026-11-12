@@ -913,15 +913,14 @@ pub(super) async fn plan_db_selected(
         // Before anything is checked against the plan: a name it creates that
         // the database already uses, outside what this project records, is a
         // `CREATE` the engine will refuse (#316, #320, #323).
-        crate::engine::refuse_occupied_relation_names(
-            conn.driver(),
+        dialect.refuse_occupied_relation_names(
             &cs,
             &scoped,
             &managed.unreadable,
             &managed.unmanaged_relations,
             &target.label,
         )?;
-        crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        dialect.require_transactional_rebuilds(&cs, staged)?;
         // The one admission rule of every site that runs code the plan holds
         // (DEC-2563.2). Review admits routines into it as the sites vet; the plan
         // shows and pins them when it seals.
@@ -929,62 +928,23 @@ pub(super) async fn plan_db_selected(
         conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
             .await?;
         let checks = async {
-            // In the read-only planning transaction, with everything below:
-            // the names this plan creates, asked of PostgreSQL's whole
-            // relation namespace, not only of what the inventory reports
-            // (#951). SQL Server's is asked after the passes below (#1077).
-            let planned = crate::engine::Planned {
-                base: pbps_diff::Side {
-                    schema: &recorded_snapshot.schema,
-                    ids: &recorded_ids,
-                },
-                desired: pbps_diff::Side {
-                    schema: &loaded.schema,
-                    ids: &resolved.ids,
-                },
-                dialect: dialect.as_ref(),
+            // In the read-only planning transaction, with everything below.
+            let frame = crate::engine::Frame {
+                label: &target.label,
+                recorded: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
+                written: pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+                base: pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                declared: pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+                hints: &hints,
+                baseline: &entry.snapshot,
             };
-            let name_facts = crate::engine::refuse_created_name_occupants(
-                &mut conn,
-                &mut cs,
-                &target.label,
-                planned,
-            )
-            .await?;
-            crate::engine::refuse_unlogged_partition_referencers(
-                &mut conn,
-                &cs,
-                &resolved.ids,
-                staged,
-            )
-            .await?;
-            crate::engine::refuse_published_unlogged(&mut conn, &cs, &resolved.ids).await?;
-            let rename_evidence = crate::engine::external_role_renames(
-                &mut conn,
-                &recorded_snapshot.ids,
-                &resolved.ids,
-            )
-            .await?
-            .check;
-            // A role this plan drops still has this environment's members,
-            // which the engine will not drop it over. They are read here, for
-            // the schedule to write into the plan by name, so the artifact the
-            // gate approves lists exactly who is removed (ADR-0005) — never
-            // found again at apply time, where nobody would have reviewed
-            // them. Without a role drop there is nothing to ask.
-            let role_members = if cs
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
-            {
-                Some(
-                    crate::engine::role_members(&mut conn)
-                        .await
-                        .context("cannot read the role memberships")?,
-                )
-            } else {
-                None
-            };
+            dialect
+                .check_names_against_catalog(&mut plan_state, &mut conn, &mut cs, frame, staged)
+                .await?;
+            let rename_evidence = dialect
+                .external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
+                .await?
+                .check;
             // The plan carries what the resolver's run bound at creation, so
             // every pass that orders it again reads the same bindings. Only the
             // observer below judges the finished `ChangeSet`, which does not
@@ -1017,103 +977,39 @@ pub(super) async fn plan_db_selected(
             // What stands on an enum this plan rebuilds is read first: the views,
             // bodies and triggers over its columns come down and go back through
             // the module rebuild below, and anything else is refused by name
-            // (DEC-1635.7).
-            let rebuild = crate::engine::enum_rebuild_dependents(
-                &mut conn,
-                cs.changes(),
-                Some(&loaded.schema),
-                &recorded_ids,
-            )
-            .await?;
-            let cs = if rebuild.is_empty() {
+            // (DEC-1635.7). The members of the roles it drops are read with it,
+            // for the schedule to write into the plan.
+            let reads = dialect
+                .read_before_schedule(&mut conn, cs.changes(), &loaded.schema, &recorded_ids)
+                .await?;
+            let cs = if reads.enum_rebuild.is_empty() {
                 cs
             } else {
-                enum_dependents.borrow_mut().extend(rebuild);
+                enum_dependents.borrow_mut().extend(reads.enum_rebuild);
                 rediff(&std::collections::BTreeSet::new())?
             };
-            let mut rebuild_verification = None;
-            let (mut cs, dependents) = if cs.changes.iter().any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))) {
-                let (changes, check, verification) = crate::engine::expand_table_rebuild(&mut conn, &site_admission, cs,
-                    pbps_diff::Side { schema: &base, ids: &recorded_ids },
-                    pbps_diff::Side { schema: &declared, ids: &resolved.ids },
-                    &hints, dialect.as_ref()).await?;
-                rebuild_verification = Some(verification);
-                (changes, check)
-            } else {
-                crate::engine::account_for_module_dependents(
-                &mut conn,
-                cs,
-                &loaded.schema,
-                crate::dependents::Sources {
-                    before: pbps_diff::Side {
-                        schema: &recorded_snapshot.schema,
-                        ids: &recorded_ids,
-                    },
-                    after: &resolved.ids,
-                },
-                &hints.annotations,
-                role_members.as_ref(),
-                dialect.as_ref(),
-                &rediff,
-            )
-            .await?
-            };
-            // A retype or drop of a column a generated column reads goes
-            // after the plan's change to that expression which stops reading
-            // it (DEC-1316.1): after the module passes, which may move that
-            // change, and before the checks that read the order.
-            crate::engine::release_generated_inputs(
-                &mut conn,
-                &mut cs,
-                pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
-                pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
-                dialect.as_ref(),
-                &hints.annotations.modules(&loaded.schema),
-            ).await?;
-            // A computed column's function drops after it, by the catalog's
-            // edges (DEC-1431.1): before the rename walk, which moves a
-            // module drop only between the drops these edges order it
-            // among (#1680).
-            let precedence =
-                crate::engine::order_computed_by_edges(&mut conn, &mut cs, &resolved.ids).await?;
-            // What an added computed column calls has no edge yet; its names
-            // are compared under the collation instead (#1459).
-            crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
-            // Last of the passes that order the plan, so the order it settles
-            // from the catalog is the one checked below and saved (#1366).
-            let object_facts = crate::engine::order_created_object_names(
-                &mut conn,
-                &mut cs,
-                &target.label,
-                &precedence,
-                &crate::dependents::schedule::Declarations {
-                    schema: &loaded.schema,
-                    sources: crate::dependents::Sources {
-                        before: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
-                        after: &resolved.ids,
-                    },
-                    annotations: &hints.annotations,
-                },
-            )
-            .await?;
-            // The module passes may plan the revision again in the differ's
-            // order (`rediff`), undoing what was ordered: the carried moves
-            // are ordered and checked again, over the same reads, as the plan
-            // now stands (#1767 review).
-            if let Some(facts) = &name_facts {
-                facts.order_and_refuse(&mut cs, &target.label, planned)?;
-            }
+            let (mut cs, dependents) = dialect
+                .schedule(
+                    &mut plan_state,
+                    &mut conn,
+                    &site_admission,
+                    cs,
+                    frame,
+                    reads.role_members.as_ref(),
+                    &rediff,
+                )
+                .await?;
+            let ordered = dialect
+                .order_by_catalog(&mut plan_state, &mut conn, &mut cs, frame)
+                .await?;
             // Every pass that orders the plan has run: the verifier checks the
             // order that is saved and applied, in tests and debug builds
-            // (#1954, DEC-1954.6).
+            // (#1954, DEC-1954.6), and the engine says when it already has.
             // Debug assertions alone, not `cfg(test)`: `pbps-diff` is compiled
             // without its own `cfg(test)` here, so a release test build has no
             // observer to call.
-            if let Some(verification) = &rebuild_verification {
-                verification.verify(pbps_diff::Side { schema: &base, ids: &recorded_ids }, pbps_diff::Side { schema: &declared, ids: &resolved.ids }, &hints, &cs, dialect.as_ref()).map_err(|why| anyhow::anyhow!("{why}"))?;
-            }
             #[cfg(debug_assertions)]
-            if rebuild_verification.is_none() { pbps_diff::order::shadow::observe_scheduled(
+            if !ordered.verified { pbps_diff::order::shadow::observe_scheduled(
                 pbps_diff::Side {
                     schema: &recorded_snapshot.schema,
                     ids: &recorded_ids,
@@ -1126,45 +1022,24 @@ pub(super) async fn plan_db_selected(
                 &hints.annotations.modules(&loaded.schema),
                 &cs,
                 pbps_diff::order::shadow::Stage::Final,
-                Some(
-                    &object_facts
-                        .clone()
-                        .or_else(|| name_facts.as_ref().map(crate::engine::NameFacts::slots))
-                        .unwrap_or_default(),
-                ),
+                Some(&ordered.facts.unwrap_or_default()),
                 &captured,
             ); }
             // The observer's own gate: a release test build has `cfg(test)`
             // but no observer, so the facts are spent here too (#2089).
             #[cfg(not(debug_assertions))]
-            let _ = object_facts;
-            let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
-            let drops = crate::engine::check_drop_blockers(
-                &mut conn,
-                &cs,
-                &resolved.ids,
-                &recorded_snapshot.schema,
-                &recorded_ids,
-            )
-            .await?;
-            let slots = crate::engine::logical_slots(&mut conn, &cs).await?;
-            let fills = crate::engine::numbered_column_fills(&mut conn, &cs, &resolved.ids).await?;
-            crate::engine::prepare_data_writes(
-                &mut conn,
-                &site_admission,
-                &cs,
-                &entry.snapshot,
-                &resolved.ids,
-            )
-            .await?;
+            let _ = (ordered.verified, ordered.facts);
+            let checks = dialect
+                .check_final_order(&mut conn, &site_admission, cs.changes(), frame)
+                .await?;
             Ok::<_, anyhow::Error>((
                 cs,
                 rename_evidence,
                 dependents,
-                rebuilds,
-                drops,
-                slots,
-                fills,
+                checks.rebuilds,
+                checks.drop_blockers,
+                checks.logical_slots,
+                checks.numbered_column_fills,
             ))
         }
         .await;

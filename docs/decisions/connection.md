@@ -1281,3 +1281,77 @@ Pinned by the `plan_session::tests` module in
 `crates/pbps-cli/src/engine/plan_session.rs` (the defaults, each with a
 negative case) and by the existing connected-plan tests, which exercise the
 positions of both engines unchanged.
+
+<a id="dec-2798-3"></a>
+
+**DEC-2798.3. The planning transaction's engine steps are seven more positions
+of `PlanSession`; a position may hold several steps when nothing neutral sits
+between them, and its default is the sequence of theirs (#2798).** DEC-2798.2
+moved the steps before the resolver block. This entry moves the ones from the
+module-name check before `conn.begin` through the final-order checks inside
+the planning transaction: twenty-one steps (the name and rebuild gates, the
+catalog name reads, the role and enum reads, the schedule, the catalog
+reorders and the checks of the final order) became seven new methods, and the
+second role-rename row is the position DEC-2798.2 already added, called again.
+
+- **Positions.** `refuse_occupied_relation_names` and
+  `require_transactional_rebuilds` (before the transaction opens),
+  `check_names_against_catalog` (the name read, the unlogged-partition and
+  publication checks), `read_before_schedule` (role members, the enum
+  dependents), `schedule`, `order_by_catalog` (the generated-input release,
+  the computed-column edges and collation screen, the `sys.objects` walk, the
+  carried-move replay and the rebuild verifier) and `check_final_order` (the
+  four rows and the data-write guard). Neutral code stays between them: the
+  second role-rename row, the re-diff the enum dependents force, the debug
+  observer.
+- **Refinement of DEC-2798.2.** The unit of a position is no longer the unit of
+  a default. Steps with different defaults share a position when no neutral
+  code between them refuses, prints, pushes a finding or mutates what either
+  reads; the position's default is the sequence of its steps' defaults, each a
+  `defaults::` function tested alone, in the order the steps ran. No
+  precedence between two refusals changed, so the allowance DEC-2798.2 made
+  was not used.
+- **Re-diff and typestate.** `schedule` takes the re-diff as a callback
+  (`&dyn Fn`) and is generic over the route state, returning `S::Output`, so
+  the change from `Continuing` to `Canonical` is in its signature and a
+  re-diff stays the pipeline's: the differ, the resolver refusal and the enum
+  dependents set remain neutral locals. The table-rebuild-or-dependents choice
+  is the engine's.
+- **State.** PostgreSQL's `PlanState` also holds the name facts (read in
+  `check_names_against_catalog`, replayed in `order_by_catalog` because the
+  schedule may plan afresh, #1767) and the rebuild verifier (set by
+  `schedule`, run at the end of `order_by_catalog`). SQL Server's state stays
+  empty: its computed-column precedence and object facts are produced and
+  consumed inside `order_by_catalog`. What neutral code needs is returned: the
+  role members and enum dependents (`ScheduleReads`), whether the order was
+  verified and the facts the debug observer replays (`Ordered`), and the four
+  rows (`FinalOrderChecks`). The pipeline hands the positions its sides in
+  one `Frame` instead of a dozen locals.
+- **Site admission.** The one admission rule (DEC-2563.2) is still created by
+  the pipeline and shared by the sites after the transaction, so it is passed
+  in, under the alias `SiteAdmission`; its type still lives in `pbps-pg` and
+  moves when the positions that use it after the transaction do.
+- **Defaults.** Each refuses naming the engine and what the plan asks, or, for
+  the four rows of the final order and the schedule's row, answers
+  `not_applicable` naming the engine. A generated column's input,
+  a computed column and a name the plan creates or moves are each refused by
+  `order_by_catalog`'s default, and `check_final_order`'s refuses a drop or
+  retype, a partition beside a `DEFAULT`, a new numbered column and a row
+  write, because an engine without a step cannot tell their dependents.
+- **Kept routed functions.** `require_transactional_rebuilds`,
+  `check_module_rebuilds`, `check_drop_blockers`, `prepare_data_writes`,
+  `refuse_unlogged_partition_referencers`, `refuse_published_unlogged`,
+  `role_members`, `refuse_added_computed_calls`, `order_created_object_names`
+  and `account_for_module_dependents` keep their callers (apply, the second
+  rebuild check after the transaction, tests) and delegate to the same bodies.
+
+Rejected:
+- **One method for the whole transaction.** The re-diff between the reads and
+  the schedule, and the debug observer between the reorders and the checks,
+  are neutral code that must stay between positions.
+- **Moving the site admission into the state now.** The sites after the
+  transaction (vetting, probes, the pin seal) read it from neutral code; it
+  moves with them.
+
+Pinned by `plan_session::tests` (each default, with its negative case) and by
+the live tests that already exercise the positions of both engines.
