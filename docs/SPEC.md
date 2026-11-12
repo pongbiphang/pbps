@@ -718,8 +718,9 @@ Three more rules, all consequences of the model rather than choices:
   the database, so it lives beside the model exactly as `strategy:` does. It is
   needed only where the identifier scan of ADR-0002 cannot see a dependency.
   The saved plan and the state record the declared annotations as `object_deps`,
-  a sorted list of `{owner, target}` reference pairs written even when empty,
-  beside the schema and outside drift comparison (DEC-2469.7).
+  a sorted list of `{owner, target}` reference pairs, beside the schema and
+  outside drift comparison. The state always writes the list; the plan omits it
+  when empty, like its other collections (DEC-2469.7).
 - **`public_execute:` is an annotation too, and its absence is the closed
   answer.** On an engine whose `CREATE` hands every new routine to `PUBLIC` —
   PostgreSQL does; SQL Server does not — a plan that creates a procedure or a

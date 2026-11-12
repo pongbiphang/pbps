@@ -8047,7 +8047,6 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
   "created_at": "2026-08-31T09:00:00Z",
   "baseline": {{ "description": "prod as queried (entry #1)", "checksum": "deadbeef" }},
   "changes": {{ "changes": [] }},
-  "object_deps": [],
   "ids": {{ "version": 1, "tables": {{}}, "columns": {{}} }}
 }}
 "#

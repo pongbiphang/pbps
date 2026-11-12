@@ -130,15 +130,22 @@ fn a_module_only_plan_keeps_its_order_and_writes_object_deps() {
     assert!(scenario("mssql").get("module_deps").is_none());
 }
 
-/// A project with no `depends_on:` still names its edges: the list is empty,
-/// not absent, so a plan that lost the field cannot be mistaken for it.
+/// A project with no `depends_on:` writes no `object_deps`: like the other
+/// collections of a plan, an empty list is left out (DEC-2469.7).
 #[test]
-fn a_plan_without_annotations_writes_an_empty_object_deps() {
+fn a_plan_without_annotations_omits_object_deps() {
     let p = Project::new("none", "mssql");
     p.file("dbo.t.yml", "table: dbo.t\ncolumns:\n  id: {type: int}\n");
     let out = p.root.join("plan.json");
     let plan = p.plan(&out);
-    assert_eq!(plan["object_deps"], serde_json::json!([]));
+    assert!(plan.get("object_deps").is_none(), "{plan}");
+    // Negative: a project with an annotation still writes its edges.
+    assert!(
+        !scenario("mssql")["object_deps"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A dependency that is not declared and a cycle are still refused at the

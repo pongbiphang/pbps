@@ -455,15 +455,12 @@ pub struct SavedPlan {
     /// ledger so a later connected plan can order drops for modules whose
     /// declaration file has disappeared.
     ///
-    /// Always written, an empty list included, and never defaulted on read: a
-    /// plan of this version without it lost the field, and the checksum would
-    /// otherwise pin a plan the approver did not see (DEC-2469.7).
-    ///
-    /// Open maintainer choice, kept in this one place: the design says always
-    /// write the field (as here). If the plan is to omit an empty list instead,
-    /// the whole change is `#[serde(default, skip_serializing_if =
-    /// "ObjectEdges::is_empty")]` on this field, and the plan goldens
-    /// regenerate. The state side is the same either way.
+    /// Omitted when empty and read as empty when absent, like the other
+    /// collections of this plan (DEC-2469.7). An absent field and an empty
+    /// list are one plan, so the checksum cannot pin a plan the approver saw
+    /// differently. The state snapshot differs on purpose: it always writes
+    /// the field and refuses a current row without it.
+    #[serde(default, skip_serializing_if = "ObjectEdges::is_empty")]
     pub object_deps: ObjectEdges,
 
     /// The identity mapping the environment has **after** this plan.
@@ -1835,13 +1832,14 @@ mod tests {
         .unwrap()
     }
 
-    /// The field is always written and read back equal, with edges, with none,
-    /// and with an edge that is not module to module (DEC-2469.7).
+    /// An empty list is not written, an absent field reads as no edges, and a
+    /// non-empty list is written and read back equal, with an edge that is not
+    /// module to module as well (DEC-2469.7).
     #[test]
-    fn a_plan_writes_object_deps_always_and_reads_them_back_equal() {
+    fn a_plan_omits_an_empty_object_deps_and_reads_the_rest_back_equal() {
         let mut plan = bare_plan();
         let none = serde_json::to_string(&plan).unwrap();
-        assert!(none.contains(r#""object_deps":[]"#), "{none}");
+        assert!(!none.contains("object_deps"), "{none}");
         assert_eq!(serde_json::from_str::<SavedPlan>(&none).unwrap(), plan);
         for rows in [
             &[("module::app.v", "module::app.f(integer)")][..],
@@ -1852,8 +1850,22 @@ mod tests {
         ] {
             plan.object_deps = edges(rows);
             let json = serde_json::to_string(&plan).unwrap();
+            assert!(json.contains(r#""object_deps":["#), "{json}");
             assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
         }
+    }
+
+    /// Like the other collections of a plan, an explicit empty list is the same
+    /// plan as an absent field, and has the same checksum once read.
+    #[test]
+    fn an_explicit_empty_object_deps_is_the_plan_without_the_field() {
+        let plan = bare_plan();
+        let json = serde_json::to_string(&plan).unwrap();
+        let explicit = json.replacen('{', r#"{"object_deps":[],"#, 1);
+        assert_ne!(explicit, json);
+        let read = serde_json::from_str::<SavedPlan>(&explicit).unwrap();
+        assert_eq!(read, plan);
+        assert_eq!(read.wire_fingerprint(), plan.wire_fingerprint());
     }
 
     /// The checksum is over the serialized plan, so an edit to the edges is an
@@ -1875,19 +1887,13 @@ mod tests {
         assert_eq!(one.wire_fingerprint(), two.wire_fingerprint());
     }
 
-    /// A plan of this version names its edges, and names them only as
-    /// `object_deps`: a missing field is not "no edges", and the old key is not
-    /// translated (a plan is never migrated, it is replanned).
+    /// A plan of this version names its edges only as `object_deps`: the old
+    /// key is not translated (a plan is never migrated, it is replanned), and
+    /// an unreadable, unsorted or repeated list is refused and names the pair.
     #[test]
-    fn a_plan_of_the_current_version_needs_object_deps_and_refuses_module_deps() {
+    fn a_plan_of_the_current_version_refuses_module_deps_and_a_bad_list() {
         let json = serde_json::to_string(&bare_plan()).unwrap();
-        let without = json.replace(r#""object_deps":[],"#, "");
-        assert_ne!(without, json);
-        let why = serde_json::from_str::<SavedPlan>(&without)
-            .unwrap_err()
-            .to_string();
-        assert!(why.contains("missing field `object_deps`"), "{why}");
-        let legacy = json.replace(r#""object_deps":[]"#, r#""module_deps":{}"#);
+        let legacy = json.replacen('{', r#"{"module_deps":{},"#, 1);
         let why = serde_json::from_str::<SavedPlan>(&legacy)
             .unwrap_err()
             .to_string();
@@ -1905,6 +1911,35 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let swapped = json.replace(&sorted.to_string(), &reversed.to_string());
         assert_ne!(swapped, json);
-        assert!(serde_json::from_str::<SavedPlan>(&swapped).is_err());
+        let why = serde_json::from_str::<SavedPlan>(&swapped)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("`object_deps` is not sorted"), "{why}");
+        assert!(why.contains("module::app.b"), "{why}");
+        // Negative: a repeated pair is refused and named.
+        let one = serde_json::to_value(edges(&[a])).unwrap().to_string();
+        let one = one.trim_start_matches('[').trim_end_matches(']');
+        let twice = serde_json::to_string(&bare_plan()).unwrap().replacen(
+            '{',
+            &format!(r#"{{"object_deps":[{one},{one}],"#),
+            1,
+        );
+        let why = serde_json::from_str::<SavedPlan>(&twice)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("lists module::app.a -> module::app.x twice"),
+            "{why}"
+        );
+        // Negative: an unreadable reference is refused by position.
+        let bad = serde_json::to_string(&bare_plan()).unwrap().replacen(
+            '{',
+            r#"{"object_deps":[{"owner":1,"target":2}],"#,
+            1,
+        );
+        let why = serde_json::from_str::<SavedPlan>(&bad)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("`object_deps` edge 0"), "{why}");
     }
 }
