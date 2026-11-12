@@ -103,6 +103,24 @@ impl Fixture {
             .collect())
     }
 }
+/// The program the positive `COPY ... TO PROGRAM` control runs. It reads all of
+/// its input before it exits. `true` exits without reading, so PostgreSQL's write
+/// of the row, or its final `pclose`, races the child's exit and fails with
+/// `could not close pipe to external command: Broken pipe` whenever the child
+/// wins, which a loaded host makes common (#2660).
+const DRAINING_PROGRAM: &str = "cat > /dev/null";
+/// More than the 64 KiB a Linux pipe holds, so a program that does not read
+/// cannot have the payload buffered for it: the failure no longer depends on
+/// timing.
+const PAYLOAD_PAST_THE_PIPE: usize = 1 << 20;
+/// Sends `bytes` bytes of text to `program` through `COPY ... TO PROGRAM`.
+async fn copy_to_program(c: &mut Conn, program: &str, bytes: usize) -> anyhow::Result<()> {
+    c.execute(&format!(
+        "COPY (SELECT repeat('x', {bytes})) TO PROGRAM '{program}'"
+    ))
+    .await?;
+    Ok(())
+}
 async fn admin(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Result<Conn> {
     Ok(Conn::connect(
         Driver::Postgres,
@@ -203,7 +221,18 @@ async fn exercise(scratch: &crate::test_scratch::TestScratch<'_>) -> anyhow::Res
             "{sql}: {e}"
         );
     }
-    c.execute("CREATE TABLE app.forbidden(n int); DROP TABLE app.forbidden; COPY (SELECT 1) TO PROGRAM 'true'").await?;
+    c.execute(&format!("CREATE TABLE app.forbidden(n int); DROP TABLE app.forbidden; COPY (SELECT 1) TO PROGRAM '{DRAINING_PROGRAM}'")).await?;
+    // The program above must hold for any payload, not just the one small row
+    // that happens to fit the pipe before a fast child exits (#2660).
+    heap(|| copy_to_program(&mut c, DRAINING_PROGRAM, PAYLOAD_PAST_THE_PIPE)).await?;
+    let stalled = heap(|| copy_to_program(&mut c, "true", PAYLOAD_PAST_THE_PIPE))
+        .await
+        .err()
+        .context("a program that never reads its input accepted a payload past the pipe")?;
+    ensure!(
+        stalled.to_string().contains("Broken pipe"),
+        "the non-draining control failed differently: {stalled}"
+    );
     ensure!(fixtures.query("SELECT * FROM app.codes").await?.len() == 1);
     drop(fixtures);
     for (grant, revoke) in [
