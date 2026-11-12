@@ -2738,6 +2738,8 @@
         "resolver::server::scratch::live_tests::docker2410_tests::recovery_waits_for_a_stop_the_runtime_is_still_finishing",
         "resolver::server::scratch::live_tests::docker2410_tests::a_container_stopping_after_a_running_observation_is_removed_once_the_stop_ends",
         "resolver::server::scratch::live_tests::docker2410_tests::recovery_keeps_a_container_whose_stop_does_not_end_within_the_wait",
+        "resolver::server::scratch::live_tests::docker2410_tests::a_sweep_that_loses_the_identity_read_to_another_remover_keeps_only_that_warning",
+        "resolver::server::scratch::live_tests::docker2410_tests::a_remover_that_leaves_a_volume_behind_fails_the_absence_check",
         "resolver::server::scratch::live_tests::recovery2410_tests::the_keepers_settings_survive_the_two_places_that_reset_a_session",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_release_that_cannot_finish_keeps_the_login_as_the_record",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_cleanup_stopped_before_the_privileges_are_put_back_is_finished_by_the_next_run",

@@ -661,6 +661,54 @@ pub(in crate::resolver::server::scratch) async fn swept_with_observation_within(
     .await
 }
 
+/// The sweep of `token`'s container alone when another remover finishes it
+/// between this sweep's listing and its identity read (#2807, DEC-2513.1).
+/// The listing and a first read happen as usual; `lose` then is the other
+/// remover, and the identity read is repeated, so the sweep holds what the
+/// runtime really answers for a container that vanished before its read: the
+/// run's own liveness and removal paths are the product's.
+#[cfg(test)]
+pub(in crate::resolver::server::scratch) async fn swept_losing_the_identity_read(
+    own: &str,
+    token: &str,
+    lose: impl AsyncFnOnce(&str),
+) -> recovery::Report {
+    struct Lost<'a> {
+        inner: Containers<'a>,
+        found: BTreeMap<String, Vec<Resource>>,
+    }
+    impl Adapter for Lost<'_> {
+        async fn leftovers(&mut self) -> Result<BTreeMap<String, Vec<Resource>>, String> {
+            Ok(std::mem::take(&mut self.found))
+        }
+        async fn liveness(
+            &mut self,
+            tokens: &[String],
+        ) -> Result<BTreeMap<String, Liveness>, String> {
+            self.inner.liveness(tokens).await
+        }
+        async fn remove(&mut self, token: &str, resource: &Resource) -> Result<(), Failed> {
+            self.inner.remove(token, resource).await
+        }
+        fn statement(&self, resource: &Resource) -> String {
+            self.inner.statement(resource)
+        }
+    }
+    let mut inner = Containers::new(own);
+    inner.only = Some(token);
+    let found = inner.leftovers().await.unwrap();
+    let name = format!("pbps-scratch-{token}");
+    lose(&name).await;
+    let lost = inner.state(&name, token).await;
+    assert!(
+        lost.as_ref()
+            .is_err_and(|why| super::no_such_container(why)),
+        "the other remover must have finished before the identity read: {lost:?}"
+    );
+    inner.listed.insert(token.to_owned(), lost);
+    recovery::sweep(&mut Lost { inner, found }).await
+}
+
 #[cfg(test)]
 mod tests {
 
