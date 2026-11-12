@@ -1673,7 +1673,7 @@ under each platform, and the CLI test that plans a 250-byte stem and refuses a
 
 <a id="dec-2804-1"></a>
 
-**DEC-2804.1. The identity tree is not written through a symbolic link below the project root; `init`, the plan of every tree write and `ids migrate`, `ids fmt` and `ids resolve` refuse it, and the root and what is above it are not looked at.**
+**DEC-2804.1. The identity tree is not written through a symbolic link that lies in the project; `init`, the plan of every tree write and `ids migrate`, `ids fmt` and `ids resolve` refuse it, and a link outside the project is followed.**
 `create_dir_all` follows links. With `.pbps` linked to a directory elsewhere,
 `init` put `ids/x.json` into that directory: git records the link and nothing
 else, so the identities were not versioned with the project. Measured on
@@ -1681,36 +1681,42 @@ Linux with the unedited tree (`commit` of a staged project, `.pbps` linked to an
 empty directory outside it).
 
 - **One function.** `ids_store::refuse_linked_ids_dir(root, ids_dir)` looks at
-  each component of `ids_dir` below `root`, `ids_dir` itself included, without
-  following links. `init` calls it in `refuse_existing`, which runs before
-  staging and again before the claim. `ids_store::plan` calls it first, before
-  the case probe, which can create a file in the directory it finds; `pull`,
-  `plan`, the intent commands, `rebuild-table`, `withdraw-rebuild` and `convert`
-  reach `plan`. `ids migrate`, `ids fmt` and `ids resolve` write the tree
-  without `plan`, so each calls it before its first change on disk. `ids fmt
-  --check` writes nothing and is not refused.
-- **Inside the root.** Judged by the lexical prefix first. An absolute `ids_dir`
-  replaces the root in `Project::ids_dir()`, so it can spell the project another
-  way (a relative root, or one reached through a link). It is then judged by
-  directory identity: the shortest ancestor that is the root's directory starts
-  the walk. Shortest, so that a `.pbps` linking back to the root is looked at
-  and not taken for the root. An ancestor that is not there is not the root; one
-  that cannot be inspected, or a root that cannot, is an error naming it.
-- **Four results.** A link is a refusal that names it. A directory is passed. A
-  component that is not there ends the walk, because nothing below it exists. One
-  that cannot be inspected is an error that names it, never "no link". A
-  component that is a file also ends the walk; the write that follows refuses it.
-- **Why the root is not checked.** A checkout may live behind a link, and a write
-  there stays inside the project. Only a link that leads out of the checkout
-  matters.
+  each component of `ids_dir`, from its first, without following links. `init`
+  calls it in `refuse_existing`, which runs before staging and again before the
+  claim. `ids_store::plan` calls it first, before the case probe, which can
+  create a file in the directory it finds; `pull`, `plan`, the intent commands,
+  `rebuild-table`, `withdraw-rebuild` and `convert` reach `plan`. `ids migrate`,
+  `ids fmt` and `ids resolve` write the tree without `plan`, so each calls it
+  before its first change on disk, `migrate` before its interrupted-run path
+  too. `ids fmt --check` writes nothing and is not refused.
+- **One rule, by real location.** A component that is a link is refused when
+  the real location of the directory it sits in (`canonicalize` of its parent)
+  is the project root's real location or below it, compared component by
+  component. A link whose parent is outside the project is followed and the walk
+  goes on. The rule never reads how the path is spelled, so a relative root, a
+  root reached through a link, an absolute `ids_dir` and `a/../.pbps/ids` all
+  give the same answer. `..` and `.` are never links; the parent of the next
+  component is resolved by `canonicalize`. A `.pbps` that links back to the root
+  is refused: its parent is the root.
+- **Four results.** A link in the project is a refusal that names it. A
+  directory is passed. A component that is not there ends the walk, because
+  nothing below it exists. One that cannot be inspected, or whose parent or the
+  root cannot be resolved when a link needs them, is an error that names it,
+  never "no link". A component that is a file also ends the walk; the write that
+  follows refuses it.
+- **Why a link outside the project is followed.** A checkout may live behind a
+  link, and `ids_dir: ../shared/ids` may reach a shared directory through one;
+  `master` accepts both. Only a link in the project can take the files out of
+  what the project's git records. The rule that tests the spelling of the path
+  (lexical prefix, then identity for an absolute path) refused the second
+  layout; a rule on the real location needs no case for `..`.
 - **Why `plan` and not `apply`.** `pull` must make every refusal of the tree
   before it publishes a declaration (DEC-2600.9). The cost is that a project that
   already keeps `.pbps` as a link is refused by `pull` even when the write would
   change nothing, and so is `ids resolve` with nothing unmerged. Such a tree is
   not versioned with the project, which is the case this entry refuses.
-- **Not covered.** An absolute `ids_dir` outside the root (no ancestor is the
-  root's directory) is not looked at. On Windows the check
-  uses `FileType::is_symlink`. Read in the `std` source (1.85 and 1.99): it is
-  true for a reparse point whose tag has the name-surrogate bit (`0x20000000`).
-  Symbolic links (`0xA000000C`) and junctions (`0xA0000003`) both have it, so
-  both are refused. Not run on Windows.
+- **Not covered.** A link placed between the check and the write is not caught.
+  On Windows the check uses `FileType::is_symlink`. Read in the `std` source
+  (1.85 and 1.99): it is true for a reparse point whose tag has the name-surrogate
+  bit (`0x20000000`). Symbolic links (`0xA000000C`) and junctions (`0xA0000003`)
+  both have it, so both are refused. Not run on Windows.

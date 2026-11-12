@@ -1272,3 +1272,27 @@ fn a_relative_project_path_with_an_absolute_ids_dir_inside_it_is_inspected_for_l
     assert!(p.has(".pbps/ids/dbo/customer.json"));
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_link_outside_the_project_on_the_way_to_a_relative_ids_dir_is_followed() {
+    // `ids_dir: ../shared/ids` leaves the project, and `shared` is a link. The
+    // link is not below the project, so it is the user's own layout.
+    let p = legacy_project_in("proj");
+    p.write("pbps.yml", "dialect: postgres\nids_dir: ../shared/ids\n");
+    let real = p.1.join("real-shared");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, p.1.join("shared")).unwrap();
+    assert_ok(&p.pbps(&["ids", "migrate"]));
+    assert!(real.join("ids/dbo/customer.json").is_file());
+    // Negative: a link inside the project on a `..` detour is still refused.
+    let q = legacy_project_in("proj");
+    q.write("pbps.yml", "dialect: postgres\nids_dir: a/../.pbps/ids\n");
+    std::fs::create_dir(q.0.join("a")).unwrap();
+    let outside = link_ids_parent(&q);
+    assert_refused(
+        &q.pbps(&["ids", "migrate"]),
+        "/proj/a/../.pbps` is a symbolic link",
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

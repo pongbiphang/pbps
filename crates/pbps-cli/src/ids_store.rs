@@ -661,91 +661,61 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
     })
 }
 
-/// Refuses an identity directory reached through a symbolic link, before
-/// anything is written (#2804).
+/// Refuses an identity directory reached through a symbolic link that lies in
+/// the project, before anything is written (#2804).
 ///
 /// `create_dir` and `create_dir_all` follow links. A linked `.pbps` would take
 /// the identity files to the link's target, where the checkout's git does not
-/// record them. Every component of `ids_dir` below `root`, `ids_dir` itself
-/// included, is looked at without being followed. The root and what is above it
-/// are not: a checkout may live behind a link, and writing there stays inside
-/// the project.
+/// record them.
+///
+/// One rule, judged by real location and not by spelling: every component of
+/// `ids_dir`, from its first, is looked at without being followed. A link is
+/// refused when the real location of the directory it sits in is the project
+/// root or below it. A link whose parent is outside the project is followed: a
+/// checkout may live behind a link, and `../shared/ids` may be one.
+/// Real locations are compared component-wise, so `proj-2` is not in `proj`.
+/// `..` and `.` are never links; the parent of the next component is resolved
+/// by `canonicalize`.
 ///
 /// Absent, a directory, a link and unreadable differ. A component that is not
 /// there ends the walk with no refusal, because nothing below it exists. One
-/// that cannot be inspected is an error that names it, never "no link". A
-/// component that is a file also ends the walk: the write that follows refuses
-/// it with its own message.
-///
-/// "Below `root`" is the lexical prefix first. An absolute `ids_dir` replaces the
-/// root in `Project::ids_dir` and may spell the project another way, so it is
-/// then judged by directory identity (`start_of_walk`). A path outside the
-/// project has nothing to look at.
+/// that cannot be inspected, or whose parent cannot be resolved, is an error
+/// that names it, never "no link". A component that is a file also ends the
+/// walk: the write that follows refuses it with its own message.
 pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
-    let (start, below) = match ids_dir.strip_prefix(root) {
-        Ok(below) => (root, below),
-        Err(_) => match start_of_walk(root, ids_dir)? {
-            Some(found) => found,
-            None => return Ok(()),
-        },
-    };
-    let mut at = start.to_path_buf();
-    for part in below.components() {
-        at.push(part);
-        let shown = || pbps_model::escape::Escaped(&at.display().to_string()).to_string();
-        match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => bail!(
-                "`{}` is a symbolic link, so the identity tree `{}` would be written where this project's git does not record it; replace the link with a real directory and run the command again; nothing was written",
-                shown(),
-                pbps_model::escape::Escaped(&ids_dir.display().to_string())
-            ),
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown())),
-        }
-    }
-    Ok(())
-}
-
-/// The ancestor of an absolute `ids_dir` that is the same directory as `root`,
-/// and what is below it. Shortest first on purpose: a `.pbps` that links back to
-/// the root is the root too, and the longest match would skip it. An ancestor
-/// that is not there is not the root; one that cannot be looked at is an error.
-fn start_of_walk<'a>(
-    root: &Path,
-    ids_dir: &'a Path,
-) -> anyhow::Result<Option<(&'a Path, &'a Path)>> {
-    if !ids_dir.is_absolute() {
-        return Ok(None);
-    }
     use std::io::ErrorKind::{NotADirectory, NotFound};
-    // An empty root is the working directory, as `Project::load` reads it.
+    let shown = |path: &Path| pbps_model::escape::Escaped(&path.display().to_string()).to_string();
+    // An empty path is the working directory, as `Project::load` reads it.
     let real = |path: &Path| {
         std::fs::canonicalize(if path.as_os_str().is_empty() {
             Path::new(".")
         } else {
             path
         })
+        .with_context(|| format!("cannot inspect `{}`", shown(path)))
     };
-    let cannot = |path: &Path, e: std::io::Error| {
-        anyhow::Error::new(e).context(format!(
-            "cannot inspect `{}`",
-            pbps_model::escape::Escaped(&path.display().to_string())
-        ))
-    };
-    let root_real = real(root).map_err(|e| cannot(root, e))?;
-    for ancestor in ids_dir.ancestors().collect::<Vec<_>>().into_iter().rev() {
-        match real(ancestor) {
-            Ok(found) if found == root_real => {
-                return Ok(ids_dir.strip_prefix(ancestor).ok().map(|b| (ancestor, b)));
+    let mut at = PathBuf::new();
+    for part in ids_dir.components() {
+        let parent = at.clone();
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if real(&parent)?.starts_with(real(root)?) {
+                    bail!(
+                        "`{}` is a symbolic link, so the identity tree `{}` would be written where this project's git does not record it; replace the link with a real directory and run the command again; nothing was written",
+                        shown(&at),
+                        shown(ids_dir)
+                    );
+                }
             }
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
-            Err(e) => return Err(cannot(ancestor, e)),
+            Ok(meta) if meta.is_dir() => {}
+            // A file, or a followed link to one: the write refuses it.
+            Ok(_) => return Ok(()),
+            Err(e) if matches!(e.kind(), NotFound | NotADirectory) => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown(&at))),
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 /// What `path` is, not followed through a link, or `None` when the filesystem
