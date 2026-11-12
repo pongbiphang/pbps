@@ -2425,3 +2425,117 @@ fn an_uninspectable_ancestor_stops_the_write_with_an_error_naming_it_and_leaves_
         "x"
     );
 }
+
+/// A project whose `ids_dir` is `ids` (the default when `None`), and an empty
+/// directory beside it that a link can point at.
+#[cfg(unix)]
+fn linkable(tag: &str, ids: Option<&str>) -> (Project, PathBuf) {
+    let project = project(tag);
+    if let Some(ids) = ids {
+        let config = project.root.join("pbps.yml");
+        std::fs::write(&config, format!("dialect: postgres\nids_dir: {ids}\n")).unwrap();
+    }
+    let project = Project::load(&project.root.join("pbps.yml")).unwrap();
+    let outside = project.root.with_file_name(format!(
+        "{}-outside",
+        project.root.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    (project, outside)
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_refuses_an_identity_tree_whose_parent_is_a_symlink_and_writes_nothing() {
+    // `pbps pull` reaches this: it plans the tree before it publishes anything.
+    let (project, outside) = linkable("linked-parent", None);
+    std::os::unix::fs::symlink(&outside, project.root.join(".pbps")).unwrap();
+    let before = listing(&project.root);
+    let error = format!(
+        "{:#}",
+        plan(&project, &customer(), &customer_declared()).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(
+        error.contains(&project.root.join(".pbps").display().to_string()),
+        "the refusal names the link: {error}"
+    );
+    assert_eq!(listing(&project.root), before);
+    assert_eq!(listing(&outside), Vec::<String>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_accepts_an_ordinary_existing_parent_of_the_identity_tree() {
+    let (project, outside) = linkable("ordinary-parent", None);
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    plan(&project, &customer(), &customer_declared())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(!tree(&project).is_empty());
+    assert_eq!(listing(&outside), Vec::<String>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_middle_of_a_deeper_ids_dir_is_refused() {
+    let (project, outside) = linkable("linked-middle", Some("meta/ids"));
+    std::os::unix::fs::symlink(&outside, project.root.join("meta")).unwrap();
+    let error = format!(
+        "{:#}",
+        plan(&project, &customer(), &customer_declared()).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(
+        error.contains(&project.root.join("meta").display().to_string()),
+        "{error}"
+    );
+    assert_eq!(listing(&outside), Vec::<String>::new());
+    // Negative: the same layout with a real `meta` directory is accepted.
+    std::fs::remove_file(project.root.join("meta")).unwrap();
+    std::fs::create_dir(project.root.join("meta")).unwrap();
+    plan(&project, &customer(), &customer_declared())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(project.root.join("meta/ids").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_root_behind_a_link_is_not_refused() {
+    let (project, outside) = linkable("root-behind-link", None);
+    let behind = outside.join("checkout");
+    std::os::unix::fs::symlink(&project.root, &behind).unwrap();
+    // The root and what is above it are the checkout's own place.
+    refuse_linked_ids_dir(&behind, &behind.join(".pbps/ids")).unwrap();
+    // Not below the root: nothing here to look at.
+    refuse_linked_ids_dir(&project.root, &outside.join("ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_component_that_cannot_be_inspected_is_an_error_not_no_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, _outside) = linkable("unreadable-parent", None);
+    let parent = project.root.join(".pbps");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::symlink_metadata(parent.join("ids")).is_ok() {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let error = format!(
+        "{:#}",
+        refuse_linked_ids_dir(&project.root, &project.ids_dir()).unwrap_err()
+    );
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains(".pbps/ids"), "{error}");
+    assert!(!error.contains("symbolic link"), "{error}");
+    // Negative: once it can be inspected and nothing is there, no refusal.
+    refuse_linked_ids_dir(&project.root, &project.ids_dir()).unwrap();
+}

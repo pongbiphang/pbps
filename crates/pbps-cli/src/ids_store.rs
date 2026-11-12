@@ -661,6 +661,45 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
     })
 }
 
+/// Refuses an identity directory reached through a symbolic link, before
+/// anything is written (#2804).
+///
+/// `create_dir` and `create_dir_all` follow links. A linked `.pbps` would take
+/// the identity files to the link's target, where the checkout's git does not
+/// record them. Every component of `ids_dir` below `root`, `ids_dir` itself
+/// included, is looked at without being followed. The root and what is above it
+/// are not: a checkout may live behind a link, and writing there stays inside
+/// the project.
+///
+/// Absent, a directory, a link and unreadable differ. A component that is not
+/// there ends the walk with no refusal, because nothing below it exists. One
+/// that cannot be inspected is an error that names it, never "no link". A
+/// component that is a file also ends the walk: the write that follows refuses
+/// it with its own message. A path not below `root` (an absolute `ids_dir`) has
+/// no components to look at here.
+pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
+    let Ok(below) = ids_dir.strip_prefix(root) else {
+        return Ok(());
+    };
+    let mut at = root.to_path_buf();
+    for part in below.components() {
+        at.push(part);
+        let shown = || pbps_model::escape::Escaped(&at.display().to_string()).to_string();
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "`{}` is a symbolic link, so the identity tree `{}` would be written where this project's git does not record it; replace the link with a real directory and run the command again; nothing was written",
+                shown(),
+                pbps_model::escape::Escaped(&ids_dir.display().to_string())
+            ),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown())),
+        }
+    }
+    Ok(())
+}
+
 /// What `path` is, not followed through a link, or `None` when the filesystem
 /// says it is not there. Only "not found" means absent: an entry that cannot be
 /// looked at (a directory above it without search permission, an I/O error) is
@@ -1030,6 +1069,9 @@ pub(crate) fn plan(
     after: &IdsFile,
     declared: &DeclaredPaths,
 ) -> anyhow::Result<TreeWrite> {
+    // First, before the probe below, which may create a file in the directory
+    // it finds.
+    refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     let key = PathKey::probe(&project.ids_dir()).with_context(|| {
         format!(
             "cannot tell whether `{}` is case-sensitive",

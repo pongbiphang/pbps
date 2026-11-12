@@ -1670,3 +1670,37 @@ last path component counts; a long directory path is not a long file name.
 Pinned by the 251, 250 and `.yaml` cases in `pbps-model`, the unit-counting test
 under each platform, and the CLI test that plans a 250-byte stem and refuses a
 251-byte one.
+
+<a id="dec-2804-1"></a>
+
+**DEC-2804.1. The identity tree is not written through a symbolic link below the project root; `init` and the plan of every tree write refuse it, and the root and what is above it are not looked at.**
+`create_dir_all` follows links. With `.pbps` linked to a directory elsewhere,
+`init` put `ids/x.json` into that directory: git records the link and nothing
+else, so the identities were not versioned with the project. Measured on
+Linux with the unedited tree (`commit` of a staged project, `.pbps` linked to an
+empty directory outside it).
+
+- **One function.** `ids_store::refuse_linked_ids_dir(root, ids_dir)` looks at
+  each component of `ids_dir` below `root`, `ids_dir` itself included, without
+  following links. `init` calls it in `refuse_existing`, which runs before
+  staging and again before the claim. `ids_store::plan` calls it first, before
+  the case probe, which can create a file in the directory it finds. `pbps pull`
+  is the command that reaches `plan`.
+- **Four results.** A link is a refusal that names it. A directory is passed. A
+  component that is not there ends the walk, because nothing below it exists. One
+  that cannot be inspected is an error that names it, never "no link". A
+  component that is a file also ends the walk; the write that follows refuses it.
+- **Why the root is not checked.** A checkout may live behind a link, and a write
+  there stays inside the project. Only a link that leads out of the checkout
+  matters.
+- **Why `plan` and not `apply`.** `pull` must make every refusal of the tree
+  before it publishes a declaration (DEC-2600.9). The cost is that a project that
+  already keeps `.pbps` as a link is refused by `pull` even when the write would
+  change nothing. Such a tree is not versioned with the project, which is the
+  case this entry refuses.
+- **Not covered.** An `ids_dir` that is an absolute path outside the root has no
+  component below the root and is not looked at. On Windows the check
+  uses `FileType::is_symlink`. Read in the `std` source (1.85 and 1.99): it is
+  true for a reparse point whose tag has the name-surrogate bit (`0x20000000`).
+  Symbolic links (`0xA000000C`) and junctions (`0xA0000003`) both have it, so
+  both are refused. Not run on Windows.
