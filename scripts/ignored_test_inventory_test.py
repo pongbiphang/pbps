@@ -1292,6 +1292,17 @@ class Win32Prediction(unittest.TestCase):
                     (self.root / "src" / path).write_text(text.replace("#![cfg(unix)]\n", ""), encoding="utf-8")
                 self.refused_name(targets, name)
 
+    def test_a_conditional_path_attribute_is_not_decided_and_counts_as_compiled(self):
+        # The default file is kept out of Windows, but cfg_attr may select another file there.
+        gated = "#![cfg(unix)]\n" + self.TEST.replace("    ", "")
+        for attribute in ('#[cfg_attr(windows, path = "win.rs")]', '#[cfg_attr(not(unix), path = "win.rs")]'):
+            for module in ("mod live;\n", "mod live {\n    mod inner;\n}\n"):
+                with self.subTest(attribute=attribute, module=module):
+                    targets = self.crate(f"{attribute}\n{module}", **{"live.rs": gated, "live/inner.rs": gated})
+                    if "inner" in module:
+                        targets[KEY]["ignored"] = {"live::inner::owned"}
+                    self.refused_name(targets, targets[KEY]["ignored"].copy().pop())
+
     def refused_name(self, targets, name):
         with self.assertRaisesRegex(audit.InventoryError, "^predicted on win32: .*" + re.escape(name)):
             self.predict(targets)

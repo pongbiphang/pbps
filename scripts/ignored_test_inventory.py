@@ -1322,6 +1322,9 @@ class RustModules:
             here = tri_all([value, attribute_cfg(attributes)])
             if here is False or kind == "fn":
                 results.append(here); continue
+            if any(attr[:1] == ["cfg_attr"] and "path" in attr for attr in attributes):
+                # A conditional #[path] may select another file on Windows: not decided here.
+                results.append(None); continue
             if body is not None:   # inline module: children live in a directory named after it
                 if (id(tokens), body) not in self.parsed:
                     self.parsed[id(tokens), body] = rust_items(tokens, *body)
