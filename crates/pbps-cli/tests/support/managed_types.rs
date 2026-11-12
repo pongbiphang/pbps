@@ -189,9 +189,11 @@ fn adopted_domains_and_older_states_keep_engine_expression_text() {
             assert!(plan.changes.is_empty());
         };
         clean();
+        // Version 30 predates `object_deps`, and a row of that age may not hold it
+        // (it is empty here: no module is declared).
         on_server(
             db,
-            "UPDATE public.__pbps_state SET state_version = 30, state_json = jsonb_set(state_json::jsonb, '{version}', '30')::text",
+            "UPDATE public.__pbps_state SET state_version = 30, state_json = jsonb_set(state_json::jsonb - 'object_deps', '{version}', '30')::text",
         );
         assert_eq!(latest_snapshot(db).version, 30);
         assert!(latest_snapshot(db).declared.types.is_empty());

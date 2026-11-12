@@ -1388,6 +1388,20 @@ mod tests {
         assert!(why.contains("module_deps"), "{why}");
     }
 
+    /// A row below the cut goes through a JSON value, and a hand-edited field
+    /// must still be refused by name there, as in the strict parse. A caller
+    /// shows that name to the operator (`--base` refusals).
+    #[test]
+    fn a_row_below_the_cut_still_refuses_an_unknown_field_by_name() {
+        let mut row = old_row(OBJECT_DEPS_VERSION - 1, None);
+        row["surprise"] = 1.into();
+        let why = StateSnapshot::from_json(&row.to_string()).unwrap_err();
+        assert!(why.contains("unknown field `surprise`"), "{why}");
+        // Negative: the same row without it reads.
+        row.as_object_mut().unwrap().shift_remove("surprise");
+        assert!(StateSnapshot::from_json(&row.to_string()).is_ok());
+    }
+
     #[test]
     fn a_current_row_must_carry_object_deps_and_may_not_carry_module_deps() {
         let mut row = old_row(OBJECT_DEPS_VERSION, None);
