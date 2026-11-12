@@ -239,8 +239,6 @@ pub(in crate::engine) fn numbered_column_fills() -> ConnectedCheck {
 /// Returns which drop waits for which by those edges, for the rename search
 /// that runs after it ([`order_created_object_names`], #1680): empty where
 /// no edge was read.
-// The complement is every change that touches no object an expression edge
-// can name: a computed column, a column it reads, its table, or a module.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
     conn: &mut Conn,
@@ -249,28 +247,8 @@ pub(in crate::engine) async fn order_computed_by_edges<S: Clone>(
 ) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
     let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
     let catalog = |at, table: &TableName| computed_catalog_table(&names, table, at);
-    let mut objects: Vec<pbps_model::TableName> = Vec::new();
-    for (at, p) in cs.changes.iter().enumerate() {
-        let touched = match &p.change {
-            pbps_model::Change::AddComputedColumn { table, .. }
-            | pbps_model::Change::DropComputedColumn { table, .. }
-            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
-            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
-            pbps_model::Change::DropColumn { column, .. }
-            | pbps_model::Change::AlterColumnType { column, .. }
-            | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                Some(catalog(at, &column.table))
-            }
-            pbps_model::Change::AlterModule { id, .. }
-            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
-            _ => None,
-        };
-        if let Some(object) = touched
-            && !objects.contains(&object)
-        {
-            objects.push(object);
-        }
-    }
+    // The tables and modules whose expression edges are worth reading.
+    let objects = computed_edge_objects(&names, cs.changes());
     if objects.is_empty() {
         return Ok(Vec::new());
     }

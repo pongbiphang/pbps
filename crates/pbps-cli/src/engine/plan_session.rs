@@ -448,7 +448,7 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     /// pipeline owns the diff. It refuses when a resolver's answer would be
     /// dropped by planning again.
     ///
-    /// Neutral (an `not_applicable` row) when the plan drops no module and
+    /// Neutral (a `not_applicable` row) when the plan drops or rebuilds no module and
     /// rebuilds no table; refuses when it does and the engine has no step for
     /// it.
     #[allow(clippy::too_many_arguments)]
@@ -475,7 +475,11 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &read, self)?;
         Ok((
             scheduled.changes,
-            defaults::not_applicable(self.name(), "module_dependents", "the plan drops no module"),
+            defaults::not_applicable(
+                self.name(),
+                "module_dependents",
+                "the plan drops or rebuilds no module",
+            ),
         ))
     }
 
@@ -497,7 +501,8 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     ) -> anyhow::Result<Ordered> {
         defaults::ordering_by_catalog(
             self.name(),
-            frame.base.schema,
+            self,
+            frame.written.ids,
             frame.declared.schema,
             changes,
         )?;
@@ -522,6 +527,46 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     ) -> anyhow::Result<FinalOrderChecks> {
         defaults::final_order(self.name(), changes)
     }
+}
+
+/// The tables and modules a plan touches that a SQL Server expression edge can
+/// name, under the names the catalog has them by: a computed column, a column
+/// it reads, its table, or a module. The first selection of
+/// `order_computed_by_edges`, shared with the default of
+/// [`PlanSession::order_by_catalog`] so the two cannot select differently; the
+/// step then narrows it to what an edge could refuse or move, which needs the
+/// catalog's answer to know, so the default takes this superset.
+// The complement is every change that touches no object an expression edge
+// can name: a computed column, a column it reads, its table, or a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(in crate::engine) fn computed_edge_objects(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+    cs: &ChangeSet,
+) -> Vec<TableName> {
+    let catalog = |at, table: &TableName| computed_catalog_table(names, table, at);
+    let mut objects: Vec<pbps_model::TableName> = Vec::new();
+    for (at, p) in cs.changes.iter().enumerate() {
+        let touched = match &p.change {
+            pbps_model::Change::AddComputedColumn { table, .. }
+            | pbps_model::Change::DropComputedColumn { table, .. }
+            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
+            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                Some(catalog(at, &column.table))
+            }
+            pbps_model::Change::AlterModule { id, .. }
+            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
+            _ => None,
+        };
+        if let Some(object) = touched
+            && !objects.contains(&object)
+        {
+            objects.push(object);
+        }
+    }
+    objects
 }
 
 /// What a provided method answers, as functions of the engine's name.
@@ -642,21 +687,39 @@ pub(crate) mod defaults {
     }
 
     /// Whether the plan creates, takes or moves a name in a namespace the
-    /// target holds: a relation (table, view, index, owned sequence), a type,
-    /// a renamed table or column, or a partition detached under a clone name.
+    /// target holds, selected by the same functions the PostgreSQL name read
+    /// asks with: the relation names it creates (tables, views, indexes,
+    /// owned sequences), the names its table renames take and the tables a
+    /// rename moves between schemas, the types it creates or renames, and the
+    /// partitions it detaches.
     #[allow(clippy::wildcard_enum_match_arm)] // The complement names nothing.
     fn names_a_thing(changes: &ChangeSet) -> bool {
         !crate::deploy::created_relation_names(changes).is_empty()
             || !crate::deploy::rename_claims(changes).is_empty()
+            || !crate::deploy::transferred_tables(changes).is_empty()
             || changes.changes.iter().any(|p| {
                 matches!(
                     p.change,
                     pbps_model::Change::CreateType { .. }
                         | pbps_model::Change::RenameType { .. }
-                        | pbps_model::Change::RenameColumn { .. }
                         | pbps_model::Change::DetachPartition { .. }
                 )
             })
+    }
+
+    /// What the namespace check reads: a table or view it creates, an index it
+    /// names, and any other module it creates (a routine or trigger is
+    /// compared with the unreadable modules, not only the relations).
+    pub(crate) fn occupied_relation_names(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            crate::deploy::created_relation_names(changes).is_empty()
+                && !changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::CreateModule { .. })),
+            "{engine} has no step that checks whether a name this plan creates is already in use"
+        );
+        Ok(())
     }
 
     /// Whether the plan drops a role, whose members the schedule writes in.
@@ -693,14 +756,6 @@ pub(crate) mod defaults {
             None => crate::dependents::schedule::Facts::default(),
         };
         (declarations, read)
-    }
-
-    pub(crate) fn occupied_relation_names(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            crate::deploy::created_relation_names(changes).is_empty(),
-            "{engine} has no step that checks whether a name this plan creates is already in use"
-        );
-        Ok(())
     }
 
     /// The refusals every engine makes of a staged run, with `module_check`
@@ -789,11 +844,8 @@ pub(crate) mod defaults {
             "{engine} has no step that reads the target's names to order and check the ones this plan creates or renames"
         );
         anyhow::ensure!(
-            !changes.changes.iter().any(|p| matches!(
-                p.change,
-                pbps_model::Change::SetTablePersistence { unlogged: true, .. }
-            )),
-            "{engine} has no step that checks the publications and foreign keys of a table this plan makes unlogged"
+            !crate::deploy::leaves_something_unlogged(changes),
+            "{engine} has no step that checks the foreign keys and publications of a table or partition this plan creates, attaches or makes unlogged"
         );
         Ok(())
     }
@@ -818,12 +870,11 @@ pub(crate) mod defaults {
     }
 
     pub(crate) fn module_dependents(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
+        // The classifier the schedule itself uses: a module dropped for good and
+        // one the plan drops and recreates (`AlterModule`) both have dependents.
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. })),
-            "{engine} has no step that reads what depends on a module this plan drops"
+            pbps_diff::order::deployment::dropped_modules(changes).is_empty(),
+            "{engine} has no step that reads what depends on a module this plan drops or rebuilds"
         );
         anyhow::ensure!(
             !changes
@@ -835,45 +886,47 @@ pub(crate) mod defaults {
         Ok(())
     }
 
-    /// The passes of [`PlanSession::order_by_catalog`], each refused for the
-    /// thing it orders: a generated column's input retyped or dropped, a
-    /// computed column the plan or the base holds, a name the plan creates or
-    /// moves.
+    /// The passes of [`PlanSession::order_by_catalog`], each refused for what
+    /// its own step selects from the plan:
+    /// - the generated-input release, any column retype or drop
+    ///   (`row_security::column_edit`), because the generated columns that
+    ///   read a column are in the catalog and not always in `declared`;
+    /// - the computed-column edges, the superset the SQL Server step reads
+    ///   edges for (`computed_edge_objects`), and the calls the collation
+    ///   comparison covers (`added_call_spellings`);
+    /// - the name walk, the objects and parents `object_reads` selects, and
+    ///   any module change, which can bind to a name the walk compares
+    ///   (`schema_bound_call_names`) — the narrowest plan-only superset,
+    ///   because what the walk then asks of the catalog decides the rest.
     pub(crate) fn ordering_by_catalog(
         engine: &str,
-        base: &Schema,
+        dialect: &dyn pbps_dialect::Dialect,
+        ids: &IdsFile,
         declared: &Schema,
         changes: &ChangeSet,
     ) -> anyhow::Result<()> {
-        let generated = |schema: &Schema| {
-            schema.tables.values().any(|t| {
-                t.columns
-                    .values()
-                    .any(|c| matches!(c.value_source, pbps_model::ValueSource::Generated(_)))
-            })
-        };
         anyhow::ensure!(
-            !(generated(base)
-                && changes.changes.iter().any(|p| matches!(
-                    p.change,
-                    pbps_model::Change::AlterColumnType { .. }
-                        | pbps_model::Change::DropColumn { .. }
-                ))),
+            !changes
+                .changes
+                .iter()
+                .any(|p| crate::row_security::column_edit(&p.change).is_some()),
             "{engine} has no step that orders the retype or drop of a column a generated column reads"
         );
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
         anyhow::ensure!(
-            ![base, declared]
-                .iter()
-                .any(|schema| schema.tables.values().any(|t| !t.computed.is_empty()))
-                && !changes.changes.iter().any(|p| matches!(
-                    p.change,
-                    pbps_model::Change::AddComputedColumn { .. }
-                        | pbps_model::Change::DropComputedColumn { .. }
-                )),
+            computed_edge_objects(&names, changes).is_empty()
+                && crate::computed_order::added_call_spellings(changes, declared, dialect)
+                    .is_empty(),
             "{engine} has no step that orders a computed column's dependencies from the catalog"
         );
+        let (created, parents) = crate::deploy::object_reads(changes, &names);
         anyhow::ensure!(
-            !names_a_thing(changes),
+            created.is_empty()
+                && parents.is_empty()
+                && !changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::change_family!(modules))),
             "{engine} has no step that orders the names this plan creates or moves from the catalog"
         );
         Ok(())
@@ -894,6 +947,10 @@ pub(crate) mod defaults {
         ))
     }
 
+    /// The drops both engines' readers select: a table, a column, a primary
+    /// key replaced, a unique constraint, an index, a numbering source (the
+    /// PostgreSQL reader keeps the ones it gives up; the default takes every
+    /// change of numbering), and the retype SQL Server counts under a key.
     #[allow(clippy::wildcard_enum_match_arm)] // The complement drops nothing.
     pub(crate) fn drop_blockers(
         engine: &'static str,
@@ -906,8 +963,7 @@ pub(crate) mod defaults {
                     | pbps_model::Change::DropColumn { .. }
                     | pbps_model::Change::DropUnique { .. }
                     | pbps_model::Change::DropIndex { .. }
-                    | pbps_model::Change::DropForeignKey { .. }
-                    | pbps_model::Change::DropCheck { .. }
+                    | pbps_model::Change::AlterColumnNumbering { .. }
                     | pbps_model::Change::AlterColumnType { .. }
                     | pbps_model::Change::SetPrimaryKey { from: Some(_), .. }
             )),
@@ -963,13 +1019,20 @@ pub(crate) mod defaults {
         ))
     }
 
+    /// The changes the PostgreSQL guard prepares for: the row statements, and
+    /// whatever rewrites a table's stored rows (`rewrite_write`).
     pub(crate) fn data_writes(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::change_family!(rows))),
-            "{engine} has no step that authenticates the triggers a row write of this plan meets"
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::InsertRow { .. }
+                    | pbps_model::Change::UpdateRow { .. }
+                    | pbps_model::Change::DeleteRow { .. }
+            ) || pbps_pg::existing_expressions::rewrite_write(
+                &p.change
+            )
+            .is_some()),
+            "{engine} has no step that authenticates the triggers a row write or rewrite of this plan meets"
         );
         Ok(())
     }
@@ -1345,59 +1408,92 @@ mod tests {
         }]);
         let message = refusal(defaults::numbered_column_fills(THIRD, &numbered));
         assert!(message.contains("identity or serial"), "{message}");
-        let insert = plan(vec![pbps_model::Change::SetDataMode {
-            table: table_name(),
-            from: None,
-            to: None,
-        }]);
-        let message = refusal(defaults::data_writes(THIRD, &insert));
+        let rewrite = retype_plan();
+        let message = refusal(defaults::data_writes(THIRD, &rewrite));
         assert!(
-            message.contains(THIRD) && message.contains("trigger"),
+            message.contains(THIRD) && message.contains("triggers"),
             "{message}"
         );
         // The row checks are asked in order: the first refusal wins.
-        let both = plan(vec![
-            pbps_model::Change::DropTable {
-                uid: uid(pbps_model::UidKind::Table, "app.t"),
-                name: table_name(),
-                detach_from: None,
-            },
-            pbps_model::Change::SetDataMode {
-                table: table_name(),
-                from: None,
-                to: None,
-            },
-        ]);
+        let mut both = plan(vec![pbps_model::Change::DropTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            name: table_name(),
+            detach_from: None,
+        }]);
+        both.changes.extend(retype_plan().changes);
         let message = refusal(defaults::final_order(THIRD, &both));
         assert!(message.contains("depends"), "{message}");
     }
 
-    #[test]
-    fn the_catalog_ordering_default_passes_an_empty_plan_and_refuses_what_it_orders() {
-        let none = Schema::default();
-        defaults::ordering_by_catalog(THIRD, &none, &none, &ChangeSet::default()).unwrap();
-        let mut computed = Schema::default();
-        computed
-            .tables
-            .entry(table_name())
-            .or_default()
-            .computed
-            .insert(
-                "c".into(),
-                pbps_model::ComputedColumn {
-                    expression: "1".into(),
-                    persisted: false,
-                    not_null: false,
-                },
-            );
-        let message = refusal(defaults::ordering_by_catalog(
+    fn ordering(changes: &ChangeSet, declared: &Schema) -> anyhow::Result<()> {
+        defaults::ordering_by_catalog(
             THIRD,
-            &computed,
-            &none,
-            &ChangeSet::default(),
-        ));
+            &pbps_pg::Postgres::new(),
+            &crate::plan_fixture::ids(changes),
+            declared,
+            changes,
+        )
+    }
+
+    fn retype_plan() -> ChangeSet {
+        plan(vec![pbps_model::Change::AlterColumnType {
+            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+            column: column_ref("a"),
+            from: "integer".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+            using: None,
+        }])
+    }
+
+    fn column_ref(name: &str) -> pbps_model::ColumnRef {
+        table_name().column(pbps_model::ColumnName::from(name))
+    }
+
+    #[test]
+    fn the_catalog_ordering_default_passes_an_empty_plan_and_refuses_a_column_edit() {
+        ordering(&ChangeSet::default(), &Schema::default()).unwrap();
+        // The generated columns that read a column are in the catalog, not
+        // necessarily in the declarations: any retype or drop is refused.
+        let drop = plan(vec![pbps_model::Change::DropColumn {
+            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+            column: column_ref("a"),
+        }]);
+        let message = refusal(ordering(&drop, &Schema::default()));
         assert!(
-            message.contains(THIRD) && message.contains("computed"),
+            message.contains(THIRD) && message.contains("generated column"),
+            "{message}"
+        );
+        // Negative: a change of persistence reads no generated column.
+        let nullable = plan(vec![pbps_model::Change::SetTablePersistence {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            table: table_name(),
+            unlogged: false,
+        }]);
+        ordering(&nullable, &Schema::default()).unwrap();
+    }
+
+    #[test]
+    fn the_catalog_ordering_default_refuses_what_the_edge_read_selects() {
+        // A computed column's function drops after it: the edge read is made
+        // for a module change, and for a rename, though no schema holds a
+        // computed column.
+        let rebuilt = plan(vec![pbps_model::Change::AlterModule {
+            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "SELECT 1".into(),
+                options: Default::default(),
+            }),
+        }]);
+        let message = refusal(ordering(&rebuilt, &Schema::default()));
+        assert!(
+            message.contains(THIRD) && message.contains("computed column"),
             "{message}"
         );
         let renamed = plan(vec![pbps_model::Change::RenameColumn {
@@ -1407,31 +1503,196 @@ mod tests {
             to: "b".into(),
             table_was: None,
         }]);
-        let message = refusal(defaults::ordering_by_catalog(THIRD, &none, &none, &renamed));
-        assert!(message.contains(THIRD), "{message}");
-        // A drop refuses only where a generated column stands to be read.
-        let retype = plan(vec![pbps_model::Change::DropColumn {
-            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
-            column: table_name().column(pbps_model::ColumnName::from("a")),
+        refusal(ordering(&renamed, &Schema::default()));
+        // Negative: a change of persistence touches no table, column or module an edge names.
+        let persistence = plan(vec![pbps_model::Change::SetTablePersistence {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            table: table_name(),
+            unlogged: false,
         }]);
-        defaults::ordering_by_catalog(THIRD, &none, &none, &retype).unwrap();
-        let mut generated = Schema::default();
-        generated
-            .tables
-            .entry(table_name())
-            .or_default()
-            .columns
-            .insert(
-                "g".into(),
-                column_named(pbps_model::ValueSource::Generated(pbps_model::Generated {
-                    expression: "a * 2".into(),
-                    stored: true,
-                })),
-            );
-        let message = refusal(defaults::ordering_by_catalog(
-            THIRD, &generated, &none, &retype,
-        ));
-        assert!(message.contains("generated column"), "{message}");
+        ordering(&persistence, &Schema::default()).unwrap();
+    }
+
+    #[test]
+    fn the_catalog_ordering_default_refuses_what_the_name_walk_selects() {
+        let created = plan(vec![pbps_model::Change::CreateTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            name: table_name(),
+            table: Default::default(),
+            beside_default: None,
+            moves_at_most: None,
+        }]);
+        let message = refusal(ordering(&created, &Schema::default()));
+        assert!(
+            message.contains("names this plan creates or moves"),
+            "{message}"
+        );
+        // A table dropped is a parent whose constraints and defaults move.
+        let dropped = plan(vec![pbps_model::Change::DropTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            name: table_name(),
+            detach_from: None,
+        }]);
+        refusal(ordering(&dropped, &Schema::default()));
+    }
+
+    #[test]
+    fn a_rebuilt_module_is_refused_by_the_schedule_default_like_a_dropped_one() {
+        // `AlterModule` is a drop and a create to the schedule's own classifier.
+        let rebuilt = plan(vec![pbps_model::Change::AlterModule {
+            id: pbps_model::ModuleId::Named(table_name()),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "SELECT 1".into(),
+                options: Default::default(),
+            }),
+        }]);
+        assert!(!pbps_diff::order::deployment::dropped_modules(&rebuilt).is_empty());
+        let message = refusal(defaults::module_dependents(THIRD, &rebuilt));
+        assert!(
+            message.contains(THIRD) && message.contains("drops or rebuilds"),
+            "{message}"
+        );
+        // Negative: a module created from nothing has no dependents yet.
+        let created = plan(vec![pbps_model::Change::CreateModule {
+            id: pbps_model::ModuleId::Named(table_name()),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "SELECT 1".into(),
+                options: Default::default(),
+            }),
+        }]);
+        assert!(pbps_diff::order::deployment::dropped_modules(&created).is_empty());
+        defaults::module_dependents(THIRD, &created).unwrap();
+    }
+
+    fn partition(unlogged: bool) -> pbps_model::Table {
+        pbps_model::Table {
+            unlogged,
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: TableName::new("app", "ev"),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_partition_created_or_attached_unlogged_is_refused_by_the_catalog_names_default() {
+        let created = |unlogged| {
+            plan(vec![pbps_model::Change::CreateTable {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                name: table_name(),
+                table: Box::new(partition(unlogged)),
+                beside_default: None,
+                moves_at_most: None,
+            }])
+        };
+        let attached = |unlogged| {
+            plan(vec![pbps_model::Change::AttachPartition {
+                uid: uid(pbps_model::UidKind::Table, "app.t"),
+                table: table_name(),
+                parent: TableName::new("app", "ev"),
+                bound: pbps_model::PartitionBound::Default,
+                key: Vec::new(),
+                shape: Box::new(pbps_model::Table {
+                    unlogged,
+                    ..Default::default()
+                }),
+            }])
+        };
+        // Only the persistence read is asked of an attach: the name read is
+        // not, so the message names unlogged tables and not names.
+        let message = refusal(defaults::catalog_names(THIRD, &attached(true)));
+        assert!(message.contains("unlogged"), "{message}");
+        // The created partition also names a relation; the persistence
+        // refusal is the second of the two, so either message is the engine's.
+        let message = refusal(defaults::catalog_names(THIRD, &created(true)));
+        assert!(message.contains(THIRD), "{message}");
+        // Negative: a table attached permanent leaves nothing unlogged.
+        defaults::catalog_names(THIRD, &attached(false)).unwrap();
+        assert!(crate::deploy::leaves_something_unlogged(&attached(true)));
+        assert!(!crate::deploy::leaves_something_unlogged(&attached(false)));
+        assert!(crate::deploy::leaves_something_unlogged(&created(true)));
+        assert!(!crate::deploy::leaves_something_unlogged(&created(false)));
+    }
+
+    #[test]
+    fn a_table_moved_between_schemas_or_a_type_renamed_is_refused_by_the_catalog_names_default() {
+        let moved = plan(vec![pbps_model::Change::RenameTable {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            from: table_name(),
+            to: TableName::new("other", "t"),
+            defaults: Vec::new(),
+        }]);
+        let message = refusal(defaults::catalog_names(THIRD, &moved));
+        assert!(message.contains(THIRD), "{message}");
+        // Negative: a change of persistence names nothing.
+        let nullable = plan(vec![pbps_model::Change::SetTablePersistence {
+            uid: uid(pbps_model::UidKind::Table, "app.t"),
+            table: table_name(),
+            unlogged: false,
+        }]);
+        defaults::catalog_names(THIRD, &nullable).unwrap();
+    }
+
+    #[test]
+    fn any_created_module_is_refused_by_the_occupied_names_default() {
+        // A routine is no relation, but the namespace check compares it with
+        // the modules the project cannot read.
+        let routine = plan(vec![pbps_model::Change::CreateModule {
+            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "SELECT 1".into(),
+                options: Default::default(),
+            }),
+        }]);
+        assert!(crate::deploy::created_relation_names(&routine).is_empty());
+        let message = refusal(defaults::occupied_relation_names(THIRD, &routine));
+        assert!(message.contains(THIRD), "{message}");
+        // Negative: dropping a module creates no name.
+        let dropped = plan(vec![pbps_model::Change::DropModule {
+            id: pbps_model::ModuleId::Routine("app.f(integer)".parse().unwrap()),
+            kind: pbps_model::ModuleKind::Function,
+        }]);
+        defaults::occupied_relation_names(THIRD, &dropped).unwrap();
+    }
+
+    #[test]
+    fn a_numbering_change_and_a_table_rewrite_are_read_by_the_final_order_defaults() {
+        let renumbered = plan(vec![pbps_model::Change::AlterColumnNumbering {
+            uid: uid(pbps_model::UidKind::Column, "app.t.a"),
+            column: column_ref("a"),
+            ty: "integer".parse().unwrap(),
+            from: pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+            to: pbps_model::ValueSource::None,
+        }]);
+        let message = refusal(defaults::drop_blockers(THIRD, &renumbered));
+        assert!(message.contains(THIRD), "{message}");
+        // Negative: dropping a foreign key or a check is not a drop these
+        // readers ask about.
+        let check = plan(vec![pbps_model::Change::DropCheck {
+            table: table_name(),
+            name: "c".into(),
+        }]);
+        defaults::drop_blockers(THIRD, &check).unwrap();
+        // A column type change rewrites the table's rows, which the guard
+        // authenticates the triggers for even though no row is written.
+        let retype = retype_plan();
+        assert!(
+            retype
+                .changes
+                .iter()
+                .all(|p| pbps_pg::existing_expressions::rewrite_write(&p.change).is_some())
+        );
+        let message = refusal(defaults::data_writes(THIRD, &retype));
+        assert!(message.contains("rewrite"), "{message}");
+        defaults::data_writes(THIRD, &check).unwrap();
     }
 
     #[test]

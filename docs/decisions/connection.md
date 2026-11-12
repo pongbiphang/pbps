@@ -1333,11 +1333,19 @@ second role-rename row is the position DEC-2798.2 already added, called again.
   moves when the positions that use it after the transaction do.
 - **Defaults.** Each refuses naming the engine and what the plan asks, or, for
   the four rows of the final order and the schedule's row, answers
-  `not_applicable` naming the engine. A generated column's input,
-  a computed column and a name the plan creates or moves are each refused by
-  `order_by_catalog`'s default, and `check_final_order`'s refuses a drop or
-  retype, a partition beside a `DEFAULT`, a new numbered column and a row
-  write, because an engine without a step cannot tell their dependents.
+  `not_applicable` naming the engine. What a default refuses is selected by
+  the functions the engines' own steps select with (the schedule's
+  `dropped_modules`, `unlogged_partition` and `unlogged_table`,
+  `created_relation_names`, `column_edit`, `object_reads`, `rebuilt_modules`,
+  `rewrite_write`), or by a shared helper both the step and the default call
+  (`computed_edge_objects`), so a default cannot be narrower than the step it
+  stands in for. Where a selector needs the catalog's names, the default takes
+  the narrowest plan-only superset. `order_by_catalog`'s default refuses a
+  column retype or drop, the objects an expression edge could name, and the
+  objects, parents and modules the name walk reads; `check_final_order`'s
+  refuses a drop, a retype or a change of numbering, a partition beside a
+  `DEFAULT`, a new numbered column, and a row write or table rewrite, because
+  an engine without a step cannot tell their dependents.
 - **Kept routed functions.** `require_transactional_rebuilds`,
   `check_module_rebuilds`, `check_drop_blockers`, `prepare_data_writes`,
   `refuse_unlogged_partition_referencers`, `refuse_published_unlogged`,

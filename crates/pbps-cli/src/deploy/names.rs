@@ -1001,7 +1001,7 @@ pub(crate) fn stored_unlogged_parents(
 /// The partition `change` leaves `UNLOGGED`, with its parent: one it creates
 /// so, or a table it attaches that the plan leaves so, which is a new
 /// partition under the parent's referencing keys all the same (#1545).
-pub(super) fn unlogged_partition(change: &pbps_model::Change) -> Option<(&TableName, &TableName)> {
+pub(crate) fn unlogged_partition(change: &pbps_model::Change) -> Option<(&TableName, &TableName)> {
     if let pbps_model::Change::CreateTable { name, table, .. } = change {
         return table
             .partition_of
@@ -1150,6 +1150,33 @@ pub(crate) fn refuse_permanent_referencers(
     );
 }
 
+/// The table `change` makes unlogged, with its identity (#1489).
+pub(crate) fn unlogged_table(
+    change: &pbps_model::Change,
+) -> Option<(&pbps_model::Uid, &TableName)> {
+    if let pbps_model::Change::SetTablePersistence {
+        uid,
+        table,
+        unlogged: true,
+    } = change
+    {
+        Some((uid, table))
+    } else {
+        None
+    }
+}
+
+/// Whether the plan leaves anything `UNLOGGED` that the two catalog checks
+/// above read about: a partition it creates or attaches so, or a table it
+/// makes so. The same selectors as [`stored_unlogged_parents`] and
+/// [`tables_made_unlogged`], without the plan names they then spell the tables
+/// by, which need the identities the catalog was read under.
+pub(crate) fn leaves_something_unlogged(cs: &pbps_model::ChangeSet) -> bool {
+    cs.changes
+        .iter()
+        .any(|p| unlogged_partition(&p.change).is_some() || unlogged_table(&p.change).is_some())
+}
+
 /// Each table this plan makes unlogged, as declared and as the catalog names
 /// it when the plan starts, which is when the publications are read (#1489).
 pub(crate) fn tables_made_unlogged(
@@ -1157,11 +1184,7 @@ pub(crate) fn tables_made_unlogged(
 ) -> Vec<(TableName, TableName)> {
     let mut out = Vec::new();
     for p in names.changes() {
-        if let pbps_model::Change::SetTablePersistence {
-            uid,
-            table,
-            unlogged: true,
-        } = &p.change
+        if let Some((uid, table)) = unlogged_table(&p.change)
             && let Some(stored) = names.table_at(uid, pbps_model::plan_names::At::Start)
         {
             out.push((table.clone(), stored.clone()));
