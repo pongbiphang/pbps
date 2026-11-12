@@ -22,12 +22,12 @@ fn a_text_search_object_the_record_lacks_is_not_compared_and_a_recorded_one_is()
     let mut live = recorded.clone();
     live.search
         .insert(name("app.made_later"), dictionary("pg_catalog.simple"));
-    only_recorded_search_objects(&recorded, &mut live);
+    live.keep_only_named_unidentified(&recorded);
     assert_eq!(live, recorded, "the unrecorded object is left out");
     // Negative: a recorded object that changed stays in, so the differ names it.
     live.search
         .insert(name("app.kept"), dictionary("pg_catalog.synonym"));
-    only_recorded_search_objects(&recorded, &mut live);
+    live.keep_only_named_unidentified(&recorded);
     assert_ne!(live, recorded);
     assert!(live.search.contains_key(&name("app.kept")));
 }
@@ -48,11 +48,11 @@ fn a_standalone_sequence_the_record_lacks_is_not_compared_and_a_recorded_one_is(
     let mut live = recorded.clone();
     live.sequences
         .insert("app.made_later".parse().unwrap(), sequence(1));
-    only_recorded_sequences(&recorded, &mut live);
+    live.keep_only_named_unidentified(&recorded);
     assert_eq!(live, recorded, "the unrecorded sequence is left out");
     // Negative: a recorded sequence that changed stays in, so the differ names it.
     live.sequences.insert(kept.clone(), sequence(50));
-    only_recorded_sequences(&recorded, &mut live);
+    live.keep_only_named_unidentified(&recorded);
     assert_ne!(live, recorded);
     assert!(live.sequences.contains_key(&kept));
 }

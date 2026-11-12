@@ -1381,8 +1381,9 @@ cache: 20
   `UNLOGGED` sequence, a package's, and one with a `.` in its schema or name
   are not held: the census names them and the pull leaves them out. A
   temporary sequence belongs to one session and is no part of the database.
-  The sequence shares its namespace with tables and views, so `validate`
-  refuses a table or a view of the same name.
+  The sequence shares its schema's namespace with tables, views, indexes and
+  the indexes behind named keys, so `validate` refuses one of those of the same
+  name in the same schema.
 - **What a plan does with them.** Nothing yet. A declared sequence is compared
   with the target's, and every difference is refused by name with the attribute
   that differs: one the target lacks, one it holds differently. A sequence the

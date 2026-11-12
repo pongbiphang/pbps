@@ -3,7 +3,7 @@
 //! the catalog really holds. Each case runs in a database of its own.
 use super::{sqlstate, text, truth};
 use pbps_db::{Conn, Driver};
-use pbps_pg::sequence::{decode, query};
+use pbps_pg::sequence::{decode, held_predicate, query};
 
 const SERVERS: [&str; 2] = ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"];
 
@@ -201,8 +201,25 @@ async fn the_pull_reads_standalone_sequences_and_nothing_else() {
                 CREATE UNLOGGED SEQUENCE unlogged_s; \
                 CREATE EXTENSION unaccent SCHEMA public; CREATE SEQUENCE pkg; ALTER EXTENSION unaccent ADD SEQUENCE pkg; \
                 CREATE TEMP SEQUENCE temp_s; \
-                CREATE SEQUENCE \"dotted.name\"").await;
+                CREATE SEQUENCE \"dotted.name\"; \
+                CREATE SCHEMA \"dotted.schema\"; CREATE SEQUENCE \"dotted.schema\".in_dotted").await;
         let held = db.held().await;
+        // The predicate the census and the default-sequence check share calls a sequence held
+        // exactly when the pull declares it: system schemas, `pg_*` ones and dotted ones
+        // included in the question, since the pull's query has no filter of its own.
+        let asked = db
+            .one(&format!(
+                "SELECT COALESCE(string_agg(n.nspname || '.' || c.relname, ','), '') \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind = 'S' AND {}",
+                held_predicate()
+            ))
+            .await;
+        let mut by_predicate: Vec<&str> = asked.split(',').filter(|n| !n.is_empty()).collect();
+        by_predicate.sort_unstable();
+        let mut by_pull: Vec<String> = held.keys().map(|k| k.raw().to_string()).collect();
+        by_pull.sort_unstable();
+        assert_eq!(by_predicate, by_pull, "the predicate and the pull agree");
         // Sorted as text here, so the expectation does not depend on the map's key order.
         let mut names: Vec<String> = held.keys().map(|k| k.raw().to_string()).collect();
         names.sort();

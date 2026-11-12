@@ -16,9 +16,13 @@
 use std::collections::BTreeMap;
 
 use pbps_dialect::DialectError;
-use pbps_model::{ColumnType, ModuleId, ObjectName, Schema, Sequence};
+use pbps_model::{ColumnType, ObjectName, Schema, Sequence};
 
 /// Whether the relation behind `$c` (a `pg_class` alias) is a sequence the pull holds.
+///
+/// The schema is part of the predicate, not of the pull's query: a system schema, a `pg_*`
+/// schema and one with a `.` in its name are not a project's, and the census and the
+/// default-sequence check must call a sequence model-owned exactly when the pull declares it.
 ///
 /// A `.` in a schema or a sequence name is not held: a declaration names a sequence as
 /// `schema.name`, and a name with a dot in it cannot be read back from that spelling.
@@ -35,10 +39,12 @@ macro_rules! held {
              AND pg_catalog.strpos(",
             $c,
             ".relname, '.') = 0 \
-             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace hn \
+             AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace hn \
                WHERE hn.oid = ",
             $c,
-            ".relnamespace AND pg_catalog.strpos(hn.nspname, '.') > 0) \
+            ".relnamespace AND hn.nspname NOT IN ('pg_catalog', 'information_schema') \
+                AND pg_catalog.left(hn.nspname, 3) <> 'pg_' \
+                AND pg_catalog.strpos(hn.nspname, '.') = 0) \
              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend o \
                WHERE o.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.objid = ",
             $c,
@@ -53,6 +59,12 @@ macro_rules! held {
 }
 pub(crate) use held;
 
+/// The predicate [`query`], the census and the default-sequence check share, over a `pg_class`
+/// alias `c`. Public so a live test can ask the engine whether it and the pull agree.
+pub fn held_predicate() -> &'static str {
+    held!("c")
+}
+
 /// Every held sequence, one row each. `pg_sequence`'s own columns only.
 pub fn query() -> String {
     format!(
@@ -64,9 +76,7 @@ pub fn query() -> String {
            FROM pg_catalog.pg_sequence s
            JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-          WHERE {held}
-            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-            AND pg_catalog.left(n.nspname, 3) <> 'pg_'",
+          WHERE {held}",
         held = held!("c"),
     )
 }
@@ -126,11 +136,11 @@ fn invalid(message: String) -> DialectError {
 
 /// What the engine would refuse, or this model would not read back the same, before any
 /// plan: the type, the start and the increment against the bounds, the options, the name,
-/// and a table or view of the same name (a sequence is in their namespace).
+/// and (elsewhere) its claim on the relation namespace.
 pub(crate) fn validate(
     name: &ObjectName,
     sequence: &Sequence,
-    schema: &Schema,
+    _schema: &Schema,
 ) -> Vec<DialectError> {
     let mut found = Vec::new();
     let shown = name.shown();
@@ -199,18 +209,8 @@ pub(crate) fn validate(
              spell: it names a sequence as `schema.name`"
         )));
     }
-    if schema.tables.contains_key(name) {
-        found.push(invalid(format!(
-            "sequence `{shown}` shares its name with a table, and the engine keeps tables, views \
-             and sequences in one namespace"
-        )));
-    }
-    if schema.modules.contains_key(&ModuleId::Named(name.clone())) {
-        found.push(invalid(format!(
-            "sequence `{shown}` shares its name with a view, and the engine keeps tables, views \
-             and sequences in one namespace"
-        )));
-    }
+    // Its name in the relation namespace is claimed with the tables', views', indexes' and keys'
+    // in `pbps_dialect::check_index_names`, the one rule that compares them with each other.
     found
 }
 
@@ -358,31 +358,34 @@ mod tests {
         assert!(said("app.s", &cache, &schema).contains("leave out `cache:`"));
     }
 
+    /// The one predicate decides "held" for the pull, the census and the default-sequence
+    /// check, so it carries the namespace exclusions and the pull's query carries none of its
+    /// own: they cannot disagree about a sequence in a system schema (#2721).
     #[test]
-    fn a_sequence_sharing_a_name_with_a_table_or_a_view_is_refused() {
-        let mut schema = Schema::default();
-        schema
-            .tables
-            .insert("app.t".parse().unwrap(), Default::default());
+    fn the_namespace_exclusions_are_in_the_shared_predicate_and_not_in_the_query() {
+        let predicate = held_predicate();
+        for needed in [
+            "'pg_catalog', 'information_schema'",
+            "pg_catalog.left(hn.nspname, 3) <> 'pg_'",
+            "pg_catalog.strpos(hn.nspname, '.') = 0",
+            "relpersistence = 'p'",
+            "refobjsubid > 0",
+            "deptype = 'e'",
+        ] {
+            assert!(predicate.contains(needed), "the predicate lacks {needed}");
+        }
+        let sql = query();
         assert!(
-            said("app.t", &sequence("bigint", 1, 1), &schema)
-                .contains("shares its name with a table")
+            sql.contains(predicate),
+            "the query uses the shared predicate"
         );
-        schema.modules.insert(
-            ModuleId::Named("app.v".parse().unwrap()),
-            pbps_model::Module {
-                kind: pbps_model::ModuleKind::View,
-                description: None,
-                definition: "SELECT 1".into(),
-                options: Default::default(),
-            },
-        );
-        assert!(
-            said("app.v", &sequence("bigint", 1, 1), &schema)
-                .contains("shares its name with a view")
-        );
-        // Negative: another name is fine.
-        assert_eq!(said("app.other", &sequence("bigint", 1, 1), &schema), "");
+        let own = sql.replace(predicate, "");
+        for filter in ["NOT IN", "information_schema", "'pg_'", "left(", "strpos"] {
+            assert!(
+                !own.contains(filter),
+                "the query carries a namespace filter of its own ({filter}): {own}"
+            );
+        }
     }
 
     #[test]

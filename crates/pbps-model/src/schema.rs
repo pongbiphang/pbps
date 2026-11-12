@@ -80,6 +80,27 @@ pub struct Schema {
     pub roles: BTreeMap<crate::RoleName, crate::role::Role>,
 }
 
+impl Schema {
+    /// Leaves out of `self`, a fresh read of a database, the objects of the kinds that have no
+    /// identity record yet (text search objects, standalone sequences) that `named` does not
+    /// hold (DEC-2728.1, DEC-2721.1).
+    ///
+    /// Such an object is the project's only by being named: one the database gained, or had
+    /// before the kind was held, and that nobody declared or recorded, is not this project's,
+    /// and comparing it would call an unchanged database drifted. One `named` holds stays, so
+    /// a change to it is still a difference. **This is the one managed projection of those
+    /// kinds.** `named` is the recorded schema for `verify` and the guard that refuses to
+    /// record over a different state, and the declared schema for the question whether a
+    /// bootstrap target already stands; anything else that compares a fresh read with a
+    /// schema must use it too.
+    pub fn keep_only_named_unidentified(&mut self, named: &Schema) {
+        self.search
+            .retain(|name, _| named.search.contains_key(name));
+        self.sequences
+            .retain(|name, _| named.sequences.contains_key(name));
+    }
+}
+
 /// Installed package state; the database-global name is the map key.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

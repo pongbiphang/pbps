@@ -215,3 +215,31 @@ fn every_difference_is_refused_by_name_and_an_undeclared_sequence_is_left_alone(
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
     });
 }
+
+/// The guard that refuses to record over a different state compares the managed projection
+/// `verify` does (DEC-2721.1): a sequence nobody declared or recorded, made after the
+/// baseline, is not a difference, so `snapshot` records without `--force`; a recorded sequence
+/// that was changed is one, and `snapshot` refuses.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_sequence_nobody_recorded_is_not_a_difference_for_snapshot_and_a_changed_recorded_one_is() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("sequences2721-snapshot-{slug}"));
+        on_server(f.target(), MADE);
+        pull(&f);
+        adopt(&f);
+        on_server(f.target(), "CREATE SEQUENCE app.made_later START 50");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        succeeds(f.d.run(&["snapshot", "--db", f.target()]));
+        // Negative: a sequence the record holds, changed by hand, is a difference.
+        on_server(f.target(), "ALTER SEQUENCE app.order_no INCREMENT BY 7");
+        let out = f.d.run(&["snapshot", "--db", f.target()]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("differs from the state recorded"),
+            "{}",
+            said(&out)
+        );
+        succeeds(f.d.run(&["snapshot", "--db", f.target(), "--force"]));
+    });
+}

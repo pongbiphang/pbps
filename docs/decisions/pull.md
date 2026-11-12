@@ -1413,8 +1413,26 @@ the parts that follow, and SQL Server's sequences in the last.
   identity would be dead state. The scoped read therefore keeps every sequence the database
   holds, and the state checksum leaves them out, for the reason DEC-2728.1 gives: one the
   recorded state does not hold would otherwise read as drift on every database that had a
-  sequence before they were held. `verify` compares only the sequences the record holds, so a
-  recorded one that changed is still named. The snapshot records them (state 44).
+  sequence before they were held. The snapshot records them (state 44).
+- **What "managed" means for a sequence.** A held sequence that is neither declared nor
+  recorded is not this project's. One function, `Schema::keep_only_named_unidentified`, is
+  the projection: it leaves out of a fresh read the sequences (and text search objects) the
+  other side does not name, and keeps those it does, so a change to one is still a
+  difference. Every comparison of a fresh read with a schema uses it: `verify`, the guard of
+  `snapshot` and `baseline` that refuses to record over a different state (`StateSnapshot::matches`, which would otherwise call a version 43 snapshot drifted from any database that
+  has a sequence), and the question whether a bootstrap target already stands, where the
+  declarations are the side that names. The checksum comparisons (`plan --db`, `status`,
+  `apply`'s baseline) already leave the kinds out. Two reads of one database compared with
+  each other (`apply`'s read-back) need no projection.
+- **One namespace.** A sequence shares its schema's relation namespace with tables, views,
+  indexes and the indexes behind named keys, so its name is claimed in the one rule that
+  compares those (`pbps_dialect::check_index_names`), not in a rule of its own. A sequence
+  and an index or key of one name in one schema are refused with that rule's message; in two
+  schemas they are not.
+- **One predicate, with the namespace in it.** The exclusion of system and `pg_*` schemas is
+  in the predicate the pull, the census and the default-sequence check share, and the pull's
+  query carries no filter of its own, so none of them can call a sequence model-owned that
+  the pull does not declare.
 - **Coverage (#168).** `pg_sequence` was already held per column; the census row for a
   standalone sequence is now held by the same macro the pull uses.
 

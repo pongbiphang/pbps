@@ -617,8 +617,12 @@ pub(super) async fn bootstrap_async(
                     dialect.as_ref(),
                     "bootstrap",
                 )?;
+                // A text search object or a sequence the declarations do not name is not this
+                // project's, so it does not make the target non-empty (DEC-2721.1).
+                let mut standing = existing.scoped.schema.clone();
+                standing.keep_only_named_unidentified(&loaded.schema);
                 refuse_nonempty_bootstrap(
-                    &existing.scoped.schema,
+                    &standing,
                     &existing.limitations,
                     dialect.as_ref(),
                     &target.label,

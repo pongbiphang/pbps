@@ -4627,6 +4627,21 @@ fn declared_relation_claims<'a>(
             );
         }
     }
+    // A standalone sequence is a relation too (#2721). Claimed before the indexes and keys,
+    // so those find it taken; and against the tables and views already claimed above, which
+    // it would otherwise replace without a word.
+    for name in schema.sequences.keys() {
+        let descriptor = format!("sequence `{name}`", name = name.shown());
+        if let Some(existing) = claimed.insert(name.clone(), unclaimed(descriptor.clone())) {
+            problems.push(format!(
+                "{} and {descriptor} are both named `{name}`; {} keeps tables, views, indexes \
+                 and sequences in one namespace per schema, so it can hold only one of them",
+                existing.descriptor,
+                dialect.name(),
+                name = name.shown()
+            ));
+        }
+    }
     for (table_name, table) in &schema.tables {
         let mut declared: Vec<(&str, RelationClaim<'_>)> = Vec::new();
         for index_name in table.indexes.keys() {
@@ -7212,6 +7227,82 @@ mod tests {
         assert!(problems[0].contains("index `coll.t2.t1`"), "{problems:?}");
 
         assert!(check_index_names(&schema, &MinimalDialect).is_empty());
+    }
+
+    /// A standalone sequence is in the relation namespace with tables, views, indexes and the
+    /// indexes behind named keys (#2721): the same rule that compares those with each other
+    /// compares it, and says so with the same message shape. The same name in another schema
+    /// is no collision, and an engine that keeps no such namespace is not asked.
+    #[test]
+    fn a_standalone_sequence_collides_with_every_other_relation_of_its_name() {
+        let sequence = |name: &str| {
+            (
+                name.parse::<ObjectName>().unwrap(),
+                pbps_model::Sequence {
+                    ty: ColumnType::simple("bigint"),
+                    start: 1,
+                    increment: 1,
+                    options: Default::default(),
+                },
+            )
+        };
+        let with_sequence = |mut schema: Schema, name: &str| {
+            let (key, value) = sequence(name);
+            schema.sequences.insert(key, value);
+            schema
+        };
+        let found = |schema: &Schema| check_index_names(schema, &OverloadingDialect);
+
+        let same_table = with_sequence(schema_of(&[("coll.foo", table())]), "coll.foo");
+        let problems = found(&same_table);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("table `coll.foo`")
+                && problems[0].contains("sequence `coll.foo`")
+                && problems[0].contains("are both named `coll.foo`")
+                && problems[0].contains("one namespace per schema"),
+            "{problems:?}"
+        );
+        let index = with_sequence(
+            schema_of(&[("coll.t", with_index(table(), "foo"))]),
+            "coll.foo",
+        );
+        let problems = found(&index);
+        assert!(
+            problems.len() == 1
+                && problems[0].contains("sequence `coll.foo`")
+                && problems[0].contains("index `coll.t.foo`"),
+            "{problems:?}"
+        );
+        let key = with_sequence(
+            schema_of(&[("coll.t", with_primary_key(table(), "foo"))]),
+            "coll.foo",
+        );
+        assert!(
+            found(&key).iter().any(
+                |p| p.contains("sequence `coll.foo`") && p.contains("primary key `coll.t.foo`")
+            ),
+            "{:?}",
+            found(&key)
+        );
+        let unique = with_sequence(
+            schema_of(&[("coll.t", with_unique(table(), "foo"))]),
+            "coll.foo",
+        );
+        assert!(
+            found(&unique)
+                .iter()
+                .any(|p| p.contains("unique constraint `coll.t.foo`")),
+            "{:?}",
+            found(&unique)
+        );
+        // Two sequences cannot share a name: they are one map key. Negatives: another schema,
+        // another name, and an engine without the shared namespace.
+        let elsewhere = with_sequence(schema_of(&[("coll.foo", table())]), "other.foo");
+        assert!(found(&elsewhere).is_empty(), "{:?}", found(&elsewhere));
+        let renamed = with_sequence(schema_of(&[("coll.foo", table())]), "coll.bar");
+        assert!(found(&renamed).is_empty());
+        assert!(check_index_names(&same_table, &MinimalDialect).is_empty());
     }
 
     /// A named unique constraint is backed by an index of that name (the

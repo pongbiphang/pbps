@@ -119,8 +119,8 @@ fn a_sequence_that_cannot_be_held_is_refused_by_name() {
     assert_eq!(p.run(&["validate"]).status.code(), Some(0));
 }
 
-/// A sequence shares the relation namespace with tables and views: one of the same name is
-/// refused by name, and the same sequence twice is one declaration twice.
+/// A sequence shares the relation namespace with tables, views and indexes: one of the same
+/// name is refused by name, and the same sequence twice is one declaration twice.
 #[test]
 fn a_sequence_sharing_a_name_with_a_table_is_refused_and_so_is_one_declared_twice() {
     let p = Project::new("namesake", "postgres");
@@ -129,11 +129,39 @@ fn a_sequence_sharing_a_name_with_a_table_is_refused_and_so_is_one_declared_twic
     let out = p.run(&["validate"]);
     assert_ne!(out.status.code(), Some(0), "{}", said(&out));
     assert!(
-        said(&out).contains("shares its name with a table"),
+        said(&out).contains("table `app.t` and sequence `app.t` are both named"),
         "{}",
         said(&out)
     );
+    // An index or a named key of the same name in the same schema is the same collision.
+    p.file("s.yml", "sequence: app.foo\n");
+    p.file(
+        "t.yml",
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nindexes:\n  foo:\n    columns: [id]\n",
+    );
+    let out = p.run(&["validate"]);
+    assert_ne!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(
+        said(&out).contains("sequence `app.foo`") && said(&out).contains("index `app.t.foo`"),
+        "{}",
+        said(&out)
+    );
+    p.file(
+        "t.yml",
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: foo, columns: [id]}\n",
+    );
+    let out = p.run(&["validate"]);
+    assert_ne!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(
+        said(&out).contains("primary key `app.t.foo`"),
+        "{}",
+        said(&out)
+    );
+    // Negative: the same name in another schema coexists.
+    p.file("s.yml", "sequence: other.foo\n");
+    assert_eq!(p.run(&["validate"]).status.code(), Some(0));
     // Negative: another name coexists with the table.
+    p.file("t.yml", "table: app.t\ncolumns:\n  id: {type: integer}\n");
     p.file("s.yml", "sequence: app.t_seq\n");
     assert_eq!(p.run(&["validate"]).status.code(), Some(0));
     p.file("u.yml", "sequence: app.t_seq\nstart: 2\n");
