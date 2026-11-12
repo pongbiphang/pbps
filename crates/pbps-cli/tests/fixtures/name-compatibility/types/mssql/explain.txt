@@ -4,7 +4,7 @@ Plan
   created     2026-10-22T00:00:00Z
   baseline    type-name master fixture
   execution   one transaction, all or nothing: a failure rolls the whole plan back
-  checksum    ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772
+  checksum    793f5385d12bc57e5d6dc478990396ba2645c64b5ed4c96c7940a60293ec8e6b
 
 What it changes
   3 change(s) across 1 table(s), 3 statement(s).
@@ -30,4 +30,4 @@ The environment
   the one question this file cannot answer; `pbps status` answers it.
 
 To approve and run it:
-  pbps apply --env "<environment>" --plan plan.json --checksum ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772
+  pbps apply --env "<environment>" --plan plan.json --checksum 793f5385d12bc57e5d6dc478990396ba2645c64b5ed4c96c7940a60293ec8e6b

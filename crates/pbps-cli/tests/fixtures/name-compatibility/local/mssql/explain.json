@@ -21,7 +21,7 @@
     "created_at": "2026-10-22T00:00:00Z",
     "baseline": "local-name master fixture",
     "mode": "transactional",
-    "checksum": "46d9749cce6d553e9b8317f2907ce4673d01e6ea7cb6a795297cdd58bf64b03e",
+    "checksum": "5b6097330d69701e19d6e9f5a54a64370d5e71896814c776b43a5677f8d4dbfb",
     "change_count": 10,
     "table_count": 1,
     "module_count": 0,
@@ -46,7 +46,7 @@
         ]
       }
     ],
-    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 46d9749cce6d553e9b8317f2907ce4673d01e6ea7cb6a795297cdd58bf64b03e --allow destructive,constraint",
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 5b6097330d69701e19d6e9f5a54a64370d5e71896814c776b43a5677f8d4dbfb --allow destructive,constraint",
     "probes": [
       "existing NULLs in app.child.id, which NOT NULL would reject",
       "rows that would collide under the new primary key",
