@@ -1616,7 +1616,10 @@ mod tests {
     /// The live tests below run the very text the keeper sends, against a real
     /// engine, with parameters this engine really refuses: `lc_messages`
     /// stands in for the unsupported interval (a locale the server lacks is
-    /// rejected with the same SQLSTATE and message shape).
+    /// rejected with the same SQLSTATE and message shape). Linux only: the
+    /// Windows engines refuse the interval itself, and the Windows job runs the
+    /// resolver flows, not this module, so no owner would run these there.
+    #[cfg(target_os = "linux")]
     mod live {
         use super::*;
         use pbps_db::{Conn, Driver};
