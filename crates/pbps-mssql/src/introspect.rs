@@ -1338,6 +1338,11 @@ fn left_out_columns_phrase(columns: &BTreeSet<&str>) -> String {
 /// different table; the reason names that object, then any key or index of
 /// the table that sits on a scheme of its own, so each is reported even
 /// though the loops below never reach an omitted table.
+/// How a table left out for its placement is named to its dependents; the two
+/// differ because a scheme is established and an unreadable placement is not.
+const PARTITIONED_TABLE: &str = "partitioned table";
+const UNREADABLE_TABLE: &str = "table whose storage placement cannot be read";
+
 fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<(&'static str, String)> {
     let also: BTreeSet<String> = raw
         .key_columns
@@ -1379,7 +1384,7 @@ fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<(&'static str, String
     match t.base.placement {
         Placement::Filegroup | Placement::OffDefaultFilegroup => None,
         Placement::PartitionScheme => Some((
-            "partitioned table",
+            PARTITIONED_TABLE,
             format!(
                 "its rows are on a partition scheme ({}), which the declarations cannot hold, \
                  and bootstrap would build the table unpartitioned{also}",
@@ -1389,7 +1394,7 @@ fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<(&'static str, String
         // Not a partitioned table: it is unknown whether it is one, and a
         // dependent's reason must not claim it is (#1227).
         Placement::Unreadable => Some((
-            "table whose storage placement cannot be read",
+            UNREADABLE_TABLE,
             format!(
                 "where its rows are stored cannot be read, so it cannot be told whether they \
                  are on a partition scheme{also}"
@@ -1412,9 +1417,7 @@ fn filegroup_notice(
 ) -> Option<String> {
     let current = raw.tables.iter().find(|t| t.object_id == id)?;
     let mut what: Vec<String> = Vec::new();
-    if current.base.placement == Placement::OffDefaultFilegroup {
-        what.push(format!("its base ({})", current.base.owner()));
-    }
+    let members = members.unwrap_or_default();
     // The clustered base is also a key or an index of the table; once is enough.
     let base_labels: Vec<String> = current
         .base
@@ -1425,12 +1428,17 @@ fn filegroup_notice(
                 .map(|kind| format!("{kind} `{}`", n.shown()))
         })
         .collect();
-    what.extend(
-        members
-            .into_iter()
-            .flatten()
-            .filter(|m| !base_labels.contains(m)),
-    );
+    // The base is named only when its declaration survives: a heap always does,
+    // and a clustered one does when the key and index loops kept it, which is
+    // when it is among the members. A clustered columnstore base is left out as
+    // unmodelled, and a notice that it will land on the default filegroup would
+    // describe an object the pull does not declare.
+    let base_declared =
+        current.base.index_type == Some(0) || base_labels.iter().any(|l| members.contains(l));
+    if current.base.placement == Placement::OffDefaultFilegroup && base_declared {
+        what.push(format!("its base ({})", current.base.owner()));
+    }
+    what.extend(members.into_iter().filter(|m| !base_labels.contains(m)));
     let history = current
         .history_table_id
         .filter(|_| current.temporal_type == 2)
@@ -2547,9 +2555,21 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .as_ref()
                     .is_some_and(|parent| omitted_tables.contains_key(parent)))
         {
-            unmanageable(
-                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, the ledger, a partition scheme, or another omitted module, which pbps cannot express",
-            );
+            // A parent left out for its placement is told apart: a scheme is
+            // established, an unreadable placement is not, and the reason must
+            // not assert the first for the second (DEC-1227.1). Any other
+            // parent keeps the list of what pbps cannot express.
+            match on.as_ref().and_then(|parent| omitted_tables.get(parent)) {
+                Some(&PARTITIONED_TABLE) => unmanageable(
+                    "its parent table has its rows on a partition scheme, which pbps cannot express",
+                ),
+                Some(&UNREADABLE_TABLE) => unmanageable(
+                    "its parent table has a storage placement that cannot be read, so pbps cannot tell what it is",
+                ),
+                _ => unmanageable(
+                    "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, the ledger, a partition scheme or a storage placement that cannot be read, or another omitted module, which pbps cannot express",
+                ),
+            }
             continue;
         }
 
@@ -5341,6 +5361,143 @@ mod tests {
         }
         // Negative: the default filegroup and an unnoticed index say nothing.
         assert!(!all.contains("dbo.plain") && !all.contains("ix_c"), "{all}");
+    }
+
+    /// The notice names a base only when the declarations keep it. A clustered
+    /// columnstore base, or a disabled clustered one, is left out as unmodelled
+    /// and is reported as that; saying a bootstrap places it on the default
+    /// filegroup would describe an object the pull does not declare
+    /// (DEC-1227.1). The members that survive are still named.
+    #[test]
+    fn a_base_the_pull_leaves_out_is_not_in_the_filegroup_notice() {
+        let mut raw = RawCatalog::default();
+        for (id, name, base) in [
+            (
+                1,
+                "cci_only",
+                base_of(5, Some("cci_a"), false, Placement::OffDefaultFilegroup),
+            ),
+            (
+                2,
+                "cci_beside",
+                base_of(5, Some("cci_b"), false, Placement::OffDefaultFilegroup),
+            ),
+            (
+                3,
+                "disabled",
+                base_of(1, Some("cx_d"), false, Placement::OffDefaultFilegroup),
+            ),
+            (
+                4,
+                "kept",
+                base_of(1, Some("cx_k"), false, Placement::OffDefaultFilegroup),
+            ),
+        ] {
+            let mut t = raw_table(id, "dbo", name);
+            t.base = base;
+            raw.tables.push(t);
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let mut cci_a = ix(1, "cci_a", false, Placement::OffDefaultFilegroup);
+        cci_a.kind = IndexKind::Unmodelled(5);
+        let mut cci_b = ix(2, "cci_b", false, Placement::OffDefaultFilegroup);
+        cci_b.kind = IndexKind::Unmodelled(5);
+        let mut cx_d = ix(3, "cx_d", false, Placement::OffDefaultFilegroup);
+        cx_d.kind = IndexKind::Clustered;
+        cx_d.is_disabled = true;
+        let mut cx_k = ix(4, "cx_k", false, Placement::OffDefaultFilegroup);
+        cx_k.kind = IndexKind::Clustered;
+        raw.index_columns = vec![
+            cci_a,
+            cci_b,
+            ix(2, "ix_b", false, Placement::OffDefaultFilegroup),
+            cx_d,
+            cx_k,
+        ];
+        let p = assemble(&raw);
+        let said = details(&p);
+        // The omitted bases are reported as what they are.
+        assert!(said.contains("index `cci_a` is"), "{said}");
+        assert!(
+            said.contains("clustered index `cx_d` is disabled"),
+            "{said}"
+        );
+        // Neither is in a notice; the surviving index beside one still is.
+        let all = p.catalog_notices.join("\n");
+        assert!(!all.contains("dbo.cci_only"), "{all}");
+        assert!(!all.contains("dbo.disabled"), "{all}");
+        for left_out in ["`cci_a`", "`cci_b`", "`cx_d`"] {
+            assert!(!all.contains(left_out), "{left_out}: {all}");
+        }
+        assert!(
+            all.contains("dbo.cci_beside: index `ix_b` sits on a filegroup other than"),
+            "{all}"
+        );
+        // Negative: a clustered index the declarations keep is still the base.
+        assert!(
+            all.contains("dbo.kept: its base (clustered index `cx_k`) sits"),
+            "{all}"
+        );
+        assert_eq!(p.catalog_notices.len(), 2, "{all}");
+    }
+
+    /// A trigger whose parent was left out for its placement is told why, in
+    /// the parent's own terms: a scheme is established, an unreadable placement
+    /// is not, and the reason asserts the first only for the first (DEC-1227.1).
+    #[test]
+    fn a_trigger_on_a_table_left_out_for_its_placement_names_which() {
+        let mut raw = RawCatalog::default();
+        for (id, name, placement) in [
+            (1, "parted", Placement::PartitionScheme),
+            (2, "unseen", Placement::Unreadable),
+            (3, "plain", Placement::Filegroup),
+        ] {
+            let mut t = raw_table(id, "dbo", name);
+            t.base = base_of(0, None, false, placement);
+            raw.tables.push(t);
+            raw.columns.push(raw_column(id, "id", "int"));
+            let trigger = RawModule {
+                object_id: 100 + id,
+                parent_object_id: Some(id),
+                schema: "dbo".into(),
+                name: format!("tr_{name}"),
+                kind: ModuleKind::Trigger,
+                definition: Some(format!(
+                    "CREATE TRIGGER dbo.tr_{name} ON dbo.{name} AFTER INSERT AS SELECT 1;"
+                )),
+                parent: Some(("dbo".into(), name.into())),
+                requires_bound_references: false,
+                schema_bound: false,
+                clr: false,
+                default_set_options: true,
+            };
+            raw.modules.push(trigger);
+        }
+        let p = assemble(&raw);
+        let why = |trigger: &str| {
+            p.unmanaged_modules
+                .iter()
+                .find(|m| m.target.object_name() == TableName::new("dbo", trigger))
+                .map(|m| m.why.clone())
+                .unwrap_or_default()
+        };
+        let parted = why("tr_parted");
+        assert!(parted.contains("on a partition scheme"), "{parted}");
+        let unseen = why("tr_unseen");
+        assert!(
+            unseen.contains("storage placement that cannot be read"),
+            "{unseen}"
+        );
+        // Negative: neither word leaks onto the other's trigger.
+        assert!(!unseen.contains("partition scheme"), "{unseen}");
+        assert!(!parted.contains("cannot be read"), "{parted}");
+        // Negative: a trigger on a table that is declared is declared.
+        assert!(
+            p.schema
+                .modules
+                .contains_key(&"dbo.plain.tr_plain".parse().unwrap())
+        );
+        assert_eq!(p.unmanaged_modules.len(), 2);
     }
 
     /// A module bound at creation to a table left out for its partitioning
