@@ -5550,9 +5550,9 @@ A key naming a class of a managed package (`ext.gin_trgm_ops`) was refused as
 - **Operators.** `OperatorRef` carries an optional schema (`ext.%`; `pg_catalog.&&`
   and `&&` stay one operator). An exclusion's operator is held when a managed
   package owns it and it stands in that package's schema, and is carried through a
-  move. **The pin of an operator is not here:** the model cannot yet create or
-  change an exclusion (the emit and the plan change are #2448's C1b), so no plan
-  names an operator for a pin to guard. It lands with C1b, which also writes
+  move. **The pin of an operator is #2448 PR C1b's** (`operator_read`,
+  `operator_pins`, DEC-2448.3): the plan can now create an exclusion, so a plan
+  names an operator for the pin to guard, and the emit writes
   `OPERATOR(schema.symbol)` with the operator's own schema.
 
 Formats. The saved plan moves (a new skip-empty field an older build rejects as

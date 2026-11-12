@@ -1,8 +1,13 @@
-//! An exclusion constraint through the whole tool (#2448 PR C1a, DEC-2448.3): the
-//! pull writes one, the round trip ends in an empty plan, and what the next parts
-//! deliver (an add, a drop, a replacement, a column change under one) is refused
-//! by name. Each case runs on both pinned engines.
-use super::{Demo, OwnDatabase, code, on_server, scalar, server, stderr, stdout, succeeds};
+//! An exclusion constraint through the whole tool (#2448 PR C1, DEC-2448.3): the
+//! pull writes one, the round trip ends in an empty plan, a declared one is added
+//! behind the `constraint` risk and enforces, a new table takes its constraint
+//! after its create, and what the next PR delivers (a drop, a replacement, a
+//! column change under one) is refused by name. Each case runs on both pinned
+//! engines.
+use super::{
+    Demo, OwnDatabase, approved_apply, code, on_server, scalar, server, stderr, stdout, succeeds,
+    try_on_server,
+};
 
 fn servers(mut check: impl FnMut(&str)) {
     for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
@@ -35,7 +40,7 @@ fn constraints(connection: &str, name: &str) -> i64 {
 
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn an_exclusion_constraint_round_trips_and_adding_one_is_refused_by_name() {
+fn an_exclusion_constraint_round_trips_is_added_behind_its_risk_and_enforces() {
     let _ = server();
     servers(|url| {
         let own = OwnDatabase::new(url, "exclude-round-trip");
@@ -67,55 +72,96 @@ fn an_exclusion_constraint_round_trips_and_adding_one_is_refused_by_name() {
         assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
         succeeds(d.run(&["verify", "--db", connection]));
 
-        // Adding one is the next PR's: refused by name, to a standing table and
-        // to a new one, and nothing reaches the database.
+        // A declared exclusion is added behind `constraint` and nothing else.
         let table = table.replacen(
             "exclude:\n",
             "exclude:\n  by_ip:\n    method: gist\n    keys:\n      - column: ip\n        \
              opclass: inet_ops\n        operator: \"&&\"\n",
             1,
         );
-        std::fs::write(&path, &table).unwrap();
+        std::fs::write(&path, table).unwrap();
         d.commit();
-        let refused = d.run(&["plan", "--db", connection]);
-        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let script = std::fs::read_to_string(&sql).unwrap();
         assert!(
-            said(&refused).contains("adding one arrives in the next PR"),
-            "{}",
-            said(&refused)
+            script.contains("ADD CONSTRAINT \"by_ip\" EXCLUDE USING gist")
+                && script.contains("WITH OPERATOR(\"pg_catalog\".&&)")
+                && script.contains("\"pg_catalog\".\"inet_ops\"")
+                && !script.contains("DROP"),
+            "{script}"
         );
-        assert_eq!(constraints(connection, "by_ip"), 0);
+        let refused = approved_apply(&d, connection, &plan, &[]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(said(&refused).contains("constraint"), "{}", said(&refused));
+        assert_eq!(
+            constraints(connection, "by_ip"),
+            0,
+            "a refused apply changes nothing"
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "constraint"],
+        ));
+        assert_eq!(constraints(connection, "by_ip"), 1);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
+        // It enforces: a second row of an address the first covers is refused.
+        assert!(
+            try_on_server(
+                connection,
+                "INSERT INTO app.booking VALUES (3, 2, 20, 21, 'c', true, '10.0.0.0/24')"
+            )
+            .is_err()
+        );
+
+        // A new table takes its exclusion after its create, with no flag: the
+        // table has no rows to check.
         std::fs::write(
-            &path,
-            table.replacen("  by_ip:\n    method: gist\n    keys:\n      - column: ip\n        opclass: inet_ops\n        operator: \"&&\"\n", "", 1),
+            d.dir.join("schema/app.slot.yml"),
+            "table: app.slot\ncolumns:\n  id: {type: integer, nullable: false}\n  a: {type: integer, \
+             nullable: false}\n  b: {type: integer, nullable: false}\nprimary_key: [id]\nexclude:\n  \
+             slot_overlap:\n    method: gist\n    keys:\n      - {expression: \"int4range(a, b)\", \
+             operator: \"&&\"}\n",
         )
         .unwrap();
-        d.commit();
-        // The new table's identities are minted offline and committed first, as
-        // the table alone: a plan that is refused mints nothing.
-        let slot = d.dir.join("schema/app.slot.yml");
-        let bare = "table: app.slot\ncolumns:\n  id: {type: integer, nullable: false}\n  a: {type: \
-                    integer, nullable: false}\n  b: {type: integer, nullable: false}\nprimary_key: [id]\n";
-        std::fs::write(&slot, bare).unwrap();
+        // An offline plan mints the new table's identities, and the project
+        // commits them: a connected plan computes against what reviewers read.
         succeeds(d.run(&["plan"]));
         d.commit();
-        std::fs::write(
-            &slot,
-            format!(
-                "{bare}exclude:\n  slot_overlap:\n    method: gist\n    keys:\n      - \
-                 {{expression: \"int4range(a, b)\", operator: \"&&\"}}\n"
-            ),
-        )
-        .unwrap();
-        d.commit();
-        let refused = d.run(&["plan", "--db", connection]);
-        assert_ne!(code(&refused), 0, "{}", said(&refused));
-        assert!(
-            said(&refused).contains("adding one arrives in the next PR"),
-            "{}",
-            said(&refused)
-        );
-        assert_eq!(constraints(connection, "slot_overlap"), 0);
+        let sql = d.dir.join("slot.sql");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let script = std::fs::read_to_string(&sql).unwrap();
+        let create = script.find("CREATE TABLE").expect(&script);
+        let add = script
+            .find("ADD CONSTRAINT \"slot_overlap\"")
+            .expect(&script);
+        assert!(create < add, "{script}");
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        assert_eq!(constraints(connection, "slot_overlap"), 1);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
     });
 }
 

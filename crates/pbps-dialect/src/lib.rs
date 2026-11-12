@@ -707,6 +707,13 @@ impl Unchecked {
                     name = name.shown(),
                 )
             }
+            Change::SetExclusion { table, name, .. } => {
+                format!(
+                    "exclusion constraint {name} on {table}",
+                    table = table.shown(),
+                    name = name.shown(),
+                )
+            }
             Change::AddForeignKey { table, name, .. } => {
                 format!(
                     "new foreign key {name} on {table}",

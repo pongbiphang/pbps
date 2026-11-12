@@ -233,6 +233,7 @@ impl<'p> PlanFacts<'p> {
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
+                | Change::SetExclusion { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }

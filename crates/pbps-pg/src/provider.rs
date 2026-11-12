@@ -12,10 +12,15 @@
 //! installed version, what a plan that updates or moves the package may do, and
 //! whether a placeholder is proved by the sealed manifest.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_db::{Conn, DbError};
 use pbps_model::escape::Escaped;
-use pbps_model::{Change, ChangeSet, ProviderMember, Schema, TypePin, TypeProvider};
+use pbps_model::{
+    Change, ChangeSet, ProviderKind, ProviderMember, ProviderPin, Schema, TypePin, TypeProvider,
+};
+
+use crate::pins::Within;
 
 /// The facts the rules read about one pinned object.
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +128,19 @@ pub fn proof(
     created: &[pbps_model::ExtensionPin],
     changed: &[pbps_model::ExtensionChangePin],
 ) -> Result<(), String> {
+    proof_where(standing, |m| m == member, noun, created, changed)
+}
+
+/// [`proof`] for an object whose member entry carries more than the pin knows: an
+/// operator is listed with its operand types, which the pin (schema and symbol) does not
+/// hold, so `is_member` says which entry is it.
+pub fn proof_where(
+    standing: Standing<'_>,
+    is_member: impl Fn(&ProviderMember) -> bool,
+    noun: Noun,
+    created: &[pbps_model::ExtensionPin],
+    changed: &[pbps_model::ExtensionChangePin],
+) -> Result<(), String> {
     let Some(provider) = standing.provider else {
         return Err(format!(
             "the {} pin for `{}.{}` names no package",
@@ -151,7 +169,7 @@ pub fn proof(
                 Escaped(&provider.extension)
             )
         })?;
-    if !manifest.members.contains(member) {
+    if !manifest.members.iter().any(is_member) {
         return Err(format!(
             "the {} `{}.{}` is not a member of the extension `{}` after the plan's change, \
              so {} cannot rely on this plan to bring it",
@@ -265,6 +283,246 @@ pub fn same_pin<P: PartialEq>(
         .1
         .is_some_and(|schema| schema == now_schema);
     moved && relocated(before, &now_schema) == *now
+}
+
+impl<'a> From<&'a ProviderPin> for Standing<'a> {
+    fn from(pin: &'a ProviderPin) -> Self {
+        Standing {
+            schema: &pin.schema,
+            name: &pin.name,
+            planned: pin.planned,
+            provider: pin.provider.as_ref(),
+        }
+    }
+}
+
+fn failed(why: impl Into<String>) -> DbError {
+    DbError::BadRow(why.into())
+}
+
+/// A kind of provider-owned object that a sealed plan pins by `ProviderPin`: an operator class
+/// or an operator. What differs per kind is here (how one is read and named, what a key may do
+/// with it, how a refusal names what holds it); the seal, the check and the proof are
+/// [`seal_kind`], [`check_kind`] and [`proof_kind`], written once (DEC-2447.14, #2448 C1b).
+pub(crate) trait PinKind {
+    /// What a plan names: the spelling of one object.
+    type Wanted: Clone + Ord;
+    /// An object that is there, as it was read.
+    type Item;
+    /// The answer of one read: present, absent or unreadable.
+    type Read;
+    /// One place the desired schema names an object.
+    type Use;
+    const NOUN: Noun;
+    const KIND: ProviderKind;
+
+    fn uses(schemas: &[&Schema]) -> Vec<Self::Use>;
+    fn used(used: &Self::Use) -> &Self::Wanted;
+    /// The objects the changes of a plan name, which a sealed plan must carry a pin for.
+    fn named_by(changes: &ChangeSet) -> BTreeSet<Self::Wanted>;
+    async fn read(conn: &mut Conn, within: Within, wanted: &[Self::Wanted]) -> Vec<Self::Read>;
+    fn present(read: &Self::Read) -> Option<&Self::Item>;
+    fn is_absent(read: &Self::Read) -> bool;
+    /// Why this answer is not an object a plan can rely on.
+    fn refusal(read: &Self::Read, wanted: &Self::Wanted) -> Option<String>;
+    fn item_wanted(item: &Self::Item) -> &Self::Wanted;
+    fn extension(item: &Self::Item) -> Option<&(String, String)>;
+    fn pin(item: &Self::Item) -> ProviderPin;
+    fn placeholder(wanted: &Self::Wanted, provider: TypeProvider) -> ProviderPin;
+    fn wanted_of(pin: &ProviderPin) -> Self::Wanted;
+    fn in_schema(wanted: &Self::Wanted, schema: &str) -> Self::Wanted;
+    /// The schema and the name a refusal shows.
+    fn qualified(wanted: &Self::Wanted) -> (&str, &str);
+    /// A refusal about an object, with what holds it.
+    fn held_by(uses: &[Self::Use], wanted: &Self::Wanted, why: String) -> String;
+    /// What a key may not do with an object that stands; a kind with no such rule has none.
+    fn refuse_uses(_items: &[&Self::Item], _uses: &[Self::Use]) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_member(pin: &ProviderPin, member: &ProviderMember) -> bool;
+}
+
+fn shown<K: PinKind>(wanted: &K::Wanted) -> String {
+    let (schema, name) = K::qualified(wanted);
+    format!("{}.{}", Escaped(schema), Escaped(name))
+}
+
+/// Reads and checks every object of the kind the desired schema names; one missing from the
+/// target in the schema of exactly one declared package is that package's placeholder
+/// (DEC-2447.12).
+pub(crate) async fn seal_kind<K: PinKind>(
+    conn: &mut Conn,
+    schemas: &[&Schema],
+    changes: &ChangeSet,
+) -> Result<Vec<ProviderPin>, DbError> {
+    let uses = K::uses(schemas);
+    let wanted: Vec<K::Wanted> = uses
+        .iter()
+        .map(|u| K::used(u).clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let declared = packages_by_schema(schemas);
+    let reads = K::read(conn, Within::OwnTransaction, &wanted).await;
+    let mut pins = Vec::new();
+    let mut items = Vec::new();
+    for (one, read) in wanted.iter().zip(&reads) {
+        let name = shown::<K>(one);
+        let (schema, _) = K::qualified(one);
+        if K::is_absent(read) && declared.contains_key(schema) {
+            let package = defer_to_package(&declared, schema, &name, K::NOUN)
+                .expect("the schema holds a declared package")
+                .map_err(|why| failed(K::held_by(&uses, one, why)))?;
+            pins.push(K::placeholder(one, package));
+        } else if let Some(item) = K::present(read) {
+            if let Some(why) = K::refusal(read, one) {
+                return Err(failed(K::held_by(&uses, one, why)));
+            }
+            let (extension, version) =
+                K::extension(item).expect("a refusal-free object has a package");
+            check_package(schemas, extension, version, &name, K::NOUN)
+                .map_err(|why| failed(K::held_by(&uses, one, why)))?;
+            items.push(item);
+            pins.push(K::pin(item));
+        } else {
+            let why = K::refusal(read, one).expect("a non-present object refuses");
+            return Err(failed(K::held_by(&uses, one, why)));
+        }
+    }
+    K::refuse_uses(&items, &uses).map_err(failed)?;
+    refuse_update_beside_provided(
+        |extension| {
+            items
+                .iter()
+                .find(|i| K::extension(i).is_some_and(|(e, _)| e == extension))
+                .map(|i| shown::<K>(K::item_wanted(i)))
+        },
+        changes,
+        K::NOUN,
+    )
+    .map_err(failed)?;
+    for pin in pins.iter_mut().filter(|p| !p.planned) {
+        if let Some(package) = &mut pin.provider {
+            package.moved_to = moved_to(&package.extension, &pin.schema, changes);
+        }
+    }
+    Ok(pins)
+}
+
+/// A pin read again is the pin that was sealed, except that an object its package's move
+/// carried is in the schema the plan said it would be.
+pub(crate) fn same_moved(sealed: &ProviderPin, now: &ProviderPin) -> bool {
+    same_pin(
+        sealed,
+        now,
+        |p| {
+            (
+                p.schema.clone(),
+                p.provider.as_ref().and_then(|x| x.moved_to.clone()),
+            )
+        },
+        |p| {
+            let mut p = p.clone();
+            if let Some(x) = &mut p.provider {
+                x.moved_to = None;
+            }
+            p
+        },
+        |p, schema| ProviderPin {
+            schema: schema.to_owned(),
+            ..p
+        },
+    )
+}
+
+/// Refuses a sealed plan whose objects of the kind are not what it was sealed over: one the plan
+/// names with no pin, an object that is gone, or one that changed.
+pub(crate) async fn check_kind<K: PinKind>(
+    conn: &mut Conn,
+    within: Within,
+    expected: &[ProviderPin],
+    changes: &ChangeSet,
+) -> Result<(), DbError> {
+    let ours: Vec<&ProviderPin> = expected.iter().filter(|p| p.kind == K::KIND).collect();
+    let pinned: BTreeSet<K::Wanted> = ours.iter().map(|p| K::wanted_of(p)).collect();
+    for wanted in K::named_by(changes) {
+        if !pinned.contains(&wanted) {
+            return Err(failed(format!(
+                "plan has no pin for the {} `{}`; plan again against the database",
+                K::NOUN.object,
+                shown::<K>(&wanted)
+            )));
+        }
+    }
+    let live: Vec<&ProviderPin> = ours.into_iter().filter(|p| !p.planned).collect();
+    // Where each object is now: under its own name or the name its package's move gave it; it
+    // keeps its OID, so exactly one is there.
+    let mut candidates = Vec::new();
+    for pin in &live {
+        candidates.push(K::wanted_of(pin));
+        if let Some(schema) = pin.provider.as_ref().and_then(|p| p.moved_to.as_deref()) {
+            candidates.push(K::in_schema(&K::wanted_of(pin), schema));
+        }
+    }
+    let reads: BTreeMap<K::Wanted, K::Read> = candidates
+        .iter()
+        .cloned()
+        .zip(K::read(conn, within, &candidates).await)
+        .collect();
+    judge::<K>(&live, &reads)
+}
+
+/// Each live pin against what was read now: the object must be there, under its own name or the
+/// one its package's move gave it, and be the object that was sealed.
+fn judge<K: PinKind>(
+    live: &[&ProviderPin],
+    reads: &BTreeMap<K::Wanted, K::Read>,
+) -> Result<(), DbError> {
+    for pin in live {
+        let own = K::wanted_of(pin);
+        let moved = pin
+            .provider
+            .as_ref()
+            .and_then(|p| p.moved_to.as_deref())
+            .map(|schema| K::in_schema(&own, schema));
+        let now = moved
+            .as_ref()
+            .and_then(|m| reads.get(m).filter(|r| K::present(r).is_some()))
+            .or_else(|| reads.get(&own));
+        match now.and_then(|r| K::present(r)) {
+            Some(item) if same_moved(pin, &K::pin(item)) => {}
+            _ => {
+                return Err(failed(format!(
+                    "the {} `{}.{}` changed since planning; plan again",
+                    K::NOUN.object,
+                    Escaped(&pin.schema),
+                    Escaped(&pin.name)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The proof after the rehearsal for each placeholder of the kind (DEC-2447.12).
+pub(crate) fn proof_kind<K: PinKind>(
+    pins: &[ProviderPin],
+    created: &[pbps_model::ExtensionPin],
+    changed: &[pbps_model::ExtensionChangePin],
+) -> Result<(), String> {
+    for pin in pins.iter().filter(|p| p.kind == K::KIND && p.planned) {
+        proof_where(
+            Standing::from(pin),
+            |m| K::is_member(pin, m),
+            K::NOUN,
+            created,
+            changed,
+        )?;
+    }
+    Ok(())
 }
 
 /// The rules are proved on a kind that is not a type: a fake object with its own
@@ -522,5 +780,85 @@ mod tests {
         assert_eq!(moved_to("beta", "ext", &set), None);
         assert_eq!(moved_to("alpha", "elsewhere", &set), None);
         assert_eq!(moved_to("alpha", "ext", &ChangeSet::default()), None);
+    }
+    /// The comparison after the read, for both kinds that use it: the object must be there and
+    /// be what was sealed, wherever its package's move put it, and anything else is "changed"
+    /// (DEC-2447.12). Each rule sits beside its negative.
+    fn judging<K: PinKind>(
+        sealed: K::Item,
+        digest_changed: K::Item,
+        carried_to_other: K::Item,
+        absent: K::Read,
+        present: impl Fn(K::Item) -> K::Read,
+    ) {
+        let mut pin = K::pin(&sealed);
+        let own = K::wanted_of(&pin);
+        let read_of = |entries: Vec<(K::Wanted, K::Read)>| entries.into_iter().collect();
+        // Unchanged is accepted; a changed digest, an absent object and an unreadable one are
+        // "changed since planning".
+        judge::<K>(&[&pin], &read_of(vec![(own.clone(), present(sealed))])).unwrap();
+        let why = judge::<K>(
+            &[&pin],
+            &read_of(vec![(own.clone(), present(digest_changed))]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("changed since planning"), "{why}");
+        assert!(judge::<K>(&[&pin], &read_of(vec![(own.clone(), absent)])).is_err());
+        assert!(judge::<K>(&[&pin], &read_of(vec![])).is_err());
+        // An object its package's move carried is found where the plan said, and only there.
+        pin.provider.as_mut().unwrap().moved_to = Some("elsewhere".into());
+        let there = K::in_schema(&own, "elsewhere");
+        let reads = read_of(vec![(there, present(carried_to_other))]);
+        judge::<K>(&[&pin], &reads).unwrap();
+    }
+
+    #[test]
+    fn a_class_read_again_is_the_class_that_was_sealed() {
+        use crate::class_pins::ClassPins;
+        use crate::class_read::{Class, ClassRead, Wanted};
+        let class = |schema: &str, digest: &str| Class {
+            wanted: Wanted {
+                method: "gin".into(),
+                schema: schema.into(),
+                name: "gin_trgm_ops".into(),
+            },
+            oid: 1,
+            is_default: false,
+            input_type: "text".into(),
+            extension: Some(("pg_trgm".into(), "1.6".into())),
+            family_extension: Some("pg_trgm".into()),
+            digest: digest.into(),
+        };
+        judging::<ClassPins>(
+            class("ext", "d"),
+            class("ext", "other"),
+            class("elsewhere", "d"),
+            ClassRead::Absent,
+            |c| ClassRead::Present(Box::new(c)),
+        );
+    }
+
+    #[test]
+    fn an_operator_read_again_is_the_operator_that_was_sealed() {
+        use crate::operator_pins::OperatorPins;
+        use crate::operator_read::{Operator, OperatorRead, Wanted};
+        let operator = |schema: &str, digest: &str| Operator {
+            wanted: Wanted {
+                schema: schema.into(),
+                symbol: "%".into(),
+            },
+            oid: 1,
+            extension: Some(("pg_trgm".into(), "1.6".into())),
+            mixed: false,
+            digest: digest.into(),
+        };
+        judging::<OperatorPins>(
+            operator("ext", "d"),
+            operator("ext", "other"),
+            operator("elsewhere", "d"),
+            OperatorRead::Absent,
+            |o| OperatorRead::Present(Box::new(o)),
+        );
     }
 }

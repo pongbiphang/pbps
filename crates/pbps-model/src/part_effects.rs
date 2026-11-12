@@ -243,6 +243,18 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             Change::DropUnique { table, name } => {
                 named(table, crate::Part::Unique, name.raw(), Effect::Removed)
             }
+            Change::SetExclusion {
+                table, name, to, ..
+            } => named(
+                table,
+                crate::Part::Exclusion,
+                name.raw(),
+                if to.is_some() {
+                    Effect::Created
+                } else {
+                    Effect::Removed
+                },
+            ),
             Change::AddForeignKey { table, name, .. } => {
                 named(table, crate::Part::ForeignKey, name.raw(), Effect::Created)
             }

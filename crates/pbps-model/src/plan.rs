@@ -300,7 +300,10 @@ use crate::zone::SessionZone;
 // (DEC-2729.1): an older build would refuse the change as unknown, and would otherwise run a
 // plan that was reviewed with the comment statements missing; 70 and 71 belong to other
 // changes.
-pub const CURRENT_VERSION: u32 = 72;
+// 73 adds `SetExclusion`, the add and alter side of an exclusion constraint (DEC-2448.3):
+// an older build would not know the change and would drop a table's `exclude` from a payload;
+// 72 belongs to another change.
+pub const CURRENT_VERSION: u32 = 73;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -1588,7 +1591,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 72);
+        assert_eq!(plan.version, 73);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");

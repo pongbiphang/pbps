@@ -774,6 +774,17 @@ pub enum Change {
         table: TableName,
         name: ObjectLocalName,
     },
+    /// Adds (`from: None`), or drops (`to: None`), an exclusion constraint
+    /// (DEC-2448.3). One variant for both, as [`Change::SetPrimaryKey`] is: a
+    /// replacement is the drop half and the add half as two changes, each in the
+    /// ordering class its direction needs. Adding takes the `constraint` risk,
+    /// dropping the `destructive` one.
+    SetExclusion {
+        table: TableName,
+        name: ObjectLocalName,
+        from: Option<Box<ExclusionConstraint>>,
+        to: Option<Box<ExclusionConstraint>>,
+    },
     AddForeignKey {
         table: TableName,
         name: ObjectLocalName,
@@ -1612,6 +1623,7 @@ macro_rules! change_family {
         $crate::Change::SetPrimaryKey { .. }
             | $crate::Change::AddUnique { .. }
             | $crate::Change::DropUnique { .. }
+            | $crate::Change::SetExclusion { .. }
             | $crate::Change::AddForeignKey { .. }
             | $crate::Change::DropForeignKey { .. }
             | $crate::Change::AddCheck { .. }
@@ -1927,6 +1939,7 @@ impl Change {
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
+            | Change::SetExclusion { table, .. }
             | Change::AddForeignKey { table, .. }
             | Change::DropForeignKey { table, .. }
             | Change::AddCheck { table, .. }
@@ -2043,6 +2056,7 @@ impl Change {
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2169,6 +2183,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2272,6 +2287,7 @@ impl Change {
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2404,6 +2420,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2480,6 +2497,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2574,6 +2592,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2656,6 +2675,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2723,6 +2743,7 @@ impl Change {
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2854,6 +2875,7 @@ impl Change {
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2943,6 +2965,7 @@ impl Change {
             }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -3037,6 +3060,16 @@ impl Change {
             Change::DropUnique { table, name, .. } => {
                 it(table, Some(name.raw()), PartAfter::Gone(Part::Unique))
             }
+            Change::SetExclusion {
+                table, name, to, ..
+            } => it(
+                table,
+                Some(name.raw()),
+                match to {
+                    Some(constraint) => standing(PartDefinition::Exclusion(constraint)),
+                    None => PartAfter::Gone(Part::Exclusion),
+                },
+            ),
             Change::AddForeignKey {
                 table,
                 name,
@@ -3180,6 +3213,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -3251,6 +3285,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -3312,6 +3347,7 @@ impl Change {
             | Change::SetComment { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -3478,6 +3514,14 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             }
             Change::AddUnique { .. } | Change::AddForeignKey { .. } | Change::AddCheck { .. } => {
                 r.insert(RiskClass::Constraint);
+            }
+            // Adding one checks every existing row under an exclusive lock;
+            // dropping one gives up a guarantee, as dropping uniqueness does.
+            Change::SetExclusion { to: Some(_), .. } => {
+                r.insert(RiskClass::Constraint);
+            }
+            Change::SetExclusion { to: None, .. } => {
+                r.insert(RiskClass::Destructive);
             }
             // The engine recomputes and rewrites the value of every stored
             // row, and a NOT NULL, check or unique index over the column can

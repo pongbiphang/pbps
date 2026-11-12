@@ -159,6 +159,9 @@ fn installs_expression(c: &Change) -> bool {
         Change::AlterColumnDefault { to, .. } => to.is_some(),
         Change::SetPartitionDefault { to, fallback, .. } => to.is_some() || fallback.is_some(),
         Change::AddCheck { .. } | Change::AddIndex { .. } => true,
+        // A new exclusion's filter and key expressions are installed with it, as an
+        // index's are (#2448 C1b).
+        Change::SetExclusion { to: Some(_), .. } => true,
         _ => false,
     }
 }
@@ -567,4 +570,27 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
         assert!(release(&remove.part_effects(), &surface));
         assert!(!release(&remove.part_effects(), &lookalike));
     }
+}
+
+#[test]
+fn a_new_exclusion_installs_an_expression_and_a_drop_does_not() {
+    let exclusion = pbps_model::ExclusionConstraint {
+        method: pbps_model::IndexMethod::Btree,
+        keys: vec![],
+        include: vec![],
+        filter: Some("room > 0".into()),
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    };
+    let set = |from, to| Change::SetExclusion {
+        table: TableName::new("app", "t"),
+        name: "no_overlap".into(),
+        from,
+        to,
+    };
+    assert!(installs_expression(&set(
+        None,
+        Some(Box::new(exclusion.clone()))
+    )));
+    assert!(!installs_expression(&set(Some(Box::new(exclusion)), None)));
 }

@@ -503,6 +503,31 @@ pub fn names(
                 name.raw(),
             )?;
         }
+        Change::SetExclusion {
+            table,
+            name,
+            from,
+            to,
+        } => {
+            if from.is_some() {
+                nx.part(
+                    false,
+                    table,
+                    NameKind::Key,
+                    PartKey::Exclusion(name.clone()),
+                    name.raw(),
+                )?;
+            }
+            if to.is_some() {
+                nx.part(
+                    true,
+                    table,
+                    NameKind::Key,
+                    PartKey::Exclusion(name.clone()),
+                    name.raw(),
+                )?;
+            }
+        }
         Change::AddForeignKey { table, name, .. } => {
             nx.part(
                 true,

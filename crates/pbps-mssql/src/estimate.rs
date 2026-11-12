@@ -211,6 +211,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::SetIndexStorageParameters { .. }
                 | pbps_model::change_family!(policies)
                 | Change::AddUnique { .. }
+                | Change::SetExclusion { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }

@@ -782,6 +782,15 @@ impl Declared {
                             .insert(name.clone(), keys);
                     }
                 }
+                Change::SetExclusion {
+                    table, name, to, ..
+                } => {
+                    remove_nested(&mut self.expressions.exclusion_filters, table, name);
+                    remove_nested(&mut self.expressions.exclusion_keys, table, name);
+                    if let Some(spec) = to {
+                        self.record_exclusion(table, name, spec);
+                    }
+                }
                 Change::DropIndex { table, name } => {
                     remove_nested(&mut self.expressions.filters, table, name);
                     remove_nested(&mut self.expressions.keys, table, name);
@@ -1823,9 +1832,10 @@ mod tests {
 
     /// An exclusion constraint's expression keys and predicate are recorded as
     /// declared and put back over the engine's respelling, only where the
-    /// read-back has the shape the record has (DEC-2448.3).
+    /// read-back has the shape the record has; a plan that adds one records its
+    /// text and a plan that drops one forgets it (DEC-2448.3).
     #[test]
-    fn an_exclusions_declared_texts_are_recorded_and_overlaid() {
+    fn an_exclusions_declared_texts_are_recorded_overlaid_and_advanced() {
         let mut declared_schema = schema();
         declared_schema
             .tables
@@ -1871,5 +1881,36 @@ mod tests {
         let x = &base.tables[&t()].exclude["no_overlap"];
         assert_eq!(x.keys[0].key.key, crate::IndexKey::Column("n".into()));
         assert_eq!(x.filter, None);
+        // A plan that drops it forgets the record; one that adds it records it.
+        let drop = ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetExclusion {
+                table: t(),
+                name: "no_overlap".into(),
+                from: Some(Box::new(excluded())),
+                to: None,
+            })],
+        };
+        let mut advanced = declared.clone();
+        advanced.advance(&drop);
+        assert!(advanced.expressions.exclusion_keys.is_empty());
+        assert!(advanced.expressions.exclusion_filters.is_empty());
+        let add = ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetExclusion {
+                table: t(),
+                name: "no_overlap".into(),
+                from: None,
+                to: Some(Box::new(excluded())),
+            })],
+        };
+        let mut fresh = Declared::default();
+        fresh.advance(&add);
+        assert_eq!(
+            fresh.expressions.exclusion_keys,
+            declared.expressions.exclusion_keys
+        );
+        assert_eq!(
+            fresh.expressions.exclusion_filters,
+            declared.expressions.exclusion_filters
+        );
     }
 }

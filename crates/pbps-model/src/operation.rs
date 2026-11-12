@@ -750,6 +750,9 @@ impl Operation {
             Change::AddUnique { table, name, .. } | Change::DropUnique { table, name } => {
                 part(table, PartKey::Unique(name.clone()))?
             }
+            Change::SetExclusion { table, name, .. } => {
+                part(table, PartKey::Exclusion(name.clone()))?
+            }
             Change::AddForeignKey { table, name, .. } | Change::DropForeignKey { table, name } => {
                 part(table, PartKey::ForeignKey(name.clone()))?
             }
@@ -938,6 +941,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::CreateModule { .. }
             | Change::CreateRole { .. }
             | Change::CreateExtension { .. } => exists(false, true)?,
+            Change::SetExclusion { from, to, .. } => exists(from.is_some(), to.is_some())?,
             Change::AlterColumnDefault { from, to, .. } => exists(from.is_some(), to.is_some())?,
             // `SET EXPRESSION` replaces the expression the engine keeps for
             // the column, as a changed default does (DEC-1168.1).

@@ -746,6 +746,14 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::SetReplicaIdentity { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }
+        | Change::SetExclusion {
+            table,
+            from: Some(_),
+            ..
+        }
+        | Change::SetExclusion {
+            table, to: None, ..
+        }
         | Change::AddForeignKey { table, .. }
         | Change::DropForeignKey { table, .. } => {
             (Exact(Surface::Table(table.clone())), true, true)
@@ -767,6 +775,23 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             false,
         ),
         Change::AddIndex { table, name, .. } => (
+            Exact(Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            }),
+            false,
+            true,
+        ),
+        // A new exclusion constraint creates its backing index, a relation of the
+        // constraint's name, and ends nothing a binding holds, as an index does: it is not a
+        // change of the table's surface, so a project with kept bindings does not need its
+        // resolver to add one (#2448 C1b). A replacement or a drop is the table's (C2).
+        Change::SetExclusion {
+            table,
+            name,
+            from: None,
+            to: Some(_),
+        } => (
             Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -835,7 +860,13 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
                 table: table.clone(),
                 name: name.clone(),
             },
-            Change::AddIndex { table, name, .. } if before => Surface::Index {
+            Change::AddIndex { table, name, .. }
+            | Change::SetExclusion {
+                table,
+                name,
+                from: None,
+                to: Some(_),
+            } if before => Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
             },
@@ -925,6 +956,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Index { table, name } => {
             matches!(c, Change::AddIndex { table: t, name: n, .. } | Change::DropIndex { table: t, name: n } if t == table && n == name)
+                || matches!(c, Change::SetExclusion { table: t, name: n, from: None, to: Some(_) } if t == table && n == name)
                 || matches!(c, Change::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. } if t == table && n == name)
         }
         Surface::Type(name) => match c {
@@ -1024,6 +1056,56 @@ mod tests {
         // Negative: another index's surface, and a key's change.
         assert!(!touches(&set(IndexPart::Index("other".into())), &index));
         assert!(!touches(&set(IndexPart::PrimaryKey), &index));
+    }
+
+    /// A new exclusion constraint creates a relation of its own name and ends nothing a binding
+    /// holds, as an index does (#2448 C1b): its surface is the index's, opened by no one. A
+    /// replacement or a drop is the table's surface. Negative: the index surface of another name
+    /// is not touched.
+    #[test]
+    fn a_new_exclusion_owns_an_index_surface_and_a_drop_or_replacement_owns_the_table() {
+        let constraint = || {
+            Box::new(crate::ExclusionConstraint {
+                method: IndexMethod::Gist,
+                keys: vec![],
+                include: vec![],
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: crate::ExclusionTiming::Immediate,
+            })
+        };
+        let change = |from, to| Change::SetExclusion {
+            table: TableName::new("app", "t"),
+            name: "no_overlap".into(),
+            from,
+            to,
+        };
+        let index = Surface::Index {
+            table: TableName::new("app", "t"),
+            name: "no_overlap".into(),
+        };
+        let add = change(None, Some(constraint()));
+        let (owners, opening, closing) = changed_owners(&add).expect("an owned change");
+        assert!(matches!(owners.as_slice(), [OwnerScope::Exact(s)] if *s == index));
+        assert!((opening, closing) == (false, true));
+        assert!(touches(&add, &index));
+        assert!(!touches(
+            &add,
+            &Surface::Index {
+                table: TableName::new("app", "t"),
+                name: "other".into()
+            }
+        ));
+        for other in [
+            change(Some(constraint()), None),
+            change(Some(constraint()), Some(constraint())),
+        ] {
+            let (owners, ..) = changed_owners(&other).expect("an owned change");
+            assert!(matches!(
+                owners.as_slice(),
+                [OwnerScope::Exact(Surface::Table(_))]
+            ));
+        }
     }
 
     fn mood() -> crate::TypeRef {

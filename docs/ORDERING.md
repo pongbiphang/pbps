@@ -296,7 +296,7 @@ The differ sorts every planned change by, in order:
    |---|---|
    | 0 | `DropPolicy` before every module-drop rank; `DropModule`, `DropRole`; P: `SetReplicaIdentity` to a target that stands, at (0, 1) |
    | 1 | `RenameTable`, `RenameRole`, `RenameType` |
-   | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`; a domain's `Loosen` (`AlterDomain`); `DropComputedColumn` at the class's end (2, 4) |
+   | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`, `SetExclusion { to: None }`; a domain's `Loosen` (`AlterDomain`); `DropComputedColumn` at the class's end (2, 4) |
    | 3 | `RenameColumn` |
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
@@ -307,7 +307,7 @@ The differ sorts every planned change by, in order:
    | 10 | `SetColumnDeprecated`, `SetComment`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
-   | 13 | A partitioned parent's `AddIndex` first (13, 0); `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex`; a domain's `Tighten` (`AlterDomain`); P: the other `SetReplicaIdentity`, last |
+   | 13 | A partitioned parent's `AddIndex` first (13, 0); `SetPrimaryKey { to: Some }`, `AddUnique`, `SetExclusion { to: Some }`, `AddForeignKey`, `AddCheck`, `AddIndex`; a domain's `Tighten` (`AlterDomain`); P: the other `SetReplicaIdentity`, last |
    | 14 | `CreateModule`, `AlterModule`; `PublicExecution` immediately after its routine's create (#687); P: `CreatePolicy` at (14, 2), then `SetRowSecurity` at (14, 3) |
    | 15 | `CreateRole` |
    | 16 | `Grant` |
@@ -495,7 +495,7 @@ requirement is common to all of them, so it is listed once,
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
-| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype; is gone before a row of its table is written (DEC-1968.2) | Exists, Is, creates, removes |
+| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`, `SetExclusion { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype; is gone before a row of its table is written (DEC-1968.2) | Exists, Is, creates, removes |
 | `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922); a check by its text, lexed | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1). Its part effect is the column's `Column` and `Generated` parts removed (DEC-2143.2) | Exists, removes |
 | `RenameColumn` | 3 | The target name free. P: no retained managed policy bound to the column. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: other dependents' text follows the rename | Exists, rewrites |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |
@@ -524,7 +524,7 @@ requirement is common to all of them, so it is listed once,
 | `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) | Exists |
 | `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes (an update's `SET c = DEFAULT` too), the rows of the tables it references, table against table, never by value; an update's also leave before the rows they release (DEC-1968.2); an update's guards read the columns it leaves alone and its key, and an insert's postcondition every column in its `types`, those it leaves at NULL among them (#2079); an insert's also the NOT NULL gone of each baseline column that is NOT NULL with nothing to fill it and that the row leaves out (#2086); the checks, uniques, foreign keys and unique or filtered indexes the plan drops or replaces under their name gone (DEC-1998.1, DEC-1968.2) | Rows | Absent, Exists, Is, creates, rewrites |
 | `DeleteRow` | 12 | Child rows moved away or cascaded: a child's rows leave before the rows of the tables it references, table against table (DEC-1968.2). The foreign keys the plan drops into its table, a rebuild's too, gone | Removes a row | Exists, Is, removes, rewrites |
-| `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first. S: a computed column it names. A partition's `AddIndex`: the indexes its parent ends with (DEC-1688.1) | A key or index | Exists, Reads, creates, removes |
+| `SetPrimaryKey { to: Some }`, `AddUnique`, `SetExclusion { to: Some }`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first. S: a computed column it names. A partition's `AddIndex`: the indexes its parent ends with (DEC-1688.1). An exclusion also needs the table's rows written first: class 11 is before 13 (DEC-2448.3) | A key, index or exclusion constraint | Exists, Reads, creates, removes |
 | `AddForeignKey` | 13 | Its columns, the referenced key, valid data: its own rows and the referenced table's, after the plan writes them | A foreign key | Exists, Is, Reads, creates |
 | `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |

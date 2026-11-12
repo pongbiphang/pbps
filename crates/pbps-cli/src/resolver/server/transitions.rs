@@ -515,6 +515,14 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::SetStorageParameters { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
+            | Change::SetExclusion {
+                table,
+                from: Some(_),
+                ..
+            }
+            | Change::SetExclusion {
+                table, to: None, ..
+            }
             | Change::AddForeignKey { table, .. }
             | Change::DropForeignKey { table, .. } => {
                 (Surface::Table(table.clone()), false, true, true, None)
@@ -551,7 +559,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     name: name.clone(),
                 }),
             ),
-            Change::AddIndex { table, name, .. } => (
+            Change::AddIndex { table, name, .. }
+            | Change::SetExclusion {
+                table,
+                name,
+                from: None,
+                to: Some(_),
+            } => (
                 Surface::Index {
                     table: table.clone(),
                     name: name.clone(),

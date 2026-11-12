@@ -689,6 +689,78 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
 /// A plan that drops, renames or alters is not a bootstrap, and building a
 /// namespace from one would reproduce neither side.
 #[test]
+fn a_split_exclusion_is_a_step_of_its_own_after_its_table_and_a_drop_is_refused() {
+    let table = TableName::new("app", "t");
+    let mut created = Table::default();
+    created.columns.insert(
+        "room".into(),
+        pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+    );
+    let exclusion = pbps_model::ExclusionConstraint {
+        method: pbps_model::IndexMethod::Btree,
+        keys: vec![pbps_model::ExclusionKey {
+            key: IndexColumn {
+                key: pbps_model::IndexKey::Column("room".into()),
+                descending: false,
+                opclass: None,
+                collation: None,
+            },
+            operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+        }],
+        include: vec![],
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    };
+    let set = |from, to| Change::SetExclusion {
+        table: table.clone(),
+        name: "one_per_room".into(),
+        from,
+        to,
+    };
+    let create = Change::CreateTable {
+        uid: Uid::generate(UidKind::Table),
+        name: table.clone(),
+        table: Box::new(created),
+        beside_default: None,
+        moves_at_most: None,
+    };
+    let reconstruction = build_reconstruction(
+        &crate::Postgres::new(),
+        &[create.clone(), set(None, Some(Box::new(exclusion.clone())))],
+    )
+    .unwrap();
+    let phases: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| step.declaration.as_str())
+        .collect();
+    assert_eq!(
+        phases,
+        ["table app.t", "exclusion constraint one_per_room on app.t"]
+    );
+    assert!(
+        reconstruction.steps[1]
+            .statements
+            .join("\n")
+            .contains("EXCLUDE USING btree")
+    );
+    // Its backing index is a relation of the constraint's name, which can shadow a name a
+    // binding holds, so the order check knows it.
+    assert_eq!(
+        reconstruction.steps[1].names,
+        [(Nameable::Index, "app".to_owned(), "one_per_room".to_owned())]
+    );
+    // Negative: a bootstrap holds only creations, so a drop is refused by kind.
+    let refused = build_reconstruction(
+        &crate::Postgres::new(),
+        &[create, set(Some(Box::new(exclusion)), None)],
+    )
+    .unwrap_err();
+    assert!(matches!(refused, ReconstructError::Unsupported(ref op) if op == "set_exclusion"));
+}
+
+#[test]
 fn a_change_no_bootstrap_contains_is_refused_by_kind() {
     let refused = build_reconstruction(
         &crate::Postgres::new(),

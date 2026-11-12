@@ -17,9 +17,7 @@ use pbps_model::escape::Escaped;
 use sha2::{Digest, Sha256};
 
 use crate::pins::Within;
-use crate::user_types::{OWN_TRANSACTION, need};
-
-const SAVEPOINT: &str = "pbps_class_reads";
+use crate::user_types::need;
 
 /// The class a key names, with the access method of the index it is used in.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -207,70 +205,25 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Reads each class twice and keeps the answer both passes agree on.
-async fn read_each(conn: &mut Conn, wanted: &[Wanted]) -> Result<Vec<ClassRead>, DbError> {
-    conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
-        .await?;
-    let mut passes = [Vec::new(), Vec::new()];
-    for pass in &mut passes {
-        for one in wanted {
-            pass.push(read_one(conn, one).await?);
-        }
-    }
-    let [first, second] = passes;
-    Ok(first
-        .into_iter()
-        .zip(second)
-        .map(|(first, second)| {
-            if first == second {
-                first
-            } else {
-                ClassRead::Unreadable("the class changed while it was being read".to_owned())
-            }
-        })
-        .collect())
-}
-
-async fn read_all(
-    conn: &mut Conn,
-    within: Within,
-    wanted: &[Wanted],
-) -> Result<Vec<ClassRead>, DbError> {
-    match within {
-        Within::OwnTransaction => {
-            conn.begin(&OWN_TRANSACTION).await?;
-            let result = read_each(conn, wanted).await;
-            let closed = conn.rollback(&OWN_TRANSACTION).await;
-            let reads = result?;
-            closed?;
-            Ok(reads)
-        }
-        Within::CallersTransaction => {
-            conn.execute(&format!("SAVEPOINT {SAVEPOINT}")).await?;
-            let result = read_each(conn, wanted).await;
-            // Leave the caller's transaction usable if it can be: a failed
-            // statement aborts it until the savepoint is rolled back.
-            let undone = conn
-                .execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
-                .await;
-            let released = conn
-                .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
-                .await;
-            let reads = result?;
-            undone?;
-            released?;
-            Ok(reads)
-        }
-    }
-}
-
 /// One answer per class, in order. A failed read is every class unreadable.
 pub async fn read(conn: &mut Conn, within: Within, wanted: &[Wanted]) -> Vec<ClassRead> {
-    match read_all(conn, within, wanted).await {
-        Ok(reads) => reads,
-        Err(e) => wanted
-            .iter()
-            .map(|_| ClassRead::Unreadable(e.to_string()))
-            .collect(),
+    crate::settled_read::read::<Classes>(conn, within, wanted).await
+}
+
+/// How a class is read, for the double read of [`crate::settled_read`].
+pub(crate) struct Classes;
+
+impl crate::settled_read::Kind for Classes {
+    type Wanted = Wanted;
+    type Read = ClassRead;
+    const SAVEPOINT: &'static str = "pbps_class_reads";
+    const NOUN: &'static str = "class";
+
+    fn unreadable(why: String) -> ClassRead {
+        ClassRead::Unreadable(why)
+    }
+
+    async fn read_one(conn: &mut Conn, wanted: &Wanted) -> Result<ClassRead, DbError> {
+        read_one(conn, wanted).await
     }
 }

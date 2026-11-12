@@ -9477,7 +9477,7 @@ another schema is a format change of its own.
 
 <a id="dec-2448-3"></a>
 
-**DEC-2448.3. EXCLUDE constraints on ordinary tables: read and round trip (#2448 PR C1a).**
+**DEC-2448.3. EXCLUDE constraints on ordinary tables: read, declare, add (#2448 PR C1).**
 A table gains `exclude:`, a map by name of `ExclusionConstraint`: a required
 `method` (`btree` or `gist`; never defaulted, because the engine's default is a
 B-tree and a declaration that leaves it out must not read as GiST), `keys`, each
@@ -9489,47 +9489,77 @@ deferred; `deferrable: false` with `initially: deferred` cannot be built). It
 is a constraint and owns its backing index, which is never declared beside it
 and is read by `conindid`, never by name. Measured on 16.15 and 18.6, identical:
 the engine has no `NOT VALID` and no `NOT ENFORCED` for it (16 does not even
-parse the latter), so neither is a field; the index is named like the constraint;
-`pg_get_constraintdef` omits `INITIALLY IMMEDIATE` and a default class, so a
-reader uses the structured rows (per-key text, `indclass`, `indcollation`, and
-`conexclop` joined to `pg_operator`), where an `INCLUDE` column has no operator.
+parse the latter), so neither is a field; the index is named like the constraint
+(`DROP INDEX` of it is `2BP01`); `pg_get_constraintdef` omits `INITIALLY
+IMMEDIATE` and a default class, so a reader uses the structured rows (per-key
+text, `indclass`, `indcollation`, and `conexclop` joined to `pg_operator`), where
+an `INCLUDE` column has no operator.
 
 The operator is `OperatorRef`: the symbol of a `pg_catalog` operator, written
 bare or `pg_catalog.&&` (one operator), validated against the engine's operator
-characters. An operator of another schema is held by #2447 PR F. Whether an
-operator is commutative, a member of its key's operator family or boolean is the
-engine's to say, as which key types a method takes is, so validation does not
-whitelist operators.
+characters, and emitted as `OPERATOR("pg_catalog".&&)`, never interpolated. An
+operator of a managed package is written with its own schema, `OPERATOR(ext.%)`,
+and is **pinned** (DEC-2447.14): the plan seals every overload of the schema and
+symbol, requires each to be a member of one extension the project manages (a
+lookalike in the package's schema has no `e` dependency and is refused by name),
+and digests what they do (function owner, source and library, commutator,
+negator, join properties, operator families) so an update or a new family
+membership moves the pin; a placeholder for a package the plan itself brings is
+proved by the sealed manifest. The pin sits in `Plan.provider_pins` beside the
+class pins, and the key classes of a new exclusion are pinned as an index's are.
+Whether an operator is
+commutative, a member of its key's operator family or boolean is the engine's to
+say, as which key types a method takes is, so validation does not whitelist
+operators; the rehearsal runs the build and the engine refuses with its own
+message.
 
-**This part reads and plans nothing.** The pull reads a constraint whole or
-leaves it out with a note: an operator count that differs from the key count (a
-join that lost one would read a weaker constraint), a backing index it cannot
-find, an unvalidated or non-enforced row, an `INITIALLY DEFERRED` without
-deferrable, a method outside the model (the engine accepts `hash` and `spgist`
-too). Pull, baseline, verify and the next plan round trip to no change. The
+**One change kind for both directions**, `Change::SetExclusion { from, to }`, as
+`SetPrimaryKey` is: adding is `from: None` (risk `constraint`, ordering class 13,
+after the rows are written), dropping is `to: None` (`destructive`, class 2), and
+a replacement will be the two as separate changes, each in its own class. The
+constraint is its own change even for a table the plan creates, never inline in
+`CREATE TABLE`: the creation payload carries none, so no emitter can create the
+table and lose it, and the constraint sees the rows the plan seeds. Adding to a
+table created in the plan with no row written to it carries no `constraint`
+risk (nothing to check); seeded, it does. Adding takes `AccessExclusive` on the
+table, with `ShareRowExclusive` and `Share`, and checks every existing row: reads
+wait too, and the estimate says so. Pre-flight reports it unchecked: a pairwise
+probe over rows would be expensive and stale, and the build is what the
+rehearsal runs.
+
+**Refused by name until the next parts**, because the engine does something
+no plan says. Dropping or replacing a standing exclusion, and renaming one (a
+drop and an add), need the retirement record of PR C2. A column of a standing
+exclusion that a plan drops or retypes is refused: measured, `DROP COLUMN` of a
+plain key column drops the constraint silently, one inside an expression is
+refused by a dependency, and `ALTER COLUMN TYPE` silently rebuilds it under an
+exclusive lock; a column a key's expression or the predicate mentions as a word
+counts as held. A partitioned table or a partition (PR E; 16 refuses a parent's
+and 18 requires the partition key), an expression or predicate that may call a
+routine of the project (its order against the routine is the index machinery's,
+which an exclusion is not on yet), a method other than `btree` and `gist` (the
+engine accepts `hash` and `spgist` too, which the pull leaves out and names), a
+key class the method does not hold, an operator of a schema where the project
+declares no package, and SQL Server as a whole are all refused by name at
+`validate` or left out of the pull.
+
+The pull reads a constraint whole or leaves it out with a note: an operator
+count that differs from the key count (a join that lost one would read a weaker
+constraint), a backing index it cannot find, an unvalidated or non-enforced row,
+an `INITIALLY DEFERRED` without deferrable, a method outside the model. The
 authored text of an expression key and of the predicate is recorded beside the
 read-back and put over the engine's respelling (`DeclaredExpressions`
 `exclusion_keys`, `exclusion_filters`), as an index's are, so a plan does not
-re-plan on the deparser's casts. **Every difference in an exclusion is refused
-by name in the differ**: adding one arrives in the next part, and dropping,
-replacing or renaming one (a drop and an add) with the retirement record after
-it. So is a plan that drops or retypes a column a standing exclusion holds:
-measured, `DROP COLUMN` of a plain key column drops the constraint silently, one
-inside an expression is refused by a dependency, and `ALTER COLUMN TYPE`
-silently rebuilds it under an exclusive lock; a column a key's expression or
-the predicate mentions as a word counts as held.
+re-plan on the deparser's casts.
 
-Refused at `validate` by name: a partitioned table or a partition (16 refuses a
-parent's and 18 requires the partition key), an expression or predicate that may
-call a routine of the project (its order against the routine is the index
-machinery's, which an exclusion is not on yet), a method that cannot back one
-(`gin`), a key class the method does not hold, a non-`pg_catalog` operator, and
-SQL Server as a whole.
-
-Formats: plan 68 (an older build would drop `exclude` from a table in a
-payload), state 39, published schema set 94 (the declaration schema gains
-`exclude:`). The ids file and its tree are untouched. A table with no exclusion
-serialises exactly as before.
+Formats: plan 73 (an older build does not know the change and would drop
+`exclude` from a table payload), no state change (the snapshot already holds
+`exclude`, DEC-2448.3). The published schema set does not move: regenerated, the
+three documents are byte-identical to the checked-in ones, because no published
+document names a `Change` or a pin, so the reserved number 105 is not spent. The
+ids file and its tree are untouched;
+the retirement record is C2's. A table with no exclusion and an index with none
+serialise exactly as before.
 
 <a id="dec-2449-1"></a>
 

@@ -394,6 +394,54 @@ pub(super) fn classify(
                 physical_attributes(capture, &mut owned, &object, &index_owner, false)?;
             }
         }
+        // An exclusion constraint is an index surface of its own name: the
+        // constraint and the index PostgreSQL builds for it are created and
+        // dropped together, so both belong to it (#2448 C1b).
+        for exclusion in table.exclude.keys() {
+            let index_owner = Surface::Index {
+                table: name.clone(),
+                name: exclusion.clone(),
+            };
+            let index = identity(
+                "pg_class",
+                vec![name.schema.clone(), exclusion.raw().to_owned()],
+                Vec::new(),
+            );
+            direct(
+                capture,
+                &mut owned,
+                index.clone(),
+                "relkind",
+                &["i", "I"],
+                index_owner.clone(),
+            )?;
+            // The index relation's own columns arrive with it, as a plain
+            // index's do; left unowned they read as an unexplained arrival.
+            if owned.get(&index) == Some(&index_owner) {
+                physical_attributes(capture, &mut owned, &index, &index_owner, false)?;
+            }
+            let found = capture
+                .inputs
+                .keys()
+                .filter(|object| {
+                    object.class == "pg_constraint"
+                        && object.name.len() == 1
+                        && object.name[0] == exclusion.raw()
+                        && object.signature.get(1) == Some(&table_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for object in found {
+                direct(
+                    capture,
+                    &mut owned,
+                    object,
+                    "contype",
+                    &["x"],
+                    index_owner.clone(),
+                )?;
+            }
+        }
         // A key constraint is independently declared. Its automatic table
         // edge does not qualify any other constraint or ordinary index.
         for (constraint_name, kind) in table

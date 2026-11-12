@@ -2468,6 +2468,14 @@ pub fn after_the_rebuilds(
                         keys.iter().any(|k| recomputed.contains(&table.column(k)))
                     })
             }
+            Change::SetExclusion {
+                table, to: Some(x), ..
+            } => {
+                calls(&x.expression_texts().collect::<Vec<_>>().join(" , "))
+                    || x.key_columns().is_some_and(|keys| {
+                        keys.iter().any(|k| recomputed.contains(&table.column(k)))
+                    })
+            }
             Change::AddUnique {
                 table, constraint, ..
             } => constraint

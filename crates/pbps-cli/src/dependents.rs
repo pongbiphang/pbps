@@ -2412,6 +2412,14 @@ fn oracle_after_the_rebuilds(
                         keys.iter().any(|k| recomputed.contains(&table.column(k)))
                     })
             }
+            Change::SetExclusion {
+                table, to: Some(x), ..
+            } => {
+                calls(&x.expression_texts().collect::<Vec<_>>().join(" , "))
+                    || x.key_columns().is_some_and(|keys| {
+                        keys.iter().any(|k| recomputed.contains(&table.column(k)))
+                    })
+            }
             Change::AddUnique {
                 table, constraint, ..
             } => constraint
@@ -5669,6 +5677,66 @@ mod tests {
             assert_eq!(serde_json::to_vec(&cs).unwrap(), bytes);
             assert_eq!(rendered(&cs), sql);
         }
+    }
+
+    /// The adapter compares the pass with its oracle, so an exclusion that
+    /// calls a function the plan creates is moved behind it by both or the
+    /// comparison fails; one that calls none, and a drop, move in neither.
+    #[test]
+    fn an_exclusion_calling_a_created_function_moves_behind_it_in_the_pass_and_its_oracle() {
+        let exclusion =
+            |key: pbps_model::IndexColumn, filter: Option<&str>, to: bool| Change::SetExclusion {
+                table: TableName::new("app", "booking"),
+                name: "xc".into(),
+                from: None,
+                to: to.then(|| {
+                    Box::new(pbps_model::ExclusionConstraint {
+                        method: pbps_model::IndexMethod::Gist,
+                        keys: vec![pbps_model::ExclusionKey {
+                            key,
+                            operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                        }],
+                        include: Vec::new(),
+                        filter: filter.map(str::to_owned),
+                        storage_parameters: Default::default(),
+                        timing: pbps_model::ExclusionTiming::Immediate,
+                    })
+                }),
+            };
+        let moved = |change: Change| {
+            let mut cs = plan(vec![change, routine("app.f()", "SELECT 1")]);
+            let schedule = Schedule::new(cs.changes.len());
+            super::test_adapters::after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &Schema::default(),
+                schedule,
+                pg().as_ref(),
+            )
+        };
+        let call = pbps_model::IndexColumn {
+            key: pbps_model::IndexKey::Expression("app.f(a)".into()),
+            descending: false,
+            opclass: None,
+            collation: None,
+        };
+        assert_eq!(moved(exclusion(call.clone(), None, true)), Ok(1));
+        assert_eq!(
+            moved(exclusion(
+                pbps_model::IndexColumn::column("a"),
+                Some("app.f(a) > 0"),
+                true
+            )),
+            Ok(1)
+        );
+        // Negative: nothing it reads is a created function.
+        assert_eq!(
+            moved(exclusion(pbps_model::IndexColumn::column("a"), None, true)),
+            Ok(0)
+        );
+        // Negative: a drop calls nothing.
+        assert_eq!(moved(exclusion(call, None, false)), Ok(0));
     }
 
     #[test]

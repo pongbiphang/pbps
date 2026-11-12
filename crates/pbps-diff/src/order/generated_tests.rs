@@ -485,6 +485,27 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
     pin(
+        Change::SetExclusion {
+            table: table.clone(),
+            name: "xc".into(),
+            from: None,
+            to: Some(Box::new(pbps_model::ExclusionConstraint {
+                method: pbps_model::IndexMethod::Gist,
+                keys: vec![pbps_model::ExclusionKey {
+                    key: pbps_model::IndexColumn::column("id"),
+                    operator: pbps_model::OperatorRef::symbol("&&").unwrap(),
+                }],
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            })),
+        },
+        vec![&table],
+        vec![],
+        None,
+    );
+    pin(
         Change::AddForeignKey {
             table: table.clone(),
             name: "fk".into(),
@@ -1155,5 +1176,60 @@ fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
     assert!(
         super::empty_columns(&changes(vec![moving, add("x".into(), "c_aaaaaa")]), &ids).is_empty(),
         "moving creation supplies no empty-root evidence"
+    );
+}
+
+/// A new exclusion constraint's key expression and predicate are expression
+/// text, as an index's are: a creation part that calls a function the plan
+/// creates must wait for it. A drop builds nothing, and a constraint over
+/// plain columns calls nothing.
+#[test]
+fn a_new_exclusion_reads_its_key_expressions_and_predicate_and_a_drop_reads_none() {
+    let exclusion = |key: IndexColumn, filter: Option<&str>| ExclusionConstraint {
+        method: IndexMethod::Gist,
+        keys: vec![ExclusionKey {
+            key,
+            operator: OperatorRef::symbol("&&").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: filter.map(str::to_owned),
+        storage_parameters: Default::default(),
+        timing: ExclusionTiming::Immediate,
+    };
+    let change =
+        |from: Option<ExclusionConstraint>, to: Option<ExclusionConstraint>| Change::SetExclusion {
+            table: TableName::new("app", "booking"),
+            name: "xc".into(),
+            from: from.map(Box::new),
+            to: to.map(Box::new),
+        };
+    let call = IndexColumn {
+        key: IndexKey::Expression("app.slot(a)".into()),
+        descending: false,
+        opclass: None,
+        collation: None,
+    };
+    assert_eq!(
+        super::gather(
+            &change(None, Some(exclusion(call.clone(), Some("app.live(b)")))),
+            super::Types::All
+        ),
+        vec!["app.live(b)", "app.slot(a)"]
+    );
+    // Negative: plain columns and no predicate call nothing.
+    assert!(
+        super::gather(
+            &change(None, Some(exclusion(IndexColumn::column("a"), None))),
+            super::Types::All
+        )
+        .is_empty()
+    );
+    // Negative: a drop reads no text, whatever the dropped one held.
+    assert!(
+        super::gather(
+            &change(Some(exclusion(call, Some("app.live(b)"))), None),
+            super::Types::All
+        )
+        .is_empty()
     );
 }

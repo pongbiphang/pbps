@@ -96,6 +96,7 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         | Change::SetPrimaryKey { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }
+        | Change::SetExclusion { table, .. }
         | Change::DropForeignKey { table, .. }
         | Change::AddCheck { table, .. }
         | Change::DropCheck { table, .. }
@@ -699,6 +700,31 @@ pub fn risks(
         .map(|(owner, _)| owner)
         .filter(|owner| !unsafe_owners.contains(owner))
         .collect();
+    // A table this plan creates and writes no row to has nothing for a new
+    // exclusion constraint to check, so adding one carries no `constraint` risk
+    // (DEC-2448.3); the constraint is its own change after the create and not
+    // inline in it, so the creation's own exemption cannot reach it.
+    let created: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            let Change::CreateTable { name, .. } = &p.change else {
+                return None;
+            };
+            Some(name)
+        })
+        .collect();
+    let seeded: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } = &p.change {
+                Some(table)
+            } else {
+                None
+            }
+        })
+        .collect();
     cs.changes
         .iter()
         .enumerate()
@@ -728,6 +754,11 @@ pub fn risks(
                             ..
                         }
                         | Change::AddUnique { .. }
+                        | Change::SetExclusion {
+                            from: None,
+                            to: Some(_),
+                            ..
+                        }
                         | Change::AddForeignKey { .. }
                         | Change::AddCheck { .. }
                         | Change::AddIndex { .. }
@@ -746,6 +777,17 @@ pub fn risks(
                 sources[at]
             };
             let mut risks = dialect.change_risks(source().unwrap_or(&part.change));
+            if let Change::SetExclusion {
+                table,
+                from: None,
+                to: Some(_),
+                ..
+            } = &part.change
+                && created.contains(table)
+                && !seeded.contains(table)
+            {
+                risks.remove(&RiskClass::Constraint);
+            }
             if policy_keys
                 .get(&at)
                 .is_some_and(|key| replacements.contains(key))
@@ -973,6 +1015,11 @@ fn gather(change: &Change, types: Types) -> Vec<&str> {
             .as_deref()
             .into_iter()
             .chain(index.columns.iter().filter_map(|c| c.key.expression()))
+            .collect(),
+        // A drop (`to: None`) reads no text: nothing it names is built.
+        Change::SetExclusion { to, .. } => to
+            .iter()
+            .flat_map(|constraint| constraint.expression_texts())
             .collect(),
         Change::InsertRow {
             defaults,
@@ -1434,6 +1481,9 @@ fn early_index_names(change: &Change) -> Vec<&str> {
     match change {
         Change::AddIndex { name, index, .. } if !index.holds_expression() => vec![name.raw()],
         Change::AddUnique { name, .. } => vec![name.raw()],
+        Change::SetExclusion {
+            name, to: Some(_), ..
+        } => vec![name.raw()],
         Change::SetPrimaryKey { to: Some(key), .. } => key.name.iter().map(|n| n.raw()).collect(),
         Change::CreateTable { table, .. } => table
             .primary_key

@@ -1323,16 +1323,10 @@ pub(crate) fn diff_partial_rebuilding(
                     origin: pbps_model::RowSecurityOrigin::Created,
                 });
             }
-            // An exclusion on a new table is added by a change of the next part
-            // (DEC-2448.3); until then it is refused by name, never dropped from
-            // the payload, so no plan creates the table without it.
-            for exclusion in table.exclude.keys() {
-                errs.push(DiffError::ExclusionRefused {
-                    table: name.clone(),
-                    name: exclusion.clone(),
-                    reason: "adding one arrives in the next PR".to_owned(),
-                });
-            }
+            // An exclusion is added by its own change, after the table's rows
+            // (DEC-2448.3): the creation payload never carries one, so no
+            // emitter can create the table and lose it.
+            let exclusions = std::mem::take(&mut table.exclude);
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -1340,6 +1334,14 @@ pub(crate) fn diff_partial_rebuilding(
                 beside_default,
                 moves_at_most,
             });
+            for (exclusion, constraint) in exclusions {
+                changes.push(Change::SetExclusion {
+                    table: name.clone(),
+                    name: exclusion,
+                    from: None,
+                    to: Some(Box::new(constraint)),
+                });
+            }
         }
     }
 
@@ -1680,6 +1682,7 @@ pub(crate) fn diff_partial_rebuilding(
             declared_name,
             &renames.apply(base_table, base_name),
             declared_table,
+            &mut changes,
             &mut errs,
         );
         diff_computed(declared_name, base_table, declared_table, &mut changes);
@@ -1803,6 +1806,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -1865,6 +1869,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2137,6 +2142,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -2201,6 +2207,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
+            | Change::SetExclusion { .. }
             | Change::AddForeignKey { .. }
             | Change::DropForeignKey { .. }
             | Change::AddCheck { .. }
@@ -3440,6 +3447,9 @@ fn recreate_referenced_foreign_keys(
             | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => continue,
+            // No foreign key references an exclusion constraint (measured:
+            // 42830), so its drop frees no key (DEC-2448.3).
+            Change::SetExclusion { .. } => continue,
             Change::SetPrimaryKey {
                 table,
                 from: Some(key),
@@ -4109,6 +4119,7 @@ fn recreate_retyped_dependents(
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
+        | Change::SetExclusion { .. }
         | Change::AddForeignKey { .. }
         | Change::DropForeignKey { .. }
         | Change::AddCheck { .. }
@@ -6245,6 +6256,7 @@ fn refuse_computed_dependencies(
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
                     | Change::DropUnique { .. }
+                    | Change::SetExclusion { .. }
                     | Change::AddForeignKey { .. }
                     | Change::DropForeignKey { .. }
                     | Change::AddCheck { .. }
@@ -6732,35 +6744,44 @@ fn diff_search(
     }
 }
 
-/// A table's exclusion constraints, by name (DEC-2448.3). **Every difference is
-/// refused here, by name**: this part reads one and plans nothing for it. Adding
-/// one arrives in the next PR, and dropping, replacing or renaming one with the
-/// retirement record after it, so a plan that would give a guarantee up, or take
-/// one on, without the change that says so is refused rather than planned.
-fn diff_exclusions(name: &TableName, base: &Table, declared: &Table, errs: &mut Vec<DiffError>) {
-    let refuse = |key: &pbps_model::ObjectLocalName, reason: &str| DiffError::ExclusionRefused {
-        table: name.clone(),
-        name: key.clone(),
-        reason: reason.to_owned(),
-    };
+/// A table's exclusion constraints, by name (DEC-2448.3). Adding one is a
+/// change of its own. **Dropping or replacing one is refused here**: that takes
+/// the retirement record of the next PR, and a refusal is better than a plan
+/// that gives a guarantee up without the reason an auditor asks for.
+fn diff_exclusions(
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    changes: &mut Vec<Change>,
+    errs: &mut Vec<DiffError>,
+) {
     for (key, was) in &base.exclude {
         match declared.exclude.get(key) {
             Some(now) if now == was => {}
-            Some(_) => errs.push(refuse(
-                key,
-                "replacing one arrives with the retirement record in a later PR; for now it \
-                 stands as it is read",
-            )),
-            None => errs.push(refuse(
-                key,
-                "dropping one (and renaming one, which is a drop and an add) arrives with the \
-                 retirement record in a later PR; for now it stands",
-            )),
+            Some(_) => errs.push(DiffError::ExclusionRefused {
+                table: name.clone(),
+                name: key.clone(),
+                reason: "replacing one arrives with the retirement record in the next PR; \
+                         for now it stands as it is read"
+                    .to_owned(),
+            }),
+            None => errs.push(DiffError::ExclusionRefused {
+                table: name.clone(),
+                name: key.clone(),
+                reason: "dropping one (and renaming one, which is a drop and an add) arrives \
+                         with the retirement record in the next PR; for now it stands"
+                    .to_owned(),
+            }),
         }
     }
-    for key in declared.exclude.keys() {
+    for (key, now) in &declared.exclude {
         if !base.exclude.contains_key(key) {
-            errs.push(refuse(key, "adding one arrives in the next PR"));
+            changes.push(Change::SetExclusion {
+                table: name.clone(),
+                name: key.clone(),
+                from: None,
+                to: Some(Box::new(now.clone())),
+            });
         }
     }
 }
@@ -7573,6 +7594,7 @@ fn dependency_rank(
         | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
         | Change::DropUnique { .. }
+        | Change::SetExclusion { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }
@@ -8587,6 +8609,7 @@ fn order_key(c: &Change) -> u8 {
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
+        | Change::SetExclusion { to: None, .. }
         | Change::SetPrimaryKey { to: None, .. } => 2,
         // After the drops above (`sort_class` places it at the class's end),
         // since an index or check over it blocks it (4922), and before every
@@ -8662,6 +8685,7 @@ fn order_key(c: &Change) -> u8 {
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
+        | Change::SetExclusion { to: Some(_), .. }
         | Change::AddIndex { .. } => 13,
         // Late, it follows the index it names (DEC-1444.1); `sort_class`
         // moves the rest to the front.
@@ -10995,54 +11019,111 @@ mod tests {
         schema_of("app.booking", t)
     }
 
-    /// This part reads an exclusion constraint and plans nothing for it: one that
-    /// stands as declared is no difference, and adding one, to a standing table
-    /// or to a new one, is refused by name rather than planned or dropped from
-    /// the plan (DEC-2448.3).
+    /// An exclusion constraint a declaration adds is one change of its own,
+    /// `constraint` risk, and nothing else; a standing one that is declared as it
+    /// stands plans nothing (DEC-2448.3).
     #[test]
-    fn a_standing_exclusion_plans_nothing_and_adding_one_is_refused_by_name() {
-        let table: TableName = "app.booking".parse().unwrap();
-        let held = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
-        let none = booking(&[]);
-        let refusals = |base: &Schema, declared: &Schema| -> Vec<String> {
-            let mut errs = Vec::new();
-            diff_exclusions(
-                &table,
-                &base.tables[&table],
-                &declared.tables[&table],
-                &mut errs,
-            );
-            errs.iter().map(ToString::to_string).collect()
+    fn a_declared_exclusion_is_added_by_one_change_and_a_standing_one_plans_nothing() {
+        let base = booking(&[]);
+        let declared = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let cs = run(&base, &declared, &[]);
+        let [
+            Change::SetExclusion {
+                table,
+                name,
+                from: None,
+                to: Some(to),
+            },
+        ] = cs
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .collect::<Vec<_>>()
+            .as_slice()
+        else {
+            panic!("{:?}", kinds(&cs));
         };
-        assert!(refusals(&held, &held).is_empty());
-        let said = refusals(&none, &held);
-        assert!(
-            said.len() == 1 && said[0].contains("adding one arrives"),
-            "{said:?}"
+        assert_eq!(
+            (table.raw().to_string(), name.raw()),
+            ("app.booking".into(), "no_overlap")
         );
-        // A new table: the plan is refused, and no `CreateTable` carries on
-        // without it.
-        let base_ids = crate::resolve(&Schema::default(), &IdsFile::default(), &[], &ctx())
-            .unwrap()
-            .ids;
-        let declared_ids = crate::resolve(&held, &base_ids, &[], &ctx()).unwrap().ids;
-        let errs = diff(
-            Side {
-                schema: &Schema::default(),
-                ids: &base_ids,
-            },
-            Side {
-                schema: &held,
-                ids: &declared_ids,
-            },
-            &MinimalDialect,
-            &Hints::default(),
-        )
-        .unwrap_err();
+        assert_eq!(to.method, IndexMethod::Gist);
         assert!(
-            errs.iter()
-                .any(|e| e.to_string().contains("adding one arrives")),
-            "{errs:?}"
+            cs.risks().contains(&RiskClass::Constraint),
+            "{:?}",
+            cs.risks()
+        );
+        assert!(
+            !cs.risks().contains(&RiskClass::Destructive),
+            "{:?}",
+            cs.risks()
+        );
+        // Negative: the same constraint on both sides is no change.
+        assert!(run(&declared, &declared, &[]).is_empty());
+    }
+
+    /// A table the plan creates takes its exclusions in a change after
+    /// `CreateTable`, whose payload never carries one: no emitter can create the
+    /// table and lose the constraint (DEC-2448.3).
+    #[test]
+    fn a_new_tables_exclusion_follows_its_create_and_is_not_in_its_payload() {
+        let declared = booking(&[("no_overlap", exclusion("int4range(a, b)", "&&"))]);
+        let cs = run(&Schema::default(), &declared, &[]);
+        let names = kinds(&cs);
+        let create = names.iter().position(|k| k == "CreateTable").unwrap();
+        let exclusion_at = names.iter().position(|k| k == "SetExclusion").unwrap();
+        assert!(create < exclusion_at, "{names:?}");
+        let Change::CreateTable { table, .. } = &cs.changes[create].change else {
+            unreachable!()
+        };
+        assert!(table.exclude.is_empty());
+    }
+
+    /// Adding an exclusion carries the `constraint` risk, except to a table the
+    /// plan creates and writes no row to, which has nothing to check; a created
+    /// table that is seeded with rows keeps it (DEC-2448.3).
+    #[test]
+    fn an_exclusions_constraint_risk_is_excused_only_for_a_table_created_empty() {
+        let x = || [("no_overlap", exclusion("int4range(a, b)", "&&"))];
+        // Standing table: the risk is asked.
+        let standing = run(&booking(&[]), &booking(&x()), &[]);
+        assert!(standing.risks().contains(&RiskClass::Constraint));
+        // A new table, no rows: it is not.
+        let created = run(&Schema::default(), &booking(&x()), &[]);
+        assert!(
+            !created.risks().contains(&RiskClass::Constraint),
+            "{:?}",
+            created.risks()
+        );
+        // A new table that is seeded: the constraint checks those rows.
+        let mut seeded = booking(&x());
+        let table: TableName = "app.booking".parse().unwrap();
+        let t = seeded.tables.get_mut(&table).unwrap();
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        t.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [(
+                pbps_model::RowKey::from("1"),
+                pbps_model::Row(
+                    [("a".into(), pbps_model::Value::Int(1))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let cs = run(&Schema::default(), &seeded, &[]);
+        let names = kinds(&cs);
+        assert!(names.iter().any(|k| k == "InsertRow"), "{names:?}");
+        assert!(
+            cs.risks().contains(&RiskClass::Constraint),
+            "{:?}",
+            cs.risks()
         );
     }
 
@@ -11136,10 +11217,12 @@ mod tests {
         let refusals = |declared: &Schema| -> Vec<String> {
             let table: TableName = "app.booking".parse().unwrap();
             let mut errs = Vec::new();
+            let mut changes = Vec::new();
             diff_exclusions(
                 &table,
                 &held.tables[&table],
                 &declared.tables[&table],
+                &mut changes,
                 &mut errs,
             );
             errs.iter().map(ToString::to_string).collect()
@@ -11158,7 +11241,7 @@ mod tests {
         assert!(said.len() == 1 && said[0].contains("replacing"), "{said:?}");
         let said = refusals(&booking(&[("renamed", exclusion("int4range(a, b)", "&&"))]));
         assert!(
-            said.len() == 2 && said.iter().any(|m| m.contains("no_overlap")),
+            said.len() == 1 && said[0].contains("no_overlap"),
             "{said:?}"
         );
         // Unchanged, or only another table's change: nothing.

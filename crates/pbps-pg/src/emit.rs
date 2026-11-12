@@ -2007,6 +2007,101 @@ fn create_index(
     create_index_on(table, name, index, strategy, false)
 }
 
+/// One index key as SQL: the column or the parenthesised expression, then its
+/// collation, class and order, in the grammar's order. Shared by an index and
+/// an exclusion constraint, whose keys are the same thing.
+fn index_key_sql(c: &pbps_model::IndexColumn, ordered: bool) -> Result<String, DialectError> {
+    // An expression is written as declared, parenthesised, and ended
+    // with a newline so a trailing line comment in it cannot swallow
+    // the rest of the statement (DECISIONS 281, DEC-1169.2).
+    let mut key = match &c.key {
+        pbps_model::IndexKey::Column(name) => quote(name.raw())?,
+        pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
+    };
+    // `COLLATE` comes before the class in the grammar. Qualified with
+    // `pg_catalog`, the only schema the model holds, so a collation of
+    // the same name earlier on the `search_path` cannot stand in
+    // (DEC-2448.2).
+    if let Some(collation) = &c.collation {
+        key = format!(
+            "{key} COLLATE {}.{}",
+            quote("pg_catalog")?,
+            quote(collation)?
+        );
+    }
+    // Qualified, so a class of the same name earlier on the
+    // `search_path` cannot stand in for the one declared: a bare class
+    // is the engine's own, `pg_catalog`'s, and a schema's carries its
+    // own (DEC-2448.1).
+    if let Some(class) = &c.opclass {
+        key = format!(
+            "{key} {}.{}",
+            quote(class.schema().unwrap_or("pg_catalog"))?,
+            quote(class.name())?
+        );
+    }
+    if ordered {
+        key = format!("{key} {}", if c.descending { "DESC" } else { "ASC" });
+    }
+    Ok(key)
+}
+
+/// `CONSTRAINT name EXCLUDE USING method (key WITH OPERATOR(pg_catalog.op), ..)
+/// [INCLUDE ..] [WITH (..)] [WHERE (..)] [DEFERRABLE [INITIALLY DEFERRED]]`
+/// (DEC-2448.3). The operator is written qualified, as a class is, so one of
+/// the same symbol earlier on the `search_path` cannot stand in, and it is a
+/// validated symbol, never text interpolated as written. The method is always
+/// spelled: the engine's default is a B-tree and nothing here relies on one.
+fn exclusion_clause(
+    name: &str,
+    x: &pbps_model::ExclusionConstraint,
+) -> Result<String, DialectError> {
+    let ordered = x.method.policy().ordered;
+    let keys = x
+        .keys
+        .iter()
+        .map(|k| {
+            // A package's operator carries its own schema; the engine's is `pg_catalog`.
+            let operator = if k.operator.schema().is_some() {
+                k.operator.raw().to_string()
+            } else {
+                format!("{}.{}", quote("pg_catalog")?, k.operator.raw())
+            };
+            Ok(format!(
+                "{} WITH OPERATOR({operator})",
+                index_key_sql(&k.key, ordered)?
+            ))
+        })
+        .collect::<Result<Vec<_>, DialectError>>()?
+        .join(", ");
+    let mut s = format!(
+        "CONSTRAINT {} EXCLUDE USING {} ({keys})",
+        quote(name)?,
+        x.method.as_str()
+    );
+    if !x.include.is_empty() {
+        s.push_str(&format!(" INCLUDE ({})", column_list(&x.include)?));
+    }
+    if !x.storage_parameters.is_empty() {
+        let method = x.method;
+        s.push_str(&format!(
+            " WITH ({})",
+            listed(&x.storage_parameters, &|name| {
+                method.policy().parameter(name).is_some()
+            })?
+        ));
+    }
+    if let Some(filter) = &x.filter {
+        s.push_str(&format!(" WHERE ({})", verbatim(filter)));
+    }
+    s.push_str(match x.timing {
+        pbps_model::ExclusionTiming::Immediate => "",
+        pbps_model::ExclusionTiming::DeferrableImmediate => " DEFERRABLE INITIALLY IMMEDIATE",
+        pbps_model::ExclusionTiming::DeferrableDeferred => " DEFERRABLE INITIALLY DEFERRED",
+    });
+    Ok(s)
+}
+
 pub(crate) fn create_index_on(
     table: &TableName,
     name: &str,
@@ -2021,41 +2116,7 @@ pub(crate) fn create_index_on(
     let keys = index
         .columns
         .iter()
-        .map(|c| {
-            // An expression is written as declared, parenthesised, and ended
-            // with a newline so a trailing line comment in it cannot swallow
-            // the rest of the statement (DECISIONS 281, DEC-1169.2).
-            let mut key = match &c.key {
-                pbps_model::IndexKey::Column(name) => quote(name.raw())?,
-                pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
-            };
-            // `COLLATE` comes before the class in the grammar. Qualified with
-            // `pg_catalog`, the only schema the model holds, so a collation of
-            // the same name earlier on the `search_path` cannot stand in
-            // (DEC-2448.2).
-            if let Some(collation) = &c.collation {
-                key = format!(
-                    "{key} COLLATE {}.{}",
-                    quote("pg_catalog")?,
-                    quote(collation)?
-                );
-            }
-            // Qualified, so a class of the same name earlier on the
-            // `search_path` cannot stand in for the one declared: a bare class
-            // is the engine's own, `pg_catalog`'s, and a schema's carries its
-            // own (DEC-2448.1).
-            if let Some(class) = &c.opclass {
-                key = format!(
-                    "{key} {}.{}",
-                    quote(class.schema().unwrap_or("pg_catalog"))?,
-                    quote(class.name())?
-                );
-            }
-            if ordered {
-                key = format!("{key} {}", if c.descending { "DESC" } else { "ASC" });
-            }
-            Ok(key)
-        })
+        .map(|c| index_key_sql(c, ordered))
         .collect::<Result<Vec<_>, DialectError>>()?
         .join(", ");
 
@@ -4797,6 +4858,28 @@ fn emit_statements(
             ),
         ),
 
+        Change::SetExclusion {
+            table,
+            name,
+            from: None,
+            to: Some(x),
+        } => one(
+            pg,
+            table,
+            format!(
+                "ALTER TABLE {} ADD {};",
+                qualified(table)?,
+                exclusion_clause(name.raw(), x)?
+            ),
+        ),
+        // Dropping or replacing one needs the retirement record and arrives with
+        // it (DEC-2448.3); a replacement is a drop and an add as two changes,
+        // each in its own ordering class, never one change carrying both.
+        Change::SetExclusion { name, .. } => Err(invalid(format!(
+            "exclusion constraint `{}` cannot be dropped or replaced yet: that arrives with \
+             the retirement record (DEC-2448.3)",
+            name.shown()
+        ))),
         Change::DropUnique { table, name }
         | Change::DropForeignKey { table, name }
         | Change::DropCheck { table, name } => one(
@@ -11079,6 +11162,169 @@ mod tests {
         );
         assert_eq!(sql("pg_catalog.jsonb_path_ops"), sql("jsonb_path_ops"));
         assert!(sql("jsonb_path_ops").contains("\"pg_catalog\".\"jsonb_path_ops\""));
+    }
+
+    /// An exclusion constraint is added by `ALTER TABLE .. ADD CONSTRAINT .. EXCLUDE`
+    /// in the grammar's order, with the method always spelled and each operator
+    /// written `OPERATOR(pg_catalog.sym)`, never a symbol interpolated as text
+    /// (DEC-2448.3).
+    /// A package's operator is written with its own schema, an engine operator with
+    /// `pg_catalog` (DEC-2447.14, #2448 C1b): the schema a package's operator is written
+    /// under must not be replaced by `pg_catalog`, which has no such operator.
+    #[test]
+    fn an_exclusion_writes_a_package_operator_under_its_own_schema() {
+        let exclusion = |operator: pbps_model::OperatorRef| pbps_model::ExclusionConstraint {
+            method: pbps_model::IndexMethod::Gist,
+            keys: vec![pbps_model::ExclusionKey {
+                key: IndexColumn {
+                    key: pbps_model::IndexKey::Column("body".into()),
+                    descending: false,
+                    opclass: Some("ext.gist_trgm_ops".parse().unwrap()),
+                    collation: None,
+                },
+                operator,
+            }],
+            include: vec![],
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: pbps_model::ExclusionTiming::Immediate,
+        };
+        let sql = |operator| {
+            sql_of(
+                &Postgres::new(),
+                &Change::SetExclusion {
+                    table: name("app", "docs"),
+                    name: "no_similar".into(),
+                    from: None,
+                    to: Some(Box::new(exclusion(operator))),
+                },
+            )
+            .join("\n")
+        };
+        let package = sql(pbps_model::OperatorRef::in_schema("ext", "%").unwrap());
+        assert!(package.contains("WITH OPERATOR(ext.%)"), "{package}");
+        assert!(!package.contains("pg_catalog\".ext"), "{package}");
+        let engine = sql(pbps_model::OperatorRef::symbol("&&").unwrap());
+        assert!(
+            engine.contains("WITH OPERATOR(\"pg_catalog\".&&)"),
+            "{engine}"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_constraint_is_added_and_dropped_as_a_constraint() {
+        let key = |text: pbps_model::IndexKey, class: Option<&str>, operator: &str| {
+            pbps_model::ExclusionKey {
+                key: IndexColumn {
+                    key: text,
+                    descending: false,
+                    opclass: class.map(|c| c.parse().unwrap()),
+                    collation: None,
+                },
+                operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
+            }
+        };
+        let constraint = |method, timing| pbps_model::ExclusionConstraint {
+            method,
+            keys: vec![
+                key(
+                    pbps_model::IndexKey::Expression("int4range(starts, ends, '[)')".into()),
+                    None,
+                    "&&",
+                ),
+                key(
+                    pbps_model::IndexKey::Column("ip".into()),
+                    Some("inet_ops"),
+                    "-|-",
+                ),
+            ],
+            include: vec!["note".into()],
+            filter: Some("active".into()),
+            storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            timing,
+        };
+        let add = |x: pbps_model::ExclusionConstraint| Change::SetExclusion {
+            table: name("app", "booking"),
+            name: "no_overlap".into(),
+            from: None,
+            to: Some(Box::new(x)),
+        };
+        let sql = sql_of(
+            &Postgres::new(),
+            &add(constraint(
+                pbps_model::IndexMethod::Gist,
+                pbps_model::ExclusionTiming::DeferrableDeferred,
+            )),
+        );
+        // Inside the pinned `search_path` framing every statement with an
+        // expression takes.
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "ALTER TABLE \"app\".\"booking\" ADD CONSTRAINT \"no_overlap\" EXCLUDE USING gist \
+                 ((int4range(starts, ends, '[)')\n) WITH OPERATOR(\"pg_catalog\".&&), \
+                 \"ip\" \"pg_catalog\".\"inet_ops\" WITH OPERATOR(\"pg_catalog\".-|-)) \
+                 INCLUDE (\"note\") WITH (fillfactor = '70') WHERE (active\n) \
+                 DEFERRABLE INITIALLY DEFERRED;"
+            ),
+            "{sql:?}"
+        );
+        // The three timing states, and a B-tree writes its method too.
+        for (timing, tail) in [
+            (
+                pbps_model::ExclusionTiming::Immediate,
+                ") WITH (fillfactor = '70') WHERE (active\n);",
+            ),
+            (
+                pbps_model::ExclusionTiming::DeferrableImmediate,
+                "DEFERRABLE INITIALLY IMMEDIATE;",
+            ),
+        ] {
+            let sql = sql_of(
+                &Postgres::new(),
+                &add(constraint(pbps_model::IndexMethod::Btree, timing)),
+            );
+            assert!(
+                sql[0].contains("EXCLUDE USING btree (") && sql[0].contains(tail),
+                "{sql:?}"
+            );
+        }
+        // Negative: dropping one, and one change that is both halves (a
+        // replacement has no ordering class as one change), are refused by name
+        // until the retirement record exists.
+        for (from, to) in [
+            (
+                Some(constraint(
+                    pbps_model::IndexMethod::Gist,
+                    pbps_model::ExclusionTiming::Immediate,
+                )),
+                None,
+            ),
+            (
+                Some(constraint(
+                    pbps_model::IndexMethod::Gist,
+                    pbps_model::ExclusionTiming::Immediate,
+                )),
+                Some(constraint(
+                    pbps_model::IndexMethod::Gist,
+                    pbps_model::ExclusionTiming::Immediate,
+                )),
+            ),
+        ] {
+            let change = Change::SetExclusion {
+                table: name("app", "booking"),
+                name: "no_overlap".into(),
+                from: from.map(Box::new),
+                to: to.map(Box::new),
+            };
+            let refused = Postgres::new()
+                .fixture_emit(&change, Strategy::default())
+                .expect_err("refused");
+            assert!(
+                refused.to_string().contains("retirement record"),
+                "{refused}"
+            );
+        }
     }
 
     /// A GiST index is built `USING gist` with its expression, `INCLUDE`,

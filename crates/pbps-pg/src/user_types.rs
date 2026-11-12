@@ -120,7 +120,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use pbps_db::{Conn, DbError, Param, Row};
-use pbps_dialect::TransactionFraming;
 use pbps_model::TypeRef;
 use pbps_model::escape::Escaped;
 use sha2::{Digest, Sha256};
@@ -816,100 +815,26 @@ impl Component {
 /// deparsed CHECK and DEFAULT qualify a name only when the path does not show
 /// it), set for the transaction and not left behind.
 pub async fn read(conn: &mut Conn, within: Within, references: &[TypeRef]) -> Vec<TypeRead> {
-    match read_all(conn, within, references).await {
-        Ok(reads) => reads,
-        Err(e) => references
-            .iter()
-            .map(|_| TypeRead::Unreadable(Unreadable::Failed(e.to_string())))
-            .collect(),
-    }
+    crate::settled_read::read::<Types>(conn, within, references).await
 }
 
-/// `REPEATABLE READ`, so the lookup, the definition and the closure of one
-/// type come from one snapshot of the catalog tables.
-pub(crate) const OWN_TRANSACTION: TransactionFraming = TransactionFraming {
-    begin: std::borrow::Cow::Borrowed("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"),
-    commit: std::borrow::Cow::Borrowed("COMMIT;"),
-    rollback: std::borrow::Cow::Borrowed("ROLLBACK;"),
-};
+pub(crate) use crate::settled_read::OWN_TRANSACTION;
 
-const SAVEPOINT: &str = "pbps_type_reads";
+/// How a type is read, for the double read of [`crate::settled_read`].
+struct Types;
 
-async fn read_all(
-    conn: &mut Conn,
-    within: Within,
-    references: &[TypeRef],
-) -> Result<Vec<TypeRead>, DbError> {
-    match within {
-        Within::OwnTransaction => {
-            conn.begin(&OWN_TRANSACTION).await?;
-            let result = read_each(conn, references).await;
-            let closed = conn.rollback(&OWN_TRANSACTION).await;
-            let reads = result?;
-            closed?;
-            Ok(reads)
-        }
-        Within::CallersTransaction => {
-            conn.execute(&format!("SAVEPOINT {SAVEPOINT}")).await?;
-            match read_each(conn, references).await {
-                Ok(reads) => {
-                    conn.execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
-                        .await?;
-                    conn.execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
-                        .await?;
-                    Ok(reads)
-                }
-                Err(e) => {
-                    // Leave the caller's transaction usable if it can be: a
-                    // failed statement aborts it until the savepoint is
-                    // rolled back. The read's own error is the one reported.
-                    let _ = conn
-                        .execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
-                        .await;
-                    let _ = conn
-                        .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
-                        .await;
-                    Err(e)
-                }
-            }
-        }
+impl crate::settled_read::Kind for Types {
+    type Wanted = TypeRef;
+    type Read = TypeRead;
+    const SAVEPOINT: &'static str = "pbps_type_reads";
+    const NOUN: &'static str = "type";
+
+    fn unreadable(why: String) -> TypeRead {
+        TypeRead::Unreadable(Unreadable::Failed(why))
     }
-}
 
-async fn read_each(conn: &mut Conn, references: &[TypeRef]) -> Result<Vec<TypeRead>, DbError> {
-    conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
-        .await?;
-    // Read the whole set twice and compare, one reference against itself. In
-    // the caller's READ COMMITTED transaction a savepoint gives the separate
-    // catalog queries of one read no common snapshot (DECISIONS 423), and even
-    // in a snapshot of our own the deparsing functions see the latest catalog.
-    // A type that changed between the queries would otherwise come back as a
-    // definition that never existed, with a pin to match. Both passes cover
-    // every reference, so a change to the first one while a later one is read
-    // is seen by the second pass. Optimistic, like 423's revalidation: a change
-    // after the last read is the replay's to see.
-    let mut passes = [Vec::new(), Vec::new()];
-    for pass in &mut passes {
-        for reference in references {
-            pass.push(read_one(conn, reference).await?);
-        }
-    }
-    let [first, second] = passes;
-    Ok(first
-        .into_iter()
-        .zip(second)
-        .map(|(first, second)| settled(first, second))
-        .collect())
-}
-
-/// The read both passes agree on, or a failed read when they do not.
-fn settled(first: TypeRead, second: TypeRead) -> TypeRead {
-    if first == second {
-        first
-    } else {
-        TypeRead::Unreadable(Unreadable::Failed(
-            "the type changed while it was being read".to_owned(),
-        ))
+    async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbError> {
+        read_one(conn, reference).await
     }
 }
 
@@ -2512,6 +2437,8 @@ mod tests {
     fn two_passes_that_differ_are_a_failed_read_and_two_that_agree_are_the_read() {
         let before = present_of(enumeration(&["a"]));
         let after = present_of(enumeration(&["a", "b"]));
+        use crate::settled_read::settled;
+        let settled = |a, b| settled::<Types>(a, b);
         assert_eq!(settled(before.clone(), before.clone()), before);
         assert_eq!(
             settled(TypeRead::Absent, TypeRead::Absent),

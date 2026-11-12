@@ -596,6 +596,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod exclusion_ownership_tests;
 #[cfg(all(test, unix))]
 mod guard_tests;
 #[cfg(test)]
