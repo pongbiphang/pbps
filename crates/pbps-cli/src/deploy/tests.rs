@@ -218,7 +218,10 @@ fn bootstrap_records_an_annotation_that_is_not_module_to_module() {
         ["table::app.t".parse().unwrap()].into(),
     )]);
     let state = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap();
-    assert_eq!(state.object_deps.to_deps(), loaded.hints.annotations.declared);
+    assert_eq!(
+        state.object_deps.to_deps(),
+        loaded.hints.annotations.declared
+    );
     // Negative: no annotation records an empty list, and a duplicate owner,
     // which has no wire form, is refused by name.
     loaded.hints.annotations = Default::default();

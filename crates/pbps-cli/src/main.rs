@@ -5619,13 +5619,11 @@ fn cmd_plan(
                 cs.changes().clone(),
                 res.ids.clone(),
             );
-            plan.module_deps = loaded
+            plan.object_deps = loaded
                 .hints
                 .annotations
                 .wire()
-                .map_err(anyhow::Error::msg)?
-                .to_deps()
-                .modules();
+                .map_err(anyhow::Error::msg)?;
             plan.dependencies = dependencies.clone();
             plan.trusted_roles = project.config.trusted_roles.clone();
             plan.git_sha = db::git_sha(project.root());

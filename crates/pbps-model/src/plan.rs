@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::change::ChangeSet;
 use crate::ids::IdsFile;
-use crate::module::ModuleDeps;
+use crate::object_ref::ObjectEdges;
 use crate::schema::Schema;
 use crate::zone::SessionZone;
 
@@ -303,7 +303,10 @@ use crate::zone::SessionZone;
 // 73 adds `SetExclusion`, the add and alter side of an exclusion constraint (DEC-2448.3):
 // an older build would not know the change and would drop a table's `exclude` from a payload;
 // 72 belongs to another change.
-pub const CURRENT_VERSION: u32 = 73;
+// 75 carries the annotations as `object_deps`, a flat sorted list of reference pairs, in place
+// of the module-only `module_deps` (DEC-2469.7): an older build would reject the field as
+// unknown; 74 belongs to another change.
+pub const CURRENT_VERSION: u32 = 75;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -445,14 +448,23 @@ pub struct SavedPlan {
 
     pub changes: ChangeSet,
 
-    /// The explicit module ordering edges after this plan.
+    /// The explicit ordering edges after this plan.
     ///
     /// These remain annotations rather than schema state: they do not
     /// participate in drift comparison. They travel with the artifact and the
     /// ledger so a later connected plan can order drops for modules whose
     /// declaration file has disappeared.
-    #[serde(default, skip_serializing_if = "ModuleDeps::is_empty")]
-    pub module_deps: ModuleDeps,
+    ///
+    /// Always written, an empty list included, and never defaulted on read: a
+    /// plan of this version without it lost the field, and the checksum would
+    /// otherwise pin a plan the approver did not see (DEC-2469.7).
+    ///
+    /// Open maintainer choice, kept in this one place: the design says always
+    /// write the field (as here). If the plan is to omit an empty list instead,
+    /// the whole change is `#[serde(default, skip_serializing_if =
+    /// "ObjectEdges::is_empty")]` on this field, and the plan goldens
+    /// regenerate. The state side is the same either way.
+    pub object_deps: ObjectEdges,
 
     /// The identity mapping the environment has **after** this plan.
     ///
@@ -745,7 +757,7 @@ impl SavedPlan {
             git_sha: None,
             baseline,
             changes,
-            module_deps: ModuleDeps::default(),
+            object_deps: ObjectEdges::default(),
             ids,
             data: BTreeMap::new(),
             routine_pins: None,
@@ -1591,7 +1603,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 73);
+        assert_eq!(plan.version, 75);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");
@@ -1812,5 +1824,87 @@ mod tests {
             edit(&mut other.extension_changes[0]);
             assert_ne!(other.wire_fingerprint(), updating.wire_fingerprint());
         }
+    }
+
+    fn edges(rows: &[(&str, &str)]) -> ObjectEdges {
+        ObjectEdges::from_deps(&crate::object_ref::ObjectDeps(
+            rows.iter()
+                .map(|(owner, target)| (owner.parse().unwrap(), [target.parse().unwrap()].into()))
+                .collect(),
+        ))
+        .unwrap()
+    }
+
+    /// The field is always written and read back equal, with edges, with none,
+    /// and with an edge that is not module to module (DEC-2469.7).
+    #[test]
+    fn a_plan_writes_object_deps_always_and_reads_them_back_equal() {
+        let mut plan = bare_plan();
+        let none = serde_json::to_string(&plan).unwrap();
+        assert!(none.contains(r#""object_deps":[]"#), "{none}");
+        assert_eq!(serde_json::from_str::<SavedPlan>(&none).unwrap(), plan);
+        for rows in [
+            &[("module::app.v", "module::app.f(integer)")][..],
+            &[
+                ("module::app.v", "table::app.t"),
+                ("table::app.t", "module::app.v"),
+            ],
+        ] {
+            plan.object_deps = edges(rows);
+            let json = serde_json::to_string(&plan).unwrap();
+            assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
+        }
+    }
+
+    /// The checksum is over the serialized plan, so an edit to the edges is an
+    /// edit to what the approver saw. Negative: the same edges in any input
+    /// order are one plan.
+    #[test]
+    fn a_plan_with_edges_changes_its_checksum_whatever_their_input_order() {
+        let bare = bare_plan();
+        let mut with = bare_plan();
+        with.object_deps = edges(&[("module::app.v", "module::app.base")]);
+        assert_ne!(with.wire_fingerprint(), bare.wire_fingerprint());
+        let (a, b) = (
+            ("module::app.a", "module::app.x"),
+            ("module::app.b", "module::app.x"),
+        );
+        let (mut one, mut two) = (bare_plan(), bare_plan());
+        one.object_deps = edges(&[a, b]);
+        two.object_deps = edges(&[b, a]);
+        assert_eq!(one.wire_fingerprint(), two.wire_fingerprint());
+    }
+
+    /// A plan of this version names its edges, and names them only as
+    /// `object_deps`: a missing field is not "no edges", and the old key is not
+    /// translated (a plan is never migrated, it is replanned).
+    #[test]
+    fn a_plan_of_the_current_version_needs_object_deps_and_refuses_module_deps() {
+        let json = serde_json::to_string(&bare_plan()).unwrap();
+        let without = json.replace(r#""object_deps":[],"#, "");
+        assert_ne!(without, json);
+        let why = serde_json::from_str::<SavedPlan>(&without)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("missing field `object_deps`"), "{why}");
+        let legacy = json.replace(r#""object_deps":[]"#, r#""module_deps":{}"#);
+        let why = serde_json::from_str::<SavedPlan>(&legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("unknown field `module_deps`"), "{why}");
+        // Negative: an unsorted list is refused here as in a state row.
+        let (a, b) = (
+            ("module::app.a", "module::app.x"),
+            ("module::app.b", "module::app.x"),
+        );
+        let mut plan = bare_plan();
+        plan.object_deps = edges(&[a, b]);
+        let sorted = serde_json::to_value(&plan.object_deps).unwrap();
+        let mut reversed = sorted.clone();
+        reversed.as_array_mut().unwrap().reverse();
+        let json = serde_json::to_string(&plan).unwrap();
+        let swapped = json.replace(&sorted.to_string(), &reversed.to_string());
+        assert_ne!(swapped, json);
+        assert!(serde_json::from_str::<SavedPlan>(&swapped).is_err());
     }
 }

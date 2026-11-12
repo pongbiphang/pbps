@@ -1816,13 +1816,11 @@ pub(super) async fn plan_db_selected(
             cs.changes().clone(),
             resolved.ids,
         );
-        plan.module_deps = loaded
+        plan.object_deps = loaded
             .hints
             .annotations
             .wire()
-            .map_err(anyhow::Error::msg)?
-            .to_deps()
-            .modules();
+            .map_err(anyhow::Error::msg)?;
         plan.dependencies = dependencies;
         plan.git_sha = db::git_sha(project.root());
         // The rows the state recorded after the apply has to cover: the
