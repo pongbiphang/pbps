@@ -9,6 +9,7 @@
 use crate::declared::Declared;
 use crate::ids::IdsFile;
 use crate::module::ModuleDeps;
+use crate::object_ref::ObjectEdges;
 use crate::schema::Schema;
 use schemars::JsonSchema;
 
@@ -158,7 +159,18 @@ use schemars::JsonSchema;
 /// Version 43 records an exclusion key's operator qualified by the schema of the package
 /// that provides it (DEC-2447.14); an older build would refuse the snapshot, and every older
 /// snapshot truthfully holds only operators of `pg_catalog`.
-pub const CURRENT_VERSION: u32 = 43;
+/// Version 45 records the annotations as `object_deps`, a flat list of reference
+/// pairs, in place of the module-only `module_deps` (DEC-2469.7); an older snapshot
+/// is converted on read, see [`OBJECT_DEPS_VERSION`].
+pub const CURRENT_VERSION: u32 = 45;
+
+/// The first version that records `object_deps` and no longer `module_deps`.
+///
+/// A constant of its own, not `CURRENT_VERSION`: the cut is where this one
+/// format changed, and a later bump by another change must not move it. A row
+/// below it is read through [`ObjectEdges::from_legacy`]; a row at or above it
+/// must carry `object_deps` and may not carry `module_deps`.
+pub const OBJECT_DEPS_VERSION: u32 = 45;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -350,11 +362,16 @@ pub struct StateSnapshot {
     /// which is data loss. State and identity have to be stored together.
     pub ids: IdsFile,
 
-    /// Explicit module ordering edges as of this state. They sit beside the
-    /// schema because creation order is not database state and must not
-    /// participate in drift comparison.
-    #[serde(default, skip_serializing_if = "ModuleDeps::is_empty")]
-    pub module_deps: ModuleDeps,
+    /// Explicit ordering edges as of this state. They sit beside the schema
+    /// because creation order is not database state and must not participate
+    /// in drift comparison.
+    ///
+    /// Always written, an empty list included, and never defaulted on read: a
+    /// row of this version without it lost the field, which is not the same
+    /// fact as "no edges" (absent, empty and unreadable are three results). A
+    /// row older than [`OBJECT_DEPS_VERSION`] is converted by
+    /// [`StateSnapshot::read_json`] before it gets here.
+    pub object_deps: ObjectEdges,
 
     /// The commit that produced this state. `None` for a baseline taken outside
     /// version control.
@@ -432,7 +449,7 @@ impl StateSnapshot {
             target_assertions: Vec::new(),
             schema,
             ids,
-            module_deps: ModuleDeps::default(),
+            object_deps: ObjectEdges::default(),
             git_sha: None,
             plan_checksum: None,
             operator: operator.into(),
@@ -552,12 +569,61 @@ impl StateSnapshot {
         let envelope: Envelope =
             serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
         check_version_number(envelope.version).map_err(Unreadable::UnsupportedVersion)?;
-        let snapshot: Self =
-            serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
+        let snapshot: Self = if envelope.version < OBJECT_DEPS_VERSION {
+            Self::read_before_object_deps(json, envelope.version)?
+        } else {
+            serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?
+        };
         snapshot
             .validate_data_work()
             .map_err(|e| Unreadable::Malformed(e.to_string()))?;
         Ok(snapshot)
+    }
+}
+
+impl StateSnapshot {
+    /// Reads a row written before `object_deps`, whose edges are `module_deps`.
+    ///
+    /// The conversion is explicit and total: every pair becomes a
+    /// module-to-module edge with no schema lookup and no filtering, so an
+    /// edge whose owner is gone from that row's schema still orders the drop of
+    /// that module (DEC-2469.7). The two fields are never both accepted, and a
+    /// row of this age that already has the new one was written by no build:
+    /// it is refused rather than trusted. The legacy path goes away with
+    /// `OLDEST_READABLE_VERSION` at the first release (#1159).
+    fn read_before_object_deps(json: &str, version: u32) -> Result<Self, Unreadable> {
+        let malformed = |why: String| Unreadable::Malformed(why);
+        let mut row: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| malformed(e.to_string()))?;
+        let fields = row
+            .as_object_mut()
+            .ok_or_else(|| malformed("a state is a JSON object".into()))?;
+        let legacy = fields.shift_remove("module_deps");
+        if fields.contains_key("object_deps") {
+            return Err(malformed(if legacy.is_some() {
+                format!(
+                    "a version {version} state holds both `module_deps` and `object_deps`; \
+                     they are two sources for one fact"
+                )
+            } else {
+                format!(
+                    "a version {version} state cannot hold `object_deps`, which first \
+                     appeared in version {OBJECT_DEPS_VERSION}"
+                )
+            }));
+        }
+        let edges = match legacy {
+            None => ObjectEdges::default(),
+            Some(deps) => ObjectEdges::from_legacy(
+                &serde_json::from_value::<ModuleDeps>(deps)
+                    .map_err(|e| malformed(format!("`module_deps`: {e}")))?,
+            ),
+        };
+        fields.insert(
+            "object_deps".into(),
+            serde_json::to_value(&edges).expect("edges serialize"),
+        );
+        serde_json::from_value(row).map_err(|e| malformed(e.to_string()))
     }
 }
 
@@ -655,6 +721,21 @@ fn check_version_number(version: u32) -> Result<(), String> {
 /// it either — the check is unavoidable rather than merely present twice.
 pub fn check_readable_version(version: u32) -> Result<(), Unreadable> {
     check_version_number(version).map_err(Unreadable::UnsupportedVersion)
+}
+
+/// A snapshot as a build older than [`OBJECT_DEPS_VERSION`] wrote it: without
+/// `object_deps`, which such a row may not hold. For tests that force an old
+/// version on today's struct; the edges must be empty, or they would be lost.
+#[cfg(test)]
+pub(crate) fn historical_row(snapshot: &StateSnapshot) -> String {
+    let mut row = serde_json::to_value(snapshot).unwrap();
+    let edges = row.as_object_mut().unwrap().shift_remove("object_deps");
+    assert_eq!(
+        edges,
+        Some(serde_json::json!([])),
+        "an old row has no edges here"
+    );
+    row.to_string()
 }
 
 #[cfg(test)]
@@ -773,6 +854,7 @@ mod tests {
             "o",
         );
         let mut json = serde_json::to_value(snapshot).unwrap();
+        json.as_object_mut().unwrap().shift_remove("object_deps");
         assert!(json.get("baseline_evidence").is_none());
         for version in 6..=30 {
             json["version"] = serde_json::json!(version);
@@ -1046,7 +1128,7 @@ mod tests {
     #[test]
     fn a_version_6_state_reads_with_nothing_declared() {
         let json = r#"{"version":6,"kind":"apply","schema":{"tables":{"dbo.t":{"columns":{"n":{"type":"int","nullable":true,"default":"((0))"}}}}},"ids":{"version":1,"tables":{},"columns":{}},"operator":"leon"}"#;
-        let snap: StateSnapshot = serde_json::from_str(json).expect("a version 6 state parses");
+        let snap = StateSnapshot::read_json(json).expect("a version 6 state parses");
         assert!(snap.check_version().is_ok());
         assert!(snap.declared.is_empty());
         assert_eq!(
@@ -1059,12 +1141,14 @@ mod tests {
             snap.schema.tables[&"dbo.t".parse::<TableName>().unwrap()].clustered,
             None
         );
-        let seven: StateSnapshot =
-            serde_json::from_str(&json.replace("\"version\":6", "\"version\":7")).unwrap();
+        let seven =
+            StateSnapshot::read_json(&json.replace("\"version\":6", "\"version\":7")).unwrap();
         assert!(seven.check_version().is_ok());
+        // Parsed directly, past the version gate, to ask `check_version` about
+        // a snapshot in hand; a row of the current shape names its edges.
         let newer: StateSnapshot = serde_json::from_str(&json.replace(
             "\"version\":6",
-            &format!("\"version\":{}", CURRENT_VERSION + 1),
+            &format!("\"version\":{},\"object_deps\":[]", CURRENT_VERSION + 1),
         ))
         .unwrap();
         assert!(newer.check_version().unwrap_err().contains("newer pbps"));
@@ -1104,7 +1188,8 @@ mod tests {
             .expressions
             .defaults
             .insert("app.t".parse().unwrap(), [("v".into(), "0".into())].into());
-        let json = serde_json::to_value(&snapshot).unwrap();
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json.as_object_mut().unwrap().shift_remove("object_deps");
         assert!(json["declared"].get("types").is_none());
         let read = StateSnapshot::read_json(&json.to_string()).unwrap();
         assert!(read.declared.types.is_empty());
@@ -1214,5 +1299,167 @@ mod tests {
             .unwrap();
         assert!(next.target_assertions.is_empty());
         assert_eq!(before.target_assertions.len(), 1);
+    }
+
+    /// A row as the build before `object_deps` wrote it: no new field, edges
+    /// as `module_deps`.
+    fn old_row(version: u32, module_deps: Option<serde_json::Value>) -> serde_json::Value {
+        let mut row = serde_json::from_str::<serde_json::Value>(&historical_row(
+            &StateSnapshot::new(StateKind::Apply, Schema::default(), IdsFile::default(), "o"),
+        ))
+        .unwrap();
+        row["version"] = version.into();
+        if let Some(deps) = module_deps {
+            row["module_deps"] = deps;
+        }
+        row
+    }
+
+    fn module(name: &str) -> crate::object_ref::ObjectRef {
+        crate::object_ref::ObjectRef::legacy(name).unwrap()
+    }
+
+    #[test]
+    fn a_row_below_the_cut_converts_module_deps_to_object_deps() {
+        // `app.gone` is in no schema of the row: the conversion does not look,
+        // so a removed module's edge still orders its drop.
+        let row = old_row(
+            OBJECT_DEPS_VERSION - 1,
+            Some(serde_json::json!({
+                "app.gone": ["app.base", "app.other"],
+                "app.v": ["app.base"],
+            })),
+        );
+        let read = StateSnapshot::from_json(&row.to_string()).unwrap();
+        assert_eq!(read.version, OBJECT_DEPS_VERSION - 1);
+        let expected: ModuleDeps = [
+            (
+                "app.gone".parse().unwrap(),
+                ["app.base".parse().unwrap(), "app.other".parse().unwrap()].into(),
+            ),
+            (
+                "app.v".parse().unwrap(),
+                ["app.base".parse().unwrap()].into(),
+            ),
+        ]
+        .into();
+        assert_eq!(read.object_deps, ObjectEdges::from_legacy(&expected));
+        assert_eq!(read.object_deps.to_deps().modules(), expected);
+        assert_eq!(read.object_deps.len(), 3);
+        // Negative: the legacy key is gone after the read, not carried beside.
+        assert!(
+            !serde_json::to_string(&read)
+                .unwrap()
+                .contains("module_deps"),
+            "the converted row is written as object_deps only"
+        );
+    }
+
+    #[test]
+    fn a_row_below_the_cut_with_neither_field_reads_as_no_edges() {
+        let row = old_row(OBJECT_DEPS_VERSION - 1, None);
+        let read = StateSnapshot::from_json(&row.to_string()).unwrap();
+        assert!(read.object_deps.is_empty());
+        // The oldest readable row is below the cut too.
+        let oldest = old_row(OLDEST_READABLE_VERSION, None);
+        assert!(StateSnapshot::from_json(&oldest.to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_row_below_the_cut_holding_object_deps_is_refused() {
+        let edges = serde_json::json!([]);
+        let mut only = old_row(OBJECT_DEPS_VERSION - 1, None);
+        only["object_deps"] = edges.clone();
+        let why = StateSnapshot::from_json(&only.to_string()).unwrap_err();
+        assert!(
+            why.contains("object_deps") && why.contains("cannot hold"),
+            "{why}"
+        );
+        let mut both = old_row(OBJECT_DEPS_VERSION - 1, Some(serde_json::json!({})));
+        both["object_deps"] = edges;
+        let why = StateSnapshot::from_json(&both.to_string()).unwrap_err();
+        assert!(why.contains("both"), "{why}");
+        // Negative: an unreadable legacy map is named, not read as empty.
+        let bad = old_row(
+            OBJECT_DEPS_VERSION - 1,
+            Some(serde_json::json!({"app.v": 3})),
+        );
+        let why = StateSnapshot::from_json(&bad.to_string()).unwrap_err();
+        assert!(why.contains("module_deps"), "{why}");
+    }
+
+    #[test]
+    fn a_current_row_must_carry_object_deps_and_may_not_carry_module_deps() {
+        let mut row = old_row(OBJECT_DEPS_VERSION, None);
+        let why = StateSnapshot::from_json(&row.to_string()).unwrap_err();
+        assert!(why.contains("missing field `object_deps`"), "{why}");
+        row["object_deps"] = serde_json::json!([]);
+        assert!(StateSnapshot::from_json(&row.to_string()).is_ok());
+        row["module_deps"] = serde_json::json!({});
+        let why = StateSnapshot::from_json(&row.to_string()).unwrap_err();
+        assert!(why.contains("module_deps"), "{why}");
+    }
+
+    #[test]
+    fn the_cut_is_its_own_constant_and_not_the_current_version() {
+        // A later bump moves CURRENT_VERSION; the cut stays where the format
+        // changed, or rows between the two would be read the wrong way.
+        assert_eq!(OBJECT_DEPS_VERSION, 45);
+        const { assert!(OBJECT_DEPS_VERSION <= CURRENT_VERSION) };
+        const { assert!(OLDEST_READABLE_VERSION < OBJECT_DEPS_VERSION) };
+    }
+
+    #[test]
+    fn a_snapshot_always_writes_object_deps_and_reads_back_equal() {
+        let mut snapshot =
+            StateSnapshot::new(StateKind::Apply, Schema::default(), IdsFile::default(), "o");
+        let none = serde_json::to_string(&snapshot).unwrap();
+        assert!(none.contains(r#""object_deps":[]"#), "{none}");
+        assert_eq!(StateSnapshot::from_json(&none).unwrap(), snapshot);
+        snapshot.object_deps = ObjectEdges::from_deps(&crate::object_ref::ObjectDeps(vec![
+            (module("app.v"), [module("app.base")].into()),
+            (
+                "table::app.t".parse().unwrap(),
+                ["module::app.v".parse().unwrap()].into(),
+            ),
+        ]))
+        .unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(StateSnapshot::from_json(&json).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn an_unsorted_duplicate_or_unreadable_edge_list_is_refused_by_name() {
+        let edge = |owner: &str, target: &str| {
+            serde_json::json!({
+                "owner": {"root": {"module": owner}, "part": "whole"},
+                "target": {"root": {"module": target}, "part": "whole"},
+            })
+        };
+        let read = |edges: serde_json::Value| {
+            let mut row = old_row(OBJECT_DEPS_VERSION, None);
+            row["object_deps"] = edges;
+            StateSnapshot::from_json(&row.to_string())
+        };
+        let (a, b) = (edge("app.a", "app.x"), edge("app.b", "app.x"));
+        assert!(read(serde_json::json!([a, b])).is_ok());
+        let why = read(serde_json::json!([b, a])).unwrap_err();
+        assert!(
+            why.contains("not sorted") && why.contains("module::app.b"),
+            "{why}"
+        );
+        let why = read(serde_json::json!([a, a])).unwrap_err();
+        assert!(
+            why.contains("twice") && why.contains("module::app.a"),
+            "{why}"
+        );
+        let why = read(serde_json::json!([a, {"owner": 1, "target": 2}])).unwrap_err();
+        assert!(why.contains("edge 1"), "{why}");
+        let mut extra = edge("app.a", "app.x");
+        extra["note"] = "x".into();
+        let why = read(serde_json::json!([extra])).unwrap_err();
+        assert!(why.contains("edge 0") && why.contains("note"), "{why}");
+        let why = read(serde_json::json!({"app.a": ["app.x"]})).unwrap_err();
+        assert!(why.contains("malformed"), "{why}");
     }
 }

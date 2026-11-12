@@ -7,6 +7,10 @@ use crate::certified_fixture::FixtureEmission;
 use pbps_dialect::Dialect;
 use pbps_model::*;
 
+#[path = "support/historical_state.rs"]
+mod historical_state;
+use historical_state::historical_state;
+
 const NAME: &str = "col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
@@ -276,7 +280,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             ("schema.json", serde_json::to_string(&schema).unwrap()),
             ("ids.json", serde_json::to_string(&state.ids).unwrap()),
             ("plan.json", serde_json::to_string(&plan).unwrap()),
-            ("state.json", serde_json::to_string(&state).unwrap()),
+            ("state.json", historical_state(&state)),
             ("plan.sha256", plan.wire_fingerprint()),
             ("state.sha256", state_checksum(&schema, &state.ids)),
             ("statements.sql", sql),
@@ -300,7 +304,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             plan
         );
         assert_eq!(
-            StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
+            StateSnapshot::from_json(&historical_state(&state)).unwrap(),
             state
         );
         let (_, mut other, _) = artifacts(SHOWN, dialect);

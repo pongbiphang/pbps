@@ -308,11 +308,12 @@ pub(super) fn dependency_hints_for_schema(
         .filter_map(|planned| planned.change.module_id())
         .collect();
     let present: std::collections::BTreeSet<_> = schema.modules.keys().collect();
+    let recorded_modules = recorded.object_deps.to_deps().modules();
     let mut dependencies = pbps_model::ModuleDeps::new();
 
     for name in schema.modules.keys() {
         let source = if dropped.contains(name) {
-            recorded.module_deps.get(name)
+            recorded_modules.get(name)
         } else {
             plan.module_deps.get(name)
         };

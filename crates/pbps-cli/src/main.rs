@@ -5623,7 +5623,9 @@ fn cmd_plan(
                 .hints
                 .annotations
                 .wire()
-                .map_err(anyhow::Error::msg)?;
+                .map_err(anyhow::Error::msg)?
+                .to_deps()
+                .modules();
             plan.dependencies = dependencies.clone();
             plan.trusted_roles = project.config.trusted_roles.clone();
             plan.git_sha = db::git_sha(project.root());

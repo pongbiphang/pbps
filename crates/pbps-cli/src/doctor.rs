@@ -916,9 +916,7 @@ fn surviving_keys(
     hints.record_row_defaults(&snapshot.schema);
     hints
         .annotations
-        .record(pbps_model::object_ref::ObjectDeps::from_legacy(
-            &snapshot.module_deps,
-        ));
+        .record(snapshot.object_deps.to_deps());
     // Compared as written, a declared default collation would rebuild its
     // column here and nowhere in the real plan, and the unchanged key around it
     // would lose a demand the delete guard needs (#1511).

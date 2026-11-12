@@ -1153,7 +1153,7 @@ mod tests {
                 "the saved plan's schema lacks `{name}`"
             );
         }
-        for name in ["baseline_evidence", "module_deps", "tombstones", "moves"] {
+        for name in ["baseline_evidence", "object_deps", "tombstones", "moves"] {
             assert!(state.contains(name), "the snapshot's schema lacks `{name}`");
         }
     }

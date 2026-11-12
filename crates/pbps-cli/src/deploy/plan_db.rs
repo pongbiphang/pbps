@@ -684,7 +684,7 @@ pub(super) async fn plan_db_selected(
         // The rehearsal rebuilds the base as the target holds it, so a kept
         // module is ordered by the annotation it was written under, not by
         // this revision's (see `rehearsal::connected::Plan::base_hints`).
-        hints.annotations.record(pbps_model::object_ref::ObjectDeps::from_legacy(&entry.snapshot.module_deps));
+        hints.annotations.record(entry.snapshot.object_deps.to_deps());
         // A rebuilt enum or domain keeps its comment, which `CREATE TYPE` does
         // not copy: it is a fact about the target, read before the differ
         // writes the swap that carries it (DEC-1635.7, DEC-1635.9). So is
@@ -1820,7 +1820,9 @@ pub(super) async fn plan_db_selected(
             .hints
             .annotations
             .wire()
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::msg)?
+            .to_deps()
+            .modules();
         plan.dependencies = dependencies;
         plan.git_sha = db::git_sha(project.root());
         // The rows the state recorded after the apply has to cover: the

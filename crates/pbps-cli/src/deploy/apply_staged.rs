@@ -675,7 +675,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             operator,
         );
         checkpoint.baseline_evidence = after.baseline_evidence;
-        checkpoint.module_deps = module_deps;
+        checkpoint.object_deps = pbps_model::object_ref::ObjectEdges::from_legacy(&module_deps);
         // A checkpoint records the database as it stands, and what was
         // declared is what the previous state said until the plan finishes:
         // the closing entry advances it by the whole plan, and nothing plans
@@ -847,7 +847,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             operator,
         );
         snapshot.baseline_evidence = after.baseline_evidence;
-        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.object_deps = pbps_model::object_ref::ObjectEdges::from_legacy(&plan.module_deps);
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
         snapshot.target_assertions = plan.target_assertions.clone();

@@ -7,6 +7,10 @@ use pbps_model::*;
 #[path = "../src/declaration_file.rs"]
 mod declaration_file;
 
+#[path = "support/historical_state.rs"]
+mod historical_state;
+use historical_state::historical_state;
+
 const NAME: &str = "local\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"local\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
@@ -403,7 +407,7 @@ where
         ("changes-debug.txt", changes_debug),
         ("ids.json", serde_json::to_string(&state.ids).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
-        ("state.json", serde_json::to_string(&state).unwrap()),
+        ("state.json", historical_state(&state)),
         ("plan.sha256", plan.wire_fingerprint()),
         ("state.sha256", state_checksum(&schema, &state.ids)),
         ("statements.sql", sql),
@@ -428,7 +432,7 @@ where
         plan
     );
     assert_eq!(
-        StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
+        StateSnapshot::from_json(&historical_state(&state)).unwrap(),
         state
     );
     let (_, mut other, _) = artifacts(SHOWN, dialect);
