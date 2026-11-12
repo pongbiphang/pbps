@@ -1673,7 +1673,7 @@ under each platform, and the CLI test that plans a 250-byte stem and refuses a
 
 <a id="dec-2804-1"></a>
 
-**DEC-2804.1. The identity tree is not written through a symbolic link below the project root; `init` and the plan of every tree write refuse it, and the root and what is above it are not looked at.**
+**DEC-2804.1. The identity tree is not written through a symbolic link below the project root; `init`, the plan of every tree write and `ids migrate`, `ids fmt` and `ids resolve` refuse it, and the root and what is above it are not looked at.**
 `create_dir_all` follows links. With `.pbps` linked to a directory elsewhere,
 `init` put `ids/x.json` into that directory: git records the link and nothing
 else, so the identities were not versioned with the project. Measured on
@@ -1684,8 +1684,11 @@ empty directory outside it).
   each component of `ids_dir` below `root`, `ids_dir` itself included, without
   following links. `init` calls it in `refuse_existing`, which runs before
   staging and again before the claim. `ids_store::plan` calls it first, before
-  the case probe, which can create a file in the directory it finds. `pbps pull`
-  is the command that reaches `plan`.
+  the case probe, which can create a file in the directory it finds; `pull`,
+  `plan`, the intent commands, `rebuild-table`, `withdraw-rebuild` and `convert`
+  reach `plan`. `ids migrate`, `ids fmt` and `ids resolve` write the tree
+  without `plan`, so each calls it before its first change on disk. `ids fmt
+  --check` writes nothing and is not refused.
 - **Four results.** A link is a refusal that names it. A directory is passed. A
   component that is not there ends the walk, because nothing below it exists. One
   that cannot be inspected is an error that names it, never "no link". A
@@ -1696,8 +1699,8 @@ empty directory outside it).
 - **Why `plan` and not `apply`.** `pull` must make every refusal of the tree
   before it publishes a declaration (DEC-2600.9). The cost is that a project that
   already keeps `.pbps` as a link is refused by `pull` even when the write would
-  change nothing. Such a tree is not versioned with the project, which is the
-  case this entry refuses.
+  change nothing, and so is `ids resolve` with nothing unmerged. Such a tree is
+  not versioned with the project, which is the case this entry refuses.
 - **Not covered.** An `ids_dir` that is an absolute path outside the root has no
   component below the root and is not looked at. On Windows the check
   uses `FileType::is_symlink`. Read in the `std` source (1.85 and 1.99): it is
