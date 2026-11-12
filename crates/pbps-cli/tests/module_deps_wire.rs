@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
@@ -16,8 +17,15 @@ struct Project {
 
 impl Project {
     fn new(name: &str, dialect: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("pbps-deps-wire-{name}-{}", std::process::id()));
+        // Every project gets a directory of its own. The tests run in parallel and two of
+        // them build the same scenario, so a name and the process id alone would let one
+        // test remove the directory another is still planning in.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "pbps-deps-wire-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("schema")).unwrap();
         std::fs::write(root.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
