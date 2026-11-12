@@ -675,13 +675,21 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
 /// there ends the walk with no refusal, because nothing below it exists. One
 /// that cannot be inspected is an error that names it, never "no link". A
 /// component that is a file also ends the walk: the write that follows refuses
-/// it with its own message. A path not below `root` (an absolute `ids_dir`) has
-/// no components to look at here.
+/// it with its own message.
+///
+/// "Below `root`" is the lexical prefix first. An absolute `ids_dir` replaces the
+/// root in `Project::ids_dir` and may spell the project another way, so it is
+/// then judged by directory identity (`start_of_walk`). A path outside the
+/// project has nothing to look at.
 pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
-    let Ok(below) = ids_dir.strip_prefix(root) else {
-        return Ok(());
+    let (start, below) = match ids_dir.strip_prefix(root) {
+        Ok(below) => (root, below),
+        Err(_) => match start_of_walk(root, ids_dir)? {
+            Some(found) => found,
+            None => return Ok(()),
+        },
     };
-    let mut at = root.to_path_buf();
+    let mut at = start.to_path_buf();
     for part in below.components() {
         at.push(part);
         let shown = || pbps_model::escape::Escaped(&at.display().to_string()).to_string();
@@ -698,6 +706,46 @@ pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+/// The ancestor of an absolute `ids_dir` that is the same directory as `root`,
+/// and what is below it. Shortest first on purpose: a `.pbps` that links back to
+/// the root is the root too, and the longest match would skip it. An ancestor
+/// that is not there is not the root; one that cannot be looked at is an error.
+fn start_of_walk<'a>(
+    root: &Path,
+    ids_dir: &'a Path,
+) -> anyhow::Result<Option<(&'a Path, &'a Path)>> {
+    if !ids_dir.is_absolute() {
+        return Ok(None);
+    }
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+    // An empty root is the working directory, as `Project::load` reads it.
+    let real = |path: &Path| {
+        std::fs::canonicalize(if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        })
+    };
+    let cannot = |path: &Path, e: std::io::Error| {
+        anyhow::Error::new(e).context(format!(
+            "cannot inspect `{}`",
+            pbps_model::escape::Escaped(&path.display().to_string())
+        ))
+    };
+    let root_real = real(root).map_err(|e| cannot(root, e))?;
+    for ancestor in ids_dir.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        match real(ancestor) {
+            Ok(found) if found == root_real => {
+                return Ok(ids_dir.strip_prefix(ancestor).ok().map(|b| (ancestor, b)));
+            }
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
+            Err(e) => return Err(cannot(ancestor, e)),
+        }
+    }
+    Ok(None)
 }
 
 /// What `path` is, not followed through a link, or `None` when the filesystem

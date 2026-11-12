@@ -1219,3 +1219,33 @@ fn resolve_refuses_a_linked_identity_parent_and_changes_nothing() {
         "the file behind the link keeps its bytes"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_relative_project_path_with_an_absolute_ids_dir_inside_it_is_inspected_for_links() {
+    // The root is the relative `proj`; `ids_dir` is the absolute path of the
+    // tree inside it. Compared by spelling these are two unrelated paths.
+    let p = legacy_project_in("proj");
+    let absolute = p.0.join(".pbps/ids");
+    p.write(
+        "pbps.yml",
+        &format!("dialect: postgres\nids_dir: '{}'\n", absolute.display()),
+    );
+    let outside = link_ids_parent(&p);
+    let run = |dir: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_pbps"))
+            .args(["--project", "proj", "ids", "migrate"])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    assert_refused(&run(&p.1), LINK_REFUSAL);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(p.has("schema.ids.json"), "the legacy file stays");
+    // Negative: with a real `.pbps` the same invocation migrates.
+    std::fs::remove_file(p.0.join(".pbps")).unwrap();
+    std::fs::create_dir(p.0.join(".pbps")).unwrap();
+    assert_ok(&run(&p.1));
+    assert!(p.has(".pbps/ids/dbo/customer.json"));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

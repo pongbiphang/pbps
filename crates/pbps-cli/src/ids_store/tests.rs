@@ -2539,3 +2539,91 @@ fn a_component_that_cannot_be_inspected_is_an_error_not_no_link() {
     // Negative: once it can be inspected and nothing is there, no refusal.
     refuse_linked_ids_dir(&project.root, &project.ids_dir()).unwrap();
 }
+
+/// A checkout reached through a link (`behind`), so that the root is spelled one
+/// way and an absolute `ids_dir` another (#2804).
+#[cfg(unix)]
+fn root_behind_a_link(tag: &str) -> (Project, PathBuf, PathBuf) {
+    let (project, outside) = linkable(tag, None);
+    let behind = outside.join("checkout");
+    std::os::unix::fs::symlink(&project.root, &behind).unwrap();
+    (project, outside, behind)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_absolute_ids_dir_inside_the_root_is_inspected_whatever_the_root_is_spelled_as() {
+    let (project, outside, behind) = root_behind_a_link("absolute-inside");
+    // The root goes through the link and `ids_dir` is the real path: the
+    // spelling is not a prefix, the directory is.
+    let ids_dir = project.root.join(".pbps/ids");
+    let stray = outside.join("stray");
+    std::fs::create_dir(&stray).unwrap();
+    std::os::unix::fs::symlink(&stray, project.root.join(".pbps")).unwrap();
+    let error = format!(
+        "{:#}",
+        refuse_linked_ids_dir(&behind, &ids_dir).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(
+        error.contains(&project.root.join(".pbps").display().to_string()),
+        "{error}"
+    );
+    // Negative: a real `.pbps` is accepted, and so is a path outside the
+    // project, existing or not.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&behind, &ids_dir).unwrap();
+    refuse_linked_ids_dir(&behind, &stray.join("ids")).unwrap();
+    refuse_linked_ids_dir(&behind, &stray.join("not/there/ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_parent_that_links_back_to_the_root_is_refused_not_taken_for_the_root() {
+    let (project, _outside, behind) = root_behind_a_link("links-back");
+    let ids_dir = project.root.join(".pbps/ids");
+    // `.pbps` is the root again. Walking from the longest ancestor would take
+    // it for the root and never look at it.
+    std::os::unix::fs::symlink(&project.root, project.root.join(".pbps")).unwrap();
+    let error = format!(
+        "{:#}",
+        refuse_linked_ids_dir(&behind, &ids_dir).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    // Negative: with a real directory the same spelling passes.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&behind, &ids_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ancestor_that_cannot_be_inspected_is_an_error_never_outside_the_project() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, outside, behind) = root_behind_a_link("ancestor-unreadable");
+    let locked = outside.join("locked");
+    std::fs::create_dir_all(locked.join("x")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ids_dir = locked.join("x/ids");
+    if std::fs::symlink_metadata(&ids_dir).is_ok() {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let error = format!(
+        "{:#}",
+        refuse_linked_ids_dir(&behind, &ids_dir).unwrap_err()
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains("locked"), "{error}");
+    // Negative: once it can be looked at, it is outside the project and passes.
+    refuse_linked_ids_dir(&behind, &ids_dir).unwrap();
+    // A root that cannot be looked at is an error as well.
+    let gone = outside.join("gone");
+    let error = format!("{:#}", refuse_linked_ids_dir(&gone, &ids_dir).unwrap_err());
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains("gone"), "{error}");
+    let _ = project;
+}

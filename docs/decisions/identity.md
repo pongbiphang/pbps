@@ -1689,6 +1689,13 @@ empty directory outside it).
   reach `plan`. `ids migrate`, `ids fmt` and `ids resolve` write the tree
   without `plan`, so each calls it before its first change on disk. `ids fmt
   --check` writes nothing and is not refused.
+- **Inside the root.** Judged by the lexical prefix first. An absolute `ids_dir`
+  replaces the root in `Project::ids_dir()`, so it can spell the project another
+  way (a relative root, or one reached through a link). It is then judged by
+  directory identity: the shortest ancestor that is the root's directory starts
+  the walk. Shortest, so that a `.pbps` linking back to the root is looked at
+  and not taken for the root. An ancestor that is not there is not the root; one
+  that cannot be inspected, or a root that cannot, is an error naming it.
 - **Four results.** A link is a refusal that names it. A directory is passed. A
   component that is not there ends the walk, because nothing below it exists. One
   that cannot be inspected is an error that names it, never "no link". A
@@ -1701,8 +1708,8 @@ empty directory outside it).
   already keeps `.pbps` as a link is refused by `pull` even when the write would
   change nothing, and so is `ids resolve` with nothing unmerged. Such a tree is
   not versioned with the project, which is the case this entry refuses.
-- **Not covered.** An `ids_dir` that is an absolute path outside the root has no
-  component below the root and is not looked at. On Windows the check
+- **Not covered.** An absolute `ids_dir` outside the root (no ancestor is the
+  root's directory) is not looked at. On Windows the check
   uses `FileType::is_symlink`. Read in the `std` source (1.85 and 1.99): it is
   true for a reparse point whose tag has the name-surrogate bit (`0x20000000`).
   Symbolic links (`0xA000000C`) and junctions (`0xA0000003`) both have it, so
