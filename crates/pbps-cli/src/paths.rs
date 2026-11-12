@@ -44,7 +44,7 @@ pub(crate) fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Existing aliases are compared by filesystem identity; missing destinations
-/// still need a spelling comparison because planning can create the ids file.
+/// still need a spelling comparison because planning can create identity files.
 pub(crate) fn same_file(a: &Path, b: &Path) -> anyhow::Result<bool> {
     #[cfg(test)]
     inspections::CALLS.with(|n| n.set(n.get() + 1));

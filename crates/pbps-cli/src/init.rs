@@ -935,7 +935,7 @@ mod tests {
     /// The recheck alone cannot serialize two inits: on Unix `rename` replaces
     /// an existing *empty* directory, so both could pass the recheck and both
     /// move `schema` — then the loser's rollback deletes the directory the
-    /// winner had already installed, leaving pbps.yml and schema.ids.json with
+    /// winner had already installed, leaving pbps.yml and `.pbps/ids` with
     /// no `schema/` beside them.
     ///
     /// The staged directory is empty on purpose: that is what plain `pbps init`
@@ -985,7 +985,7 @@ mod tests {
                 "exactly one init may claim the root, got {outcomes:?}"
             );
             // The winner's project must be whole: the reported failure left
-            // pbps.yml and schema.ids.json behind with no `schema/`.
+            // pbps.yml and `.pbps/ids` behind with no `schema/`.
             let winner = std::fs::read_to_string(root.join("pbps.yml")).unwrap_or_else(|e| {
                 panic!("round {round}: an init succeeded but left no config: {e}")
             });

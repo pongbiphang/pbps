@@ -8,7 +8,7 @@
 //! A module carries no data. Dropping and recreating one is semantically
 //! lossless and its complete definition is in git, so a rename is just drop +
 //! add and the audit trail is the commit that did it. **Modules therefore never
-//! appear in `schema.ids.json`.**
+//! appear in the identity files.**
 //!
 //! That is a principled line, not an economy: the criterion is "does drop + add
 //! destroy state that lives only in the environment?", and for a module the

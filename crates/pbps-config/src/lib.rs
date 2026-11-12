@@ -358,9 +358,11 @@ pub struct Config {
     pub schema_dir: PathBuf,
 
     /// The single identity file. `ids_dir` replaces it; name one or the other.
-    // The reason behind the pair, kept out of the published schema's text:
-    // every reader and writer still uses this file until the identity tree
-    // takes over (#2600, DEC-2600.7), so it cannot be removed yet.
+    // The reason the key is still here, kept out of the published schema's
+    // text: a project that has not migrated names its single file with it, and
+    // `pbps ids migrate` must find that file to move it (#2600, DEC-2600.7).
+    // Removing it would turn such a project's unknown key into a config error
+    // that does not say what to run.
     #[serde(default = "default_ids_file")]
     pub ids_file: PathBuf,
 
@@ -476,7 +478,8 @@ fn default_schema_dir() -> PathBuf {
 /// Where the identity tree lives when `ids_dir` is not named (design-2600 §3.2).
 pub const DEFAULT_IDS_DIR: &str = ".pbps/ids";
 
-/// The legacy identity file's name, until the switch to the tree (#2600).
+/// The retired single identity file's name: what `ids_file` defaults to, and
+/// what `pbps ids migrate` and history look for (#2600).
 pub(crate) const DEFAULT_IDS_FILE: &str = "schema.ids.json";
 
 fn default_ids_file() -> PathBuf {

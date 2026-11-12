@@ -1,8 +1,11 @@
-//! The identity file (`schema.ids.json`).
+//! The identity mapping: what a plan, a state snapshot and every command hold
+//! of the project's identities. On disk it is split into one file per
+//! declaration (`ids_tree`); this is the whole as one value, and the single
+//! file `schema.ids.json` of the earlier layout was its serialization.
 //!
-//! This file is committed to git and holds exactly what **cannot be derived from
-//! the declaration files**: the mapping from UID to name, tombstones for
-//! deleted objects, and the moves a human allowed (SPEC §5, §6). Types, nullability and index definitions are never
+//! It holds exactly what **cannot be derived from the declaration files**: the
+//! mapping from UID to name, tombstones for deleted objects, and the moves a
+//! human allowed (SPEC §5, §6). Types, nullability and index definitions are never
 //! stored here — the YAML already has them, and duplicating them would only
 //! create two sources of truth that can disagree.
 

@@ -1824,7 +1824,7 @@ fn run() -> anyhow::Result<()> {
 
 /// Renders documentation from the declarations, offline (SPEC §9.4).
 ///
-/// The ids file is read but not required: without it there is simply no
+/// The identities are read but not required: without them there is simply no
 /// graveyard section. Documentation must not become the one command that fails
 /// on a project that has never run `plan`.
 fn cmd_docs(
@@ -5267,8 +5267,8 @@ fn cmd_plan(
             return Err(Found::new(message).into());
         }
         // The write itself waits for the policy gate below. `error` refuses the
-        // plan "before any file is written" (ADR-0008), and the identity file is a
-        // file: minting a uid and then refusing left `pbps.ids.json` changed for a
+        // plan "before any file is written" (ADR-0008), and the identity files are
+        // files: minting a uid and then refusing left them changed for a
         // plan that does not exist, so the next run compared against identities no
         // reviewed plan ever used (DECISIONS 154).
         let ids_to_write = stale.then(|| res.ids.clone());
