@@ -49,7 +49,7 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                                 before,
                                 after: &s.ids,
                             },
-                            module_deps: &Default::default(),
+                            annotations: &Default::default(),
                         },
                         &Facts::default()
                             .with_module_dependents(&Default::default())
@@ -195,7 +195,7 @@ fn physical_column_lists_are_obligations_at_attach_and_detach() {
                     before,
                     after: &s.ids,
                 },
-                module_deps: &Default::default(),
+                annotations: &Default::default(),
             },
             &Facts::default()
                 .with_policy_dependents(&policies)

@@ -3415,11 +3415,7 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
         modules.insert(key, module.clone());
     }
     schema.modules = modules;
-    hints.module_deps = hints
-        .module_deps
-        .iter()
-        .map(|(id, on)| (spell(id), on.iter().map(&spell).collect()))
-        .collect();
+    hints.annotations.declared = hints.annotations.declared.map_modules(spell);
     // Every set keyed by a module identity goes through the same pass, and
     // this one is keyed by it too. A declaration spelling `app.f(int)` has
     // its module key rewritten to `app.f(integer)` above; an opt-in left in
@@ -3538,6 +3534,37 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
         anyhow::bail!("the declarations have {} problem(s)", collisions.len());
     }
     Ok(loaded)
+}
+
+/// The findings on `depends_on:` annotations, under the two codes the module
+/// checks have always used. A module-to-module finding keeps its text; a
+/// reference of another kind is judged by the registry and mapped onto the
+/// same codes, so nothing a user scripts against changes (#2469).
+fn annotation_findings(
+    schema: &pbps_model::Schema,
+    annotations: &pbps_model::object_ref::Annotations,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let modules = annotations.declared.modules();
+    // A `depends_on:` naming a module nobody declared is silently a no-op in
+    // the ordering, so nothing else would ever say so.
+    for problem in pbps_model::module::check_dependencies(schema, &modules) {
+        out.push(("schema.unknown-dependency", problem));
+    }
+    // And lists that close a cycle: no order honours them, and the plan would
+    // break one without saying which (#2083).
+    for problem in pbps_model::module::check_dependency_cycles(schema, &modules) {
+        out.push(("schema.dependency-cycle", problem));
+    }
+    for problem in annotations.extended_problems(schema) {
+        let code = if matches!(problem, pbps_model::object_ref::Problem::Cycle(_)) {
+            "schema.dependency-cycle"
+        } else {
+            "schema.unknown-dependency"
+        };
+        out.push((code, problem.to_string()));
+    }
+    out
 }
 
 /// Every declaration problem `validate` reports as an error, as
@@ -3708,16 +3735,9 @@ fn declaration_problems_with_sources(
             ));
         }
     }
-    // And a third: a `depends_on:` naming a module nobody declared. It is
-    // silently a no-op in the ordering, so nothing else would ever say so.
-    for problem in pbps_model::module::check_dependencies(schema, &loaded.hints.module_deps) {
-        out.push(("schema.unknown-dependency", problem));
-    }
-    // And `depends_on:` lists that close a cycle: no order honours them,
-    // and the plan would break one without saying which (#2083).
-    for problem in pbps_model::module::check_dependency_cycles(schema, &loaded.hints.module_deps) {
-        out.push(("schema.dependency-cycle", problem));
-    }
+    // And a third: a `depends_on:` that names nothing declared or closes a
+    // cycle (the checks are in `annotation_findings`).
+    out.extend(annotation_findings(schema, &loaded.hints.annotations));
     // Reference data (ADR-0004). Model rules, not engine rules — a row's
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.
@@ -5301,11 +5321,9 @@ fn cmd_plan(
         // declarations do not hold, which is refused (#2083 review). `plan --db`
         // carries the snapshot's the same way.
         let mut hints = loaded.hints.clone();
-        for (name, deps) in &base.hints.module_deps {
-            if !loaded.schema.modules.contains_key(name) {
-                hints.module_deps.insert(name.clone(), deps.clone());
-            }
-        }
+        hints
+            .annotations
+            .record(base.hints.annotations.declared.clone());
 
         // A snapshot baseline is a read-back, and the engine respells what it
         // stores; where the snapshot recorded what was declared, that is what the
@@ -5449,7 +5467,7 @@ fn cmd_plan(
                         },
                         after: &res.ids,
                     },
-                    module_deps: &hints.module_deps,
+                    annotations: &hints.annotations,
                 },
                 &dependents::schedule::Facts::default(),
                 dialect.as_ref(),
@@ -5601,7 +5619,11 @@ fn cmd_plan(
                 cs.changes().clone(),
                 res.ids.clone(),
             );
-            plan.module_deps = loaded.hints.module_deps.clone();
+            plan.module_deps = loaded
+                .hints
+                .annotations
+                .wire()
+                .map_err(anyhow::Error::msg)?;
             plan.dependencies = dependencies.clone();
             plan.trusted_roles = project.config.trusted_roles.clone();
             plan.git_sha = db::git_sha(project.root());
@@ -6864,6 +6886,70 @@ mod tests {
         )
     }
 
+    #[test]
+    fn registry_findings_use_the_two_module_codes_and_leave_module_text_alone() {
+        use pbps_model::object_ref::{Annotations, ObjectDeps};
+        let mut schema = pbps_model::Schema::default();
+        schema
+            .tables
+            .insert("app.t".parse().unwrap(), pbps_model::Table::default());
+        for name in ["app.v", "app.w"] {
+            schema.modules.insert(
+                name.parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    definition: "SELECT 1".into(),
+                    description: None,
+                    options: Default::default(),
+                },
+            );
+        }
+        let deps = |rows: &[(&str, &str)]| Annotations {
+            declared: ObjectDeps(
+                rows.iter()
+                    .map(|(o, t)| (o.parse().unwrap(), [t.parse().unwrap()].into()))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        // A target that is not declared, and a cycle through a table.
+        let unknown = annotation_findings(&schema, &deps(&[("module::app.v", "table::app.nope")]));
+        assert!(
+            matches!(unknown.as_slice(), [("schema.unknown-dependency", why)] if why.contains("table::app.nope")),
+            "{unknown:?}"
+        );
+        let cycle = annotation_findings(
+            &schema,
+            &deps(&[
+                ("module::app.v", "table::app.t"),
+                ("table::app.t", "module::app.v"),
+            ]),
+        );
+        assert!(
+            cycle
+                .iter()
+                .any(|(code, _)| *code == "schema.dependency-cycle"),
+            "{cycle:?}"
+        );
+        // Negative: module-only findings keep the text the module checks give.
+        let ghost = annotation_findings(&schema, &deps(&[("module::app.v", "module::app.ghost")]));
+        assert!(
+            matches!(ghost.as_slice(), [("schema.unknown-dependency", why)]
+                if why.contains("which is not a declared module")),
+            "{ghost:?}"
+        );
+        assert!(
+            annotation_findings(&schema, &deps(&[("module::app.v", "module::app.w")])).is_empty()
+        );
+        // A table that depends on a missing module is nobody's module edge:
+        // the registry reports it, once, under the same code.
+        let mixed = annotation_findings(&schema, &deps(&[("table::app.t", "module::app.ghost")]));
+        assert!(
+            matches!(mixed.as_slice(), [("schema.unknown-dependency", why)] if why.contains("module::app.ghost")),
+            "{mixed:?}"
+        );
+    }
+
     /// Everything keyed by a routine identity is rewritten together, or the
     /// halves stop matching. The loader is dialect-free, so a declaration may
     /// spell `app.f(int)`; the module key becomes `app.f(integer)`, and an
@@ -6896,8 +6982,8 @@ mod tests {
         let mut hints = pbps_model::Hints::default();
         hints.public_execute.insert(written.clone());
         hints
-            .module_deps
-            .insert(written.clone(), [helper.clone()].into_iter().collect());
+            .annotations
+            .declare_module(written.clone(), [helper.clone()].into_iter().collect());
 
         let collisions =
             routine_ids_as_the_dialect_spells_them(&mut schema, &mut hints, dialect.as_ref());
@@ -6916,7 +7002,9 @@ mod tests {
         assert!(!hints.public_execute.contains(&written));
         assert_eq!(
             hints
-                .module_deps
+                .annotations
+                .declared
+                .modules()
                 .get(&spelled)
                 .map(|d| d.iter().collect::<Vec<_>>()),
             Some(vec![&helper_spelled])

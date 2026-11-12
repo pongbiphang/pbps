@@ -147,7 +147,7 @@ pub async fn with_session<T, E>(
                     &mut target,
                     binding,
                     base.ids,
-                    &hints.module_deps,
+                    &hints.annotations.modules(desired.schema),
                     &mut prepared,
                 )
                 .await?;
@@ -171,7 +171,7 @@ pub async fn with_session<T, E>(
                     &mut target,
                     binding,
                     desired.ids,
-                    &hints.module_deps,
+                    &hints.annotations.modules(desired.schema),
                     &mut prepared,
                 )
                 .await?;

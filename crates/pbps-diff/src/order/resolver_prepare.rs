@@ -213,7 +213,7 @@ pub(crate) fn changes(
             planned,
             ids,
             &ordinary.changes,
-            &hints.module_deps,
+            &hints.annotations.modules(desired),
             dialect,
         )
         .map_err(Error::Names)?

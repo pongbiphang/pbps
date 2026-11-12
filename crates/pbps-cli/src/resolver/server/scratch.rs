@@ -328,7 +328,7 @@ impl Run<'_> {
                 target,
                 binding,
                 desired.ids,
-                &hints.module_deps,
+                &hints.annotations.modules(desired.schema),
                 &mut prepared,
             )
             .await?;

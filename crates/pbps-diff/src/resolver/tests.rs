@@ -436,7 +436,7 @@ fn a_resolver_plan_with_a_cycle_through_the_evidence_is_refused_by_name() {
     }
     let wanted_ids = ids(&desired, &old_ids);
     let mut hints = Hints::default();
-    hints.module_deps.insert(
+    hints.annotations.declare_module(
         "app.va".parse().unwrap(),
         BTreeSet::from(["app.vz".parse().unwrap()]),
     );
@@ -651,7 +651,7 @@ fn explicit_module_dependencies_and_ordinary_orders_survive_resolution() {
         ids: &wanted_ids,
     };
     let mut hints = Hints::default();
-    hints.module_deps.insert(
+    hints.annotations.declare_module(
         "app.va".parse().unwrap(),
         BTreeSet::from(["app.vz".parse().unwrap()]),
     );

@@ -83,7 +83,7 @@ pub(super) async fn run(
                 before: base,
                 after: &ids,
             },
-            module_deps: &hints.module_deps,
+            annotations: &hints.annotations,
         },
         &Default::default(),
         &dialect,

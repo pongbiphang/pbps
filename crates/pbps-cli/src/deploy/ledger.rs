@@ -385,7 +385,11 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
             );
             snapshot.baseline_evidence = scoped.baseline_evidence;
-            snapshot.module_deps = loaded.hints.module_deps.clone();
+            snapshot.module_deps = loaded
+                .hints
+                .annotations
+                .wire()
+                .map_err(anyhow::Error::msg)?;
             let tables = snapshot.schema.tables.len();
             let id = crate::engine::record(&mut conn, &snapshot).await?;
             Ok::<_, anyhow::Error>((id, tables))
@@ -636,7 +640,11 @@ pub fn cmd_baseline(
                     StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
                 );
                 snapshot.baseline_evidence = scoped.baseline_evidence;
-                snapshot.module_deps = loaded.hints.module_deps.clone();
+                snapshot.module_deps = loaded
+                    .hints
+                    .annotations
+                    .wire()
+                    .map_err(anyhow::Error::msg)?;
                 // The note on what was removed rides on the reason only where
                 // the bounded column has room for both: it never turns a reason
                 // that fits into a record that fails. The removal is printed

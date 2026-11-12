@@ -245,13 +245,17 @@ pub(super) fn bootstrap_record(
     held: IdsFile,
     loaded: &pbps_load::Loaded,
     operator: &str,
-) -> StateSnapshot {
+) -> anyhow::Result<StateSnapshot> {
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
-    snapshot.module_deps = loaded.hints.module_deps.clone();
+    snapshot.module_deps = loaded
+        .hints
+        .annotations
+        .wire()
+        .map_err(anyhow::Error::msg)?;
     // Every object was created from these declarations (ADR-0009 §2.2).
     snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
-    snapshot
+    Ok(snapshot)
 }
 
 pub(super) fn bootstrap(
@@ -382,7 +386,7 @@ pub(super) async fn bootstrap_async(
                 extension_updates: Default::default(),
                 extension_moves: Default::default(),
                 strategies: Default::default(),
-                module_deps: loaded.hints.module_deps.clone(),
+                annotations: loaded.hints.annotations.clone(),
                 // Carried for the same reason, and one more: it is what decides
                 // whether the routines this bootstrap creates arrive executable
                 // by every principal in the cluster (ADR-0010 §5). Dropping it
@@ -413,7 +417,7 @@ pub(super) async fn bootstrap_async(
                     },
                     after: &ids,
                 },
-                module_deps: &loaded.hints.module_deps,
+                annotations: &loaded.hints.annotations,
             },
             &crate::dependents::schedule::Facts::default(),
             dialect.as_ref(),
@@ -701,7 +705,7 @@ pub(super) async fn bootstrap_async(
                 .await?;
                 let snapshot = with_provenance(
                     project.root(),
-                    bootstrap_record(built, held, &loaded, operator),
+                    bootstrap_record(built, held, &loaded, operator)?,
                 );
                 let id = crate::engine::record(&mut conn, &snapshot).await?;
                 write_script(&pin_zone(&conn))?;

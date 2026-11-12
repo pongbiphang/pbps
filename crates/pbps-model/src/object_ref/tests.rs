@@ -908,3 +908,188 @@ fn a_selectors_schema_has_one_branch_per_wire_form() {
         .expect("the nameless kinds are one enum");
     assert_eq!(unit.len(), 7, "{schema}");
 }
+
+fn legacy(rows: &[(&str, &[&str])]) -> ModuleDeps {
+    ObjectDeps(
+        rows.iter()
+            .map(|(o, t)| (reference(o), t.iter().map(|s| reference(s)).collect()))
+            .collect(),
+    )
+    .to_legacy()
+    .unwrap()
+}
+
+#[test]
+fn the_module_view_keeps_module_edges_and_leaves_the_rest_to_the_contract() {
+    let deps = dependencies(&[
+        ("module::app.v", &["module::app.f(integer)", "table::app.t"]),
+        ("table::app.t", &["module::app.v"]),
+    ]);
+    assert!(!deps.is_legacy());
+    assert_eq!(
+        deps.modules(),
+        legacy(&[("module::app.v", &["module::app.f(integer)"])])
+    );
+    // Negative: a module-only set is its own view and is legacy.
+    let only = dependencies(&[("module::app.v", &["module::app.f(integer)"])]);
+    assert!(only.is_legacy());
+    assert_eq!(only.to_legacy().unwrap(), only.modules());
+}
+
+#[test]
+fn the_merged_view_is_derived_once_from_declared_and_recorded_apart() {
+    let schema = fixture();
+    let mut annotations = Annotations::default();
+    annotations.declare_module(
+        "app.v".parse().unwrap(),
+        ["app.f(integer)".parse().unwrap()].into(),
+    );
+    annotations.record(dependencies(&[
+        // A module no longer declared keeps its recorded edge for its drop...
+        ("module::app.gone", &["module::app.f(integer)"]),
+        // ...but a declared one owns its current list: the old edge is gone.
+        ("module::app.v", &["module::app.gone"]),
+    ]));
+    let merged = annotations.modules(&schema);
+    assert_eq!(
+        merged,
+        legacy(&[
+            ("module::app.v", &["module::app.f(integer)"]),
+            ("module::app.gone", &["module::app.f(integer)"]),
+        ])
+    );
+    // The baseline view is the opposite: what was recorded wins.
+    assert_eq!(
+        annotations
+            .baseline()
+            .declared
+            .modules()
+            .get(&"app.v".parse().unwrap()),
+        Some(&["app.gone".parse().unwrap()].into())
+    );
+    // Negative: the sets stay apart; the merge is not stored in either.
+    assert_eq!(annotations.declared.0.len(), 1);
+    assert_eq!(annotations.recorded.0.len(), 2);
+}
+
+#[test]
+fn only_a_non_module_reference_makes_the_input_extended() {
+    let mut annotations = Annotations::default();
+    assert!(!annotations.is_extended());
+    annotations.declare_module("app.v".parse().unwrap(), BTreeSet::new());
+    assert!(!annotations.is_extended());
+    annotations.recorded = dependencies(&[("module::app.v", &["table::app.t"])]);
+    assert!(annotations.is_extended(), "a recorded reference counts too");
+}
+
+#[test]
+fn an_extended_reference_is_refused_at_the_wire_by_name() {
+    let annotations = Annotations {
+        declared: dependencies(&[("module::app.v", &["table::app.t"])]),
+        ..Default::default()
+    };
+    let why = annotations.wire().unwrap_err();
+    assert!(why.contains("table::app.t"), "{why}");
+    assert!(why.contains("module-to-module"), "{why}");
+    let owner = Annotations {
+        declared: dependencies(&[("table::app.t", &["module::app.v"])]),
+        ..Default::default()
+    };
+    assert!(owner.wire().unwrap_err().contains("table::app.t"));
+    // Negative: module-only annotations are written as before.
+    let only = Annotations {
+        declared: dependencies(&[("module::app.v", &["module::app.f(integer)"])]),
+        ..Default::default()
+    };
+    assert_eq!(only.wire().unwrap(), only.declared.to_legacy().unwrap());
+}
+
+#[test]
+fn only_findings_about_non_module_references_are_extended_problems() {
+    let schema = fixture();
+    let annotations = Annotations {
+        declared: dependencies(&[
+            // Module to module: left to the module checks that pin its text.
+            ("module::app.v", &["module::app.ghost"]),
+            // Not a module: the registry's finding.
+            ("module::app.f(integer)", &["table::app.nope"]),
+        ]),
+        ..Default::default()
+    };
+    let problems = annotations.extended_problems(&schema);
+    assert!(
+        problems.iter().any(
+            |p| matches!(p, Problem::UnknownTarget(r) if r.shown().to_string() == "table::app.nope")
+        ),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .all(|p| !matches!(p, Problem::UnknownTarget(r) if r.module_id().is_some())),
+        "{problems:?}"
+    );
+    // A cycle through a table is the registry's; one only of modules is not.
+    let through_table = Annotations {
+        declared: dependencies(&[
+            ("module::app.v", &["table::app.t"]),
+            ("table::app.t", &["module::app.v"]),
+        ]),
+        ..Default::default()
+    };
+    assert!(
+        through_table
+            .extended_problems(&schema)
+            .iter()
+            .any(|p| matches!(p, Problem::Cycle(_)))
+    );
+    let modules_only = Annotations {
+        declared: dependencies(&[
+            ("module::app.v", &["module::app.f(integer)"]),
+            ("module::app.f(integer)", &["module::app.v"]),
+        ]),
+        ..Default::default()
+    };
+    assert!(modules_only.extended_problems(&schema).is_empty());
+}
+
+#[test]
+fn an_edge_is_extended_by_its_endpoints_not_by_which_reference_failed() {
+    let schema = fixture();
+    let unknown = |problems: &[Problem], name: &str| {
+        problems
+            .iter()
+            .filter(|p| matches!(p, Problem::UnknownTarget(r) if r.shown().to_string() == name))
+            .count()
+    };
+    // A table owner and a missing module: no module check sees the edge.
+    let mixed = Annotations {
+        declared: dependencies(&[("table::app.t", &["module::app.ghost"])]),
+        ..Default::default()
+    };
+    let problems = mixed.extended_problems(&schema);
+    assert_eq!(unknown(&problems, "module::app.ghost"), 1, "{problems:?}");
+    // The module edge to the same target is the module checks' report; the
+    // mixed edge keeps its own, so exactly one finding is extended.
+    let both = Annotations {
+        declared: dependencies(&[
+            ("module::app.v", &["module::app.ghost"]),
+            ("table::app.t", &["module::app.ghost"]),
+        ]),
+        ..Default::default()
+    };
+    let problems = both.extended_problems(&schema);
+    assert_eq!(unknown(&problems, "module::app.ghost"), 1, "{problems:?}");
+    // Negative: module-only input gives none, a module-only cycle included.
+    let modules_only = Annotations {
+        declared: dependencies(&[
+            (
+                "module::app.v",
+                &["module::app.ghost", "module::app.f(integer)"],
+            ),
+            ("module::app.f(integer)", &["module::app.v"]),
+        ]),
+        ..Default::default()
+    };
+    assert!(modules_only.extended_problems(&schema).is_empty());
+}

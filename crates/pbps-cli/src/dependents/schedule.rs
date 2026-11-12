@@ -49,8 +49,15 @@ pub(crate) struct Declarations<'a> {
     pub schema: &'a Schema,
     /// The baseline the plan departs from and the identities the plan ends in.
     pub sources: Sources<'a>,
-    /// The `depends_on:` edges the identifier scan cannot see.
-    pub module_deps: &'a ModuleDeps,
+    /// The `depends_on:` annotations the identifier scan cannot see.
+    pub annotations: &'a pbps_model::object_ref::Annotations,
+}
+
+impl Declarations<'_> {
+    /// The module-to-module edges the passes read (see the differ's twin).
+    pub(crate) fn module_deps(&self) -> ModuleDeps {
+        self.annotations.modules(self.schema)
+    }
 }
 
 /// What a module drop's catalog dependents are, per dropped module, deepest
@@ -199,7 +206,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
             before: declared.sources.before,
             after: declared.sources.after,
         },
-        module_deps: declared.module_deps,
+        annotations: declared.annotations,
     };
     let read = facts.owned();
     // The frozen oracle predates captured bindings and orders by the lexical
@@ -257,7 +264,7 @@ pub(crate) fn schedule_fixture<S: pbps_diff::order::RouteState<dyn Dialect>>(
             before: declared.sources.before,
             after: declared.sources.after,
         },
-        module_deps: declared.module_deps,
+        annotations: declared.annotations,
     };
     let read = facts.owned();
     #[cfg(test)]
@@ -320,7 +327,7 @@ fn oracle_schedule(
             None => {}
         }
         let ids = [declared.sources.after, declared.sources.before.ids];
-        split += split_new_tables(&mut cs, &ids, declared.module_deps, dialect)
+        split += split_new_tables(&mut cs, &ids, &declared.module_deps(), dialect)
             .map_err(Refusal::module_passes)?;
         let releases = match facts.module_dependents {
             Some(found) => {
@@ -385,7 +392,7 @@ fn oracle_schedule(
         moved += after_the_rebuilds(
             &mut cs,
             &releases,
-            declared.module_deps,
+            &declared.module_deps(),
             declared.schema,
             handovers,
             dialect,
@@ -434,7 +441,7 @@ fn oracle_schedule(
             ids: declared.sources.after,
         },
         dialect,
-        declared.module_deps,
+        &declared.module_deps(),
         facts.membership_catalog,
     )
     .map_err(Refusal)?;
@@ -491,7 +498,7 @@ fn oracle_schedule(
             ids: declared.sources.after,
         },
         dialect,
-        declared.module_deps,
+        &declared.module_deps(),
         &cs,
         pbps_diff::order::shadow::Stage::Differ,
         None,
@@ -548,7 +555,7 @@ fn keep_handover_dependents(
         operations.as_slice(),
         &effects.effects,
         &edges::Baseline::of(before, &owners),
-        declared.module_deps,
+        &declared.module_deps(),
         edges::Checks::ALL,
     );
     let dependencies = Schedule::of_graph(&graph, operations.as_slice());
@@ -589,7 +596,7 @@ fn policy_release_schedule(
             schema: declared.schema,
             ids: declared.sources.after,
         },
-        declared.module_deps,
+        &declared.module_deps(),
         dialect,
     )
     .map_err(Refusal)?;
@@ -723,7 +730,7 @@ mod tests {
                     },
                     after: ids,
                 },
-                module_deps: &ModuleDeps::new(),
+                annotations: &Default::default(),
             },
             facts,
             &pg(),
@@ -843,7 +850,7 @@ mod tests {
                     },
                     after: &final_ids,
                 },
-                module_deps: &ModuleDeps::new(),
+                annotations: &Default::default(),
             };
             let offline = schedule(
                 pbps_diff::order::propose(changes.clone()),
@@ -964,7 +971,7 @@ mod tests {
         };
         let after = Schema::default();
         let final_ids = IdsFile::default();
-        let deps = ModuleDeps::new();
+        let deps = pbps_model::object_ref::Annotations::default();
         let declared = Declarations {
             schema: &after,
             sources: Sources {
@@ -974,7 +981,7 @@ mod tests {
                 },
                 after: &final_ids,
             },
-            module_deps: &deps,
+            annotations: &deps,
         };
         let policy = |owner: usize, name: &str| pbps_pg::modules::PolicyDependent {
             table: tables[owner].clone(),
@@ -1242,7 +1249,7 @@ mod tests {
                             before: base,
                             after: &ids,
                         },
-                        module_deps: &ModuleDeps::new(),
+                        annotations: &Default::default(),
                     },
                     &Facts::default(),
                     &pg(),
@@ -1565,7 +1572,7 @@ mod tests {
                         },
                         after: &ids,
                     },
-                    module_deps: &ModuleDeps::new(),
+                    annotations: &Default::default(),
                 },
                 facts,
                 &sql_server,
@@ -1648,7 +1655,7 @@ mod tests {
                     },
                     after: &ids,
                 },
-                module_deps: &ModuleDeps::new(),
+                annotations: &Default::default(),
             },
             &Facts::default(),
             &sql_server,
@@ -1737,7 +1744,7 @@ mod tests {
                     },
                     after: &ids,
                 },
-                module_deps: &ModuleDeps::new(),
+                annotations: &Default::default(),
             },
             &Facts::default(),
             &sql_server,

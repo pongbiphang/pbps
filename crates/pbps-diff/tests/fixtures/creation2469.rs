@@ -209,22 +209,38 @@ impl Fixture {
             schema: base,
             ids: base_ids,
         };
-        pbps_diff::order::deployment::schedule::diff_annotated(
+        let mut hints = Hints::default();
+        hints.annotations.declared = deps.clone();
+        let planned = pbps_diff::diff(
             before,
+            pbps_diff::Side {
+                schema: &self.schema,
+                ids: &self.ids,
+            },
+            engine,
+            &hints,
+        )
+        .map_err(|errors| {
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        pbps_diff::order::deployment::schedule::schedule(
+            planned,
             &Declarations {
                 schema: &self.schema,
                 sources: Sources {
                     before,
                     after: &self.ids,
                 },
-                module_deps: &Default::default(),
+                annotations: &hints.annotations,
             },
-            &Hints::default(),
-            &ObjectDeps::default(),
-            deps,
             &Facts::default(),
             engine,
         )
         .map(|s| s.changes)
+        .map_err(|e| e.to_string())
     }
 }

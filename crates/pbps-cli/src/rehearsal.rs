@@ -268,7 +268,7 @@ pub fn lower_between<D: crate::emission::Engine>(
         &crate::dependents::schedule::Declarations {
             schema,
             sources: crate::dependents::Sources { before, after: ids },
-            module_deps: &hints.module_deps,
+            annotations: &hints.annotations,
         },
         &crate::dependents::schedule::Facts::default(),
         dialect,

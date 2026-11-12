@@ -45,6 +45,9 @@ pub struct Contract {
     demanded: BTreeMap<Root, BTreeSet<ObjectRef>>,
     creation: BTreeMap<pbps_model::operation::Source, (BTreeSet<ObjectRef>, Creation)>,
     pub(crate) extended: bool,
+    /// Refusals of the differ that an annotation edge may discharge after
+    /// scheduling, because the discharge reads the settled order.
+    pub(crate) deferred: Vec<crate::DiffError>,
 }
 
 fn containing(declaration: &Declaration) -> Result<ObjectRef, String> {
@@ -304,6 +307,7 @@ impl Contract {
             labels,
             demanded,
             extended,
+            deferred: Vec::new(),
         })
     }
 

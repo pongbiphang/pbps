@@ -82,6 +82,58 @@ impl ObjectDeps {
         )
     }
 
+    /// Whether every reference is module to module, the only shape the saved
+    /// plan and the state can write today.
+    pub fn is_legacy(&self) -> bool {
+        let module = |r: &ObjectRef| r.module_id().is_some();
+        self.0
+            .iter()
+            .all(|(owner, targets)| module(owner) && targets.iter().all(module))
+    }
+
+    /// The module-to-module references, as the ordering passes read them. A
+    /// reference with another kind of owner or target is not here: the
+    /// passes take no part in it, the transient contract does (DEC-2469.3).
+    pub fn modules(&self) -> ModuleDeps {
+        let mut out = ModuleDeps::new();
+        for (owner, targets) in &self.0 {
+            let Some(id) = owner.module_id() else {
+                continue;
+            };
+            out.entry(id.clone())
+                .or_default()
+                .extend(targets.iter().filter_map(|t| t.module_id().cloned()));
+        }
+        out
+    }
+
+    /// Sets the targets of one module owner, replacing what it listed before.
+    pub fn insert_module(&mut self, owner: ModuleId, targets: BTreeSet<ModuleId>) {
+        let owner = ObjectRef::whole(Root::Module(owner));
+        let targets = targets
+            .into_iter()
+            .map(|t| ObjectRef::whole(Root::Module(t)))
+            .collect();
+        match self.0.iter_mut().find(|(o, _)| *o == owner) {
+            Some((_, old)) => *old = targets,
+            None => self.0.push((owner, targets)),
+        }
+    }
+
+    /// Rewrites every module reference through `spell`, leaving the others.
+    pub fn map_modules(&self, spell: impl Fn(&ModuleId) -> ModuleId) -> Self {
+        let map = |r: &ObjectRef| match r.module_id() {
+            Some(id) => ObjectRef::whole(Root::Module(spell(id))),
+            None => r.clone(),
+        };
+        Self(
+            self.0
+                .iter()
+                .map(|(owner, targets)| (map(owner), targets.iter().map(map).collect()))
+                .collect(),
+        )
+    }
+
     /// This is the only write adapter until non-module persistence is enabled.
     pub fn to_legacy(&self) -> Result<ModuleDeps, Problem> {
         let mut out = ModuleDeps::new();
@@ -103,6 +155,133 @@ impl ObjectDeps {
             out.insert(id.clone(), targets);
         }
         Ok(out)
+    }
+}
+
+/// The annotations a plan is made under, declared and recorded kept apart.
+///
+/// # Why two sets and not one merged set
+///
+/// The declared set is the goal and the recorded set is the baseline; the
+/// registry binds each against its own schema, and a merged set cannot
+/// validate as either (DEC-2469.6). The ordering passes still read one
+/// module-only view, which [`Annotations::modules`] derives, so that exists
+/// in exactly one place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Annotations {
+    /// What the declarations say now.
+    pub declared: ObjectDeps,
+    /// What the state recorded when the baseline was last written.
+    pub recorded: ObjectDeps,
+}
+
+impl Annotations {
+    /// Whether some declared or recorded reference is not module to module:
+    /// only then does a plan need the general route (`Contract`).
+    pub fn is_extended(&self) -> bool {
+        !self.declared.is_legacy() || !self.recorded.is_legacy()
+    }
+
+    /// The module-only view the ordering passes read: every declared edge,
+    /// and the recorded edges of a module the declarations no longer have. A
+    /// module still declared owns its current `depends_on:`; one that dropped
+    /// an edge has dropped it, and carrying the old edge beside a reversed new
+    /// one made a cycle the declarations do not hold (#2083 review).
+    pub fn modules(&self, declared: &Schema) -> ModuleDeps {
+        let mut out = self.declared.modules();
+        for (owner, targets) in self.recorded.modules() {
+            if !declared.modules.contains_key(&owner) {
+                out.insert(owner, targets);
+            }
+        }
+        out
+    }
+
+    /// The annotations of the baseline: the recorded entries win over the
+    /// declared ones, because a kept module was written under the annotation
+    /// it was recorded with (a rehearsal rebuilds the base as the target
+    /// holds it).
+    pub fn baseline(&self) -> Self {
+        let mut declared = self.declared.clone();
+        for (owner, targets) in &self.recorded.0 {
+            match declared.0.iter_mut().find(|(o, _)| o == owner) {
+                Some((_, old)) => old.clone_from(targets),
+                None => declared.0.push((owner.clone(), targets.clone())),
+            }
+        }
+        Self {
+            declared,
+            recorded: self.recorded.clone(),
+        }
+    }
+
+    /// Records what the state held when the baseline was written. This is
+    /// the single place the baseline side is set; [`Annotations::modules`]
+    /// derives every merged view from it.
+    pub fn record(&mut self, recorded: ObjectDeps) {
+        self.recorded = recorded;
+    }
+
+    /// The declared annotations as the saved plan and the state write them.
+    /// Both persist `module_deps` until a PR changes the wire (#2469 C3b), so
+    /// a reference that cannot be written that way is refused here, by name,
+    /// rather than dropped: a plan that silently lost an edge would order
+    /// differently when it is applied.
+    pub fn wire(&self) -> Result<ModuleDeps, String> {
+        self.declared.to_legacy().map_err(|problem| {
+            // `to_legacy` fails only on these two; any other would be a bug
+            // in it, and its own text still names the reference.
+            let named = match &problem {
+                Problem::WrongSelector(r) | Problem::DuplicateOwner(r) => r.shown().to_string(),
+                Problem::UnknownOwner(_)
+                | Problem::UnknownTarget(_)
+                | Problem::MissingPart(_)
+                | Problem::Ambiguous(_)
+                | Problem::SelfDependency(_)
+                | Problem::Cycle(_)
+                | Problem::OutsideDatabase(_)
+                | Problem::Unrecorded { .. } => problem.to_string(),
+            };
+            format!(
+                "`{named}` cannot be saved in a plan or the state yet: they record module-to-module \
+                 `depends_on` annotations only"
+            )
+        })
+    }
+
+    /// What the registry finds wrong with the declared annotations that the
+    /// module-only checks (`module::check_dependencies`, `dependency_cycles`)
+    /// cannot say.
+    ///
+    /// # Why the module-only subset is subtracted, not a rule per kind
+    ///
+    /// The legacy findings are exactly what the registry yields for the
+    /// module-to-module subset alone, so those are removed (one occurrence
+    /// each) from the findings over the whole set. Classifying by the failing
+    /// reference instead hid `table::app.t -> module::app.missing`: the missing
+    /// target is a module, yet no legacy check ever sees an edge whose owner is
+    /// a table. A module edge and a mixed edge that fail on the same target
+    /// each keep their own report.
+    pub fn extended_problems(&self, schema: &Schema) -> Vec<Problem> {
+        let registry = Registry::new(schema);
+        let mut legacy =
+            registry.validate(&ObjectDeps::from_legacy(&self.declared.modules()), None);
+        registry
+            .validate(&self.declared, None)
+            .into_iter()
+            .filter(|problem| match legacy.iter().position(|l| l == problem) {
+                Some(at) => {
+                    legacy.swap_remove(at);
+                    false
+                }
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Declares the targets of one module, as its file lists them.
+    pub fn declare_module(&mut self, owner: ModuleId, targets: BTreeSet<ModuleId>) {
+        self.declared.insert_module(owner, targets);
     }
 }
 

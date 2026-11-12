@@ -5957,7 +5957,7 @@ async fn scratch_generated_table_parts_compile_literal_and_collision_names_befor
                 let version = engine::generation_version(&mut conn).await.map_err(anyhow::Error::msg)?;
                 let pg = pbps_pg::Postgres::new().with_server_version(version);
                 let mut reconstruction = engine::reconstruction(Driver::Postgres, &[],
-                    inputs.binding().bootstrap, inputs.desired().ids, &inputs.hints.module_deps, version)
+                    inputs.binding().bootstrap, inputs.desired().ids, &inputs.hints.annotations.modules(inputs.desired().schema), version)
                     .map_err(anyhow::Error::msg)?;
                 let compiled = reconstruction.compile(&pg, &pbps_model::SessionZone::utc(), &mut conn).await;
                 if case == "missing" {

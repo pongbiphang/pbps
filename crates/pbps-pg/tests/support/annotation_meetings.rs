@@ -185,7 +185,7 @@ pub fn canonical(
                 before,
                 after: &s.ids,
             },
-            module_deps: &Default::default(),
+            annotations: &Default::default(),
         },
         &facts,
         &pg,

@@ -126,7 +126,7 @@ fn scheduled(
                 },
                 after: &ids,
             },
-            module_deps: &ModuleDeps::new(),
+            annotations: &Default::default(),
         },
         &super::super::schedule::Facts::default(),
         pg,

@@ -403,7 +403,7 @@ fn load_from_git(
             // nothing from it but the state itself (ADR-0002).
             Ok(pbps_load::LoadedFile::Module(m)) => {
                 if !m.depends_on.is_empty() {
-                    hints.module_deps.insert(m.id.clone(), m.depends_on);
+                    hints.annotations.declare_module(m.id.clone(), m.depends_on);
                 }
                 schema.modules.insert(m.id, m.module);
                 count += 1;

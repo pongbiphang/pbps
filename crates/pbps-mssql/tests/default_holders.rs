@@ -101,7 +101,7 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
                 },
                 after: &ids,
             },
-            module_deps: &Default::default(),
+            annotations: &Default::default(),
         };
         let done = order::deployment::schedule::schedule(
             order::propose(changes),
@@ -209,7 +209,7 @@ fn an_existing_default_change_is_split_once_and_no_facts_add_no_release() {
             },
             after: &ids,
         },
-        module_deps: &Default::default(),
+        annotations: &Default::default(),
     };
     let done = order::deployment::schedule::schedule(
         order::propose(changes),
@@ -245,7 +245,7 @@ fn an_existing_default_change_is_split_once_and_no_facts_add_no_release() {
             },
             after: &ids,
         },
-        module_deps: &Default::default(),
+        annotations: &Default::default(),
     };
     let done = order::deployment::schedule::schedule(
         order::propose(changes),
@@ -338,7 +338,7 @@ fn default_consumer_order(update: bool) {
                 },
                 after: &ids,
             },
-            module_deps: &Default::default(),
+            annotations: &Default::default(),
         };
         let done = order::deployment::schedule::schedule(
             order::propose(changes),

@@ -1,7 +1,7 @@
 //! Declaration addresses and their recorded identities, outside Schema (DEC-2469.1).
 
 mod registry;
-pub use registry::{BoundRoot, ObjectDeps, Problem, Registry};
+pub use registry::{Annotations, BoundRoot, ObjectDeps, Problem, Registry};
 
 use crate::operation::PartKey;
 use crate::{ColumnRef, ModuleId, RoleName, TableName, TypeRef};

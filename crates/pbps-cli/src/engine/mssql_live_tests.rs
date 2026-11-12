@@ -73,7 +73,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         assert!(before.tables.is_empty() && after.tables.is_empty());
         let mut plan = order::propose(changes);
         let ids = IdsFile::default();
-        let dependencies = Default::default();
+        let dependencies = pbps_model::object_ref::Annotations::default();
         let declarations = crate::dependents::schedule::Declarations {
             schema: &after,
             sources: crate::dependents::Sources {
@@ -83,7 +83,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
                 },
                 after: &ids,
             },
-            module_deps: &dependencies,
+            annotations: &dependencies,
         };
         // This is the shipping connected pass. Neither computed-column read
         // runs; its existing object-name comparison must still cover calls.
@@ -318,7 +318,7 @@ async fn the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ord
             captured,
         )
     };
-    let dependencies = Default::default();
+    let dependencies = pbps_model::object_ref::Annotations::default();
     let declarations = crate::dependents::schedule::Declarations {
         schema: &after,
         sources: crate::dependents::Sources {
@@ -328,7 +328,7 @@ async fn the_connected_settlement_of_a_resolver_plan_keeps_the_bindings_that_ord
             },
             after: &ids,
         },
-        module_deps: &dependencies,
+        annotations: &dependencies,
     };
     let mut ordered = plan_with(&captured)
         .expect("planned from the capture")

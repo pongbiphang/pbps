@@ -92,7 +92,7 @@ pub(super) fn identity_meeting_refusal(major: i64) {
                         before: a,
                         after: &ids,
                     },
-                    module_deps: &Default::default(),
+                    annotations: &Default::default(),
                 },
                 &pbps_diff::order::deployment::schedule::Facts::default()
                     .with_policy_dependents(&policies)

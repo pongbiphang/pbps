@@ -340,7 +340,7 @@ pub(crate) fn observe_plan(
         base,
         desired,
         dialect,
-        &hints.module_deps,
+        &hints.annotations.modules(desired.schema),
         changes,
         &operations,
         Stage::BeforeSchedule,

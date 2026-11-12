@@ -111,13 +111,16 @@ fn policy_release_schedule(
         operations.as_slice(),
         &effects.effects,
         &pbps_diff::order::Baseline::of(before, &owners),
-        declared.module_deps,
+        &declared.module_deps(),
         pbps_diff::order::Checks::ALL,
     );
     let mut schedule = pbps_diff::order::Schedule::of_graph(&graph, operations.as_slice());
-    for edge in
-        pbps_diff::order::generated::constraints(cs, declared.schema, declared.module_deps, dialect)
-    {
+    for edge in pbps_diff::order::generated::constraints(
+        cs,
+        declared.schema,
+        &declared.module_deps(),
+        dialect,
+    ) {
         schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
     let slots = pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, dialect);

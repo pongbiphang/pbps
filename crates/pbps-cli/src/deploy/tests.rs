@@ -203,6 +203,32 @@ fn bootstrap_requires_each_declared_type_identity() {
 }
 
 #[test]
+fn bootstrap_refuses_to_record_an_annotation_the_state_cannot_hold() {
+    let mut loaded = pbps_load::Loaded::default();
+    loaded.hints.annotations.declared = pbps_model::object_ref::ObjectDeps(vec![(
+        "module::app.v".parse().unwrap(),
+        ["table::app.t".parse().unwrap()].into(),
+    )]);
+    let built = pbps_diff::scope(
+        &Schema::default(),
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let why = bootstrap_record(built, IdsFile::default(), &loaded, "operator").unwrap_err();
+    assert!(why.to_string().contains("table::app.t"), "{why}");
+    // Negative: the same call without the extended reference records.
+    loaded.hints.annotations = Default::default();
+    let built = pbps_diff::scope(
+        &Schema::default(),
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    assert!(bootstrap_record(built, IdsFile::default(), &loaded, "operator").is_ok());
+}
+
+#[test]
 fn bootstrap_records_identified_types_created_on_an_empty_target() {
     for yaml in [
         "enum: app.mood\nvalues: [ok]\n",
@@ -243,7 +269,7 @@ fn bootstrap_records_identified_types_created_on_an_empty_target() {
             checks.insert("positive".into(), "(VALUE > 0)".into());
         }
         let built = pbps_diff::scope(&read_back, &ids, &Default::default(), &Default::default());
-        let snapshot = bootstrap_record(built, ids.clone(), &loaded, "operator");
+        let snapshot = bootstrap_record(built, ids.clone(), &loaded, "operator").unwrap();
         assert_eq!(snapshot.kind, StateKind::Bootstrap);
         assert_eq!(snapshot.ids, ids);
         assert_eq!(snapshot.schema, read_back);

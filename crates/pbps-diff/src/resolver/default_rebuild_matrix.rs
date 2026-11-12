@@ -341,7 +341,7 @@ mod default_rebuild_matrix {
             planned.operations.as_slice(),
             &shadow.effects,
             &baseline,
-            &Hints::default().module_deps,
+            &Default::default(),
         );
         assert!(
             violations.is_empty(),
@@ -675,7 +675,7 @@ mod default_rebuild_matrix {
             &ops,
             &owners,
             &resolution,
-            &hints.module_deps,
+            &hints.annotations.modules(after.schema),
             before,
             after,
             &dialect,
@@ -805,7 +805,7 @@ mod default_rebuild_matrix {
             planned.operations.as_slice(),
             &shadow.effects,
             &baseline,
-            &hints.module_deps,
+            &hints.annotations.modules(after.schema),
         );
         assert!(
             violations.is_empty(),

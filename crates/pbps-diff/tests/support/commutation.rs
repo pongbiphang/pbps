@@ -562,7 +562,7 @@ async fn checked<E: Engine>(
             ids: &p.ids,
         },
     );
-    let declared = &p.desired.hints.module_deps;
+    let declared = &p.desired.hints.annotations.modules(&p.desired.schema);
     let read = commute::read(sides.0, sides.1, dialect, declared, &p.changes, None)?;
     if !read.report.unowned.is_empty() || !read.report.violations.is_empty() {
         return Err(Finding::Harness(format!(
@@ -778,7 +778,7 @@ pub async fn audit<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> (u
             ids: &p.ids,
         },
     );
-    let declared = &p.desired.hints.module_deps;
+    let declared = &p.desired.hints.annotations.modules(&p.desired.schema);
     let name = scenario.name;
     let read = match commute::read(sides.0, sides.1, dialect, declared, &p.changes, None) {
         Ok(read) => read,

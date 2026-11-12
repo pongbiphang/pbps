@@ -310,6 +310,10 @@ Typed portable creation demands stay in planning state (DEC-2469.4).
 `pbps-dialect::creation` selects facets and refines engine-provided recipes using
 existing Changes; engine capability and legal group decisions stay in each
 dialect. The annotation identity wrapper remains shared above `creation_parts`.
-`pbps-diff::order::deployment::schedule::diff_annotated` admits the annotated
-comparison only after canonical scheduling; connected computed-call collation
-checks remain in the SQL Server planning adapter. No persisted model changes.
+The production differ (`pbps-diff::diff` and its variants) attaches the
+annotation contract for extended input, and
+`pbps-diff::order::deployment::schedule::schedule` discharges a deferred
+computed-call refusal only after canonical scheduling; connected computed-call
+collation checks remain in the SQL Server planning adapter. No persisted model
+changes: `Hints` carries `Annotations`, and the saved plan and state still write
+`module_deps` through `Annotations::wire`.

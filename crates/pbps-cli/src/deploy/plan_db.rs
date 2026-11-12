@@ -678,15 +678,10 @@ pub(super) async fn plan_db_selected(
         // annotations so connected planning can still drop dependents first.
         let mut hints = loaded.hints.clone();
         hints.record_row_defaults(&entry.snapshot.schema);
-        for (name, dependencies) in &entry.snapshot.module_deps {
-            if !loaded.schema.modules.contains_key(name) {
-                hints.module_deps.insert(name.clone(), dependencies.clone());
-            }
-        }
         // The rehearsal rebuilds the base as the target holds it, so a kept
         // module is ordered by the annotation it was written under, not by
         // this revision's (see `rehearsal::connected::Plan::base_hints`).
-        let recorded_module_deps = entry.snapshot.module_deps.clone();
+        hints.annotations.record(pbps_model::object_ref::ObjectDeps::from_legacy(&entry.snapshot.module_deps));
         // A rebuilt enum or domain keeps its comment, which `CREATE TYPE` does
         // not copy: it is a fact about the target, read before the differ
         // writes the swap that carries it (DEC-1635.7, DEC-1635.9). So is
@@ -1051,7 +1046,7 @@ pub(super) async fn plan_db_selected(
                     },
                     after: &resolved.ids,
                 },
-                &hints.module_deps,
+                &hints.annotations,
                 role_members.as_ref(),
                 dialect.as_ref(),
                 &rediff,
@@ -1068,7 +1063,7 @@ pub(super) async fn plan_db_selected(
                 pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
                 pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
                 dialect.as_ref(),
-                &hints.module_deps,
+                &hints.annotations.modules(&loaded.schema),
             ).await?;
             // A computed column's function drops after it, by the catalog's
             // edges (DEC-1431.1): before the rename walk, which moves a
@@ -1092,7 +1087,7 @@ pub(super) async fn plan_db_selected(
                         before: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
                         after: &resolved.ids,
                     },
-                    module_deps: &hints.module_deps,
+                    annotations: &hints.annotations,
                 },
             )
             .await?;
@@ -1123,7 +1118,7 @@ pub(super) async fn plan_db_selected(
                     ids: &resolved.ids,
                 },
                 dialect.as_ref(),
-                &hints.module_deps,
+                &hints.annotations.modules(&loaded.schema),
                 &cs,
                 pbps_diff::order::shadow::Stage::Final,
                 Some(
@@ -1564,7 +1559,7 @@ pub(super) async fn plan_db_selected(
                 let ordered = cs.clone().ordered(plan_mode(staged), dialect.as_ref());
                 let lowered = crate::statements(&ordered, &dialect)?;
                 let mut base_hints = hints.clone();
-                base_hints.module_deps.extend(recorded_module_deps.clone());
+                base_hints.annotations = hints.annotations.baseline();
                 // The same refusal the plan meets below, before a rehearsal
                 // can meet the statement instead.
                 if !staged {
@@ -1816,7 +1811,11 @@ pub(super) async fn plan_db_selected(
             cs.changes().clone(),
             resolved.ids,
         );
-        plan.module_deps = loaded.hints.module_deps.clone();
+        plan.module_deps = loaded
+            .hints
+            .annotations
+            .wire()
+            .map_err(anyhow::Error::msg)?;
         plan.dependencies = dependencies;
         plan.git_sha = db::git_sha(project.root());
         // The rows the state recorded after the apply has to cover: the
