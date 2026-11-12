@@ -41,6 +41,10 @@ pub fn supported_files(dialect: &str) {
     let path = base.to_str().unwrap();
     for version in pbps_model::state::OLDEST_READABLE_VERSION..=pbps_model::state::CURRENT_VERSION {
         snapshot["version"] = json!(version);
+        // A row of the current shape names its edges, empty or not (DEC-2469.7).
+        if version >= pbps_model::state::OBJECT_DEPS_VERSION {
+            snapshot["object_deps"] = json!([]);
+        }
         std::fs::write(&base, snapshot.to_string()).unwrap();
         let report: Value = serde_json::from_str(&success(
             &d,

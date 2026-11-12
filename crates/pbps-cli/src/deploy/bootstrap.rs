@@ -248,7 +248,7 @@ pub(super) fn bootstrap_record(
 ) -> anyhow::Result<StateSnapshot> {
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
-    snapshot.module_deps = loaded
+    snapshot.object_deps = loaded
         .hints
         .annotations
         .wire()

@@ -10,6 +10,10 @@ use pbps_model::{
     SavedPlan, Schema, StateKind, StateSnapshot, Table, TableName, Uid, state_checksum,
 };
 
+#[path = "support/historical_state.rs"]
+mod historical_state;
+use historical_state::historical_state;
+
 const NAME: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
@@ -109,7 +113,7 @@ fn hostile_names_keep_master_artifact_bytes_checksums_and_sql() {
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         ("ids.json", serde_json::to_string(&ids).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
-        ("state.json", serde_json::to_string(&state).unwrap()),
+        ("state.json", historical_state(&state)),
         ("state.sha256", state_checksum(&schema, &ids)),
         ("plan.sha256", plan.wire_fingerprint()),
         ("postgres.sql", sql(&plan, &pbps_pg::Postgres::new())),

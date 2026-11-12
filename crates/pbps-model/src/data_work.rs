@@ -157,7 +157,7 @@ mod tests {
         old.version = 33;
         old.git_sha = Some("deployed-branch".into());
         old.plan_checksum = Some("a".repeat(64));
-        let bytes = serde_json::to_string(&old).unwrap();
+        let bytes = crate::state::historical_row(&old);
         let read = StateSnapshot::from_json(&bytes).unwrap();
         assert_eq!(read.version, 33);
         assert!(read.data_work.is_none());
@@ -172,12 +172,12 @@ mod tests {
         assert_eq!(new.version, crate::state::CURRENT_VERSION);
         assert_eq!(new.schema, old.schema);
         assert_eq!(new.ids, old.ids);
-        assert_eq!(new.module_deps, old.module_deps);
+        assert_eq!(new.object_deps, old.object_deps);
         assert_eq!(new.declared, old.declared);
         assert_eq!(new.baseline_evidence, old.baseline_evidence);
         assert!(new.plan_checksum.is_none());
         assert_eq!(new.git_sha.unwrap().raw(), "operator-branch");
-        assert_eq!(serde_json::to_string(&old).unwrap(), bytes);
+        assert_eq!(crate::state::historical_row(&old), bytes);
     }
 
     #[test]

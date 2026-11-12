@@ -1622,7 +1622,8 @@ mod extension_tests {
             "operator",
         );
         let mut json = serde_json::to_value(&old).unwrap();
-        json["version"] = (crate::state::CURRENT_VERSION - 1).into();
+        json["version"] = (crate::state::OBJECT_DEPS_VERSION - 1).into();
+        json.as_object_mut().unwrap().shift_remove("object_deps");
         let back = crate::StateSnapshot::from_json(&json.to_string()).unwrap();
         assert!(back.schema.extensions.is_empty());
         assert!(back.ids.extensions.is_empty());

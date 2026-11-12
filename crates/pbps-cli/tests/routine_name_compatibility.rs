@@ -14,6 +14,7 @@ use pbps_model::{
 #[path = "../src/declaration_file.rs"]
 mod declaration_file;
 
+
 const NAME: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
@@ -90,7 +91,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     plan.module_deps.insert(view, [routine].into());
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.module_deps = plan.module_deps.clone();
+    state.object_deps = pbps_model::object_ref::ObjectEdges::from_legacy(&plan.module_deps);
     state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
@@ -159,7 +160,6 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
             ("plan.json", serde_json::to_string(&plan).unwrap()),
-            ("state.json", serde_json::to_string(&state).unwrap()),
             ("state.sha256", state_checksum(&schema, &state.ids)),
             ("plan.sha256", plan.wire_fingerprint()),
             ("statements.sql", sql),
@@ -183,8 +183,14 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
             serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
             plan
         );
+        // The captured row is the historical input: it carries the edge as
+        // `module_deps`, which no current struct can write, so it is read and
+        // must convert to the edge the fixture builds (DEC-2469.7).
         assert_eq!(
-            StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
+            StateSnapshot::from_json(
+                &std::fs::read_to_string(root.join("state.json")).unwrap()
+            )
+            .unwrap(),
             state
         );
         let (_, mut ordinary, _) = artifacts("ordinary", dialect);
