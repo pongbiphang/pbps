@@ -1052,6 +1052,42 @@ fn a_duplicate_owner_is_refused_by_name_at_the_wire() {
     assert!(two.wire().is_ok());
 }
 
+/// A generic JSON value keeps the last of two members with one name. The list
+/// is read straight from the input, so the typed readers still see the repeat.
+#[test]
+fn a_repeated_member_in_a_saved_edge_is_refused_by_position() {
+    let spelled = |r: &str| serde_json::to_string(&reference(r)).unwrap();
+    let (t, v, base) = (
+        spelled("table::app.t"),
+        spelled("module::app.v"),
+        spelled("module::app.base"),
+    );
+    let refused = |text: String| {
+        serde_json::from_str::<ObjectEdges>(&text)
+            .unwrap_err()
+            .to_string()
+    };
+    // A member of the pair twice, in the second edge.
+    let why = refused(format!(
+        r#"[{{"owner":{t},"target":{v}}},{{"owner":{v},"owner":{v},"target":{base}}}]"#
+    ));
+    assert!(
+        why.contains("`object_deps` edge 1") && why.contains("duplicate field `owner`"),
+        "{why}"
+    );
+    // A member of a reference twice, in the first edge.
+    let twice = t.replacen(r#""part":"#, r#""part":"whole","part":"#, 1);
+    assert_ne!(twice, t, "the reference has a `part` member to repeat");
+    let why = refused(format!(r#"[{{"owner":{twice},"target":{v}}}]"#));
+    assert!(
+        why.contains("`object_deps` edge 0") && why.contains("duplicate field `part`"),
+        "{why}"
+    );
+    // Negative: the same two edges with every member once are read.
+    let once = format!(r#"[{{"owner":{t},"target":{v}}},{{"owner":{v},"target":{base}}}]"#);
+    assert_eq!(serde_json::from_str::<ObjectEdges>(&once).unwrap().len(), 2);
+}
+
 #[test]
 fn only_findings_about_non_module_references_are_extended_problems() {
     let schema = fixture();
