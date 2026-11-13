@@ -53,7 +53,7 @@ pub(crate) fn uses_in_table(name: &pbps_model::TableName, table: &Table, out: &m
     }
 }
 
-fn uses(schemas: &[&Schema]) -> Vec<Use> {
+pub(crate) fn uses(schemas: &[&Schema]) -> Vec<Use> {
     let mut out = Vec::new();
     if let Some(desired) = schemas.last() {
         for (name, table) in &desired.tables {

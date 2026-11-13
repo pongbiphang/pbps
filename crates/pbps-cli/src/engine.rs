@@ -91,7 +91,10 @@ pub(crate) use collected::*;
 mod profile;
 // The engine's steps of a connected plan, reached at named positions (#2798).
 mod plan_session;
-pub(crate) use plan_session::{Frame, PlanSession};
+pub(crate) use plan_session::{
+    DeclaredTypes, DomainCode, ExtensionSeals, Frame, PlanSession, SealedFacts, ServerLimits,
+    SupportReads, SupportRows, in_contract_order,
+};
 
 /// A scratch baseline may assume only package state the scratch actually holds.
 pub async fn require_scratch_extensions(
@@ -249,127 +252,15 @@ pub async fn recover_failed_staged_validation(
 
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
+#[cfg(test)]
 pub async fn operational_cost(
     conn: &mut Conn,
     cs: &ChangeSet,
     ids: &IdsFile,
 ) -> crate::cost::CostReport {
-    use crate::cost::{ChangeCost, CostReport, Rows};
-    let names = match pbps_model::plan_names::PlanNames::of(&cs.changes, ids) {
-        Ok(names) => names,
-        Err(error) => {
-            return CostReport::Unavailable {
-                engine: profile::profile(conn.driver()).cost_report_engine,
-                reason: format!("operational_cost could not establish plan identities: {error}"),
-            };
-        }
-    };
     match conn.driver() {
-        Driver::Mssql => {
-            use pbps_mssql::estimate as ms;
-            let mut estimates = ms::planned_estimates(&names).into_iter().peekable();
-            if estimates.peek().is_none() && !cs.changes.is_empty() {
-                return CostReport::Unavailable {
-                    engine: "sqlserver",
-                    reason: "operational_cost currently measures SQL Server column type and nullability changes and clustered index changes; this plan contains none".to_owned(),
-                };
-            }
-            let mut changes = Vec::with_capacity(cs.changes.len());
-            for change_index in 0..cs.changes.len() {
-                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index)
-                else {
-                    changes.push(ChangeCost::Unavailable {
-                        change_index,
-                        reason: "operational_cost has no measurement for this SQL Server change"
-                            .to_owned(),
-                    });
-                    continue;
-                };
-                if let Err(error) = ms::against(conn, &mut e).await {
-                    changes.push(ChangeCost::Unavailable {
-                        change_index,
-                        reason: format!(
-                            "operational_cost could not read SQL Server catalog context: {error}"
-                        ),
-                    });
-                    continue;
-                }
-                changes.push(ChangeCost::Available {
-                    change_index,
-                    about: e.about,
-                    table: e.table.raw().to_string(),
-                    rewrite: e.rewrite.into(),
-                    reads: e.reads.into(),
-                    lock: e.lock.to_owned(),
-                    blocks: e.blocks.to_owned(),
-                    also_locks: Vec::new(),
-                    rows: match e.rows {
-                        Some(count) => Rows::Estimated { count },
-                        None => Rows::Unknown {
-                            reason: e.rows_unknown.unwrap_or_else(|| {
-                                "no catalog row estimate is available".to_owned()
-                            }),
-                        },
-                    },
-                });
-            }
-            CostReport::Available {
-                engine: "sqlserver",
-                changes,
-            }
-        }
-        Driver::Postgres => {
-            use pbps_pg::estimate as pg;
-            let mut estimates = pg::planned_estimates(&names).into_iter().peekable();
-            let mut changes = Vec::with_capacity(cs.changes.len());
-            for change_index in 0..cs.changes.len() {
-                let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index)
-                else {
-                    changes.push(ChangeCost::Unavailable {
-                        change_index,
-                        reason: "operational_cost has no measurement for this PostgreSQL change"
-                            .to_owned(),
-                    });
-                    continue;
-                };
-                if let Err(error) = pg::against(conn, &mut e).await {
-                    changes.push(ChangeCost::Unavailable {
-                        change_index,
-                        reason: format!(
-                            "operational_cost could not read PostgreSQL catalog context: {error}"
-                        ),
-                    });
-                    continue;
-                }
-                changes.push(ChangeCost::Available {
-                    change_index,
-                    about: e.about,
-                    table: e.table.raw().to_string(),
-                    rewrite: e.rewrite.into(),
-                    reads: e.reads.into(),
-                    lock: e.lock.to_string(),
-                    blocks: e.lock.blocks().to_owned(),
-                    also_locks: e
-                        .also_locks
-                        .iter()
-                        .map(|name| name.raw().to_string())
-                        .collect(),
-                    rows: match e.rows {
-                        Some(pg::Rows::Estimated(count)) => Rows::Estimated { count },
-                        Some(pg::Rows::NeverAnalyzed) => Rows::NeverAnalyzed,
-                        None => Rows::Unknown {
-                            reason: e.rows_unknown.unwrap_or_else(|| {
-                                "no catalog row estimate is available".to_owned()
-                            }),
-                        },
-                    },
-                });
-            }
-            CostReport::Available {
-                engine: "postgres",
-                changes,
-            }
-        }
+        Driver::Postgres => plan_session::postgres::operational_cost(conn, cs, ids).await,
+        Driver::Mssql => plan_session::mssql::operational_cost(conn, cs, ids).await,
     }
 }
 
@@ -798,20 +689,10 @@ pub async fn unsupported_temporal(
     conn: &mut Conn,
     changes: &ChangeSet,
 ) -> anyhow::Result<Vec<String>> {
-    if conn.driver() != Driver::Mssql || !pbps_mssql::temporal::needs_the_question(changes) {
+    if conn.driver() != Driver::Mssql {
         return Ok(Vec::new());
     }
-    if pbps_mssql::temporal::has_history_retention(conn).await? {
-        return Ok(Vec::new());
-    }
-    let versioned = if pbps_mssql::temporal::needs_the_catalog(changes) {
-        pbps_mssql::temporal::system_versioned_tables(conn).await?
-    } else {
-        Default::default()
-    };
-    Ok(pbps_mssql::temporal::refused_without_retention(
-        changes, &versioned,
-    ))
+    plan_session::mssql::unsupported_temporal(conn, changes).await
 }
 
 /// The refusal [`unsupported_temporal`]'s problems make, if there are any.
@@ -1429,23 +1310,8 @@ pub async fn edition_verdict(
     changes: &ChangeSet,
 ) -> Result<EditionVerdict, DbError> {
     match conn.driver() {
-        Driver::Mssql => {
-            let edition = pbps_mssql::edition::edition(conn).await?;
-            Ok(EditionVerdict {
-                refused_online: pbps_mssql::edition::online_not_supported(changes, &edition),
-                runs: edition.name().to_owned(),
-                warnings: pbps_mssql::edition::size_of_data_warnings(changes, &edition),
-            })
-        }
-        // No editions, so no hint is refused for one and no addition is
-        // metadata-only elsewhere and a rewrite here: whether a PostgreSQL
-        // change rewrites the table is the type's question, and the pure
-        // dialect answers it at plan time (ADR-0012, `pbps_pg::estimate`).
-        Driver::Postgres => Ok(EditionVerdict {
-            refused_online: Vec::new(),
-            runs: "PostgreSQL".to_owned(),
-            warnings: Vec::new(),
-        }),
+        Driver::Mssql => plan_session::mssql::edition_verdict(conn, changes).await,
+        Driver::Postgres => Ok(plan_session::postgres::edition_verdict()),
     }
 }
 
@@ -1458,6 +1324,20 @@ pub struct ConnectedCheck {
     pub message: String,
 }
 
+/// Whether the plan gives a domain a check or NOT NULL it did not have: the
+/// change whose scan `check_domain_alterations` reports.
+pub(in crate::engine) fn tightens_a_domain(changes: &ChangeSet) -> bool {
+    changes.changes.iter().any(|p| {
+        matches!(
+            p.change,
+            pbps_model::Change::AlterDomain {
+                half: pbps_model::DomainHalf::Tighten,
+                ..
+            }
+        )
+    })
+}
+
 /// What a tightened domain validates, and a refusal where the engine would
 /// refuse (DEC-1635.8). `None` when no domain in the plan gains a check or
 /// NOT NULL, so a plan without one reports nothing new.
@@ -1466,44 +1346,10 @@ pub async fn check_domain_alterations(
     changes: &ChangeSet,
     stored: &pbps_model::IdsFile,
 ) -> anyhow::Result<Option<ConnectedCheck>> {
-    if conn.driver() != Driver::Postgres
-        || !changes.changes.iter().any(|p| {
-            matches!(
-                p.change,
-                pbps_model::Change::AlterDomain {
-                    half: pbps_model::DomainHalf::Tighten,
-                    ..
-                }
-            )
-        })
-    {
+    if conn.driver() != Driver::Postgres {
         return Ok(None);
     }
-    let tightened = pbps_pg::domain_alter::census(conn, changes, stored)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let message = tightened
-        .scans
-        .iter()
-        .map(|(domain, tables)| {
-            if tables.is_empty() {
-                format!("{} validates no table (no column uses it)", domain.shown())
-            } else {
-                format!(
-                    "{} validates every row of {} under a lock held to commit",
-                    domain.shown(),
-                    tables.join(", ")
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Ok(Some(ConnectedCheck {
-        name: "domain-validation",
-        engine: "PostgreSQL",
-        status: "listed",
-        message,
-    }))
+    plan_session::postgres::check_domain_alterations(conn, changes, stored).await
 }
 
 /// Predict existing table/column/key DROP dependencies in the caller's transaction.
@@ -1582,139 +1428,12 @@ pub fn owned_targets(
     owners: &std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
     session_role: &pbps_model::RoleName,
 ) -> anyhow::Result<ConnectedCheck> {
-    // The map is empty on a reader that carries no owner, so the loop would
-    // find nothing anyway — named here so that "this engine was not asked"
-    // reads differently from "this engine was asked and said no".
-    if driver != Driver::Postgres {
-        return Ok(ConnectedCheck {
-            name: "owned_targets",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server grants to an object's owner like any other principal, \
-                      and this reader carries no object owner; the PostgreSQL check for a \
-                      grant no `REVOKE` could ever undo does not apply"
-                .to_owned(),
-        });
-    }
-    // Who will own each target when the `GRANT` runs, which is not always who
-    // owns it now. A plan that creates a target — or replaces one, which this
-    // model spells as a drop and a create — leaves it owned by the role that
-    // ran the statements, **measured** on 18.6: a table created in somebody
-    // else's schema is owned by its creator, not by the schema's owner.
-    //
-    // Both directions matter. Asking the baseline about a replaced object
-    // refuses a valid plan, because the old object's owner is gone with it;
-    // asking it about a created one finds nothing and lets through the grant
-    // whose closing read then refuses the apply.
-    let created: std::collections::BTreeSet<pbps_model::GrantTarget> = changes
-        .changes
-        .iter()
-        .filter_map(|planned| match &planned.change {
-            pbps_model::Change::CreateTable { name, .. } => {
-                Some(pbps_model::GrantTarget::Object(name.clone()))
-            }
-            pbps_model::Change::CreateModule { id, .. } => match id {
-                pbps_model::ModuleId::Routine(r) => {
-                    Some(pbps_model::GrantTarget::Routine(r.clone()))
-                }
-                pbps_model::ModuleId::Named(n) => Some(pbps_model::GrantTarget::Object(n.clone())),
-                // A trigger is not a securable a grant can name.
-                pbps_model::ModuleId::Trigger { .. } => None,
-            },
-            // Every other change either leaves the target where it was or
-            // takes it away, and a grant on something this plan drops is a
-            // different finding.
-            _ => None,
-        })
-        .collect();
-
-    // A rename moves the target without changing who owns it, and the grant
-    // beside it in the same plan names the object as the plan leaves it. The
-    // owner map is keyed by what the read saw, so the question has to be
-    // asked under the earlier name.
-    //
-    // Only tables: a module is replaced rather than renamed, and a role this
-    // dialect does not manage is renamed in the cluster before the plan is
-    // built, so the read already knows it under its new name (DECISIONS 377).
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-
-    let mut impossible = Vec::new();
-    for planned in &changes.changes {
-        let pbps_model::Change::Grant {
-            role,
-            target,
-            permissions,
-        } = &planned.change
-        else {
-            continue;
-        };
-        // An owner neither the plan nor the read supplies is an object this
-        // read did not cover. Absent, not empty — and not something this
-        // check can refuse on.
-        let sequence_created = if let pbps_model::GrantTarget::Sequence(c) = target {
-            created.contains(&pbps_model::GrantTarget::Object(c.table.clone()))
-                || changes.changes.iter().any(|p| {
-                    if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
-                        return table == &c.table && name == &c.name;
-                    }
-                    if let pbps_model::Change::AlterColumnNumbering {
-                        column, from, to, ..
-                    } = &p.change
-                    {
-                        return column == c
-                            && !matches!(from, pbps_model::ValueSource::Sequence(_))
-                            && matches!(to, pbps_model::ValueSource::Sequence(_));
-                    }
-                    false
-                })
-        } else {
-            false
-        };
-        let owner = if created.contains(target) || sequence_created {
-            (!session_role.raw().is_empty()).then_some(session_role)
-        } else {
-            owners.get(&stored_grant_target(&names, target))
-        };
-        if owner == Some(role) {
-            let when = if created.contains(target) || sequence_created {
-                format!(
-                    "role `{role}` will own `{target}`, because this plan creates it and \
-                         the role that runs the statements owns what they create (measured)",
-                    role = role.shown(),
-                    target = target.shown(),
-                )
-            } else {
-                format!(
-                    "role `{role}` owns `{target}`",
-                    role = role.shown(),
-                    target = target.shown(),
-                )
-            };
-            impossible.push(format!(
-                "{when}, so `{}` on it is a grant that cannot change what the role holds: an \
-                 owner already holds every privilege on its own object, and this engine \
-                 records the whole default set rather than the one permission (ADR-0010 §1, \
-                 measured). The pull reads that entry as the zero point rather than a grant \
-                 (DECISIONS 371), so nothing would ever satisfy this line — delete it from \
-                 role `{role}`",
-                permissions
-                    .iter()
-                    .map(|p| p.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                role = role.shown(),
-            ));
+    match driver {
+        Driver::Mssql => Ok(plan_session::mssql::owned_targets()),
+        Driver::Postgres => {
+            plan_session::postgres::owned_targets(changes, ids, owners, session_role)
         }
     }
-    if !impossible.is_empty() {
-        anyhow::bail!("owned_targets (PostgreSQL): {}", impossible.join("\n"));
-    }
-    Ok(ConnectedCheck {
-        name: "owned_targets",
-        engine: "PostgreSQL",
-        status: "passed",
-        message: "no declared grant names a target its own grantee owns".to_owned(),
-    })
 }
 
 /// Refuse a plan that revokes a grant no `REVOKE` from this connection could
@@ -1738,59 +1457,10 @@ pub fn unrevocable_grants(
     ids: &pbps_model::IdsFile,
     unrevocable: &[pbps_db::catalog::Unrevocable],
 ) -> anyhow::Result<ConnectedCheck> {
-    if driver != Driver::Postgres {
-        return Ok(ConnectedCheck {
-            name: "unrevocable_grants",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server's `REVOKE` names its grantor with `AS`, and this reader \
-                      carries no unrevocable grant; the PostgreSQL check for a grant this \
-                      connection could not take away does not apply"
-                .to_owned(),
-        });
+    match driver {
+        Driver::Mssql => Ok(plan_session::mssql::unrevocable_grants()),
+        Driver::Postgres => plan_session::postgres::unrevocable_grants(changes, ids, unrevocable),
     }
-    // A rename moves the target without changing who granted what on it, and
-    // the `Revoke` beside it in the same plan names the object as the plan
-    // leaves it — while this list is keyed by what the read saw. The same
-    // translation `owned_targets` makes, for the same reason: without it a
-    // plan that renames and narrows in one step passes a check that would
-    // refuse either step alone.
-    //
-    // Only tables, again: a module is replaced rather than renamed, and a
-    // schema this dialect does not rename cannot move under a grant.
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-
-    let mut impossible = Vec::new();
-    for planned in &changes.changes {
-        let pbps_model::Change::Revoke {
-            role,
-            target,
-            permissions,
-        } = &planned.change
-        else {
-            continue;
-        };
-        let read_as = stored_grant_target(&names, target);
-        for found in unrevocable {
-            if &found.role == role
-                && found.target == read_as
-                && permissions.contains(&found.permission)
-            {
-                impossible.push(format!("role {role}: {}", found.why, role = role.shown(),));
-            }
-        }
-    }
-    if !impossible.is_empty() {
-        anyhow::bail!("unrevocable_grants (PostgreSQL): {}", impossible.join("\n"));
-    }
-    Ok(ConnectedCheck {
-        name: "unrevocable_grants",
-        engine: "PostgreSQL",
-        status: "passed",
-        message: "every permission this plan revokes is one a `REVOKE` from this connection \
-                  would carry the grantor of"
-            .to_owned(),
-    })
 }
 
 /// Grants on modules and schemas retain their catalog identity; only an
@@ -2453,60 +2123,10 @@ pub async fn generation_support(
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
-    if conn.driver() == Driver::Mssql {
-        return Ok(ConnectedCheck {
-            name: "generation_support",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "this model holds generated columns for PostgreSQL only".to_owned(),
-        });
+    match conn.driver() {
+        Driver::Mssql => Ok(plan_session::mssql::generation_support()),
+        Driver::Postgres => plan_session::postgres::generation_support(conn, changes, ids).await,
     }
-    let mut problems = Vec::new();
-    let expressions: Vec<&pbps_model::ColumnRef> = changes
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let pbps_model::Change::AlterColumnExpression { column, .. } = &p.change {
-                Some(column)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let version = pbps_pg::roles::server_version_num(conn).await?;
-    if !expressions.is_empty() && version < pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN {
-        for column in &expressions {
-            problems.push(format!(
-                "{column}: changing a generated column's expression needs PostgreSQL 17 or \
-                 later (`SET EXPRESSION`), and this server is {version}",
-                column = column.shown()
-            ));
-        }
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    let mut dependences = BTreeMap::new();
-    for p in &changes.changes {
-        if let Some((table, ..)) = changed_column(&names, &p.change)
-            && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
-        {
-            let found = pbps_pg::generated::dependences(conn, e.key()).await?;
-            e.insert(found);
-        }
-    }
-    problems.extend(unreleased(changes, &names, &dependences));
-    if !problems.is_empty() {
-        anyhow::bail!("generation_support (PostgreSQL): {}", problems.join("\n"));
-    }
-    Ok(ConnectedCheck {
-        name: "generation_support",
-        engine: "PostgreSQL",
-        status: "passed",
-        message: format!(
-            "PostgreSQL server_version_num {version}: every generated-column change this plan \
-             makes has an in-place form here, and no column it retypes or drops is one a live \
-             generated column still reads at that point"
-        ),
-    })
 }
 
 /// Policy recipients need not be declared roles: an existing cluster role may
@@ -2565,81 +2185,8 @@ pub async fn permission_support(
     ids: &IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
-        Driver::Mssql => Ok(ConnectedCheck {
-            name: "permission_support",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server permissions are validated by its dialect; the PostgreSQL \
-                      permission-version check does not apply"
-                .to_owned(),
-        }),
-        Driver::Postgres => {
-            let tables = crate::row_security::standing_owners(changes, ids)?;
-            let ownership = pbps_pg::doctor::table_ownership(conn, &tables)
-                .await
-                .map_err(|error| {
-                    anyhow::Error::new(error).context(format!(
-                        "cannot read effective ownership for row-security tables: {}",
-                        tables
-                            .iter()
-                            .map(|table| table.shown().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                })?;
-            for (table, present, owned) in ownership {
-                if !present {
-                    anyhow::bail!(
-                        "{}: standing row-security table is absent; plan again",
-                        table.shown()
-                    );
-                }
-                if !owned {
-                    anyhow::bail!(
-                        "{}: the deployer must own the table to change row-security policies or flags",
-                        table.shown()
-                    );
-                }
-            }
-            refuse_missing_policy_roles(conn, changes).await?;
-            let version = pbps_pg::roles::server_version_num(conn).await?;
-            let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();
-            for planned in &changes.changes {
-                if let pbps_model::Change::Grant {
-                    role,
-                    target,
-                    permissions,
-                } = &planned.change
-                {
-                    roles
-                        .entry(role.clone())
-                        .or_default()
-                        .grants
-                        .entry(target.clone())
-                        .or_default()
-                        .extend(permissions.iter().copied());
-                }
-            }
-            let errors: Vec<String> = roles
-                .iter()
-                .flat_map(|(name, role)| {
-                    pbps_pg::roles::unsupported_permissions(version, name, role)
-                })
-                .map(|error| error.to_string())
-                .collect();
-            if !errors.is_empty() {
-                anyhow::bail!("permission_support (PostgreSQL): {}", errors.join("\n"));
-            }
-            Ok(ConnectedCheck {
-                name: "permission_support",
-                engine: "PostgreSQL",
-                status: "passed",
-                message: format!(
-                    "PostgreSQL server_version_num {version} supports the permissions \
-                                  this plan grants"
-                ),
-            })
-        }
+        Driver::Mssql => Ok(plan_session::mssql::permission_support()),
+        Driver::Postgres => plan_session::postgres::permission_support(conn, changes, ids).await,
     }
 }
 
@@ -5368,31 +4915,6 @@ pub async fn seal_type_pins(
         Driver::Postgres => {
             plan_session::postgres::seal_type_pins(conn, schemas, changes, trusted, pin_routines)
                 .await
-        }
-        Driver::Mssql => plan_session::mssql::seal_type_pins(trusted),
-    }
-}
-
-/// Lifecycle pin collection must retain each reference's side-specific identity.
-pub async fn seal_plan_type_pins(
-    conn: &mut Conn,
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    changes: &ChangeSet,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    pin_routines: bool,
-) -> anyhow::Result<Prerequisites> {
-    match conn.driver() {
-        Driver::Postgres => {
-            plan_session::postgres::seal_plan_type_pins(
-                conn,
-                base,
-                desired,
-                changes,
-                trusted,
-                pin_routines,
-            )
-            .await
         }
         Driver::Mssql => plan_session::mssql::seal_type_pins(trusted),
     }

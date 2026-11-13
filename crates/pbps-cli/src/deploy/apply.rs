@@ -1091,7 +1091,7 @@ pub(super) async fn preflight<D: crate::emission::Engine>(
 /// caller of [`run_probes`] that probes a plan builds it here, so the plan-time
 /// removed-label count and the apply-time probes see the same relation
 /// (#2406).
-pub(super) fn probe_partitions(
+pub(crate) fn probe_partitions(
     stored: &pbps_model::Schema,
     names: &pbps_model::plan_names::PlanNames<'_>,
 ) -> pbps_model::Partitions {

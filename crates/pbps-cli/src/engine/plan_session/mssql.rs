@@ -500,12 +500,180 @@ pub(in crate::engine) async fn role_members(
     Ok(pbps_mssql::catalog::role_members(conn).await?)
 }
 
-/// Nothing crosses positions for SQL Server: its misspelling probe asks
-/// nothing of a type-routine review. A unit struct and not `()`, so the
-/// pipeline's `let mut state = Default::default()` is not a unit binding in
-/// this engine's instantiation of the macro.
-#[derive(Debug, Default)]
-pub(crate) struct PlanState;
+/// The SQL Server body of `operational_cost`.
+pub(in crate::engine) async fn operational_cost(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    ids: &IdsFile,
+) -> crate::cost::CostReport {
+    use crate::cost::{ChangeCost, CostReport, Rows};
+    let names = match pbps_model::plan_names::PlanNames::of(&cs.changes, ids) {
+        Ok(names) => names,
+        Err(error) => {
+            return CostReport::Unavailable {
+                engine: profile::profile(conn.driver()).cost_report_engine,
+                reason: format!("operational_cost could not establish plan identities: {error}"),
+            };
+        }
+    };
+    use pbps_mssql::estimate as ms;
+    let mut estimates = ms::planned_estimates(&names).into_iter().peekable();
+    if estimates.peek().is_none() && !cs.changes.is_empty() {
+        return CostReport::Unavailable {
+            engine: "sqlserver",
+            reason: "operational_cost currently measures SQL Server column type and nullability changes and clustered index changes; this plan contains none".to_owned(),
+        };
+    }
+    let mut changes = Vec::with_capacity(cs.changes.len());
+    for change_index in 0..cs.changes.len() {
+        let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index) else {
+            changes.push(ChangeCost::Unavailable {
+                change_index,
+                reason: "operational_cost has no measurement for this SQL Server change".to_owned(),
+            });
+            continue;
+        };
+        if let Err(error) = ms::against(conn, &mut e).await {
+            changes.push(ChangeCost::Unavailable {
+                change_index,
+                reason: format!(
+                    "operational_cost could not read SQL Server catalog context: {error}"
+                ),
+            });
+            continue;
+        }
+        changes.push(ChangeCost::Available {
+            change_index,
+            about: e.about,
+            table: e.table.raw().to_string(),
+            rewrite: e.rewrite.into(),
+            reads: e.reads.into(),
+            lock: e.lock.to_owned(),
+            blocks: e.blocks.to_owned(),
+            also_locks: Vec::new(),
+            rows: match e.rows {
+                Some(count) => Rows::Estimated { count },
+                None => Rows::Unknown {
+                    reason: e
+                        .rows_unknown
+                        .unwrap_or_else(|| "no catalog row estimate is available".to_owned()),
+                },
+            },
+        });
+    }
+    CostReport::Available {
+        engine: "sqlserver",
+        changes,
+    }
+}
+
+/// SQL Server permissions are validated by its dialect; the PostgreSQL
+/// permission-version check does not apply.
+pub(in crate::engine) fn permission_support() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "permission_support",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server permissions are validated by its dialect; the PostgreSQL \
+                  permission-version check does not apply"
+            .to_owned(),
+    }
+}
+
+/// This model holds generated columns for PostgreSQL only.
+pub(in crate::engine) fn generation_support() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "generation_support",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "this model holds generated columns for PostgreSQL only".to_owned(),
+    }
+}
+
+/// SQL Server grants to an object's owner like any other principal, and its
+/// reader carries no object owner. The owner map is empty on a reader that
+/// carries none, so the loop would find nothing anyway — named so that "this
+/// engine was not asked" reads differently from "this engine was asked and
+/// said no".
+pub(in crate::engine) fn owned_targets() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "owned_targets",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server grants to an object's owner like any other principal, \
+                  and this reader carries no object owner; the PostgreSQL check for a \
+                  grant no `REVOKE` could ever undo does not apply"
+            .to_owned(),
+    }
+}
+
+/// SQL Server's `REVOKE` names its grantor with `AS`, and its reader carries
+/// no unrevocable grant.
+pub(in crate::engine) fn unrevocable_grants() -> ConnectedCheck {
+    ConnectedCheck {
+        name: "unrevocable_grants",
+        engine: "SQL Server",
+        status: "not_applicable",
+        message: "SQL Server's `REVOKE` names its grantor with `AS`, and this reader \
+                  carries no unrevocable grant; the PostgreSQL check for a grant this \
+                  connection could not take away does not apply"
+            .to_owned(),
+    }
+}
+
+/// The SQL Server body of `edition_verdict`, which apply also calls.
+pub(in crate::engine) async fn edition_verdict(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> Result<EditionVerdict, DbError> {
+    let edition = pbps_mssql::edition::edition(conn).await?;
+    Ok(EditionVerdict {
+        refused_online: pbps_mssql::edition::online_not_supported(changes, &edition),
+        runs: edition.name().to_owned(),
+        warnings: pbps_mssql::edition::size_of_data_warnings(changes, &edition),
+    })
+}
+
+/// The SQL Server body of `unsupported_temporal`.
+pub(in crate::engine) async fn unsupported_temporal(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<Vec<String>> {
+    if !pbps_mssql::temporal::needs_the_question(changes) {
+        return Ok(Vec::new());
+    }
+    if pbps_mssql::temporal::has_history_retention(conn).await? {
+        return Ok(Vec::new());
+    }
+    let versioned = if pbps_mssql::temporal::needs_the_catalog(changes) {
+        pbps_mssql::temporal::system_versioned_tables(conn).await?
+    } else {
+        Default::default()
+    };
+    Ok(pbps_mssql::temporal::refused_without_retention(
+        changes, &versioned,
+    ))
+}
+
+/// What SQL Server carries from one position of a plan to a later one: only the
+/// site admission every engine's state holds, which its sites never admit
+/// anything into. Its misspelling probe asks nothing of a type-routine review.
+#[derive(Default)]
+pub(crate) struct PlanState {
+    admission: SiteAdmission,
+}
+
+impl AsRef<SiteAdmission> for PlanState {
+    fn as_ref(&self) -> &SiteAdmission {
+        &self.admission
+    }
+}
+
+impl AsMut<SiteAdmission> for PlanState {
+    fn as_mut(&mut self) -> &mut SiteAdmission {
+        &mut self.admission
+    }
+}
 
 impl PlanSession for pbps_mssql::Mssql {
     type State = PlanState;
@@ -698,7 +866,6 @@ impl PlanSession for pbps_mssql::Mssql {
         &self,
         _state: &mut PlanState,
         conn: &mut Conn,
-        _admission: &SiteAdmission,
         changes: PlanningPlan<S>,
         frame: Frame<'_>,
         role_members: Option<&RoleMembers>,
@@ -766,8 +933,8 @@ impl PlanSession for pbps_mssql::Mssql {
 
     async fn check_final_order(
         &self,
+        _state: &PlanState,
         conn: &mut Conn,
-        _admission: &SiteAdmission,
         changes: &ChangeSet,
         frame: Frame<'_>,
     ) -> anyhow::Result<FinalOrderChecks> {
@@ -788,5 +955,112 @@ impl PlanSession for pbps_mssql::Mssql {
             logical_slots: logical_slots(),
             numbered_column_fills: numbered_column_fills(),
         })
+    }
+
+    async fn vet_plan_sites(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        _on_note: &mut dyn FnMut(String),
+    ) -> anyhow::Result<()> {
+        // SQL Server vets the requirement a drop is guarded by. It records no
+        // conversion's expression and binds no table expression this way.
+        vet_drop_requirements(conn, &state.admission, names).await
+    }
+
+    /// SQL Server has neither enums nor domains, so no row is stranded.
+    async fn probe_stranded_rows(
+        &self,
+        _state: &PlanState,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _frame: Frame<'_>,
+        _progress: Option<&crate::deploy::services::Progress>,
+    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+        Ok(None)
+    }
+
+    async fn support_rows(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _ids: &IdsFile,
+        _reads: SupportReads<'_>,
+    ) -> anyhow::Result<SupportRows> {
+        Ok(SupportRows {
+            permission_support: permission_support(),
+            generation_support: generation_support(),
+            owned_targets: owned_targets(),
+            unrevocable_grants: unrevocable_grants(),
+        })
+    }
+
+    async fn server_limits(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<ServerLimits> {
+        // The edition is a connection-time fact, and it is the only place the
+        // two edition-dependent questions of ADR-0003 can be answered
+        // honestly: whether ONLINE will be accepted at all, and whether an
+        // addition that is metadata-only on Enterprise rewrites every row
+        // here. An offline plan has to assume the conservative answer.
+        let edition = edition_verdict(conn, changes).await?;
+        // A server fact like the edition: 2016 has no history retention and
+        // no cascading key from a system-versioned table (#1502). Answered,
+        // it is a finding, as the edition's is; a failure to ask stays an
+        // error (#1630).
+        let temporal = unsupported_temporal(conn, changes).await?;
+        Ok(ServerLimits { edition, temporal })
+    }
+
+    async fn operational_cost(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> crate::cost::CostReport {
+        operational_cost(conn, changes, ids).await
+    }
+
+    async fn seal_plan_facts(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        project: &pbps_config::Project,
+        target: &crate::db::Target,
+        _frame: Frame<'_>,
+        _changes: &ChangeSet,
+        managed: &BTreeSet<pbps_model::ModuleId>,
+    ) -> anyhow::Result<SealedFacts> {
+        // The sealing step refuses `trusted_roles`; the routine pins that
+        // follow refuse `pin_type_routines` in their own words.
+        let Prerequisites {
+            types: type_pins,
+            providers: provider_pins,
+        } = seal_type_pins(&project.config.trusted_roles)?;
+        let reviewed =
+            crate::pins::seal_selected(conn, project, target, &type_pins, &state.admission).await?;
+        let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
+        Ok(SealedFacts {
+            type_pins,
+            provider_pins,
+            reviewed,
+            routine_pins,
+        })
+    }
+
+    /// SQL Server has no domains.
+    async fn declared_domain_code(
+        &self,
+        _scratch: Option<&mut crate::resolution::Entry<'_>>,
+        _conn: &mut Conn,
+        _target: &crate::db::Target,
+        _project: &pbps_config::Project,
+        _desired: pbps_diff::Side<'_>,
+        _changes: &ChangeSet,
+    ) -> anyhow::Result<DomainCode> {
+        Ok(DomainCode::NotAsked)
     }
 }

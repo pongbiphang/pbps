@@ -220,7 +220,7 @@ pub(super) fn refuse_two_owners(
 /// manifest for, that the declarations also manage a member of, or that a move
 /// would put on a name an unmanaged object holds in the destination, is refused,
 /// never sealed.
-pub(super) async fn extension_change_pins(
+pub(crate) async fn extension_change_pins(
     conn: &mut pbps_db::Conn,
     cs: &pbps_model::ChangeSet,
     manifests: &crate::rehearsal::connected::Manifests,
@@ -377,7 +377,7 @@ pub(crate) async fn extension_drop_facts(
 /// The sealed evidence of each drop: the manifest the target holds now, and
 /// what the drop reaches beyond it that the plan accepted. A package the
 /// target no longer holds as the plan assumed is refused, never sealed.
-pub(super) async fn extension_drop_pins(
+pub(crate) async fn extension_drop_pins(
     conn: &mut pbps_db::Conn,
     cs: &pbps_model::ChangeSet,
 ) -> anyhow::Result<Vec<pbps_model::ExtensionDropPin>> {
@@ -427,7 +427,7 @@ pub(super) async fn extension_drop_pins(
 /// The sealed evidence of each create: the manifest the rehearsal read, after
 /// the check that no member is also an object the declaration manages. A
 /// create the rehearsal did not capture is refused, never sealed empty.
-pub(super) fn extension_pins(
+pub(crate) fn extension_pins(
     cs: &pbps_model::ChangeSet,
     mut manifests: crate::rehearsal::connected::Manifests,
     declared: &Schema,

@@ -71,42 +71,6 @@ pub(crate) fn computed_column_screen(driver: Driver) -> pbps_diff::Screen {
     profile::profile(driver).computed_column_screen
 }
 
-/// Binds the expressions a plan gives a table, to learn which routines the
-/// review admits (DEC-2563.4), and hands `on_note` each note about one that
-/// cannot be bound yet because it uses an object the plan creates.
-///
-/// PostgreSQL binds them in the planning transaction; SQL Server does not
-/// bind table expressions this way.
-pub(crate) async fn table_expression_notes(
-    conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
-    changes: &[pbps_model::PlannedChange],
-    mut on_note: impl FnMut(String),
-) {
-    match conn.driver() {
-        Driver::Postgres => {
-            for planned in changes {
-                let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) =
-                    vet_table_expressions(
-                        conn,
-                        admission,
-                        pbps_pg::pins::Within::OwnTransaction,
-                        pbps_pg::table_expressions::Moment::Early,
-                        &planned.change,
-                    )
-                    .await
-                else {
-                    continue;
-                };
-                for note in notes {
-                    on_note(note);
-                }
-            }
-        }
-        Driver::Mssql => {}
-    }
-}
-
 /// Whether the rows an enum rebuild would strand are counted at plan time.
 ///
 /// PostgreSQL counts the rows that hold a label an enum rebuild removes, or
@@ -114,15 +78,22 @@ pub(crate) async fn table_expression_notes(
 /// so the plan is refused by name and with a count before anything is written
 /// (DEC-1635.7, DEC-1635.9). SQL Server has neither enums nor domains.
 pub(crate) fn counts_rows_an_enum_retype_strands(driver: Driver, changes: &ChangeSet) -> bool {
-    profile::profile(driver).counts_stranded_rows_at_plan_time
-        && changes.changes.iter().any(|p| {
-            matches!(&p.change, pbps_model::Change::EnumRebuild {
-                step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
-            } if match values.as_ref() {
-                pbps_model::ValueChange::Cast { from, to, .. } => from != to,
-                pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
-            })
+    profile::profile(driver).counts_stranded_rows_at_plan_time && enum_retype_strands_rows(changes)
+}
+
+/// Whether the plan retypes an enum so that rows could be stranded: a cast that
+/// changes the labels' meaning, or a relabel that removes one. The selection
+/// the plan-time probes are asked for, shared with the default of
+/// `PlanSession::probe_stranded_rows`.
+pub(crate) fn enum_retype_strands_rows(changes: &ChangeSet) -> bool {
+    changes.changes.iter().any(|p| {
+        matches!(&p.change, pbps_model::Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
+        } if match values.as_ref() {
+            pbps_model::ValueChange::Cast { from, to, .. } => from != to,
+            pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
         })
+    })
 }
 
 /// Whether planning vets declared domain `CHECK` and `DEFAULT` code on the

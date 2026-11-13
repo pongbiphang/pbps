@@ -26,6 +26,22 @@ pub(crate) struct PlanState {
     /// The verifier of a table rebuild the schedule expanded, run once every
     /// pass that orders the plan has (#1954).
     rebuild_verification: Option<RebuildVerification>,
+    /// The one admission rule of every site that runs code the plan holds
+    /// (DEC-2563.2): the routines the sites vet are admitted into it, and the
+    /// plan shows and pins them when it seals.
+    admission: SiteAdmission,
+}
+
+impl AsRef<SiteAdmission> for PlanState {
+    fn as_ref(&self) -> &SiteAdmission {
+        &self.admission
+    }
+}
+
+impl AsMut<SiteAdmission> for PlanState {
+    fn as_mut(&mut self) -> &mut SiteAdmission {
+        &mut self.admission
+    }
 }
 
 pub(in crate::engine) async fn seal_type_pins(
@@ -852,6 +868,455 @@ pub(in crate::engine) fn require_transactional_rebuilds(
     })
 }
 
+/// The PostgreSQL body of `operational_cost`.
+pub(in crate::engine) async fn operational_cost(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    ids: &IdsFile,
+) -> crate::cost::CostReport {
+    use crate::cost::{ChangeCost, CostReport, Rows};
+    let names = match pbps_model::plan_names::PlanNames::of(&cs.changes, ids) {
+        Ok(names) => names,
+        Err(error) => {
+            return CostReport::Unavailable {
+                engine: profile::profile(conn.driver()).cost_report_engine,
+                reason: format!("operational_cost could not establish plan identities: {error}"),
+            };
+        }
+    };
+    use pbps_pg::estimate as pg;
+    let mut estimates = pg::planned_estimates(&names).into_iter().peekable();
+    let mut changes = Vec::with_capacity(cs.changes.len());
+    for change_index in 0..cs.changes.len() {
+        let Some((_, mut e)) = estimates.next_if(|(index, _)| *index == change_index) else {
+            changes.push(ChangeCost::Unavailable {
+                change_index,
+                reason: "operational_cost has no measurement for this PostgreSQL change".to_owned(),
+            });
+            continue;
+        };
+        if let Err(error) = pg::against(conn, &mut e).await {
+            changes.push(ChangeCost::Unavailable {
+                change_index,
+                reason: format!(
+                    "operational_cost could not read PostgreSQL catalog context: {error}"
+                ),
+            });
+            continue;
+        }
+        changes.push(ChangeCost::Available {
+            change_index,
+            about: e.about,
+            table: e.table.raw().to_string(),
+            rewrite: e.rewrite.into(),
+            reads: e.reads.into(),
+            lock: e.lock.to_string(),
+            blocks: e.lock.blocks().to_owned(),
+            also_locks: e
+                .also_locks
+                .iter()
+                .map(|name| name.raw().to_string())
+                .collect(),
+            rows: match e.rows {
+                Some(pg::Rows::Estimated(count)) => Rows::Estimated { count },
+                Some(pg::Rows::NeverAnalyzed) => Rows::NeverAnalyzed,
+                None => Rows::Unknown {
+                    reason: e
+                        .rows_unknown
+                        .unwrap_or_else(|| "no catalog row estimate is available".to_owned()),
+                },
+            },
+        });
+    }
+    CostReport::Available {
+        engine: "postgres",
+        changes,
+    }
+}
+
+/// The PostgreSQL body of `permission_support`, which apply and bootstrap also call.
+pub(in crate::engine) async fn permission_support(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &IdsFile,
+) -> anyhow::Result<ConnectedCheck> {
+    let tables = crate::row_security::standing_owners(changes, ids)?;
+    let ownership = pbps_pg::doctor::table_ownership(conn, &tables)
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "cannot read effective ownership for row-security tables: {}",
+                tables
+                    .iter()
+                    .map(|table| table.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+    for (table, present, owned) in ownership {
+        if !present {
+            anyhow::bail!(
+                "{}: standing row-security table is absent; plan again",
+                table.shown()
+            );
+        }
+        if !owned {
+            anyhow::bail!(
+                "{}: the deployer must own the table to change row-security policies or flags",
+                table.shown()
+            );
+        }
+    }
+    refuse_missing_policy_roles(conn, changes).await?;
+    let version = pbps_pg::roles::server_version_num(conn).await?;
+    let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();
+    for planned in &changes.changes {
+        if let pbps_model::Change::Grant {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        {
+            roles
+                .entry(role.clone())
+                .or_default()
+                .grants
+                .entry(target.clone())
+                .or_default()
+                .extend(permissions.iter().copied());
+        }
+    }
+    let errors: Vec<String> = roles
+        .iter()
+        .flat_map(|(name, role)| pbps_pg::roles::unsupported_permissions(version, name, role))
+        .map(|error| error.to_string())
+        .collect();
+    if !errors.is_empty() {
+        anyhow::bail!("permission_support (PostgreSQL): {}", errors.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "permission_support",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: format!(
+            "PostgreSQL server_version_num {version} supports the permissions \
+                          this plan grants"
+        ),
+    })
+}
+
+/// The PostgreSQL body of `generation_support`, which apply also calls.
+pub(in crate::engine) async fn generation_support(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<ConnectedCheck> {
+    let mut problems = Vec::new();
+    let expressions: Vec<&pbps_model::ColumnRef> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::AlterColumnExpression { column, .. } = &p.change {
+                Some(column)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let version = pbps_pg::roles::server_version_num(conn).await?;
+    if !expressions.is_empty() && version < pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN {
+        for column in &expressions {
+            problems.push(format!(
+                "{column}: changing a generated column's expression needs PostgreSQL 17 or \
+                 later (`SET EXPRESSION`), and this server is {version}",
+                column = column.shown()
+            ));
+        }
+    }
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let mut dependences = BTreeMap::new();
+    for p in &changes.changes {
+        if let Some((table, ..)) = changed_column(&names, &p.change)
+            && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
+        {
+            let found = pbps_pg::generated::dependences(conn, e.key()).await?;
+            e.insert(found);
+        }
+    }
+    problems.extend(unreleased(changes, &names, &dependences));
+    if !problems.is_empty() {
+        anyhow::bail!("generation_support (PostgreSQL): {}", problems.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "generation_support",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: format!(
+            "PostgreSQL server_version_num {version}: every generated-column change this plan \
+             makes has an in-place form here, and no column it retypes or drops is one a live \
+             generated column still reads at that point"
+        ),
+    })
+}
+
+/// The PostgreSQL body of `owned_targets`, which apply and bootstrap also call.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(in crate::engine) fn owned_targets(
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
+    session_role: &pbps_model::RoleName,
+) -> anyhow::Result<ConnectedCheck> {
+    // Who will own each target when the `GRANT` runs, which is not always who
+    // owns it now. A plan that creates a target — or replaces one, which this
+    // model spells as a drop and a create — leaves it owned by the role that
+    // ran the statements, **measured** on 18.6: a table created in somebody
+    // else's schema is owned by its creator, not by the schema's owner.
+    //
+    // Both directions matter. Asking the baseline about a replaced object
+    // refuses a valid plan, because the old object's owner is gone with it;
+    // asking it about a created one finds nothing and lets through the grant
+    // whose closing read then refuses the apply.
+    let created: std::collections::BTreeSet<pbps_model::GrantTarget> = changes
+        .changes
+        .iter()
+        .filter_map(|planned| match &planned.change {
+            pbps_model::Change::CreateTable { name, .. } => {
+                Some(pbps_model::GrantTarget::Object(name.clone()))
+            }
+            pbps_model::Change::CreateModule { id, .. } => match id {
+                pbps_model::ModuleId::Routine(r) => {
+                    Some(pbps_model::GrantTarget::Routine(r.clone()))
+                }
+                pbps_model::ModuleId::Named(n) => Some(pbps_model::GrantTarget::Object(n.clone())),
+                // A trigger is not a securable a grant can name.
+                pbps_model::ModuleId::Trigger { .. } => None,
+            },
+            // Every other change either leaves the target where it was or
+            // takes it away, and a grant on something this plan drops is a
+            // different finding.
+            _ => None,
+        })
+        .collect();
+
+    // A rename moves the target without changing who owns it, and the grant
+    // beside it in the same plan names the object as the plan leaves it. The
+    // owner map is keyed by what the read saw, so the question has to be
+    // asked under the earlier name.
+    //
+    // Only tables: a module is replaced rather than renamed, and a role this
+    // dialect does not manage is renamed in the cluster before the plan is
+    // built, so the read already knows it under its new name (DECISIONS 377).
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Grant {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        // An owner neither the plan nor the read supplies is an object this
+        // read did not cover. Absent, not empty — and not something this
+        // check can refuse on.
+        let sequence_created = if let pbps_model::GrantTarget::Sequence(c) = target {
+            created.contains(&pbps_model::GrantTarget::Object(c.table.clone()))
+                || changes.changes.iter().any(|p| {
+                    if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
+                        return table == &c.table && name == &c.name;
+                    }
+                    if let pbps_model::Change::AlterColumnNumbering {
+                        column, from, to, ..
+                    } = &p.change
+                    {
+                        return column == c
+                            && !matches!(from, pbps_model::ValueSource::Sequence(_))
+                            && matches!(to, pbps_model::ValueSource::Sequence(_));
+                    }
+                    false
+                })
+        } else {
+            false
+        };
+        let owner = if created.contains(target) || sequence_created {
+            (!session_role.raw().is_empty()).then_some(session_role)
+        } else {
+            owners.get(&stored_grant_target(&names, target))
+        };
+        if owner == Some(role) {
+            let when = if created.contains(target) || sequence_created {
+                format!(
+                    "role `{role}` will own `{target}`, because this plan creates it and \
+                         the role that runs the statements owns what they create (measured)",
+                    role = role.shown(),
+                    target = target.shown(),
+                )
+            } else {
+                format!(
+                    "role `{role}` owns `{target}`",
+                    role = role.shown(),
+                    target = target.shown(),
+                )
+            };
+            impossible.push(format!(
+                "{when}, so `{}` on it is a grant that cannot change what the role holds: an \
+                 owner already holds every privilege on its own object, and this engine \
+                 records the whole default set rather than the one permission (ADR-0010 §1, \
+                 measured). The pull reads that entry as the zero point rather than a grant \
+                 (DECISIONS 371), so nothing would ever satisfy this line — delete it from \
+                 role `{role}`",
+                permissions
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                role = role.shown(),
+            ));
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("owned_targets (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "owned_targets",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "no declared grant names a target its own grantee owns".to_owned(),
+    })
+}
+
+/// The PostgreSQL body of `unrevocable_grants`, which apply also calls.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(in crate::engine) fn unrevocable_grants(
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+    unrevocable: &[pbps_db::catalog::Unrevocable],
+) -> anyhow::Result<ConnectedCheck> {
+    // A rename moves the target without changing who granted what on it, and
+    // the `Revoke` beside it in the same plan names the object as the plan
+    // leaves it — while this list is keyed by what the read saw. The same
+    // translation `owned_targets` makes, for the same reason: without it a
+    // plan that renames and narrows in one step passes a check that would
+    // refuse either step alone.
+    //
+    // Only tables, again: a module is replaced rather than renamed, and a
+    // schema this dialect does not rename cannot move under a grant.
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+
+    let mut impossible = Vec::new();
+    for planned in &changes.changes {
+        let pbps_model::Change::Revoke {
+            role,
+            target,
+            permissions,
+        } = &planned.change
+        else {
+            continue;
+        };
+        let read_as = stored_grant_target(&names, target);
+        for found in unrevocable {
+            if &found.role == role
+                && found.target == read_as
+                && permissions.contains(&found.permission)
+            {
+                impossible.push(format!("role {role}: {}", found.why, role = role.shown(),));
+            }
+        }
+    }
+    if !impossible.is_empty() {
+        anyhow::bail!("unrevocable_grants (PostgreSQL): {}", impossible.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "unrevocable_grants",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: "every permission this plan revokes is one a `REVOKE` from this connection \
+                  would carry the grantor of"
+            .to_owned(),
+    })
+}
+
+/// No editions, so no hint is refused for one and no addition is
+/// metadata-only elsewhere and a rewrite here: whether a PostgreSQL change
+/// rewrites the table is the type's question, and the pure dialect answers
+/// it at plan time (ADR-0012, `pbps_pg::estimate`).
+pub(in crate::engine) fn edition_verdict() -> EditionVerdict {
+    EditionVerdict {
+        refused_online: Vec::new(),
+        runs: "PostgreSQL".to_owned(),
+        warnings: Vec::new(),
+    }
+}
+
+/// The PostgreSQL body of `check_domain_alterations`, which apply also calls.
+pub(in crate::engine) async fn check_domain_alterations(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    stored: &pbps_model::IdsFile,
+) -> anyhow::Result<Option<ConnectedCheck>> {
+    if !tightens_a_domain(changes) {
+        return Ok(None);
+    }
+    let tightened = pbps_pg::domain_alter::census(conn, changes, stored)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let message = tightened
+        .scans
+        .iter()
+        .map(|(domain, tables)| {
+            if tables.is_empty() {
+                format!("{} validates no table (no column uses it)", domain.shown())
+            } else {
+                format!(
+                    "{} validates every row of {} under a lock held to commit",
+                    domain.shown(),
+                    tables.join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(ConnectedCheck {
+        name: "domain-validation",
+        engine: "PostgreSQL",
+        status: "listed",
+        message,
+    }))
+}
+
+/// Binds the expressions a plan gives a table, to learn which routines the
+/// review admits (DEC-2563.4), and hands `on_note` each note about one that
+/// cannot be bound yet because it uses an object the plan creates.
+///
+/// PostgreSQL binds them in the planning transaction; SQL Server does not
+/// bind table expressions this way.
+pub(in crate::engine) async fn table_expression_notes(
+    conn: &mut Conn,
+    admission: &pbps_pg::admission::Admission,
+    changes: &[pbps_model::PlannedChange],
+    mut on_note: impl FnMut(String),
+) {
+    for planned in changes {
+        let Ok(pbps_pg::table_expressions::Vetted::Unjudged(notes)) = vet_table_expressions(
+            conn,
+            admission,
+            pbps_pg::pins::Within::OwnTransaction,
+            pbps_pg::table_expressions::Moment::Early,
+            &planned.change,
+        )
+        .await
+        else {
+            continue;
+        };
+        for note in notes {
+            on_note(note);
+        }
+    }
+}
+
 impl PlanSession for pbps_pg::Postgres {
     type State = PlanState;
 
@@ -1167,7 +1632,6 @@ impl PlanSession for pbps_pg::Postgres {
         &self,
         state: &mut PlanState,
         conn: &mut Conn,
-        admission: &SiteAdmission,
         changes: PlanningPlan<S>,
         frame: Frame<'_>,
         role_members: Option<&RoleMembers>,
@@ -1180,7 +1644,7 @@ impl PlanSession for pbps_pg::Postgres {
         {
             let (changes, check, verification) = expand_table_rebuild(
                 conn,
-                admission,
+                &state.admission,
                 changes,
                 frame.base,
                 frame.declared,
@@ -1261,8 +1725,8 @@ impl PlanSession for pbps_pg::Postgres {
 
     async fn check_final_order(
         &self,
+        state: &PlanState,
         conn: &mut Conn,
-        admission: &SiteAdmission,
         changes: &ChangeSet,
         frame: Frame<'_>,
     ) -> anyhow::Result<FinalOrderChecks> {
@@ -1277,12 +1741,254 @@ impl PlanSession for pbps_pg::Postgres {
         .await?;
         let logical_slots = logical_slots(conn, changes).await?;
         let numbered_column_fills = numbered_column_fills(conn, changes, frame.written.ids).await?;
-        prepare_data_writes(conn, admission, changes, frame.baseline, frame.written.ids).await?;
+        prepare_data_writes(
+            conn,
+            &state.admission,
+            changes,
+            frame.baseline,
+            frame.written.ids,
+        )
+        .await?;
         Ok(FinalOrderChecks {
             rebuilds,
             drop_blockers,
             logical_slots,
             numbered_column_fills,
         })
+    }
+
+    async fn vet_plan_sites(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        names: &pbps_model::plan_names::PlanNames<'_>,
+        on_note: &mut dyn FnMut(String),
+    ) -> anyhow::Result<()> {
+        vet_drop_requirements(conn, &state.admission, names).await?;
+        // A conversion is judged at apply, before its first evaluation
+        // (DEC-2331.1). Here it only tells which routines the review admits, so
+        // the plan can show and pin them; a refusal waits for apply, which
+        // judges it again, and a routine missed here fails closed there.
+        let _ = vet_conversions(conn, &state.admission, names.changes()).await;
+        // The expressions a table gains are bound the same way, to learn which
+        // routines the review admits; one that uses an object this plan creates
+        // cannot be bound yet and is said so, then judged at apply (DEC-2563.4).
+        table_expression_notes(conn, &state.admission, names.changes(), on_note).await;
+        Ok(())
+    }
+
+    async fn probe_stranded_rows(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        frame: Frame<'_>,
+        progress: Option<&crate::deploy::services::Progress>,
+    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+        // Rows that hold a label an enum rebuild removes, or that a domain's
+        // narrower base cannot hold, are counted now, by the same probes the
+        // apply runs, so the plan is refused by name and with a count before
+        // anything is written (DEC-1635.7, DEC-1635.9).
+        if !counts_rows_an_enum_retype_strands(Driver::Postgres, changes) {
+            return Ok(None);
+        }
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, frame.written.ids)?;
+        Ok(Some(
+            crate::deploy::run_probes_observed(
+                conn,
+                &state.admission,
+                self,
+                &names,
+                &crate::deploy::probe_partitions(frame.recorded.schema, &names),
+                Some(pbps_model::operation::Snapshot {
+                    schema: frame.recorded.schema,
+                    ids: frame.recorded.ids,
+                }),
+                None,
+                progress,
+            )
+            .await,
+        ))
+    }
+
+    async fn support_rows(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+        reads: SupportReads<'_>,
+    ) -> anyhow::Result<SupportRows> {
+        let permission_support = permission_support(conn, changes, ids).await?;
+        let generation_support = generation_support(conn, changes, ids).await?;
+        // Asked of the read this plan was built from, not of the connection
+        // again: the owners came out of the same statement snapshot as the
+        // schema, so the two cannot disagree (DECISIONS 174).
+        let owned_targets = owned_targets(changes, ids, reads.owners, reads.session_role)?;
+        // The other half of the same read, and the other direction: a grant
+        // this connection could see and could not take away is refused only
+        // when the plan actually revokes it (#251).
+        let unrevocable_grants = unrevocable_grants(changes, ids, reads.unrevocable)?;
+        Ok(SupportRows {
+            permission_support,
+            generation_support,
+            owned_targets,
+            unrevocable_grants,
+        })
+    }
+
+    async fn server_limits(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+    ) -> anyhow::Result<ServerLimits> {
+        Ok(ServerLimits {
+            edition: edition_verdict(),
+            temporal: Vec::new(),
+        })
+    }
+
+    async fn operational_cost(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> crate::cost::CostReport {
+        operational_cost(conn, changes, ids).await
+    }
+
+    async fn seal_plan_facts(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        project: &pbps_config::Project,
+        target: &crate::db::Target,
+        frame: Frame<'_>,
+        changes: &ChangeSet,
+        managed: &BTreeSet<pbps_model::ModuleId>,
+    ) -> anyhow::Result<SealedFacts> {
+        let Prerequisites {
+            types: type_pins,
+            providers: provider_pins,
+        } = seal_plan_type_pins(
+            conn,
+            pbps_diff::Side {
+                schema: &frame.baseline.schema,
+                ids: frame.recorded.ids,
+            },
+            frame.written,
+            changes,
+            &project.config.trusted_roles,
+            project.config.pin_type_routines,
+        )
+        .await?;
+        let reviewed =
+            crate::pins::seal_selected(conn, project, target, &type_pins, &state.admission).await?;
+        // Last, so that the routines are sealed as close to the gate as the
+        // plan can get them. The managed set is the one `apply` rebuilds from
+        // the ledger and the plan: what was recorded, and what is declared.
+        let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
+        Ok(SealedFacts {
+            type_pins,
+            provider_pins,
+            reviewed,
+            routine_pins,
+        })
+    }
+
+    async fn declared_domain_code(
+        &self,
+        scratch: Option<&mut crate::resolution::Entry<'_>>,
+        conn: &mut Conn,
+        target: &crate::db::Target,
+        project: &pbps_config::Project,
+        desired: pbps_diff::Side<'_>,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<DomainCode> {
+        use crate::resolution::domain::{Verdict, needed, vet};
+        let Some(entry) =
+            scratch.filter(|_| vets_declared_domain_code(Driver::Postgres) && needed(changes))
+        else {
+            return Ok(DomainCode::NotAsked);
+        };
+        Ok(match vet(entry, conn, target, project, desired).await {
+            Verdict::Passed => DomainCode::Passed(ConnectedCheck {
+                name: "declared-domain-code",
+                engine: "PostgreSQL",
+                status: "checked",
+                message: "Declared domain CHECK and DEFAULT code passed the advisory scratch vet; apply repeats its own in-transaction vet.".into(),
+            }),
+            Verdict::Refused(finding) => DomainCode::Refused(finding),
+            Verdict::Unavailable(finding) => DomainCode::Unavailable {
+                row: ConnectedCheck {
+                    name: "declared-domain-code",
+                    engine: "PostgreSQL",
+                    status: "deferred",
+                    message: "Scratch could not answer the advisory domain-code vet; apply vets CHECK and DEFAULT code in its transaction.".into(),
+                },
+                finding,
+            },
+        })
+    }
+
+    async fn declared_types(
+        &self,
+        conn: &mut Conn,
+        read_back: &Schema,
+        recorded_ids: &IdsFile,
+        declared: &Schema,
+        ids: &IdsFile,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<DeclaredTypes> {
+        let pins = pbps_pg::type_refs::declared::seal(read_back, recorded_ids, declared, ids);
+        let validation = check_domain_alterations(conn, changes, recorded_ids).await?;
+        let deferred_domain_code = pins
+            .iter()
+            .any(|pin| {
+                matches!(&pin.definition, pbps_model::ManagedType::Domain { default, checks, .. }
+                    if default.is_some() || !checks.is_empty())
+            })
+            .then(|| ConnectedCheck {
+                name: "declared-domain-code",
+                engine: "PostgreSQL",
+                status: "deferred",
+                message: "Declared domain checks and defaults are vetted inside apply, immediately after their type statements.".into(),
+            });
+        Ok(DeclaredTypes {
+            pins,
+            validation,
+            deferred_domain_code,
+        })
+    }
+
+    async fn extension_seals(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        manifests: crate::rehearsal::connected::Manifests,
+        declared: &Schema,
+        ids: &IdsFile,
+    ) -> anyhow::Result<ExtensionSeals> {
+        let change_pins =
+            crate::deploy::extension_change_pins(conn, changes, &manifests, declared).await?;
+        let pins = crate::deploy::extension_pins(changes, manifests, declared, ids)?;
+        let drops = crate::deploy::extension_drop_pins(conn, changes).await?;
+        Ok(ExtensionSeals {
+            changes: change_pins,
+            pins,
+            drops,
+        })
+    }
+
+    fn prove_plan_pins(
+        &self,
+        type_pins: &[pbps_model::TypePin],
+        provider_pins: &[pbps_model::ProviderPin],
+        extension_pins: &[pbps_model::ExtensionPin],
+        extension_changes: &[pbps_model::ExtensionChangePin],
+    ) -> Result<(), String> {
+        // A type the plan expects its own package to bring must be one the
+        // rehearsal found in that package (DEC-2447.12).
+        pbps_pg::type_refs::provider_proof(type_pins, extension_pins, extension_changes)?;
+        pbps_pg::class_pins::proof(provider_pins, extension_pins, extension_changes)
     }
 }
