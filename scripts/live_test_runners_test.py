@@ -26,6 +26,49 @@ ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("live_shards", ROOT / "scripts/live-shards.py")
 SHARDS = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(SHARDS)
+# Source shared by every `docker` stand-in below (they run as separate
+# processes, so it is text, not an import) and executed here for the tests'
+# own assertions, so both sides read a `docker exec` the same way (#2847).
+DOCKER_STAND_IN_HELPERS = r'''
+import fcntl
+
+# Options of `docker exec` that take a value; any other option is a flag.
+_EXEC_VALUE_OPTIONS = {"-u", "--user", "-e", "--env", "--env-file", "-w", "--workdir",
+                       "--detach-keys"}
+
+
+def container_of(command):
+    # `docker exec -i <name> ...` has "-i" where `docker exec <name> ...` has
+    # the name; indexing by position made the two parallel pg_partman installs
+    # share one counter file named "-i" (#2847).
+    args = iter(command[2:])
+    for arg in args:
+        if arg in _EXEC_VALUE_OPTIONS:
+            next(args, None)
+        elif not arg.startswith("-"):
+            return arg
+    raise ValueError("no container in " + repr(command))
+
+
+def bump(path):
+    # Read-modify-write under a lock: `write_text` truncates before it writes,
+    # so a second stand-in started together with the first could read the file
+    # between the two and fail on int("") (#2847). The lock covers the whole
+    # update, so a reader never sees a half-written counter.
+    with open(path, "a+") as counter:
+        fcntl.flock(counter, fcntl.LOCK_EX)
+        counter.seek(0)
+        text = counter.read()
+        count = int(text) + 1 if text else 1
+        counter.seek(0)
+        counter.truncate()
+        counter.write(str(count))
+    return count
+'''
+_helpers = {}
+exec(DOCKER_STAND_IN_HELPERS, _helpers)
+container_of = _helpers["container_of"]
+
 FIXTURE_NAMES = {
     "PBPS_TEST_MSSQL_NAME": "pbps-test-mssql",
     "PBPS_TEST_MSSQL_EXPRESS_NAME": "pbps-test-mssql-express",
@@ -1252,8 +1295,7 @@ class LiveExecution(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = self.fixture_names(runner, "lane.", ".fixture")
                 self.assertEqual(self.started_names(calls), expected)
-                self.assertEqual({c[3] if c[2] == "-i" else c[2]
-                                  for c in calls if c[:2] == ["docker", "exec"]},
+                self.assertEqual({container_of(c) for c in calls if c[:2] == ["docker", "exec"]},
                                  set(expected))
                 validators = [c for c in calls if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
                 checked = [c[c.index("--container") + 1] for c in validators]
@@ -1267,8 +1309,7 @@ class LiveExecution(unittest.TestCase):
                                     key, key.removesuffix("_NAME") + "_PORT")
                     self.assertEqual(call[call.index("--port") + 1], ports[port_key])
                 if runner == "pg":
-                    # `-i` precedes the container: the script arrives on stdin.
-                    installs = [c[3] for c in calls if c[:3] == ["docker", "exec", "-i"]
+                    installs = [container_of(c) for c in calls if c[:2] == ["docker", "exec"]
                                 and "partman" in " ".join(c)]
                     self.assertCountEqual(installs, expected[:2])
                     self.assertTrue(environments)
@@ -1394,7 +1435,7 @@ class LiveExecution(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="pbps-fixture-names-") as directory:
             root = Path(directory)
             fake = root / "client"
-            fake.write_text(f"#!{sys.executable}\n" + r'''
+            fake.write_text(f"#!{sys.executable}\n" + DOCKER_STAND_IN_HELPERS + r'''
 import json, os, signal, sys, time
 from pathlib import Path
 root = Path(os.environ["PBPS_NAMES_CONTROL"])
@@ -1428,7 +1469,7 @@ elif command[:2] == ["docker", "run"]:
     with (root / "started").open("a") as started:
         started.write(command[command.index("--name") + 1] + "\n")
 elif command[:2] == ["docker", "exec"]:
-    if command[2] == os.environ["PBPS_NAMES_FAILING"]:
+    if container_of(command) == os.environ["PBPS_NAMES_FAILING"]:
         sys.exit(1)
     if "SELECT CONVERT" in command[-1]:
         print("SQL_Latin1_General_CP1_CI_AS")
@@ -1542,8 +1583,7 @@ elif command[:2] != ["docker", "run"] and command[0] != "python3":
                                   if c[:2] == ["docker", "run"]]
                         expected = [scratch] if reuse else [name, scratch]
                         self.assertEqual(starts, expected)
-                        self.assertEqual({c[3] if c[2] == "-i" else c[2]
-                                  for c in calls if c[:2] == ["docker", "exec"]},
+                        self.assertEqual({container_of(c) for c in calls if c[:2] == ["docker", "exec"]},
                                          {name, scratch})
                         validators = [c[c.index("--container") + 1] for c in calls
                                       if c[0] == "python3"]
@@ -1577,7 +1617,7 @@ elif command[:2] != ["docker", "run"] and command[0] != "python3":
         with tempfile.TemporaryDirectory(prefix='pbps-collation-admission-') as directory:
             root = Path(directory)
             fake = root / 'client'
-            fake.write_text(f'#!{sys.executable}\n' + r'''
+            fake.write_text(f'#!{sys.executable}\n' + DOCKER_STAND_IN_HELPERS + r'''
 import json, os, subprocess, sys
 from pathlib import Path
 root = Path(os.environ['PBPS_COLLATION_CONTROL'])
@@ -1589,13 +1629,11 @@ if command[:2] == ['docker', 'ps']:
 elif command[:2] == ['docker', 'run']:
     print('owned-fixture')
 elif command[:2] == ['docker', 'exec']:
-    if 'express' not in command[2]:
+    if 'express' not in container_of(command):
         if "SERVERPROPERTY('Collation')" in command[command.index('-Q') + 1]:
             print('SQL_Latin1_General_CP1_CI_AS')
         sys.exit(0)
-    state = root / 'probes'
-    count = int(state.read_text()) + 1 if state.exists() else 1
-    state.write_text(str(count))
+    count = bump(root / 'probes')
     query = command[command.index('-Q') + 1]
     guarded = ('-b' in command and "SERVERPROPERTY('Collation')" in query
                and 'Latin1_General_100_CS_AS' in query and 'THROW' in query)
@@ -1733,8 +1771,8 @@ elif command[0] != 'sleep':
         # pg_partman (#1533) goes onto the two servers the flow cases use,
         # once each is ready and before any client runs; never the scratch.
         last_probe = max(i for i, c in enumerate(calls) if c[3:4] == ["pg_isready"])
-        installs = [(i, c[3]) for i, c in enumerate(calls)
-                    if c[:3] == ["docker", "exec", "-i"] and "partman" in " ".join(c)]
+        installs = [(i, container_of(c)) for i, c in enumerate(calls)
+                    if c[:2] == ["docker", "exec"] and "partman" in " ".join(c)]
         # In either order: the two run at once.
         self.assertCountEqual([name for _, name in installs], ["pbps-test-pg", "pbps-test-pg16"])
         self.assertTrue(all(last_probe < i < first_client for i, _ in installs), installs)
@@ -1787,7 +1825,7 @@ elif command[0] != 'sleep':
         with tempfile.TemporaryDirectory(prefix="pbps-pg-admission-") as directory:
             root = Path(directory)
             fake = root / "client"
-            fake.write_text(f"#!{sys.executable}\n" + r'''
+            fake.write_text(f"#!{sys.executable}\n" + DOCKER_STAND_IN_HELPERS + r'''
 import json, os, sys
 from pathlib import Path
 root = Path(os.environ["PBPS_ADMISSION_CONTROL"])
@@ -1801,10 +1839,8 @@ if command[0] == "cargo":
 if command[:2] == ["docker", "ps"]:
     print("pbps-test-pg\npbps-test-pg16\npbps-test-pg-scratch")
 elif command[:2] == ["docker", "exec"]:
-    name = command[2]
-    state = root / name
-    count = int(state.read_text()) + 1 if state.exists() else 1
-    state.write_text(str(count))
+    name = container_of(command)
+    count = bump(root / name)
     mode = os.environ["PBPS_ADMISSION_MODE"]
     tcp = "-h" in command and command[command.index("-h") + 1] == "127.0.0.1"
     deadline = (mode == "deadline-new" and name == "pbps-test-pg" or
@@ -1828,10 +1864,70 @@ elif command[0] not in ("cargo", "python3", "sleep"):
             result = subprocess.run(["bash", "scripts/live-tests-pg.sh"], cwd=ROOT,
                                     env=env, text=True, capture_output=True, timeout=30)
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            # What the stand-in counted, by the file it used: one per container.
+            self.admission_counters = {
+                path.name: int(path.read_text()) for path in root.iterdir()
+                if path.is_file() and not path.is_symlink() and path.read_text().isdigit()}
             images = root / "images"
             self.cargo_images = [json.loads(line) for line in images.read_text().splitlines()] \
                 if images.exists() else []
             return result, calls
+
+    def test_the_postgresql_stand_in_counts_each_container_in_its_own_file(self):
+        # The two pg_partman installs are `docker exec -i <name>`; counted by
+        # position they shared one file named "-i".
+        result, _ = self.local_pg_script("initializing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        counters = self.admission_counters
+        self.assertEqual(set(counters), {"pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"})
+        # The first two TCP probes of each are still refused, then admitted.
+        self.assertTrue(all(count >= 3 for count in counters.values()), counters)
+
+
+class DockerStandIn(unittest.TestCase):
+    """The `docker exec` stand-ins read their container and count calls soundly (#2847)."""
+
+    def test_the_container_is_the_first_argument_that_is_not_an_option(self):
+        for command, name in (
+                (["docker", "exec", "c1", "pg_isready"], "c1"),
+                (["docker", "exec", "-i", "c1", "sh", "-s", "--", "pkg"], "c1"),
+                (["docker", "exec", "-i", "-u", "root", "c1", "id"], "c1"),
+                (["docker", "exec", "--env", "A=1", "-w", "/tmp", "c1", "env"], "c1")):
+            with self.subTest(command=command):
+                self.assertEqual(container_of(command), name)
+
+    def test_a_docker_exec_without_a_container_is_an_error_and_not_an_option(self):
+        for command in (["docker", "exec"], ["docker", "exec", "-i"],
+                        ["docker", "exec", "-u", "root"]):
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    container_of(command)
+
+    def test_a_counter_counts_calls_in_order(self):
+        with tempfile.TemporaryDirectory(prefix="pbps-counter-") as directory:
+            path = Path(directory) / "c1"
+            self.assertEqual([_helpers["bump"](path) for _ in range(4)], [1, 2, 3, 4])
+            self.assertEqual(path.read_text(), "4")
+
+    def test_a_counter_never_shows_a_reader_a_half_written_file(self):
+        # Many stand-ins start together, as the two parallel pg_partman installs
+        # do; with a truncating `write_text` one of them reads an empty file
+        # and dies on int(""). Every call must get its own count.
+        script = DOCKER_STAND_IN_HELPERS + (
+            "import sys\nfrom pathlib import Path\nprint(bump(Path(sys.argv[1])))\n")
+        with tempfile.TemporaryDirectory(prefix="pbps-counter-") as directory:
+            path = Path(directory) / "c1"
+            runs = 24
+            start = time.monotonic() + 1.0
+            code = f"import time; time.sleep(max(0, {start} - time.monotonic()))\n" + script
+            procs = [subprocess.Popen([sys.executable, "-c", code, str(path)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for _ in range(runs)]
+            results = [(p.communicate(), p.returncode) for p in procs]
+            self.assertEqual([r for _, r in results], [0] * runs, results)
+            counts = sorted(int(out.strip()) for (out, _), _ in results)
+            self.assertEqual(counts, list(range(1, runs + 1)))
+
 
 class PartmanInstall(unittest.TestCase):
     """scripts/install-pg-partman.sh must never move the running server (#2835)."""
