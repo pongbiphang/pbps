@@ -1127,20 +1127,19 @@ def validate(root, inventory, targets, platform, rules=None):
 #
 # The Windows `quick` job lists the ignored tests of the Windows build and refuses
 # a rule-only case whose owner does not run on win32. A Linux run only lists the
-# Linux binaries, so it cannot see that. Which tests the Windows build compiles is
-# a `cfg` question, answered here from source: the `cfg` attributes of the test
-# function, of every enclosing module (inline or file), and the inner `#![cfg]` of
-# a module file, and then whether the test is still `#[ignore]`d there (a
-# `#[cfg_attr(unix, ignore)]` test runs ordinarily on Windows and is not listed). The module
-# files are found by rustc's own path rule (see `RustModules`). A `cfg` the evaluator cannot
-# decide counts as compiled and ignored on Windows, so the prediction fails closed; the
-# win32 run stays the authority.
+# Linux binaries, so it cannot see that. Whether the Windows build compiles a test and
+# still lists it as ignored is answered here from source, from the attributes of the test
+# function and of every enclosing module (inline or file), each read once as one list (see
+# "Attributes" below): outer attributes plus leading inner attributes, `cfg_attr` expanded.
+# The module files are found by rustc's own path rule (see `RustModules`). Whatever the
+# reader cannot decide counts as compiled and ignored on Windows, so the prediction fails
+# closed; the win32 run stays the authority.
 
 # The Windows runner of the `quick` job: windows-latest, MSVC, x86_64.
 WINDOWS_CFG = {"target_os": "windows", "target_family": "windows", "target_env": "msvc",
                "target_arch": "x86_64", "target_pointer_width": "64", "target_endian": "little",
                "target_vendor": "pc"}
-WINDOWS_FLAGS = {"windows": True, "unix": False, "test": True}
+WINDOWS_FLAGS = {"windows": True, "unix": False, "test": True, "true": True, "false": False}
 
 
 def tri_all(values):
@@ -1184,20 +1183,119 @@ def parse_cfg(tokens, i):
     return WINDOWS_FLAGS.get(name), i
 
 
-def attribute_cfg(attributes):
-    """Windows value of the `cfg` attributes on an item: True/False, or None if undecidable."""
-    values = []
+def tri_not(value):
+    return None if value is None else not value
+
+
+# Attributes (#2833). Every item the prediction reads (a function, a module, a module
+# file, the crate root) has its outer attributes and its leading inner attributes
+# gathered into one list, `cfg_attr` is expanded once, completely and recursively, into
+# the attributes it stands for with the value of the condition they apply under on
+# Windows, and the three questions (is it compiled, is it ignored, which file) are
+# answered from that one list. An attribute the expansion cannot read is UNCLASSIFIED
+# and answers every question "undecided", so the prediction fails closed.
+UNCLASSIFIED = ["<unclassified>"]
+UNDECIDED = object()
+
+
+def split_arguments(tokens):
+    """The top-level comma-separated parts of tokens (a cfg_attr's attribute list)."""
+    parts, current, depth = [], [], 0
+    for token in tokens:
+        if isinstance(token, str) and token in ("(", "[", "{"): depth += 1
+        elif isinstance(token, str) and token in (")", "]", "}"): depth -= 1
+        if token == "," and depth == 0:
+            parts.append(current); current = []
+        else:
+            current.append(token)
+    if current: parts.append(current)
+    return parts
+
+
+def effective_attributes(attributes, applies=True):
+    """Expand `cfg_attr` in attributes into [(attribute tokens, applies on Windows)].
+
+    `applies` is True, or None when the guarding predicate is undecidable; an attribute whose
+    guard is False on Windows is not there at all."""
+    result = []
     for tokens in attributes:
-        if tokens[:1] == ["cfg"] and tokens[1:2] == ["("]:
-            try:
-                value, end = parse_cfg(tokens, 2)
-            except InventoryError:
-                values.append(None); continue
-            values.append(value if end < len(tokens) and tokens[end] == ")" else None)
-        elif tokens[:1] == ["cfg_attr"] and "cfg" in tokens[2:]:
-            # cfg_attr can introduce a cfg; the evaluator does not expand it.
+        if tokens[:1] != ["cfg_attr"]:
+            result.append((tokens, applies)); continue
+        if tokens[1:2] != ["("] or tokens[-1:] != [")"]:
+            result.append((UNCLASSIFIED, None)); continue
+        try:
+            predicate, i = parse_cfg(tokens, 2)
+        except InventoryError:
+            result.append((UNCLASSIFIED, None)); continue
+        if i == len(tokens) - 1:
+            continue   # cfg_attr(predicate): no attribute at all
+        if tokens[i] != ",":
+            result.append((UNCLASSIFIED, None)); continue
+        guard = tri_all([applies, predicate])
+        if guard is not False:
+            result += effective_attributes(split_arguments(tokens[i + 1:-1]), guard)
+    return result
+
+
+def cfg_of(effective):
+    """Windows value of the `cfg` attributes among effective: True/False, or None if undecidable."""
+    values = []
+    for tokens, applies in effective:
+        if tokens == UNCLASSIFIED:
             values.append(None)
+        elif tokens[:1] == ["cfg"]:
+            try:
+                value, end = parse_cfg(tokens, 2) if tokens[1:2] == ["("] else (None, 0)
+            except InventoryError:
+                value, end = None, 0
+            if end != len(tokens) - 1 or tokens[end] != ")":
+                value = None
+            values.append(tri_any([tri_not(applies), value]))
     return tri_all(values)
+
+
+def ignored_of(effective):
+    """Is the item `#[ignore]`d on Windows: True/False, or None if undecidable?
+
+    `#[ignore]` and `#[ignore = "why"]` ignore it; an `ignore` of any other spelling is not read."""
+    values = []
+    for tokens, applies in effective:
+        if tokens == UNCLASSIFIED:
+            values.append(None)
+        elif tokens[:1] == ["ignore"]:
+            exact = tokens == ["ignore"] or (len(tokens) == 3 and tokens[1] == "=" and isinstance(tokens[2], tuple))
+            values.append(applies if exact else None)
+    return tri_any(values)
+
+
+def path_of(effective):
+    """The string of the `#[path = "..."]` in effect on Windows, None if there is none, UNDECIDED if unreadable."""
+    found = None
+    for tokens, applies in effective:
+        if tokens == UNCLASSIFIED:
+            return UNDECIDED
+        if tokens[:1] == ["path"]:
+            if applies is None or len(tokens) != 3 or tokens[1] != "=" or not isinstance(tokens[2], tuple) \
+                    or tokens[2][1].startswith('"'):   # a conditional path, or an escape the lexer could not decode
+                return UNDECIDED
+            found = tokens[2][1]
+    return found
+
+
+def attribute_facts(outer, inner=()):
+    """(compiled, ignored, path) of one item on Windows, from its outer and leading inner attributes together."""
+    everything = effective_attributes([*outer, *inner])
+    return cfg_of(everything), ignored_of(everything), path_of(effective_attributes(outer))
+
+
+def leading_inner_attributes(tokens, i, end):
+    """The inner attributes `#![...]` at the start of a body, tokens[i:end]."""
+    inner = []
+    while i + 2 < end and tokens[i] == "#" and tokens[i + 1] == "!" and tokens[i + 2] == "[":
+        close = skip_balanced(tokens, i + 2)
+        inner.append(tokens[i + 3:close - 1])
+        i = close
+    return inner
 
 
 def skip_balanced(tokens, i):
@@ -1256,8 +1354,13 @@ def rust_items(tokens, start=0, end=None):
             name, k = tokens[j + 1], j + 2
             while k < end and tokens[k] not in ("{", ";"):
                 k = skip_balanced(tokens, k) if tokens[k] in ("(", "[") else k + 1
-            items.append(("fn", name, attributes, None))
-            i = skip_balanced(tokens, k) if k < end and tokens[k] == "{" else k + 1
+            if k < end and tokens[k] == "{":
+                close = skip_balanced(tokens, k)
+                items.append(("fn", name, [*attributes, *leading_inner_attributes(tokens, k + 1, close - 1)], None))
+                i = close
+            else:
+                items.append(("fn", name, attributes, None))
+                i = k + 1
         else:
             # Any other item: to the `;` or the closing brace of its body, at depth 0.
             braced = kind in ("struct", "enum", "union", "impl", "trait", "macro_rules", "extern", "{") \
@@ -1274,48 +1377,6 @@ def rust_items(tokens, start=0, end=None):
                 k += 1
             i = max(k, i + 1)
     return inner, items
-
-
-def attribute_ignore(tokens):
-    """Windows value of one attribute as a source of `ignore`: True/False, or None if undecidable.
-
-    `#[ignore]` and `#[ignore = "why"]` ignore the test; `#[cfg_attr(pred, ignore, ...)]` does
-    when `pred` holds on Windows, nested `cfg_attr` included. Any other attribute does not."""
-    if tokens == ["ignore"] or tokens[:2] == ["ignore", "="]:
-        return True
-    if tokens[:2] != ["cfg_attr", "("] or tokens[-1:] != [")"]:
-        return False
-    try:
-        predicate, i = parse_cfg(tokens, 2)
-    except InventoryError:
-        predicate, i = None, len(tokens)
-    if i >= len(tokens) - 1 or tokens[i] != ",":
-        return None if i < len(tokens) - 1 else False
-    attributes, current, depth = [], [], 0
-    for token in tokens[i + 1:-1]:
-        if isinstance(token, str) and token in ("(", "[", "{"): depth += 1
-        elif isinstance(token, str) and token in (")", "]", "}"): depth -= 1
-        if token == "," and depth == 0:
-            attributes.append(current); current = []
-        else:
-            current.append(token)
-    if current: attributes.append(current)
-    inner = tri_any([attribute_ignore(attribute) for attribute in attributes])
-    return False if inner is False else tri_all([predicate, inner])
-
-
-def ignored_on_windows(attributes):
-    """True/False, or None if undecidable: is the function still `#[ignore]`d in the Windows build?"""
-    return tri_any([attribute_ignore(tokens) for tokens in attributes])
-
-
-def path_attribute_of(attributes):
-    """The string of a `#[path = "..."]` among the attributes, or None."""
-    found = None
-    for attr in attributes:
-        if attr[:2] == ["path", "="] and len(attr) == 3 and isinstance(attr[2], tuple):
-            found = attr[2][1]
-    return found
 
 
 # rustc's module-path rule (rustc_expand::module), implemented once. The state of a module
@@ -1382,7 +1443,7 @@ class RustModules:
         return self.walk((root.parent, None), tokens, inner, items, name.split("::"), True) is not False
 
     def walk(self, state, tokens, inner, items, parts, inherited):
-        value = tri_all([inherited, attribute_cfg(inner)])
+        value = tri_all([inherited, attribute_facts([], inner)[0]])
         if value is False:
             return False
         kind = "fn" if len(parts) == 1 else "mod"
@@ -1391,15 +1452,14 @@ class RustModules:
             return None   # generated by a macro, or outside what this reads: undecided
         results = []
         for _, _, attributes, body in found:
-            here = tri_all([value, attribute_cfg(attributes)])
+            compiled, ignored, path_attribute = attribute_facts(attributes)
+            here = tri_all([value, compiled])
             if kind == "fn":
-                results.append(tri_all([here, ignored_on_windows(attributes)])); continue
+                results.append(tri_all([here, ignored])); continue
             if here is False:
                 results.append(here); continue
-            if any(attr[:1] == ["cfg_attr"] and "path" in attr for attr in attributes):
-                # A conditional #[path] may select another file on Windows: not decided here.
-                results.append(None); continue
-            path_attribute = path_attribute_of(attributes)
+            if path_attribute is UNDECIDED:
+                results.append(None); continue   # a conditional or unreadable #[path]: not decided here
             if body is not None:   # inline module: it pushes a directory for its children
                 if (id(tokens), body) not in self.parsed:
                     self.parsed[id(tokens), body] = rust_items(tokens, *body)

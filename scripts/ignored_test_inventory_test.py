@@ -1416,6 +1416,135 @@ class Win32Prediction(unittest.TestCase):
         self.refused(self.crate("mod live {\n    #[test]\n    #[ignore]\n    #[cfg_attr(unix, should_panic)]\n"
                                 "    fn owned() {}\n}\n"))
 
+    @staticmethod
+    def live(body, name="live"):
+        return "mod " + name + " {\n" + body + "\n}\n"
+
+    # The attribute class (#2833): everything that can switch a module or a test on or off on
+    # Windows, from outer and from inner attributes, through `cfg_attr` however nested. Each
+    # case is a crate source and whether the Windows build lists `live::owned` as ignored
+    # (the case is then refused). CLASS_FILES adds module files to the cases that need them;
+    # a real rustc, asked for the Windows target's tests, agrees with every row (~/t2833).
+    CLASS = (
+        # Inner attributes of the function body (the reviewer's fixtures).
+        ("inner ignore", live.__func__("#[test]\nfn owned() { #![ignore] }"), True),
+        ("inner ignore with a reason", live.__func__('#[test]\nfn owned() { #![ignore = "why"] }'), True),
+        ("inner cfg(unix) on an ignored test", live.__func__("#[test]\n#[ignore]\nfn owned() { #![cfg(unix)] }"), False),
+        ("inner cfg(windows) on an ignored test", live.__func__("#[test]\n#[ignore]\nfn owned() { #![cfg(windows)] }"), True),
+        ("inner cfg_attr(unix, ignore)", live.__func__("#[test]\nfn owned() { #![cfg_attr(unix, ignore)] }"), False),
+        ("inner cfg_attr(windows, ignore)", live.__func__("#[test]\nfn owned() { #![cfg_attr(windows, ignore)] }"), True),
+        ("inner cfg_attr(windows, cfg(unix))", live.__func__("#[test]\n#[ignore]\nfn owned() { #![cfg_attr(windows, cfg(unix))] }"), False),
+        ("inner cfg_attr(unix, cfg(unix))", live.__func__("#[test]\n#[ignore]\nfn owned() { #![cfg_attr(unix, cfg(unix))] }"), True),
+        ("inner cfg among other inner attributes", live.__func__("#[test]\n#[ignore]\nfn owned() {\n    #![allow(unused)]\n    #![cfg(unix)]\n}"), False),
+        ("inner attribute after comments", live.__func__("#[test]\n#[ignore]\nfn owned() {\n    // why\n    /* c */ #![cfg(unix)]\n}"), False),
+        ("an inner ignore on another function", live.__func__("#[test]\nfn owned() {}\n#[test]\nfn other() { #![ignore] }"), False),
+        ("an inner cfg on another function", live.__func__("#[test]\n#[ignore]\nfn other() { #![cfg(unix)] }\n#[test]\n#[ignore]\nfn owned() {}"), True),
+        ("inner attribute text in a string", live.__func__('#[test]\n#[ignore]\nfn owned() { let _ = "#![cfg(unix)]"; }'), True),
+        # cfg_attr nested, with several attributes, with ignore = "reason", with a trailing comma.
+        ("nested cfg_attr, outer guard false", live.__func__("#[test]\n#[cfg_attr(unix, cfg_attr(windows, ignore))]\nfn owned() {}"), False),
+        ("nested cfg_attr, inner guard false", live.__func__("#[test]\n#[cfg_attr(windows, cfg_attr(unix, ignore))]\nfn owned() {}"), False),
+        ("nested cfg_attr, both guards true", live.__func__("#[test]\n#[cfg_attr(windows, cfg_attr(windows, ignore))]\nfn owned() {}"), True),
+        ("nested cfg_attr around a cfg", live.__func__("#[test]\n#[ignore]\n#[cfg_attr(all(), cfg_attr(windows, cfg(unix)))]\nfn owned() {}"), False),
+        ("cfg_attr with test and ignore, false guard", live.__func__("#[cfg_attr(unix, test, ignore)]\nfn owned() {}"), False),
+        ("cfg_attr with test and ignore, true guard", live.__func__("#[cfg_attr(windows, test, ignore)]\nfn owned() {}"), True),
+        ("cfg_attr with several attributes, false guard", live.__func__("#[test]\n#[cfg_attr(unix, should_panic, ignore)]\nfn owned() {}"), False),
+        ("cfg_attr with several attributes, true guard", live.__func__("#[test]\n#[cfg_attr(windows, should_panic, ignore)]\nfn owned() {}"), True),
+        ("cfg_attr with a trailing comma", live.__func__("#[test]\n#[cfg_attr(unix, ignore,)]\nfn owned() {}"), False),
+        ("ignore = reason", live.__func__('#[test]\n#[ignore = "why"]\nfn owned() {}'), True),
+        ("ignore = raw reason", live.__func__('#[test]\n#[ignore = r"why"]\nfn owned() {}'), True),
+        ("cfg_attr(windows, ignore = reason with a comma)", live.__func__('#[test]\n#[cfg_attr(windows, ignore = "a, b")]\nfn owned() {}'), True),
+        ("cfg_attr(unix, ignore = reason with a comma)", live.__func__('#[test]\n#[cfg_attr(unix, ignore = "a, b")]\nfn owned() {}'), False),
+        # cfg_attr on module items, nested, and the inner attributes of an inline module.
+        ("cfg_attr(windows, cfg(unix)) on a module", "#[cfg_attr(windows, cfg(unix))]\n" + live.__func__("#[test]\n#[ignore]\nfn owned() {}"), False),
+        ("cfg_attr(unix, cfg(unix)) on a module", "#[cfg_attr(unix, cfg(unix))]\n" + live.__func__("#[test]\n#[ignore]\nfn owned() {}"), True),
+        ("cfg_attr(not(unix), cfg(unix)) on a module", "#[cfg_attr(not(unix), cfg(unix))]\n" + live.__func__("#[test]\n#[ignore]\nfn owned() {}"), False),
+        ("nested cfg_attr on a module", "#[cfg_attr(all(), cfg_attr(windows, cfg(unix)))]\n" + live.__func__("#[test]\n#[ignore]\nfn owned() {}"), False),
+        ("inner cfg(unix) of an inline module", live.__func__("#![cfg(unix)]\n#[test]\n#[ignore]\nfn owned() {}"), False),
+        ("inner cfg_attr(windows, cfg(unix)) of an inline module", live.__func__("#![cfg_attr(windows, cfg(unix))]\n#[test]\n#[ignore]\nfn owned() {}"), False),
+        ("inner cfg_attr(unix, cfg(unix)) of an inline module", live.__func__("#![cfg_attr(unix, cfg(unix))]\n#[test]\n#[ignore]\nfn owned() {}"), True),
+        # Attributes split across lines, with comments, spacing and doc comments between them.
+        ("comments between the attributes", live.__func__("#[test]\n// why\n/* a /* nested */ block */ #[ignore] // here\nfn owned() {}"), True),
+        ("a commented-out cfg", live.__func__("#[test]\n// #[cfg(unix)]\n#[ignore]\nfn owned() {}"), True),
+        ("a cfg inside a doc string", live.__func__('#[test]\n#[doc = "#[cfg(unix)]"]\n#[ignore]\nfn owned() {}'), True),
+        ("a doc comment between the attributes", live.__func__("#[test]\n/// the owner\n#[ignore]\nfn owned() {}"), True),
+        ("spacing inside the attributes", live.__func__("#[test]\n# [ cfg ( unix ) ]\n# [ ignore ]\nfn owned() {}"), False),
+        ("a cfg split across lines", live.__func__("#[test]\n#[ignore]\n#[cfg(\n    any(\n        unix, // linux\n        target_os = \"macos\"\n    )\n)]\nfn owned() {}"), False),
+        ("a cfg_attr split across lines", live.__func__("#[test]\n#[cfg_attr(\n    unix, // not here\n    ignore, /* why */\n)]\nfn owned() {}"), False),
+        ("cfg(true) and cfg(false)", live.__func__("#[test]\n#[ignore]\n#[cfg(false)]\nfn owned() {}"), False),
+    )
+
+    def test_the_attribute_class_is_decided_the_way_rustc_decides_it(self):
+        for label, source, refused in self.CLASS:
+            with self.subTest(label):
+                targets = self.crate(source)
+                if refused:
+                    self.refused(targets)
+                else:
+                    self.assertEqual(self.predict(targets), 0)
+
+    # Module files: the cfg_attr of a `mod x;` and the inner attributes of the file, and a
+    # #[path] that cfg_attr selects only where its guard holds (rustc reads the other file).
+    CLASS_FILES = (
+        ("cfg_attr(windows, cfg(unix)) on mod x;", "#[cfg_attr(windows, cfg(unix))]\nmod live;\n", {"live.rs": "PLAIN"}, False),
+        ("cfg_attr(unix, cfg(unix)) on mod x;", "#[cfg_attr(unix, cfg(unix))]\nmod live;\n", {"live.rs": "PLAIN"}, True),
+        ("inner cfg_attr(windows, cfg(unix)) of a file", "mod live;\n", {"live.rs": "#![cfg_attr(windows, cfg(unix))]\nPLAIN"}, False),
+        ("inner cfg_attr(unix, cfg(unix)) of a file", "mod live;\n", {"live.rs": "#![cfg_attr(unix, cfg(unix))]\nPLAIN"}, True),
+        ("a comment before the inner attribute of a file", "mod live;\n", {"live.rs": "// why\n#![cfg(unix)]\nPLAIN"}, False),
+        ("inner cfg of a file under an enclosing cfg_attr module", "#[cfg_attr(windows, cfg(unix))]\nmod outer;\n",
+         {"outer.rs": "mod live;\n", "outer/live.rs": "PLAIN"}, False),
+        ("the path cfg_attr selects where its guard holds", '#[cfg_attr(windows, path = "win.rs")]\nmod live;\n',
+         {"live.rs": "PLAIN", "win.rs": "#![cfg(unix)]\nPLAIN"}, False),
+        ("the path cfg_attr selects, and that file is compiled", '#[cfg_attr(windows, path = "win.rs")]\nmod live;\n',
+         {"live.rs": "#![cfg(unix)]\nPLAIN", "win.rs": "PLAIN"}, True),
+        ("the path cfg_attr does not select where its guard fails", '#[cfg_attr(unix, path = "unix.rs")]\nmod live;\n',
+         {"live.rs": "PLAIN", "unix.rs": "#![cfg(unix)]\nPLAIN"}, True),
+        ("the path cfg_attr nested", '#[cfg_attr(all(), cfg_attr(windows, path = "win.rs"))]\nmod live;\n',
+         {"live.rs": "PLAIN", "win.rs": "#![cfg(unix)]\nPLAIN"}, False),
+        ("a path under an undecidable guard is not decided", '#[cfg_attr(feature = "x", path = "win.rs")]\nmod live;\n',
+         {"live.rs": "PLAIN", "win.rs": "#![cfg(unix)]\nPLAIN"}, True),
+        ("a path cfg_attr on an inline module", '#[cfg_attr(windows, path = "other")]\nmod live {\n    mod child;\n}\n',
+         {"other/child.rs": "#![cfg(unix)]\nPLAIN", "live/child.rs": "PLAIN"}, False),
+    )
+
+    def test_module_file_attributes_are_decided_the_way_rustc_decides_them(self):
+        plain = self.TEST.replace("    ", "")
+        for label, source, files, refused in self.CLASS_FILES:
+            with self.subTest(label):
+                files = {name: text.replace("PLAIN", plain) for name, text in files.items()}
+                targets = self.crate(source, **files)
+                module = "live::child" if "child" in source else "outer::live" if "outer" in source else "live"
+                targets[KEY]["ignored"] = {module + "::owned"}
+                self.rules["rules"][0]["prefix"] = module + "::"
+                if refused:
+                    self.refused_name(targets, module + "::owned")
+                else:
+                    self.assertEqual(self.predict(targets), 0)
+
+    # What the reader cannot classify is not decided and counts as compiled and ignored. The first
+    # group stands where `ignore` would be (the test has no other ignore), the second where a
+    # `cfg` would be (the test is plainly ignored).
+    UNDECIDED_IGNORE = (
+        "#[cfg_attr]", "#[cfg_attr(unix ignore)]", "#[cfg_attr(windows, cfg_attr)]", "#[cfg_attr(cfg(unix), ignore)]",
+        "#[cfg_attr(1, ignore)]", '#[cfg_attr(feature = "x", cfg_attr(windows, ignore))]', "#[ignore(x)]",
+        '#[cfg_attr(windows, ignore(x))]', '#[cfg_attr(feature = "x", ignore)]',
+    )
+    UNDECIDED_CFG = (
+        "#[cfg_attr]", "#[cfg_attr(cfg(unix), cfg(unix))]", '#[cfg_attr(windows, cfg_attr(feature = "x", cfg(unix)))]',
+        '#[cfg_attr(feature = "x", cfg(unix))]', "#[cfg]", '#[cfg(feature = "x")]',
+    )
+
+    def test_an_attribute_the_reader_cannot_classify_fails_closed(self):
+        for attribute in self.UNDECIDED_IGNORE:
+            with self.subTest(attribute):
+                self.refused(self.crate(self.live("#[test]\n" + attribute + "\nfn owned() {}")))
+        for attribute in self.UNDECIDED_CFG:
+            with self.subTest(attribute):
+                self.refused(self.crate(self.live("#[test]\n#[ignore]\n" + attribute + "\nfn owned() {}")))
+        for body in ("#[test]\nfn owned() { #![cfg_attr(feature = \"x\", ignore)] }",
+                     "#[test]\n#[ignore]\nfn owned() { #![cfg(feature = \"x\")] }"):
+            with self.subTest(body):
+                self.refused(self.crate(self.live(body)))
+
     def refused_name(self, targets, name):
         with self.assertRaisesRegex(audit.InventoryError, "^predicted on win32: .*" + re.escape(name)):
             self.predict(targets)
