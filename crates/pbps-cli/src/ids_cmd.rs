@@ -118,8 +118,8 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
 }
 
 /// A name beside `path` for a temp file, an aside or a respelling step
-/// (`.pbps-<kind><n>-<digest><tail>`, `n` counting from 0) that nothing uses:
-/// not on disk, and not in `reserved`, the planned destinations and their
+/// (`.pbps-<kind><n>-<digest>-<token><tail>`, `n` counting from 0) that nothing
+/// uses: not on disk, and not in `reserved`, the planned destinations and their
 /// ancestors, which a later step of the same write may still create. The pick
 /// is added to `reserved`. `tail` ends the name, for one the reader must still
 /// take (`.json`).
@@ -132,11 +132,17 @@ pub(crate) fn load(project: &Project) -> anyhow::Result<(Loaded, DeclaredPaths)>
 /// and one would rename the other's bytes into its own file. `n` is still what
 /// tells apart names that are taken on disk or in `reserved`.
 ///
+/// `token` is 16 random hex digits drawn once per call. It tells apart two
+/// writers of the same entry (#2820): testing that a name is absent reserves
+/// nothing, so both could pick it. It is a token and not an exclusive create
+/// because an aside and a respelling step are rename targets that can be
+/// directories (DEC-2820.1).
+///
 /// The name does not embed `path`'s own name, only its digest, so its length
 /// is bounded whatever `path` is called: `.pbps-` (6) + `kind` + `n` (at most
-/// 20 digits) + `-` + 16 + `tail`. A file name may be 255 bytes, and a name
-/// built by adding to a declaration's mirror (`.<name>.respell0.json`) passes
-/// that limit for a long one.
+/// 20 digits) + `-` + 16 + `-` + 16 + `tail`. A file name may be 255 bytes, and
+/// a name built by adding to a declaration's mirror (`.<name>.respell0.json`)
+/// passes that limit for a long one.
 ///
 /// Only "not found" means free. A candidate that cannot be inspected (a
 /// directory without search permission, an I/O error) is an error naming it:
@@ -151,9 +157,10 @@ pub(crate) fn unused_sibling(
 ) -> anyhow::Result<PathBuf> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let digest = name_digest(path, kind);
+    let token = format!("{:016x}", name_token());
     let mut n = 0usize;
     loop {
-        let candidate = parent.join(format!(".pbps-{kind}{n}-{digest}{tail}"));
+        let candidate = parent.join(format!(".pbps-{kind}{n}-{digest}-{token}{tail}"));
         if reserved.contains(&key.path(&candidate)) {
             n += 1;
             continue;
@@ -166,11 +173,25 @@ pub(crate) fn unused_sibling(
             .with_context(|| format!("cannot choose a name for a {kind} file"))?
             .is_none()
         {
+            // Where a second writer gets in: judged free, not yet claimed.
+            #[cfg(test)]
+            crate::ids_store::tests::after_name_judged_free(&candidate);
             reserved.insert(key.path(&candidate));
             return Ok(candidate);
         }
         n += 1;
     }
+}
+
+/// Random in production; fixed under test unless a test sets another.
+#[cfg(not(test))]
+fn name_token() -> u64 {
+    rand::random()
+}
+
+#[cfg(test)]
+fn name_token() -> u64 {
+    crate::ids_store::tests::token_now()
 }
 
 /// The 16 hex characters that tell the transient names of different entries
@@ -185,15 +206,36 @@ fn name_digest(path: &Path, kind: &str) -> String {
     digest
 }
 
+/// Creates `path` and fails if it exists. A plain write would truncate another
+/// writer's temp; the token makes a shared name impossible, this is the backstop.
+pub(crate) fn create_exclusive(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
 /// Writes through a temporary name in the same directory, so a crash leaves
 /// either the old file or the new one (design §2.4 rule 4).
 pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
     let tmp = unused_sibling(path, "tmp", "", &mut BTreeSet::new(), Default::default())?;
+    let written = create_exclusive(&tmp, text);
+    // Not this call's file: refuse, and leave it for its owner.
+    if let Err(taken) = &written
+        && taken.kind() == std::io::ErrorKind::AlreadyExists
+    {
+        bail!(
+            "cannot write `{}`: it exists already ({taken})",
+            tmp.display()
+        );
+    }
     // A temp file this call made is not left behind when it fails: the reader
     // refuses a stray entry in the tree.
-    let result = std::fs::write(&tmp, text)
+    let result = written
         .with_context(|| format!("cannot write `{}`", tmp.display()))
         .and_then(|()| {
             std::fs::rename(&tmp, path)

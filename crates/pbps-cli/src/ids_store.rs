@@ -410,8 +410,8 @@ impl TreeWrite {
     ///
     /// A move can turn a file into a directory (`a.json` becomes
     /// `a.json/a.json`) or back. The old path then blocks the new one, so it
-    /// is first renamed to a sibling `.pbps-aside<n>-<digest>`, which is not a `.json`
-    /// file: a crash with an aside left makes the next read refuse and name
+    /// is first renamed to a sibling `.pbps-aside<n>-<digest>-<token>`, which is not
+    /// a `.json` file: a crash with an aside left makes the next read refuse and name
     /// that entry, which holds the only copy of the old file and is renamed
     /// back by hand. A crash before the aside leaves the tree as it was; after
     /// the new files are in place it leaves both copies; the aside is deleted
@@ -431,7 +431,7 @@ impl TreeWrite {
         let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
         // Names a temp file or an aside must not take: every planned
         // destination and each of its ancestors (a declaration may be called
-        // like the temp file of another: `.pbps-tmp0-<digest>/b.yml`), on top
+        // like the temp file of another: `.pbps-tmp0-<digest>-<token>/b.yml`), on top
         // of what already exists on disk.
         let key = self.key;
         let mut reserved = self.reserved_names();
@@ -472,8 +472,13 @@ impl TreeWrite {
             // call may have left.
             staged.temp(&tmp);
             files.push((tmp.clone(), path));
-            write_staged(&tmp, text)
-                .with_context(|| format!("cannot write `{}`", tmp.display()))?;
+            if let Err(e) = write_staged(&tmp, text) {
+                // Not this write's file: the undo must leave it.
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    staged.not_ours(&tmp);
+                }
+                return Err(e).with_context(|| format!("cannot write `{}`", tmp.display()));
+            }
         }
         for (tmp, path) in &files {
             // A directory the new file takes the place of (a move the other
@@ -837,10 +842,10 @@ fn redirected(path: &Path, asides: &[(PathBuf, PathBuf)], key: PathKey) -> PathB
 fn write_staged(tmp: &Path, text: &str) -> std::io::Result<()> {
     #[cfg(test)]
     if tests::fault_now() {
-        std::fs::write(tmp, &text[..text.len() / 2])?;
+        crate::ids_cmd::create_exclusive(tmp, &text[..text.len() / 2])?;
         return Err(std::io::Error::other("injected: no space left on device"));
     }
-    std::fs::write(tmp, text)
+    crate::ids_cmd::create_exclusive(tmp, text)
 }
 
 /// The device a path is on: `st_dev` on Unix. Elsewhere the volume (drive or
@@ -918,6 +923,11 @@ impl Staged {
         self.temps.push(tmp.to_owned());
     }
 
+    /// `tmp` is a file this write did not create: the undo leaves it.
+    fn not_ours(&mut self, tmp: &Path) {
+        self.temps.retain(|t| t != tmp);
+    }
+
     /// Directories the write is about to create, outermost first.
     pub(crate) fn created(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
         self.created.extend(dirs);
@@ -947,8 +957,7 @@ impl Staged {
         &self.asides
     }
 
-    /// Renames `path` to an unused `.pbps-aside<n>-<digest>` sibling (the
-    /// digest is of `path`'s name, so another entry's aside has another name)
+    /// Renames `path` to an unused `.pbps-aside<n>-<digest>-<token>` sibling
     /// and records the pair.
     fn set_aside(
         &mut self,
@@ -1619,4 +1628,4 @@ pub(crate) fn write_ids_tree(project: &Project, ids: &IdsFile) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

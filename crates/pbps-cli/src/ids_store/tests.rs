@@ -46,6 +46,40 @@ pub(super) fn set_aside_fault_now() -> bool {
     })
 }
 
+type NameHook = Box<dyn FnOnce(&Path)>;
+
+thread_local! {
+    /// The token of the next transient name this thread draws (#2820). Zero
+    /// unless a test sets another, so the tests that spell a name out stay exact.
+    static TOKEN: Cell<u64> = const { Cell::new(0) };
+    /// Runs once, inside `unused_sibling`, after a name is judged free and
+    /// before the caller claims it: the moment a second writer can get in.
+    static AFTER_NAME_FREE: std::cell::RefCell<Option<NameHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the transient names this thread draws from now on carry `token`.
+fn set_token(token: u64) {
+    TOKEN.with(|c| c.set(token));
+}
+
+pub(crate) fn token_now() -> u64 {
+    TOKEN.with(Cell::get)
+}
+
+/// Runs `hook` once, with the name just judged free, inside the next name
+/// choice of this thread. Production builds carry no such hook.
+fn on_name_judged_free(hook: impl FnOnce(&Path) + 'static) {
+    AFTER_NAME_FREE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn after_name_judged_free(name: &Path) {
+    // Taken out first: the hook may choose names itself (a second writer).
+    if let Some(hook) = AFTER_NAME_FREE.with(|h| h.borrow_mut().take()) {
+        hook(name);
+    }
+}
+
 fn project(tag: &str) -> Project {
     let root = std::env::temp_dir().join(format!("pbps-ids-store-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -78,9 +112,16 @@ const T: &str = "t_aaaaaa";
 
 /// The transient name for `entry` (a file name), `kind`, counter `n` and
 /// `tail`, spelled out here and not taken from `unused_sibling`: the first 16
-/// hex characters of the SHA-256 of `pbps-transient\0<kind>\0<entry>`. A test
+/// hex characters of the SHA-256 of `pbps-transient\0<kind>\0<entry>`, then
+/// the writer's token (zero here, see `TOKEN`). A test
 /// that asks the function for its own expectation could not fail.
 fn transient(entry: &str, kind: &str, n: usize, tail: &str) -> String {
+    transient_with(entry, kind, n, tail, 0)
+}
+
+/// [`transient`] for a writer that drew `token`: `.pbps-<kind><n>-<digest>-<token>`
+/// with the token as 16 lowercase hex digits.
+fn transient_with(entry: &str, kind: &str, n: usize, tail: &str, token: u64) -> String {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"pbps-transient\0");
@@ -88,7 +129,7 @@ fn transient(entry: &str, kind: &str, n: usize, tail: &str) -> String {
     hasher.update(b"\0");
     hasher.update(entry.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    format!(".pbps-{kind}{n}-{}{tail}", &digest[..16])
+    format!(".pbps-{kind}{n}-{}-{token:016x}{tail}", &digest[..16])
 }
 
 fn customer() -> IdsFile {
@@ -1156,29 +1197,49 @@ fn two_destinations_in_one_directory_never_get_the_same_transient_name() {
 }
 
 #[test]
-fn the_same_destination_gets_the_same_first_name_and_the_counter_tells_taken_names_apart() {
-    // Negative case: the same file written twice at once shares its name. That
-    // is the case that already stood on `master` (`.<name>.tmp`), the one this
-    // digest does not and does not claim to close.
-    let path = Path::new("/ids/a.json");
-    assert_eq!(first_name(path, "tmp", ""), first_name(path, "tmp", ""));
-    // Within one write a taken name moves the counter on.
+fn every_kind_of_transient_name_differs_between_two_writers() {
+    let project = project("token-differs");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("a.json");
+    for (kind, tail) in [("tmp", ""), ("aside", ""), ("respell", ".json")] {
+        set_token(0xa);
+        let first = first_name(&path, kind, tail);
+        set_token(0xb);
+        let second = first_name(&path, kind, tail);
+        assert_ne!(first, second, "{kind}");
+        // Both are spelled out, so a token left out of one kind is caught.
+        assert_eq!(
+            first,
+            dir.join(transient_with("a.json", kind, 0, tail, 0xa))
+        );
+        assert_eq!(
+            second,
+            dir.join(transient_with("a.json", kind, 0, tail, 0xb))
+        );
+        // Negative: a name that is taken (same token) moves the counter on, as
+        // before; the token does not replace the existence test.
+        std::fs::write(&second, "taken").unwrap();
+        assert_eq!(
+            first_name(&path, kind, tail),
+            dir.join(transient_with("a.json", kind, 1, tail, 0xb)),
+            "{kind}"
+        );
+        std::fs::remove_file(&second).unwrap();
+    }
+    // Within one write a name that is reserved moves the counter on too.
+    set_token(0);
     let (mut reserved, key) = (BTreeSet::new(), PathKey::default());
-    let mut pick = || crate::ids_cmd::unused_sibling(path, "tmp", "", &mut reserved, key).unwrap();
-    assert_eq!(
-        pick(),
-        Path::new("/ids").join(transient("a.json", "tmp", 0, ""))
-    );
-    assert_eq!(
-        pick(),
-        Path::new("/ids").join(transient("a.json", "tmp", 1, ""))
-    );
+    let mut pick = || crate::ids_cmd::unused_sibling(&path, "tmp", "", &mut reserved, key).unwrap();
+    assert_eq!(pick(), dir.join(transient("a.json", "tmp", 0, "")));
+    assert_eq!(pick(), dir.join(transient("a.json", "tmp", 1, "")));
 }
 
 #[test]
 fn a_transient_name_is_short_whatever_the_destination_is_called() {
     let long = format!("{}.json", "x".repeat(250));
     assert_eq!(long.len(), 255);
+    set_token(u64::MAX);
     let short = first_name(Path::new("/ids/a.json"), "respell", ".json");
     let for_long = first_name(&Path::new("/ids").join(&long), "respell", ".json");
     // The longest of the three kinds, with a 255-byte destination name.
@@ -1186,7 +1247,170 @@ fn a_transient_name_is_short_whatever_the_destination_is_called() {
         short.file_name().unwrap().len(),
         for_long.file_name().unwrap().len()
     );
-    assert!(for_long.file_name().unwrap().len() <= 40, "{for_long:?}");
+    // `.pbps-` + `respell0` + `-` + digest + `-` + token + `.json`.
+    assert_eq!(
+        for_long.file_name().unwrap().len(),
+        6 + 8 + 1 + 16 + 1 + 16 + 5
+    );
+    assert!(for_long.file_name().unwrap().len() <= 80, "{for_long:?}");
+    // Two destinations still get different names under one token.
+    assert_ne!(short, for_long);
+}
+
+/// Writer B's claim, as it would run in another process: a name of its own
+/// (token `0xb`) and its bytes in it. Returns B's temp.
+fn claim_as_writer_b(dest: &Path, bytes: &str) -> PathBuf {
+    set_token(0xb);
+    let tmp =
+        crate::ids_cmd::unused_sibling(dest, "tmp", "", &mut BTreeSet::new(), PathKey::default())
+            .unwrap();
+    crate::ids_cmd::create_exclusive(&tmp, bytes).unwrap();
+    set_token(0);
+    tmp
+}
+
+#[test]
+fn two_writers_of_one_file_never_share_a_transient_name() {
+    let project = project("two-writers");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("a.json");
+    let b_temp = std::rc::Rc::new(std::cell::RefCell::new(PathBuf::new()));
+    // Writer A has judged its name free; before it claims it, B picks and
+    // fills its own.
+    let (b_dest, b_out) = (dest.clone(), b_temp.clone());
+    on_name_judged_free(move |_| *b_out.borrow_mut() = claim_as_writer_b(&b_dest, "B bytes"));
+    TreeWrite {
+        dir: dir.clone(),
+        files: [("a.json".to_owned(), "A bytes".to_owned())].into(),
+        ..TreeWrite::default()
+    }
+    .apply()
+    .unwrap();
+    let b_temp = b_temp.borrow().clone();
+    assert_eq!(
+        b_temp,
+        dir.join(transient_with("a.json", "tmp", 0, "", 0xb))
+    );
+    // A finished: its bytes are whole and B's temp was not touched.
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "A bytes");
+    assert_eq!(std::fs::read_to_string(&b_temp).unwrap(), "B bytes");
+    // Then B renames, and its bytes are whole.
+    std::fs::rename(&b_temp, &dest).unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "B bytes");
+    assert_eq!(names_in(&dir), ["a.json"]);
+}
+
+#[test]
+fn the_same_race_in_write_atomic_installs_whole_bytes() {
+    let project = project("two-writers-atomic");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("a.json");
+    let b_temp = std::rc::Rc::new(std::cell::RefCell::new(PathBuf::new()));
+    let (b_dest, b_out) = (dest.clone(), b_temp.clone());
+    on_name_judged_free(move |_| *b_out.borrow_mut() = claim_as_writer_b(&b_dest, "B bytes"));
+    write_atomic(&dest, "A bytes").unwrap();
+    let b_temp = b_temp.borrow().clone();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "A bytes");
+    assert_eq!(std::fs::read_to_string(&b_temp).unwrap(), "B bytes");
+    std::fs::rename(&b_temp, &dest).unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "B bytes");
+    assert_eq!(names_in(&dir), ["a.json"]);
+}
+
+#[test]
+fn a_temp_is_never_opened_over_an_existing_file() {
+    // A file appears at the chosen name after the choice and before the create
+    // (same token, so the name is the one chosen). The write refuses and names
+    // it; the file there keeps its bytes, also after the undo.
+    for via in ["tree write", "write_atomic"] {
+        let project = project(via);
+        let dir = project.ids_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("a.json");
+        on_name_judged_free(|name| std::fs::write(name, "planted").unwrap());
+        let error = if via == "write_atomic" {
+            write_atomic(&dest, "mine").unwrap_err()
+        } else {
+            TreeWrite {
+                dir: dir.clone(),
+                files: [("a.json".to_owned(), "mine".to_owned())].into(),
+                ..TreeWrite::default()
+            }
+            .apply()
+            .unwrap_err()
+        };
+        let planted = dir.join(transient("a.json", "tmp", 0, ""));
+        let shown = format!("{error:#}");
+        assert!(
+            shown.contains(&planted.display().to_string()),
+            "{via}: {shown}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            "planted",
+            "{via}"
+        );
+        assert!(!dest.exists(), "{via}: nothing was installed");
+    }
+}
+
+#[test]
+fn a_failed_write_removes_only_its_own_temp() {
+    let project = project("own-temp-only");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // Another writer's temp for the same file. Writer A, below, fails after it
+    // has staged its own; the undo takes A's temps away and not B's.
+    let b_temp = std::rc::Rc::new(std::cell::RefCell::new(PathBuf::new()));
+    let (b_dest, b_out) = (dir.join("a.json"), b_temp.clone());
+    on_name_judged_free(move |_| *b_out.borrow_mut() = claim_as_writer_b(&b_dest, "B bytes"));
+    let write = TreeWrite {
+        dir: dir.clone(),
+        files: [
+            ("a.json".to_owned(), "A".to_owned()),
+            ("b.json".to_owned(), "A too".to_owned()),
+        ]
+        .into(),
+        ..TreeWrite::default()
+    };
+    fail_write_number(2);
+    let error = write.apply().unwrap_err();
+    assert!(format!("{error:#}").contains("injected"), "{error:#}");
+    let b_temp = b_temp.borrow().clone();
+    assert_eq!(std::fs::read_to_string(&b_temp).unwrap(), "B bytes");
+    assert_eq!(
+        names_in(&dir),
+        [b_temp.file_name().unwrap().to_str().unwrap()]
+    );
+}
+
+#[test]
+fn a_leftover_with_another_token_does_not_block_a_write_and_is_still_refused_by_the_reader() {
+    let project = project("leftover-token");
+    let dir = project.ids_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // What a crashed run of another process left: same entry, another token.
+    let stray = transient_with("a.json", "tmp", 0, "", 0xdead);
+    std::fs::write(dir.join(&stray), "x").unwrap();
+    // The write takes its own name at counter 0 and does not trip over it.
+    assert_eq!(
+        first_name(&dir.join("a.json"), "tmp", ""),
+        dir.join(transient("a.json", "tmp", 0, ""))
+    );
+    TreeWrite {
+        dir: dir.clone(),
+        files: [("a.json".to_owned(), "{}".to_owned())].into(),
+        ..TreeWrite::default()
+    }
+    .apply()
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "{}");
+    // Nothing sweeps it, and the reader refuses the tree and names it.
+    assert_eq!(std::fs::read_to_string(dir.join(&stray)).unwrap(), "x");
+    let error = read_ids_tree(&dir).unwrap_err().to_string();
+    assert!(error.contains(&stray), "{error}");
 }
 
 #[cfg(unix)]
