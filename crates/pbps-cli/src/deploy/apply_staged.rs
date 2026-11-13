@@ -668,6 +668,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         // it, so a hand-made change to that table while the deployment is
         // paused is seen rather than carried silently into the closing entry.
         let module_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
+        let mut after = after;
+        after.schema.carry_unidentified_from(&entry.snapshot.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
             after.schema,
@@ -840,6 +842,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
              database with `pbps baseline --reason ...` and plan from there"
             ))
         })?;
+        let mut after = after;
+        after.schema.carry_unidentified_from(&entry.snapshot.schema);
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
             after.schema,

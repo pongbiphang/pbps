@@ -29474,6 +29474,73 @@ mod meeting_shape_tests {
         );
     }
 
+    /// The two halves of one rule (DEC-2721.1): recorded through the declarations' projection,
+    /// a sequence or text search object nobody declared is not in the record, so its dropping
+    /// later is no drift; a declared and recorded one that is dropped still is, by name.
+    #[test]
+    fn dropping_an_undeclared_object_is_no_drift_and_dropping_a_declared_one_is() {
+        let sequence = pbps_model::Sequence {
+            ty: ColumnType::simple("bigint"),
+            start: 1,
+            increment: 1,
+            options: Default::default(),
+        };
+        let dictionary = |name: &str| {
+            (
+                pbps_model::SearchRef::new(
+                    pbps_model::SearchKind::Dictionary,
+                    name.parse().unwrap(),
+                ),
+                pbps_model::SearchObject::Dictionary {
+                    template: "pg_catalog.simple".parse().unwrap(),
+                    options: Default::default(),
+                },
+            )
+        };
+        let mut live_then = Schema::default();
+        for name in ["app.declared", "app.helper"] {
+            live_then
+                .sequences
+                .insert(name.parse().unwrap(), sequence.clone());
+            let (key, value) = dictionary(name);
+            live_then.search.insert(key, value);
+        }
+        let mut declared = Schema::default();
+        declared
+            .sequences
+            .insert("app.declared".parse().unwrap(), sequence.clone());
+        let (key, value) = dictionary("app.declared");
+        declared.search.insert(key, value);
+        // What a recording writes of them: only what the declarations name.
+        let mut recorded = live_then.clone();
+        recorded.keep_only_named_unidentified(&declared);
+        assert_eq!(recorded.sequences.len(), 1);
+        assert_eq!(recorded.search.len(), 1);
+        // The helper is dropped: nothing to say.
+        let mut live_now = live_then.clone();
+        live_now.sequences.remove(&"app.helper".parse().unwrap());
+        live_now.search.retain(|k, _| k.name.name() != "helper");
+        live_now.keep_only_named_unidentified(&recorded);
+        assert!(unidentified_drift(&recorded, &live_now).is_empty());
+        // Negative: the declared one is dropped, and both kinds say so by name.
+        let mut live_gone = live_then.clone();
+        live_gone.sequences.remove(&"app.declared".parse().unwrap());
+        live_gone.search.retain(|k, _| k.name.name() != "declared");
+        live_gone.keep_only_named_unidentified(&recorded);
+        let said = unidentified_drift(&recorded, &live_gone);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|m| m.contains("sequence `app.declared` was recorded")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`app.declared` was recorded")),
+            "{said:?}"
+        );
+    }
+
     /// A standalone sequence the declarations hold is compared with the target's and every
     /// difference is refused by name, since nothing plans them yet (DEC-2721.1): one the
     /// target lacks, one it holds differently, said attribute by attribute. An identical

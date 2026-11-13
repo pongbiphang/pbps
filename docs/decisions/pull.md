@@ -1452,6 +1452,15 @@ one arrive in the parts that follow, and SQL Server's sequences in the last.
   of each, which is the scratch it had before the kinds were held. A default that calls such a
   sequence meets the scratch's compile exactly as it did then. The real bootstrap is not
   projected: a declared sequence there is refused by name, not skipped.
+- **What a recording writes of them.** Only what is named. A recording from the database
+  (`baseline`, `snapshot`, a bootstrap) keeps of the sequences and text search objects the ones
+  the declarations name, through `Schema::keep_only_named_unidentified`; an `apply` records what
+  the record already held, through `Schema::carry_unidentified_from`, because no plan can
+  change them yet and one the record forgot could never be missed. A helper sequence the target
+  holds and nobody declared, present when a state is recorded and dropped later, is therefore
+  no drift: the first cut recorded every live sequence, and a recorded sequence is the
+  project's by being recorded. The part that can create a sequence adds the ones its plan
+  creates to what `apply` records.
 - **One namespace.** A sequence shares its schema's relation namespace with tables, views,
   indexes and the indexes behind named keys, so its name is claimed in the one rule that
   compares those (`pbps_dialect::check_index_names`), not in a rule of its own. A sequence

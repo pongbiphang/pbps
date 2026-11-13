@@ -258,11 +258,13 @@ pub(super) fn refuse_extension_prerequisite_drift(
 /// Keep the read-back and authored definitions together: the former proves
 /// drift, while the latter preserves expressions the catalog respells.
 pub(super) fn bootstrap_record(
-    built: pbps_diff::Scoped,
+    mut built: pbps_diff::Scoped,
     held: IdsFile,
     loaded: &pbps_load::Loaded,
     operator: &str,
 ) -> anyhow::Result<StateSnapshot> {
+    // Only what the declarations name of the kinds with no identity record yet (DEC-2721.1).
+    built.schema.keep_only_named_unidentified(&loaded.schema);
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
     snapshot.module_deps = loaded

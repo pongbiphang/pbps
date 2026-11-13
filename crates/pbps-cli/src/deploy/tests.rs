@@ -202,6 +202,73 @@ fn bootstrap_requires_each_declared_type_identity() {
     refuse_unidentified_bootstrap_objects(&Schema::default(), &IdsFile::default()).unwrap();
 }
 
+/// A bootstrap records, of the sequences, only the ones the declarations name (DEC-2721.1): a
+/// helper the target holds and nobody declared is not this project's, so dropping it later is
+/// no drift of the project's. `apply` carries the record's own sequences forward instead.
+#[test]
+fn a_recording_keeps_only_the_sequences_the_declarations_name_and_apply_carries_the_record() {
+    let sequence = |start| pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start,
+        increment: 1,
+        options: Default::default(),
+    };
+    let mut live = Schema::default();
+    live.sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    live.sequences
+        .insert("app.helper".parse().unwrap(), sequence(1));
+    let mut loaded = pbps_load::Loaded::default();
+    loaded
+        .schema
+        .sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    let built = pbps_diff::scope(
+        &live,
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let snapshot = bootstrap_record(built, IdsFile::default(), &loaded, "operator").unwrap();
+    assert_eq!(
+        snapshot
+            .schema
+            .sequences
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect::<Vec<_>>(),
+        ["app.named"]
+    );
+    // Negative: nothing declared, nothing recorded.
+    let built = pbps_diff::scope(
+        &live,
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let snapshot = bootstrap_record(
+        built,
+        IdsFile::default(),
+        &pbps_load::Loaded::default(),
+        "operator",
+    )
+    .unwrap();
+    assert!(snapshot.schema.sequences.is_empty());
+    // An apply records what the record held, whatever the database holds now.
+    let mut after = live.clone();
+    after.carry_unidentified_from(&snapshot.schema);
+    assert!(after.sequences.is_empty(), "the helper is not adopted");
+    let mut previous = Schema::default();
+    previous
+        .sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    after.carry_unidentified_from(&previous);
+    assert_eq!(
+        after.sequences, previous.sequences,
+        "a recorded one is kept though gone"
+    );
+}
+
 #[test]
 fn bootstrap_refuses_to_record_an_annotation_the_state_cannot_hold() {
     let mut loaded = pbps_load::Loaded::default();

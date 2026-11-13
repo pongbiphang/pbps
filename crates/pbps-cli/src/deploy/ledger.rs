@@ -337,7 +337,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
             let ids = crate::engine::installation_ids(&mut conn, &ids).await?;
-            let scoped = managed_state(
+            let mut scoped = managed_state(
                 &mut conn,
                 &ids,
                 &declared_modules,
@@ -386,6 +386,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // never creates (#1600, #1606).
             crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+            // Only what the declarations name is recorded of the kinds with no identity record
+            // yet: a sequence nobody declared is not this project's, and its dropping later is
+            // not this project's drift (DEC-2721.1).
+            scoped.schema.keep_only_named_unidentified(&loaded.schema);
             let held = ids
                 .without(&scoped.missing)
                 .without_roles(&gone)
@@ -595,7 +599,7 @@ pub fn cmd_baseline(
             };
             let body = async {
                 let removed = crate::engine::drop_scan_checks(&mut conn, &checks).await?;
-                let scoped = managed_state(
+                let mut scoped = managed_state(
                     &mut conn,
                     &ids,
                     &declared_modules,
@@ -641,6 +645,10 @@ pub fn cmd_baseline(
                 // What the database holds, as `snapshot` records it (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+                // Only what the declarations name is recorded of the kinds with no identity record
+                // yet: a sequence nobody declared is not this project's, and its dropping later is
+                // not this project's drift (DEC-2721.1).
+                scoped.schema.keep_only_named_unidentified(&loaded.schema);
                 let held = ids
                     .without(&scoped.missing)
                     .without_roles(&gone)

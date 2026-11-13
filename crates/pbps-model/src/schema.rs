@@ -100,6 +100,16 @@ impl Schema {
             .retain(|name, _| named.sequences.contains_key(name));
     }
 
+    /// Takes the objects of those kinds from `previous`, the schema last recorded, and leaves
+    /// this schema's own out: what a recording that cannot plan any of them (`apply`) writes
+    /// for them, so that a plan neither adopts a sequence nobody declared nor forgets one that
+    /// was recorded and has since gone (DEC-2721.1). The part that can create one will add the
+    /// ones its plan creates.
+    pub fn carry_unidentified_from(&mut self, previous: &Schema) {
+        self.search = previous.search.clone();
+        self.sequences = previous.sequences.clone();
+    }
+
     /// A copy without the objects of those kinds: what a schema is, for a caller that must
     /// build it from nothing before any plan can create them.
     ///

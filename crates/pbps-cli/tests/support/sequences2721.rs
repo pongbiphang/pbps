@@ -377,3 +377,64 @@ fn a_recorded_sequence_that_was_dropped_renamed_or_altered_is_drift_by_name_and_
         assert!(!text.contains("stride_moved"), "{text}");
     });
 }
+
+/// Of the sequences, a recording holds only what the declarations name (DEC-2721.1): a helper
+/// the target holds and nobody declared, present when a state is recorded by a bootstrap, a
+/// baseline or an apply, is not in the record, so dropping it later is no drift of the
+/// project's. Negative: a declared and recorded sequence that is dropped still is, by name.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_undeclared_sequence_present_when_a_state_is_recorded_is_not_recorded_and_dropping_it_is_no_drift()
+ {
+    servers(|server, slug| {
+        // Bootstrap: the helper stood before the build.
+        let f = Fixture::new(
+            server,
+            &format!("sequences2721-rec-boot-{slug}"),
+            Kind::Supplied,
+            &Options {
+                externals: Some("CREATE SEQUENCE app.helper"),
+                ..Options::default()
+            },
+        );
+        on_server(f.target(), "DROP SEQUENCE app.helper");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        // Apply: the helper appears after the build, and a plan is applied beside it.
+        let a = Fixture::new(
+            server,
+            &format!("sequences2721-rec-apply-{slug}"),
+            Kind::Supplied,
+            &Options {
+                target_only: Some("CREATE SEQUENCE app.helper"),
+                ..Options::default()
+            },
+        );
+        a.revise_row();
+        succeeds(a.plan(&[]));
+        succeeds(a.apply("data-update"));
+        on_server(a.target(), "DROP SEQUENCE app.helper");
+        succeeds(a.d.run(&["verify", "--db", a.target()]));
+        // Baseline: the helper stands when the state is recorded from the declarations.
+        let b = fixture(server, &format!("sequences2721-rec-base-{slug}"));
+        on_server(b.target(), MADE);
+        pull(&b);
+        on_server(b.target(), "CREATE SEQUENCE app.helper");
+        adopt(&b);
+        on_server(b.target(), "DROP SEQUENCE app.helper");
+        succeeds(b.d.run(&["verify", "--db", b.target()]));
+        // Snapshot: a second helper stands when the current state is recorded.
+        on_server(b.target(), "CREATE SEQUENCE app.helper_two");
+        succeeds(b.d.run(&["snapshot", "--db", b.target()]));
+        on_server(b.target(), "DROP SEQUENCE app.helper_two");
+        succeeds(b.d.run(&["verify", "--db", b.target()]));
+        // Negative: a declared and recorded one that is dropped is drift, by name.
+        on_server(b.target(), "DROP SEQUENCE app.plain");
+        let out = b.d.run(&["verify", "--db", b.target()]);
+        assert_eq!(code(&out), 2, "{}", said(&out));
+        assert!(
+            said(&out).contains("sequence `app.plain` was recorded and is not in the database now"),
+            "{}",
+            said(&out)
+        );
+    });
+}
