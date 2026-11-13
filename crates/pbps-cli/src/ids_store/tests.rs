@@ -2503,6 +2503,27 @@ fn a_link_in_the_middle_of_a_deeper_ids_dir_is_refused() {
     assert!(project.root.join("meta/ids").is_dir());
 }
 
+#[test]
+fn a_root_spelled_as_the_filesystem_resolves_it_is_walked_from_its_first_directory() {
+    // On Windows `canonicalize` gives `\\?\C:\...`, and the prefix alone
+    // cannot be looked at. It is where the path starts, not a component that
+    // could be a link.
+    let project = project("resolved-root");
+    let root = project.root.canonicalize().unwrap();
+    refuse_linked_ids_dir(&root, &root.join(".pbps/ids")).unwrap();
+    // Negative: a link below that root is still refused.
+    #[cfg(unix)]
+    {
+        let name = root.file_name().unwrap().to_string_lossy();
+        let outside = root.with_file_name(format!("{name}-outside"));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".pbps")).unwrap();
+        let error = link_refusal(&root, &root.join(".pbps/ids"));
+        assert!(error.contains("is a symbolic link"), "{error}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_project_root_behind_a_link_is_not_refused() {

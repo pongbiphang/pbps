@@ -1731,4 +1731,9 @@ empty directory outside it).
   On Windows the check uses `FileType::is_symlink`. Read in the `std` source
   (1.85 and 1.99): it is true for a reparse point whose tag has the name-surrogate
   bit (`0x20000000`). Symbolic links (`0xA000000C`) and junctions (`0xA0000003`)
-  both have it, so both are refused. Not run on Windows.
+  both have it, so both are refused. No link is created on Windows: the tests
+  that make one are Unix-only.
+- **A drive prefix and the root are not inspected.** They are where a path
+  starts, not entries of a directory, so neither can be a link. Windows cannot
+  look at a verbatim prefix alone (`\\?\C:`), and `canonicalize` spells every
+  path with one. The Windows job runs `init` and `pull` through this.

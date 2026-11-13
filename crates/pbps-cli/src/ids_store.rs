@@ -688,7 +688,8 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
 /// that cannot be inspected, or whose parent cannot be resolved, is an error
 /// that names it, never "no link". A component that is a file also ends the
 /// walk: the write that follows refuses it with its own message. A refusal
-/// names the link as the user spelled the path.
+/// names the link as the user spelled the path. A drive prefix and the root
+/// are passed without being looked at: they are not entries of a directory.
 pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
     use std::io::ErrorKind::{NotADirectory, NotFound};
     let shown = |path: &Path| pbps_model::escape::Escaped(&path.display().to_string()).to_string();
@@ -711,6 +712,14 @@ pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Resu
     let mut pending = 0usize;
     for part in ids_dir.components() {
         spelled.push(part);
+        // A drive prefix and the root are where a path starts, not entries of a
+        // directory, so neither can be a link and there is nothing to inspect.
+        // Windows refuses to look at a verbatim prefix alone (`\\?\C:`), and
+        // `canonicalize` spells every path with one.
+        if matches!(part, Component::Prefix(_) | Component::RootDir) {
+            at.push(part);
+            continue;
+        }
         if pending > 0 {
             match part {
                 Component::CurDir => {}
