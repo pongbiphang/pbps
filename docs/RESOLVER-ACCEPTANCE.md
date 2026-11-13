@@ -309,18 +309,20 @@ and no other row stands in for it.
 - Case 14 on SQL Server: the PostgreSQL witness (`backend`) rejects a replacement
   that reuses the old backend's registered continuation. The SQL Server run keeps
   no such continuation: every reconnect re-verifies the compared facts of the new
-  session (DEC-2143.4) and `ms-reconnect` is that whole mechanism. Whether this is
-  accepted as the SQL Server disposition awaits the maintainer.
+  session (DEC-2143.4) and `ms-reconnect` is that whole mechanism. Disposition
+  pending maintainer.
 - PostgreSQL 16: `am-03`, `am-09`, `am-11` and `am-14` to `am-22` run on PostgreSQL 18.6
-  only (the one scratch server is 18); their 16 cells need a 16 scratch fixture or a
-  disposition.
+  only. A scratch must match its target's server version, so a 16 target with the
+  one 18 scratch cluster is refused by design (measured on `597d8c873`: 11 of the 12
+  tests refuse with `server_version_num`). Their 16 cells need a PostgreSQL 16
+  scratch cluster in CI or an explicit disposition. Disposition pending maintainer.
 - Docker scratch: PostgreSQL rows other than the container lifecycle and the
   trace rows are server-kind; SQL Server's seam rows run on a supplied second
   instance, and Docker is covered by the trace rows and the container lifecycle
   rows only.
 - End-to-end flows that start no resolver (the ordinary path as a compatibility
   check) on each engine, and the family of macOS (#2492) and CLR assemblies
-  (#2106), which wait for the maintainer's block-or-limitation decision.
+  (#2106). Disposition pending maintainer (block or documented limitation).
 
 ## Closing audit
 
