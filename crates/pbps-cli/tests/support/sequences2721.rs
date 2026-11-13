@@ -330,3 +330,50 @@ fn a_rehearsed_plan_beside_a_held_sequence_converges_on_the_scratch() {
         );
     });
 }
+
+/// Drift in a recorded sequence is reported by name (DEC-2721.1): one dropped or renamed away
+/// out of band, and one altered, each make `verify` say so; a sequence nobody recorded, made
+/// beside them, is not looked at.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_recorded_sequence_that_was_dropped_renamed_or_altered_is_drift_by_name_and_an_unrecorded_one_is_not()
+ {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("sequences2721-drift-{slug}"));
+        on_server(f.target(), MADE);
+        pull(&f);
+        adopt(&f);
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        // Negative: a sequence nobody recorded is not drift.
+        on_server(f.target(), "CREATE SEQUENCE app.made_later");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        let drifted = |sql: &str| {
+            on_server(f.target(), sql);
+            let out = f.d.run(&["verify", "--db", f.target()]);
+            assert_eq!(code(&out), 2, "{}", said(&out));
+            said(&out)
+        };
+        let text = drifted("ALTER SEQUENCE app.order_no INCREMENT BY 7");
+        assert!(
+            text.contains("sequence `app.order_no` changed since it was recorded")
+                && text.contains("increment: now 7, recorded 5"),
+            "{text}"
+        );
+        on_server(f.target(), "ALTER SEQUENCE app.order_no INCREMENT BY 5");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        let text = drifted("DROP SEQUENCE app.plain");
+        assert!(
+            text.contains("sequence `app.plain` was recorded and is not in the database now"),
+            "{text}"
+        );
+        on_server(f.target(), "CREATE SEQUENCE app.plain");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        let text = drifted("ALTER SEQUENCE app.stride RENAME TO stride_moved");
+        assert!(
+            text.contains("sequence `app.stride` was recorded and is not in the database now"),
+            "{text}"
+        );
+        // The renamed one is a sequence nobody recorded: not named on its own.
+        assert!(!text.contains("stride_moved"), "{text}");
+    });
+}

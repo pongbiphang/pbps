@@ -1432,7 +1432,11 @@ one arrive in the parts that follow, and SQL Server's sequences in the last.
   recorded is not this project's. One function, `Schema::keep_only_named_unidentified`, is
   the projection: it leaves out of a fresh read the sequences (and text search objects) the
   other side does not name, and keeps those it does, so a change to one is still a
-  difference. Every comparison of a fresh read with a schema uses it: `verify`, the guard of
+  difference. The differ walks the new side only, so a recorded sequence that was dropped or
+  renamed away is on neither list there; `verify` names it, and one that changed, through
+  `pbps_diff::unidentified_drift` ("was recorded and is not in the database now", "changed
+  since it was recorded (increment: now 7, recorded 5)"), and keeps those objects out of the
+  differ's inputs so none is said twice in a plan's words. Every comparison of a fresh read with a schema uses it: `verify`, the guard of
   `snapshot` and `baseline` that refuses to record over a different state (`StateSnapshot::matches`, which would otherwise call a version 43 snapshot drifted from any database that
   has a sequence), and the question whether a bootstrap target already stands, where the
   declarations are the side that names. The checksum comparisons (`plan --db`, `status`,

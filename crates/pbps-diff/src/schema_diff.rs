@@ -6777,7 +6777,7 @@ fn diff_sequences(
             }
             Some(was) => {
                 let (was, now) = (normal(was), normal(now));
-                let differing = sequence_differences(&was, &now);
+                let differing = sequence_differences(&was, &now, ("declared", "target has"));
                 if differing.is_empty() {
                     continue;
                 }
@@ -6795,17 +6795,25 @@ fn diff_sequences(
     }
 }
 
-/// What differs between the target's sequence and the declared one, attribute by attribute,
-/// each as `name: declared where the target has held`. A bound or a cache that is `None` is
+/// What differs between the held sequence and the new one, attribute by attribute, each as
+/// `name: <words.0> new, <words.1> held` ("declared", "target has" in a plan; "now",
+/// "recorded" in a drift report). A bound or a cache that is `None` is
 /// the engine's default, and is said so.
-fn sequence_differences(was: &pbps_model::Sequence, now: &pbps_model::Sequence) -> Vec<String> {
+fn sequence_differences(
+    was: &pbps_model::Sequence,
+    now: &pbps_model::Sequence,
+    words: (&str, &str),
+) -> Vec<String> {
     fn bound(value: Option<i64>) -> String {
         value.map_or_else(|| "the engine's default".to_owned(), |v| v.to_string())
     }
     let mut out = Vec::new();
     let mut note = |what: &str, declared: String, held: String| {
         if declared != held {
-            out.push(format!("{what}: declared {declared}, target has {held}"));
+            out.push(format!(
+                "{what}: {} {declared}, {} {held}",
+                words.0, words.1
+            ));
         }
     };
     note(
@@ -6827,6 +6835,44 @@ fn sequence_differences(was: &pbps_model::Sequence, now: &pbps_model::Sequence) 
         was.options.cycle.to_string(),
     );
     note("cache", bound(now.options.cache), bound(was.options.cache));
+    out
+}
+
+/// Drift in the kinds that have no identity record yet (text search objects, standalone
+/// sequences): what `recorded` holds of them that `live` lost or changed, each by name
+/// (DEC-2721.1, DEC-2728.1). `live` is a fresh read already projected through
+/// `Schema::keep_only_named_unidentified(recorded)`, so a sequence nobody recorded is not here
+/// to be called anything; a recorded one that is gone, renamed away or changed is. The
+/// differ cannot say so itself: it walks the new side, and a recorded object that is missing
+/// from it is on neither list.
+pub fn unidentified_drift(recorded: &pbps_model::Schema, live: &pbps_model::Schema) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, was) in &recorded.sequences {
+        match live.sequences.get(name) {
+            None => out.push(format!(
+                "sequence `{}` was recorded and is not in the database now",
+                name.shown()
+            )),
+            Some(now) if now != was => out.push(format!(
+                "sequence `{}` changed since it was recorded ({})",
+                name.shown(),
+                sequence_differences(was, now, ("now", "recorded")).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, was) in &recorded.search {
+        match live.search.get(name) {
+            None => out.push(format!(
+                "{} was recorded and is not in the database now",
+                name.shown()
+            )),
+            Some(now) if now != was => {
+                out.push(format!("{} changed since it was recorded", name.shown()))
+            }
+            Some(_) => {}
+        }
+    }
     out
 }
 
@@ -29353,6 +29399,78 @@ mod meeting_shape_tests {
                 .to_string()
                 .contains("text search configuration `app.same`")),
             "{errs:?}"
+        );
+    }
+
+    /// Drift in a recorded sequence or text search object is reported by name: one that is
+    /// gone (dropped, or renamed away) and one that changed, said attribute by attribute for a
+    /// sequence. An unchanged one is silent, and one only the live side holds is not looked at
+    /// (DEC-2721.1).
+    #[test]
+    fn a_recorded_sequence_that_is_gone_or_changed_is_drift_and_an_unrecorded_one_is_not_looked_at()
+    {
+        let sequence = |start, increment| pbps_model::Sequence {
+            ty: ColumnType::simple("bigint"),
+            start,
+            increment,
+            options: Default::default(),
+        };
+        let mut recorded = Schema::default();
+        for (name, held) in [
+            ("app.same", sequence(1, 1)),
+            ("app.changed", sequence(1, 5)),
+            ("app.gone", sequence(1, 1)),
+        ] {
+            recorded.sequences.insert(name.parse().unwrap(), held);
+        }
+        let mut live = Schema::default();
+        live.sequences
+            .insert("app.same".parse().unwrap(), sequence(1, 1));
+        live.sequences
+            .insert("app.changed".parse().unwrap(), sequence(1, 7));
+        // Not recorded: nothing to say about it.
+        live.sequences
+            .insert("app.theirs".parse().unwrap(), sequence(1, 1));
+        let said = unidentified_drift(&recorded, &live);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter().any(
+                |m| m.contains("sequence `app.changed` changed since it was recorded")
+                    && m.contains("increment: now 7, recorded 5")
+            ),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m
+                    .contains("sequence `app.gone` was recorded and is not in the database now")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .all(|m| !m.contains("app.same") && !m.contains("app.theirs"))
+        );
+        // Negative: nothing recorded, nothing to report; and the same read is no drift.
+        assert!(unidentified_drift(&Schema::default(), &live).is_empty());
+        assert!(unidentified_drift(&recorded, &recorded).is_empty());
+        // A text search object is held to the same rule.
+        let key = pbps_model::SearchRef::new(
+            pbps_model::SearchKind::Dictionary,
+            "app.d".parse().unwrap(),
+        );
+        let mut with = Schema::default();
+        with.search.insert(
+            key,
+            pbps_model::SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let said = unidentified_drift(&with, &Schema::default());
+        assert!(
+            said.iter()
+                .any(|m| m.contains("text search dictionary `app.d` was recorded")),
+            "{said:?}"
         );
     }
 

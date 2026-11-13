@@ -119,6 +119,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
         live_read.keep_only_named_unidentified(&recorded_read);
         without_comments(&mut recorded_read, &mut live_read);
+        // Compared by name here and not by the differ, which walks the new side only: a
+        // recorded sequence that was dropped or renamed away is on neither side's list there.
+        // Out of the differ's inputs afterwards, so none is reported twice, in the words of a
+        // plan ("declared", "the target has none").
+        let unidentified = pbps_diff::unidentified_drift(&recorded_read, &live_read);
+        for read in [&mut recorded_read, &mut live_read] {
+            read.search.clear();
+            read.sequences.clear();
+        }
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &recorded_read,
@@ -145,6 +154,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
+        unexpressible.extend(unidentified);
         // A managed role's permission the declarations cannot spell is the
         // same kind of difference as a catalog fact they cannot: established,
         // and with no `Change` to carry it (DECISIONS 95).
