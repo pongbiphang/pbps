@@ -1130,8 +1130,11 @@ def validate(root, inventory, targets, platform, rules=None):
 # Linux binaries, so it cannot see that. Which tests the Windows build compiles is
 # a `cfg` question, answered here from source: the `cfg` attributes of the test
 # function, of every enclosing module (inline or file), and the inner `#![cfg]` of
-# a module file. A `cfg` the evaluator cannot decide counts as compiled on
-# Windows, so the prediction fails closed; the win32 run stays the authority.
+# a module file, and then whether the test is still `#[ignore]`d there (a
+# `#[cfg_attr(unix, ignore)]` test runs ordinarily on Windows and is not listed). The module
+# files are found by rustc's own path rule (see `RustModules`). A `cfg` the evaluator cannot
+# decide counts as compiled and ignored on Windows, so the prediction fails closed; the
+# win32 run stays the authority.
 
 # The Windows runner of the `quick` job: windows-latest, MSVC, x86_64.
 WINDOWS_CFG = {"target_os": "windows", "target_family": "windows", "target_env": "msvc",
@@ -1273,6 +1276,74 @@ def rust_items(tokens, start=0, end=None):
     return inner, items
 
 
+def attribute_ignore(tokens):
+    """Windows value of one attribute as a source of `ignore`: True/False, or None if undecidable.
+
+    `#[ignore]` and `#[ignore = "why"]` ignore the test; `#[cfg_attr(pred, ignore, ...)]` does
+    when `pred` holds on Windows, nested `cfg_attr` included. Any other attribute does not."""
+    if tokens == ["ignore"] or tokens[:2] == ["ignore", "="]:
+        return True
+    if tokens[:2] != ["cfg_attr", "("] or tokens[-1:] != [")"]:
+        return False
+    try:
+        predicate, i = parse_cfg(tokens, 2)
+    except InventoryError:
+        predicate, i = None, len(tokens)
+    if i >= len(tokens) - 1 or tokens[i] != ",":
+        return None if i < len(tokens) - 1 else False
+    attributes, current, depth = [], [], 0
+    for token in tokens[i + 1:-1]:
+        if isinstance(token, str) and token in ("(", "[", "{"): depth += 1
+        elif isinstance(token, str) and token in (")", "]", "}"): depth -= 1
+        if token == "," and depth == 0:
+            attributes.append(current); current = []
+        else:
+            current.append(token)
+    if current: attributes.append(current)
+    inner = tri_any([attribute_ignore(attribute) for attribute in attributes])
+    return False if inner is False else tri_all([predicate, inner])
+
+
+def ignored_on_windows(attributes):
+    """True/False, or None if undecidable: is the function still `#[ignore]`d in the Windows build?"""
+    return tri_any([attribute_ignore(tokens) for tokens in attributes])
+
+
+def path_attribute_of(attributes):
+    """The string of a `#[path = "..."]` among the attributes, or None."""
+    found = None
+    for attr in attributes:
+        if attr[:2] == ["path", "="] and len(attr) == 3 and isinstance(attr[2], tuple):
+            found = attr[2][1]
+    return found
+
+
+# rustc's module-path rule (rustc_expand::module), implemented once. The state of a module
+# is (directory, relative): the directory of its source file (or the one its inline modules
+# have pushed) and, for a file `foo.rs` that is not `mod.rs`, the name `foo` its children
+# live under.
+#   - lib.rs, main.rs and the crate root start at (their directory, None);
+#   - `mod x;` without #[path] is `<directory>/<relative>/x.rs`, state (that file's
+#     directory, x), or `<directory>/<relative>/x/mod.rs`, state (that directory, None);
+#   - `#[path = "p"] mod x;` is `<directory>/p` (the relative name is not used), and the
+#     file owns its directory: state (its directory, None);
+#   - `mod x { }` pushes `<relative>/x` onto the directory: state (<directory>/<relative>/x, None);
+#     with its own #[path = "p"] it pushes p instead: state (<directory>/p, None);
+#   - nesting composes, because every child starts from its parent's state.
+
+
+def children_base(state):
+    directory, relative = state
+    return directory / relative if relative else directory
+
+
+def inline_state(state, name, path_attribute):
+    """State of the children of the inline module `name`."""
+    if path_attribute is not None:
+        return state[0] / path_attribute, None
+    return children_base(state) / name, None
+
+
 class RustModules:
     """The module tree of one crate, read lazily from source."""
 
@@ -1284,35 +1355,33 @@ class RustModules:
             self.tokens[path] = rust_tokens(path.read_text(encoding="utf-8"))
         return self.tokens[path]
 
-    def file_module(self, path, directory):
-        """(inner attributes, items, tokens) of a module file; `directory` holds its children."""
+    def file_module(self, path):
+        """(inner attributes, items, tokens) of a module file."""
         tokens = self.read(path)
         if path not in self.parsed:
             self.parsed[path] = rust_items(tokens)
         inner, items = self.parsed[path]
-        return inner, items, tokens, directory
+        return inner, items, tokens
 
-    def child_file(self, path_base, directory, path_attribute, name):
-        """Source file of `mod name;`; None if it cannot be found.
-
-        A `#[path]` is relative to the directory of the declaring file, or, below
-        inline modules, to the module directory of that file plus their names
-        (`path_base`)."""
+    def child_file(self, state, path_attribute, name):
+        """(source file, state) of `mod name;` declared in `state`; None if it cannot be found."""
+        directory = state[0]
         if path_attribute is not None:
-            candidate = path_base / path_attribute
-            return (candidate, candidate.parent) if candidate.is_file() else None
-        for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
+            candidate = directory / path_attribute
+            return (candidate, (candidate.parent, None)) if candidate.is_file() else None
+        base = children_base(state)
+        for candidate, relative in ((base / f"{name}.rs", name), (base / name / "mod.rs", None)):
             if candidate.is_file():
-                return candidate, (candidate.parent if candidate.name == "mod.rs" else directory / name)
+                return candidate, (candidate.parent, relative)
         return None
 
-    def compiled_on_windows(self, root, name):
-        """False if the Windows build certainly does not compile test `name` of the crate at `root`."""
-        parts = name.split("::")
-        inner, items, tokens, directory = self.file_module(root, root.parent)
-        return self.walk(root.parent, tokens, directory, inner, items, parts, True) is not False
+    def still_ignored_on_windows(self, root, name):
+        """False if the Windows build certainly does not list test `name` of the crate at `root`
+        as ignored: it does not compile it, or it is not `#[ignore]`d there."""
+        inner, items, tokens = self.file_module(root)
+        return self.walk((root.parent, None), tokens, inner, items, name.split("::"), True) is not False
 
-    def walk(self, path_base, tokens, directory, inner, items, parts, inherited):
+    def walk(self, state, tokens, inner, items, parts, inherited):
         value = tri_all([inherited, attribute_cfg(inner)])
         if value is False:
             return False
@@ -1323,32 +1392,27 @@ class RustModules:
         results = []
         for _, _, attributes, body in found:
             here = tri_all([value, attribute_cfg(attributes)])
-            if here is False or kind == "fn":
+            if kind == "fn":
+                results.append(tri_all([here, ignored_on_windows(attributes)])); continue
+            if here is False:
                 results.append(here); continue
             if any(attr[:1] == ["cfg_attr"] and "path" in attr for attr in attributes):
                 # A conditional #[path] may select another file on Windows: not decided here.
                 results.append(None); continue
-            if body is not None:   # inline module: children live in a directory named after it
+            path_attribute = path_attribute_of(attributes)
+            if body is not None:   # inline module: it pushes a directory for its children
                 if (id(tokens), body) not in self.parsed:
                     self.parsed[id(tokens), body] = rust_items(tokens, *body)
                 sub_inner, sub_items = self.parsed[id(tokens), body]
-                # A #[path] below an inline module is relative to the module's directory, which
-                # for a file that is not mod.rs starts with the file's stem (rustc: outer.rs holding
-                # `mod inner { #[path = "live.rs"] mod live; }` loads outer/inner/live.rs).
-                results.append(self.walk(directory / parts[0], tokens, directory / parts[0], sub_inner,
+                results.append(self.walk(inline_state(state, parts[0], path_attribute), tokens, sub_inner,
                                          sub_items, parts[1:], here))
                 continue
-            path_attribute = None
-            for attr in attributes:
-                if attr[:2] == ["path", "="] and len(attr) == 3 and isinstance(attr[2], tuple):
-                    path_attribute = attr[2][1]
-            located = self.child_file(path_base, directory, path_attribute, parts[0])
+            located = self.child_file(state, path_attribute, parts[0])
             if located is None:
                 results.append(None); continue
-            child, child_directory = located
-            sub_inner, sub_items, sub_tokens, _ = self.file_module(child, child_directory)
-            results.append(self.walk(child.parent, sub_tokens, child_directory, sub_inner, sub_items,
-                                     parts[1:], here))
+            child, child_state = located
+            sub_inner, sub_items, sub_tokens = self.file_module(child)
+            results.append(self.walk(child_state, sub_tokens, sub_inner, sub_items, parts[1:], here))
         return tri_any(results)
 
 
@@ -1368,7 +1432,7 @@ def predict_win32(inventory, rules, targets, platform):
         if owner is None or owners[owner]["platform"] == "win32":
             continue
         root = targets[case[:3]].get("root")
-        if root is not None and not modules.compiled_on_windows(Path(root), case[3]):
+        if root is not None and not modules.still_ignored_on_windows(Path(root), case[3]):
             continue
         raise InventoryError(
             f"predicted on win32: rule-only case {case} discovered on win32 cannot be verified on "

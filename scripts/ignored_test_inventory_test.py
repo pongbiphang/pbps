@@ -1321,6 +1321,101 @@ class Win32Prediction(unittest.TestCase):
                         targets[KEY]["ignored"] = {"live::inner::owned"}
                     self.refused_name(targets, targets[KEY]["ignored"].copy().pop())
 
+    # rustc's module-path rule, one case per rule. Each shape names the file rustc reads for the
+    # leaf module and the decoys it must not read. Run both ways, so that only the right file counts:
+    # the cfg(unix) gate in the right file keeps the test out of Windows (accepted) while a plain
+    # decoy sits elsewhere; the plain right file with a gated decoy is compiled on Windows (refused).
+    PATH_RULES = (
+        ("a crate root owns its directory", "mod live;\n", {}, "live.rs", ["sub/live.rs", "src/live.rs"], "live"),
+        ("a mod.rs file owns its directory", "mod outer;\n", {"outer/mod.rs": "mod live;\n"},
+         "outer/live.rs", ["live.rs", "outer/outer/live.rs"], "outer::live"),
+        ("a file foo.rs owns foo/", "mod outer;\n", {"outer.rs": "mod live;\n"},
+         "outer/live.rs", ["live.rs", "outer/mod/live.rs"], "outer::live"),
+        ("foo/mod.rs is found when foo.rs is not", "mod live;\n", {}, "live/mod.rs", ["mod.rs"], "live"),
+        ("a path on a file module is relative to the crate root's directory",
+         '#[path = "support/live.rs"]\nmod live;\n', {}, "support/live.rs", ["live.rs"], "live"),
+        ("a path in a file that is not mod.rs is relative to its directory, not to foo/",
+         "mod outer;\n", {"outer.rs": '#[path = "live.rs"]\nmod live;\n'}, "live.rs", ["outer/live.rs"], "outer::live"),
+        ("a path in a mod.rs file is relative to its directory", "mod outer;\n",
+         {"outer/mod.rs": '#[path = "live.rs"]\nmod live;\n'}, "outer/live.rs", ["live.rs"], "outer::live"),
+        ("a path file owns its directory", '#[path = "p/a.rs"]\nmod a;\n', {"p/a.rs": "mod live;\n"},
+         "p/live.rs", ["p/a/live.rs", "live.rs", "a/live.rs"], "a::live"),
+        ("an inline module pushes its name", "mod x {\n    mod live;\n}\n", {}, "x/live.rs", ["live.rs"], "x::live"),
+        ("an inline module in a file that is not mod.rs pushes its name after the file's stem", "mod outer;\n",
+         {"outer.rs": "mod x {\n    mod live;\n}\n"}, "outer/x/live.rs", ["x/live.rs", "outer/live.rs"], "outer::x::live"),
+        ("an inline module with its own path pushes that path instead",
+         '#[path = "other"]\nmod x {\n    mod live;\n}\n', {}, "other/live.rs", ["x/live.rs", "live.rs"], "x::live"),
+        ("the reviewer's inline path fixture", '#[path = "other"]\nmod live {\n    mod child;\n}\n', {},
+         "other/child.rs", ["live/child.rs", "child.rs"], "live::child"),
+        ("an inline path in a file that is not mod.rs is relative to its directory, not to foo/",
+         "mod outer;\n", {"outer.rs": '#[path = "p"]\nmod x {\n    mod live;\n}\n'},
+         "p/live.rs", ["outer/p/live.rs", "outer/x/live.rs", "x/live.rs"], "outer::x::live"),
+        ("a path on a child of an inline module is relative to the pushed directory",
+         'mod x {\n    #[path = "live.rs"]\n    mod live;\n}\n', {}, "x/live.rs", ["live.rs"], "x::live"),
+        ("a path on a child of an inline module with its own path starts at that path",
+         '#[path = "p"]\nmod x {\n    #[path = "live.rs"]\n    mod live;\n}\n', {}, "p/live.rs", ["x/live.rs", "live.rs"], "x::live"),
+        ("the reviewer's non-mod.rs path fixture", "mod outer;\n",
+         {"outer.rs": 'mod inner {\n    #[path = "live.rs"]\n    mod live;\n}\n'},
+         "outer/inner/live.rs", ["inner/live.rs", "outer/live.rs", "live.rs"], "outer::inner::live"),
+        ("nested inline modules compose in a file that is not mod.rs", "mod outer;\n",
+         {"outer.rs": 'mod a {\n    mod b {\n        #[path = "live.rs"]\n        mod live;\n    }\n}\n'},
+         "outer/a/b/live.rs", ["a/b/live.rs", "outer/live.rs", "outer/a/live.rs"], "outer::a::b::live"),
+        ("a file module under an inline module under a file that is not mod.rs", "mod outer;\n",
+         {"outer.rs": "mod a {\n    mod b;\n}\n", "outer/a/b.rs": "mod live;\n"},
+         "outer/a/b/live.rs", ["outer/a/live.rs", "a/b/live.rs"], "outer::a::b::live"),
+    )
+
+    def test_the_module_path_rule_reads_the_file_rustc_reads_and_never_a_decoy(self):
+        plain = self.TEST.replace("    ", "")
+        for label, source, files, right, decoys, module in self.PATH_RULES:
+            for gated_right in (True, False):
+                with self.subTest(label, gated_right=gated_right):
+                    leaf = {right: ("#![cfg(unix)]\n" if gated_right else "") + plain}
+                    for decoy in decoys:
+                        if decoy not in files and decoy != right:
+                            leaf[decoy] = ("" if gated_right else "#![cfg(unix)]\n") + plain
+                    targets = self.crate(source, **files, **leaf)
+                    name = module + "::owned"
+                    targets[KEY]["ignored"] = {name}
+                    self.rules["rules"][0]["prefix"] = module + "::"
+                    if gated_right:
+                        self.assertEqual(self.predict(targets), 0)
+                    else:
+                        self.refused_name(targets, name)
+
+    IGNORE_ON_WINDOWS = (
+        ("#[ignore]", True), ('#[ignore = "why"]', True),
+        ("#[cfg_attr(unix, ignore)]", False), ('#[cfg_attr(unix, ignore = "why")]', False),
+        ("#[cfg_attr(windows, ignore)]", True), ('#[cfg_attr(not(unix), ignore = "why")]', True),
+        ("#[cfg_attr(not(windows), ignore)]", False),
+        ("#[cfg_attr(unix, ignore)]\n    #[ignore]", True),
+        ("#[cfg_attr(windows, ignore)]\n    #[cfg_attr(unix, ignore)]", True),
+        ("#[cfg_attr(unix, ignore, doc = \"x\")]", False),
+        ("#[cfg_attr(windows, doc = \"x\", ignore)]", True),
+        ("#[cfg_attr(windows, doc = \"x\")]\n    #[ignore]", True),
+        ("#[cfg_attr(unix, doc = \"x\")]", False),
+        ("#[cfg_attr(all(), cfg_attr(unix, ignore))]", False),
+        ("#[cfg_attr(all(), cfg_attr(windows, ignore))]", True),
+        # An undecidable predicate guarding an ignore stays fail-closed; one guarding nothing is irrelevant.
+        ('#[cfg_attr(feature = "slow", ignore)]', True),
+        ('#[cfg_attr(feature = "slow", ignore)]\n    #[cfg_attr(unix, ignore)]', True),
+        ('#[cfg_attr(any(unix, feature = "slow"), ignore)]', True),
+    )
+
+    def test_a_test_is_refused_only_if_it_is_still_ignored_in_the_windows_build(self):
+        for attributes, refused in self.IGNORE_ON_WINDOWS:
+            with self.subTest(attributes):
+                targets = self.crate("mod live {\n    #[test]\n    " + attributes + "\n    fn owned() {}\n}\n")
+                if refused:
+                    self.refused(targets)
+                else:
+                    self.assertEqual(self.predict(targets), 0)
+
+    def test_an_ignore_the_attribute_does_not_spell_is_not_decided_by_a_decoy_attribute(self):
+        # A cfg_attr that adds some other attribute is not an ignore, whatever its predicate says.
+        self.refused(self.crate("mod live {\n    #[test]\n    #[ignore]\n    #[cfg_attr(unix, should_panic)]\n"
+                                "    fn owned() {}\n}\n"))
+
     def refused_name(self, targets, name):
         with self.assertRaisesRegex(audit.InventoryError, "^predicted on win32: .*" + re.escape(name)):
             self.predict(targets)

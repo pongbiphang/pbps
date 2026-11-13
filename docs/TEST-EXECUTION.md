@@ -193,8 +193,13 @@ portable successful mutation control. Run the integrated suite on actual
   attributes on the function and on every enclosing `mod`, inline or file, and a
   module file's inner `#![cfg]`, evaluated for `windows`, `unix`, `target_os` and
   the other target predicates of the Windows runner. A predicate it cannot decide
-  (a feature, `cfg_attr`) or a test it cannot find in the source (a macro) counts
-  as compiled, so the prediction fails closed. A Linux-owned test the Windows
+  (a feature, a `cfg_attr` that adds a `cfg`) or a test it cannot find in the
+  source (a macro) counts as compiled, so the prediction fails closed. It finds
+  module files by rustc's rules (a file `foo.rs` owns `foo/`, an inline module
+  pushes its name or its own `#[path]`) and a `#[ignore]` through
+  `#[cfg_attr(<predicate>, ignore)]` only where the predicate holds on Windows:
+  `#[cfg_attr(unix, ignore)]` runs the test ordinarily there, so it is not
+  refused. A Linux-owned test the Windows
   build compiles needs an exact legacy entry with an owner that runs on win32, or
   a `cfg` that keeps it out of that build (`#[cfg(unix)]` on the test or its
   module is the usual form). Windows-only tests and Windows-only owners stay with
