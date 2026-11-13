@@ -222,6 +222,11 @@ fn read_tree(project: &Project) -> anyhow::Result<BTreeMap<String, String>> {
 // --------------------------------------------------------------- migrate ----
 
 fn migrate(project: &Project) -> anyhow::Result<()> {
+    // Before any path that writes: the write loop creates `ids_dir` and
+    // `create_dir_all` follows a linked parent out of the project, and the
+    // config write names a tree git does not track. The interrupted-run path
+    // below writes only the config, so it needs the check too (#2804).
+    crate::ids_store::refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     let dirs = Dirs::of(project);
     let tree = read_tree(project)?;
     let Some(ids) = crate::read_legacy_ids_opt(project)? else {
@@ -521,6 +526,8 @@ fn fmt(project: &Project, check: bool) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // After the `--check` return, which writes nothing and stays a read.
+    crate::ids_store::refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     for (rel, canonical) in &changes {
         write_atomic(&project.ids_dir().join(rel), canonical)?;
         println!("rewrote {}", shown(&dirs, rel));
@@ -621,6 +628,9 @@ fn unmerged(project: &Project, dirs: &Dirs) -> anyhow::Result<BTreeMap<String, [
 
 fn resolve(project: &Project) -> anyhow::Result<()> {
     let dirs = Dirs::of(project);
+    // First, before `unmerged` probes the directory (a probe can create a file),
+    // and before any merge is written through a linked parent (#2804).
+    crate::ids_store::refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     // Section 5, step 1: the YAML first. The ids conflict only where the YAML
     // does, so the declarations are what decides a clash, and they must be
     // settled before anything is decided by them.

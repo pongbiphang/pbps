@@ -355,6 +355,9 @@ fn refuse_existing(root: &Path) -> anyhow::Result<()> {
             config.display()
         );
     }
+    // Before the claim creates `.pbps`: `create_dir_all` would follow a link
+    // there and put the identity files outside the project (#2804).
+    crate::ids_store::refuse_linked_ids_dir(root, &root.join(pbps_config::DEFAULT_IDS_DIR))?;
     // Whether anything is there at all, not whether it is empty: creating this
     // directory is the claim on the root (see `commit`), so another init's
     // leftover or a user's own directory must stop this one.
@@ -1023,6 +1026,64 @@ mod tests {
         );
         assert!(!stage.exists(), "staging must be discarded on the race");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project directory with a staged project beside it, and a directory
+    /// outside the project that a link can point at.
+    #[cfg(unix)]
+    fn linked_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("pbps-init-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("project"), base.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let stage = root.join(".pbps-init-test");
+        std::fs::create_dir_all(stage.join("schema")).unwrap();
+        std::fs::create_dir_all(stage.join(".pbps/ids")).unwrap();
+        std::fs::write(stage.join(".pbps/ids/x.json"), "generated ids\n").unwrap();
+        std::fs::write(stage.join("pbps.yml"), "generated config\n").unwrap();
+        (base, root, outside)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_an_identity_tree_whose_parent_is_a_symlink_and_writes_nothing() {
+        let (base, root, outside) = linked_fixture("linked-parent");
+        std::os::unix::fs::symlink(&outside, root.join(".pbps")).unwrap();
+
+        for error in [
+            refuse_existing(&root).unwrap_err(),
+            commit(&root, &root.join(".pbps-init-test")).unwrap_err(),
+        ] {
+            let text = format!("{error:#}");
+            assert!(text.contains("is a symbolic link"), "{text}");
+            assert!(
+                text.contains(&root.join(".pbps").display().to_string()),
+                "the refusal names the link: {text}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing was written through the link"
+        );
+        assert!(!root.join("pbps.yml").exists());
+        assert!(!root.join("schema").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_accepts_an_ordinary_existing_parent_of_the_identity_tree() {
+        let (base, root, outside) = linked_fixture("ordinary-parent");
+        std::fs::create_dir(root.join(".pbps")).unwrap();
+        refuse_existing(&root).unwrap();
+        commit(&root, &root.join(".pbps-init-test")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".pbps/ids/x.json")).unwrap(),
+            "generated ids\n"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

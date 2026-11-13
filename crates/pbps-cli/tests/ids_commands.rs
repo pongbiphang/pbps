@@ -1138,3 +1138,191 @@ fn a_declaration_whose_identity_file_name_is_exactly_255_bytes_plans_writes_and_
     assert_ok(&p.pbps(&["plan", "--no-dev"]));
     assert_eq!(tree_of(&p), before);
 }
+
+// ------------------------------------------------- a linked parent (#2804) ---
+
+/// Makes `.pbps` a symbolic link to a directory outside the project (the
+/// project is a subdirectory of the repository root, so `outside` is not in
+/// it). A `.pbps` that exists is moved there with its files. Returns the
+/// directory the link points at.
+#[cfg(unix)]
+fn link_ids_parent(p: &Project) -> PathBuf {
+    let target = p.1.join("outside/pbps-dir");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let here = p.0.join(".pbps");
+    if here.exists() {
+        std::fs::rename(&here, &target).unwrap();
+    } else {
+        std::fs::create_dir(&target).unwrap();
+    }
+    std::os::unix::fs::symlink(&target, &here).unwrap();
+    target
+}
+
+#[cfg(unix)]
+const LINK_REFUSAL: &str = "/proj/.pbps` is a symbolic link";
+
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_a_linked_identity_parent_and_changes_nothing() {
+    // The negative (an ordinary `.pbps`) is
+    // `migrate_writes_one_file_per_declaration_and_reads_back_to_the_same_mapping`.
+    let p = legacy_project_in("proj");
+    let outside = link_ids_parent(&p);
+    let (config, legacy_file) = (p.read("pbps.yml"), p.read("schema.ids.json"));
+    assert_refused(&p.pbps(&["ids", "migrate"]), LINK_REFUSAL);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(p.read("pbps.yml"), config);
+    assert_eq!(
+        p.read("schema.ids.json"),
+        legacy_file,
+        "the legacy file stays"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_a_linked_parent_reached_after_a_missing_part_and_dot_dot() {
+    // `create_dir_all` makes `a`, and `a/..` is then the project, where `.pbps`
+    // is a link.
+    let p = legacy_project_in("proj");
+    p.write(
+        "pbps.yml",
+        "dialect: postgres\nids_file: schema.ids.json\nids_dir: a/../.pbps/ids\n",
+    );
+    let outside = link_ids_parent(&p);
+    let config = p.read("pbps.yml");
+    assert_refused(
+        &p.pbps(&["ids", "migrate"]),
+        "/proj/a/../.pbps` is a symbolic link",
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(!p.has("a"), "the refusal creates no directory");
+    assert_eq!(p.read("pbps.yml"), config);
+    // Negative: with an ordinary `.pbps` the same `ids_dir` migrates.
+    let q = legacy_project_in("proj");
+    q.write(
+        "pbps.yml",
+        "dialect: postgres\nids_file: schema.ids.json\nids_dir: a/../.pbps/ids\n",
+    );
+    std::fs::create_dir(q.0.join(".pbps")).unwrap();
+    assert_ok(&q.pbps(&["ids", "migrate"]));
+    assert!(q.has(".pbps/ids/dbo/customer.json"));
+}
+
+/// An interrupted migration: the tree stands, the old file is gone, and
+/// `pbps.yml` still names `ids_file`.
+#[cfg(unix)]
+fn interrupted_migration_in(sub: &str) -> Project {
+    let p = migrated_in(sub);
+    p.write("pbps.yml", "dialect: postgres\nids_file: schema.ids.json\n");
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupted_migrate_with_a_linked_identity_parent_is_refused_and_pbps_yml_is_untouched() {
+    let p = interrupted_migration_in("proj");
+    link_ids_parent(&p);
+    let config = p.read("pbps.yml");
+    assert_refused(&p.pbps(&["ids", "migrate"]), LINK_REFUSAL);
+    assert_eq!(p.read("pbps.yml"), config);
+    // Negative: the same interrupted run behind an ordinary `.pbps` finishes.
+    let q = interrupted_migration_in("proj");
+    assert_ok(&q.pbps(&["ids", "migrate"]));
+    assert!(q.read("pbps.yml").contains("ids_dir: .pbps/ids"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_refuses_a_linked_identity_parent_but_check_still_reads() {
+    // The negative is `fmt_check_lists_a_hand_edited_file_and_fmt_restores_the_canonical_bytes`.
+    let p = migrated_in("proj");
+    let canonical = p.read(".pbps/ids/dbo/customer.json");
+    let edited = canonical.replace("\n\n    \"c_aaaaa2\"", "\n    \"c_aaaaa2\"");
+    p.write(".pbps/ids/dbo/customer.json", &edited);
+    let outside = link_ids_parent(&p);
+    assert_refused(&p.pbps(&["ids", "fmt"]), LINK_REFUSAL);
+    assert_eq!(
+        std::fs::read_to_string(outside.join("ids/dbo/customer.json")).unwrap(),
+        edited,
+        "the file behind the link keeps its bytes"
+    );
+    // `--check` writes nothing and keeps reading as before: it lists the file.
+    let check = p.pbps(&["ids", "fmt", "--check"]);
+    assert_refused(&check, "customer.json");
+    assert!(!text(&check).contains("symbolic link"), "{}", text(&check));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_refuses_a_linked_identity_parent_and_changes_nothing() {
+    // The negative is `resolve_takes_the_name_the_resolved_yaml_declares_and_stages_nothing`.
+    let p = conflicted_in("proj");
+    p.write(
+        "schema/dbo/customer.yml",
+        &CUSTOMER.replace("full_name", "display_name"),
+    );
+    let outside = link_ids_parent(&p);
+    let before = std::fs::read_to_string(outside.join("ids/dbo/customer.json")).unwrap();
+    assert_refused(&p.pbps(&["ids", "resolve"]), LINK_REFUSAL);
+    assert_eq!(
+        std::fs::read_to_string(outside.join("ids/dbo/customer.json")).unwrap(),
+        before,
+        "the file behind the link keeps its bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_project_path_with_an_absolute_ids_dir_inside_it_is_inspected_for_links() {
+    // The root is the relative `proj`; `ids_dir` is the absolute path of the
+    // tree inside it. Compared by spelling these are two unrelated paths.
+    let p = legacy_project_in("proj");
+    let absolute = p.0.join(".pbps/ids");
+    p.write(
+        "pbps.yml",
+        &format!("dialect: postgres\nids_dir: '{}'\n", absolute.display()),
+    );
+    let outside = link_ids_parent(&p);
+    let run = |dir: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_pbps"))
+            .args(["--project", "proj", "ids", "migrate"])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    assert_refused(&run(&p.1), LINK_REFUSAL);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(p.has("schema.ids.json"), "the legacy file stays");
+    // Negative: with a real `.pbps` the same invocation migrates.
+    std::fs::remove_file(p.0.join(".pbps")).unwrap();
+    std::fs::create_dir(p.0.join(".pbps")).unwrap();
+    assert_ok(&run(&p.1));
+    assert!(p.has(".pbps/ids/dbo/customer.json"));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_outside_the_project_on_the_way_to_a_relative_ids_dir_is_followed() {
+    // `ids_dir: ../shared/ids` leaves the project, and `shared` is a link. The
+    // link is not below the project, so it is the user's own layout.
+    let p = legacy_project_in("proj");
+    p.write("pbps.yml", "dialect: postgres\nids_dir: ../shared/ids\n");
+    let real = p.1.join("real-shared");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, p.1.join("shared")).unwrap();
+    assert_ok(&p.pbps(&["ids", "migrate"]));
+    assert!(real.join("ids/dbo/customer.json").is_file());
+    // Negative: a link inside the project on a `..` detour is still refused.
+    let q = legacy_project_in("proj");
+    q.write("pbps.yml", "dialect: postgres\nids_dir: a/../.pbps/ids\n");
+    std::fs::create_dir(q.0.join("a")).unwrap();
+    let outside = link_ids_parent(&q);
+    assert_refused(
+        &q.pbps(&["ids", "migrate"]),
+        "/proj/a/../.pbps` is a symbolic link",
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

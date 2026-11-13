@@ -2425,3 +2425,357 @@ fn an_uninspectable_ancestor_stops_the_write_with_an_error_naming_it_and_leaves_
         "x"
     );
 }
+
+/// A project whose `ids_dir` is `ids` (the default when `None`), and an empty
+/// directory beside it that a link can point at.
+#[cfg(unix)]
+fn linkable(tag: &str, ids: Option<&str>) -> (Project, PathBuf) {
+    let project = project(tag);
+    if let Some(ids) = ids {
+        let config = project.root.join("pbps.yml");
+        std::fs::write(&config, format!("dialect: postgres\nids_dir: {ids}\n")).unwrap();
+    }
+    let project = Project::load(&project.root.join("pbps.yml")).unwrap();
+    let outside = project.root.with_file_name(format!(
+        "{}-outside",
+        project.root.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    (project, outside)
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_refuses_an_identity_tree_whose_parent_is_a_symlink_and_writes_nothing() {
+    // `pbps pull` reaches this: it plans the tree before it publishes anything.
+    let (project, outside) = linkable("linked-parent", None);
+    std::os::unix::fs::symlink(&outside, project.root.join(".pbps")).unwrap();
+    let before = listing(&project.root);
+    let error = format!(
+        "{:#}",
+        plan(&project, &customer(), &customer_declared()).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(
+        error.contains(&project.root.join(".pbps").display().to_string()),
+        "the refusal names the link: {error}"
+    );
+    assert_eq!(listing(&project.root), before);
+    assert_eq!(listing(&outside), Vec::<String>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_accepts_an_ordinary_existing_parent_of_the_identity_tree() {
+    let (project, outside) = linkable("ordinary-parent", None);
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    plan(&project, &customer(), &customer_declared())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(!tree(&project).is_empty());
+    assert_eq!(listing(&outside), Vec::<String>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_middle_of_a_deeper_ids_dir_is_refused() {
+    let (project, outside) = linkable("linked-middle", Some("meta/ids"));
+    std::os::unix::fs::symlink(&outside, project.root.join("meta")).unwrap();
+    let error = format!(
+        "{:#}",
+        plan(&project, &customer(), &customer_declared()).unwrap_err()
+    );
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(
+        error.contains(&project.root.join("meta").display().to_string()),
+        "{error}"
+    );
+    assert_eq!(listing(&outside), Vec::<String>::new());
+    // Negative: the same layout with a real `meta` directory is accepted.
+    std::fs::remove_file(project.root.join("meta")).unwrap();
+    std::fs::create_dir(project.root.join("meta")).unwrap();
+    plan(&project, &customer(), &customer_declared())
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(project.root.join("meta/ids").is_dir());
+}
+
+#[test]
+fn a_root_spelled_as_the_filesystem_resolves_it_is_walked_from_its_first_directory() {
+    // On Windows `canonicalize` gives `\\?\C:\...`, and the prefix alone
+    // cannot be looked at. It is where the path starts, not a component that
+    // could be a link.
+    let project = project("resolved-root");
+    let root = project.root.canonicalize().unwrap();
+    refuse_linked_ids_dir(&root, &root.join(".pbps/ids")).unwrap();
+    // Negative: a link below that root is still refused.
+    #[cfg(unix)]
+    {
+        let name = root.file_name().unwrap().to_string_lossy();
+        let outside = root.with_file_name(format!("{name}-outside"));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".pbps")).unwrap();
+        let error = link_refusal(&root, &root.join(".pbps/ids"));
+        assert!(error.contains("is a symbolic link"), "{error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_root_behind_a_link_is_not_refused() {
+    let (project, outside) = linkable("root-behind-link", None);
+    let behind = outside.join("checkout");
+    std::os::unix::fs::symlink(&project.root, &behind).unwrap();
+    // The root and what is above it are the checkout's own place.
+    refuse_linked_ids_dir(&behind, &behind.join(".pbps/ids")).unwrap();
+    // Not below the root: nothing here to look at.
+    refuse_linked_ids_dir(&project.root, &outside.join("ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_component_that_cannot_be_inspected_is_an_error_not_no_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, _outside) = linkable("unreadable-parent", None);
+    let parent = project.root.join(".pbps");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::symlink_metadata(parent.join("ids")).is_ok() {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let error = format!(
+        "{:#}",
+        refuse_linked_ids_dir(&project.root, &project.ids_dir()).unwrap_err()
+    );
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains(".pbps/ids"), "{error}");
+    assert!(!error.contains("symbolic link"), "{error}");
+    // Negative: once it can be inspected and nothing is there, no refusal.
+    refuse_linked_ids_dir(&project.root, &project.ids_dir()).unwrap();
+}
+
+/// A checkout reached through a link (`behind`), so that the root is spelled one
+/// way and an absolute `ids_dir` another (#2804).
+#[cfg(unix)]
+fn root_behind_a_link(tag: &str) -> (Project, PathBuf, PathBuf) {
+    let (project, outside) = linkable(tag, None);
+    let behind = outside.join("checkout");
+    std::os::unix::fs::symlink(&project.root, &behind).unwrap();
+    (project, outside, behind)
+}
+
+#[cfg(unix)]
+fn link_refusal(root: &Path, ids_dir: &Path) -> String {
+    format!("{:#}", refuse_linked_ids_dir(root, ids_dir).unwrap_err())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_outside_the_project_is_followed_even_when_ids_dir_is_spelled_relative_to_the_root() {
+    // `ids_dir: ../shared/ids`, where `shared` is a link to another directory.
+    // `master` accepts this layout (the finding of round 2).
+    let (project, outside) = linkable("leaves-the-project", None);
+    let target = outside.join("real-shared");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, outside.join("shared")).unwrap();
+    let name = outside.file_name().unwrap();
+    let ids_dir = project.root.join("..").join(name).join("shared/ids");
+    refuse_linked_ids_dir(&project.root, &ids_dir).unwrap();
+    // Negative: `a/../.pbps/ids` is inside the project, and `.pbps` is a link.
+    std::fs::create_dir(project.root.join("a")).unwrap();
+    std::os::unix::fs::symlink(&target, project.root.join(".pbps")).unwrap();
+    let error = link_refusal(&project.root, &project.root.join("a/../.pbps/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert!(error.contains("a/../.pbps"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_inside_the_project_is_refused_whether_it_points_in_or_out() {
+    let (project, outside) = linkable("link-in-or-out", None);
+    for target in [outside.clone(), project.root.join("store")] {
+        let _ = std::fs::create_dir(project.root.join("store"));
+        let _ = std::fs::remove_file(project.root.join(".pbps"));
+        std::os::unix::fs::symlink(&target, project.root.join(".pbps")).unwrap();
+        let error = link_refusal(&project.root, &project.root.join(".pbps/ids"));
+        assert!(error.contains("is a symbolic link"), "{error}");
+    }
+    // Negative: a real directory is accepted.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&project.root, &project.root.join(".pbps/ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_parent_that_links_back_to_the_root_is_refused() {
+    let (project, _outside, behind) = root_behind_a_link("links-back");
+    std::os::unix::fs::symlink(&project.root, project.root.join(".pbps")).unwrap();
+    for (root, ids_dir) in [
+        (&project.root, project.root.join(".pbps/ids")),
+        (&behind, project.root.join(".pbps/ids")),
+    ] {
+        let error = link_refusal(root, &ids_dir);
+        assert!(error.contains("is a symbolic link"), "{error}");
+    }
+    // Negative: with a real directory the same spelling passes.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&behind, &project.root.join(".pbps/ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn the_inner_link_is_refused_and_the_outer_link_is_not_when_the_project_is_spelled_two_ways() {
+    let (project, outside, behind) = root_behind_a_link("two-spellings");
+    let stray = outside.join("stray");
+    std::fs::create_dir(&stray).unwrap();
+    std::os::unix::fs::symlink(&stray, project.root.join(".pbps")).unwrap();
+    // Root through the link, `ids_dir` by the real path, and the reverse.
+    let real = project.root.join(".pbps/ids");
+    let through = behind.join(".pbps/ids");
+    for (root, ids_dir) in [(&behind, &real), (&project.root, &through)] {
+        let error = link_refusal(root, ids_dir);
+        assert!(error.contains("is a symbolic link"), "{error}");
+        assert!(error.contains(".pbps"), "{error}");
+    }
+    // Negative: the outer link alone (`checkout`) is the checkout's own place.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&behind, &real).unwrap();
+    refuse_linked_ids_dir(&project.root, &through).unwrap();
+    refuse_linked_ids_dir(&behind, &through).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ids_dir_wholly_outside_the_project_is_accepted_with_links_on_its_way() {
+    let (project, outside) = linkable("wholly-outside", None);
+    let real = outside.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, outside.join("linked")).unwrap();
+    refuse_linked_ids_dir(&project.root, &outside.join("linked/ids")).unwrap();
+    // Not there at all is accepted too.
+    refuse_linked_ids_dir(&project.root, &outside.join("linked/not/there/ids")).unwrap();
+    // Negative: the same link inside the project is refused.
+    std::os::unix::fs::symlink(&real, project.root.join("linked")).unwrap();
+    let error = link_refusal(&project.root, &project.root.join("linked/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+}
+
+/// Makes `.pbps` in the project a link to `target`, for the tests
+/// of a missing part followed by `..`.
+#[cfg(unix)]
+fn link_pbps(project: &Project, target: &Path) {
+    std::os::unix::fs::symlink(target, project.root.join(".pbps")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_reached_after_a_missing_part_and_dot_dot_is_refused() {
+    // `create_dir_all` creates `a`, and then `a/..` is the project root again.
+    let (project, outside) = linkable("missing-then-dot-dot", None);
+    link_pbps(&project, &outside);
+    for spelling in ["a/../.pbps/ids", "a/b/../../.pbps/ids", "a/./../.pbps/ids"] {
+        let error = link_refusal(&project.root, &project.root.join(spelling));
+        assert!(error.contains("is a symbolic link"), "{error}");
+        // The user's spelling is named, not the path that was inspected.
+        let link = project.root.join(spelling.trim_end_matches("/ids"));
+        assert!(error.contains(&link.display().to_string()), "{error}");
+    }
+    assert!(
+        !project.root.join("a").exists(),
+        "the check creates nothing"
+    );
+    // A dangling link is a link, not a missing part.
+    std::fs::remove_file(project.root.join(".pbps")).unwrap();
+    link_pbps(&project, &project.root.join("gone"));
+    let error = link_refusal(&project.root, &project.root.join(".pbps/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+    // Negative: the link is not on the resolved path of `a/b/../.pbps/ids`,
+    // which is `a/.pbps/ids`, and nothing of `a` exists.
+    refuse_linked_ids_dir(&project.root, &project.root.join("a/b/../.pbps/ids")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_part_and_dot_dot_before_a_directory_or_nothing_is_accepted() {
+    let (project, _outside) = linkable("missing-then-real", None);
+    let spelled = project.root.join("a/../.pbps/ids");
+    // `.pbps` absent: nothing below it exists.
+    refuse_linked_ids_dir(&project.root, &spelled).unwrap();
+    // `.pbps` a real directory.
+    std::fs::create_dir(project.root.join(".pbps")).unwrap();
+    refuse_linked_ids_dir(&project.root, &spelled).unwrap();
+    // A walk that ends inside the missing part has found no link.
+    refuse_linked_ids_dir(&project.root, &project.root.join("a/b/ids")).unwrap();
+    // Negative: the same real directory, with a link where `ids` would be.
+    std::os::unix::fs::symlink(&project.root, project.root.join(".pbps/ids")).unwrap();
+    let error = link_refusal(&project.root, &spelled);
+    assert!(error.contains("is a symbolic link"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_part_and_dot_dot_before_a_link_outside_the_project_is_followed() {
+    let (project, outside) = linkable("missing-then-outside-link", None);
+    let real = outside.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, outside.join("linked")).unwrap();
+    // The same spelling as the refused one, but the link's parent is outside.
+    refuse_linked_ids_dir(&project.root, &outside.join("a/../linked/ids")).unwrap();
+    // More `..` than pending components: the second `..` is looked at as it is.
+    let name = outside.file_name().unwrap();
+    let leaves = project.root.join("a/../..").join(name).join("linked/ids");
+    refuse_linked_ids_dir(&project.root, &leaves).unwrap();
+    // Negative: the second `..` leaves the project and the path comes back in,
+    // to a link in the project.
+    link_pbps(&project, &real);
+    let back = project
+        .root
+        .join("a/../..")
+        .join(project.root.file_name().unwrap());
+    let error = link_refusal(&project.root, &back.join(".pbps/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+    // And a link outside the project that leads back into it is refused.
+    std::os::unix::fs::symlink(&project.root, outside.join("home")).unwrap();
+    std::os::unix::fs::symlink(&real, project.root.join("inner")).unwrap();
+    let error = link_refusal(&project.root, &outside.join("home/b/../inner/ids"));
+    assert!(error.contains("is a symbolic link"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_component_outside_the_project_that_cannot_be_inspected_is_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, outside) = linkable("outside-unreadable", None);
+    let locked = outside.join("locked");
+    std::fs::create_dir_all(locked.join("x")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ids_dir = locked.join("x/ids");
+    if std::fs::symlink_metadata(&ids_dir).is_ok() {
+        // Root ignores permission bits, so the fault cannot be injected.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let error = link_refusal(&project.root, &ids_dir);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains("locked"), "{error}");
+    // Negative: once it can be looked at, it is accepted.
+    refuse_linked_ids_dir(&project.root, &ids_dir).unwrap();
+    // A link on the way and a root that cannot be resolved: an error naming
+    // the root, never "outside".
+    std::os::unix::fs::symlink(&outside, project.root.join("l")).unwrap();
+    let gone = outside.join("gone");
+    let error = link_refusal(&gone, &project.root.join("l/ids"));
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(error.contains("gone"), "{error}");
+}

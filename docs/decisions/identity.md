@@ -1670,3 +1670,70 @@ last path component counts; a long directory path is not a long file name.
 Pinned by the 251, 250 and `.yaml` cases in `pbps-model`, the unit-counting test
 under each platform, and the CLI test that plans a 250-byte stem and refuses a
 251-byte one.
+
+<a id="dec-2804-1"></a>
+
+**DEC-2804.1. The identity tree is not written through a symbolic link that lies in the project; `init`, the plan of every tree write and `ids migrate`, `ids fmt` and `ids resolve` refuse it, and a link outside the project is followed.**
+`create_dir_all` follows links. With `.pbps` linked to a directory elsewhere,
+`init` put `ids/x.json` into that directory: git records the link and nothing
+else, so the identities were not versioned with the project. Measured on
+Linux with the unedited tree (`commit` of a staged project, `.pbps` linked to an
+empty directory outside it).
+
+- **One function.** `ids_store::refuse_linked_ids_dir(root, ids_dir)` looks at
+  each component of `ids_dir`, from its first, without following links. `init`
+  calls it in `refuse_existing`, which runs before staging and again before the
+  claim. `ids_store::plan` calls it first, before the case probe, which can
+  create a file in the directory it finds; `pull`, `plan`, the intent commands,
+  `rebuild-table`, `withdraw-rebuild` and `convert` reach `plan`. `ids migrate`,
+  `ids fmt` and `ids resolve` write the tree without `plan`, so each calls it
+  before its first change on disk, `migrate` before its interrupted-run path
+  too. `ids fmt --check` writes nothing and is not refused.
+- **One rule, by real location.** A component that is a link is refused when
+  the real location of the directory it sits in (`canonicalize` of its parent)
+  is the project root's real location or below it, compared component by
+  component. A link whose parent is outside the project is followed and the walk
+  goes on. The rule never reads how the path is spelled, so a relative root, a
+  root reached through a link, an absolute `ids_dir` and `a/../.pbps/ids` all
+  give the same answer. `..` and `.` are never links; the parent of the next
+  component is resolved by `canonicalize`. A `.pbps` that links back to the root
+  is refused: its parent is the root.
+- **Four results.** A link in the project is a refusal that names it, as the
+  user spelled the path. A directory is passed. A component that is not there
+  is a directory the write will create. One that cannot be inspected, or whose
+  parent or the root cannot be resolved when a link needs them, is an error that
+  names it, never "no link". A component that is a file ends the walk; the write
+  that follows refuses it.
+- **A missing part is counted, not trusted.** The walk does not stop at the
+  first component that is not there: `ids_dir: a/../.pbps/ids` with no `a`
+  makes `create_dir_all` create `a`, and `a/..` is then the directory the walk
+  had reached, with `.pbps` a link in it. So a missing component starts a count
+  of directories the write will create; while it is above zero nothing is
+  inspected, a normal component adds one, `..` removes one and `.` changes
+  nothing. At zero the walk inspects again from the directory it had reached
+  before the missing part, by the rule above. More `..` than the count is
+  inspected as an ordinary `..`. A walk that ends with the count above zero found
+  no link: nothing below exists. A dangling link is a link, so it is judged by
+  the rule and is not a missing part. Reasoned and measured by unit tests; no
+  case for a particular spelling.
+- **Why a link outside the project is followed.** A checkout may live behind a
+  link, and `ids_dir: ../shared/ids` may reach a shared directory through one;
+  `master` accepts both. Only a link in the project can take the files out of
+  what the project's git records. The rule that tests the spelling of the path
+  (lexical prefix, then identity for an absolute path) refused the second
+  layout; a rule on the real location needs no case for `..`.
+- **Why `plan` and not `apply`.** `pull` must make every refusal of the tree
+  before it publishes a declaration (DEC-2600.9). The cost is that a project that
+  already keeps `.pbps` as a link is refused by `pull` even when the write would
+  change nothing, and so is `ids resolve` with nothing unmerged. Such a tree is
+  not versioned with the project, which is the case this entry refuses.
+- **Not covered.** A link placed between the check and the write is not caught.
+  On Windows the check uses `FileType::is_symlink`. Read in the `std` source
+  (1.85 and 1.99): it is true for a reparse point whose tag has the name-surrogate
+  bit (`0x20000000`). Symbolic links (`0xA000000C`) and junctions (`0xA0000003`)
+  both have it, so both are refused. No link is created on Windows: the tests
+  that make one are Unix-only.
+- **A drive prefix and the root are not inspected.** They are where a path
+  starts, not entries of a directory, so neither can be a link. Windows cannot
+  look at a verbatim prefix alone (`\\?\C:`), and `canonicalize` spells every
+  path with one. The Windows job runs `init` and `pull` through this.

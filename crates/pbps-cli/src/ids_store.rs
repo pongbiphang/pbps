@@ -26,7 +26,7 @@
 //! still refused is a live declaration with no place.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use pbps_config::Project;
@@ -661,6 +661,98 @@ fn rename_through(from: &Path, via: &Path, wanted: &Path) -> anyhow::Result<()> 
     })
 }
 
+/// Refuses an identity directory reached through a symbolic link that lies in
+/// the project, before anything is written (#2804).
+///
+/// `create_dir` and `create_dir_all` follow links. A linked `.pbps` would take
+/// the identity files to the link's target, where the checkout's git does not
+/// record them.
+///
+/// One rule, judged by real location and not by spelling: every component of
+/// `ids_dir`, from its first, is looked at without being followed. A link is
+/// refused when the real location of the directory it sits in is the project
+/// root or below it. A link whose parent is outside the project is followed: a
+/// checkout may live behind a link, and `../shared/ids` may be one.
+/// Real locations are compared component-wise, so `proj-2` is not in `proj`.
+/// `..` and `.` are never links; the parent of the next component is resolved
+/// by `canonicalize`.
+///
+/// Absent, a directory, a link and unreadable differ. A component that is not
+/// there is a directory the write will create, so it is not looked at again;
+/// it is counted. A normal component below it adds one, `..` removes one and
+/// `.` changes nothing. When the count is back at zero (`a/../.pbps` with `a`
+/// absent) the walk looks at the filesystem again from the directory it had
+/// reached, because creating `a` makes `a/..` that directory. A walk that ends
+/// with the count above zero has found no link: nothing below exists. More
+/// `..` than pending components is ordinary inspection of `..`. A component
+/// that cannot be inspected, or whose parent cannot be resolved, is an error
+/// that names it, never "no link". A component that is a file also ends the
+/// walk: the write that follows refuses it with its own message. A refusal
+/// names the link as the user spelled the path. A drive prefix and the root
+/// are passed without being looked at: they are not entries of a directory.
+pub(crate) fn refuse_linked_ids_dir(root: &Path, ids_dir: &Path) -> anyhow::Result<()> {
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+    let shown = |path: &Path| pbps_model::escape::Escaped(&path.display().to_string()).to_string();
+    // An empty path is the working directory, as `Project::load` reads it.
+    let real = |path: &Path| {
+        std::fs::canonicalize(if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        })
+        .with_context(|| format!("cannot inspect `{}`", shown(path)))
+    };
+    // `at` is the last directory that is really there; `spelled` is the path as
+    // the user wrote it, for the message. They differ after a missing part.
+    let mut at = PathBuf::new();
+    let mut spelled = PathBuf::new();
+    // Directories the write will create below `at`. Nothing is inspected while
+    // there are any: a later `..` can leave them, and then `at` is the
+    // directory the write is in, links and all.
+    let mut pending = 0usize;
+    for part in ids_dir.components() {
+        spelled.push(part);
+        // A drive prefix and the root are where a path starts, not entries of a
+        // directory, so neither can be a link and there is nothing to inspect.
+        // Windows refuses to look at a verbatim prefix alone (`\\?\C:`), and
+        // `canonicalize` spells every path with one.
+        if matches!(part, Component::Prefix(_) | Component::RootDir) {
+            at.push(part);
+            continue;
+        }
+        if pending > 0 {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => pending -= 1,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => pending += 1,
+            }
+            continue;
+        }
+        let probe = at.join(part);
+        match std::fs::symlink_metadata(&probe) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if real(&at)?.starts_with(real(root)?) {
+                    bail!(
+                        "`{}` is a symbolic link, so the identity tree `{}` would be written where this project's git does not record it; replace the link with a real directory and run the command again; nothing was written",
+                        shown(&spelled),
+                        shown(ids_dir)
+                    );
+                }
+            }
+            Ok(meta) if meta.is_dir() => {}
+            // A file, or a followed link to one: the write refuses it.
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == NotFound => pending = 1,
+            Err(e) if e.kind() == NotADirectory => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{}`", shown(&probe))),
+        }
+        if pending == 0 {
+            at = probe;
+        }
+    }
+    Ok(())
+}
+
 /// What `path` is, not followed through a link, or `None` when the filesystem
 /// says it is not there. Only "not found" means absent: an entry that cannot be
 /// looked at (a directory above it without search permission, an I/O error) is
@@ -1030,6 +1122,9 @@ pub(crate) fn plan(
     after: &IdsFile,
     declared: &DeclaredPaths,
 ) -> anyhow::Result<TreeWrite> {
+    // First, before the probe below, which may create a file in the directory
+    // it finds.
+    refuse_linked_ids_dir(&project.root, &project.ids_dir())?;
     let key = PathKey::probe(&project.ids_dir()).with_context(|| {
         format!(
             "cannot tell whether `{}` is case-sensitive",
