@@ -207,6 +207,8 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
     crate::emission::LoweredPlan,
     pbps_model::operation::Operations,
 )> {
+    // What no plan can create yet is not built (DEC-2721.1).
+    let schema = &schema.without_unplanned_kinds();
     // A type whose identity is recorded and whose declaration the base lacks
     // is a type the target does not hold yet (a declared type is recorded when
     // it is planned, not when it exists), and an empty apply may not claim an
@@ -976,6 +978,41 @@ mod tests {
             .insert(name.clone(), declared.types[&name].clone());
         assert!(domain_respellings(&declared, &same).is_empty());
         assert!(domain_respellings(&declared, &Schema::default()).is_empty());
+    }
+
+    /// A base that holds a sequence builds from nothing as it did before sequences were read
+    /// (DEC-2721.1): the differ refuses to create one, and a rehearsal that asked would make a
+    /// plan the target could always answer unanswerable. The tables beside it are still built.
+    #[test]
+    fn a_base_holding_a_sequence_is_built_from_nothing_without_it() {
+        let pg = pbps_pg::Postgres::new();
+        let mut schema = Schema::default();
+        schema.sequences.insert(
+            "app.theirs".parse().unwrap(),
+            pbps_model::Sequence {
+                ty: pbps_model::ColumnType::simple("bigint"),
+                start: 1,
+                increment: 1,
+                options: Default::default(),
+            },
+        );
+        let (lowered, _) =
+            lower_from_empty(&pg, &schema, &IdsFile::default(), &Default::default()).unwrap();
+        assert!(lowered.statements().is_empty());
+        // Negative: the differ itself still refuses to create it, as a real bootstrap must.
+        let refused = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &Schema::default(),
+                ids: &IdsFile::default(),
+            },
+            pbps_diff::Side {
+                schema: &schema,
+                ids: &IdsFile::default(),
+            },
+            &pg,
+            &Default::default(),
+        );
+        assert!(refused.is_err());
     }
 
     /// A declared type is recorded when it is planned, so the target's base can

@@ -2036,6 +2036,32 @@ fn a_chain_that_ends_where_it_began_is_qualified_as_one_composed_rebuild() {
     }
 }
 
+/// A sequence the target holds and the declarations do not name is not an "unrelated schema
+/// edit" beside a rebuild (DEC-2721.1): a read-only kind must not stop a plan that was valid
+/// before it was read. One the declarations name and the target lacks still is an edit.
+#[test]
+fn a_sequence_nobody_declared_is_not_an_unrelated_edit_beside_a_rebuild() {
+    let (start, _, away, first, back) = there_and_back(false);
+    let sequence = pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start: 1,
+        increment: 1,
+        options: Default::default(),
+    };
+    let mut theirs = away.clone();
+    theirs
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence.clone());
+    qualify(side(&theirs, &first), side(&start, &back), &table()).unwrap();
+    // Negative: declared and missing from the target, it is an edit to plan separately.
+    let mut declared = start.clone();
+    declared
+        .sequences
+        .insert("app.mine".parse().unwrap(), sequence);
+    let error = qualify(side(&away, &first), side(&declared, &back), &table()).unwrap_err();
+    assert!(error.why.contains("unrelated schema edits"), "{error}");
+}
+
 #[test]
 fn a_composed_rebuild_without_a_net_change_still_meets_every_other_rule() {
     let (start, ids, away, first, back) = there_and_back(false);

@@ -4977,8 +4977,10 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
         on_server(src, "DROP TABLE app.other");
 
         // These are each a partition's own default, so its limitation must
-        // still take the whole tree out of the pull (DEC-2072.1).
-        on_server(src, "CREATE SEQUENCE app.another_seq");
+        // still take the whole tree out of the pull (DEC-2072.1). Unlogged, so that the
+        // model cannot hold it: a plain standalone sequence is held (#2721), and a default
+        // over one is carried beside its declaration, no limitation.
+        on_server(src, "CREATE UNLOGGED SEQUENCE app.another_seq");
         for (slug, sql) in [
             (
                 "other-sequence",

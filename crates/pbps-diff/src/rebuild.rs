@@ -211,6 +211,10 @@ fn shape(
     for name in tree(desired, table).keys() {
         outside_after.tables.remove(name);
     }
+    // A sequence or a text search object the target holds and the declarations do not name is
+    // not an edit of the schema (DEC-2721.1): the one projection, so that no read-only kind
+    // makes a rebuild's plan "unrelated edits".
+    outside_before.keep_only_named_unidentified(&outside_after);
     if outside_before != outside_after {
         return Err(refused(
             table,

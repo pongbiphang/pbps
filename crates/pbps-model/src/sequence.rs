@@ -72,4 +72,26 @@ mod tests {
         let with_value = r#"{"type":"bigint","start":1,"increment":1,"last_value":7}"#;
         assert!(serde_json::from_str::<Sequence>(with_value).is_err());
     }
+
+    #[test]
+    fn a_schema_without_unplanned_kinds_keeps_everything_else() {
+        let mut schema = crate::Schema::default();
+        schema.sequences.insert(
+            "app.s".parse().unwrap(),
+            Sequence {
+                ty: bigint(),
+                start: 1,
+                increment: 1,
+                options: Default::default(),
+            },
+        );
+        schema
+            .tables
+            .insert("app.t".parse().unwrap(), Default::default());
+        let kept = schema.without_unplanned_kinds();
+        assert!(kept.sequences.is_empty());
+        assert_eq!(kept.tables, schema.tables);
+        // Negative: the original is untouched.
+        assert_eq!(schema.sequences.len(), 1);
+    }
 }

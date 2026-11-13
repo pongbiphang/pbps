@@ -143,7 +143,14 @@ pub async fn run<D: crate::emission::Engine>(
     refuse_absent_roles(conn, &named).await?;
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
-    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.desired);
+    // Without what no plan can create yet: the scratch holds what it held before those kinds
+    // were read (DEC-2721.1).
+    let desired_buildable = plan.desired.schema.without_unplanned_kinds();
+    let desired_side = pbps_diff::Side {
+        schema: &desired_buildable,
+        ids: plan.desired.ids,
+    };
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(desired_side);
     // As the resolver forms it (`resolution::resolve`): from nothing no module
     // stands to be rebuilt, so the plan is not observed, and the text screen of
     // a standing computed column has nothing standing to judge.
@@ -152,7 +159,7 @@ pub async fn run<D: crate::emission::Engine>(
             schema: &prerequisites,
             ids: &prerequisite_ids,
         },
-        plan.desired,
+        desired_side,
         dialect,
         plan.hints,
     )
@@ -329,13 +336,18 @@ fn lowered<D: crate::emission::Engine>(
 pub(crate) fn base_bootstrap<D: crate::emission::Engine>(
     plan: &Plan<'_, D>,
 ) -> anyhow::Result<pbps_diff::order::DiffPlan> {
-    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(plan.base);
+    let base_buildable = plan.base.schema.without_unplanned_kinds();
+    let base_side = pbps_diff::Side {
+        schema: &base_buildable,
+        ids: plan.base.ids,
+    };
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(base_side);
     pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,
         },
-        plan.base,
+        base_side,
         plan.dialect.as_ref(),
         plan.base_hints,
     )

@@ -99,6 +99,21 @@ impl Schema {
         self.sequences
             .retain(|name, _| named.sequences.contains_key(name));
     }
+
+    /// A copy without the objects of those kinds: what a schema is, for a caller that must
+    /// build it from nothing before any plan can create them.
+    ///
+    /// A rehearsal replays the target's managed model (or the declarations) on a scratch
+    /// database from nothing. Text search objects and sequences are read and compared but not
+    /// yet planned (DEC-2728.1, DEC-2721.1), so the differ refuses to "create" one, and a
+    /// rehearsal that asked it to would make a plan the target could always answer
+    /// unanswerable. Left out, the scratch is what it was before the kinds were held.
+    #[must_use]
+    pub fn without_unplanned_kinds(&self) -> Schema {
+        let mut kept = self.clone();
+        kept.keep_only_named_unidentified(&Schema::default());
+        kept
+    }
 }
 
 /// Installed package state; the database-global name is the map key.

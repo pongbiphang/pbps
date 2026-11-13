@@ -146,6 +146,15 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
     Ok(())
 }
 
+/// What stands on the target, for the question whether it is empty: a text search object or a
+/// sequence the declarations do not name is not this project's, so it does not make the target
+/// non-empty (DEC-2721.1).
+pub(super) fn standing_of_the_declared(existing: &Schema, declared: &Schema) -> Schema {
+    let mut standing = existing.clone();
+    standing.keep_only_named_unidentified(declared);
+    standing
+}
+
 /// Refuse before attempting a transaction: only a proven empty managed set
 /// justifies the empty snapshot recorded after a rolled-back bootstrap.
 pub(super) fn refuse_nonempty_bootstrap(
@@ -617,12 +626,8 @@ pub(super) async fn bootstrap_async(
                     dialect.as_ref(),
                     "bootstrap",
                 )?;
-                // A text search object or a sequence the declarations do not name is not this
-                // project's, so it does not make the target non-empty (DEC-2721.1).
-                let mut standing = existing.scoped.schema.clone();
-                standing.keep_only_named_unidentified(&loaded.schema);
                 refuse_nonempty_bootstrap(
-                    &standing,
+                    &standing_of_the_declared(&existing.scoped.schema, &loaded.schema),
                     &existing.limitations,
                     dialect.as_ref(),
                     &target.label,

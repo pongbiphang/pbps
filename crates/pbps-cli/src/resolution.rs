@@ -401,13 +401,19 @@ pub(crate) async fn resolve<D: pbps_cli::resolver::server::PlanningDialect>(
         ));
     }
     let dialect = crate::dialect_for(request.project.config.dialect);
-    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(request.desired);
+    // Without what no plan can create yet, as a rehearsal forms it (DEC-2721.1).
+    let desired_buildable = request.desired.schema.without_unplanned_kinds();
+    let desired_side = pbps_diff::Side {
+        schema: &desired_buildable,
+        ids: request.desired.ids,
+    };
+    let (prerequisites, prerequisite_ids) = pbps_diff::bootstrap_base(desired_side);
     let bootstrap = pbps_diff::bootstrap(
         pbps_diff::Side {
             schema: &prerequisites,
             ids: &prerequisite_ids,
         },
-        request.desired,
+        desired_side,
         dialect.as_ref(),
         request.hints,
     )

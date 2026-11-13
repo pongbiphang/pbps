@@ -1432,6 +1432,16 @@ the parts that follow, and SQL Server's sequences in the last.
   declarations are the side that names. The checksum comparisons (`plan --db`, `status`,
   `apply`'s baseline) already leave the kinds out. Two reads of one database compared with
   each other (`apply`'s read-back) need no projection.
+- **Where a read-only kind must not be counted or built.** Two more consumers of a live read
+  took the sequences (and text search objects) the target holds for edits or for something to
+  create, and refused plans that were valid before the kinds were read. A rebuild's "unrelated
+  schema edits" test compares the schema outside the rebuilt tree on both sides, and now does
+  so through the same projection, with the declarations naming. A rehearsal replays the
+  target's managed model, and the declarations, from nothing on a scratch, and the differ
+  refuses to create what no plan can yet; the rehearsal builds `Schema::without_unplanned_kinds`
+  of each, which is the scratch it had before the kinds were held. A default that calls such a
+  sequence meets the scratch's compile exactly as it did then. The real bootstrap is not
+  projected: a declared sequence there is refused by name, not skipped.
 - **One namespace.** A sequence shares its schema's relation namespace with tables, views,
   indexes and the indexes behind named keys, so its name is claimed in the one rule that
   compares those (`pbps_dialect::check_index_names`), not in a rule of its own. A sequence
