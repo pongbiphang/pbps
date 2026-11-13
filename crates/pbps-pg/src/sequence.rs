@@ -50,8 +50,8 @@ pub fn held_namespace_predicate() -> &'static str {
 /// Whether the relation behind `$c` (a `pg_class` alias) is a sequence the pull holds.
 ///
 /// The schema is part of the predicate, not of the pull's query: a system schema, a `pg_*`
-/// schema and one with a `.` in its name are not a project's, and the census and the
-/// default-sequence check must call a sequence model-owned exactly when the pull declares it.
+/// schema and one with a `.` in its name are not a project's, and the census must call a
+/// sequence model-owned exactly when the pull declares it.
 ///
 /// A `.` in a schema or a sequence name is not held: a declaration names a sequence as
 /// `schema.name`, and a name with a dot in it cannot be read back from that spelling.
@@ -88,7 +88,7 @@ macro_rules! held {
 }
 pub(crate) use {held, held_namespace};
 
-/// The predicate [`query`], the census and the default-sequence check share, over a `pg_class`
+/// The predicate [`query`] and the census share, over a `pg_class`
 /// alias `c`. Public so a live test can ask the engine whether it and the pull agree.
 pub fn held_predicate() -> &'static str {
     held!("c")
@@ -388,9 +388,9 @@ mod tests {
         assert!(said("app.s", &cache, &schema).contains("leave out `cache:`"));
     }
 
-    /// The one predicate decides "held" for the pull, the census and the default-sequence
-    /// check, so it carries the namespace exclusions and the pull's query carries none of its
-    /// own: they cannot disagree about a sequence in a system schema (#2721).
+    /// The one predicate decides "held" for the pull and the census, so it carries the
+    /// namespace exclusions and the pull's query carries none of its own: they cannot
+    /// disagree about a sequence in a system schema (#2721).
     #[test]
     fn the_namespace_exclusions_are_in_the_shared_predicate_and_not_in_the_query() {
         let predicate = held_predicate();

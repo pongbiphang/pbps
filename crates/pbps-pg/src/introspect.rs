@@ -2687,10 +2687,11 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: Option<&str>, pull
             &parts.name,
             format!(
                 "column `{}`.`{}` defaults from the sequence {sequences}, which it does not own. \
-                 This model holds the default and has nowhere to put the sequence, so a \
-                 declaration pulled from here creates a table whose default names an object that \
-                 is not there -- and `nextval` resolves that name when the table is created, not \
-                 when a row is inserted.",
+                 This model holds the default and plans no creation of the sequence before the \
+                 table that calls it (a standalone sequence is declared where it can be held, \
+                 #2721), so a declaration pulled from here creates a table whose default names \
+                 an object that is not there -- and `nextval` resolves that name when the table \
+                 is created, not when a row is inserted.",
                 parts.name.shown(),
                 raw.name
             ),

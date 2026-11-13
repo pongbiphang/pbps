@@ -800,7 +800,6 @@ fn columns_query() -> String {
     // A partition's identity belongs to its parent: 18 copies attidentity but
     // no sequence dependency, while 16 copies neither (DEC-1681.1). Match by
     // name, since dropped columns can leave the two attnums different.
-    let held_sequence = crate::sequence::held!("sq");
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty,
@@ -834,9 +833,9 @@ fn columns_query() -> String {
                JOIN pg_catalog.pg_namespace sn ON sn.oid = sq.relnamespace
               WHERE dd.classid = 'pg_attrdef'::regclass
                 AND dd.objid = d.oid
-                -- A sequence the model holds (#2721) is declared beside the table, so a
-                -- default over it is no longer a fact the model cannot hold.
-                AND NOT {held_sequence}
+                -- A sequence the model holds (#2721) is still listed: the pull declares it,
+                -- but nothing yet orders its creation before the table that calls it, so a
+                -- default over it keeps the limitation it had before the sequence was held.
                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend od
                                  WHERE od.classid = 'pg_class'::regclass
                                    AND od.objid = sq.oid

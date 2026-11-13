@@ -22,14 +22,14 @@ fn fixture(server: &str, slug: &str) -> Fixture {
     Fixture::new(server, slug, Kind::Supplied, &Options::default())
 }
 
-/// What a user made: an integer sequence with every option, a plain one, and a table whose
-/// primary key defaults from the first.
+/// What a user made: an integer sequence with every option, a plain one, one with a step
+/// beyond its type's span, and a table that calls none of them (a default that calls one is a
+/// limitation of its own, DEC-2721.1).
 const MADE: &str = "\
     CREATE SEQUENCE app.order_no AS integer START 100 INCREMENT 5 MINVALUE 100 MAXVALUE 999999 CYCLE CACHE 20; \
     CREATE SEQUENCE app.plain; \
     CREATE SEQUENCE app.stride AS smallint INCREMENT BY 40000; \
-    CREATE TABLE app.orders (id integer PRIMARY KEY DEFAULT nextval('app.order_no'), note text, \
-      step smallint DEFAULT nextval('app.stride'))";
+    CREATE TABLE app.orders (id integer PRIMARY KEY, note text)";
 
 /// The sequence files under `schema/`, by name, with their text.
 fn sequence_files(f: &Fixture) -> BTreeMap<String, String> {
@@ -77,9 +77,8 @@ fn a_database_with_standalone_sequences_pulls_again_with_no_difference_and_advan
         on_server(f.target(), MADE);
         let out = pull(&f);
         assert!(
-            !said(&out).contains("which it does not own")
-                && !said(&out).contains("standalone sequence"),
-            "a held sequence is neither a limitation nor a census notice: {}",
+            !said(&out).contains("standalone sequence"),
+            "a held sequence is not a census notice: {}",
             said(&out)
         );
         let files = sequence_files(&f);
@@ -102,10 +101,7 @@ fn a_database_with_standalone_sequences_pulls_again_with_no_difference_and_advan
             files["app.plain.sequence.yml"],
             "sequence: app.plain\ntype: bigint\nstart: 1\nincrement: 1\n"
         );
-        let table = std::fs::read_to_string(f.d.dir.join("schema/app.orders.yml")).unwrap();
-        assert!(table.contains("nextval("), "{table}");
-        // What the pull wrote validates: no pulled sequence is dropped on the way, so the
-        // table defaults that call them have something to call.
+        // What the pull wrote validates: no pulled sequence is dropped on the way.
         succeeds(f.d.run(&["validate"]));
         assert!(!said(&out).contains("was left out"), "{}", said(&out));
         // The same bytes the second time.
@@ -118,7 +114,7 @@ fn a_database_with_standalone_sequences_pulls_again_with_no_difference_and_advan
         on_server(
             f.target(),
             "SELECT nextval('app.order_no'); SELECT nextval('app.order_no'); \
-             SELECT setval('app.plain', 4000); INSERT INTO app.orders (note) VALUES ('x')",
+             SELECT setval('app.plain', 4000); INSERT INTO app.orders (id, note) VALUES (1, 'x')",
         );
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
         succeeds(f.d.run(&["verify", "--db", f.target()]));
@@ -251,5 +247,86 @@ fn a_sequence_nobody_recorded_is_not_a_difference_for_snapshot_and_a_changed_rec
             said(&out)
         );
         succeeds(f.d.run(&["snapshot", "--db", f.target(), "--force"]));
+    });
+}
+
+/// A table whose default calls a standalone sequence keeps the limitation it had before the
+/// sequence was held (DEC-2721.1): the pull declares the sequence and carries the table with
+/// the limitation named, and the table cannot be recorded, because nothing yet creates the
+/// sequence before the table that calls it. A rehearsal that built it from nothing would have
+/// refused a plan that was valid.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_table_defaulting_from_a_standalone_sequence_keeps_its_limitation_and_cannot_be_baselined() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("sequences2721-default-{slug}"));
+        on_server(
+            f.target(),
+            "CREATE SEQUENCE app.order_no; \
+             CREATE TABLE app.caller (id integer DEFAULT nextval('app.order_no'), note text)",
+        );
+        let out = pull(&f);
+        let notes = said(&out);
+        assert!(
+            notes.contains("defaults from the sequence") && notes.contains("app.order_no"),
+            "the limitation is named: {notes}"
+        );
+        // The sequence itself is declared, and the table is carried with its default.
+        assert!(sequence_files(&f).contains_key("app.order_no.sequence.yml"));
+        let table = std::fs::read_to_string(f.d.dir.join("schema/app.caller.yml")).unwrap();
+        assert!(table.contains("nextval("), "{table}");
+        f.d.commit();
+        let out = f.d.run(&[
+            "baseline",
+            "--db",
+            f.target(),
+            "--reason",
+            "adopt a default over a sequence",
+        ]);
+        assert_ne!(code(&out), 0, "{}", said(&out));
+        assert!(
+            said(&out).contains("defaults from the sequence"),
+            "{}",
+            said(&out)
+        );
+        // Negative: the sequence beside a table that does not call it records and plans.
+        let g = fixture(server, &format!("sequences2721-default-none-{slug}"));
+        on_server(
+            g.target(),
+            "CREATE SEQUENCE app.order_no; CREATE TABLE app.caller (id integer, note text)",
+        );
+        pull(&g);
+        adopt(&g);
+        no_changes(&succeeds(g.d.run(&["plan", "--db", g.target()])));
+    });
+}
+
+/// A sequence the target holds, beside a plan that goes through the rehearsal, does not make
+/// the plan unanswerable (DEC-2721.1): the scratch is built without what no plan can create.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_rehearsed_plan_beside_a_held_sequence_converges_on_the_scratch() {
+    servers(|server, slug| {
+        let f = Fixture::new(
+            server,
+            &format!("sequences2721-rehearse-{slug}"),
+            Kind::Supplied,
+            &Options {
+                target_only: Some(
+                    "CREATE SEQUENCE app.held_beside; CREATE SEQUENCE app.held_too START 9",
+                ),
+                ..Options::default()
+            },
+        );
+        f.revise_row();
+        let out = f.plan(&[]);
+        assert_eq!(code(&out), 0, "{}", said(&out));
+        let text = stdout(&out);
+        assert!(text.contains("Rehearsal: converged on scratch"), "{text}");
+        assert!(
+            !said(&out).contains("could not be completed"),
+            "{}",
+            said(&out)
+        );
     });
 }

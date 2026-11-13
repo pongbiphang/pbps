@@ -1388,6 +1388,11 @@ cache: 20
   The sequence shares its schema's namespace with tables, views, indexes and
   the indexes behind named keys, so `validate` refuses one of those of the same
   name in the same schema.
+- **A table default that calls one stays a limitation.** A column whose default is
+  `nextval` of a standalone sequence is carried as its default text, with the named
+  limitation "defaults from the sequence ..., which it does not own", held sequence or not:
+  nothing yet creates the sequence before the table that calls it, so a managed table with
+  it refuses plans, as before sequences were read. The part that creates a sequence lifts it.
 - **What a plan does with them.** Nothing yet. A declared sequence is compared
   with the target's, and every difference is refused by name with the attribute
   that differs: one the target lacks, one it holds differently. A sequence the

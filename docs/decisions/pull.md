@@ -1368,8 +1368,9 @@ really refuses it. Each dialect's validation tests pin that separately.
 A sequence no column owns was named by the census and left out of the pull, and a column
 defaulting from one was refused as a limitation, so a pulled project could not be
 bootstrapped: its table's default named an object the declarations did not hold (#2721).
-This part reads and declares them. Creating, dropping, altering and renaming one arrive in
-the parts that follow, and SQL Server's sequences in the last.
+This part reads and declares them; the limitation on a table default stays until a plan can
+create the sequence before the table that calls it. Creating, dropping, altering and renaming
+one arrive in the parts that follow, and SQL Server's sequences in the last.
 
 - **A model kind of its own.** `Schema.sequences` is keyed by the sequence's name and holds
   `Sequence { ty, start, increment, options }`, with the `SequenceOptions` a column's sequence
@@ -1388,16 +1389,21 @@ the parts that follow, and SQL Server's sequences in the last.
   package, with no `.` in its schema or name. One a column owns (`OWNED BY`, an identity, a
   `serial`) is part of that column, as before. An `UNLOGGED` sequence and a package's are not
   held and stay named by the census; a temporary sequence belongs to one session and is already
-  outside the census (DEC-2681.1). One SQL text decides "held" for the pull, the census and the
-  default-sequence limitation, so a sequence is named exactly when it is not read.
-- **What goes away, and how it is decided.** For a held sequence the census notice and the
-  "defaults from the sequence ..., which it does not own" limitation are gone, in the catalog
-  read. They are not conditional on the declarations, because the catalog read is one function
-  of the database that every connected command shares, and the declarations are known to none
-  of them. The consequence is stated plainly: a held sequence that the project does not declare
-  is, like a text search object (DEC-2728.1), not this project's, and a table default calling it
-  raises no limitation. Naming it again would need the sequence to take an identity, which is
-  the part that creates one. A default over a sequence the model cannot hold is still named.
+  outside the census (DEC-2681.1). One SQL text decides "held" for the pull and the census, so
+  a sequence is named exactly when it is not read.
+- **What goes away, and what stays.** For a held sequence the census notice is gone, in the
+  catalog read: the sequence is read and declared. It is not conditional on the declarations,
+  because the catalog read is one function of the database that every connected command
+  shares, and the declarations are known to none of them; a held sequence the project does not
+  declare is, like a text search object (DEC-2728.1), not this project's. **The limitation on
+  a table default stays.** "Defaults from the sequence ..., which it does not own" is still
+  raised for a column whose default calls a standalone sequence, held or not, because nothing
+  yet orders the sequence's creation before the table that calls it. A first cut lifted it for
+  a held sequence, and a rehearsal then rebuilt the table on a scratch that lacked the
+  sequence (which the differ cannot yet create) and refused a plan that was valid: behaviour
+  must be as before wherever something is built from nothing. The part that creates a
+  sequence lifts the limitation, with the ordering edge that makes it true. The table is
+  carried with the limitation as before, and a managed table with it refuses plans by name.
 - **Validation** (`pbps-pg`, offline): a smallint, integer or bigint, with the engine's own
   rules for the start, the increment and the options as a column's sequence has them (a bound
   spelled as its default is refused so each sequence has one spelling), and a name the engine
@@ -1407,7 +1413,7 @@ the parts that follow, and SQL Server's sequences in the last.
   rule the first cut had that the engine does not share, a step larger than the type's span
   (the engine accepts `smallint INCREMENT BY 40000`; it hands out its start and then
   refuses), is not made for a standalone sequence: refusing it would have made a pulled
-  declaration fail `validate` with the default-sequence limitation already suppressed. A
+  declaration fail `validate`. A
   declaration the dialect does refuse is still left out of a pull by name, with the consequence
   for the defaults that call it, as for any object. SQL Server refuses the file by name
   (`validate_sequence`), so it is never ignored.
@@ -1448,8 +1454,8 @@ the parts that follow, and SQL Server's sequences in the last.
   and an index or key of one name in one schema are refused with that rule's message; in two
   schemas they are not.
 - **One predicate, with the namespace in it.** The exclusion of system and `pg_*` schemas is
-  in the predicate the pull, the census and the default-sequence check share, and the pull's
-  query carries no filter of its own, so none of them can call a sequence model-owned that
+  in the predicate the pull and the census share, and the pull's
+  query carries no filter of its own, so neither can call a sequence model-owned that
   the pull does not declare. `validate` asks the same question of a declaration's schema in Rust
   (`schema_is_held`, the table's `a_projects_schema` and no dot), and a live test puts the two
   to the engine side by side on every schema the cluster has.
