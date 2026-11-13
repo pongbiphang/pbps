@@ -593,6 +593,7 @@ impl StateSnapshot {
     /// `OLDEST_READABLE_VERSION` at the first release (#1159).
     fn read_before_object_deps(json: &str, version: u32) -> Result<Self, Unreadable> {
         let malformed = |why: String| Unreadable::Malformed(why);
+        serde_json::from_str::<EachMemberOnce>(json).map_err(|e| malformed(e.to_string()))?;
         let mut row: serde_json::Value =
             serde_json::from_str(json).map_err(|e| malformed(e.to_string()))?;
         let fields = row
@@ -624,6 +625,66 @@ impl StateSnapshot {
             serde_json::to_value(&edges).expect("edges serialize"),
         );
         serde_json::from_value(row).map_err(|e| malformed(e.to_string()))
+    }
+}
+
+/// A JSON text in which no object names a member twice.
+///
+/// A row below the cut is rewritten through a generic JSON value, and a value
+/// keeps the last of two members with one name. The typed readers refuse a
+/// repeated field, but they would run only after the value had dropped it. So
+/// the text is read once before that, into nothing.
+///
+/// This is one rule for the whole row and it knows no field. It therefore also
+/// refuses a repeated key of a map, of which the typed readers keep the last.
+/// No build writes one.
+struct EachMemberOnce;
+
+impl<'de> serde::Deserialize<'de> for EachMemberOnce {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+        struct Walk;
+        impl<'de> Visitor<'de> for Walk {
+            type Value = EachMemberOnce;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_bool<E: Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_i64<E: Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_u64<E: Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_f64<E: Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_str<E: Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+                Ok(EachMemberOnce)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<EachMemberOnce>()?.is_some() {}
+                Ok(EachMemberOnce)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut seen = std::collections::BTreeSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    map.next_value::<EachMemberOnce>()?;
+                    if let Some(twice) = seen.replace(name) {
+                        // serde's own wording for a repeated field of a struct.
+                        return Err(A::Error::custom(format_args!("duplicate field `{twice}`")));
+                    }
+                }
+                Ok(EachMemberOnce)
+            }
+        }
+        d.deserialize_any(Walk)
     }
 }
 
@@ -1400,6 +1461,43 @@ mod tests {
         // Negative: the same row without it reads.
         row.as_object_mut().unwrap().shift_remove("surprise");
         assert!(StateSnapshot::from_json(&row.to_string()).is_ok());
+    }
+
+    /// A JSON value keeps the last of two members with one name, so the row
+    /// below the cut is checked as text before it becomes one. Every case here
+    /// was read without complaint through the value alone.
+    #[test]
+    fn a_row_below_the_cut_still_refuses_a_repeated_member_by_name() {
+        let once = old_row(
+            OBJECT_DEPS_VERSION - 1,
+            Some(serde_json::json!({"app.v": ["app.base"]})),
+        )
+        .to_string();
+        let refused = |from: &str, to: &str, name: &str| {
+            let twice = once.replacen(from, to, 1);
+            assert_ne!(twice, once, "the row has `{from}` to repeat");
+            let why = StateSnapshot::from_json(&twice).unwrap_err();
+            assert!(why.contains(&format!("duplicate field `{name}`")), "{why}");
+        };
+        // A field of the row; the value would have kept the second operator.
+        refused(
+            r#""operator":"#,
+            r#""operator":"x","operator":"#,
+            "operator",
+        );
+        // The legacy field itself: two sources for the edges.
+        refused(
+            r#""module_deps":"#,
+            r#""module_deps":{},"module_deps":"#,
+            "module_deps",
+        );
+        // A field of a nested struct.
+        refused(r#""tables":{}"#, r#""tables":{},"tables":{}"#, "tables");
+        // A key of a map: stricter than the typed reader, which keeps the last.
+        refused(r#""app.v":"#, r#""app.v":[],"app.v":"#, "app.v");
+        // Negative: the same row with every member once reads, edges and all.
+        let read = StateSnapshot::from_json(&once).unwrap();
+        assert_eq!(read.object_deps.len(), 1);
     }
 
     #[test]
