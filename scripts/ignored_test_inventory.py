@@ -1295,8 +1295,9 @@ class RustModules:
     def child_file(self, path_base, directory, path_attribute, name):
         """Source file of `mod name;`; None if it cannot be found.
 
-        A `#[path]` is relative to the directory of the declaring file plus the
-        names of the inline modules around the declaration (`path_base`)."""
+        A `#[path]` is relative to the directory of the declaring file, or, below
+        inline modules, to the module directory of that file plus their names
+        (`path_base`)."""
         if path_attribute is not None:
             candidate = path_base / path_attribute
             return (candidate, candidate.parent) if candidate.is_file() else None
@@ -1331,7 +1332,10 @@ class RustModules:
                 if (id(tokens), body) not in self.parsed:
                     self.parsed[id(tokens), body] = rust_items(tokens, *body)
                 sub_inner, sub_items = self.parsed[id(tokens), body]
-                results.append(self.walk(path_base / parts[0], tokens, directory / parts[0], sub_inner,
+                # A #[path] below an inline module is relative to the module's directory, which
+                # for a file that is not mod.rs starts with the file's stem (rustc: outer.rs holding
+                # `mod inner { #[path = "live.rs"] mod live; }` loads outer/inner/live.rs).
+                results.append(self.walk(directory / parts[0], tokens, directory / parts[0], sub_inner,
                                          sub_items, parts[1:], here))
                 continue
             path_attribute = None

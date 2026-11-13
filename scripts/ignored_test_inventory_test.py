@@ -1282,6 +1282,11 @@ class Win32Prediction(unittest.TestCase):
             ("mod outer;\n", {"outer/mod.rs": "mod live;\n", "outer/live.rs": gated}, "outer::live::owned"),
             ("mod outer {\n    mod live;\n}\n", {"outer/live.rs": gated}, "outer::live::owned"),
             ("mod live;\n", {"live/mod.rs": gated}, "live::owned"),
+            # An inline module in a file that is not mod.rs: a #[path] below it starts at the file's stem.
+            ("mod outer;\n", {"outer.rs": "mod inner {\n    #[path = \"live.rs\"]\n    mod live;\n}\n",
+                              "outer/inner/live.rs": gated}, "outer::inner::live::owned"),
+            ("mod outer;\n", {"outer/mod.rs": "mod inner {\n    #[path = \"live.rs\"]\n    mod live;\n}\n",
+                              "outer/inner/live.rs": gated}, "outer::inner::live::owned"),
         )
         for source, files, name in shapes:
             with self.subTest(source=source, files=sorted(files)):
@@ -1293,6 +1298,17 @@ class Win32Prediction(unittest.TestCase):
                 for path, text in files.items():
                     (self.root / "src" / path).write_text(text.replace("#![cfg(unix)]\n", ""), encoding="utf-8")
                 self.refused_name(targets, name)
+
+    def test_a_path_below_an_inline_module_of_a_non_mod_rs_file_is_not_read_from_the_files_directory(self):
+        # The file sits where the old rule looked (inner/live.rs), not where rustc loads it
+        # (outer/inner/live.rs): it is not found, so the case counts as compiled on Windows.
+        gated = "#![cfg(unix)]\n" + self.TEST.replace("    ", "")
+        targets = self.crate("mod outer;\n", **{
+            "outer.rs": "mod inner {\n    #[path = \"live.rs\"]\n    mod live;\n}\n",
+            "inner/live.rs": gated})
+        targets[KEY]["ignored"] = {"outer::inner::live::owned"}
+        self.rules["rules"][0]["prefix"] = "outer::inner::live::"
+        self.refused_name(targets, "outer::inner::live::owned")
 
     def test_a_conditional_path_attribute_is_not_decided_and_counts_as_compiled(self):
         # The default file is kept out of Windows, but cfg_attr may select another file there.
