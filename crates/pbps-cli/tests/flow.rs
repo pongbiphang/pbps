@@ -2644,6 +2644,128 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// #1227 (DEC-1227.1): a table whose rows sit on a partition scheme is not
+/// written, and the pull names the object holding them; a key or index on a
+/// scheme of its own over ordinary rows is left out alone and its table
+/// written. Declared as plain, bootstrap would have built them unpartitioned
+/// and nothing would have compared unequal afterwards. What is written
+/// validates, and no declaration is left naming what was left out.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_names_partition_scheme_placement_and_omits_unrepresentable_objects() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "partition_pull");
+    on_server(
+        own.connection(),
+        "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10, 20);
+         CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);
+         CREATE TABLE dbo.on_scheme (id int NOT NULL,
+             CONSTRAINT pk_on_scheme PRIMARY KEY CLUSTERED (id)) ON ps (id);
+         CREATE TABLE dbo.child (id int NOT NULL, parent_id int NULL,
+             CONSTRAINT pk_child PRIMARY KEY (id),
+             CONSTRAINT fk_child_on_scheme FOREIGN KEY (parent_id) REFERENCES dbo.on_scheme (id));
+         CREATE TABLE dbo.ordinary (id int NOT NULL, v int NOT NULL, w int NOT NULL,
+             CONSTRAINT pk_ordinary PRIMARY KEY CLUSTERED (id));
+         CREATE INDEX ix_scheme ON dbo.ordinary (v) ON ps (v);
+         CREATE INDEX ix_plain ON dbo.ordinary (w);
+         CREATE TABLE dbo.control (id int NOT NULL, CONSTRAINT pk_control PRIMARY KEY (id));",
+    );
+    let d = Demo::new("partition-pull");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let warnings = stderr(&o);
+    for named in [
+        "dbo.on_scheme: its rows are on a partition scheme (clustered primary key `pk_on_scheme`)",
+        "dbo.ordinary: index `ix_scheme` is on a partition scheme",
+        "foreign key `fk_child_on_scheme` references partitioned table dbo.on_scheme",
+    ] {
+        assert!(warnings.contains(named), "{named}: {warnings}");
+    }
+    let schema = d.dir.join("schema");
+    assert!(!schema.join("dbo.on_scheme.yml").exists());
+    for kept in ["dbo.ordinary.yml", "dbo.child.yml", "dbo.control.yml"] {
+        assert!(schema.join(kept).is_file(), "{kept}: {warnings}");
+    }
+    let ordinary = std::fs::read_to_string(schema.join("dbo.ordinary.yml")).unwrap();
+    assert!(ordinary.contains("ix_plain"), "{ordinary}");
+    assert!(!ordinary.contains("ix_scheme"), "{ordinary}");
+    let child = std::fs::read_to_string(schema.join("dbo.child.yml")).unwrap();
+    assert!(!child.contains("fk_child_on_scheme"), "{child}");
+    let validate = d.run(&["validate"]);
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+}
+
+/// Issue #1227, DEC-1227.1: a table or index on a filegroup other than the
+/// database's default is written as it is, and named: `pull` prints one
+/// warning per table, and a connected `plan` reports the same text as the
+/// nonfatal `plan.unheld-object`. Bootstrap places the object on the target's
+/// default filegroup and nothing compares unequal after, so this word is the
+/// only one anyone gets. A table on the default filegroup is the control, and
+/// the declarations still validate.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_and_plan_name_an_off_default_filegroup_without_refusing_it() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "filegroup_pull");
+    on_server(
+        own.connection(),
+        &format!(
+            "ALTER DATABASE [{name}] ADD FILEGROUP fgx;
+             ALTER DATABASE [{name}] ADD FILE (NAME='{name}_fgx',
+                 FILENAME='/var/opt/mssql/data/{name}_fgx.ndf') TO FILEGROUP fgx;",
+            name = own.name
+        ),
+    );
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.off_default (id int NOT NULL, v int NOT NULL,
+             CONSTRAINT pk_off_default PRIMARY KEY CLUSTERED (id)) ON fgx;
+         CREATE INDEX ix_off_default ON dbo.off_default (v) ON fgx;
+         CREATE TABLE dbo.control (id int NOT NULL, CONSTRAINT pk_control PRIMARY KEY (id));",
+    );
+    let said = "on a filegroup other than the database's default; the declarations do not hold \
+                a filegroup, so a bootstrap places them on the target's default filegroup";
+    let line = format!(
+        "dbo.off_default: its base (clustered primary key `pk_off_default`), index \
+         `ix_off_default` sit {said}"
+    );
+    let d = Demo::new("filegroup-pull");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let warnings = stderr(&o);
+    assert!(warnings.contains(&line), "{warnings}");
+    assert_eq!(
+        warnings.matches("filegroup other than").count(),
+        1,
+        "{warnings}"
+    );
+    // Declared, with its index; the control draws nothing.
+    let schema = d.dir.join("schema");
+    let declared = std::fs::read_to_string(schema.join("dbo.off_default.yml")).unwrap();
+    assert!(declared.contains("ix_off_default"), "{declared}");
+    assert!(schema.join("dbo.control.yml").is_file());
+    assert!(!warnings.contains("dbo.control"), "{warnings}");
+    let validate = d.run(&["validate"]);
+    assert_eq!(code(&validate), 0, "{}", stderr(&validate));
+
+    // A connected plan carries the same text as the report-only rule, and is
+    // not refused for it.
+    d.commit();
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let reported = stderr(&o);
+    assert!(reported.contains(&line), "{reported}");
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    // The machine report names the rule that carries it.
+    let o = d.run(&["plan", "--db", own.connection(), "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let json = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(json.contains("plan.unheld-object"), "{json}");
+    assert!(json.contains("filegroup other than"), "{json}");
+}
+
 /// Issue #902, on this engine: the reader leaves the ledger's tables out of
 /// the pull but read a trigger on one of them (#891), and the pull wrote that
 /// trigger's declaration — which `validate` refuses, because its table is

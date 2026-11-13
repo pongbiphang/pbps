@@ -2916,58 +2916,467 @@ async fn every_rowstore_layout_round_trips_through_an_empty_database() {
     assert_eq!(types("c"), [("pk_c", 1), ("uq_c_code", 2)]);
 }
 
-/// Partitioned rows under a layout this reader adopts since #1178 — a
-/// clustered index, a clustered UNIQUE constraint, a nonclustered key on a
-/// partitioned heap — are left out and named: declared, bootstrap would build
-/// the table unpartitioned (#1209 review). Measured on 17.0: the partition
-/// scheme shows as data space type `PS` on the heap's or the clustered
-/// index's row, and a nonclustered key beside a partitioned clustered index
-/// can sit on a plain filegroup, so the rows' data space is what is read.
+/// A table, key or index on a filegroup that is not the database's default is
+/// declared as it is and drawn into ONE report-only notice per table; the same
+/// shapes on the default draw none, even when the default is not PRIMARY
+/// (#1227, DEC-1227.1). Measured on 17.0: the declarations hold no filegroup,
+/// so a bootstrap places every object on the target's default, silently, and
+/// nothing compares unequal afterwards: the notice is the only word of it. The
+/// default is `sys.filegroups.is_default` on the object's own data space, so
+/// moving the default moves which objects are noticed.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
-async fn a_layout_on_partitioned_rows_is_left_out_and_named() {
-    let mut db = TestDb::create("partition1178").await;
+async fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
+    let mut db = TestDb::create("filegroup1227").await;
+    let name = db.name.clone();
+    for fg in ["fgx", "fgd"] {
+        db.conn
+            .execute(&format!(
+                "ALTER DATABASE [{name}] ADD FILEGROUP {fg};
+                 ALTER DATABASE [{name}] ADD FILE (NAME='{name}_{fg}',
+                     FILENAME='/var/opt/mssql/data/{name}_{fg}.ndf') TO FILEGROUP {fg};"
+            ))
+            .await
+            .expect("add a filegroup");
+    }
+    db.conn
+        .execute(
+            "-- On a filegroup that is not the default.
+             CREATE TABLE dbo.n_heap (id int NOT NULL) ON fgx;
+             CREATE TABLE dbo.n_cpk (id int NOT NULL,
+                 CONSTRAINT pk_n_cpk PRIMARY KEY CLUSTERED (id)) ON fgx;
+             CREATE TABLE dbo.n_mem (id int NOT NULL, v int NOT NULL, w int NOT NULL,
+                 CONSTRAINT pk_n_mem PRIMARY KEY CLUSTERED (id));
+             CREATE INDEX ix_n_mem ON dbo.n_mem (v) ON fgx;
+             ALTER TABLE dbo.n_mem ADD CONSTRAINT uq_n_mem UNIQUE NONCLUSTERED (w) ON fgx;
+             CREATE INDEX ix_n_mem_plain ON dbo.n_mem (v, w);
+             -- Controls: the default filegroup, PRIMARY for now.
+             CREATE TABLE dbo.p_heap (id int NOT NULL);
+             CREATE TABLE dbo.p_cpk (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_p_cpk PRIMARY KEY CLUSTERED (id));
+             CREATE INDEX ix_p_cpk ON dbo.p_cpk (v);
+             -- Indexed views: one index on fgx, one on the default.
+             CREATE TABLE dbo.v_base (id int NOT NULL, v int NOT NULL);
+             EXEC(N'CREATE VIEW dbo.v_off WITH SCHEMABINDING AS SELECT id, v FROM dbo.v_base');
+             EXEC(N'CREATE VIEW dbo.v_on WITH SCHEMABINDING AS SELECT id, v FROM dbo.v_base');
+             CREATE UNIQUE CLUSTERED INDEX ux_v_off ON dbo.v_off (id) ON fgx;
+             CREATE UNIQUE CLUSTERED INDEX ux_v_on ON dbo.v_on (id);",
+        )
+        .await
+        .expect("create the tables");
+
+    async fn physical(db: &mut TestDb) -> std::collections::BTreeMap<String, (String, bool)> {
+        db.conn
+            .query(
+                "SELECT o.name AS tbl, ISNULL(i.name, N'(heap)') AS idx, ds.name AS fg,
+                        CONVERT(int, f.is_default) AS dflt
+                   FROM sys.objects o
+                   JOIN sys.indexes i ON i.object_id = o.object_id AND o.type IN ('U', 'V')
+                   JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
+                   JOIN sys.filegroups f ON f.data_space_id = ds.data_space_id
+                  ORDER BY o.name, i.index_id;",
+            )
+            .await
+            .expect("read the placements")
+            .iter()
+            .map(|r| {
+                (
+                    format!(
+                        "{}.{}",
+                        r.try_get::<&str>("tbl").unwrap().unwrap(),
+                        r.try_get::<&str>("idx").unwrap().unwrap()
+                    ),
+                    (
+                        r.try_get::<&str>("fg").unwrap().unwrap().to_owned(),
+                        r.try_get::<i32>("dflt").unwrap().unwrap() == 1,
+                    ),
+                )
+            })
+            .collect()
+    }
+    let placed = physical(&mut db).await;
+    for (obj, fg, default) in [
+        ("n_heap.(heap)", "fgx", false),
+        ("n_cpk.pk_n_cpk", "fgx", false),
+        ("n_mem.pk_n_mem", "PRIMARY", true),
+        ("n_mem.ix_n_mem", "fgx", false),
+        ("n_mem.uq_n_mem", "fgx", false),
+        ("n_mem.ix_n_mem_plain", "PRIMARY", true),
+        ("p_heap.(heap)", "PRIMARY", true),
+        ("p_cpk.ix_p_cpk", "PRIMARY", true),
+        ("v_off.ux_v_off", "fgx", false),
+        ("v_on.ux_v_on", "PRIMARY", true),
+    ] {
+        assert_eq!(placed[obj], (fg.to_owned(), default), "premise: {obj}");
+    }
+
+    let first = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let declared = |p: &pbps_db::catalog::Pulled| {
+        p.schema
+            .tables
+            .keys()
+            .map(|t| t.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        declared(&first),
+        ["n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base"]
+    );
+    // Both views are declared, with their indexes.
+    assert_eq!(
+        first.schema.modules.len(),
+        2,
+        "{:?}",
+        first.unmanaged_modules
+    );
+    // Declared as they were, not omitted and not a managed-set limitation.
+    let n_mem = &first.schema.tables[&TableName::new("dbo", "n_mem")];
+    assert!(n_mem.indexes.contains_key("ix_n_mem"));
+    assert!(n_mem.unique.contains_key("uq_n_mem"));
+    assert!(first.limitations.is_empty(), "{:?}", first.limitations);
+    assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+    let tail = "sit on a filegroup other than the database's default; the declarations do not \
+                hold a filegroup, so a bootstrap places them on the target's default filegroup";
+    assert_eq!(
+        first.catalog_notices,
+        [
+            "dbo.n_cpk: its base (clustered primary key `pk_n_cpk`) sits on a filegroup other \
+             than the database's default; the declarations do not hold a filegroup, so a \
+             bootstrap places it on the target's default filegroup"
+                .to_owned(),
+            "dbo.n_heap: its base (a heap) sits on a filegroup other than the database's \
+             default; the declarations do not hold a filegroup, so a bootstrap places it on \
+             the target's default filegroup"
+                .to_owned(),
+            format!("dbo.n_mem: index `ix_n_mem`, unique constraint `uq_n_mem` {tail}"),
+            // One for the view, not one per index or per column.
+            "dbo.v_off: index `ux_v_off` sits on a filegroup other than the database's \
+             default; the declarations do not hold a filegroup, so a bootstrap places it on \
+             the target's default filegroup"
+                .to_owned(),
+        ]
+    );
+
+    // A default that is not PRIMARY: its objects draw nothing, and PRIMARY,
+    // now an ordinary filegroup, does.
+    db.conn
+        .execute(&format!(
+            "ALTER DATABASE [{name}] MODIFY FILEGROUP fgd DEFAULT;
+             CREATE TABLE dbo.d_heap (id int NOT NULL);
+             CREATE TABLE dbo.d_cpk (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_d_cpk PRIMARY KEY CLUSTERED (id));
+             CREATE INDEX ix_d_cpk ON dbo.d_cpk (v);"
+        ))
+        .await
+        .expect("move the default filegroup");
+    let placed = physical(&mut db).await;
+    for (obj, fg, default) in [
+        ("d_heap.(heap)", "fgd", true),
+        ("d_cpk.pk_d_cpk", "fgd", true),
+        ("d_cpk.ix_d_cpk", "fgd", true),
+        ("p_heap.(heap)", "PRIMARY", false),
+        ("n_heap.(heap)", "fgx", false),
+    ] {
+        assert_eq!(placed[obj], (fg.to_owned(), default), "premise: {obj}");
+    }
+    let second = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    assert_eq!(
+        declared(&second),
+        [
+            "d_cpk", "d_heap", "n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base"
+        ]
+    );
+    let all = second.catalog_notices.join("\n");
+    for noticed in [
+        "n_cpk", "n_heap", "n_mem", "p_cpk", "p_heap", "v_base", "v_off", "v_on",
+    ] {
+        assert!(
+            all.contains(&format!("dbo.{noticed}: ")),
+            "{noticed}: {all}"
+        );
+    }
+    // Negative: the default draws nothing, however it is named.
+    assert!(!all.contains("d_cpk") && !all.contains("d_heap"), "{all}");
+    // n_mem's PRIMARY-side members are noticed now, beside its fgx ones.
+    assert!(
+        all.contains(
+            "dbo.n_mem: its base (clustered primary key `pk_n_mem`), index `ix_n_mem_plain`, \
+             index `ix_n_mem`, unique constraint `uq_n_mem` sit"
+        ),
+        "{all}"
+    );
+    assert!(second.limitations.is_empty(), "{:?}", second.limitations);
+}
+
+/// A table whose rows sit on a partition scheme is left out whole and its
+/// holder named, and a key or index on a scheme of its own over ordinary rows
+/// is left out alone; none of them is declared as the plain object bootstrap
+/// would build unpartitioned (#1227, DEC-1227.1, which replaces #1209's partial
+/// adoption). Measured on 17.0: a scheme shows as data space type `PS` on the
+/// heap's or clustered index's row and on a secondary's own row, and a
+/// secondary can sit on a filegroup beside partitioned rows or on a scheme
+/// beside ordinary ones, so each object's own row is read. The fixture is
+/// proved physically before anything is asserted about the reader.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn partition_scheme_placement_is_named_and_never_declared_as_plain() {
+    let mut db = TestDb::create("partition1227").await;
     db.conn
         .execute(
             "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10, 20);
-             CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);",
+             CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);
+             CREATE PARTITION FUNCTION pf1 (int) AS RANGE RIGHT FOR VALUES ();
+             CREATE PARTITION SCHEME ps1 AS PARTITION pf1 ALL TO ([PRIMARY]);",
         )
         .await
-        .expect("create the partition scheme");
+        .expect("create the partition schemes: ALL TO PRIMARY, and one partition");
     db.conn
         .execute(
-            "CREATE TABLE dbo.x (id int NOT NULL, v int NOT NULL,
-                 CONSTRAINT pk_x PRIMARY KEY NONCLUSTERED (id, v) ON [PRIMARY]);
-             CREATE CLUSTERED INDEX cx_x ON dbo.x (v) ON ps (v);
-             CREATE TABLE dbo.h (id int NOT NULL,
-                 CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED (id) ON [PRIMARY]) ON ps (id);
-             CREATE TABLE dbo.u (id int NOT NULL,
-                 CONSTRAINT uq_u UNIQUE CLUSTERED (id) ON ps (id));
-             CREATE TABLE dbo.plain (id int NOT NULL CONSTRAINT pk_plain PRIMARY KEY NONCLUSTERED);",
+            "-- Rows on a scheme: every kind of holder.
+             CREATE TABLE dbo.cpk (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_cpk PRIMARY KEY CLUSTERED (id)) ON ps (id);
+             CREATE INDEX ix_cpk_fg ON dbo.cpk (v) ON [PRIMARY];
+             CREATE TABLE dbo.heap_bare (id int NOT NULL) ON ps (id);
+             CREATE TABLE dbo.heap_nc (id int NOT NULL,
+                 CONSTRAINT pk_heap_nc PRIMARY KEY NONCLUSTERED (id)) ON ps (id);
+             CREATE TABLE dbo.cu (id int NOT NULL,
+                 CONSTRAINT uq_cu UNIQUE CLUSTERED (id) ON ps (id));
+             CREATE TABLE dbo.cx (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_cx PRIMARY KEY NONCLUSTERED (id, v) ON [PRIMARY]);
+             CREATE CLUSTERED INDEX cx_cx ON dbo.cx (v) ON ps (v);
+             CREATE TABLE dbo.one (id int NOT NULL,
+                 CONSTRAINT pk_one PRIMARY KEY CLUSTERED (id)) ON ps1 (id);
+             CREATE TABLE dbo.multi (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_multi PRIMARY KEY CLUSTERED (id)) ON ps (id);
+             CREATE INDEX ix_multi ON dbo.multi (v) ON ps (v);
+             -- Ordinary rows with members on a scheme of their own.
+             CREATE TABLE dbo.ord (id int NOT NULL, v int NOT NULL, w int NOT NULL, u int NOT NULL,
+                 CONSTRAINT pk_ord PRIMARY KEY CLUSTERED (id));
+             CREATE INDEX ix_ord ON dbo.ord (v) ON ps (v);
+             CREATE UNIQUE INDEX ux_ord ON dbo.ord (w) ON ps (w);
+             ALTER TABLE dbo.ord ADD CONSTRAINT uq_ord UNIQUE NONCLUSTERED (u) ON ps (u);
+             CREATE INDEX ix_ord_fg ON dbo.ord (v, w);
+             CREATE TABLE dbo.ord_heap (id int NOT NULL,
+                 CONSTRAINT pk_ord_heap PRIMARY KEY NONCLUSTERED (id) ON ps (id));
+             CREATE TABLE dbo.ord_one (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_ord_one PRIMARY KEY CLUSTERED (id));
+             -- The same member name on another table is another index.
+             CREATE INDEX ix_ord ON dbo.ord_one (v) ON ps1 (v);
+             -- Controls: the same shapes on a filegroup.
+             CREATE TABLE dbo.plain_cpk (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_plain_cpk PRIMARY KEY CLUSTERED (id));
+             CREATE INDEX ix_plain ON dbo.plain_cpk (v);
+             CREATE TABLE dbo.plain_heap (id int NOT NULL,
+                 CONSTRAINT pk_plain_heap PRIMARY KEY NONCLUSTERED (id));
+             CREATE TABLE dbo.plain_bare (id int NOT NULL);
+             -- Dependents of what is left out.
+             CREATE TABLE dbo.child (id int NOT NULL,
+                 a int NULL CONSTRAINT fk_child_cpk REFERENCES dbo.cpk (id),
+                 b int NULL CONSTRAINT fk_child_ux REFERENCES dbo.ord (w),
+                 c int NULL CONSTRAINT fk_child_plain REFERENCES dbo.plain_cpk (id));",
         )
         .await
-        .expect("create partitioned tables");
+        .expect("create the tables");
+
+    // The premise, read from the catalog: where each object really sits.
+    let sit = db
+        .conn
+        .query(
+            "SELECT o.name AS tbl, ISNULL(i.name, N'(heap)') AS idx, ds.type AS space
+               FROM sys.tables o
+               JOIN sys.indexes i ON i.object_id = o.object_id
+               JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
+              ORDER BY o.name, i.index_id;",
+        )
+        .await
+        .expect("read the placements");
+    let placement: std::collections::BTreeMap<(String, String), String> = sit
+        .iter()
+        .map(|r| {
+            (
+                (
+                    r.try_get::<&str>("tbl").unwrap().unwrap().to_owned(),
+                    r.try_get::<&str>("idx").unwrap().unwrap().to_owned(),
+                ),
+                r.try_get::<&str>("space").unwrap().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let space = |t: &str, i: &str| placement[&(t.to_owned(), i.to_owned())].as_str();
+    for (t, i) in [
+        ("cpk", "pk_cpk"),
+        ("heap_bare", "(heap)"),
+        ("heap_nc", "(heap)"),
+        ("heap_nc", "pk_heap_nc"),
+        ("cu", "uq_cu"),
+        ("cx", "cx_cx"),
+        ("one", "pk_one"),
+        ("multi", "ix_multi"),
+        ("ord", "ix_ord"),
+        ("ord", "ux_ord"),
+        ("ord", "uq_ord"),
+        ("ord_heap", "pk_ord_heap"),
+        ("ord_one", "ix_ord"),
+    ] {
+        assert_eq!(space(t, i), "PS", "premise: {t}.{i}");
+    }
+    for (t, i) in [
+        ("cpk", "ix_cpk_fg"),
+        ("cx", "pk_cx"),
+        ("ord", "pk_ord"),
+        ("ord", "ix_ord_fg"),
+        ("ord_heap", "(heap)"),
+        ("plain_cpk", "pk_plain_cpk"),
+        ("plain_cpk", "ix_plain"),
+        ("plain_heap", "pk_plain_heap"),
+        ("plain_bare", "(heap)"),
+    ] {
+        assert_eq!(space(t, i), "FG", "premise: {t}.{i}");
+    }
+
     let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect");
     db.drop().await;
 
+    let tables: Vec<String> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            "child",
+            "ord",
+            "ord_heap",
+            "ord_one",
+            "plain_bare",
+            "plain_cpk",
+            "plain_heap"
+        ],
+        "{:?}",
+        pulled.warnings
+    );
     let t = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
-    assert!(t("x").indexes.is_empty());
-    assert_eq!(t("x").primary_key, None);
-    assert!(t("u").unique.is_empty());
-    assert_eq!(t("h").primary_key, None);
-    let said = pulled.warnings.join("\n");
-    for name in ["cx_x", "uq_u", "pk_h", "pk_x"] {
-        assert!(
-            said.contains(&format!(
-                "`{name}`: the table's rows are on a partition scheme"
-            )),
-            "{name}: {said}"
+    // Only the member goes; the table, its other members and its default
+    // layout stay.
+    assert_eq!(
+        t("ord").indexes.keys().map(|k| k.raw()).collect::<Vec<_>>(),
+        ["ix_ord_fg"]
+    );
+    assert!(t("ord").unique.is_empty());
+    assert!(t("ord").primary_key.is_some());
+    assert_eq!(t("ord_heap").primary_key, None);
+    assert_eq!(t("ord_heap").clustered, None);
+    assert!(t("ord_one").indexes.is_empty());
+    assert!(t("ord_one").primary_key.is_some());
+    // Negative: the same shapes on a filegroup are declared as they were.
+    assert!(t("plain_cpk").primary_key.is_some());
+    assert!(t("plain_cpk").indexes.contains_key("ix_plain"));
+    assert_eq!(t("plain_heap").clustered, Some(Clustered::Heap));
+    assert_eq!(t("plain_bare").clustered, None);
+    // No foreign key is left naming what was left out.
+    assert_eq!(
+        t("child")
+            .foreign_keys
+            .keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
+        ["fk_child_plain"]
+    );
+
+    let relation = |name: &str| {
+        pbps_mssql::introspect::LimitationTarget::Relation(TableName::new("dbo", name))
+    };
+    let said = |name: &str| {
+        pulled
+            .limitations
+            .iter()
+            .filter(|l| l.target == relation(name))
+            .map(|l| l.detail.clone())
+            .collect::<Vec<_>>()
+    };
+    for (table, holder) in [
+        ("cpk", "(clustered primary key `pk_cpk`)"),
+        ("heap_bare", "(a heap)"),
+        ("heap_nc", "(a heap)"),
+        ("cu", "(clustered unique constraint `uq_cu`)"),
+        ("cx", "(clustered index `cx_cx`)"),
+        ("one", "(clustered primary key `pk_one`)"),
+        ("multi", "(clustered primary key `pk_multi`)"),
+    ] {
+        let prefix = format!("dbo.{table}: its rows are on a partition scheme {holder}");
+        assert_eq!(
+            said(table)
+                .iter()
+                .filter(|d| d.starts_with(&prefix))
+                .count(),
+            1,
+            "{table}: {:?}",
+            said(table)
         );
     }
-    // Negative: unpartitioned, the same key is declared as a heap's.
-    assert_eq!(t("plain").clustered, Some(Clustered::Heap));
+    // A key or index of the table on a scheme of its own is named with it.
+    for (table, also) in [
+        (
+            "heap_nc",
+            "also on a partition scheme: primary key `pk_heap_nc`",
+        ),
+        ("multi", "also on a partition scheme: index `ix_multi`"),
+    ] {
+        assert!(
+            said(table).iter().any(|d| d.contains(also)),
+            "{table}: {:?}",
+            said(table)
+        );
+    }
+    for (table, what) in [
+        ("ord", "unique constraint `uq_ord` is on a partition scheme"),
+        ("ord", "index `ix_ord` is on a partition scheme"),
+        ("ord", "unique index `ux_ord` is on a partition scheme"),
+        (
+            "ord_heap",
+            "primary key `pk_ord_heap` is on a partition scheme",
+        ),
+        ("ord_one", "index `ix_ord` is on a partition scheme"),
+        (
+            "child",
+            "foreign key `fk_child_cpk` references partitioned table dbo.cpk",
+        ),
+        (
+            "child",
+            "foreign key `fk_child_ux` references unique index `ux_ord` of dbo.ord",
+        ),
+    ] {
+        assert!(
+            said(table).iter().any(|d| d.contains(what)),
+            "{table}: {what}: {:?}",
+            said(table)
+        );
+    }
+    // Ordinary members and tables are never called partitioned.
+    let all = pulled.warnings.join("\n");
+    for ordinary in [
+        "ix_ord_fg",
+        "ix_plain",
+        "pk_plain_cpk",
+        "pk_plain_heap",
+        "ix_cpk_fg",
+    ] {
+        assert!(
+            !all.contains(&format!("`{ordinary}` is on a partition")),
+            "{ordinary}: {all}"
+        );
+    }
+    assert_eq!(said("plain_cpk"), Vec::<String>::new());
 }
 
 /// Runs every probe of a plan and returns (description, count) pairs.
@@ -4262,16 +4671,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("ck_plain_temporal_fn")
-            && limitation
-                .detail
-                .contains("omitted temporal or ledger object or module")
+            && limitation.detail.contains(
+                "omitted temporal, ledger, partitioned or unreadable-placement object or module",
+            )
     }));
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("df_plain_temporal_fn")
-            && limitation
-                .detail
-                .contains("omitted temporal or ledger object or module")
+            && limitation.detail.contains(
+                "omitted temporal, ledger, partitioned or unreadable-placement object or module",
+            )
     }));
     assert!(
         pulled.schema.tables[&TableName::new("dbo", "plain")]
@@ -18359,6 +18768,95 @@ async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
             .await
             .unwrap(),
         vec![reader]
+    );
+    db.drop().await;
+}
+
+/// A memory-optimized table whose indexes are only hash or nonclustered is
+/// still pulled (#1227): its base row is a heap row on no `sys.data_spaces` row
+/// (`data_space_id = 0`, measured on 17.0), which reads as the in-memory space,
+/// neither a scheme nor an unreadable placement. A review feared such a table
+/// has no base row at all and would be left out as unreadable; the premise
+/// below is the measurement that it does have one, and the pull is what would
+/// change if the engine ever stopped answering it. A disk table is the control.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_memory_optimized_table_with_only_a_hash_key_is_pulled_not_left_out() {
+    let mut db = TestDb::create("memopt1227").await;
+    let name = db.name.clone();
+    db.conn
+        .execute(&format!(
+            "ALTER DATABASE [{name}] ADD FILEGROUP mo CONTAINS MEMORY_OPTIMIZED_DATA;
+             ALTER DATABASE [{name}] ADD FILE (NAME='{name}_mo',
+                 FILENAME='/var/opt/mssql/data/{name}_mo') TO FILEGROUP mo;"
+        ))
+        .await
+        .expect("add a memory-optimized filegroup");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.mo_hash (id int NOT NULL
+                 PRIMARY KEY NONCLUSTERED HASH WITH (BUCKET_COUNT = 64), v int NULL)
+                 WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_AND_DATA);
+             CREATE TABLE dbo.mo_nc (id int NOT NULL PRIMARY KEY NONCLUSTERED, v int NULL)
+                 WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY);
+             CREATE TABLE dbo.plain_cpk (id int NOT NULL PRIMARY KEY, v int NULL);",
+        )
+        .await
+        .expect("create the tables");
+
+    // The premise: no clustered index, a heap row on data space 0, and no
+    // `sys.data_spaces` row for it, for the memory-optimized tables only.
+    let bases = db
+        .conn
+        .query(
+            "SELECT t.name AS tbl, CONVERT(int, t.is_memory_optimized) AS mo,
+                    b.index_id, b.data_space_id,
+                    CONVERT(int, CASE WHEN ds.data_space_id IS NULL THEN 0 ELSE 1 END) AS has_space
+               FROM sys.tables t
+               JOIN sys.indexes b ON b.object_id = t.object_id AND b.index_id IN (0, 1)
+               LEFT JOIN sys.data_spaces ds ON ds.data_space_id = b.data_space_id
+              ORDER BY t.name",
+        )
+        .await
+        .expect("read the bases");
+    let seen: Vec<(String, i32, i32, i32, i32)> = bases
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("tbl").unwrap().unwrap().to_owned(),
+                r.try_get::<i32>("mo").unwrap().unwrap(),
+                r.try_get::<i32>("index_id").unwrap().unwrap(),
+                r.try_get::<i32>("data_space_id").unwrap().unwrap(),
+                r.try_get::<i32>("has_space").unwrap().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("mo_hash".to_owned(), 1, 0, 0, 0),
+            ("mo_nc".to_owned(), 1, 0, 0, 0),
+            ("plain_cpk".to_owned(), 0, 1, 1, 1),
+        ]
+    );
+
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let declared: Vec<_> = pulled
+        .schema
+        .tables
+        .keys()
+        .map(|t| t.name.to_string())
+        .collect();
+    let said = format!("{:?} {:?}", pulled.limitations, pulled.catalog_notices);
+    assert_eq!(declared, ["mo_hash", "mo_nc", "plain_cpk"], "{said}");
+    // Neither unreadable nor partitioned, and no filegroup notice for them.
+    assert!(!said.contains("cannot be read"), "{said}");
+    assert!(!said.contains("partition"), "{said}");
+    assert!(
+        !said.contains("mo_hash") || !said.contains("filegroup"),
+        "{said}"
     );
     db.drop().await;
 }

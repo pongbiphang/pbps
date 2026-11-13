@@ -9609,3 +9609,70 @@ Formats: plan 69 (an older build would read `brin` as an unknown value), state
 added: both options are in the existing `storage_parameters` map, and a btree,
 GIN or GiST index keeps its bytes.
 
+
+<a id="dec-1227-1"></a>
+
+**DEC-1227.1. A SQL Server table whose rows sit on a partition scheme is
+left out of a pull whole; a key or index on a scheme of its own over ordinary
+rows is left out alone (#1227; amends DEC-1178.1).** The declarations hold no
+data space, so an object declared in place of one on a partition scheme is
+built by bootstrap on the default filegroup, unpartitioned, and nothing
+compares unequal afterwards. Two cases follow from where the placement is:
+
+- **The table's base rows** (its heap, or its clustered primary key, clustered
+  UNIQUE constraint, clustered index or clustered columnstore index) are on a
+  partition scheme: the whole table is omitted, with its history if it is
+  system-versioned, and the limitation names the object that holds the rows (or
+  says it is a heap) and any key or index of the table that is on a scheme of its
+  own. The other policy kept the table without the object that holds its rows. It
+  was refused because the kept table is then a heap or a table with another
+  clustered key, which is the unpartitioned table the omission exists to prevent.
+  This replaces #1209's partial adoption of the layouts #1178 added (a
+  nonclustered primary key on a partitioned heap, a clustered UNIQUE constraint,
+  a clustered index).
+- **A member's own data space** (a nonclustered index, a unique index, a UNIQUE
+  constraint or a nonclustered primary key) is a partition scheme over base
+  rows that are not: only that member is omitted, named, and the table is kept
+  with its other members. A foreign key bound to an omitted member goes with
+  it, as for any other omitted key.
+
+A scheme is told by `sys.data_spaces.type = 'PS'` on the object's own row
+(`sys.indexes.data_space_id`; a key is read through its backing index), not by
+the scheme's partitions: a scheme `ALL TO ([PRIMARY])` and one with a single
+partition are schemes. The heap, which `INDEX_COLUMNS` never lists, is read with
+the clustered index through `index_id IN (0, 1)`, one row per table. A data
+space the login cannot see is a third answer, neither a filegroup nor a scheme:
+the table or member is left out with a limitation that says the placement cannot
+be read, and is never declared as ordinary. A table left out for that reason is
+named as such to its dependents (a foreign key, a default, a check, a module,
+a trigger), not as a partitioned table, which nobody has established. A history table whose rows are on a
+scheme, or on a placement that cannot be read, is named with the object that holds
+its rows (its clustered index), as the current table is, and the two reasons stay
+apart. The filegroup notice names a base only when the declarations keep it: a
+clustered columnstore or disabled clustered base is left out as unmodelled and is
+not described as placed on the default filegroup. A memory-optimized table has no
+`sys.data_spaces` row (`data_space_id = 0`, measured on 17.0) and is no scheme.
+
+**A filegroup other than the database's default is declared and noticed.**
+Measured on 17.0 (SQL Server 2025 RTM-CU8): the emitter writes no `ON <filegroup>`,
+so a bootstrap places every object on the target's default filegroup. A heap, a
+clustered primary key and a nonclustered index that sat on a user filegroup of
+the source all came back on PRIMARY, `pull` warned of nothing, and a re-plan of
+the rebuilt target had 0 changes. The object is kept, since refusing it would
+block adopting a database that places data on filegroups, and one report-only
+notice is printed instead, as #168's notices are (DEC-2444.1): `pull` shows it as
+a warning, and a connected `plan` as the nonfatal `plan.unheld-object`. It is no
+managed-set limitation and no `note()`. The notice is read from the object's own
+data space with `sys.filegroups.is_default = 0`, is grouped per table (its base
+rows, each declared key or index, and its history table) or per indexed view
+(its declared indexes), and says that a bootstrap places them on the target's
+default filegroup. An object on the
+source's **default** filegroup draws nothing, even when the default is not
+PRIMARY (measured: after `MODIFY FILEGROUP ... DEFAULT`, objects created without
+`ON` land on it, and the objects left on PRIMARY are the ones noticed). A
+filegroup row the login cannot see is unreadable, not the default. A declared
+`filegroup` field is a separate issue.
+
+No format version moves: no `Change` kind, plan, state or declaration field is
+added; the omissions are limitations of the pull, and the notice is a
+report-only string.

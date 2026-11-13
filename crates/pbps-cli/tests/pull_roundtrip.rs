@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use pbps_mssql::introspect::{
-    ColumnReader, IndexKind, ModuleKind, RawCatalog, RawCheck, RawCheckColumn, RawColumn,
-    RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawReadColumn, RawTable,
-    assemble,
+    ColumnReader, IndexKind, ModuleKind, Placement, RawBase, RawCatalog, RawCheck, RawCheckColumn,
+    RawColumn, RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawReadColumn,
+    RawTable, assemble,
 };
 
 /// A catalog exercising every construct the model can express.
@@ -64,7 +64,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
-                column: "id".into(), rows_partitioned: false,
+                column: "id".into(), placement: Placement::Filegroup,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -73,7 +73,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "uq_customer_email".into(),
                 is_primary: false,
-                column: "email".into(), rows_partitioned: false,
+                column: "email".into(), placement: Placement::Filegroup,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -82,7 +82,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 2,
                 constraint_name: "pk_region".into(),
                 is_primary: true,
-                column: "region_id".into(), rows_partitioned: false,
+                column: "region_id".into(), placement: Placement::Filegroup,
             },
         ],
         foreign_key_columns: vec![RawForeignKeyColumn {
@@ -132,7 +132,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "email".into(),
                 is_included: false,
-                is_descending: true, rows_partitioned: false,
+                is_descending: true, placement: Placement::Filegroup,
             },
             RawIndexColumn {
             is_disabled: false,
@@ -144,7 +144,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "status".into(),
                 is_included: true,
-                is_descending: false, rows_partitioned: false,
+                is_descending: false, placement: Placement::Filegroup,
             },
         ],
         modules: vec![
@@ -204,6 +204,7 @@ fn raw_table(object_id: i32, schema: &str, name: &str) -> RawTable {
         retention: None,
         period: None,
         compression: None,
+        base: RawBase::heap(),
     }
 }
 
