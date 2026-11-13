@@ -71,57 +71,6 @@ pub(crate) fn computed_column_screen(driver: Driver) -> pbps_diff::Screen {
     profile::profile(driver).computed_column_screen
 }
 
-/// Refuses a plan that creates a name the database already uses outside the
-/// recorded scope (#316, #320, #323, DEC-316.1).
-///
-/// PostgreSQL has one namespace this check reads. SQL Server's is asked after
-/// the passes of the connected plan instead (#1077), so here it accepts.
-pub(crate) fn refuse_occupied_relation_names(
-    driver: Driver,
-    cs: &ChangeSet,
-    scoped: &pbps_diff::Scoped,
-    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
-    unmanaged_relations: &[TableName],
-    label: &str,
-) -> anyhow::Result<()> {
-    match driver {
-        Driver::Postgres => {
-            crate::deploy::refuse_occupied_names(cs, scoped, unreadable, unmanaged_relations, label)
-        }
-        Driver::Mssql => Ok(()),
-    }
-}
-
-/// The modules a plan must rebuild around the enums it rebuilds and does not
-/// yet, found in the planning transaction (DEC-1635.7).
-///
-/// What stands on a rebuilt enum comes down and goes back through the module
-/// rebuild, and anything else is refused by name. Only PostgreSQL has enums
-/// to rebuild; SQL Server has no module to add.
-pub(crate) async fn enum_rebuild_dependents(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    declared: Option<&Schema>,
-    before: &IdsFile,
-) -> anyhow::Result<BTreeSet<pbps_model::ModuleId>> {
-    match conn.driver() {
-        Driver::Postgres => {
-            if !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
-            {
-                return Ok(BTreeSet::new());
-            }
-            let census = pbps_pg::type_rebuild::census(conn, changes, declared, before, false)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(census.rebuild)
-        }
-        Driver::Mssql => Ok(BTreeSet::new()),
-    }
-}
-
 /// Binds the expressions a plan gives a table, to learn which routines the
 /// review admits (DEC-2563.4), and hands `on_note` each note about one that
 /// cannot be bound yet because it uses an object the plan creates.

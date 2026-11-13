@@ -91,7 +91,7 @@ pub(crate) use collected::*;
 mod profile;
 // The engine's steps of a connected plan, reached at named positions (#2798).
 mod plan_session;
-pub(crate) use plan_session::PlanSession;
+pub(crate) use plan_session::{Frame, PlanSession};
 
 /// A scratch baseline may assume only package state the scratch actually holds.
 pub async fn require_scratch_extensions(
@@ -905,126 +905,6 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
     )
 }
 
-/// Refuses a name this plan creates that a PostgreSQL relation-namespace
-/// entry outside the catalog inventory already holds (#951). SQL Server's
-/// `sys.objects` walk also orders the plan, so it runs after every pass that
-/// changes the plan: [`order_created_object_names`]. On PostgreSQL it first
-/// orders a cross-schema rename after the rename that moves a carried
-/// object's holder away (#1767, DEC-1957.2). What it read is returned, for
-/// [`NameFacts::order_and_refuse`] again once the module passes, which may
-/// plan the revision afresh in the differ's order, have run.
-/// Type occupants are retained here and refused only by that settled replay.
-#[allow(clippy::wildcard_enum_match_arm)] // Only type creators/renames add pg_type queries.
-pub async fn refuse_created_name_occupants<S: Clone>(
-    conn: &mut Conn,
-    cs: &mut PlanningPlan<S>,
-    label: &str,
-    plan: Planned<'_>,
-) -> anyhow::Result<Option<NameFacts>> {
-    match conn.driver() {
-        Driver::Postgres => {
-            // The names it creates, and those its table renames take on
-            // their way (#1785 review).
-            let mut asked = crate::deploy::created_relation_names(cs);
-            asked.extend(crate::deploy::rename_claims(cs));
-            let mut owners = crate::deploy::transferred_tables(cs);
-            let mut detach_releases = std::collections::BTreeMap::new();
-            let mut detach_retained = std::collections::BTreeMap::new();
-            for change in &cs.changes {
-                if let pbps_model::Change::DetachPartition {
-                    uid, parent, names, ..
-                } = &change.change
-                {
-                    let Some(table) = plan.base.ids.tables.get(uid) else {
-                        continue;
-                    };
-                    owners.push(table.clone());
-                    let Some(parent) = plan
-                        .desired
-                        .ids
-                        .tables
-                        .iter()
-                        .find(|(_, name)| *name == parent)
-                        .and_then(|(id, _)| plan.base.ids.tables.get(id))
-                    else {
-                        continue;
-                    };
-                    let clones = pbps_pg::catalog::detach_clone_names(conn, table, parent).await?;
-                    let slots = crate::deploy::detach_clone_slots(uid, names, &clones);
-                    detach_releases.extend(slots.detach_releases);
-                    detach_retained.extend(slots.detach_retained);
-                }
-            }
-            let mut occupants =
-                pbps_pg::catalog::relation_name_occupants(conn, &asked, &owners).await?;
-            // What a cross-schema rename carries lands on names of its own,
-            // which something else may hold there now (#1749), a table or a
-            // view included (#1765).
-            let carried = crate::deploy::carried_names(cs, &occupants);
-            let landing: Vec<TableName> = carried
-                .iter()
-                .filter(|n| !occupants.iter().any(|o| &o.name == *n))
-                .cloned()
-                .collect();
-            for found in pbps_pg::catalog::relation_name_occupants(conn, &landing, &[]).await? {
-                if !occupants.contains(&found) {
-                    occupants.push(found);
-                }
-            }
-            let mut at_names = carried;
-            at_names.extend(crate::deploy::rename_claims(cs));
-            at_names.extend(cs.changes.iter().flat_map(|p| {
-                crate::deploy::sequence_names_claimed(&p.change)
-                    .into_iter()
-                    .map(|(name, _)| name)
-            }));
-            at_names.extend(
-                cs.changes
-                    .iter()
-                    .filter(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
-                    .flat_map(|p| crate::deploy::relation_names_created(&p.change)),
-            );
-            let mut type_names = asked.clone();
-            type_names.extend(cs.changes.iter().flat_map(|p| match &p.change {
-                pbps_model::Change::CreateType { name, .. } => {
-                    vec![TableName::new(name.schema(), name.name())]
-                }
-                pbps_model::Change::RenameType { from, to, .. } => vec![
-                    TableName::new(to.schema(), to.name()),
-                    TableName::new(to.schema(), from.name()),
-                ],
-                _ => Vec::new(),
-            }));
-            let type_occupants = pbps_pg::catalog::type_names_at(conn, &type_names)
-                .await?
-                .into_iter()
-                .filter(|name| {
-                    !plan.base.schema.tables.contains_key(name)
-                        && !plan.base.schema.modules.iter().any(|(id, m)| {
-                            m.kind == pbps_model::ModuleKind::View && id.object_name() == *name
-                        })
-                        && !plan
-                            .base
-                            .schema
-                            .types
-                            .keys()
-                            .any(|t| t.schema() == name.schema && t.name() == name.name)
-                })
-                .collect();
-            let facts = NameFacts {
-                type_occupants,
-                relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
-                occupants,
-                detach_releases,
-                detach_retained,
-            };
-            facts.order_relations_and_refuse(cs, label, plan)?;
-            Ok(Some(facts))
-        }
-        Driver::Mssql => Ok(None),
-    }
-}
-
 /// What [`refuse_created_name_occupants`] read of a PostgreSQL target: the
 /// name occupants the plan's names and moves meet, and the tables and views
 /// at the carried names.
@@ -1225,22 +1105,7 @@ pub async fn refuse_unlogged_partition_referencers(
     if conn.driver() != Driver::Postgres {
         return Ok(());
     }
-    // Each parent under the name the catalog has it by: the partition names
-    // it as declared, after a rename this plan may run first (#1613, #1690).
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
-    let parents = crate::deploy::stored_unlogged_parents(&names);
-    if parents.is_empty() {
-        return Ok(());
-    }
-    let referencers = pbps_pg::catalog::permanent_referencers(conn, &parents)
-        .await
-        .map_err(|e| {
-            anyhow::Error::new(e).context(
-                "cannot read the foreign keys that reference a parent this plan adds an unlogged \
-                 partition to",
-            )
-        })?;
-    crate::deploy::refuse_permanent_referencers(cs, &names, &referencers, staged)
+    plan_session::postgres::refuse_unlogged_partition_referencers(conn, cs, ids, staged).await
 }
 
 /// Refuses making a table unlogged while a publication names it (#1489,
@@ -1254,19 +1119,7 @@ pub async fn refuse_published_unlogged(
     if conn.driver() != Driver::Postgres {
         return Ok(());
     }
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
-    let made_unlogged = crate::deploy::tables_made_unlogged(&names);
-    if made_unlogged.is_empty() {
-        return Ok(());
-    }
-    let stored: Vec<TableName> = made_unlogged.iter().map(|(_, s)| s.clone()).collect();
-    let naming = pbps_pg::catalog::publications_naming(conn, &stored)
-        .await
-        .map_err(|e| {
-            anyhow::Error::new(e)
-                .context("cannot read the publications of a table this plan makes unlogged")
-        })?;
-    crate::deploy::refuse_published_unlogged(&made_unlogged, &naming)
+    plan_session::postgres::refuse_published_unlogged(conn, cs, ids).await
 }
 
 /// Catalog reads precede the plan, while the caller names an object at its
@@ -1282,157 +1135,12 @@ fn computed_catalog_table(
         .unwrap_or_else(|| table.clone())
 }
 
-/// Orders a SQL Server plan's function drops after the computed columns that
-/// call them, with what each is schema-bound to after it, and refuses what
-/// the catalog's expression edges say the engine will not do (#1431,
-/// DEC-1431.1). Reads the edges of the tables and modules the plan touches,
-/// under the names the catalog has them by. PostgreSQL has no computed
-/// columns, and its generated ones are `release_generated_inputs`'s.
-///
-/// Returns which drop waits for which by those edges, for the rename search
-/// that runs after it ([`order_created_object_names`], #1680): empty where
-/// no edge was read.
-// The complement is every change that touches no object an expression edge
-// can name: a computed column, a column it reads, its table, or a module.
-#[allow(clippy::wildcard_enum_match_arm)]
-pub async fn order_computed_by_edges<S: Clone>(
-    conn: &mut Conn,
-    cs: &mut PlanningPlan<S>,
-    ids: &pbps_model::IdsFile,
-) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
-    if conn.driver() != Driver::Mssql {
-        return Ok(Vec::new());
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
-    let catalog = |at, table: &TableName| computed_catalog_table(&names, table, at);
-    let mut objects: Vec<pbps_model::TableName> = Vec::new();
-    for (at, p) in cs.changes.iter().enumerate() {
-        let touched = match &p.change {
-            pbps_model::Change::AddComputedColumn { table, .. }
-            | pbps_model::Change::DropComputedColumn { table, .. }
-            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(at, table)),
-            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
-            pbps_model::Change::DropColumn { column, .. }
-            | pbps_model::Change::AlterColumnType { column, .. }
-            | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                Some(catalog(at, &column.table))
-            }
-            pbps_model::Change::AlterModule { id, .. }
-            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
-            _ => None,
-        };
-        if let Some(object) = touched
-            && !objects.contains(&object)
-        {
-            objects.push(object);
-        }
-    }
-    if objects.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The edges refuse or move only these: a column a computed column of its
-    // own table reads, a function one calls, a computed column a module is
-    // bound to, and drops `release` orders, which takes two. A plan with none
-    // of them, such as one adding a computed column or dropping one view,
-    // needs no edge read and so no grant that makes one complete (#1643
-    // review).
-    let mut inputs: Vec<pbps_model::TableName> = Vec::new();
-    let mut drops = 0;
-    let mut decides = false;
-    for (at, p) in cs.changes.iter().enumerate() {
-        match &p.change {
-            pbps_model::Change::RenameColumn { table, .. } => inputs.push(catalog(at, table)),
-            pbps_model::Change::DropColumn { column, .. }
-            | pbps_model::Change::AlterColumnType { column, .. }
-            | pbps_model::Change::AlterColumnNullability { column, .. } => {
-                inputs.push(catalog(at, &column.table));
-            }
-            pbps_model::Change::DropComputedColumn { .. } => decides = true,
-            pbps_model::Change::AlterModule { module, .. } => {
-                decides |= module.kind == pbps_model::ModuleKind::Function;
-            }
-            pbps_model::Change::DropModule { kind, .. } => {
-                decides |= *kind == pbps_model::ModuleKind::Function;
-                drops += 1;
-            }
-            pbps_model::Change::DropTable { .. } => drops += 1,
-            _ => {}
-        }
-    }
-    let modules_dropped = cs
-        .changes
-        .iter()
-        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }));
-    decides |= modules_dropped && drops > 1;
-    if !decides {
-        decides = pbps_mssql::catalog::may_hold_computed_columns(conn, &inputs)
-            .await
-            .map_err(|e| {
-                anyhow::Error::new(e)
-                    .context("cannot read whether a changed column's table has computed columns")
-            })?;
-    }
-    if !decides {
-        return Ok(Vec::new());
-    }
-    // An empty read is "no edge" only where no referrer the pass decides by
-    // can be hidden (#1462).
-    let mut targets = pbps_mssql::catalog::ReferrerTargets::default();
-    for (at, p) in cs.changes.iter().enumerate() {
-        match &p.change {
-            pbps_model::Change::AlterModule { id, module }
-                if module.kind == pbps_model::ModuleKind::Function =>
-            {
-                targets.functions.push(id.object_name());
-            }
-            pbps_model::Change::DropModule {
-                id,
-                kind: pbps_model::ModuleKind::Function,
-            } => targets.functions.push(id.object_name()),
-            pbps_model::Change::DropComputedColumn { table, name, .. } => {
-                targets
-                    .computed_columns
-                    .push((catalog(at, table), name.clone()));
-            }
-            _ => {}
-        }
-    }
-    pbps_mssql::catalog::prove_referrers_visible(conn, &targets)
-        .await
-        .map_err(|e| {
-            anyhow::Error::new(e).context(
-                "cannot prove the catalog shows everything that calls what this plan changes",
-            )
-        })?;
-    let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
-    if edges.is_empty() {
-        return Ok(Vec::new());
-    }
-    // One group: whether two strings are one name is the collation's, not
-    // the kind of object they name.
-    let spellings: Vec<String> = crate::computed_order::spellings(cs, &edges)
-        .into_iter()
-        .collect();
-    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
-    let alike = crate::computed_order::Alike::from_pairs(
-        pbps_mssql::catalog::column_names_alike(conn, &grouped)
-            .await?
-            .into_iter()
-            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
-    );
-    crate::computed_order::order_by_edges(cs, ids, &edges, &alike)
-        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))?;
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
-    Ok(crate::computed_order::drop_precedence(
-        cs, &names, &edges, &alike,
-    ))
-}
-
 /// Refuses a SQL Server computed column this plan adds, new or again, whose
 /// expression calls a function the plan creates, alters or drops, comparing
 /// the names under the database's collation (#1459, DEC-1459.1). Only the
 /// collation is asked, not `sys.sql_expression_dependencies`, which has no
 /// edge for an expression not yet stored, so no grant beyond reading names.
+#[cfg(test)]
 pub async fn refuse_added_computed_calls<S>(
     conn: &mut Conn,
     cs: &pbps_diff::order::PlanningPlan<S>,
@@ -1441,26 +1149,7 @@ pub async fn refuse_added_computed_calls<S>(
     if conn.driver() != Driver::Mssql {
         return Ok(());
     }
-    let dialect = pbps_mssql::Mssql;
-    let spellings: Vec<String> =
-        crate::computed_order::added_call_spellings(cs, declared, &dialect)
-            .into_iter()
-            .collect();
-    if spellings.is_empty() {
-        return Ok(());
-    }
-    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
-    let alike = crate::computed_order::Alike::from_pairs(
-        pbps_mssql::catalog::column_names_alike(conn, &grouped)
-            .await?
-            .into_iter()
-            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone()))
-            // Successful catalog comparison covers every supplied spelling;
-            // the query reports distinct pairs only, not reflexive rows.
-            .chain(spellings.iter().map(|s| (s.clone(), s.clone()))),
-    );
-    crate::computed_order::refuse_added_calls_in(cs, declared, &dialect, &alike)
-        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
+    plan_session::mssql::refuse_added_computed_calls(conn, cs, declared).await
 }
 
 /// Orders this plan's column and table renames on SQL Server from what the
@@ -1470,6 +1159,7 @@ pub async fn refuse_added_computed_calls<S>(
 /// creates or moves things to, and the children of the tables it changes,
 /// so the plan's own moves can be walked. The last pass to reorder the plan:
 /// called after every other one, so what it settles is what is saved.
+#[cfg(test)]
 pub(crate) async fn order_created_object_names<S: Clone>(
     conn: &mut Conn,
     cs: &mut PlanningPlan<S>,
@@ -1480,92 +1170,10 @@ pub(crate) async fn order_created_object_names<S: Clone>(
     if conn.driver() != Driver::Mssql {
         return Ok(None);
     }
-    // Column renames first: each one may move a generated default, which the
-    // `sys.objects` walk below follows in the order they run (DEC-1366.3).
-    let columns = crate::object_order::renamed_column_names(cs);
-    if !columns.is_empty() {
-        let tables: Vec<&TableName> = columns.iter().map(|(t, _)| t).collect();
-        let grouped: Vec<(usize, String)> = columns
-            .iter()
-            .map(|(t, name)| {
-                let group = tables.iter().position(|u| *u == t).unwrap_or_default();
-                (group, name.raw().to_owned())
-            })
-            .collect();
-        let alike: Vec<_> = pbps_mssql::catalog::column_names_alike(conn, &grouped)
-            .await?
-            .into_iter()
-            .map(|(a, b)| (columns[a].clone(), columns[b].clone()))
-            .collect();
-        crate::object_order::order_column_renames(cs, &alike, label)?;
-    }
-    let index = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)?;
-    let (mut names, parents) = crate::deploy::object_reads(cs, &index);
-    let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
-    // Where a transfer carries each child of a moved table: a name the
-    // first read could not know to ask until it found the child (#1366).
-    let carried: Vec<TableName> = crate::deploy::carried_destinations(cs, &occupants)
-        .into_iter()
-        .filter(|n| !names.contains(n))
-        .collect();
-    if !carried.is_empty() {
-        occupants.extend(pbps_mssql::catalog::object_name_occupants(conn, &carried, &[]).await?);
-        names.extend(carried);
-    }
-    // An absent row is a free name only where nothing can be hidden
-    // from this login (#1192), so only the names the read found no
-    // row at need the proof. A name holds one object per schema, so
-    // one this login sees leaves no room for a hidden one: a table
-    // dropped and recreated at its own name is not asked. Nor are
-    // `parents`, read for what the walk moves or removes with a
-    // table, so a drop-only plan claims nothing to prove (review of
-    // #1360).
-    let mut schemas: Vec<String> = names
-        .iter()
-        .filter(|n| !occupants.iter().any(|o| &o.wanted == *n))
-        .map(|n| n.schema.clone())
-        .collect();
-    schemas.sort();
-    schemas.dedup();
-    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas)
-        .await
-        // As context, never interpolated: a driver frame has to reach
-        // `ledger_safe_reason` intact to be redacted (DECISIONS 455).
-        .map_err(|e| {
-            anyhow::Error::new(e).context("cannot prove the names this plan creates are free")
-        })?;
-    // Which of the plan's own names are one under the database's
-    // collation (#1215).
-    let mut candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
-    // Computed-column reads may be skipped on a module-only plan. Extend this
-    // existing comparison, whose answers the final observer already carries.
-    candidates.extend(pbps_mssql::schema_bound_call_names(
-        cs,
-        declared.sources.before.schema,
-        declared.schema,
-    ));
-    candidates.sort();
-    candidates.dedup();
-    let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
-    let facts = object_slots(&occupants, &candidates, &alike);
-    // Name equality can reveal a dependency that the earlier lexical passes
-    // could not schedule (#2221). Settle it before the final name walk and
-    // observer, using the same comparison and existing release mechanism.
-    *cs = pbps_diff::order::catalog_requirements(
-        cs.clone(),
-        declared.sources.before,
-        pbps_diff::Side {
-            schema: declared.schema,
-            ids: declared.sources.after,
-        },
-        &pbps_mssql::Mssql,
-        &declared.module_deps(),
-        &facts,
-        precedence,
-    )
-    .map_err(anyhow::Error::msg)?;
-    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)?;
-    Ok(Some(facts))
+    Ok(Some(
+        plan_session::mssql::order_created_object_names(conn, cs, label, precedence, declared)
+            .await?,
+    ))
 }
 
 /// What the `sys.objects` reads found, as name slots for the slot replay
@@ -1710,7 +1318,7 @@ pub async fn role_members(
     conn: &mut Conn,
 ) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>> {
     match conn.driver() {
-        Driver::Mssql => Ok(pbps_mssql::catalog::role_members(conn).await?),
+        Driver::Mssql => plan_session::mssql::role_members(conn).await,
         Driver::Postgres => Err(roles_are_the_clusters("reading the role memberships")),
     }
 }
@@ -1909,48 +1517,11 @@ pub async fn check_drop_blockers(
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
         Driver::Mssql => {
-            let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-            let reports = pbps_mssql::impact::key_drop_blockers(conn, &names).await?;
-            refuse_drop_reports("SQL Server", &reports)?;
-            // Two kinds of question now, and the count says which: a key this
-            // plan drops, and a column it retypes while a key stands on it
-            // (DECISIONS 515). Classified by the change each report points at
-            // rather than by reading its target text, which belongs to the
-            // engine that wrote it.
-            let retypes = reports
-                .iter()
-                .filter(|r| {
-                    matches!(
-                        changes.changes.get(r.change_index).map(|p| &p.change),
-                        Some(pbps_model::Change::AlterColumnType { .. })
-                    )
-                })
-                .count();
-            Ok(ConnectedCheck {
-                name: "drop_blockers",
-                engine: "SQL Server",
-                status: "unavailable",
-                message: format!(
-                    "{} unique-key drop(s) and {retypes} column retype(s) checked; the table/column drop dependency reader is not implemented for SQL Server",
-                    reports.len() - retypes
-                ),
-            })
+            plan_session::mssql::check_drop_blockers(conn, changes, ids, stored, stored_ids).await
         }
         Driver::Postgres => {
-            let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-            let sources =
-                pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
-            let reports = pbps_pg::impact::drop_blockers(conn, &sources).await?;
-            refuse_drop_reports("PostgreSQL", &reports)?;
-            Ok(ConnectedCheck {
-                name: "drop_blockers",
-                engine: "PostgreSQL",
-                status: "passed",
-                message: format!(
-                    "{} table/column/key/index drop(s) checked against current catalog dependencies",
-                    reports.len()
-                ),
-            })
+            plan_session::postgres::check_drop_blockers(conn, changes, ids, stored, stored_ids)
+                .await
         }
     }
 }
@@ -2697,33 +2268,6 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
     )
 }
 
-/// [`order_after_releases`], with the live edges of every table the plan
-/// retypes or drops a column of. PostgreSQL only.
-pub async fn release_generated_inputs<S: Clone>(
-    conn: &mut Conn,
-    changes: &mut PlanningPlan<S>,
-    before: pbps_diff::Side<'_>,
-    after: pbps_diff::Side<'_>,
-    dialect: &dyn pbps_dialect::Dialect,
-    declared: &pbps_model::ModuleDeps,
-) -> anyhow::Result<usize> {
-    if conn.driver() != Driver::Postgres {
-        return Ok(0);
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)?;
-    let mut dependences = BTreeMap::new();
-    for p in &changes.changes {
-        if let Some((table, ..)) = changed_column(&names, &p.change)
-            && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
-        {
-            let found = pbps_pg::generated::dependences(conn, e.key()).await?;
-            e.insert(found);
-        }
-    }
-    order_after_releases(changes, before, after, &dependences, dialect, declared)
-        .map_err(|why| anyhow::anyhow!("generation_support (PostgreSQL): {why}"))
-}
-
 /// Every retype or drop of a column a live generated column reads that
 /// nothing releases first: the same plan dropping the generated column, or an
 /// earlier change to its expression whose text does not name the column
@@ -2774,55 +2318,6 @@ fn unreleased(
     problems
 }
 
-/// The logical replication slots that would decode the rows this plan moves
-/// out of a DEFAULT partition (#1788), listed and never refused: a slot's
-/// consumer may take a delete and an insert in its stride, and whether it
-/// does is what the operator allowing the move answers. A publication is
-/// another matter, refused by the pre-flight, since a subscriber is known to
-/// lose the rows. Asked only of a plan that makes a partition beside a
-/// DEFAULT; whether it moves any row is the apply's to count.
-pub async fn logical_slots(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<ConnectedCheck> {
-    if conn.driver() == Driver::Mssql {
-        return Ok(ConnectedCheck {
-            name: "logical_slots",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server has no partition this model moves rows into".to_owned(),
-        });
-    }
-    let moving: Vec<String> = changes
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let pbps_model::Change::CreateTable {
-                name,
-                beside_default: Some(default),
-                ..
-            } = &p.change
-            {
-                Some(format!(
-                    "{default} into {name}",
-                    default = default.shown(),
-                    name = name.shown()
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if moving.is_empty() {
-        return Ok(ConnectedCheck {
-            name: "logical_slots",
-            engine: "PostgreSQL",
-            status: "not_applicable",
-            message: "this plan makes no partition beside a DEFAULT, so it moves no rows"
-                .to_owned(),
-        });
-    }
-    let slots = pbps_pg::impact::logical_slots(conn).await?;
-    Ok(slots_listed(&moving, &slots))
-}
-
 /// [`logical_slots`]' answer over what the catalog said. Measured on 16 and
 /// 18 with `test_decoding`: a move decodes as the DEFAULT's delete and the
 /// new partition's insert.
@@ -2854,77 +2349,6 @@ fn slots_listed(moving: &[String], slots: &[(String, String)]) -> ConnectedCheck
         status: if slots.is_empty() { "passed" } else { "listed" },
         message,
     }
-}
-
-/// What logical decoding misses of a plan's identity or `serial` column
-/// added to a table already there (#1890, DEC-1890.1), listed and never
-/// refused. The engine numbers every row already there in the table's
-/// rewrite, and measured on 18.6 that rewrite reaches no stream: a
-/// `test_decoding` slot shows an empty transaction, a `pgoutput` slot nothing,
-/// and a subscriber keeps the new column empty for those rows, while a row
-/// inserted afterwards arrives with its number. So the publications over the
-/// table and the database's logical slots are named, for whoever answers for
-/// their consumers. A table the plan creates is empty when made: it has no
-/// `AddColumn`, and its rows stream as they come.
-pub async fn numbered_column_fills(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-) -> anyhow::Result<ConnectedCheck> {
-    use pbps_model::plan_names::At;
-    if conn.driver() == Driver::Mssql {
-        return Ok(ConnectedCheck {
-            name: "numbered_column_fills",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server has no logical decoding this model reads".to_owned(),
-        });
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    let mut fills: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
-    for (i, p) in changes.changes.iter().enumerate() {
-        let pbps_model::Change::AddColumn {
-            table,
-            name,
-            column,
-            ..
-        } = &p.change
-        else {
-            continue;
-        };
-        let numbered = match column.value_source {
-            pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Sequence(_) => true,
-            pbps_model::ValueSource::None
-            | pbps_model::ValueSource::Default(_)
-            | pbps_model::ValueSource::Generated(_) => false,
-        };
-        // The table under the name the catalog has it by now, after a
-        // rename this plan may run first; none for one the plan creates.
-        if let (true, Some(live)) = (numbered, names.stored(table, At::Before(i))) {
-            fills.push((live, name.clone()));
-        }
-    }
-    if fills.is_empty() {
-        return Ok(ConnectedCheck {
-            name: "numbered_column_fills",
-            engine: "PostgreSQL",
-            status: "not_applicable",
-            message: "this plan adds no identity or serial column to a table already there"
-                .to_owned(),
-        });
-    }
-    let mut publications = Vec::new();
-    for (table, _) in &fills {
-        if !publications
-            .iter()
-            .any(|(t, _): &(TableName, _)| t == table)
-        {
-            let found = pbps_pg::impact::publications_of(conn, table).await?;
-            publications.push((table.clone(), found));
-        }
-    }
-    let slots = pbps_pg::impact::logical_slots(conn).await?;
-    Ok(fills_listed(&fills, &publications, &slots))
 }
 
 /// [`numbered_column_fills`]' answer over what the catalog said.
@@ -3630,64 +3054,10 @@ pub fn require_transactional_rebuilds(
     changes: &ChangeSet,
     staged: bool,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !staged
-            || !changes
-                .changes
-                .iter()
-                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
-        "table rebuild requires transactional mode; --staged is unsupported"
-    );
-    if driver == Driver::Postgres && staged && !rebuilt_modules(changes).is_empty() {
-        anyhow::bail!(
-            "PostgreSQL module rebuilds require a transaction to preserve their catalog state \
-             (ADR-0009 §3); remove --staged and plan again"
-        );
+    match driver {
+        Driver::Postgres => plan_session::postgres::require_transactional_rebuilds(changes, staged),
+        Driver::Mssql => plan_session::mssql::require_transactional_rebuilds(changes, staged),
     }
-    // The `CREATE` and the revoke that closes the routine are two statements,
-    // and a staged run commits each one on its own (DECISIONS 517). Between
-    // those two commits the routine is visible to the whole cluster holding
-    // this engine's default `EXECUTE` to `PUBLIC` — and the revoke sorts with
-    // the grants, after every row the plan writes, so the window is the rest
-    // of the plan rather than an instant. A `SECURITY DEFINER` routine open
-    // for that long is the exposure this revoke exists to prevent, so the
-    // plan is refused rather than run with a gap in it.
-    let closes: Vec<String> = changes
-        .changes
-        .iter()
-        .filter_map(|p| {
-            // Only the half whose window is an over-exposure. `Kept`
-            // writes a `GRANT` of its own, but the state between its
-            // `CREATE` and that grant is a routine *less* reachable than the
-            // declaration asks for — a caller sees a permission error, not
-            // somebody else's privileges — so staging it is merely slow.
-            if let pbps_model::Change::PublicExecution {
-                routine,
-                access: pbps_model::PublicAccess::Revoked,
-                ..
-            } = &p.change
-            {
-                Some(routine.shown().to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if staged && !closes.is_empty() {
-        anyhow::bail!(
-            "a staged run commits each statement on its own, so {} would stay executable by \
-             every principal in the cluster between its `CREATE` and the revoke that closes it \
-             (DECISIONS 517): {}.\nRemove --staged and plan again, or declare \
-             `public_execute: true` on the routines that are meant to stay open",
-            if closes.len() == 1 {
-                "1 routine".to_owned()
-            } else {
-                format!("{} routines", closes.len())
-            },
-            closes.join(", ")
-        );
-    }
-    Ok(())
 }
 
 /// Called inside the transaction before the DROP and after the CREATE.
@@ -3698,35 +3068,9 @@ pub async fn check_module_rebuilds(
     after: bool,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
-        Driver::Mssql => Ok(ConnectedCheck {
-            name: "before_a_rebuild",
-            engine: "SQL Server",
-            status: "not_applicable",
-            message: "SQL Server uses CREATE OR ALTER to retain module state; the PostgreSQL drop/recreate check does not apply".into(),
-        }),
+        Driver::Mssql => Ok(plan_session::mssql::check_module_rebuilds()),
         Driver::Postgres => {
-            let rebuilt = rebuilt_modules(changes);
-            for (id, (before_kind, after_kind)) in &rebuilt {
-                let found = pbps_pg::modules::before_a_rebuild(
-                    conn,
-                    id,
-                    if after { *after_kind } else { *before_kind },
-                    changes,
-                )
-                .await?;
-                if let Some(reason) = found.refusal() {
-                    anyhow::bail!("before_a_rebuild (PostgreSQL): {reason}");
-                }
-                if !after && let pbps_pg::modules::Serialized::Not(reason) = found.serialized {
-                    eprintln!("warning: {id}: {reason}", id = id.shown());
-                }
-            }
-            Ok(ConnectedCheck {
-                name: "before_a_rebuild",
-                engine: "PostgreSQL",
-                status: "passed",
-                message: format!("{} module rebuild(s) checked for catalog state a replacement cannot preserve", rebuilt.len()),
-            })
+            plan_session::postgres::check_module_rebuilds(conn, changes, after).await
         }
     }
 }
@@ -3785,12 +3129,13 @@ async fn module_dependents(
 // The eighth argument is the role members the caller read: the schedule
 // takes every fact in one call (#1955).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn account_for_module_dependents<
     S: pbps_diff::order::RouteState<D>,
     D: crate::emission::Engine,
 >(
     conn: &mut Conn,
-    mut changes: PlanningPlan<S>,
+    changes: PlanningPlan<S>,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::object_ref::Annotations,
@@ -3798,147 +3143,34 @@ pub async fn account_for_module_dependents<
     dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
 ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
-    let declarations = crate::dependents::schedule::Declarations {
-        schema: declared,
-        sources,
-        annotations: deps,
-    };
-    // The members of the roles this plan drops, which the caller read when
-    // there were any: every connected plan goes through the schedule once,
-    // whichever facts its engine supplies (#1955 review).
-    let read = match role_members {
-        Some(members) => crate::dependents::schedule::Facts::default().with_role_members(members),
-        None => crate::dependents::schedule::Facts::default(),
-    };
-    if conn.driver() != Driver::Postgres {
-        let found = module_dependents(conn, &changes).await?;
-        let read = read.with_module_dependents(&found);
-        let scheduled =
-            crate::dependents::schedule::schedule(changes, &declarations, &read, dialect)?;
-        return Ok((
-            scheduled.changes,
-            ConnectedCheck {
-                name: "module_dependents",
-                engine: "SQL Server",
-                status: if found.values().any(|v| !v.is_empty()) {
-                    "passed"
-                } else {
-                    "not_applicable"
-                },
-                message: if found.is_empty() {
-                    "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into()
-                } else {
-                    format!(
-                        "{} DEFAULT holder(s) of {} dropped routine(s) accounted for; {} change(s) added",
-                        found.values().map(Vec::len).sum::<usize>(),
-                        found.len(),
-                        scheduled.added
-                    )
-                },
-            },
-        ));
-    }
-    // Version is observed once, before the pure expansion. Ordinary CLI
-    // planning has no extra write-path schemas (DEC-1503.1).
-    let pg = dialect.with_planning_version(pbps_pg::roles::server_version_num(conn).await?);
-    let dialect = &pg;
-    let mut found = module_dependents(conn, &changes).await?;
-    let untouched = crate::dependents::untouched_module_dependents(&changes, &found, declared);
-    if !untouched.is_empty() {
-        changes = rediff(&untouched)?;
-        found = module_dependents(conn, &changes).await?;
-    }
-    // Every reordering pass, in one place (#1955): `weave` over what the
-    // catalog just said depends on the modules this plan drops, then the
-    // passes that read nothing.
-    let policies = policy_dependents(conn, &changes, sources.after, sources.before.schema).await?;
-    // Only a plan that moves a partition while changing its parent's columns
-    // reads stored column facts. The read stays in this transaction and call,
-    // beside the dependents it is consulted with (DEC-2296.2).
-    let tables = pbps_diff::order::boundary_catalog_tables(
-        &changes,
-        sources.before,
-        pbps_diff::Side {
-            schema: declared,
-            ids: sources.after,
-        },
-    );
-    let stored = if tables.is_empty() {
-        None
-    } else {
-        Some(
-            pbps_pg::modules::dependencies::references(
+    match conn.driver() {
+        Driver::Postgres => {
+            plan_session::postgres::account_for_module_dependents(
                 conn,
-                pbps_model::operation::Snapshot {
-                    schema: sources.before.schema,
-                    ids: sources.before.ids,
-                },
-                &tables,
+                changes,
+                declared,
+                sources,
+                deps,
+                role_members,
+                dialect,
+                rediff,
             )
-            .await?,
-        )
-    };
-    let facts = read
-        .with_module_dependents(&found)
-        .with_policy_dependents(&policies);
-    let facts = match &stored {
-        Some(stored) => facts.with_membership_catalog(stored),
-        None => facts,
-    };
-    let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &facts, dialect)?;
-    let changes = scheduled.changes;
-    pbps_diff::order::row_security::check_releases(&changes, sources.after, &policies)?;
-    let (added, split, moved) = (scheduled.added, scheduled.split, scheduled.moved);
-    let partitions = crate::dependents::standing_partitions(declared, &changes);
-    // On the final order: every pass above may move what an expression
-    // names, or the expression (#1576).
-    // Which name each unnamed key's index takes depends on what holds its
-    // candidates now (#1645).
-    let holders =
-        pbps_pg::catalog::key_name_holders(conn, &crate::dependents::key_name_prefixes(&changes))
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("module_dependents (PostgreSQL): reading what holds key names: {e}")
-            })?;
-    let mut later = Vec::new();
-    for name in crate::dependents::names_a_later_relation(
-        &changes,
-        dialect,
-        Some(&holders),
-        sources.before.schema,
-    ) {
-        if !resolves_now(conn, &name).await? {
-            later.push(name);
+        }
+        Driver::Mssql => {
+            plan_session::mssql::account_for_module_dependents(
+                conn,
+                changes,
+                declared,
+                sources,
+                deps,
+                role_members,
+                dialect,
+                rediff,
+            )
+            .await
         }
     }
-    crate::dependents::later_relation_refusal(&later)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    let left = crate::dependents::unaccounted(
-        &changes,
-        &found,
-        &partitions,
-        &sources
-            .project(&changes.changes)
-            .map_err(anyhow::Error::msg)?,
-    );
-    if !left.is_empty() {
-        anyhow::bail!(
-            "module_dependents (PostgreSQL): the plan still drops a module before what depends \
-             on it; this is a bug in pbps, please report it:\n  {}",
-            left.join("\n  ")
-        );
-    }
-    let dependents: usize = found.values().map(Vec::len).sum();
-    let check = ConnectedCheck {
-        name: "module_dependents",
-        engine: "PostgreSQL",
-        status: "passed",
-        message: format!(
-            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them; {split} part(s) split out of new tables; {moved} addition(s) moved after the function(s) they call",
-            found.len()
-        ),
-    };
-    Ok((changes, check))
 }
 
 /// The connection's immutable planning capability, before any expansion.
@@ -4069,139 +3301,14 @@ pub async fn prepare_data_writes(
         // SQL Server keeps its existing reference-data execution policy.
         Driver::Mssql => Ok(DataWriteGuard::default()),
         Driver::Postgres => {
-            use pbps_dialect::{RowOperation, RowWrite};
-            use pbps_model::Change;
-            let mut writes = Vec::new();
-            let mut dropped = pbps_pg::data_triggers::Dropped::default();
-            // Asked once per row change and updated column: indexed once,
-            // not scanned per question (#1870).
-            let planned_names = planned_ids.index();
-            let baseline_names = baseline.ids.index();
-            // The plan's own name for a table, in the spelling the catalog
-            // still holds: the guard runs before the renames (DECISIONS 445).
-            let stored = |table: &pbps_model::TableName| {
-                planned_names
-                    .table_uid(table)
-                    .or_else(|| baseline_names.table_uid(table))
-                    .and_then(|uid| baseline.ids.tables.get(uid))
-                    .cloned()
-            };
-            let stored_column = |column: &pbps_model::ColumnRef| {
-                planned_names
-                    .column_uid(column)
-                    .or_else(|| baseline_names.column_uid(column))
-                    .and_then(|uid| baseline.ids.columns.get(uid))
-                    .map_or_else(
-                        || column.name.raw().to_owned(),
-                        |old| old.name.raw().to_owned(),
-                    )
-            };
-            for planned in &changes.changes {
-                if let Change::DropModule { id, .. } = &planned.change {
-                    dropped.modules.insert(id.clone());
-                }
-                // Both are ordered ahead of every row change, so the
-                // referential action they carry cannot write when the row
-                // statement runs (DECISIONS 451).
-                if let Change::DropForeignKey { table, name } = &planned.change
-                    && let Some(old) = stored(table)
-                {
-                    dropped.foreign_keys.insert((old, name.clone()));
-                }
-                if let Change::DropTable { name, .. } = &planned.change {
-                    dropped
-                        .tables
-                        .insert(stored(name).unwrap_or_else(|| name.clone()));
-                }
-                // The expressions the plan removes or replaces before a row is
-                // written or a table rewritten: `prepare` does not judge what
-                // will be gone by then, and `check` judges whatever is not
-                // (DEC-2563.9).
-                dropped.note_removed_expressions(&planned.change, &stored, &stored_column);
-                // A table the plan rewrites, scans or copies into runs its index
-                // expressions as the deploying role even though no row of the
-                // plan is written to it. One that did not exist has no stored
-                // name and is judged at its own statement instead.
-                if let Some(write) = pbps_pg::existing_expressions::rewrite_write(&planned.change)
-                    && let Some(old) = stored(&write.table)
-                {
-                    writes.push(RowWrite {
-                        table: old,
-                        operation: write.operation,
-                    });
-                }
-                let (table, mut operation) = if let Change::InsertRow {
-                    table,
-                    key_column,
-                    row,
-                    ..
-                } = &planned.change
-                {
-                    // The columns the INSERT names: the guard judges the
-                    // DEFAULT of no other (#2748).
-                    (
-                        table,
-                        RowOperation::Insert {
-                            columns: std::iter::once(key_column.clone())
-                                .chain(row.columns().map(|(column, _)| column.clone()))
-                                .collect(),
-                        },
-                    )
-                } else if let Change::UpdateRow { table, columns, .. } = &planned.change {
-                    (
-                        table,
-                        RowOperation::Update {
-                            columns: columns.keys().cloned().collect(),
-                        },
-                    )
-                } else if let Change::DeleteRow { table, .. } = &planned.change {
-                    (table, RowOperation::Delete)
-                } else {
-                    continue;
-                };
-                // The logical target has the plan's final spelling; locks are
-                // acquired before any rename, through the stable table uid.
-                // New tables receive no existing-trigger allowance.
-                if let Some(old) = stored(table).as_ref() {
-                    // Like the table, an updated or inserted column may still
-                    // carry its pre-plan name while the guard authenticates
-                    // triggers.
-                    if let RowOperation::Update { columns } | RowOperation::Insert { columns } =
-                        &mut operation
-                    {
-                        *columns = columns
-                            .iter()
-                            .map(|name| {
-                                let column = pbps_model::ColumnRef {
-                                    table: table.clone(),
-                                    name: name.clone(),
-                                };
-                                planned_names
-                                    .column_uid(&column)
-                                    .or_else(|| baseline_names.column_uid(&column))
-                                    .and_then(|uid| baseline.ids.columns.get(uid))
-                                    .map_or_else(|| name.clone(), |old| old.name.clone())
-                            })
-                            .collect();
-                    }
-                    writes.push(RowWrite {
-                        table: old.clone(),
-                        operation,
-                    });
-                }
-            }
-            Ok(DataWriteGuard {
-                postgres: Some(
-                    pbps_pg::data_triggers::prepare(
-                        conn,
-                        admission,
-                        &writes,
-                        &baseline.schema,
-                        &dropped,
-                    )
-                    .await?,
-                ),
-            })
+            plan_session::postgres::prepare_data_writes(
+                conn,
+                admission,
+                changes,
+                baseline,
+                planned_ids,
+            )
+            .await
         }
     }
 }
@@ -6472,59 +5579,6 @@ pub async fn installation_ids(conn: &mut Conn, ids: &IdsFile) -> anyhow::Result<
         ids,
         previous.as_ref().map(|e| &e.snapshot),
     )?)
-}
-
-/// The qualified table root expands at the existing connected continuation.
-pub async fn expand_table_rebuild<
-    S: pbps_diff::order::RouteState<D>,
-    D: crate::emission::Engine,
->(
-    conn: &mut Conn,
-    admission: &pbps_pg::admission::Admission,
-    changes: PlanningPlan<S>,
-    before: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    hints: &pbps_model::Hints,
-    dialect: &D,
-) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck, RebuildVerification)> {
-    anyhow::ensure!(
-        conn.driver() == Driver::Postgres,
-        "this engine does not support table rebuilds"
-    );
-    let (links, cap) = changes
-        .changes
-        .first()
-        .and_then(|p| {
-            if let pbps_model::Change::RebuildPartitionedTable(r) = &p.change {
-                Some((r.earlier.len() + 1, r.cap()))
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| anyhow::anyhow!("missing qualified rebuild root"))?;
-    let (changes, observed, verification) =
-        pbps_pg::rebuild::plan(conn, admission, changes, before, desired, hints, dialect).await?;
-    Ok((
-        changes,
-        ConnectedCheck {
-            name: "blocking_rewrite",
-            engine: "PostgreSQL",
-            status: if observed.is_some() {
-                "checked"
-            } else {
-                "unchecked"
-            },
-            message: match observed {
-                Some((rows, bytes)) => format!(
-                    "blocking rewrite composed over {links} approved links: {rows} observed rows, max_rows {cap}, {bytes} total bytes; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
-                ),
-                None => format!(
-                    "blocking rewrite composed over {links} approved links, max_rows {cap}: the rows were not observed because a conversion routine awaits source review; apply observes them before copying; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
-                ),
-            },
-        },
-        verification,
-    ))
 }
 
 pub async fn rebuild_window(
