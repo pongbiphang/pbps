@@ -3219,8 +3219,14 @@ DEC-1674.1).**
       - Death is noticed at once for an idle session; a vanished host's
         within about a minute (`tcp_keepalives_idle 30`, `interval 10`,
         `count 3`), and a client killed inside a long statement within
-        `client_connection_check_interval` (10 s). Until then the run reads
-        as alive, which only keeps its resources.
+        `client_connection_check_interval` (10 s). Where the engine rejects
+        that interval as unsupported on its platform (PostgreSQL on
+        Windows), the run goes on without it: a client killed inside a long
+        statement is then noticed when the statement ends, while the
+        `tcp_keepalives_*` settings, which stay mandatory, still apply
+        (DEC-2777.1; the interval is set in a PL/pgSQL block, so the scratch
+        account needs `USAGE` on that language). Until then the run reads as
+        alive, which only keeps its resources.
       - **SQL Server** recovers the same way, with its own pieces
         (DEC-2410.2). The proof is the `##pbps_<token>` marker table the
         run's session keeps (visible to a login with no privilege, gone with

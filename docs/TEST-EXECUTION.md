@@ -177,7 +177,14 @@ portable successful mutation control. Run the integrated suite on actual
 - A rule-only case must be discovered on its owner's job platform. A namespace
   cannot prove that a case discovered elsewhere also compiles there. On another
   platform, retain an exact legacy entry with the right owner, whose existence
-  is checked on `validate_on`, or use a rule for an owner that runs locally.
+  is checked on `validate_on`, or use a rule for an owner that runs locally. A
+  case compiled on one platform only (a `cfg(windows)` module) under a broad
+  rule of another platform's owner takes the exact entry of its owner: where
+  the case is compiled, an owner that runs on the discovering platform; where it
+  is not (the registry names it, this platform cannot see it), an owner of
+  another platform (#2491). Two owners on one platform, a compiled case whose
+  exact owner runs elsewhere, and an uncompiled case whose exact owner runs on
+  the discovering platform still disagree.
   Rule-only and legacy cases use the same existence/ignore-condition checks and
   selector audit. Cleanup must retain entries needed for cross-platform existence
   evidence. Rules do not replace fixture scheduling evidence. A rule matching no

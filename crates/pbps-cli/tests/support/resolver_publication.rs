@@ -35,16 +35,7 @@ pub fn published(server: &str) {
     successful(run(&d, &["plan"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -282,16 +273,7 @@ pub fn ordinary_checks(server: &str, refused: bool) {
     successful(run(&d, &["plan"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -562,12 +544,28 @@ fn assert_exact_order(script: &str) {
     assert_eq!(statements, expected, "{script}");
 }
 
+/// The hook command that copies its standard input to `path`, as the YAML
+/// scalar that holds it. Hooks run through `sh -c` on Unix and `cmd /D /S /C`
+/// on Windows (#2491): there `cat` does not exist and a path's backslashes are
+/// escapes in a double-quoted scalar, so the command is `findstr` in a
+/// single-quoted one.
+fn capture_hook(path: &std::path::Path) -> String {
+    if cfg!(windows) {
+        format!("'findstr \"^\" > \"{}\"'", path.display())
+    } else {
+        format!("\"cat > {}\"", path.display())
+    }
+}
+
 fn configure(d: &Demo) {
     std::fs::write(
         d.dir.join("pbps.yml"),
-        "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    \
-         url_env: PBPS_SCRATCH_1516\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_1516\n    \
-         resolve_with: scratch\n    fingerprint_key_file: key\n",
+        format!(
+            "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    \
+             url_env: PBPS_SCRATCH_1516\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_1516\n    \
+             resolve_with: scratch\n{}",
+            key_line()
+        ),
     )
     .unwrap();
 }
@@ -747,16 +745,7 @@ impl Sealed {
             );
             std::fs::write(&config, configured).unwrap();
         }
-        successful(run(
-            &d,
-            &[
-                "key",
-                "generate",
-                "--out",
-                d.dir.join("key").to_str().unwrap(),
-            ],
-            None,
-        ));
+        generate_key(&d);
         let artifact = d.dir.join("plan.json");
         let sql = d.dir.join("plan.sql");
         let targets = Targets {
@@ -1089,31 +1078,42 @@ pub fn refused_before_ddl(server: &str) {
         .unwrap()
         .to_owned();
 
-    // Another key: both identifiers named.
-    let key = sealed.d.dir.join("key");
-    let kept = std::fs::read(&key).unwrap();
-    std::fs::remove_file(&key).unwrap();
-    successful(run(
-        &sealed.d,
-        &["key", "generate", "--out", key.to_str().unwrap()],
-        None,
-    ));
-    refused(
-        sealed.apply(&sealed.artifact),
-        &[
-            &format!("sealed under fingerprint key {sealed_key}, and `prod` has key"),
-            "Plan again",
-        ],
-    );
-    std::fs::write(&key, &kept).unwrap();
+    // Another key: both identifiers named. The key is a file the project
+    // names, or (where a key file cannot be made, on Windows) the environment
+    // variable it names (#2491): then the other key is the variable's other
+    // value for this one apply.
+    let other_apply_says = [
+        &format!("sealed under fingerprint key {sealed_key}, and `prod` has key") as &str,
+        "Plan again",
+    ];
+    if std::env::var_os(crate::KEY_ENV).is_some() {
+        refused(
+            sealed
+                .apply_command(&sealed.artifact)
+                .env(
+                    crate::KEY_ENV,
+                    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                )
+                .output()
+                .unwrap(),
+            &other_apply_says,
+        );
+    } else {
+        let key = sealed.d.dir.join("key");
+        let kept = std::fs::read(&key).unwrap();
+        std::fs::remove_file(&key).unwrap();
+        successful(run(
+            &sealed.d,
+            &["key", "generate", "--out", key.to_str().unwrap()],
+            None,
+        ));
+        refused(sealed.apply(&sealed.artifact), &other_apply_says);
+        std::fs::write(&key, &kept).unwrap();
+    }
     // No key at all: the sealed identifier and the remedy.
     let config = sealed.d.dir.join("pbps.yml");
     let configured = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(
-        &config,
-        configured.replace("    fingerprint_key_file: key\n", ""),
-    )
-    .unwrap();
+    std::fs::write(&config, configured.replace(key_line(), "")).unwrap();
     refused(
         sealed.apply(&sealed.artifact),
         &[
@@ -1436,9 +1436,9 @@ pub fn applied(server: &str) {
     let attempt_hook = sealed.d.dir.join("on_apply_attempt.json");
     let mut configured = std::fs::read_to_string(&config).unwrap();
     configured.push_str(&format!(
-        "hooks:\n  on_apply: \"cat > {}\"\n  on_apply_attempt: \"cat > {}\"\n",
-        applied_hook.display(),
-        attempt_hook.display()
+        "hooks:\n  on_apply: {}\n  on_apply_attempt: {}\n",
+        capture_hook(&applied_hook),
+        capture_hook(&attempt_hook)
     ));
     std::fs::write(&config, configured).unwrap();
     // The scratch the plan was made with, and a Docker socket, both listen
@@ -1566,16 +1566,7 @@ pub fn row_security(server: &str, scratch_server: &str) {
         None,
     ));
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let scratch = Confined::new(scratch_server);
     if server != scratch_server {
         assert_eq!(
@@ -1924,16 +1915,7 @@ pub fn declared_types(server: &str) {
             )
             .unwrap();
         }
-        successful(run(
-            &d,
-            &[
-                "key",
-                "generate",
-                "--out",
-                d.dir.join("key").to_str().unwrap(),
-            ],
-            None,
-        ));
+        generate_key(&d);
         let targets = Targets {
             target: connection,
             scratch: &scratch.connection,
@@ -2106,16 +2088,7 @@ pub fn in_place_default_edits(server: &str, drop_function: bool) {
     println!("logical #1896 input: {:#?}", logical.changes);
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,
@@ -2260,16 +2233,7 @@ pub fn partition_own_default_bindings(server: &str) {
     successful(run(&d, &["plan", "--no-dev"], None));
     d.commit();
     configure(&d);
-    successful(run(
-        &d,
-        &[
-            "key",
-            "generate",
-            "--out",
-            d.dir.join("key").to_str().unwrap(),
-        ],
-        None,
-    ));
+    generate_key(&d);
     let targets = Targets {
         target: connection,
         scratch: &scratch.connection,

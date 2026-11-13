@@ -108,17 +108,81 @@ pub async fn extension_manifests(
         .collect()
 }
 
-/// What the keeper session sets so the engine notices a vanished client
-/// (#2410). `RESET ALL` and `DISCARD ALL` clear them, so a session that runs
-/// either sends them again; `application_name` is set at connection instead.
+/// What the keeper session must set so the engine notices a vanished client
+/// (#2410): TCP keepalives, which every platform accepts. `RESET ALL` and
+/// `DISCARD ALL` clear them, so a session that runs either sends them again;
+/// `application_name` is set at connection instead.
 pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_interval = 10; \
-     SET tcp_keepalives_count = 3; \
-     SET client_connection_check_interval = '10s'";
+     SET tcp_keepalives_count = 3";
 
-/// Applies [`KEEPER_SETTINGS`], in one round trip.
-pub async fn keep(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
-    conn.execute(KEEPER_SETTINGS).await
+/// The keeper's check that the client is still connected while a statement
+/// runs (#2410), sent alone, as a block that the ENGINE decides (#2777):
+/// PostgreSQL accepts a nonzero `client_connection_check_interval` only where
+/// the operating system can report that the peer closed, and rejects it as an
+/// invalid value elsewhere (Windows). The refusal is caught where it happens,
+/// in a `DO` block's exception handler, which is a subtransaction: the session,
+/// in or out of a transaction block, goes on, and nothing reaches the client
+/// to be tolerated there (a refused statement the client swallowed left the
+/// fill's transaction aborted, 25P02; a `SAVEPOINT` in a multi-statement string
+/// is refused outside a block). It needs PL/pgSQL, which every database has and
+/// `PUBLIC` may use unless an operator revoked it: then the keeper fails with
+/// the engine's own error naming the language (DEC-2777.1).
+pub const KEEPER_CHECK_INTERVAL: &str = "DO $pbps$ DECLARE refusal text; BEGIN \
+     SET client_connection_check_interval = '10s'; \
+     EXCEPTION WHEN invalid_parameter_value THEN \
+     GET STACKED DIAGNOSTICS refusal = MESSAGE_TEXT; \
+     IF position('\"client_connection_check_interval\"' in refusal) = 0 THEN RAISE; END IF; \
+     END $pbps$";
+
+/// [`KEEPER_CHECK_INTERVAL`]'s shape for any one `SET` statement and the
+/// parameter whose refusal it tolerates: SQLSTATE `22023` naming exactly that
+/// quoted parameter, which is language-independent (the sentence is
+/// translated, the quoted name is not), and nothing else; every other error is
+/// raised again as it was. Exists so that the live tests drive the very text
+/// the keeper sends with other parameters the engine really refuses; a unit
+/// test pins that it yields [`KEEPER_CHECK_INTERVAL`] for the interval.
+pub fn guarded_set(parameter: &str, set: &str) -> String {
+    format!(
+        "DO $pbps$ DECLARE refusal text; BEGIN {set}; \
+         EXCEPTION WHEN invalid_parameter_value THEN \
+         GET STACKED DIAGNOSTICS refusal = MESSAGE_TEXT; \
+         IF position('\"{parameter}\"' in refusal) = 0 THEN RAISE; END IF; \
+         END $pbps$"
+    )
+}
+
+/// Where the keeper's statements are sent: any engine connection, or in the
+/// unit tests a scripted one (the connection traits are sealed, so a test
+/// cannot implement them).
+pub trait SendKeeper {
+    fn send<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a;
+}
+
+impl<T: ExecuteConnection> SendKeeper for T {
+    fn send<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send + 'a {
+        self.execute(sql)
+    }
+}
+
+/// Applies the keeper's settings, one string per call: the mandatory
+/// keepalives first and alone (a failing statement of a multi-statement batch
+/// rolls the whole batch back, so nothing that may be refused shares it), then
+/// the check interval, whose refusal as unsupported the engine absorbs
+/// ([`KEEPER_CHECK_INTERVAL`]). The client tolerates nothing: any error from
+/// either string is the caller's. Where the engine refuses the interval, a
+/// client killed inside a long statement is noticed when the statement ends
+/// instead of within the interval, which only keeps the run's resources a
+/// while longer (SPEC 9.3.2, DEC-2777.1).
+pub async fn keep(conn: &mut impl SendKeeper) -> Result<(), DbError> {
+    conn.send(KEEPER_SETTINGS).await?;
+    conn.send(KEEPER_CHECK_INTERVAL).await
 }
 
 /// The first OID a database assigns after initdb. Everything below it was
@@ -1454,5 +1518,307 @@ mod tests {
         let mut empty = account;
         empty.shared.clear();
         assert!(empty.confined());
+    }
+
+    /// A scripted engine: `answers` maps a statement to its error, every other
+    /// statement succeeds; `sent` records what arrived, in order.
+    struct Scripted {
+        answers: Vec<(&'static str, DbError)>,
+        sent: Vec<String>,
+    }
+
+    impl SendKeeper for Scripted {
+        async fn send<'a>(&'a mut self, sql: &'a str) -> Result<(), DbError> {
+            self.sent.push(sql.to_owned());
+            match self
+                .answers
+                .iter()
+                .position(|(statement, _)| *statement == sql)
+            {
+                Some(index) => Err(self.answers.remove(index).1),
+                None => Ok(()),
+            }
+        }
+    }
+
+    async fn keep_scripted(
+        answers: Vec<(&'static str, DbError)>,
+    ) -> (Vec<String>, Result<(), DbError>) {
+        let mut engine = Scripted {
+            answers,
+            sent: Vec::new(),
+        };
+        let outcome = keep(&mut engine).await;
+        (engine.sent, outcome)
+    }
+
+    fn error(code: &str, message: &str) -> DbError {
+        DbError::Driver {
+            message: message.to_owned(),
+            code: Some(code.to_owned()),
+            diagnostic: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_keepalives_go_first_and_alone_then_the_interval() {
+        let (sent, outcome) = keep_scripted(vec![]).await;
+        assert!(outcome.is_ok());
+        assert_eq!(sent, [KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL]);
+        assert_eq!(KEEPER_SETTINGS.matches("SET ").count(), 3);
+        assert!(KEEPER_SETTINGS.contains("tcp_keepalives_count = 3"));
+        assert!(!KEEPER_SETTINGS.contains("client_connection_check_interval"));
+        assert!(!KEEPER_SETTINGS.contains("DO "));
+    }
+
+    #[tokio::test]
+    async fn the_client_tolerates_nothing_whatever_the_engine_answers() {
+        // The engine absorbs the one refusal inside the block; an error that
+        // does reach the client, from either string, is the caller's.
+        for (statement, sent_after) in [
+            (KEEPER_SETTINGS, vec![KEEPER_SETTINGS]),
+            (
+                KEEPER_CHECK_INTERVAL,
+                vec![KEEPER_SETTINGS, KEEPER_CHECK_INTERVAL],
+            ),
+        ] {
+            for failure in [
+                error(
+                    "22023",
+                    "invalid value for parameter \"client_connection_check_interval\": 10000",
+                ),
+                error("42501", "permission denied for language plpgsql"),
+                error("25P02", "current transaction is aborted"),
+            ] {
+                let (sent, outcome) = keep_scripted(vec![(statement, failure)]).await;
+                assert!(outcome.is_err(), "{statement}: {outcome:?}");
+                assert_eq!(sent, sent_after);
+            }
+        }
+    }
+
+    #[test]
+    fn the_interval_block_is_the_template_applied_to_the_interval() {
+        assert_eq!(
+            guarded_set(
+                "client_connection_check_interval",
+                "SET client_connection_check_interval = '10s'"
+            ),
+            KEEPER_CHECK_INTERVAL
+        );
+        // Exactly one SET, in a block that re-raises everything it does not name.
+        assert_eq!(KEEPER_CHECK_INTERVAL.matches("SET ").count(), 1);
+        assert!(KEEPER_CHECK_INTERVAL.contains("EXCEPTION WHEN invalid_parameter_value THEN"));
+        assert!(KEEPER_CHECK_INTERVAL.contains("RAISE; END IF"));
+        assert!(!KEEPER_CHECK_INTERVAL.contains("WHEN OTHERS"));
+    }
+
+    /// The live tests below run the very text the keeper sends, against a real
+    /// engine, with parameters this engine really refuses: `lc_messages`
+    /// stands in for the unsupported interval (a locale the server lacks is
+    /// rejected with the same SQLSTATE and message shape). Linux only: the
+    /// Windows engines refuse the interval itself, and the Windows job runs the
+    /// resolver flows, not this module, so no owner would run these there.
+    #[cfg(target_os = "linux")]
+    mod live {
+        use super::*;
+        use pbps_db::{Conn, Driver};
+
+        async fn connect() -> Conn {
+            let base = std::env::var("PBPS_TEST_PG_DB").expect("live PostgreSQL fixture setting");
+            Conn::connect(Driver::Postgres, &base).await.unwrap()
+        }
+
+        const REFUSED: &str = "SET lc_messages = 'no_such_locale_pbps'";
+
+        async fn show(conn: &mut Conn, name: &str) -> String {
+            let rows = conn
+                .query(&format!("SELECT current_setting('{name}') AS value"))
+                .await
+                .unwrap();
+            rows[0]
+                .try_get::<&str>("value")
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        }
+
+        fn code_of(error: &DbError) -> String {
+            let DbError::Driver {
+                code: Some(code), ..
+            } = error
+            else {
+                panic!("not a server error: {error:?}");
+            };
+            code.clone()
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn an_engine_that_supports_the_interval_has_it_in_effect_in_or_out_of_a_block() {
+            let mut conn = connect().await;
+            keep(&mut conn).await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+            assert_eq!(show(&mut conn, "tcp_keepalives_idle").await, "30");
+            assert_eq!(show(&mut conn, "tcp_keepalives_interval").await, "10");
+            assert_eq!(show(&mut conn, "tcp_keepalives_count").await, "3");
+            // The restoration runs inside a transaction block (the fill's).
+            conn.execute("RESET ALL").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            keep(&mut conn).await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(
+                show(&mut conn, "client_connection_check_interval").await,
+                "10s"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn the_refusal_of_exactly_the_named_parameter_is_absorbed_in_or_out_of_a_block() {
+            let mut conn = connect().await;
+            let block = guarded_set("lc_messages", REFUSED);
+            let before = show(&mut conn, "lc_messages").await;
+            conn.execute(&block).await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute(&block).await.unwrap();
+            // The block is not aborted: the session goes on inside it.
+            conn.execute("SELECT 1").await.unwrap();
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(show(&mut conn, "lc_messages").await, before);
+            // Locale-proof: the sentence may be translated, the quoted name is
+            // not, and the handler looks at the name only.
+            let translated = guarded_set(
+                "lc_messages",
+                "RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = '\"lc_messages\" 的值無效'",
+            );
+            conn.execute(&translated).await.unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn anything_else_is_raised_again_with_its_own_code() {
+            let mut conn = connect().await;
+            let cases = [
+                (
+                    "another parameter refused, same code",
+                    guarded_set("client_connection_check_interval", REFUSED),
+                    "22023",
+                ),
+                (
+                    "the code without the name",
+                    guarded_set(
+                        "lc_messages",
+                        "RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid value for parameter \"other\"'",
+                    ),
+                    "22023",
+                ),
+                (
+                    "the name under another code",
+                    guarded_set(
+                        "lc_messages",
+                        "RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'permission denied to set parameter \"lc_messages\"'",
+                    ),
+                    "42501",
+                ),
+                (
+                    "an unrelated error",
+                    guarded_set("lc_messages", "PERFORM 1 / 0"),
+                    "22012",
+                ),
+            ];
+            for in_a_block in [false, true] {
+                for (why, block, expected) in &cases {
+                    if in_a_block {
+                        conn.execute("BEGIN").await.unwrap();
+                    }
+                    let error = conn.execute(block).await.unwrap_err();
+                    assert_eq!(
+                        &code_of(&error),
+                        expected,
+                        "{why} (in a block: {in_a_block}): {error:?}"
+                    );
+                    if in_a_block {
+                        conn.execute("ROLLBACK").await.unwrap();
+                    }
+                }
+            }
+            conn.execute("SELECT 1").await.unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+        async fn where_plpgsql_is_not_usable_the_keeper_fails_naming_the_language() {
+            // An operator who revoked USAGE on the language (a database-level
+            // privilege) gets an explicit refusal, not a silent loss of the
+            // interval: the engine names the language.
+            let mut admin = connect().await;
+            let name = format!(
+                "pbps_t2777_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let password = crate::catalog::probe_token().replace('-', "");
+            for statement in [
+                format!("CREATE ROLE {name} LOGIN PASSWORD '{password}'"),
+                format!("CREATE DATABASE {name} OWNER {name} TEMPLATE template0"),
+            ] {
+                admin.execute(&statement).await.unwrap();
+            }
+            let base = std::env::var("PBPS_TEST_PG_DB").unwrap();
+            let kept: Vec<&str> = base
+                .split_whitespace()
+                .filter(|word| {
+                    !word.starts_with("dbname=")
+                        && !word.starts_with("user=")
+                        && !word.starts_with("password=")
+                })
+                .collect();
+            let as_user = |user: &str, secret: &str| {
+                format!(
+                    "{} dbname={name} user={user} password={secret}",
+                    kept.join(" ")
+                )
+            };
+            let outcome = async {
+                // A privilege on a language is the language owner's to revoke
+                // (a superuser's); anyone else's REVOKE only warns. The
+                // database's owner then has no way left to use the language.
+                let base_in_database = format!(
+                    "{} dbname={name}",
+                    base.split_whitespace()
+                        .filter(|word| !word.starts_with("dbname="))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let mut superuser = Conn::connect(Driver::Postgres, &base_in_database)
+                    .await
+                    .unwrap();
+                superuser
+                    .execute("REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC")
+                    .await
+                    .unwrap();
+                let mut owner = Conn::connect(Driver::Postgres, &as_user(&name, &password))
+                    .await
+                    .unwrap();
+                keep(&mut owner).await
+            }
+            .await;
+            for statement in [
+                format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+                format!("DROP ROLE IF EXISTS {name}"),
+            ] {
+                admin.execute(&statement).await.unwrap();
+            }
+            let error = outcome.unwrap_err();
+            assert_eq!(code_of(&error), "42501", "{error:?}");
+            assert!(error.to_string().contains("plpgsql"), "{error}");
+        }
     }
 }
