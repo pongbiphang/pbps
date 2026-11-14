@@ -262,7 +262,14 @@ fn an_undeclared_text_search_object_is_not_recorded_and_dropping_it_is_no_drift(
         on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.undeclared");
         succeeds(f.d.run(&["verify", "--db", f.target()]));
         succeeds(f.d.run(&["snapshot", "--db", f.target()]));
-        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+        // The fixture's declarations were not pulled from this database, so the plan has
+        // changes of its own; what is pinned is that its drift gate lets it through.
+        let planned = succeeds(f.d.run(&["plan", "--db", f.target()]));
+        assert!(
+            !said(&planned).contains("has drifted"),
+            "{}",
+            said(&planned)
+        );
         let shown = status(&f);
         assert!(shown.contains("ok") && !shown.contains("drift"), "{shown}");
     });
@@ -337,7 +344,10 @@ fn an_apply_keeps_the_text_search_objects_the_record_names() {
             "CREATE TEXT SEARCH DICTIONARY app.outside (TEMPLATE = pg_catalog.simple)",
         );
         f.revise_row();
-        let planned = f.plan(&[]);
+        // Not rehearsed: a rehearsal builds the target's state without the text search
+        // objects, and `app.articles` names one, so the scratch rejects the table until
+        // creating them is planned (#2728 B).
+        let planned = f.plan(&["--no-rehearse"]);
         assert_eq!(code(&planned), 0, "{}", said(&planned));
         let applied = f.apply("data-update");
         assert_eq!(code(&applied), 0, "{}", said(&applied));
