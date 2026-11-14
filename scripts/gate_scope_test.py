@@ -140,6 +140,7 @@ class Blocked(Repo):
     def test_a_blocked_path_in_either_diff_is_changed_even_when_the_lines_match(self):
         for path in ("Cargo.lock", "Cargo.toml", "crates/x/Cargo.toml", "rust-toolchain.toml", ".github/workflows/ci.yml",
                      "scripts/live-tests.sh", "scripts/live-shards.py", "scripts/live_transport_test.py",
+                     "scripts/live-pg-nondurable.sh",
                      ".cargo/config.toml", "scripts/fixtures/pg-history695/x.sql", "scripts/gate_scope.py",
                      "scripts/gate_rerun.py"):
             with self.subTest(path=path):

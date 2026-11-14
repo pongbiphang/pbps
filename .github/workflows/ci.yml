@@ -668,6 +668,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
+      # Test-only speed (#2864, DEC-2864.1): the fixtures' data is disposable, so
+      # `fsync`, `synchronous_commit` and `full_page_writes` go off (16% less
+      # wall time on `flow_pg`). A service container takes no server arguments,
+      # so the same script `scripts/live-tests-pg.sh` runs reloads them, and it
+      # fails when a value did not take effect. Every fixture server of the job,
+      # before any test. The scratch containers the product itself starts are
+      # untouched.
+      - name: Make the PostgreSQL fixtures non-durable
+        env:
+          PG_FIXTURE_18: ${{ job.services.postgres.id }}
+          PG_FIXTURE_16: ${{ job.services['postgres-old'].id }}
+          PG_FIXTURE_SCRATCH: ${{ job.services['postgres-scratch'].id }}
+        run: |
+          set -euo pipefail
+          for fixture in "$PG_FIXTURE_18" "$PG_FIXTURE_16" "$PG_FIXTURE_SCRATCH"; do
+            docker exec -i "$fixture" sh -s < scripts/live-pg-nondurable.sh
+          done
       - uses: dtolnay/rust-toolchain@stable
       # Flow shares build the same target and restore the existing flow-rest cache.
       - uses: Swatinem/rust-cache@v2

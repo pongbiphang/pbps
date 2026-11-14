@@ -1922,3 +1922,35 @@ a quarter whatever the runner does. After it, `resolver-mssql` and
 `live-pg (dialect)`, at 35 to 43 minutes, bound the run together with the
 slowest share. The rule that assigns each listed test to exactly one share
 (DEC-2434.1) is unchanged; only the share count is.
+
+<a id="dec-2864-1"></a>
+
+**DEC-2864.1. The live PostgreSQL fixtures run with `fsync`, `synchronous_commit`
+and `full_page_writes` off; the product's own scratch containers do not.** A
+`flow_pg` case creates and drops a database and commits through many short
+connections, so the suite waits on commits (#2864). Seventy cases (`type_refs::`,
+`deploy::`, `retained2354::`, serial) on one head and machine, against private
+PostgreSQL 18, 16 and scratch fixtures, alternated the default settings with the
+three off: 1,249 s and 1,296 s default, 1,083 s and 1,049 s off, 16% less wall
+time at a load average of 37 to 45, all 70 passing every time. A fixture's data
+is disposable, so no durability is asked of it. The settings are applied after
+the server is ready, by `scripts/live-pg-nondurable.sh` (`ALTER SYSTEM` and a
+reload, then a read-back), not as `-c` server arguments: a GitHub Actions
+`services:` container accepts no server arguments, and one mechanism for the
+local runner and for CI cannot drift. `fsync` and `full_page_writes` reload on
+SIGHUP and `synchronous_commit` is per session, so no restart is needed, and the
+script persists them in the data directory. It fails when a value did not take
+effect; an unreadable or empty answer is a failure, not "off". It is applied to
+every fixture server of `scripts/live-tests-pg.sh` and of the `live-pg` job,
+the supplied scratch included. The `viewer`, `compatibility`, `live-transport`
+and release-qualification fixtures keep the defaults: each runs one case or a
+few statements and gains nothing. The containers the product itself starts
+(`--dev docker://` and the resolver's Docker scratch) are shipped behaviour,
+not test set-up, and are untouched; `pg_settings` rows the resolver compares
+(`compatibility.rs`) include none of the three, and the capture's environment
+check reads `pg_conf_load_time()` only to see a reload inside one capture, which
+this script does before any test. Crash risk: with `fsync` off a server killed
+uncleanly can lose its cluster, so a fixture a test kills must be one the test
+started and removes; no suite restarts or kills a shared fixture (the
+`docker kill` calls in the Docker scratch tests target containers those tests
+started). A clean restart keeps the settings.
