@@ -269,15 +269,24 @@ pub fn decode(
             "dictionary" => {
                 let kind = SearchKind::Dictionary;
                 let built = named(&schema, &name).and_then(|n| {
-                    Ok((
-                        SearchRef::new(kind, n),
-                        reference(&ref_schema, &ref_name)?,
-                        parse_options(&text(row, "options").map_err(|e| e.to_string())?)?,
-                    ))
+                    let object = SearchObject::Dictionary {
+                        template: reference(&ref_schema, &ref_name)?,
+                        options: parse_options(&text(row, "options").map_err(|e| e.to_string())?)?,
+                    };
+                    // The engine keeps the name as it was written and resolves it by the search
+                    // path of whoever uses it, so there is no schema to write here that is true:
+                    // the declaration file refuses it (`pbps-load`), and so it is left out.
+                    if let Some(value) = object.unqualified_sub_dictionary() {
+                        return Err(format!(
+                            "its option `dictionary` names `{value}` without a schema; \
+                             `ALTER TEXT SEARCH DICTIONARY` it to `schema.name` and it can be held"
+                        ));
+                    }
+                    Ok((SearchRef::new(kind, n), object))
                 });
                 match built {
-                    Ok((key, template, options)) => {
-                        held.insert(key, SearchObject::Dictionary { template, options });
+                    Ok((key, object)) => {
+                        held.insert(key, object);
                     }
                     Err(why) => {
                         if let Ok(n) = named(&schema, &name) {
@@ -458,6 +467,18 @@ pub(crate) fn validate(
     _schema: &Schema,
 ) -> Vec<DialectError> {
     let mut found = Vec::new();
+    // The pull never reads these schemas (`catalog::a_projects_schema`, the one test types,
+    // tables and modules share), so the object would be created and no plan could see it
+    // again: its recorded identity would go wrong.
+    if !crate::catalog::a_projects_schema(name.name.schema()) {
+        found.push(invalid(format!(
+            "{} is declared in `{}`, which this dialect's pull never reads: `pg_catalog`, \
+             `information_schema` and every schema whose name begins with `pg_` are excluded \
+             from the managed set. Declare it in a schema of the project's own",
+            name.shown(),
+            pbps_model::escape::Escaped(name.name.schema())
+        )));
+    }
     let held = |reference: &TypeRef, list: &[&str]| {
         reference.schema() == "pg_catalog" && list.contains(&reference.name())
     };
@@ -974,6 +995,103 @@ mod tests {
         }
         assert!(found(&name, &with("synonyms", "a\\0b")).is_empty());
         assert!(found(&name, &with("synonyms", "ab")).is_empty());
+    }
+
+    /// An object declared in a schema the pull never reads is refused by name: it would be
+    /// created and then never seen, so its recorded identity would go wrong. The test is the
+    /// one types, tables and modules use. Negatives: a project schema, and names that only
+    /// contain or resemble the prefix (`pgx`, `my_pg_x`), are held.
+    #[test]
+    fn an_object_in_a_schema_the_pull_never_reads_is_refused_by_name() {
+        let config = SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: Default::default(),
+        };
+        let dictionary = SearchObject::Dictionary {
+            template: t("pg_catalog.simple"),
+            options: Default::default(),
+        };
+        for schema in [
+            "pg_catalog",
+            "information_schema",
+            "pg_temp",
+            "pg_toast",
+            "pg_foo",
+        ] {
+            for (kind, object) in [("config", &config), ("dictionary", &dictionary)] {
+                let name: SearchRef = format!("{kind} {schema}.x").parse().unwrap();
+                let said = found(&name, object);
+                assert_eq!(said.len(), 1, "{schema} {kind}: {said:?}");
+                assert!(
+                    said[0].contains(&format!("{schema}.x")) && said[0].contains("never reads"),
+                    "{said:?}"
+                );
+            }
+        }
+        for schema in ["app", "pgx", "my_pg_x", "public"] {
+            for (kind, object) in [("config", &config), ("dictionary", &dictionary)] {
+                let name: SearchRef = format!("{kind} {schema}.x").parse().unwrap();
+                assert!(found(&name, object).is_empty(), "{schema} {kind}");
+            }
+        }
+    }
+
+    /// A thesaurus whose `dictionary` option is spelled without a schema is left out of the
+    /// pull with its configuration, named and with the remedy, instead of held as a file the
+    /// loader refuses. Negative: the qualified spelling is held, and so is the configuration
+    /// over it.
+    #[test]
+    fn a_thesaurus_with_an_unqualified_sub_dictionary_is_left_out_with_what_maps_it() {
+        let rows = vec![
+            row(
+                "dictionary",
+                "bare",
+                ("pg_catalog", "thesaurus"),
+                "dictfile = 'mythes', dictionary = 'english_stem'",
+                json!([]),
+            ),
+            row(
+                "dictionary",
+                "full",
+                ("pg_catalog", "thesaurus"),
+                "dictfile = 'mythes', dictionary = 'pg_catalog.english_stem'",
+                json!([]),
+            ),
+            row(
+                "config",
+                "over_bare",
+                ("pg_catalog", "default"),
+                "",
+                json!([["word", "app", "bare"]]),
+            ),
+            row(
+                "config",
+                "over_full",
+                ("pg_catalog", "default"),
+                "",
+                json!([["word", "app", "full"]]),
+            ),
+        ];
+        let (held, left_out) = decode(&rows).unwrap();
+        let held_names: Vec<String> = held.keys().map(|k| k.raw().to_string()).collect();
+        assert_eq!(
+            held_names,
+            ["config app.over_full", "dictionary app.full"],
+            "{held_names:?}"
+        );
+        let said: Vec<&str> = left_out.iter().map(|l| l.detail.as_str()).collect();
+        assert!(
+            said.iter().any(|d| d.contains("app.bare")
+                && d.contains("english_stem")
+                && d.contains("schema.name")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|d| d.contains("app.over_bare") && d.contains("is left out")),
+            "{said:?}"
+        );
+        assert_eq!(left_out.len(), 2, "{said:?}");
     }
 
     /// The pull holds a parser and a template by the same test `validate` applies: the SQL

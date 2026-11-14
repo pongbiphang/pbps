@@ -184,13 +184,34 @@ impl SearchObject {
                 .flatten()
                 .map(|name| SearchRef::new(SearchKind::Dictionary, name.clone()))
                 .collect(),
-            Self::Dictionary { options, .. } => options
-                .iter()
-                .filter(|(key, _)| key.eq_ignore_ascii_case("dictionary"))
-                .filter_map(|(_, value)| value.parse::<SearchName>().ok())
+            Self::Dictionary { .. } => self
+                .sub_dictionary()
+                .and_then(|value| value.parse::<SearchName>().ok())
                 .map(|name| SearchRef::new(SearchKind::Dictionary, name))
+                .into_iter()
                 .collect(),
         }
+    }
+
+    /// The dictionary option that names another dictionary (a thesaurus's), as written.
+    fn sub_dictionary(&self) -> Option<&str> {
+        match self {
+            Self::Dictionary { options, .. } => options
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("dictionary"))
+                .map(|(_, value)| value.as_str()),
+            Self::Config { .. } => None,
+        }
+    }
+
+    /// The sub-dictionary this object names in a spelling that is not `schema.name`, as
+    /// written. [`Self::dictionaries`] cannot see it: the engine resolves it by the search
+    /// path of whoever uses it, so the create order and the drop guard would silently miss
+    /// the edge. Callers refuse it (load) or leave the object out (pull) instead.
+    #[must_use]
+    pub fn unqualified_sub_dictionary(&self) -> Option<&str> {
+        self.sub_dictionary()
+            .filter(|value| value.parse::<SearchName>().is_err())
     }
 }
 
@@ -252,6 +273,36 @@ mod tests {
         );
         assert!(dictionary(&[]).dictionaries().is_empty());
         assert!(config(&[]).dictionaries().is_empty());
+    }
+
+    /// A sub-dictionary spelled without its schema is reported, whatever the case of the
+    /// option name; a qualified one, no option, and a configuration are not. Negative: a
+    /// name that is not `schema.name` at all (three parts, empty) is reported too.
+    #[test]
+    fn a_sub_dictionary_without_its_schema_is_reported() {
+        let unqualified = |o: &[(&str, &str)]| {
+            dictionary(o)
+                .unqualified_sub_dictionary()
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            unqualified(&[("dictionary", "english_stem")]).as_deref(),
+            Some("english_stem")
+        );
+        assert_eq!(
+            unqualified(&[("DICTIONARY", "english_stem")]).as_deref(),
+            Some("english_stem")
+        );
+        assert_eq!(
+            unqualified(&[("dictionary", "a.b.c")]).as_deref(),
+            Some("a.b.c")
+        );
+        assert_eq!(unqualified(&[("dictionary", "")]).as_deref(), Some(""));
+        assert_eq!(unqualified(&[("dictionary", "app.sub")]), None);
+        assert_eq!(unqualified(&[("dictionary", "_sub.x")]), None);
+        assert_eq!(unqualified(&[("dictfile", "mythes")]), None);
+        assert_eq!(unqualified(&[]), None);
+        assert_eq!(config(&[]).unqualified_sub_dictionary(), None);
     }
 
     /// A text search object has no array type, so its name may start with an underscore,

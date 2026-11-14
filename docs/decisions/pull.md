@@ -1523,6 +1523,12 @@ reach an empty database in one plan.
   rule, so a part may start with an underscore (`app._words`): it has no array type to
   be mistaken for. The scratch bootstrap of a target builds only the objects an
   identity names, as it builds only the types, packages and tables one names.
+  An object is refused by name in a schema the pull never reads (`pg_catalog`,
+  `information_schema`, `pg_*`: `catalog::a_projects_schema`, the test types, tables and
+  modules share). A thesaurus's `dictionary` option must be `schema.name`: the engine
+  resolves a bare name by the search path of whoever uses it, so the create order and the
+  drop guard could not see the edge. The loader refuses it with that remedy, and the pull
+  leaves such a thesaurus out with the configurations that map it, naming the fix.
 - **Packages.** A configuration that maps a dictionary a package provides waits for
   the plan's create of that package (`package_input`, the rule that serves a type or
   an operator class a package provides), and ranks behind the packages in the draft as

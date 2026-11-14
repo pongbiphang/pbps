@@ -69,12 +69,24 @@ pub fn load_search_str(path: &Path, text: &str) -> Result<LoadedSearch, Vec<Load
             let name: SearchName =
                 reference(&dto.text_search_dictionary, "text search dictionary").map_err(fail)?;
             let template: TypeRef = reference(&dto.template, "template").map_err(fail)?;
+            let definition = SearchObject::Dictionary {
+                template,
+                options: dto.options,
+            };
+            // The engine resolves an unqualified sub-dictionary by the search path of whoever
+            // uses it, so the create order and the drop guard could not see the edge. It is
+            // refused here, by name, rather than dropped from the dependencies without a word.
+            if let Some(value) = definition.unqualified_sub_dictionary() {
+                return Err(fail(format!(
+                    "text search dictionary `{}`: the option `dictionary` names `{}`, which is \
+                     not `schema.name`; qualify it as `schema.name`",
+                    name.shown(),
+                    pbps_model::escape::Escaped(value)
+                )));
+            }
             Ok(LoadedSearch {
                 name: SearchRef::new(SearchKind::Dictionary, name),
-                definition: SearchObject::Dictionary {
-                    template,
-                    options: dto.options,
-                },
+                definition,
             })
         }
         _ => Err(fail(
@@ -233,6 +245,32 @@ mod tests {
             let said = refusal(text);
             assert!(said.contains(expected), "{text:?}: {said}");
         }
+    }
+
+    /// A thesaurus names its sub-dictionary in the `dictionary` option. Spelled without its
+    /// schema it would drop out of the create order and the drop guard, so the file is refused
+    /// by the dictionary's name and the remedy. Negative: the qualified spelling loads, and so
+    /// does a dictionary with no such option.
+    #[test]
+    fn an_unqualified_sub_dictionary_is_refused_with_its_remedy() {
+        let thesaurus = |value: &str| {
+            format!(
+                "text_search_dictionary: app.thes\ntemplate: pg_catalog.thesaurus\noptions:\n  \
+                 dictfile: mythes\n  dictionary: {value}\n"
+            )
+        };
+        for value in ["english_stem", "a.b.c"] {
+            let said = refusal(&thesaurus(value));
+            assert!(
+                said.contains("app.thes")
+                    && said.contains(value)
+                    && said.contains("qualify it as `schema.name`"),
+                "{value}: {said}"
+            );
+        }
+        let loaded = config(&thesaurus("pg_catalog.english_stem"));
+        assert_eq!(loaded.definition.dictionaries().len(), 1);
+        config("text_search_dictionary: app.d\ntemplate: pg_catalog.simple\n");
     }
 
     /// The file kind is the leading key, so the two kinds of one name, and a domain of

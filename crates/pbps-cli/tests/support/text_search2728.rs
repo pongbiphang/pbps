@@ -156,7 +156,11 @@ fn what_the_model_does_not_hold_is_left_out_and_named() {
              CREATE TEXT SEARCH CONFIGURATION app.owned (COPY = pg_catalog.simple); \
              ALTER EXTENSION unaccent ADD TEXT SEARCH CONFIGURATION app.owned; \
              CREATE TEXT SEARCH CONFIGURATION app.usesunaccent (COPY = pg_catalog.simple); \
-             ALTER TEXT SEARCH CONFIGURATION app.usesunaccent ALTER MAPPING FOR word WITH public.unaccent, pg_catalog.simple",
+             ALTER TEXT SEARCH CONFIGURATION app.usesunaccent ALTER MAPPING FOR word WITH public.unaccent, pg_catalog.simple; \
+             CREATE TEXT SEARCH DICTIONARY app.thesbare (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = english_stem); \
+             CREATE TEXT SEARCH DICTIONARY app.thesfull (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample, DICTIONARY = pg_catalog.english_stem); \
+             CREATE TEXT SEARCH CONFIGURATION app.overthes (PARSER = pg_catalog.\"default\"); \
+             ALTER TEXT SEARCH CONFIGURATION app.overthes ADD MAPPING FOR word WITH app.thesbare",
         );
         // A parser and a template made in `pg_catalog` itself, which shares the namespace of
         // the built-in ones and is no more held than a custom one anywhere else (the pull
@@ -182,8 +186,33 @@ fn what_the_model_does_not_hold_is_left_out_and_named() {
         }
         assert_eq!(
             names,
-            ["app.usesunaccent.textsearch-config.yml"],
-            "only the configuration over the built-in parser and held dictionaries"
+            [
+                "app.thesfull.textsearch-dictionary.yml",
+                "app.usesunaccent.textsearch-config.yml"
+            ],
+            "only the configuration over the built-in parser and held dictionaries, and the \
+             thesaurus whose sub-dictionary is qualified"
+        );
+        // A thesaurus naming its sub-dictionary without a schema has none that is true to
+        // write: it is left out with the configuration over it, and the remedy is named. The
+        // qualified one is written so, and what is written is read back.
+        assert!(
+            files["app.thesfull.textsearch-dictionary.yml"]
+                .contains("dictionary: pg_catalog.english_stem"),
+            "{files:?}"
+        );
+        assert!(
+            notes.contains("thesbare")
+                && notes.contains("schema.name")
+                && notes.contains("overthes"),
+            "{notes}"
+        );
+        assert!(!notes.contains("`app.thesfull`"), "{notes}");
+        pull(&f);
+        assert_eq!(
+            search_files(&f),
+            files,
+            "a second pull reads its own files and changes none"
         );
         assert!(
             files["app.usesunaccent.textsearch-config.yml"]
