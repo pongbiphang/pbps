@@ -62,26 +62,16 @@ fn identities(ids: &IdsFile, tables: &BTreeMap<TableName, Table>) -> RebuildIden
 /// declarations and catalog reads must converge before either is compared.
 struct CanonicalSchema(Schema);
 
+/// `schema` as it is compared with `named_by`: types in the dialect's one spelling and a
+/// kind held by name only kept only where `named_by` names it (DEC-2855.1). The two
+/// sides of a rebuild are each prepared against the other, so an object the catalog holds
+/// and the declarations do not name is not an "unrelated schema edit" (#2855).
 fn canonical_schema(
     schema: &Schema,
+    named_by: &Schema,
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> CanonicalSchema {
-    let mut schema = schema.clone();
-    for definition in schema.types.values_mut() {
-        if let pbps_model::ManagedType::Domain { base, .. } = definition
-            && let Ok(ty) = dialect.normalize_type(base)
-        {
-            *base = ty;
-        }
-    }
-    for table in schema.tables.values_mut() {
-        for column in table.columns.values_mut() {
-            if let Ok(ty) = dialect.normalize_type(&column.ty) {
-                column.ty = ty;
-            }
-        }
-    }
-    CanonicalSchema(schema)
+    CanonicalSchema(pbps_dialect::compared::compared(schema, named_by, dialect))
 }
 
 impl CanonicalSchema {
@@ -392,8 +382,8 @@ pub fn record(
     let uid = ids
         .table_uid(table)
         .ok_or_else(|| refused(table, "the source parent must already have an identity"))?;
-    let before = canonical_schema(base.schema, dialect);
-    let after = canonical_schema(desired, dialect);
+    let before = canonical_schema(base.schema, desired, dialect);
+    let after = canonical_schema(desired, base.schema, dialect);
     let base = Side {
         schema: &before.0,
         ids: base.ids,
@@ -711,8 +701,8 @@ pub fn qualify(
     };
     let used = &links[start..];
     let (first, intent) = (used[0].1, head);
-    let before = canonical_schema(base.schema, dialect);
-    let after = canonical_schema(desired.schema, dialect);
+    let before = canonical_schema(base.schema, desired.schema, dialect);
+    let after = canonical_schema(desired.schema, base.schema, dialect);
     let base = Side {
         schema: &before.0,
         ids: base.ids,
@@ -1107,6 +1097,6 @@ pub fn same_tree(
     root: &TableName,
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> bool {
-    tree(&canonical_schema(before, dialect).0, root)
-        == tree(&canonical_schema(observed, dialect).0, root)
+    tree(&canonical_schema(before, observed, dialect).0, root)
+        == tree(&canonical_schema(observed, before, dialect).0, root)
 }
