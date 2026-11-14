@@ -117,8 +117,17 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
         let mut live_read = scoped.schema.clone();
         pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
-        only_recorded_search_objects(&recorded_read, &mut live_read);
+        live_read.keep_only_named_unidentified(&recorded_read);
         without_comments(&mut recorded_read, &mut live_read);
+        // Compared by name here and not by the differ, which walks the new side only: a
+        // recorded sequence that was dropped or renamed away is on neither side's list there.
+        // Out of the differ's inputs afterwards, so none is reported twice, in the words of a
+        // plan ("declared", "the target has none").
+        let unidentified = pbps_diff::unidentified_drift(&recorded_read, &live_read);
+        for read in [&mut recorded_read, &mut live_read] {
+            read.search.clear();
+            read.sequences.clear();
+        }
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
                 schema: &recorded_read,
@@ -145,6 +154,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
+        unexpressible.extend(unidentified);
         // A managed role's permission the declarations cannot spell is the
         // same kind of difference as a catalog fact they cannot: established,
         // and with no `Change` to carry it (DECISIONS 95).
@@ -327,7 +337,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
             let ids = crate::engine::installation_ids(&mut conn, &ids).await?;
-            let scoped = managed_state(
+            let mut scoped = managed_state(
                 &mut conn,
                 &ids,
                 &declared_modules,
@@ -376,6 +386,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // never creates (#1600, #1606).
             crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+            // Only what the declarations name is recorded of the kinds with no identity record
+            // yet: a sequence nobody declared is not this project's, and its dropping later is
+            // not this project's drift (DEC-2721.1).
+            scoped.schema.keep_only_named_unidentified(&loaded.schema);
             let held = ids
                 .without(&scoped.missing)
                 .without_roles(&gone)
@@ -585,7 +599,7 @@ pub fn cmd_baseline(
             };
             let body = async {
                 let removed = crate::engine::drop_scan_checks(&mut conn, &checks).await?;
-                let scoped = managed_state(
+                let mut scoped = managed_state(
                     &mut conn,
                     &ids,
                     &declared_modules,
@@ -631,6 +645,10 @@ pub fn cmd_baseline(
                 // What the database holds, as `snapshot` records it (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+                // Only what the declarations name is recorded of the kinds with no identity record
+                // yet: a sequence nobody declared is not this project's, and its dropping later is
+                // not this project's drift (DEC-2721.1).
+                scoped.schema.keep_only_named_unidentified(&loaded.schema);
                 let held = ids
                     .without(&scoped.missing)
                     .without_roles(&gone)

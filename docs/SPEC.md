@@ -586,7 +586,8 @@ indexes:
   table (#1893). A role inserting
   into it needs a grant on the sequence, which is not declared yet (#1892).
   A `data:` block keyed by one is refused. SQL Server refuses it: its form is
-  `identity:` (DEC-1631.1).
+  `identity:` (DEC-1631.1). A sequence no column owns is a file of its own
+  (§4.11).
 - **A PostgreSQL column's numbering source changes in place**: a `serial` or
   an identity put on a column, taken off, retuned, or one turned into the
   other, as one change (DEC-1889.1). One put on a column that holds values
@@ -1342,6 +1343,64 @@ reach before the statement, proves afterwards that the package and everything
 reachable are gone, and rolls back on any difference. The plan is sealed in plan
 format 61. A drop is planned only against a database, and a rehearsal is not
 required for it.
+
+### 4.11 Standalone PostgreSQL sequences (read and declare)
+
+A sequence no column owns is one object of its own, declared in one
+`schema/<schema>.<name>.sequence.yml` file. The leading `sequence:` gives both
+its kind and its qualified name (#2721, DEC-2721.1):
+
+```yaml
+# schema/app.order_no.sequence.yml
+sequence: app.order_no
+type: integer
+start: 100
+increment: 5
+max: 999999
+cycle: true
+cache: 20
+```
+
+- **What it holds.** The type (`smallint`, `integer` or `bigint`; absent is
+  `bigint`, the engine's own), where a restart would begin (`start`; absent is
+  1), the step (`increment`; absent is 1), and the same `min`, `max`, `cycle`
+  and `cache` a column's sequence has (§4.3). A bound left out is the engine's
+  for the type and the direction counted, and spelling that default is refused,
+  so each sequence has one spelling. `fmt` writes `type`, `start` and
+  `increment` always and the rest only when set. There is no owner: role
+  ownership is not modelled anywhere.
+- **Where the counter stands is not in the file, and cannot be.** `last_value`
+  and `is_called` are state the database advances on every `nextval`. They are
+  in no declaration, no state snapshot, no checksum and no comparison, and the
+  pull reads `pg_sequence` only, never `pg_sequences`. Advancing a sequence
+  therefore leaves `plan` and `verify` as they were. `start` says where a
+  restart would begin; a plan never moves the counter.
+- **Which sequences are held.** A permanent sequence in a project's schema
+  that no column owns and no package owns. One a column owns (`OWNED BY`, an
+  identity, a `serial`) is part of that column and stays as §4.3 says. An
+  `UNLOGGED` sequence, a package's, and one with a `.` in its schema or name
+  are not held: the census names them and the pull leaves them out. A
+  temporary sequence belongs to one session and is no part of the database.
+  A sequence declared in `pg_catalog`, `information_schema` or a `pg_*` schema is
+  refused, as a table is: the pull never reads those schemas. What the pull reads
+  always validates, a step larger than the type's span included (the engine
+  accepts one).
+  The sequence shares its schema's namespace with tables, views, indexes and
+  the indexes behind named keys, so `validate` refuses one of those of the same
+  name in the same schema.
+- **A table default that calls one stays a limitation.** A column whose default is
+  `nextval` of a standalone sequence is carried as its default text, with the named
+  limitation "defaults from the sequence ..., which it does not own", held sequence or not:
+  nothing yet creates the sequence before the table that calls it, so a managed table with
+  it refuses plans, as before sequences were read. The part that creates a sequence lifts it.
+- **What a plan does with them.** Nothing yet. A declared sequence is compared
+  with the target's, and every difference is refused by name with the attribute
+  that differs: one the target lacks, one it holds differently. A sequence the
+  target has and the declarations do not is not this project's, and is left
+  alone. Creating, dropping, altering and renaming one arrive in later parts of
+  #2721.
+- **SQL Server** refuses the file by name and says so; its sequences arrive
+  with the SQL Server part of the same issue.
 
 ## 5. The identity files
 

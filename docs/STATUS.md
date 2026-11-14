@@ -79,6 +79,12 @@ a block has stopped looking like reference data.
 Declarations may carry database roles and their grants (`role:`, ADR-0005);
 membership stays each environment's own.
 
+PostgreSQL projects may declare standalone sequences (`sequence:`, SPEC §4.11,
+DEC-2721.1): read, declared and pulled. Where the counter stands is never schema,
+so advancing a sequence plans nothing and is no drift. A difference between a
+declared sequence and the target's is refused by name until creating, altering,
+renaming and dropping one arrive (#2721); SQL Server refuses the file by name.
+
 A SQL Server table declares its clustered index with `clustered:` (`heap`, or
 the UNIQUE constraint or index that holds the rows; absent is a clustered
 primary key), and `pull` reads it (#1178, DEC-1178.1). PostgreSQL refuses the
@@ -493,6 +499,7 @@ What a project can declare, by the leading key of the declaration file.
 | `domain:` | managed | refused |
 | `text_search_config:` | partly held | refused |
 | `text_search_dictionary:` | partly held | refused |
+| `sequence:` | partly held | refused |
 | `dependency:` | refused | managed |
 <!-- /generated:declared -->
 
@@ -517,6 +524,7 @@ How each kind is handled today:
 | Extensions, as declared and versioned objects | named by census | #2447; census [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | `gist` indexes (held, DEC-2448.2) and `EXCLUDE` constraints (read, declare and add held, DEC-2448.3; drop, replace, rebuild and partitions next) | partly held | #2448 |
 | `brin` indexes | named | #2449 |
+| Standalone sequences (read, declared and pulled, DEC-2721.1; their current value is never schema; create, drop, alter and rename next) | partly held | #2721 |
 | Text search configurations and dictionaries (a user's, over the built-in parser and templates, are held and pulled, DEC-2728.1; create, alter, rename and drop next) | partly held | #2728 |
 <!-- /generated:postgres-planned -->
 
@@ -531,8 +539,9 @@ How each kind is handled today:
 
 Pull names these objects and connected plan reports them as nonfatal
 `plan.unheld-object` findings by default (DEC-2444.1). They remain outside
-schema state. System objects, extension members, column-owned sequences and
-column-used types are excluded. An unreadable catalog is an error.
+schema state. System objects, extension members, column-owned sequences, the
+standalone sequences the model holds (DEC-2721.1) and column-used types are
+excluded. An unreadable catalog is an error.
 
 <!-- generated:postgres-census -->
 | Kind | Tracking |
@@ -541,7 +550,7 @@ column-used types are excluded. An unreadable catalog is an error.
 | Comments on extensions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Publications | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Subscriptions | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
-| Standalone sequences | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
+| Standalone sequences that are unlogged, a package's, or named with a dot | [#2721](https://github.com/pongbiphang/pbps/issues/2721) |
 | User-defined operators | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Operator classes | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |
 | Extended statistics | [#2444](https://github.com/pongbiphang/pbps/issues/2444) |

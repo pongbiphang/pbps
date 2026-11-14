@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 105;
+pub const SCHEMA_VERSION: u32 = 106;
+// 106: the `sequence:` file in declarations, and `sequences` in state (#2721 PR A).
 // 105: `doctor`'s `identity_file` becomes `identity_dir`: the identity tree's directory replaces the single identity file (#2600 PR 5a).
 // 104: a partition entry's own `description:` (#2729 PR A); 103 belongs to another change.
 // 102: an `opclass:` of a managed package and a qualified exclusion `operator:` in declarations (#2447 PR G2); 101 belongs to another change.

@@ -3890,6 +3890,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 105,
+  "x-pbps-schema-version": 106,
   "x-pbps-tool-version": "0.0.0"
 }

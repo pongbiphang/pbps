@@ -96,6 +96,35 @@ mod tests {
         }
     }
 
+    /// A standalone sequence is documented by where a restart would begin and the options it
+    /// sets, in both prose formats; a project with none has no such section (DEC-2721.1).
+    #[test]
+    fn prose_documents_a_standalone_sequence_and_a_project_without_one_has_no_section() {
+        let mut schema = Schema::default();
+        schema.sequences.insert(
+            "app.order_no".parse().unwrap(),
+            pbps_model::Sequence {
+                ty: pbps_model::ColumnType::simple("integer"),
+                start: 100,
+                increment: 5,
+                options: pbps_model::SequenceOptions {
+                    max: Some(9999),
+                    cycle: true,
+                    ..Default::default()
+                },
+            },
+        );
+        for f in [Format::Markdown, Format::Html] {
+            let out = render(&schema, &IdsFile::default(), f, "Docs");
+            for needle in ["Sequences", "app.order_no", "100", "max = 9999", "cycle"] {
+                assert!(out.contains(needle), "{f:?} lacks {needle}: {out}");
+            }
+            // Negative: no sequence, no section.
+            let none = render(&Schema::default(), &IdsFile::default(), f, "Docs");
+            assert!(!none.contains("Sequences"), "{f:?}: {none}");
+        }
+    }
+
     #[test]
     fn prose_documents_declared_permissions_without_serial_markers_or_empty_grants() {
         use pbps_model::{Permission, Role};

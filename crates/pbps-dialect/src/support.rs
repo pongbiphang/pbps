@@ -109,6 +109,7 @@ const fn census(
 const CENSUS: &str = "[#2444](https://github.com/pongbiphang/pbps/issues/2444)";
 const COVERAGE: &str = "[#168](https://github.com/pongbiphang/pbps/issues/168)";
 const SEARCH: &str = "[#2728](https://github.com/pongbiphang/pbps/issues/2728)";
+const SEQUENCE: &str = "[#2721](https://github.com/pongbiphang/pbps/issues/2721)";
 const MSSQL_CENSUS: &str = "[#2794](https://github.com/pongbiphang/pbps/issues/2794)";
 
 use Engine::{Postgres, SqlServer};
@@ -127,6 +128,7 @@ pub const DECLARATIONS: &[&str] = &[
     "domain",
     "text_search_config",
     "text_search_dictionary",
+    "sequence",
     "dependency",
 ];
 
@@ -187,7 +189,22 @@ pub const RECORDS: &[Record] = &[
     census("Comments on extensions", &["comment on extension"], CENSUS),
     census("Publications", &["publication"], CENSUS),
     census("Subscriptions", &["subscription"], CENSUS),
-    census("Standalone sequences", &["standalone sequence"], CENSUS),
+    Record {
+        declared_as: &["sequence"],
+        census: &["standalone sequence"],
+        planned: Some(Planned {
+            label: "Standalone sequences (read, declared and pulled, DEC-2721.1; their current \
+                    value is never schema; create, drop, alter and rename next)",
+            today: "partly held",
+            tracking: "#2721",
+        }),
+        ..issue(
+            Postgres,
+            "Standalone sequences that are unlogged, a package's, or named with a dot",
+            Partly,
+            SEQUENCE,
+        )
+    },
     census("User-defined operators", &["operator"], CENSUS),
     census("Operator classes", &["operator class"], CENSUS),
     census("Extended statistics", &["extended statistics"], CENSUS),

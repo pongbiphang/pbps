@@ -98,6 +98,8 @@ mod drop_requirements2400;
 mod index_gist2448;
 #[path = "support/index_policy2448.rs"]
 mod index_policy2448;
+#[path = "support/sequences2721.rs"]
+mod sequences2721;
 #[path = "support/text_search2728.rs"]
 mod text_search2728;
 

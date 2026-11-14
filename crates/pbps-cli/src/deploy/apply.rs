@@ -609,6 +609,9 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
                 .before_recording(conn, &after.schema, &plan.ids)
                 .await?;
         }
+        // No plan can change those kinds yet, so the record keeps what it held of them
+        // (DEC-2721.1).
+        after.schema.carry_unidentified_from(&entry.snapshot.schema);
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
             after.schema,

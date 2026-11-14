@@ -81,6 +81,7 @@ fn fixture() -> Schema {
     Schema {
         extensions: Default::default(),
         search: Default::default(),
+        sequences: Default::default(),
         tables: [("app.t".parse().unwrap(), t)].into(),
         types: [(
             "app.d".parse().unwrap(),

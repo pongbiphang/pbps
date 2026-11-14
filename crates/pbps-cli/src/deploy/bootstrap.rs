@@ -97,6 +97,8 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
         types,
         // Text search objects take identities with the next part (#2728).
         search: _,
+        // Nor do sequences, until the part that creates one (#2721).
+        sequences: _,
         modules: _,
         roles,
         extensions,
@@ -144,6 +146,15 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
     Ok(())
 }
 
+/// What stands on the target, for the question whether it is empty: a text search object or a
+/// sequence the declarations do not name is not this project's, so it does not make the target
+/// non-empty (DEC-2721.1).
+pub(super) fn standing_of_the_declared(existing: &Schema, declared: &Schema) -> Schema {
+    let mut standing = existing.clone();
+    standing.keep_only_named_unidentified(declared);
+    standing
+}
+
 /// Refuse before attempting a transaction: only a proven empty managed set
 /// justifies the empty snapshot recorded after a rolled-back bootstrap.
 pub(super) fn refuse_nonempty_bootstrap(
@@ -157,6 +168,7 @@ pub(super) fn refuse_nonempty_bootstrap(
         tables,
         types,
         search,
+        sequences,
         modules,
         roles,
         extensions,
@@ -165,6 +177,11 @@ pub(super) fn refuse_nonempty_bootstrap(
         .keys()
         .map(|name| name.shown().to_string())
         .chain(search.keys().map(|name| name.shown().to_string()))
+        .chain(
+            sequences
+                .keys()
+                .map(|name| format!("sequence `{}`", name.shown())),
+        )
         .chain(modules.keys().map(|id| id.shown().to_string()))
         // PostgreSQL cluster roles with no managed grants are prerequisites,
         // rather than objects bootstrap creates (DECISIONS 211).
@@ -241,11 +258,13 @@ pub(super) fn refuse_extension_prerequisite_drift(
 /// Keep the read-back and authored definitions together: the former proves
 /// drift, while the latter preserves expressions the catalog respells.
 pub(super) fn bootstrap_record(
-    built: pbps_diff::Scoped,
+    mut built: pbps_diff::Scoped,
     held: IdsFile,
     loaded: &pbps_load::Loaded,
     operator: &str,
 ) -> anyhow::Result<StateSnapshot> {
+    // Only what the declarations name of the kinds with no identity record yet (DEC-2721.1).
+    built.schema.keep_only_named_unidentified(&loaded.schema);
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
     snapshot.module_deps = loaded
@@ -610,7 +629,7 @@ pub(super) async fn bootstrap_async(
                     "bootstrap",
                 )?;
                 refuse_nonempty_bootstrap(
-                    &existing.scoped.schema,
+                    &standing_of_the_declared(&existing.scoped.schema, &loaded.schema),
                     &existing.limitations,
                     dialect.as_ref(),
                     &target.label,

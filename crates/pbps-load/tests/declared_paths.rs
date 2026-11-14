@@ -95,6 +95,8 @@ fn only_declarations_that_carry_a_uid_have_a_path() {
         "extension: citext\nschema: public\nversion: \"1.6\"\n",
     );
     dir.write("v.yml", "view: dbo.v\ndefinition: SELECT 1\n");
+    // A sequence has no identity record yet (#2721), so it has no declared path either.
+    dir.write("s.yml", "sequence: app.order_no\n");
     let paths = load_schema_dir(&dir.0)
         .unwrap()
         .declared_paths(&dir.0)
@@ -109,9 +111,11 @@ fn only_declarations_that_carry_a_uid_have_a_path() {
             Declaration::Extension(_) => "extension",
             Declaration::Module(_) => "module",
             Declaration::Search(_) => "search",
+            Declaration::Sequence(_) => "sequence",
         })
         .collect();
     assert!(!kinds.contains(&"module"), "{kinds:?}");
+    assert!(!kinds.contains(&"sequence"), "{kinds:?}");
     assert_eq!(kinds.len(), 4, "{kinds:?}");
     assert!(paths.files.values().any(|f| f.path == "r.yml"));
     assert!(paths.files.values().any(|f| f.path == "e.yml"));

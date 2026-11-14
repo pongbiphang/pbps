@@ -202,6 +202,73 @@ fn bootstrap_requires_each_declared_type_identity() {
     refuse_unidentified_bootstrap_objects(&Schema::default(), &IdsFile::default()).unwrap();
 }
 
+/// A bootstrap records, of the sequences, only the ones the declarations name (DEC-2721.1): a
+/// helper the target holds and nobody declared is not this project's, so dropping it later is
+/// no drift of the project's. `apply` carries the record's own sequences forward instead.
+#[test]
+fn a_recording_keeps_only_the_sequences_the_declarations_name_and_apply_carries_the_record() {
+    let sequence = |start| pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start,
+        increment: 1,
+        options: Default::default(),
+    };
+    let mut live = Schema::default();
+    live.sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    live.sequences
+        .insert("app.helper".parse().unwrap(), sequence(1));
+    let mut loaded = pbps_load::Loaded::default();
+    loaded
+        .schema
+        .sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    let built = pbps_diff::scope(
+        &live,
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let snapshot = bootstrap_record(built, IdsFile::default(), &loaded, "operator").unwrap();
+    assert_eq!(
+        snapshot
+            .schema
+            .sequences
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect::<Vec<_>>(),
+        ["app.named"]
+    );
+    // Negative: nothing declared, nothing recorded.
+    let built = pbps_diff::scope(
+        &live,
+        &IdsFile::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let snapshot = bootstrap_record(
+        built,
+        IdsFile::default(),
+        &pbps_load::Loaded::default(),
+        "operator",
+    )
+    .unwrap();
+    assert!(snapshot.schema.sequences.is_empty());
+    // An apply records what the record held, whatever the database holds now.
+    let mut after = live.clone();
+    after.carry_unidentified_from(&snapshot.schema);
+    assert!(after.sequences.is_empty(), "the helper is not adopted");
+    let mut previous = Schema::default();
+    previous
+        .sequences
+        .insert("app.named".parse().unwrap(), sequence(1));
+    after.carry_unidentified_from(&previous);
+    assert_eq!(
+        after.sequences, previous.sequences,
+        "a recorded one is kept though gone"
+    );
+}
+
 #[test]
 fn bootstrap_refuses_to_record_an_annotation_the_state_cannot_hold() {
     let mut loaded = pbps_load::Loaded::default();
@@ -325,6 +392,47 @@ fn bootstrap_extensions_are_exact_prerequisites_but_ordinary_objects_must_be_abs
         .tables
         .insert(TableName::new("app", "ordinary"), Default::default());
     assert!(refuse_nonempty_bootstrap(&schema, &[], &pg, "target").is_err());
+}
+
+/// A sequence the declarations do not name does not make a bootstrap target non-empty, and one
+/// they name does (DEC-2721.1): the target is asked through the declarations' projection.
+#[test]
+fn an_undeclared_sequence_does_not_make_a_bootstrap_target_non_empty_and_a_declared_one_does() {
+    let sequence = pbps_model::Sequence {
+        ty: pbps_model::ColumnType::simple("bigint"),
+        start: 1,
+        increment: 1,
+        options: Default::default(),
+    };
+    let pg = pbps_pg::Postgres::new();
+    let mut existing = Schema::default();
+    existing
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence.clone());
+    let declared = Schema::default();
+    refuse_nonempty_bootstrap(
+        &standing_of_the_declared(&existing, &declared),
+        &[],
+        &pg,
+        "target",
+    )
+    .unwrap();
+    // Negative: the one the declarations name stands, and is a reason to refuse.
+    let mut named = Schema::default();
+    named
+        .sequences
+        .insert("app.theirs".parse().unwrap(), sequence);
+    let error = refuse_nonempty_bootstrap(
+        &standing_of_the_declared(&existing, &named),
+        &[],
+        &pg,
+        "target",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("sequence `app.theirs`"),
+        "{error}"
+    );
 }
 
 #[test]

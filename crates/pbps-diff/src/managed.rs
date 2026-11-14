@@ -130,6 +130,9 @@ pub fn scope(
         // every one the database holds is kept; the plan compares only the ones the
         // declarations name (DEC-2728.1).
         search: schema.search.clone(),
+        // Likewise standalone sequences (DEC-2721.1): every one the database holds is kept,
+        // and the plan compares only the ones the declarations name.
+        sequences: schema.sequences.clone(),
         ..Default::default()
     };
     let mut unmanaged_types = Vec::new();
@@ -640,6 +643,38 @@ mod tests {
             &BTreeSet::new(),
         );
         assert!(none.schema.search.is_empty());
+    }
+
+    /// A standalone sequence the database holds is in the scoped read, so that the plan can
+    /// compare it with the declaration and the recorded state can hold it (DEC-2721.1).
+    #[test]
+    fn the_standalone_sequences_of_the_database_are_kept_in_scope() {
+        let mut live = schema(&["dbo.customer"]);
+        let key: pbps_model::ObjectName = "app.order_no".parse().unwrap();
+        live.sequences.insert(
+            key.clone(),
+            pbps_model::Sequence {
+                ty: pbps_model::ColumnType::simple("bigint"),
+                start: 1,
+                increment: 1,
+                options: Default::default(),
+            },
+        );
+        let scoped = scope(
+            &live,
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(scoped.schema.sequences.keys().collect::<Vec<_>>(), [&key]);
+        // Negative: a database with none scopes to none.
+        let none = scope(
+            &schema(&["dbo.customer"]),
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(none.schema.sequences.is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pbps declaration",
-  "description": "One pbps declaration file: a table, module, role, enum, domain, or a text search\nconfiguration or dictionary.\nThe leading key is both the kind and the name.",
+  "description": "One pbps declaration file: a table, module, role, enum, domain, a standalone sequence,\nor a text search configuration or dictionary.\nThe leading key is both the kind and the name.",
   "anyOf": [
     {
       "$ref": "#/$defs/ExtensionDto"
@@ -29,6 +29,9 @@
     },
     {
       "$ref": "#/$defs/SearchDictionaryDto"
+    },
+    {
+      "$ref": "#/$defs/StandaloneSequenceDto"
     }
   ],
   "$defs": {
@@ -2069,8 +2072,79 @@
         "text_search_dictionary",
         "template"
       ]
+    },
+    "StandaloneSequenceDto": {
+      "description": "A standalone sequence: one no column owns (#2721). The leading key names it, qualified\nby its schema. There is no field for the counter's position: that is state the database\nadvances on every `nextval`, not schema.",
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "type": "string"
+        },
+        "type": {
+          "description": "`smallint`, `integer` or `bigint`. Absent is `bigint`, the engine's default.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "start": {
+          "description": "Where a restart would begin; the plan never moves the counter. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "increment": {
+          "description": "The step. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "min": {
+          "description": "The lowest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max": {
+          "description": "The highest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "cycle": {
+          "description": "Whether the sequence starts again at the other bound once it reaches one.\nAbsent is `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "cache": {
+          "description": "How many numbers a session takes at once. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence"
+      ]
     }
   },
-  "x-pbps-schema-version": 105,
+  "x-pbps-schema-version": 106,
   "x-pbps-tool-version": "0.0.0"
 }

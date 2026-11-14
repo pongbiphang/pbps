@@ -42,6 +42,12 @@ pub struct Schema {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub search: BTreeMap<crate::SearchRef, crate::SearchObject>,
 
+    /// Standalone sequences, keyed by their name in the relation namespace (#2721,
+    /// DEC-2721.1). Held and pulled; planning them arrives with later parts. Their current
+    /// value is in no field of this model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequences: BTreeMap<crate::ObjectName, crate::Sequence>,
+
     /// Database-global PostgreSQL packages, pinned exactly (DEC-2447.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<ObjectLocalName, Extension>,
@@ -72,6 +78,52 @@ pub struct Schema {
     /// environment with no managed roles, not a broken file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<crate::RoleName, crate::role::Role>,
+}
+
+impl Schema {
+    /// Leaves out of `self`, a fresh read of a database, the objects of the kinds that have no
+    /// identity record yet (text search objects, standalone sequences) that `named` does not
+    /// hold (DEC-2728.1, DEC-2721.1).
+    ///
+    /// Such an object is the project's only by being named: one the database gained, or had
+    /// before the kind was held, and that nobody declared or recorded, is not this project's,
+    /// and comparing it would call an unchanged database drifted. One `named` holds stays, so
+    /// a change to it is still a difference. **This is the one managed projection of those
+    /// kinds.** `named` is the recorded schema for `verify` and the guard that refuses to
+    /// record over a different state, and the declared schema for the question whether a
+    /// bootstrap target already stands; anything else that compares a fresh read with a
+    /// schema must use it too.
+    pub fn keep_only_named_unidentified(&mut self, named: &Schema) {
+        self.search
+            .retain(|name, _| named.search.contains_key(name));
+        self.sequences
+            .retain(|name, _| named.sequences.contains_key(name));
+    }
+
+    /// Takes the objects of those kinds from `previous`, the schema last recorded, and leaves
+    /// this schema's own out: what a recording that cannot plan any of them (`apply`) writes
+    /// for them, so that a plan neither adopts a sequence nobody declared nor forgets one that
+    /// was recorded and has since gone (DEC-2721.1). The part that can create one will add the
+    /// ones its plan creates.
+    pub fn carry_unidentified_from(&mut self, previous: &Schema) {
+        self.search = previous.search.clone();
+        self.sequences = previous.sequences.clone();
+    }
+
+    /// A copy without the objects of those kinds: what a schema is, for a caller that must
+    /// build it from nothing before any plan can create them.
+    ///
+    /// A rehearsal replays the target's managed model (or the declarations) on a scratch
+    /// database from nothing. Text search objects and sequences are read and compared but not
+    /// yet planned (DEC-2728.1, DEC-2721.1), so the differ refuses to "create" one, and a
+    /// rehearsal that asked it to would make a plan the target could always answer
+    /// unanswerable. Left out, the scratch is what it was before the kinds were held.
+    #[must_use]
+    pub fn without_unplanned_kinds(&self) -> Schema {
+        let mut kept = self.clone();
+        kept.keep_only_named_unidentified(&Schema::default());
+        kept
+    }
 }
 
 /// Installed package state; the database-global name is the map key.

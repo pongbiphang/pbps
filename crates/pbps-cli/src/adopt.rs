@@ -372,6 +372,25 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
             name = name.shown()
         ));
     }
+    // A standalone sequence is its own object (#2721): the one whose declaration `validate`
+    // would refuse, an increment beyond its span say, is left out alone and named.
+    let refused_sequences: Vec<_> = schema
+        .sequences
+        .iter()
+        .filter_map(|(name, sequence)| {
+            let why = rendered(dialect.validate_sequence(name, sequence, schema));
+            (!why.is_empty()).then(|| (name.clone(), why))
+        })
+        .collect();
+    for (name, why) in refused_sequences {
+        schema.sequences.remove(&name);
+        pulled.warnings.push(format!(
+            "sequence `{name}` was left out: `pbps validate` refuses its declaration — {}; a \
+             table default that calls it now names an object the declarations do not hold",
+            why.join("; "),
+            name = name.shown()
+        ));
+    }
     // A partition whose own checks or indexes `validate` refuses takes its
     // whole tree: a tree is read whole or not at all (#1170), and a parent
     // written without one of its partitions would refuse that partition as
@@ -715,6 +734,12 @@ pub(crate) fn write_declarations_with_deps(
     for (name, definition) in &schema.search {
         let path = declaration_file::search_path(dir, name)?;
         std::fs::write(&path, pbps_load::render_search(name, definition))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
+    for (name, definition) in &schema.sequences {
+        let path = declaration_file::sequence_path(dir, name)?;
+        std::fs::write(&path, pbps_load::render_sequence(name, definition))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }
@@ -1209,6 +1234,47 @@ mod tests {
             "{warned}"
         );
         assert_eq!(pulled.warnings.len(), 2, "{warned}");
+    }
+
+    /// A pulled sequence `validate` would refuse is left out alone, with a warning that says
+    /// why; the ones it accepts are kept (#2721).
+    #[test]
+    fn a_pulled_sequence_that_validate_refuses_is_left_out_alone_and_named() {
+        let mut pulled = Pulled::default();
+        let sequence = |ty: &str, increment: i64| pbps_model::Sequence {
+            ty: pbps_model::ColumnType::simple(ty),
+            start: 1,
+            increment,
+            options: Default::default(),
+        };
+        pulled
+            .schema
+            .sequences
+            .insert("app.ok".parse().unwrap(), sequence("bigint", 1));
+        pulled.schema.sequences.insert(
+            pbps_model::ObjectName::new("app", "a.b"),
+            sequence("smallint", 1),
+        );
+        // The step beyond a type's span, which the engine accepts, is kept (it validates).
+        pulled
+            .schema
+            .sequences
+            .insert("app.stride".parse().unwrap(), sequence("smallint", 40_000));
+        leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+        let kept: Vec<String> = pulled
+            .schema
+            .sequences
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect();
+        assert_eq!(kept, ["app.ok", "app.stride"]);
+        let warned = pulled.warnings.join("\n");
+        assert!(
+            warned.contains("sequence `app.a.b` was left out") && warned.contains("`.`"),
+            "{warned}"
+        );
+        // Negative: the kept one raises nothing.
+        assert!(!warned.contains("app.ok"), "{warned}");
     }
 
     /// A table keyed by a declared enum is held, and one keyed by a type the

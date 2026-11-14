@@ -358,6 +358,16 @@ where
             .unwrap()
             .shift_remove(definition);
     }
+    // #2721 PR A adds the standalone `sequence:` file kind (schema set 106); the captured
+    // declaration schema predates it.
+    declaration_schema["anyOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|variant| variant["$ref"] != "#/$defs/StandaloneSequenceDto");
+    declaration_schema["$defs"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("StandaloneSequenceDto");
     // #2447 PR G2 words the `opclass:` of a key for a package's class (schema set 102);
     // the captured text predates it.
     declaration_schema["$defs"]["IndexKeyDto"]["properties"]["opclass"]["description"] =

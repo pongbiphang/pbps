@@ -57,6 +57,11 @@ pub enum DiffError {
         name: pbps_model::SearchRef,
         reason: String,
     },
+    #[error("sequence `{}`: {reason} (DEC-2721.1)", .name.shown())]
+    SequenceRefused {
+        name: pbps_model::ObjectName,
+        reason: String,
+    },
     #[error("extension `{}`: {action} is unsupported in the read-only extension phase (DEC-2447.1)", .name.shown())]
     ExtensionLifecycleUnsupported {
         name: pbps_model::ObjectLocalName,
@@ -952,6 +957,7 @@ pub(crate) fn diff_partial_rebuilding(
         dialect.name(),
     ));
     diff_search(base.schema, declared.schema, &mut errs);
+    diff_sequences(base.schema, declared.schema, dialect, &mut errs);
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
         errs.push(DiffError::ConversionsUnsupported {
             count: declared.ids.conversions.len(),
@@ -6742,6 +6748,132 @@ fn diff_search(
             reason: reason.to_owned(),
         });
     }
+}
+
+/// Standalone sequences, by name (DEC-2721.1). **Every difference is refused here, by
+/// name**: this part reads and holds them and plans nothing for them. Creating one arrives
+/// in the next part, and altering, renaming or dropping one after it, so a plan that would
+/// leave a declaration unmet is refused rather than made without the change that says so.
+/// A sequence the target has and the declarations do not is not this project's, and is left
+/// alone. The counter is not compared: it is in no field of either side.
+fn diff_sequences(
+    base: &pbps_model::Schema,
+    declared: &pbps_model::Schema,
+    dialect: &(impl Dialect + ?Sized),
+    errs: &mut Vec<DiffError>,
+) {
+    // Spellings of one type (`int`, `integer`) are one type to the engine.
+    let normal = |sequence: &pbps_model::Sequence| {
+        let mut sequence = sequence.clone();
+        if let Ok(ty) = dialect.normalize_type(&sequence.ty) {
+            sequence.ty = ty;
+        }
+        sequence
+    };
+    for (name, now) in &declared.sequences {
+        let reason = match base.sequences.get(name) {
+            None => {
+                "the target has none; creating one arrives with the next part of #2721".to_owned()
+            }
+            Some(was) => {
+                let (was, now) = (normal(was), normal(now));
+                let differing = sequence_differences(&was, &now, ("declared", "target has"));
+                if differing.is_empty() {
+                    continue;
+                }
+                format!(
+                    "it differs from the target's ({}); changing one arrives in a later part of \
+                     #2721, and for now it stands as the target holds it",
+                    differing.join("; ")
+                )
+            }
+        };
+        errs.push(DiffError::SequenceRefused {
+            name: name.clone(),
+            reason,
+        });
+    }
+}
+
+/// What differs between the held sequence and the new one, attribute by attribute, each as
+/// `name: <words.0> new, <words.1> held` ("declared", "target has" in a plan; "now",
+/// "recorded" in a drift report). A bound or a cache that is `None` is
+/// the engine's default, and is said so.
+fn sequence_differences(
+    was: &pbps_model::Sequence,
+    now: &pbps_model::Sequence,
+    words: (&str, &str),
+) -> Vec<String> {
+    fn bound(value: Option<i64>) -> String {
+        value.map_or_else(|| "the engine's default".to_owned(), |v| v.to_string())
+    }
+    let mut out = Vec::new();
+    let mut note = |what: &str, declared: String, held: String| {
+        if declared != held {
+            out.push(format!(
+                "{what}: {} {declared}, {} {held}",
+                words.0, words.1
+            ));
+        }
+    };
+    note(
+        "type",
+        now.ty.shown().to_string(),
+        was.ty.shown().to_string(),
+    );
+    note("start", now.start.to_string(), was.start.to_string());
+    note(
+        "increment",
+        now.increment.to_string(),
+        was.increment.to_string(),
+    );
+    note("min", bound(now.options.min), bound(was.options.min));
+    note("max", bound(now.options.max), bound(was.options.max));
+    note(
+        "cycle",
+        now.options.cycle.to_string(),
+        was.options.cycle.to_string(),
+    );
+    note("cache", bound(now.options.cache), bound(was.options.cache));
+    out
+}
+
+/// Drift in the kinds that have no identity record yet (text search objects, standalone
+/// sequences): what `recorded` holds of them that `live` lost or changed, each by name
+/// (DEC-2721.1, DEC-2728.1). `live` is a fresh read already projected through
+/// `Schema::keep_only_named_unidentified(recorded)`, so a sequence nobody recorded is not here
+/// to be called anything; a recorded one that is gone, renamed away or changed is. The
+/// differ cannot say so itself: it walks the new side, and a recorded object that is missing
+/// from it is on neither list.
+pub fn unidentified_drift(recorded: &pbps_model::Schema, live: &pbps_model::Schema) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, was) in &recorded.sequences {
+        match live.sequences.get(name) {
+            None => out.push(format!(
+                "sequence `{}` was recorded and is not in the database now",
+                name.shown()
+            )),
+            Some(now) if now != was => out.push(format!(
+                "sequence `{}` changed since it was recorded ({})",
+                name.shown(),
+                sequence_differences(was, now, ("now", "recorded")).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, was) in &recorded.search {
+        match live.search.get(name) {
+            None => out.push(format!(
+                "{} was recorded and is not in the database now",
+                name.shown()
+            )),
+            Some(now) if now != was => {
+                out.push(format!("{} changed since it was recorded", name.shown()))
+            }
+            Some(_) => {}
+        }
+    }
+    out
 }
 
 /// A table's exclusion constraints, by name (DEC-2448.3). Adding one is a
@@ -29268,5 +29400,204 @@ mod meeting_shape_tests {
                 .contains("text search configuration `app.same`")),
             "{errs:?}"
         );
+    }
+
+    /// Drift in a recorded sequence or text search object is reported by name: one that is
+    /// gone (dropped, or renamed away) and one that changed, said attribute by attribute for a
+    /// sequence. An unchanged one is silent, and one only the live side holds is not looked at
+    /// (DEC-2721.1).
+    #[test]
+    fn a_recorded_sequence_that_is_gone_or_changed_is_drift_and_an_unrecorded_one_is_not_looked_at()
+    {
+        let sequence = |start, increment| pbps_model::Sequence {
+            ty: ColumnType::simple("bigint"),
+            start,
+            increment,
+            options: Default::default(),
+        };
+        let mut recorded = Schema::default();
+        for (name, held) in [
+            ("app.same", sequence(1, 1)),
+            ("app.changed", sequence(1, 5)),
+            ("app.gone", sequence(1, 1)),
+        ] {
+            recorded.sequences.insert(name.parse().unwrap(), held);
+        }
+        let mut live = Schema::default();
+        live.sequences
+            .insert("app.same".parse().unwrap(), sequence(1, 1));
+        live.sequences
+            .insert("app.changed".parse().unwrap(), sequence(1, 7));
+        // Not recorded: nothing to say about it.
+        live.sequences
+            .insert("app.theirs".parse().unwrap(), sequence(1, 1));
+        let said = unidentified_drift(&recorded, &live);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter().any(
+                |m| m.contains("sequence `app.changed` changed since it was recorded")
+                    && m.contains("increment: now 7, recorded 5")
+            ),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m
+                    .contains("sequence `app.gone` was recorded and is not in the database now")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .all(|m| !m.contains("app.same") && !m.contains("app.theirs"))
+        );
+        // Negative: nothing recorded, nothing to report; and the same read is no drift.
+        assert!(unidentified_drift(&Schema::default(), &live).is_empty());
+        assert!(unidentified_drift(&recorded, &recorded).is_empty());
+        // A text search object is held to the same rule.
+        let key = pbps_model::SearchRef::new(
+            pbps_model::SearchKind::Dictionary,
+            "app.d".parse().unwrap(),
+        );
+        let mut with = Schema::default();
+        with.search.insert(
+            key,
+            pbps_model::SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let said = unidentified_drift(&with, &Schema::default());
+        assert!(
+            said.iter()
+                .any(|m| m.contains("text search dictionary `app.d` was recorded")),
+            "{said:?}"
+        );
+    }
+
+    /// The two halves of one rule (DEC-2721.1): recorded through the declarations' projection,
+    /// a sequence or text search object nobody declared is not in the record, so its dropping
+    /// later is no drift; a declared and recorded one that is dropped still is, by name.
+    #[test]
+    fn dropping_an_undeclared_object_is_no_drift_and_dropping_a_declared_one_is() {
+        let sequence = pbps_model::Sequence {
+            ty: ColumnType::simple("bigint"),
+            start: 1,
+            increment: 1,
+            options: Default::default(),
+        };
+        let dictionary = |name: &str| {
+            (
+                pbps_model::SearchRef::new(
+                    pbps_model::SearchKind::Dictionary,
+                    name.parse().unwrap(),
+                ),
+                pbps_model::SearchObject::Dictionary {
+                    template: "pg_catalog.simple".parse().unwrap(),
+                    options: Default::default(),
+                },
+            )
+        };
+        let mut live_then = Schema::default();
+        for name in ["app.declared", "app.helper"] {
+            live_then
+                .sequences
+                .insert(name.parse().unwrap(), sequence.clone());
+            let (key, value) = dictionary(name);
+            live_then.search.insert(key, value);
+        }
+        let mut declared = Schema::default();
+        declared
+            .sequences
+            .insert("app.declared".parse().unwrap(), sequence.clone());
+        let (key, value) = dictionary("app.declared");
+        declared.search.insert(key, value);
+        // What a recording writes of them: only what the declarations name.
+        let mut recorded = live_then.clone();
+        recorded.keep_only_named_unidentified(&declared);
+        assert_eq!(recorded.sequences.len(), 1);
+        assert_eq!(recorded.search.len(), 1);
+        // The helper is dropped: nothing to say.
+        let mut live_now = live_then.clone();
+        live_now.sequences.remove(&"app.helper".parse().unwrap());
+        live_now.search.retain(|k, _| k.name.name() != "helper");
+        live_now.keep_only_named_unidentified(&recorded);
+        assert!(unidentified_drift(&recorded, &live_now).is_empty());
+        // Negative: the declared one is dropped, and both kinds say so by name.
+        let mut live_gone = live_then.clone();
+        live_gone.sequences.remove(&"app.declared".parse().unwrap());
+        live_gone.search.retain(|k, _| k.name.name() != "declared");
+        live_gone.keep_only_named_unidentified(&recorded);
+        let said = unidentified_drift(&recorded, &live_gone);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|m| m.contains("sequence `app.declared` was recorded")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`app.declared` was recorded")),
+            "{said:?}"
+        );
+    }
+
+    /// A standalone sequence the declarations hold is compared with the target's and every
+    /// difference is refused by name, since nothing plans them yet (DEC-2721.1): one the
+    /// target lacks, one it holds differently, said attribute by attribute. An identical
+    /// one is no difference, a spelling of the same type is not one, and one only the
+    /// target has is not this project's.
+    #[test]
+    fn every_difference_in_a_standalone_sequence_is_refused_by_name_and_an_undeclared_one_is_left_alone()
+     {
+        let sequence = |ty: &str, start: i64, increment: i64| pbps_model::Sequence {
+            ty: ColumnType::simple(ty),
+            start,
+            increment,
+            options: Default::default(),
+        };
+        let mut base = Schema::default();
+        let mut declared = Schema::default();
+        for (name, held) in [
+            ("app.same", sequence("bigint", 1, 1)),
+            // Only the target has it: not this project's.
+            ("app.theirs", sequence("bigint", 1, 1)),
+        ] {
+            base.sequences.insert(name.parse().unwrap(), held);
+        }
+        declared
+            .sequences
+            .insert("app.same".parse().unwrap(), sequence("bigint", 1, 1));
+        let mut errs = Vec::new();
+        diff_sequences(&base, &declared, &MinimalDialect, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        // Changed in two attributes, and absent from the target.
+        base.sequences
+            .insert("app.changed".parse().unwrap(), sequence("integer", 1, 1));
+        let mut wanted = sequence("integer", 100, 1);
+        wanted.options.cycle = true;
+        declared
+            .sequences
+            .insert("app.changed".parse().unwrap(), wanted);
+        declared
+            .sequences
+            .insert("app.new".parse().unwrap(), sequence("bigint", 1, 1));
+        diff_sequences(&base, &declared, &MinimalDialect, &mut errs);
+        let said: Vec<String> = errs.iter().map(ToString::to_string).collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said.iter().any(|m| m.contains("sequence `app.changed`")
+                && m.contains("start: declared 100, target has 1")
+                && m.contains("cycle: declared true, target has false")
+                && !m.contains("type:")
+                && !m.contains("increment:")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|m| m.contains("sequence `app.new`") && m.contains("creating one")),
+            "{said:?}"
+        );
+        // Negative: nothing about the counter can differ, because no field holds it.
+        assert!(said.iter().all(|m| !m.contains("last_value")), "{said:?}");
     }
 }

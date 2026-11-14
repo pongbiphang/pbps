@@ -36,6 +36,8 @@ pub struct KindProbe {
     #[serde(default)]
     pub text_search_dictionary: Option<String>,
     #[serde(default)]
+    pub sequence: Option<String>,
+    #[serde(default)]
     pub table: Option<String>,
     #[serde(default)]
     pub view: Option<String>,
@@ -1543,8 +1545,8 @@ pub enum IndexOrder {
 // happened to be tried first. This type exists so the *schema* says what the
 // loader accepts, in one place, generated from the very structures it reads.
 
-/// One pbps declaration file: a table, module, role, enum, domain, or a text search
-/// configuration or dictionary.
+/// One pbps declaration file: a table, module, role, enum, domain, a standalone sequence,
+/// or a text search configuration or dictionary.
 /// The leading key is both the kind and the name.
 #[derive(schemars::JsonSchema)]
 #[serde(untagged)]
@@ -1561,6 +1563,7 @@ pub enum DeclarationFile {
     Domain(Box<DomainTypeDto>),
     SearchConfig(Box<SearchConfigDto>),
     SearchDictionary(Box<SearchDictionaryDto>),
+    Sequence(Box<StandaloneSequenceDto>),
 }
 
 #[cfg(test)]
@@ -1669,6 +1672,37 @@ pub struct SearchDictionaryDto {
     /// one of them; the file itself is not held.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
+}
+
+/// A standalone sequence: one no column owns (#2721). The leading key names it, qualified
+/// by its schema. There is no field for the counter's position: that is state the database
+/// advances on every `nextval`, not schema.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneSequenceDto {
+    pub sequence: String,
+    /// `smallint`, `integer` or `bigint`. Absent is `bigint`, the engine's default.
+    #[serde(default, rename = "type")]
+    pub ty: Option<String>,
+    /// Where a restart would begin; the plan never moves the counter. Absent is 1.
+    #[serde(default)]
+    pub start: Option<i64>,
+    /// The step. Absent is 1.
+    #[serde(default)]
+    pub increment: Option<i64>,
+    /// The lowest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub min: Option<i64>,
+    /// The highest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub max: Option<i64>,
+    /// Whether the sequence starts again at the other bound once it reaches one.
+    /// Absent is `false`.
+    #[serde(default)]
+    pub cycle: bool,
+    /// How many numbers a session takes at once. Absent is 1.
+    #[serde(default)]
+    pub cache: Option<i64>,
 }
 
 /// Exact PostgreSQL package declaration. Rename is deliberately not a field.
