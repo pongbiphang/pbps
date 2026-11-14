@@ -33,6 +33,7 @@ pub use identity::{
 };
 pub use managed::{
     Scoped, external_parents, observed_ids, observed_ids_reserving, own_parts, scope,
+    without_unmanaged_search,
 };
 pub use schema_diff::{
     DiffError, Diffed, Screen, Side, bootstrap, diff, diff_connected, diff_partial, diff_read_back,

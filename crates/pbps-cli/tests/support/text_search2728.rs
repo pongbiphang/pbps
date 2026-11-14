@@ -241,6 +241,25 @@ fn every_difference_is_refused_by_name_and_an_undeclared_object_is_left_alone() 
             "CREATE TEXT SEARCH CONFIGURATION app.extra (COPY = pg_catalog.simple)",
         );
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+        // And it does not stop a plan that touches only a table from being rehearsed on the
+        // scratch, where the base is built from the target's managed objects alone (ready
+        // round 2).
+        let table = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                std::fs::read_to_string(p).is_ok_and(|t| t.starts_with("table: app.articles"))
+            })
+            .unwrap();
+        let kept = std::fs::read_to_string(&table).unwrap();
+        std::fs::write(
+            &table,
+            kept.replacen("primary_key", "  note: {type: text}\nprimary_key", 1),
+        )
+        .unwrap();
+        let out = succeeds(f.d.run(&["plan", "--db", f.target()]));
+        assert!(said(&out).contains("note"), "{}", said(&out));
+        std::fs::write(&table, kept).unwrap();
         // A declaration that was recorded and is gone is a drop, and it needs its reason.
         std::fs::remove_file(dir.join("app.copied.textsearch-config.yml")).unwrap();
         let out = f.d.run(&["plan", "--db", f.target()]);
