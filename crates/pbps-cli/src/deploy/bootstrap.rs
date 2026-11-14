@@ -144,6 +144,25 @@ pub(super) fn refuse_unidentified_bootstrap_objects(
     Ok(())
 }
 
+/// [`refuse_nonempty_bootstrap`] over what the declarations can occupy: a kind held by name
+/// only counts only where `declared` names it, since bootstrap would have to create that one.
+/// One nothing names is not an object of this project, and an empty database that holds one
+/// is still empty for it (#2855, DEC-2855.1).
+pub(super) fn refuse_occupied_bootstrap(
+    existing: &Schema,
+    declared: &Schema,
+    limitations: &[String],
+    dialect: &dyn Dialect,
+    label: &str,
+) -> anyhow::Result<()> {
+    refuse_nonempty_bootstrap(
+        &existing.clone().with_name_only_restricted_to(declared),
+        limitations,
+        dialect,
+        label,
+    )
+}
+
 /// Refuse before attempting a transaction: only a proven empty managed set
 /// justifies the empty snapshot recorded after a rolled-back bootstrap.
 pub(super) fn refuse_nonempty_bootstrap(
@@ -246,6 +265,8 @@ pub(super) fn bootstrap_record(
     loaded: &pbps_load::Loaded,
     operator: &str,
 ) -> anyhow::Result<StateSnapshot> {
+    // `built` is the recorded form already: the read it came from keeps a kind held by
+    // name only only where `loaded` names it (`managed_state_once`, DEC-2855.1).
     let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
     snapshot.module_deps = loaded
@@ -609,8 +630,9 @@ pub(super) async fn bootstrap_async(
                     dialect.as_ref(),
                     "bootstrap",
                 )?;
-                refuse_nonempty_bootstrap(
+                refuse_occupied_bootstrap(
                     &existing.scoped.schema,
+                    &loaded.schema,
                     &existing.limitations,
                     dialect.as_ref(),
                     &target.label,

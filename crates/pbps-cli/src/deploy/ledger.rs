@@ -113,19 +113,16 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // out; compared unnamed, a renamed sequence would take the other
         // side's name and read as no change (#1631). The checksums below are
         // the reads' own.
-        let mut recorded_read = baseline.snapshot.schema.clone();
-        pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
-        let mut live_read = scoped.schema.clone();
-        pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
-        only_recorded_search_objects(&recorded_read, &mut live_read);
-        without_comments(&mut recorded_read, &mut live_read);
+        let comparison =
+            drift_comparison(&baseline.snapshot.schema, &scoped.schema, dialect.as_ref());
+        let (recorded_read, live_read) = (&comparison.recorded, &comparison.live);
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
-                schema: &recorded_read,
+                schema: recorded_read,
                 ids: &recorded_ids,
             },
             pbps_diff::Side {
-                schema: &live_read,
+                schema: live_read,
                 ids: &observed,
             },
             dialect.as_ref(),
@@ -145,6 +142,9 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         let mut unexpressible: Vec<String> =
             diffed.errors.iter().map(ToString::to_string).collect();
         unexpressible.extend(managed.limitations);
+        // A recorded text search object that is gone or changed: no checksum sees one
+        // and the differ has no change for it (DEC-2855.1, #2846).
+        unexpressible.extend(comparison.name_only);
         // A managed role's permission the declarations cannot spell is the
         // same kind of difference as a catalog fact they cannot: established,
         // and with no `Change` to carry it (DECISIONS 95).

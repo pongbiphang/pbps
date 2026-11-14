@@ -601,9 +601,25 @@ pub(super) async fn plan_db_selected(
             }
         }
         let recorded = pbps_model::drift_checksum(&expected, &recorded_ids);
-        if live != recorded {
+        // The checksums leave a text search object out, so a recorded one that is gone or
+        // changed is the same drift `verify` reports, found here by the one report both
+        // call (DEC-2855.1, #2846).
+        let name_only = pbps_model::Schema::name_only_drift(&entry.snapshot.schema, &as_recorded);
+        if live != recorded || !name_only.is_empty() {
+            let named = if name_only.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n  {}",
+                    name_only
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n  ")
+                )
+            };
             bail!(
-                "`{}` has drifted from the state recorded at {} (entry #{}).\n\
+                "`{}` has drifted from the state recorded at {} (entry #{}).{named}\n\
                  Run `pbps verify --env/--db ...` to see how, and resolve it before planning.",
                 pbps_model::escape::Escaped(&target.label),
                 entry.applied_at,

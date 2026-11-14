@@ -670,7 +670,8 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         let module_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
-            after.schema,
+            // Carried forward, as the closing entry's is (DEC-2855.1).
+            after.schema.as_recorded_after_apply(&entry.snapshot.schema),
             live_ids.clone(),
             operator,
         );
@@ -842,7 +843,9 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         })?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
-            after.schema,
+            // No plan changes a text search object: the previous record is carried
+            // forward, not the read-back (DEC-2855.1).
+            after.schema.as_recorded_after_apply(&entry.snapshot.schema),
             plan.ids.clone(),
             operator,
         );

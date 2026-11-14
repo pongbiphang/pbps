@@ -421,6 +421,23 @@ fn record_catalog_findings(
         record_status_issue(row, "drift", scoped.unexpressible.join("; "));
     }
 
+    // A recorded text search object that is gone or changed: the checksum below leaves
+    // the kind out, so without this `status` read `ok` where `verify` reads drift
+    // (#2846, DEC-2855.1). From the scoped read, so a row read that failed hides nothing.
+    let name_only = pbps_model::Schema::name_only_drift(&entry.snapshot.schema, &scoped.schema);
+    if !name_only.is_empty() {
+        record_drift(row, entry.id, &name);
+        record_status_issue(
+            row,
+            "drift",
+            name_only
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+
     // Decided here and recorded in two places: drift right away, so that it
     // keeps outranking an `unmanaged: warn` on the row; a failure at the very
     // end, so that nothing established in between is dropped.
@@ -1137,6 +1154,77 @@ mod tests {
         // Negative: an external partition only as its parent makes it.
         let r = status_of(true, partition(false));
         assert_eq!(r.state, "ok", "{r:?}");
+    }
+
+    /// `verify`, `status` and the `plan --db` gate read one report of the recorded objects
+    /// of a kind held by name only (DEC-2855.1, #2846). The checksums leave the kind out,
+    /// so `status` used to read `ok` where `verify` reads drift.
+    #[test]
+    fn a_recorded_text_search_object_that_is_gone_or_changed_is_drift() {
+        use pbps_model::{SearchKind, SearchObject, SearchRef};
+        let name = |text: &str| SearchRef::new(SearchKind::Dictionary, text.parse().unwrap());
+        let dictionary = |template: &str| SearchObject::Dictionary {
+            template: template.parse().unwrap(),
+            options: Default::default(),
+        };
+        let status_of = |live: &[(&str, &str)]| {
+            let mut recorded = pbps_model::Schema::default();
+            recorded
+                .search
+                .insert(name("app.kept"), dictionary("pg_catalog.simple"));
+            let entry = pbps_db::LedgerEntry {
+                id: 9,
+                applied_at: "2026-10-18T05:00:00.000".into(),
+                snapshot: pbps_model::StateSnapshot::new(
+                    pbps_model::StateKind::Apply,
+                    recorded,
+                    pbps_model::IdsFile::default(),
+                    "ci-deploy",
+                ),
+            };
+            let mut schema = pbps_model::Schema::default();
+            for (object, template) in live {
+                schema.search.insert(name(object), dictionary(template));
+            }
+            let pulled = pbps_db::catalog::Pulled {
+                schema,
+                ..Default::default()
+            };
+            let scoped = pbps_diff::scope(
+                &pulled.schema,
+                &entry.snapshot.ids,
+                &recorded_modules(&entry),
+                &Default::default(),
+            );
+            let mut r = row("prod", "ok");
+            record_catalog_findings(
+                &mut r,
+                &entry,
+                &pulled,
+                &scoped,
+                Ok(Default::default()),
+                pbps_config::Unmanaged::Ignore,
+            );
+            r
+        };
+        let gone = status_of(&[]);
+        assert_eq!(gone.state, "drift", "{gone:?}");
+        assert!(
+            gone.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("`app.kept` was recorded and is no longer in the database"),
+            "{gone:?}"
+        );
+        let altered = status_of(&[("app.kept", "pg_catalog.synonym")]);
+        assert_eq!(altered.state, "drift", "{altered:?}");
+        // Negative: as recorded, and one nobody recorded beside it, are not drift.
+        assert_eq!(status_of(&[("app.kept", "pg_catalog.simple")]).state, "ok");
+        let extra = status_of(&[
+            ("app.kept", "pg_catalog.simple"),
+            ("app.made_later", "pg_catalog.simple"),
+        ]);
+        assert_eq!(extra.state, "ok", "{extra:?}");
     }
 
     /// A ledger entry that recorded an empty schema, and a catalog that has one
