@@ -49,6 +49,7 @@
 //! A partition with no upper end (`MAXVALUE`) leaves nothing to run out of.
 
 use pbps_db::doctor::Reach;
+use pbps_db::pull::plural;
 use pbps_model::BoundDatum;
 
 use crate::partition_series::{
@@ -311,10 +312,6 @@ fn fmt_civil(key: Key, c: &Civil) -> String {
     }
 }
 
-fn plural(n: u32) -> String {
-    format!("{n} partition{}", if n == 1 { "" } else { "s" })
-}
-
 /// A horizon whose target is a value past the calendar, for a series whose
 /// newest rows start at `held_from`: there is no point to say a series that
 /// ends falls short of (#1924). The reason reads inside the `…-unknown`
@@ -362,7 +359,7 @@ fn need(
     newest: &Range,
 ) -> Result<(Need, String), String> {
     match horizon {
-        Horizon::Partitions(k) => Ok((Need::Partitions(*k), plural(*k))),
+        Horizon::Partitions(k) => Ok((Need::Partitions(*k), plural(*k, "partition"))),
         Horizon::Width { step, text } => match &reference.val {
             Val::Time(c) => {
                 let Some(until) = add(c, width_of(step), 1) else {
@@ -744,7 +741,7 @@ mod tests {
             assess(Key::Date, &ranges, &[], &ranges[11], &count("1 ")),
             Ok(Verdict::Covered)
         );
-        assert_eq!(plural(1), "1 partition");
+        assert_eq!(plural(1_u32, "partition"), "1 partition");
     }
 
     /// A series with a hole in it is counted by partitions, not by the span.

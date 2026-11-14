@@ -67,6 +67,7 @@ use pbps_model::{
 };
 
 use crate::types;
+use pbps_db::pull::{group, listed, plural, record_limitation};
 
 // The shapes a pull returns are `pbps-db`'s, filled here from `pg_catalog` and
 // re-exported under the paths this crate's callers and tests have always used
@@ -1875,35 +1876,6 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
     }
 }
 
-/// `1 routine` / `4 routines`.
-fn plural(n: usize, what: &str) -> String {
-    if n == 1 {
-        format!("1 {what}")
-    } else {
-        format!("{n} {what}s")
-    }
-}
-
-/// The names, capped, with the rest counted rather than printed.
-///
-/// A count alone sends the reader to write the query themselves; the whole
-/// list of every routine in a large database is a wall nobody reads. Ten and a
-/// remainder is the shape that answers "which ones" for the cases that have an
-/// answer and stays one paragraph for the ones that do not.
-fn listed(names: &[String]) -> String {
-    const SHOWN: usize = 10;
-    let mut out = names
-        .iter()
-        .take(SHOWN)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.len() > SHOWN {
-        out.push_str(&format!(" and {} more", names.len() - SHOWN));
-    }
-    out
-}
-
 /// What an `ALTER DEFAULT PRIVILEGES` entry's object type covers, in words.
 fn default_acl_objects(objtype: char) -> &'static str {
     match objtype {
@@ -2345,31 +2317,18 @@ fn after_a_qualified_name(text: &str) -> Option<&str> {
 }
 
 fn after_one_identifier(text: &str) -> Option<&str> {
-    let Some(mut rest) = text.strip_prefix('"') else {
-        // A bare identifier is what the deparser writes when no quoting is
-        // needed, and it ends at the first character that cannot continue one.
-        let end = text
-            .find(|c: char| !pbps_dialect::continues_ident(c))
-            .unwrap_or(text.len());
-        return (end > 0).then(|| &text[end..]);
-    };
-    loop {
-        let close = rest.find('"')?;
-        let tail = &rest[close + 1..];
-        // A doubled quote is a quote inside the name and does not close it.
-        match tail.strip_prefix('"') {
-            Some(after) => rest = after,
-            None => return Some(tail),
-        }
+    if text.starts_with('"') {
+        // The dialect's own reader of `"…"`, where a doubled quote is a quote
+        // inside the name and does not close it: one rule, not a second
+        // spelling that could drift from it.
+        return pbps_dialect::quoted_identifier_len(text).map(|len| &text[len..]);
     }
-}
-
-fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Vec<&T>> {
-    let mut out: BTreeMap<K, Vec<&T>> = BTreeMap::new();
-    for item in items {
-        out.entry(key(item)).or_default().push(item);
-    }
-    out
+    // A bare identifier is what the deparser writes when no quoting is
+    // needed, and it ends at the first character that cannot continue one.
+    let end = text
+        .find(|c: char| !pbps_dialect::continues_ident(c))
+        .unwrap_or(text.len());
+    (end > 0).then(|| &text[end..])
 }
 
 /// The names of this table that the declaration format cannot write back, if
@@ -2636,8 +2595,12 @@ fn note_module(pulled: &mut Pulled, kind: &'static str, target: LimitationTarget
 }
 
 fn note_target(pulled: &mut Pulled, target: LimitationTarget, detail: String) {
-    pulled.warnings.push(detail.clone());
-    pulled.limitations.push(Limitation { target, detail });
+    record_limitation(
+        &mut pulled.warnings,
+        &mut pulled.limitations,
+        Some(target),
+        detail,
+    );
 }
 
 /// The sequences a column's default uses, each named as a limitation: the
@@ -9613,5 +9576,53 @@ mod tests {
         let opaque = ColumnType::simple(ty.raw().to_string());
         assert!(!survives_the_declaration(&opaque));
         assert_ne!(opaque, ty);
+    }
+
+    /// The hand-written scan this reader used before it asked the dialect for
+    /// the quoted case, kept as the reference the shared one must agree with.
+    fn reference_after_one_identifier(text: &str) -> Option<&str> {
+        let Some(mut rest) = text.strip_prefix('"') else {
+            let end = text
+                .find(|c: char| !pbps_dialect::continues_ident(c))
+                .unwrap_or(text.len());
+            return (end > 0).then(|| &text[end..]);
+        };
+        loop {
+            let close = rest.find('"')?;
+            let tail = &rest[close + 1..];
+            match tail.strip_prefix('"') {
+                Some(after) => rest = after,
+                None => return Some(tail),
+            }
+        }
+    }
+
+    #[test]
+    fn stepping_over_a_name_agrees_with_the_reference_on_every_short_text() {
+        // Every text up to seven characters over the characters that decide
+        // the answer: the quote, a name character, a dot, a space, and a
+        // multi-byte character (a byte offset must stay on a boundary).
+        let alphabet = ['"', 'a', '.', ' ', '\u{e9}'];
+        let mut texts = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..7 {
+            level = level
+                .iter()
+                .flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}")))
+                .collect();
+            texts.extend(level.iter().cloned());
+        }
+        for text in &texts {
+            assert_eq!(
+                after_one_identifier(text),
+                reference_after_one_identifier(text),
+                "{text:?}"
+            );
+        }
+        // The shapes that matter, spelled out: a doubled quote stays inside
+        // the name, and a name that never closes has no end.
+        assert_eq!(after_one_identifier(r#""a""b" rest"#), Some(" rest"));
+        assert_eq!(after_one_identifier(r#""a"#), None);
+        assert_eq!(after_one_identifier(""), None);
     }
 }

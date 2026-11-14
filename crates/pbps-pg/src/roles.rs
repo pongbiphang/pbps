@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use pbps_db::pull::plural;
 use pbps_db::{Conn, DbError, Param, Row};
 use pbps_dialect::DialectError;
 use pbps_model::{Permission, Role};
@@ -313,16 +314,8 @@ impl DropBlocker {
             "`{}` {what} {} {where_}; run {remedy} -- in that database, since neither statement \
              reaches beyond the one it runs in (ADR-0010 section 4)",
             self.role.shown(),
-            plural(self.objects),
+            plural(self.objects, "object"),
         )
-    }
-}
-
-fn plural(n: i64) -> String {
-    if n == 1 {
-        "1 object".to_owned()
-    } else {
-        format!("{n} objects")
     }
 }
 

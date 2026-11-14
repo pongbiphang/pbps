@@ -2217,8 +2217,13 @@ pub fn after_string_gap(mut text: &str) -> (&str, bool) {
 }
 
 /// The length of the `"…"` at the front of `text`, a doubled quote being a
-/// quote inside the name; `None` where it never closes.
-fn quoted_identifier_len(text: &str) -> Option<usize> {
+/// quote inside the name; `None` where it never closes. `text` must start with
+/// the opening quote.
+///
+/// Public because `pbps-pg` steps over a deparsed name with it, and a second
+/// spelling of the doubled-quote rule is how two readers come to disagree.
+#[must_use]
+pub fn quoted_identifier_len(text: &str) -> Option<usize> {
     let mut at = 1;
     loop {
         let close = at + text[at..].find('"')?;
@@ -2231,15 +2236,28 @@ fn quoted_identifier_len(text: &str) -> Option<usize> {
     }
 }
 
-/// Where the block comment opening at `at` closes, or `None` where it never
-/// does.
+/// Where the block comment opening at `at` closes (the offset just past its
+/// final `*/`), or `None` where it never does.
 ///
 /// Byte-wise, and safely so: `/` and `*` are ASCII, and a UTF-8 continuation
 /// byte is never an ASCII byte, so no multi-byte character can contain a false
-/// opener or closer. They **nest** on both measured engines, which is why this
-/// counts depth rather than looking for the first `*/`
-/// (see [`Lexicon`]'s own note).
-fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
+/// opener or closer, and every offset returned is a character boundary.
+/// Stepping two bytes past each delimiter is what keeps `/*/` from reading as
+/// an opener that also closes itself. They **nest** on both measured engines,
+/// which is why this counts depth rather than looking for the first `*/`
+/// (see [`Lexicon`]'s own note): ending early would read the rest of the outer
+/// comment as code.
+///
+/// `at` is where an opener starts. A `*/` met at depth zero is no closer, so a
+/// start that is not an opener skips it rather than subtracting from zero: an
+/// unmatched `*/` makes this read no comment there, where a wrapping
+/// subtraction would make it read to the end of the text.
+///
+/// Public because `pbps-mssql` skips the comments in a stored module header
+/// with it, and a second spelling of the nesting rule is how two readers come
+/// to disagree about where a comment ends.
+#[must_use]
+pub fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = at;
@@ -2249,7 +2267,7 @@ fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
                 depth += 1;
                 i += 2;
             }
-            (b'*', b'/') => {
+            (b'*', b'/') if depth > 0 => {
                 depth -= 1;
                 i += 2;
                 if depth == 0 {
@@ -8216,5 +8234,72 @@ UESCAPE '!' AS s";
             assert_eq!(keys.len(), 2);
             assert_eq!(keys.get(&arg), Some(&"raw"));
         }
+    }
+
+    /// The scan `pbps-mssql` kept for itself before it used this one: the
+    /// length of the comment `s` opens, with the subtraction guarded.
+    fn reference_block_comment(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let (mut depth, mut i) = (0usize, 0usize);
+        while i + 1 < bytes.len() {
+            match (bytes[i], bytes[i + 1]) {
+                (b'/', b'*') => {
+                    depth += 1;
+                    i += 2;
+                }
+                (b'*', b'/') if depth > 0 => {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_block_comment_ends_where_the_reference_scan_says_for_every_short_text() {
+        // Every text up to nine characters over the characters that decide the
+        // answer, plus a multi-byte one (an offset must stay on a boundary).
+        let alphabet = ["/", "*", "a", "\u{e9}"];
+        let mut level = vec![String::new()];
+        let mut compared = 0;
+        for _ in 0..9 {
+            level = level
+                .iter()
+                .flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}")))
+                .collect();
+            for text in level.iter().filter(|t| t.starts_with("/*")) {
+                assert_eq!(
+                    closing_block_comment(text, 0),
+                    reference_block_comment(text),
+                    "{text:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 20_000, "{compared}");
+    }
+
+    #[test]
+    fn a_block_comment_nests_and_a_slash_star_slash_does_not_close_itself() {
+        assert_eq!(closing_block_comment("/* a /* b */ c */ 1", 0), Some(17));
+        assert_eq!(closing_block_comment("/*/ x */", 0), Some(8));
+        assert_eq!(closing_block_comment("/* a /* b */ c", 0), None);
+        assert_eq!(closing_block_comment("/* never", 0), None);
+        assert_eq!(closing_block_comment("x /* \u{e9} */ y", 2), Some(10));
+    }
+
+    #[test]
+    fn an_unmatched_closer_is_no_comment_and_never_panics_or_wraps() {
+        // At depth zero a `*/` is skipped, not subtracted from.
+        assert_eq!(closing_block_comment("*/", 0), None);
+        assert_eq!(closing_block_comment("*/ a", 0), None);
+        assert_eq!(closing_block_comment("a */ b */", 0), None);
+        // A comment that opens after the stray closer is still read whole.
+        assert_eq!(closing_block_comment("*/ /* x */", 0), Some(10));
     }
 }
