@@ -2627,7 +2627,11 @@ the resolver's plan.
 
 Recorded in SPEC §9.3.2 and §9.8, README, STATUS and RESOLVER-DELIVERY.
 Pinned by the live tests `resolver_recheck_binds_the_target_by_engine_identity`,
-`resolver_recheck_refuses_a_target_changed_after_the_run`,
+`resolver_recheck_refuses_a_prerequisite_created_after_the_run`,
+`resolver_recheck_refuses_a_captured_routine_mutated_in_place_after_the_run`,
+`resolver_recheck_refuses_a_compared_setting_changed_after_the_run`,
+`resolver_recheck_refuses_an_extension_created_after_the_run`,
+`resolver_recheck_refuses_a_schema_owner_changed_after_the_run`,
 `resolver_recheck_refuses_an_external_shape_changed_after_planning` and
 `resolver_seals_an_accepted_build_limitation_and_rechecks_it`
 (`resolver::server::scratch`), `resolver_publishes_its_rechecked_plan_in_the_exact_order`

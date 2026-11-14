@@ -1,5 +1,5 @@
 //! Standing-policy delivery and its pre-DDL and transactional boundaries.
-use super::row_security_roundtrip::{Roles, assert_noop, versions};
+use super::row_security_roundtrip::{Roles, assert_noop, on_version, versions};
 use super::*;
 
 pub(super) const ALLOW: &[&str] = &["--allow", "row-security,revoke,destructive,rename,not-null"];
@@ -37,10 +37,8 @@ fn apply(d: &Demo, connection: &str) -> pbps_model::SavedPlan {
     saved
 }
 
-#[test]
-#[ignore = "needs both live PostgreSQL versions"]
-fn row_security_c_standing_transitions_apply_verify_and_replan_empty() {
-    versions(|base, _| {
+fn row_security_c_standing_transitions_apply_verify_and_replan_empty(pg: Pg) {
+    on_version(pg, |base, _| {
         let mut roles = Roles::new(base);
         let first = roles.create("c_target_a", "");
         let second = roles.create("c_target_b", "");
@@ -116,6 +114,10 @@ fn row_security_c_standing_transitions_apply_verify_and_replan_empty() {
             }
         }
     });
+}
+
+on_both_servers! {
+    row_security_c_standing_transitions_apply_verify_and_replan_empty => row_security_c_standing_transitions_apply_verify_and_replan_empty,
 }
 
 #[test]
