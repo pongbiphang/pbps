@@ -1906,3 +1906,19 @@ other tests. Explicit caller overrides still change the digest and retain the
 runners' nonempty-value precedence; an empty override uses the tree default
 but remains a caller input. Excluding the image names outright would lose
 that distinction. Python and whole-Cargo proofs retain their existing environment.
+
+<a id="dec-2860-1"></a>
+
+**DEC-2860.1. The merge group runs `flow_pg` in four shares, and the split
+stays round-robin.** The longest job of a merge-group run was always one of the
+three `live-pg (flow-N)` shares, which looked like an uneven split (#2860). It
+is not: over twelve consecutive merge-group runs the three test steps averaged
+55, 48 and 52 minutes, each share was the slowest in some run, and one share
+ranged from 38 to 65 minutes. Locally measured weights predict the round-robin
+shares within 8% of each other. The spread is the hosted runner, so a split by
+measured weight would add a checked-in data file and a refresh duty and move
+nothing; it was built and discarded. A fourth share cuts each share's work by
+a quarter whatever the runner does. After it, `resolver-mssql` and
+`live-pg (dialect)`, at 35 to 43 minutes, bound the run together with the
+slowest share. The rule that assigns each listed test to exactly one share
+(DEC-2434.1) is unchanged; only the share count is.
