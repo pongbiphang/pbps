@@ -326,7 +326,7 @@ test('every flow share has the full-list CI entry and both servers and packages'
       {}, {}, { suite })), isFlow);
     for (const step of selected) {
       const command = step.match(/^run: (.+)$/m)[1];
-      const match = command.match(/^python3 scripts\/live-shards\.py ci ([0-9]+)\/3 test -p pbps-cli --test flow_pg -- --ignored$/);
+      const match = command.match(/^python3 scripts\/live-shards\.py ci ([0-9]+)\/4 test -p pbps-cli --test flow_pg -- --ignored$/);
       assert.ok(match, 'the entry enumerates the complete ignored list without name filters');
       selectors.push(Number(match[1]));
       assert.match(step, /^          PBPS_TEST_PG_CONTAINER: \$\{\{ job\.services\.postgres\.id \}\}$/m);
@@ -334,7 +334,7 @@ test('every flow share has the full-list CI entry and both servers and packages'
       assert.doesNotMatch(step, /continue-on-error/);
     }
   }
-  assert.deepEqual(selectors.sort(), [0, 1, 2], 'all three distinct shares execute');
+  assert.deepEqual(selectors.sort(), [0, 1, 2, 3], 'all four distinct shares execute');
   assert.doesNotMatch(block, /cargo test -p pbps-cli --test flow_pg/);
   assert.doesNotMatch(block, /scripts\/ui-browser\.py|pbps-ui-build/);
 });
