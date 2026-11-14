@@ -106,6 +106,9 @@ pub(super) fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::
         // `ALTER INDEX … SET` after the creation is not this plan's (#1483
         // review).
         && declared.storage_parameters == now.storage_parameters
+        // In the `CREATE`'s own clause, so held as the table's rows are
+        // (#2813, DEC-1774.1).
+        && declared.filegroup == now.filegroup
 }
 
 /// Whether an exclusion constraint read back is the one declared (DEC-2448.3):
@@ -160,6 +163,7 @@ pub(super) fn primary_key_as_declared(
             .is_some_and(|n| Some(n) != now.name.as_ref())
         // As an index's (#1442, #1483 review).
         && declared.storage_parameters == now.storage_parameters
+        && declared.filegroup == now.filegroup
 }
 
 /// `schema` with each owned sequence's name set to the one it has

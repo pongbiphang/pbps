@@ -819,6 +819,7 @@ fn a_new_replica_identity_index_does_not_order_the_old_one_s_parameter_change() 
         filter: None,
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut was = table_with(&["a"]);
     was.indexes.insert("ix_old".into(), index());
@@ -901,6 +902,7 @@ fn a_replica_identity_moves_to_a_standing_index_before_the_old_one_is_dropped() 
         filter: None,
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut was = table_with(&[]);
     let mut a = Column::new(int());
@@ -1012,6 +1014,7 @@ fn self_referencing(with_key: bool) -> Table {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     if with_key {
         table.foreign_keys.insert(
@@ -1150,6 +1153,7 @@ fn the_rows_of_a_table_referencing_itself_keep_the_order_given() {
         pbps_model::UniqueConstraint {
             columns: vec!["code".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.foreign_keys.insert(
@@ -1210,6 +1214,7 @@ fn a_replica_identity_target_made_usable_by_the_plan_is_switched_to_last() {
         filter: None,
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let nullable = |not_null: bool| {
         let mut table = table_with(&[]);
@@ -1299,6 +1304,7 @@ fn tightened_column(logical: Vec<PlannedChange>) -> Plan {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table
     };
@@ -1561,6 +1567,7 @@ fn a_primary_key_over_a_column_the_plan_tightens_follows_the_tightening() {
         name: None,
         columns: vec!["n".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let (mut before, mut after) = (Schema::default(), Schema::default());
     before.tables.insert(t("t"), was);
@@ -2126,6 +2133,7 @@ fn checked(was: &str, will: &str, update: pbps_model::Cell) -> Plan {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.checks.insert(
             "ck".into(),
@@ -2227,6 +2235,7 @@ fn a_unique_constraint_kept_through_a_rename_or_a_parameter_change_is_not_replac
         storage_parameters: fill
             .map(|f| [("fillfactor".to_owned(), f.to_owned())].into())
             .unwrap_or_default(),
+        filegroup: None,
     };
     let requires_absent =
         |was: pbps_model::UniqueConstraint, will: pbps_model::UniqueConstraint, renamed: bool| {
@@ -2317,6 +2326,7 @@ fn a_foreign_key_added_follows_the_parent_rows_the_plan_writes() {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table
     };
@@ -2522,6 +2532,7 @@ fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_c
         filter: None,
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut a = Column::new(int());
     a.nullable = false;
@@ -3162,6 +3173,7 @@ fn rows_across(
         pbps_model::UniqueConstraint {
             columns: strings(key),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let mut child = table_with(&[&["id"], child_columns].concat());
@@ -3263,6 +3275,7 @@ fn a_retype_beside_a_foreign_key_the_plan_keeps_is_recorded_and_not_refused() {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let mut child = table_with(&["pid"]);
     child.foreign_keys.insert(
@@ -3356,6 +3369,7 @@ fn parent_and_child(
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     if !unique.is_empty() {
         parent.unique.insert(
@@ -3363,6 +3377,7 @@ fn parent_and_child(
             pbps_model::UniqueConstraint {
                 columns: unique.iter().map(|c| (*c).into()).collect(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }
@@ -3371,6 +3386,7 @@ fn parent_and_child(
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     child.foreign_keys.insert("fk".into(), fk);
     let (mut before, mut after) = (Schema::default(), Schema::default());
@@ -3511,6 +3527,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
         filter: None,
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let swap = |key: i64, from: i64, to: i64| {
         p(Change::UpdateRow {
@@ -3753,6 +3770,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
             pbps_model::UniqueConstraint {
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table
@@ -4424,6 +4442,7 @@ fn one_index(name: &str, column: &str) -> (String, pbps_model::Index) {
             filter: None,
             method: IndexMethod::Btree,
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     )
 }
@@ -4819,6 +4838,7 @@ fn a_unique_key_follows_the_rows_it_validates() {
         pbps_model::UniqueConstraint {
             columns: vec!["c".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     refused_backwards(&on_one_table(
@@ -4862,6 +4882,7 @@ fn a_foreign_key_follows_the_key_it_references() {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut parent_after = table_with(&["id"]);
     parent_after.primary_key = Some(key.clone());
@@ -4969,6 +4990,7 @@ fn a_primary_key_s_drop_follows_the_drop_of_the_table_whose_key_references_it() 
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 to: None,
                 nonclustered: false,

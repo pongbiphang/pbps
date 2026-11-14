@@ -397,6 +397,7 @@ pub(crate) fn convert_for_diagnostics(
             name: None,
             columns,
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         Some(PrimaryKeyDto::Spec(spec)) => Some(PrimaryKey {
             name: spec.name,
@@ -408,6 +409,7 @@ pub(crate) fn convert_for_diagnostics(
                 btree_help,
                 &mut errs,
             ),
+            filegroup: spec.filegroup.map(pbps_model::Filegroup::new),
         }),
     };
 
@@ -417,6 +419,7 @@ pub(crate) fn convert_for_diagnostics(
             UniqueDto::Columns(columns) => UniqueConstraint {
                 columns,
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             UniqueDto::Spec(spec) => UniqueConstraint {
                 columns: spec.columns,
@@ -427,6 +430,7 @@ pub(crate) fn convert_for_diagnostics(
                     btree_help,
                     &mut errs,
                 ),
+                filegroup: spec.filegroup.map(pbps_model::Filegroup::new),
             },
         };
         unique.insert(k, constraint);
@@ -858,6 +862,7 @@ pub(crate) fn convert_for_diagnostics(
                     indexes,
                     exclude,
                     data,
+                    filegroup: dto.filegroup.map(pbps_model::Filegroup::new),
                     clustered: dto.clustered.map(|c| match c {
                         ClusteredDto::Heap => Clustered::Heap,
                         ClusteredDto::Unique(name) => Clustered::Unique(name),
@@ -1097,6 +1102,7 @@ fn convert_indexes(
                     filter: ix.filter,
                     method,
                     storage_parameters,
+                    filegroup: ix.filegroup.map(pbps_model::Filegroup::new),
                 },
             );
         }

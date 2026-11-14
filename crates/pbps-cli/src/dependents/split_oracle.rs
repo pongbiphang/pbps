@@ -227,6 +227,7 @@ fn schema() -> Schema {
                 filter,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }

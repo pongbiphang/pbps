@@ -231,6 +231,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Default::default()
         }
@@ -475,6 +476,7 @@ mod tests {
                     constraint: pbps_model::UniqueConstraint {
                         columns: vec!["b".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                     clustered: false,
                 },

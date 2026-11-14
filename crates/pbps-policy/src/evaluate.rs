@@ -799,6 +799,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         s.tables.insert("dbo.customer".parse().unwrap(), t);

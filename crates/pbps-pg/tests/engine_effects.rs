@@ -313,6 +313,7 @@ fn an_index_key_naming_a_package_class_requires_the_package_and_an_engine_class_
                     filter: None,
                     method: IndexMethod::Gin,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -422,6 +423,7 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
                     filter: None,
                     method: IndexMethod::Btree,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }

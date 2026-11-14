@@ -352,6 +352,17 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         defaults::history_references(self.name(), declared)
     }
 
+    /// Refuses a declared SQL Server filegroup the target cannot place the
+    /// object on (#2813, DEC-2813.1). PostgreSQL's `validate` refuses the
+    /// field outright, so the default asks nothing.
+    async fn refuse_unknown_filegroups(
+        &self,
+        _conn: &mut Conn,
+        _declared: &Schema,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Reconciles incoming and renamed cluster roles against the read the
     /// baseline checksum was computed from, inserting what it found into
     /// `expected`. Not an `async fn`: it asks no further question of the
@@ -2597,6 +2608,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             schema

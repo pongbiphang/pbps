@@ -146,11 +146,11 @@ pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
     BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ExclusionConstraint,
-    ExclusionKey, ExclusionTiming, Extension, ForeignKey, Generated, Identity, Index, IndexColumn,
-    IndexKey, IndexMethod, ListDatum, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn,
-    PartitionOf, PartitionStrategy, PolicyCommand, PolicyRoles, PrimaryKey, ReferentialAction,
-    ReplicaIdentity, Retention, RetentionUnit, RowPolicy, RowSecurity, Schema, SequenceOptions,
-    SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
+    ExclusionKey, ExclusionTiming, Extension, Filegroup, ForeignKey, Generated, Identity, Index,
+    IndexColumn, IndexKey, IndexMethod, ListDatum, OwnedSequence, PartitionBound, PartitionBy,
+    PartitionColumn, PartitionOf, PartitionStrategy, PolicyCommand, PolicyRoles, PrimaryKey,
+    ReferentialAction, ReplicaIdentity, Retention, RetentionUnit, RowPolicy, RowSecurity, Schema,
+    SequenceOptions, SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
 pub use search::{SearchKind, SearchObject, SearchRef};
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};

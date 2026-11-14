@@ -6053,6 +6053,7 @@ mod tests {
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["v".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },
@@ -6103,6 +6104,7 @@ mod tests {
                 constraint: pbps_model::UniqueConstraint {
                     columns: columns.clone(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },
@@ -6121,6 +6123,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             },
@@ -6131,6 +6134,7 @@ mod tests {
                     name: None,
                     columns: columns.clone(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 nonclustered: false,
             },
@@ -6454,6 +6458,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -7410,6 +7415,7 @@ mod tests {
                     constraint: pbps_model::UniqueConstraint {
                         columns: vec!["v".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                     clustered: false,
                 },
@@ -7431,6 +7437,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     }),
                     clustered: false,
                 },
@@ -7444,6 +7451,7 @@ mod tests {
                         name: None,
                         columns: vec!["v".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     }),
                     nonclustered: false,
                 },
@@ -7823,6 +7831,7 @@ mod tests {
                 filter: None,
                 method: pbps_model::IndexMethod::default(),
                 storage_parameters: BTreeMap::new(),
+                filegroup: None,
             }),
             clustered: false,
         };

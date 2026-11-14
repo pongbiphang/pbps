@@ -1162,6 +1162,7 @@ mod tests {
                     name: Some(name.into()),
                     columns: vec!["id".into()],
                     storage_parameters: BTreeMap::new(),
+                    filegroup: None,
                 };
                 before.tables.get_mut(&r).unwrap().primary_key = Some(key("pk_r"));
                 let trigger = ModuleId::Trigger {
@@ -1198,6 +1199,7 @@ mod tests {
                             UniqueConstraint {
                                 columns: vec!["id".into()],
                                 storage_parameters: BTreeMap::new(),
+                                filegroup: None,
                             },
                         );
                         target.replica_identity = Some(ReplicaIdentity::Unique("audit".into()));

@@ -589,6 +589,7 @@ mod local_name_key_tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let changes = ChangeSet {
             changes: vec![
@@ -598,6 +599,7 @@ mod local_name_key_tests {
                     constraint: pbps_model::UniqueConstraint {
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                     clustered: false,
                 }),

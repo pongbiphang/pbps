@@ -1433,6 +1433,7 @@ mod tests {
             name: None,
             columns: c.into_iter().map(pbps_model::ColumnName::from).collect(),
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t
     }

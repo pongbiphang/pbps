@@ -120,6 +120,8 @@ pub struct RawBase {
     pub is_primary: bool,
     pub is_unique_constraint: bool,
     pub placement: Placement,
+    /// The name of the filegroup the rows are on, where they are on one.
+    pub filegroup: Option<String>,
 }
 
 impl RawBase {
@@ -131,6 +133,7 @@ impl RawBase {
             is_primary: false,
             is_unique_constraint: false,
             placement: Placement::Unreadable,
+            filegroup: None,
         }
     }
 
@@ -142,6 +145,7 @@ impl RawBase {
             is_primary: false,
             is_unique_constraint: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         }
     }
 
@@ -478,6 +482,8 @@ pub struct RawKeyColumn {
     pub index_type: u8,
     /// The data space of the key's own backing index (#1227).
     pub placement: Placement,
+    /// The name of the filegroup it is on, where it is on one (#2813).
+    pub filegroup: Option<String>,
     pub object_id: i32,
     pub constraint_name: pbps_model::ObjectLocalName,
     pub is_primary: bool,
@@ -642,6 +648,7 @@ fn indexed_view(
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
         if i.is_included {
             index.include.push(i.column.clone().into());
@@ -728,6 +735,7 @@ pub struct RawIndexColumn {
     pub is_descending: bool,
     /// The data space of the index itself; see [`RawKeyColumn`].
     pub placement: Placement,
+    pub filegroup: Option<String>,
 }
 
 /// One view, procedure, function or trigger, as `sys.objects` and
@@ -1358,58 +1366,46 @@ fn base_obstacle(raw: &RawCatalog, t: &RawTable) -> Option<(&'static str, String
     }
 }
 
-/// The one notice for a declared table whose rows, keys or indexes sit on a
-/// filegroup that is not the database's default (DEC-1227.1). The declarations
-/// hold no filegroup, so a bootstrap places each on the target's default; the
-/// object is kept, since refusing it would block adopting a database that uses
-/// filegroups for placement. A key or index is named only when the declarations
-/// kept it, and a history table counts with its table.
-fn filegroup_notice(
-    raw: &RawCatalog,
-    id: i32,
-    table: &TableName,
-    members: Option<BTreeSet<String>>,
-) -> Option<String> {
+/// The one notice for a declared table whose history table sits on a filegroup
+/// that is not the database's default (DEC-1227.1). The table's own rows, keys
+/// and indexes are declared with their filegroup (DEC-2813.1) and draw none;
+/// the history table is built by the engine and the declarations hold no
+/// placement for it, so a bootstrap places it on the target's default.
+fn filegroup_notice(raw: &RawCatalog, id: i32, table: &TableName) -> Option<String> {
     let current = raw.tables.iter().find(|t| t.object_id == id)?;
-    let mut what: Vec<String> = Vec::new();
-    let members = members.unwrap_or_default();
-    // The clustered base is also a key or an index of the table; once is enough.
-    let base_labels: Vec<String> = current
-        .base
-        .name
-        .iter()
-        .flat_map(|n| {
-            ["primary key", "unique constraint", "index"]
-                .map(|kind| format!("{kind} `{}`", n.shown()))
-        })
-        .collect();
-    // The base is named only when its declaration survives: a heap always does,
-    // and a clustered one does when the key and index loops kept it, which is
-    // when it is among the members. A clustered columnstore base is left out as
-    // unmodelled, and a notice that it will land on the default filegroup would
-    // describe an object the pull does not declare.
-    let base_declared =
-        current.base.index_type == Some(0) || base_labels.iter().any(|l| members.contains(l));
-    if current.base.placement == Placement::OffDefaultFilegroup && base_declared {
-        what.push(format!("its base ({})", current.base.owner()));
-    }
-    what.extend(members.into_iter().filter(|m| !base_labels.contains(m)));
     let history = current
         .history_table_id
         .filter(|_| current.temporal_type == 2)
-        .and_then(|h| raw.tables.iter().find(|t| t.object_id == h));
-    if let Some(h) = history
-        && (h.base.placement == Placement::OffDefaultFilegroup
-            || raw.index_columns.iter().any(|i| {
-                i.object_id == h.object_id && i.placement == Placement::OffDefaultFilegroup
-            }))
+        .and_then(|h| raw.tables.iter().find(|t| t.object_id == h))?;
+    if history.base.placement == Placement::OffDefaultFilegroup
+        || raw.index_columns.iter().any(|i| {
+            i.object_id == history.object_id && i.placement == Placement::OffDefaultFilegroup
+        })
     {
-        what.push("its history table".to_owned());
+        return Some(filegroup_message(
+            &table.shown().to_string(),
+            &["its history table".to_owned()],
+        ));
     }
-    if what.is_empty() {
-        return None;
+    None
+}
+
+/// What a nonclustered key or index writes as its `filegroup` (DEC-2813.1):
+/// none where it sits where its table's rows do, which is where the engine
+/// puts an object that names no filegroup, and its own name otherwise. The
+/// clustered object is the table's rows, so it always agrees with them.
+///
+/// "Where its rows are" is the same filegroup, and both names come from the
+/// one catalog, which spells a filegroup one way under every collation. So
+/// they are compared exactly: on a case-sensitive database `fgx` and `FGX` are
+/// two filegroups, and folding them would drop an index's placement, which a
+/// later rebuild would then move onto the table's.
+fn own_filegroup(own: &Option<String>, rows: Option<&String>) -> Option<pbps_model::Filegroup> {
+    let own = own.as_deref()?;
+    match rows {
+        Some(rows) if rows == own => None,
+        _ => Some(pbps_model::Filegroup::new(own)),
     }
-    Some(filegroup_message(&table.shown().to_string(), &what))
 }
 
 /// The one wording of the notice, for a table and for a view alike.
@@ -1887,7 +1883,12 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     // What of each declared table sits on a filegroup other than the default:
     // declared as it is, and named in one notice per table (DEC-1227.1).
-    let mut off_default: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
+    // Where each table's rows are, by name, which a key or index is compared to.
+    let rows_on: BTreeMap<i32, &String> = raw
+        .tables
+        .iter()
+        .filter_map(|t| Some((t.object_id, t.base.filegroup.as_ref()?)))
+        .collect();
     let mut unsupported_keys = BTreeSet::new();
     for k in &raw.key_columns {
         let Some(table) = tables.get_mut(&k.object_id) else {
@@ -2008,22 +2009,12 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             _ => {}
         }
-        if k.placement == Placement::OffDefaultFilegroup {
-            off_default.entry(k.object_id).or_default().insert(format!(
-                "{} `{}`",
-                if k.is_primary {
-                    "primary key"
-                } else {
-                    "unique constraint"
-                },
-                k.constraint_name.shown()
-            ));
-        }
         if k.is_primary {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
                 name: Some(k.constraint_name.clone()),
                 columns: Vec::new(),
                 storage_parameters: Default::default(),
+                filegroup: own_filegroup(&k.filegroup, rows_on.get(&k.object_id).copied()),
             });
             pk.columns.push(k.column.clone().into());
         } else {
@@ -2033,6 +2024,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .or_insert_with(|| UniqueConstraint {
                     columns: Vec::new(),
                     storage_parameters: Default::default(),
+                    filegroup: own_filegroup(&k.filegroup, rows_on.get(&k.object_id).copied()),
                 })
                 .columns
                 .push(k.column.clone().into());
@@ -2145,12 +2137,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if i.kind == IndexKind::Clustered {
             clustered_on.insert(i.object_id, Clustered::Index(i.index_name.clone()));
         }
-        if i.placement == Placement::OffDefaultFilegroup {
-            off_default
-                .entry(i.object_id)
-                .or_default()
-                .insert(format!("index `{}`", i.index_name.shown()));
-        }
         let index = table
             .indexes
             .entry(i.index_name.clone())
@@ -2164,6 +2150,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .map(|f| strip_stored_parens(f).to_owned()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: own_filegroup(&i.filegroup, rows_on.get(&i.object_id).copied()),
             });
         if i.is_included {
             index.include.push(i.column.clone().into());
@@ -2384,7 +2371,24 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     let mut filegroup_notices: BTreeMap<String, String> = BTreeMap::new();
     let mut schema = Schema::default();
-    for (id, table) in tables {
+    for (id, mut table) in tables {
+        // Where the rows are, when that is not the database's default. A base
+        // the declarations leave out (a clustered columnstore) has no
+        // declaration to carry it (DEC-2813.1).
+        if let Some(t) = raw.tables.iter().find(|t| t.object_id == id)
+            && t.base.placement == Placement::OffDefaultFilegroup
+            && match (&t.base.index_type, &t.base.name) {
+                (Some(0), _) => true,
+                (Some(1), Some(n)) => {
+                    table.primary_key.as_ref().and_then(|k| k.name.as_ref()) == Some(n)
+                        || table.unique.contains_key(n)
+                        || table.indexes.contains_key(n)
+                }
+                _ => false,
+            }
+        {
+            table.filegroup = t.base.filegroup.as_deref().map(pbps_model::Filegroup::new);
+        }
         // A table whose every column was unsupported must not be declared as an
         // empty table — that would plan the drop of the columns it really has.
         if table.columns.is_empty() {
@@ -2400,7 +2404,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
         let name = names.remove(&id).unwrap();
-        if let Some(notice) = filegroup_notice(raw, id, &name, off_default.remove(&id)) {
+        if let Some(notice) = filegroup_notice(raw, id, &name) {
             filegroup_notices.insert(name.shown().to_string(), notice);
         }
         schema.tables.insert(name, table);
@@ -2954,6 +2958,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         RawCatalog {
             tables: vec![current, history],
@@ -3601,6 +3606,7 @@ mod tests {
                 is_primary: true,
                 column: "id".into(),
                 placement: Placement::Filegroup,
+                filegroup: None,
             }],
             ..Default::default()
         }
@@ -4021,6 +4027,7 @@ mod tests {
                 is_primary: true,
                 column: "email".into(),
                 placement: Placement::Filegroup,
+                filegroup: None,
             },
             RawKeyColumn {
                 is_disabled: false,
@@ -4031,6 +4038,7 @@ mod tests {
                 is_primary: true,
                 column: "id".into(),
                 placement: Placement::Filegroup,
+                filegroup: None,
             },
         ];
         let p = assemble(&raw);
@@ -4199,6 +4207,7 @@ mod tests {
             is_primary,
             column: column.into(),
             placement: Placement::Filegroup,
+            filegroup: None,
         }
     }
 
@@ -4226,6 +4235,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         raw.index_columns = vec![
             index(1, "ux_p_code", IndexKind::Unmodelled(7), false),
@@ -4343,6 +4353,7 @@ mod tests {
             is_included,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         raw.index_columns = vec![
             index("ix_hidden", "hidden", false),
@@ -4533,6 +4544,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         raw.index_columns = vec![
             index("ix_c", "c", None),
@@ -4641,6 +4653,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         });
         for (name, ref_object_id, ref_table, ref_key, ref_column) in [
             ("fk_child_h", 1, "h", "pk_h", "id"),
@@ -4673,6 +4686,7 @@ mod tests {
                 name: Some(name.into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             })
         };
         assert_eq!(table("h").primary_key, pk("pk_h"));
@@ -4741,6 +4755,7 @@ mod tests {
             is_included: false,
             is_descending: true,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         raw.index_columns.push(base.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -4778,6 +4793,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         raw.index_columns.push(customer_index.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -4815,6 +4831,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         let mut raw = one_table_catalog();
         raw.key_columns[0].index_type = 2;
@@ -4861,7 +4878,15 @@ mod tests {
             is_primary,
             is_unique_constraint: false,
             placement,
+            filegroup: filegroup_of(placement),
         }
+    }
+
+    /// The filegroup a placement stands for in these fixtures: a user filegroup
+    /// for an off-default one, and none named for the rest, which a test that
+    /// is about names sets itself.
+    fn filegroup_of(placement: Placement) -> Option<String> {
+        (placement == Placement::OffDefaultFilegroup).then(|| "fgx".to_owned())
     }
 
     fn ix(object_id: i32, name: &str, is_unique: bool, placement: Placement) -> RawIndexColumn {
@@ -4877,6 +4902,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement,
+            filegroup: filegroup_of(placement),
         }
     }
 
@@ -5255,12 +5281,21 @@ mod tests {
     }
 
     /// A table, key or index on a filegroup that is not the database's default
-    /// is declared as it is and named in ONE report-only notice per table; one
-    /// on the default filegroup, or on none the catalog could not read, draws
-    /// none (DEC-1227.1). The notice is no limitation: a managed table must
-    /// stay adoptable.
+    /// is declared with it and draws no notice (DEC-2813.1, which replaces
+    /// DEC-1227.1's for these objects). A nonclustered object names its own only
+    /// where it is not beside its table's rows, so one on the default filegroup
+    /// under a table elsewhere has to say so, and one beside the table's rows
+    /// says nothing. The clustered object never does: it is the table's rows.
     #[test]
-    fn an_off_default_filegroup_is_declared_and_noticed_once_per_table() {
+    fn an_off_default_filegroup_is_declared_and_only_where_it_differs_from_the_tables() {
+        let named = |mut k: RawKeyColumn, fg: &str| {
+            k.filegroup = Some(fg.to_owned());
+            k
+        };
+        let on = |mut i: RawIndexColumn, fg: &str| {
+            i.filegroup = Some(fg.to_owned());
+            i
+        };
         let mut raw = RawCatalog::default();
         for (id, name, base) in [
             (
@@ -5278,20 +5313,28 @@ mod tests {
         ] {
             let mut t = raw_table(id, "dbo", name);
             t.base = base;
+            if id >= 3 {
+                t.base.filegroup = Some("PRIMARY".to_owned());
+            }
             raw.tables.push(t);
             raw.columns.push(raw_column(id, "id", "int"));
         }
-        let mut uq = key(4, "uq_m", false, 2, "id");
-        uq.placement = Placement::OffDefaultFilegroup;
-        // The clustered base is a key of its table too, and is named once.
-        let mut pk = key(2, "pk_cpk", true, 1, "id");
-        pk.placement = Placement::OffDefaultFilegroup;
-        raw.key_columns = vec![uq, pk, key(3, "uq_p", false, 2, "id")];
+        // The clustered base is a key of its table too, on the table's own.
+        raw.key_columns = vec![
+            named(key(4, "uq_m", false, 2, "id"), "fgx"),
+            named(key(2, "pk_cpk", true, 1, "id"), "fgx"),
+            named(key(3, "uq_p", false, 2, "id"), "PRIMARY"),
+        ];
         raw.index_columns = vec![
-            ix(4, "ix_a", false, Placement::OffDefaultFilegroup),
-            ix(4, "ix_b", false, Placement::OffDefaultFilegroup),
-            ix(4, "ix_c", false, Placement::Filegroup),
-            ix(3, "ix_p", false, Placement::Filegroup),
+            on(ix(4, "ix_a", false, Placement::OffDefaultFilegroup), "fgx"),
+            on(ix(4, "ix_c", false, Placement::Filegroup), "PRIMARY"),
+            // Beside the table's rows on fgx: nothing to say. Back on the
+            // default while the rows are elsewhere: it has to.
+            on(
+                ix(1, "ix_beside", false, Placement::OffDefaultFilegroup),
+                "fgx",
+            ),
+            on(ix(1, "ix_home", false, Placement::Filegroup), "PRIMARY"),
         ];
         let p = assemble(&raw);
         for name in ["heap", "cpk", "plain", "members"] {
@@ -5302,40 +5345,107 @@ mod tests {
         }
         assert!(p.limitations.is_empty(), "{}", details(&p));
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
-        assert_eq!(p.catalog_notices.len(), 3, "{:?}", p.catalog_notices);
-        let all = p.catalog_notices.join("\n");
-        for what in [
-            "dbo.cpk: its base (clustered primary key `pk_cpk`) sits on a filegroup other than the \
-             database's default; the declarations do not hold a filegroup, so a bootstrap \
-             places it on the target's default filegroup",
-            "dbo.heap: its base (a heap) sits",
-            "dbo.members: index `ix_a`, index `ix_b`, unique constraint `uq_m` sit on a \
-             filegroup other than the database's default",
-        ] {
-            assert!(all.contains(what), "{what}: {all}");
-        }
-        // Negative: the default filegroup and an unnoticed index say nothing.
-        assert!(!all.contains("dbo.plain") && !all.contains("ix_c"), "{all}");
+        assert!(p.catalog_notices.is_empty(), "{:?}", p.catalog_notices);
+        let table = |n: &str| &p.schema.tables[&TableName::new("dbo", n)];
+        let fg = |f: &Option<pbps_model::Filegroup>| f.as_ref().map(|f| f.to_string());
+        assert_eq!(fg(&table("heap").filegroup).as_deref(), Some("fgx"));
+        assert_eq!(fg(&table("cpk").filegroup).as_deref(), Some("fgx"));
+        assert_eq!(
+            fg(&table("cpk").primary_key.as_ref().unwrap().filegroup),
+            None
+        );
+        assert_eq!(fg(&table("heap").indexes["ix_beside"].filegroup), None);
+        assert_eq!(
+            fg(&table("heap").indexes["ix_home"].filegroup).as_deref(),
+            Some("PRIMARY")
+        );
+        assert_eq!(fg(&table("members").filegroup), None);
+        assert_eq!(
+            fg(&table("members").unique["uq_m"].filegroup).as_deref(),
+            Some("fgx")
+        );
+        assert_eq!(
+            fg(&table("members").indexes["ix_a"].filegroup).as_deref(),
+            Some("fgx")
+        );
+        // Negative: on the default filegroup, beside rows that are too, nothing
+        // is written, whatever the name the engine gives that filegroup.
+        assert_eq!(fg(&table("members").indexes["ix_c"].filegroup), None);
+        assert_eq!(fg(&table("plain").filegroup), None);
+        assert_eq!(fg(&table("plain").unique["uq_p"].filegroup), None);
     }
 
-    /// The notice names a base only when the declarations keep it. A clustered
-    /// columnstore base, or a disabled clustered one, is left out as unmodelled
-    /// and is reported as that; saying a bootstrap places it on the default
-    /// filegroup would describe an object the pull does not declare
-    /// (DEC-1227.1). The members that survive are still named.
+    /// Whether an object sits where its table's rows do is decided by the
+    /// filegroup's identity, which the one catalog spells one way: exactly.
+    /// On a case-sensitive database `fgx` and `FGX` are two filegroups, so an
+    /// index on the other one has to say so, or a rebuild would move it
+    /// (DEC-2813.1).
     #[test]
-    fn a_base_the_pull_leaves_out_is_not_in_the_filegroup_notice() {
+    fn an_object_is_beside_its_rows_only_on_the_very_same_filegroup() {
+        let rows = "fgx".to_owned();
+        let own = |name: &str| own_filegroup(&Some(name.to_owned()), Some(&rows));
+        assert_eq!(own("fgx"), None, "the same filegroup writes nothing");
+        assert_eq!(
+            own("FGX").as_ref().map(|f| f.to_string()).as_deref(),
+            Some("FGX"),
+            "a case-distinct filegroup is another one"
+        );
+        assert_eq!(
+            own("other").as_ref().map(|f| f.to_string()).as_deref(),
+            Some("other")
+        );
+        // Without rows to compare to (a view's index), the object's own is
+        // written; with no filegroup of its own, nothing is.
+        assert!(own_filegroup(&Some("fgx".into()), None).is_some());
+        assert_eq!(own_filegroup(&None, Some(&rows)), None);
+
+        let on = |mut i: RawIndexColumn, fg: &str| {
+            i.filegroup = Some(fg.to_owned());
+            i
+        };
+        let mut raw = RawCatalog::default();
+        let mut t = raw_table(1, "dbo", "t");
+        t.base = base_of(0, None, false, Placement::OffDefaultFilegroup);
+        t.base.filegroup = Some("fgx".to_owned());
+        raw.tables.push(t);
+        raw.columns.push(raw_column(1, "id", "int"));
+        raw.index_columns = vec![
+            on(
+                ix(1, "ix_same", false, Placement::OffDefaultFilegroup),
+                "fgx",
+            ),
+            on(
+                ix(1, "ix_twin", false, Placement::OffDefaultFilegroup),
+                "FGX",
+            ),
+        ];
+        let p = assemble(&raw);
+        let indexes = &p.schema.tables[&TableName::new("dbo", "t")].indexes;
+        assert!(indexes["ix_same"].filegroup.is_none());
+        assert_eq!(
+            indexes["ix_twin"]
+                .filegroup
+                .as_ref()
+                .map(|f| f.to_string())
+                .as_deref(),
+            Some("FGX")
+        );
+    }
+
+    /// A base the pull leaves out has no declaration to carry a filegroup: a
+    /// clustered columnstore base, or a disabled clustered one, is reported as
+    /// the limitation it is and the table is not placed by it. A clustered
+    /// index the declarations keep is the base, and places its table
+    /// (DEC-2813.1). A system-versioned table's history is still noticed:
+    /// the engine builds it, and the declarations hold no placement for it.
+    #[test]
+    fn a_base_the_pull_leaves_out_does_not_place_its_table_and_a_history_is_noticed() {
         let mut raw = RawCatalog::default();
         for (id, name, base) in [
             (
                 1,
                 "cci_only",
                 base_of(5, Some("cci_a"), false, Placement::OffDefaultFilegroup),
-            ),
-            (
-                2,
-                "cci_beside",
-                base_of(5, Some("cci_b"), false, Placement::OffDefaultFilegroup),
             ),
             (
                 3,
@@ -5355,45 +5465,54 @@ mod tests {
         }
         let mut cci_a = ix(1, "cci_a", false, Placement::OffDefaultFilegroup);
         cci_a.kind = IndexKind::Unmodelled(5);
-        let mut cci_b = ix(2, "cci_b", false, Placement::OffDefaultFilegroup);
-        cci_b.kind = IndexKind::Unmodelled(5);
         let mut cx_d = ix(3, "cx_d", false, Placement::OffDefaultFilegroup);
         cx_d.kind = IndexKind::Clustered;
         cx_d.is_disabled = true;
         let mut cx_k = ix(4, "cx_k", false, Placement::OffDefaultFilegroup);
         cx_k.kind = IndexKind::Clustered;
-        raw.index_columns = vec![
-            cci_a,
-            cci_b,
-            ix(2, "ix_b", false, Placement::OffDefaultFilegroup),
-            cx_d,
-            cx_k,
-        ];
+        raw.index_columns = vec![cci_a, cx_d, cx_k];
         let p = assemble(&raw);
         let said = details(&p);
-        // The omitted bases are reported as what they are.
         assert!(said.contains("index `cci_a` is"), "{said}");
         assert!(
             said.contains("clustered index `cx_d` is disabled"),
             "{said}"
         );
-        // Neither is in a notice; the surviving index beside one still is.
-        let all = p.catalog_notices.join("\n");
-        assert!(!all.contains("dbo.cci_only"), "{all}");
-        assert!(!all.contains("dbo.disabled"), "{all}");
-        for left_out in ["`cci_a`", "`cci_b`", "`cx_d`"] {
-            assert!(!all.contains(left_out), "{left_out}: {all}");
-        }
-        assert!(
-            all.contains("dbo.cci_beside: index `ix_b` sits on a filegroup other than"),
-            "{all}"
+        let table = |n: &str| &p.schema.tables[&TableName::new("dbo", n)];
+        assert!(table("cci_only").filegroup.is_none());
+        assert!(table("disabled").filegroup.is_none());
+        // Negative: a clustered index the declarations keep is the base.
+        assert_eq!(
+            table("kept")
+                .filegroup
+                .as_ref()
+                .map(|f| f.to_string())
+                .as_deref(),
+            Some("fgx")
         );
-        // Negative: a clustered index the declarations keep is still the base.
+        assert!(p.catalog_notices.is_empty(), "{:?}", p.catalog_notices);
+
+        // The history table of a system-versioned table, off the default.
+        let mut raw = RawCatalog::default();
+        let mut current = raw_table(10, "dbo", "orders");
+        current.temporal_type = 2;
+        current.history_table_id = Some(11);
+        current.period = Some(("valid_from".to_owned(), "valid_to".to_owned()));
+        let mut history = raw_table(11, "dbo", "orders_history");
+        history.temporal_type = 1;
+        history.base = base_of(0, None, false, Placement::OffDefaultFilegroup);
+        raw.tables.extend([current, history]);
+        raw.columns.push(raw_column(10, "id", "int"));
+        raw.columns.push(raw_column(11, "id", "int"));
+        let notice = filegroup_notice(&raw, 10, &TableName::new("dbo", "orders"));
+        let notice = notice.expect("the history table is noticed");
         assert!(
-            all.contains("dbo.kept: its base (clustered index `cx_k`) sits"),
-            "{all}"
+            notice.contains("dbo.orders: its history table sits on a filegroup other than"),
+            "{notice}"
         );
-        assert_eq!(p.catalog_notices.len(), 2, "{all}");
+        // Negative: one on the default draws nothing.
+        raw.tables[1].base = base_of(0, None, false, Placement::Filegroup);
+        assert!(filegroup_notice(&raw, 10, &TableName::new("dbo", "orders")).is_none());
     }
 
     /// A trigger whose parent was left out for its placement is told why, in
@@ -5513,6 +5632,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         });
         let p = assemble(&raw);
         let t = &p.schema.tables[&TableName::new("dbo", "customer")];
@@ -5554,6 +5674,7 @@ mod tests {
             is_included: false,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         };
         let mut raw = one_table_catalog();
         raw.index_columns.push(column("cci", 5));
@@ -5682,6 +5803,7 @@ mod tests {
                 is_disabled: false,
                 ignore_dup_key: false,
                 placement: Placement::Filegroup,
+                filegroup: None,
             });
             raw.read_columns.push(RawReadColumn {
                 object_id: 1,
@@ -6399,6 +6521,7 @@ mod module_tests {
             is_included: included,
             is_descending: false,
             placement: Placement::Filegroup,
+            filegroup: None,
         }
     }
 

@@ -18,6 +18,7 @@ fn messages(name: &str) -> serde_json::Value {
             name: Some(name.into()),
             columns: vec!["absent".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         ..Default::default()
     };

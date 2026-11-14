@@ -134,6 +134,7 @@ mod effects_of_each_kind {
             filter: None,
             method: IndexMethod::Btree,
             storage_parameters: BTreeMap::new(),
+            filegroup: None,
         }
     }
     fn pk() -> PrimaryKey {
@@ -141,6 +142,7 @@ mod effects_of_each_kind {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: BTreeMap::new(),
+            filegroup: None,
         }
     }
     fn fk() -> ForeignKey {
@@ -200,6 +202,7 @@ mod effects_of_each_kind {
             UniqueConstraint {
                 columns: vec!["x".into()],
                 storage_parameters: BTreeMap::new(),
+                filegroup: None,
             },
         );
         t.foreign_keys.insert("f".into(), fk());
@@ -868,6 +871,7 @@ mod effects_of_each_kind {
                     constraint: UniqueConstraint {
                         columns: vec!["x".into()],
                         storage_parameters: BTreeMap::new(),
+                        filegroup: None,
                     },
                     clustered: false,
                 },

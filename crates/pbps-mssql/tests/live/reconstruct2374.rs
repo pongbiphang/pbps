@@ -246,6 +246,7 @@ async fn defaults_checks_and_keys_over_a_computed_column_compile_after_their_fun
                         pbps_model::UniqueConstraint {
                             columns: vec!["c".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                 }),
@@ -311,6 +312,7 @@ async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
                         name: Some("pk_id".into()),
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     });
                     t.computed.insert("c".into(), computed("app.f(v)"));
                 }),
@@ -660,6 +662,7 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
                     name: Some("pk_k".into()),
                     columns: vec!["k".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
                 t.clustered = clustered.clone();
             });
@@ -670,6 +673,7 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
                     name: Some("pk_id".into()),
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             });
             let child = table("child", |t| {
@@ -804,6 +808,7 @@ async fn a_key_over_two_computed_columns_follows_both_and_their_functions() {
                     pbps_model::UniqueConstraint {
                         columns: vec!["c1".into(), "c2".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             })];

@@ -192,11 +192,13 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         PartitionIndexDefinition::Unique(UniqueConstraint {
             columns: vec!["k".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         PartitionIndexDefinition::PrimaryKey(PrimaryKey {
             name: Some(recipe.name.clone()),
             columns: vec!["k".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
     ] {
         recipe.definition = definition;

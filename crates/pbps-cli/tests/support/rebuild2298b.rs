@@ -329,6 +329,7 @@ fn negatives(server: &str) {
                     name: Some("pk_p".into()),
                     columns: vec!["k".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             }
         }

@@ -74,6 +74,128 @@ pub(in crate::engine) async fn refuse_unknown_collations(
     Ok(())
 }
 
+/// Refuses a declared filegroup the target cannot place the object on, by
+/// name and before any statement runs (#2813, DEC-2813.1): one it does not
+/// hold, one that is read-only, and one that is the database's default where
+/// the declaration would read back as none, which no plan could converge on.
+/// pbps never creates a filegroup, so none of these is something a later step
+/// of the plan supplies.
+pub(in crate::engine) async fn refuse_unknown_filegroups(
+    conn: &mut Conn,
+    schema: &Schema,
+) -> anyhow::Result<()> {
+    let declared = declared_filegroups(schema);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    // Each distinct declared name is resolved by the engine, under the
+    // database's collation, so that what is accepted here is what `ON [fg]`
+    // will accept.
+    let mut names: Vec<&str> = declared.iter().map(|(_, fg, _)| fg.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let found = pbps_mssql::catalog::filegroups_named(conn, &names).await?;
+    let held: std::collections::BTreeMap<&str, pbps_mssql::catalog::FilegroupRow> = names
+        .iter()
+        .copied()
+        .zip(found)
+        .filter_map(|(n, row)| Some((n, row?)))
+        .collect();
+    let problems = filegroup_problems(&declared, &held);
+    if !problems.is_empty() {
+        anyhow::bail!("{}", problems.join("\n"));
+    }
+    Ok(())
+}
+
+/// Every declared filegroup with where it is declared, and whether that
+/// object sits where its table does when it names none (`follows`): an object
+/// on the default filegroup reads back as none unless its table is elsewhere.
+pub(in crate::engine) fn declared_filegroups(
+    schema: &Schema,
+) -> Vec<(String, &pbps_model::Filegroup, bool)> {
+    let mut out = Vec::new();
+    for (name, table) in &schema.tables {
+        let table_name = name.shown();
+        if let Some(fg) = &table.filegroup {
+            out.push((format!("table `{table_name}`"), fg, false));
+        }
+        let beside = table.filegroup.is_some();
+        if let Some(fg) = table
+            .primary_key
+            .as_ref()
+            .and_then(|k| k.filegroup.as_ref())
+        {
+            out.push((format!("the primary key of `{table_name}`"), fg, beside));
+        }
+        for (n, u) in &table.unique {
+            if let Some(fg) = &u.filegroup {
+                out.push((
+                    format!("unique constraint `{}` of `{table_name}`", n.shown()),
+                    fg,
+                    beside,
+                ));
+            }
+        }
+        for (n, ix) in &table.indexes {
+            if let Some(fg) = &ix.filegroup {
+                out.push((
+                    format!("index `{}` of `{table_name}`", n.shown()),
+                    fg,
+                    beside,
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn filegroup_problems(
+    declared: &[(String, &pbps_model::Filegroup, bool)],
+    held: &std::collections::BTreeMap<&str, pbps_mssql::catalog::FilegroupRow>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (what, fg, beside) in declared {
+        let name = pbps_model::escape::Escaped(fg.as_str());
+        let Some(found) = held.get(fg.as_str()) else {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, which this database does not have; pbps \
+                 never creates a filegroup, so add it (with its files) first"
+            ));
+            continue;
+        };
+        // The engine's lookup is by its collation, which may fold accents,
+        // widths or kana the model does not: the model's equality decides, and
+        // the lookup only confirms that the filegroup is there. A filegroup
+        // found under another spelling would read back as a change forever.
+        let stored = pbps_model::Filegroup::new(found.name.as_str());
+        if stored != **fg {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, but the database's filegroup is `{}`; \
+                 declare it as stored",
+                pbps_model::escape::Escaped(stored.as_str())
+            ));
+        } else if found.alike > 1 {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, but this database holds several that differ \
+                 only in case; pbps compares filegroup names without case and cannot tell them \
+                 apart, so rename all but one"
+            ));
+        } else if found.is_read_only {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, which is read-only here, so nothing can \
+                 be built on it"
+            ));
+        } else if found.is_default && !beside {
+            problems.push(format!(
+                "{what} names `{name}`, the database's default filegroup, which a pull writes \
+                 as no `filegroup`: remove the line"
+            ));
+        }
+    }
+    problems
+}
+
 pub(in crate::engine) async fn refuse_history_references_alike(
     conn: &mut Conn,
     schema: &Schema,
@@ -744,6 +866,14 @@ impl PlanSession for pbps_mssql::Mssql {
         refuse_history_references_alike(conn, declared, self).await
     }
 
+    async fn refuse_unknown_filegroups(
+        &self,
+        conn: &mut Conn,
+        declared: &Schema,
+    ) -> anyhow::Result<()> {
+        refuse_unknown_filegroups(conn, declared).await
+    }
+
     fn reconcile_cluster_roles(
         &self,
         _recorded: &IdsFile,
@@ -1062,5 +1192,191 @@ impl PlanSession for pbps_mssql::Mssql {
         _changes: &ChangeSet,
     ) -> anyhow::Result<DomainCode> {
         Ok(DomainCode::NotAsked)
+    }
+}
+
+#[cfg(test)]
+mod filegroup_tests {
+    use super::*;
+    use pbps_mssql::catalog::FilegroupRow;
+    use std::collections::BTreeMap;
+
+    /// What the engine answers for a declared name, which it matches under
+    /// the database's collation: a name it does not match is simply absent.
+    fn held(answers: &[(&'static str, bool, bool, usize)]) -> BTreeMap<&'static str, FilegroupRow> {
+        answers
+            .iter()
+            .map(|&(asked, is_default, is_read_only, alike)| {
+                let name = if asked.eq_ignore_ascii_case("primary") {
+                    "PRIMARY"
+                } else {
+                    asked
+                };
+                (
+                    asked,
+                    FilegroupRow {
+                        name: name.to_owned(),
+                        is_default,
+                        is_read_only,
+                        alike,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn problems_with(schema: &Schema, answers: &[(&'static str, bool, bool, usize)]) -> String {
+        filegroup_problems(&declared_filegroups(schema), &held(answers)).join("\n")
+    }
+
+    fn problems(schema: &Schema) -> String {
+        problems_with(
+            schema,
+            &[
+                ("PRIMARY", true, false, 1),
+                ("primary", true, false, 1),
+                ("fgx", false, false, 1),
+                ("FGX", false, false, 1),
+                ("frozen", false, true, 1),
+            ],
+        )
+    }
+
+    fn table_with(table: Option<&str>, index: Option<&str>) -> Schema {
+        let mut t = pbps_model::Table {
+            filegroup: table.map(pbps_model::Filegroup::new),
+            ..Default::default()
+        };
+        t.indexes.insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: index.map(pbps_model::Filegroup::new),
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert("dbo.t".parse().unwrap(), t);
+        schema
+    }
+
+    /// A declared filegroup must be one the database holds, writable, and not
+    /// the default where it would read back as none (#2813, DEC-2813.1).
+    #[test]
+    fn a_filegroup_the_database_lacks_or_cannot_write_is_refused_by_name() {
+        assert_eq!(problems(&table_with(Some("fgx"), Some("FGX"))), "");
+        assert_eq!(problems(&table_with(None, None)), "");
+        let said = problems(&table_with(Some("nope"), Some("frozen")));
+        assert!(
+            said.contains(
+                "table `dbo.t` names the filegroup `nope`, which this database does not have"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("index `ix` of `dbo.t` names the filegroup `frozen`, which is read-only"),
+            "{said}"
+        );
+        // Negative: nothing is said of a filegroup that is fine.
+        assert!(!problems(&table_with(Some("nope"), Some("fgx"))).contains("`fgx`"));
+    }
+
+    /// The default filegroup reads back as none, so naming it on the table, or
+    /// on an object whose table is on the default too, never converges; under
+    /// a table elsewhere it is the only way to say where the object is.
+    #[test]
+    fn the_default_filegroup_is_refused_unless_the_table_is_elsewhere() {
+        let said = problems(&table_with(Some("PRIMARY"), None));
+        assert!(said.contains("the database's default filegroup"), "{said}");
+        let said = problems(&table_with(None, Some("primary")));
+        assert!(
+            said.contains("index `ix` of `dbo.t` names `primary`, the database's default"),
+            "{said}"
+        );
+        assert_eq!(problems(&table_with(Some("fgx"), Some("PRIMARY"))), "");
+    }
+
+    /// The engine matches the name under the database's collation, so a name
+    /// it does not return is missing here even when it differs from a held
+    /// one only in case (a case-sensitive database refuses `ON [fgx]` for
+    /// `FGX`, measured), and one it does return is accepted (a
+    /// case-insensitive database accepts it). The live test pins the engine's
+    /// side of this.
+    #[test]
+    fn a_name_the_engine_does_not_match_is_missing_whatever_its_case() {
+        let case_sensitive = problems_with(
+            &table_with(Some("fgx"), Some("FGX")),
+            &[("FGX", false, false, 1)],
+        );
+        assert!(
+            case_sensitive.contains(
+                "table `dbo.t` names the filegroup `fgx`, which this database does not have"
+            ),
+            "{case_sensitive}"
+        );
+        assert!(!case_sensitive.contains("`FGX`"), "{case_sensitive}");
+        // Negative: the same declaration, matched, is accepted.
+        let case_insensitive = problems_with(
+            &table_with(Some("fgx"), Some("FGX")),
+            &[("fgx", false, false, 1), ("FGX", false, false, 1)],
+        );
+        assert_eq!(case_insensitive, "");
+    }
+
+    /// The engine's lookup follows the database's collation, which may fold
+    /// accents or widths the model does not, so a filegroup it returns under
+    /// another spelling is refused by both names; the model's equality (ASCII
+    /// case only) decides, and the lookup only confirms.
+    #[test]
+    fn a_filegroup_the_engine_found_under_another_spelling_is_refused_as_stored() {
+        let stored = |asked: &'static str, name: &str| {
+            let mut held = BTreeMap::new();
+            held.insert(
+                asked,
+                FilegroupRow {
+                    name: name.to_owned(),
+                    is_default: false,
+                    is_read_only: false,
+                    alike: 1,
+                },
+            );
+            filegroup_problems(&declared_filegroups(&table_with(Some(asked), None)), &held)
+                .join("\n")
+        };
+        let said = stored("cafe", "café");
+        assert!(
+            said.contains(
+                "table `dbo.t` names the filegroup `cafe`, but the database's filegroup is `café`; declare it as stored"
+            ),
+            "{said}"
+        );
+        // Negative: the same spelling, or one that differs only in ASCII case,
+        // is the model's own equality and passes.
+        assert_eq!(stored("café", "café"), "");
+        assert_eq!(stored("FGX", "fgx"), "");
+        // Negative: a non-ASCII case difference is a different name to the model.
+        assert!(stored("éast", "Éast").contains("declare it as stored"));
+    }
+
+    /// A case-sensitive database may hold `fgx` and `FGX`; the model, which
+    /// compares names without case, cannot tell an object on one from an
+    /// object on the other, so naming either is refused rather than left to
+    /// go unseen at the next change.
+    #[test]
+    fn filegroups_differing_only_in_case_are_refused_by_name() {
+        let said = problems_with(&table_with(Some("fgx"), None), &[("fgx", false, false, 2)]);
+        assert!(
+            said.contains("names the filegroup `fgx`, but this database holds several that differ only in case"),
+            "{said}"
+        );
+        // Negative: a filegroup that is alone under its name is fine.
+        assert_eq!(
+            problems_with(&table_with(Some("fgx"), None), &[("fgx", false, false, 1)]),
+            ""
+        );
     }
 }

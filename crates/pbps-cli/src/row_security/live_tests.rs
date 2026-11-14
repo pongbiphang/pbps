@@ -96,6 +96,7 @@ async fn check(connection: String, owner: String) {
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["d".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
                 clustered: false,
             },

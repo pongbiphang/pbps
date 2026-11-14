@@ -1365,6 +1365,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut with_index = pbps_model::Schema::default();

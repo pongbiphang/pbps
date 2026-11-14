@@ -1465,6 +1465,7 @@ mod tests {
             filter: None,
             method: IndexMethod::Gin,
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let table = "app.docs".parse::<pbps_model::TableName>().unwrap();
         let blocker = member("index", &["app", "docs_trgm"]);
@@ -2146,6 +2147,7 @@ mod tests {
                     filter: None,
                     method: IndexMethod::Gin,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.exclude.insert(
@@ -2231,6 +2233,7 @@ mod tests {
             filter: None,
             method,
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let class = |schema: &str, name: &str| Some(OpClassRef::in_schema(schema, name));
         let mut table = Table::default();

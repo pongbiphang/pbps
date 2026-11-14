@@ -7980,6 +7980,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let sql = create("app.ev_old", &own);
@@ -8569,6 +8570,7 @@ mod tests {
             filter: Some("v > 0".into()),
             method: Default::default(),
             storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            filegroup: None,
         };
         let add = |index: &pbps_model::Index| {
             sql_of(
@@ -8604,6 +8606,7 @@ mod tests {
             name: Some("t_pkey".into()),
             columns: vec!["id".into()],
             storage_parameters: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            filegroup: None,
         };
         assert_eq!(
             primary_key_clause(&key).unwrap(),
@@ -8871,6 +8874,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         created.replica_identity = Some(R::Index("t_ix".into()));
@@ -8917,6 +8921,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let index = pbps_model::Index {
             columns: vec![IndexColumn {
@@ -8930,10 +8935,12 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let unique = pbps_model::UniqueConstraint {
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut created = Table::default();
         created
@@ -10952,6 +10959,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 to: None,
                 nonclustered: false,
@@ -10994,6 +11002,7 @@ mod tests {
                     name: None,
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 to: None,
                 nonclustered: false,
@@ -11025,6 +11034,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let change = Change::AddIndex {
             table: name("app", "t"),
@@ -11110,6 +11120,7 @@ mod tests {
                 filter: None,
                 method: pbps_model::IndexMethod::Gin,
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         };
@@ -11145,6 +11156,7 @@ mod tests {
                     filter: None,
                     method: pbps_model::IndexMethod::Gin,
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             };
@@ -11349,6 +11361,7 @@ mod tests {
             } else {
                 Default::default()
             },
+            filegroup: None,
         };
         let emit = |index: Index| {
             let change = Change::AddIndex {
@@ -11428,6 +11441,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let change = Change::AddIndex {
             table: name("app", "t"),
@@ -11556,6 +11570,7 @@ mod tests {
                     filter: Some("n > 0 -- why".into()),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             },

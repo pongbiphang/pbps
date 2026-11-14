@@ -2695,75 +2695,461 @@ fn pull_names_partition_scheme_placement_and_omits_unrepresentable_objects() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
-/// Issue #1227, DEC-1227.1: a table or index on a filegroup other than the
-/// database's default is written as it is, and named: `pull` prints one
-/// warning per table, and a connected `plan` reports the same text as the
-/// nonfatal `plan.unheld-object`. Bootstrap places the object on the target's
-/// default filegroup and nothing compares unequal after, so this word is the
-/// only one anyone gets. A table on the default filegroup is the control, and
-/// the declarations still validate.
+/// Issue #2813, DEC-2813.1 (which replaces #1227's notice for these objects):
+/// a table, a key or an index on a filegroup other than the database's default
+/// is written as a `filegroup:`, and draws no notice. A nonclustered object
+/// writes its own only where it is not beside its table's rows, and the
+/// clustered one never does: its rows are the table's. A table, key and index
+/// on the default filegroup are the control and write nothing. A connected
+/// plan is empty and carries no `plan.unheld-object`.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
-fn pull_and_plan_name_an_off_default_filegroup_without_refusing_it() {
+fn pull_and_plan_declare_an_off_default_filegroup_without_a_notice() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let own = OwnDatabase::new(&server, "filegroup_pull");
-    on_server(
-        own.connection(),
-        &format!(
-            "ALTER DATABASE [{name}] ADD FILEGROUP fgx;
-             ALTER DATABASE [{name}] ADD FILE (NAME='{name}_fgx',
-                 FILENAME='/var/opt/mssql/data/{name}_fgx.ndf') TO FILEGROUP fgx;",
-            name = own.name
-        ),
-    );
+    add_filegroups(own.connection(), &own.name, &["fgx"]);
     on_server(
         own.connection(),
         "CREATE TABLE dbo.off_default (id int NOT NULL, v int NOT NULL,
              CONSTRAINT pk_off_default PRIMARY KEY CLUSTERED (id)) ON fgx;
          CREATE INDEX ix_off_default ON dbo.off_default (v) ON fgx;
-         CREATE TABLE dbo.control (id int NOT NULL, CONSTRAINT pk_control PRIMARY KEY (id));",
-    );
-    let said = "on a filegroup other than the database's default; the declarations do not hold \
-                a filegroup, so a bootstrap places them on the target's default filegroup";
-    let line = format!(
-        "dbo.off_default: its base (clustered primary key `pk_off_default`), index \
-         `ix_off_default` sit {said}"
+         CREATE INDEX ix_back_home ON dbo.off_default (id, v) ON [PRIMARY];
+         CREATE TABLE dbo.mixed (id int NOT NULL, u int NOT NULL, w int NOT NULL,
+             CONSTRAINT pk_mixed PRIMARY KEY CLUSTERED (id),
+             CONSTRAINT uq_mixed UNIQUE NONCLUSTERED (u) ON fgx);
+         CREATE INDEX ix_mixed ON dbo.mixed (w) ON fgx;
+         CREATE TABLE dbo.control (id int NOT NULL, CONSTRAINT pk_control PRIMARY KEY (id));
+         CREATE INDEX ix_control ON dbo.control (id);",
     );
     let d = Demo::new("filegroup-pull");
     let o = d.run(&["pull", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let warnings = stderr(&o);
-    assert!(warnings.contains(&line), "{warnings}");
-    assert_eq!(
-        warnings.matches("filegroup other than").count(),
-        1,
-        "{warnings}"
-    );
-    // Declared, with its index; the control draws nothing.
+    assert!(!warnings.contains("filegroup other than"), "{warnings}");
     let schema = d.dir.join("schema");
-    let declared = std::fs::read_to_string(schema.join("dbo.off_default.yml")).unwrap();
-    assert!(declared.contains("ix_off_default"), "{declared}");
-    assert!(schema.join("dbo.control.yml").is_file());
-    assert!(!warnings.contains("dbo.control"), "{warnings}");
+    let read = |name: &str| std::fs::read_to_string(schema.join(name)).unwrap();
+    // Rows on fgx: the table says so once. Its index beside them says nothing,
+    // and the one back on PRIMARY has to say where it is.
+    let off = read("dbo.off_default.yml");
+    assert!(off.contains("\nfilegroup: fgx\n"), "{off}");
+    assert_eq!(off.matches("filegroup:").count(), 2, "{off}");
+    assert!(off.contains("filegroup: PRIMARY"), "{off}");
+    // Rows on the default: only what is elsewhere says so.
+    let mixed = read("dbo.mixed.yml");
+    assert!(!mixed.contains("\nfilegroup:"), "{mixed}");
+    assert_eq!(mixed.matches("filegroup: fgx").count(), 2, "{mixed}");
+    let control = read("dbo.control.yml");
+    assert!(!control.contains("filegroup"), "{control}");
     let validate = d.run(&["validate"]);
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 
-    // A connected plan carries the same text as the report-only rule, and is
-    // not refused for it.
+    // A connected plan has nothing to say and nothing to change.
     d.commit();
     let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["plan", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-    let reported = stderr(&o);
-    assert!(reported.contains(&line), "{reported}");
+    assert!(
+        !stderr(&o).contains("filegroup other than"),
+        "{}",
+        stderr(&o)
+    );
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
-    // The machine report names the rule that carries it.
     let o = d.run(&["plan", "--db", own.connection(), "--format", "json"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let json = format!("{}{}", stdout(&o), stderr(&o));
-    assert!(json.contains("plan.unheld-object"), "{json}");
-    assert!(json.contains("filegroup other than"), "{json}");
+    assert!(!json.contains("plan.unheld-object"), "{json}");
+}
+
+/// Issue #2813, offline: a declared filegroup is accepted as a name, and the
+/// plan says once, per filegroup, that it is checked only against a database.
+/// A table that declares none draws nothing, and the machine report carries
+/// the same advisory under its own id.
+#[test]
+fn an_offline_plan_accepts_a_filegroup_by_name_and_says_it_is_not_checked() {
+    let d = Demo::new("filegroup-offline");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  v: {type: int}\n\
+         primary_key: [id]\nindexes:\n  ix_v:\n    columns: [v]\n    filegroup: fgx\n\
+         filegroup: fgx\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert_eq!(said.matches("is not checked offline").count(), 1, "{said}");
+    assert!(
+        said.contains("table `dbo.t` (`fgx`), index `ix_v` of `dbo.t` (`fgx`)"),
+        "{said}"
+    );
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let json = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(json.contains("plan.filegroup-unchecked"), "{json}");
+    // Negative: no filegroup, no advisory.
+    let plain = Demo::new("filegroup-offline-plain");
+    plain.table(ONE_COLUMN);
+    let o = plain.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stderr(&o).contains("not checked offline"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Adds user filegroups, each with one file, to a database a test owns.
+fn add_filegroups(connection: &str, database: &str, names: &[&str]) {
+    for name in names {
+        on_server(
+            connection,
+            &format!(
+                "ALTER DATABASE [{database}] ADD FILEGROUP {name};
+                 ALTER DATABASE [{database}] ADD FILE (NAME='{database}_{name}',
+                     FILENAME='/var/opt/mssql/data/{database}_{name}.ndf') TO FILEGROUP {name};"
+            ),
+        );
+    }
+}
+
+/// Where each named object sits, as `object=filegroup` lines in one string.
+fn placements(connection: &str) -> String {
+    text_on_server(
+        connection,
+        "SELECT COALESCE(STRING_AGG(o.name + COALESCE('.' + i.name, '') + '=' + ds.name, ';')
+                WITHIN GROUP (ORDER BY o.name, i.name), '')
+           FROM sys.indexes i
+           JOIN sys.objects o ON o.object_id = i.object_id AND o.type = 'U'
+           JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id;",
+    )
+}
+
+/// Issue #2813: a table, a key and an index on a user filegroup are pulled,
+/// bootstrapped onto an empty database that holds the filegroup, land on it,
+/// and a re-plan is empty. A pulled file that names no filegroup the target
+/// has is refused at plan by name, and so is a changed one.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_filegroup_round_trips_through_pull_and_bootstrap_and_a_missing_or_changed_one_is_refused() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::new(&server, "filegroup2813_src");
+    let target = OwnDatabase::new(&server, "filegroup2813_dst");
+    let bare = OwnDatabase::new(&server, "filegroup2813_bare");
+    add_filegroups(source.connection(), &source.name, &["fgx", "fgy"]);
+    add_filegroups(target.connection(), &target.name, &["fgx", "fgy"]);
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.heap_t (id int NOT NULL, v int NOT NULL) ON fgx;
+         CREATE TABLE dbo.keyed (id int NOT NULL, u int NOT NULL, w int NOT NULL,
+             CONSTRAINT pk_keyed PRIMARY KEY NONCLUSTERED (id) ON fgx,
+             CONSTRAINT uq_keyed UNIQUE NONCLUSTERED (u) ON fgy);
+         CREATE INDEX ix_keyed ON dbo.keyed (w) ON fgx;
+         CREATE TABLE dbo.clustered_t (id int NOT NULL, v int NOT NULL,
+             CONSTRAINT pk_clustered_t PRIMARY KEY CLUSTERED (id)) ON fgy;
+         CREATE INDEX ix_clustered_t ON dbo.clustered_t (v) ON fgy;
+         CREATE TABLE dbo.plain (id int NOT NULL, CONSTRAINT pk_plain PRIMARY KEY (id));",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("filegroup2813");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let before = placements(source.connection());
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    assert_eq!(placements(target.connection()), before);
+    assert!(before.contains("keyed.pk_keyed=fgx"), "{before}");
+    assert!(before.contains("keyed.uq_keyed=fgy"), "{before}");
+    assert!(before.contains("plain.pk_plain=PRIMARY"), "{before}");
+    let o = d.run(&["plan", "--db", target.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // A filegroup the database lacks is refused by name before bootstrap
+    // builds anything, and at a connected plan.
+    let o = d.run(&["bootstrap", "--db", bare.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("`fgx`"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("does not have"), "{}", stderr(&o));
+    // An existing table is edited rather than a new one added: a new table
+    // would first meet the stale identity file, which is a different refusal.
+    let plain = d.dir.join("schema/dbo.plain.yml");
+    let undeclared = std::fs::read_to_string(&plain).unwrap();
+    std::fs::write(&plain, format!("{undeclared}filegroup: fgz\n")).unwrap();
+    let o = d.run(&["plan", "--db", target.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("`fgz`"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("does not have"), "{}", stderr(&o));
+    std::fs::write(&plain, undeclared).unwrap();
+
+    // A changed one is refused by name, and nothing is planned for it.
+    let path = d.dir.join("schema/dbo.heap_t.yml");
+    let declared = std::fs::read_to_string(&path).unwrap();
+    assert!(declared.contains("filegroup: fgx"), "{declared}");
+    std::fs::write(&path, declared.replace("filegroup: fgx", "filegroup: fgy")).unwrap();
+    let o = d.run(&["plan", "--db", target.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = stderr(&o);
+    assert!(said.contains("dbo.heap_t"), "{said}");
+    assert!(said.contains("`fgx`") && said.contains("`fgy`"), "{said}");
+}
+
+/// Issue #2813 (review round 1): a declared filegroup is resolved by the
+/// engine under the target database's collation, which is how `ON [fg]` will
+/// resolve it. On a case-sensitive database a declaration naming `fgx` does not
+/// find the filegroup `FGX` and is refused by name (the engine itself answers
+/// `Invalid filegroup 'fgx'`, Msg 1921), while `FGX` is found; on a
+/// case-insensitive one `fgx` finds `FGX`. A case-sensitive database holding
+/// both `fgx` and `FGX` is refused, since the model cannot tell them apart.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_filegroup_is_resolved_under_the_target_databases_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let sensitive = OwnDatabase::collated(&server, "fg2813_cs", "SQL_Latin1_General_CP1_CS_AS");
+    let insensitive = OwnDatabase::collated(&server, "fg2813_ci", "SQL_Latin1_General_CP1_CI_AS");
+    let twins = OwnDatabase::collated(&server, "fg2813_tw", "SQL_Latin1_General_CP1_CS_AS");
+    add_filegroups(sensitive.connection(), &sensitive.name, &["FGX"]);
+    add_filegroups(insensitive.connection(), &insensitive.name, &["FGX"]);
+    // The logical file names are compared without case whatever the database's
+    // collation, so the second filegroup's file is named apart by hand.
+    add_filegroups(twins.connection(), &twins.name, &["FGX"]);
+    on_server(
+        twins.connection(),
+        &format!(
+            "ALTER DATABASE [{db}] ADD FILEGROUP fgx;
+             ALTER DATABASE [{db}] ADD FILE (NAME='{db}_second',
+                 FILENAME='/var/opt/mssql/data/{db}_second.ndf') TO FILEGROUP fgx;",
+            db = twins.name
+        ),
+    );
+    // Whether a placement starting with `prefix` is there, as one whole entry
+    // of the `;`-separated list (the ledger's own tables are in it too).
+    let has = |prefix: &str, connection: &str| {
+        placements(connection)
+            .split(';')
+            .any(|entry| entry.starts_with(prefix))
+    };
+    let declare = |name: &str, filegroup: &str| {
+        let d = Demo::new(name);
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\nfilegroup: {filegroup}\n"),
+        )
+        .unwrap();
+        // Identities are minted and committed before a database is touched.
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d
+    };
+
+    let lower = declare("filegroup2813-cs-lower", "fgx");
+    let o = lower.run(&["bootstrap", "--db", sensitive.connection()]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("`fgx`"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("does not have"), "{}", stderr(&o));
+    assert!(!has("t=", sensitive.connection()), "nothing was built");
+
+    let exact = declare("filegroup2813-cs-exact", "FGX");
+    let o = exact.run(&["bootstrap", "--db", sensitive.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=FGX", sensitive.connection()));
+
+    let folded = declare("filegroup2813-ci", "fgx");
+    let o = folded.run(&["bootstrap", "--db", insensitive.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=FGX", insensitive.connection()));
+
+    let both = declare("filegroup2813-twins", "fgx");
+    let o = both.run(&["bootstrap", "--db", twins.connection()]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("several that differ only in case"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!has("t=", twins.connection()), "nothing was built");
+}
+
+/// Issue #2813 (review round 2): the engine finds a filegroup by its
+/// collation's equality, which folds more than the model's (ASCII case only),
+/// so the model decides and the engine only confirms. Under an accent-
+/// insensitive collation a declared `cafe` finds the filegroup `café` (and
+/// `ON [cafe]` would place the table there), but reads back as `café`, a name
+/// the model holds to be another; it is refused naming the stored one. Under a
+/// case-sensitive collation `Éast` and `éast` are two filegroups, and the model
+/// tells them apart as well, so neither is taken for the other's twin.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_model_and_not_the_collation_decides_which_filegroup_a_name_is() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let accents = OwnDatabase::collated(&server, "fg2813_ai", "Latin1_General_100_CI_AI");
+    let first = OwnDatabase::collated(&server, "fg2813_e1", "Latin1_General_100_CS_AS");
+    let second = OwnDatabase::collated(&server, "fg2813_e2", "Latin1_General_100_CS_AS");
+    let add = |own: &OwnDatabase, names: &[&str]| {
+        for (n, name) in names.iter().enumerate() {
+            on_server(
+                own.connection(),
+                &format!(
+                    "ALTER DATABASE [{db}] ADD FILEGROUP [{name}];
+                     ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f{n}',
+                         FILENAME='/var/opt/mssql/data/{db}_f{n}.ndf') TO FILEGROUP [{name}];",
+                    db = own.name
+                ),
+            );
+        }
+    };
+    add(&accents, &["café"]);
+    // Both spellings sit in each database, so that a lookup that folded them
+    // would find two where the model finds one.
+    add(&first, &["Éast", "éast"]);
+    add(&second, &["Éast", "éast"]);
+    let has = |prefix: &str, connection: &str| {
+        placements(connection)
+            .split(';')
+            .any(|entry| entry.starts_with(prefix))
+    };
+    let declare = |name: &str, filegroup: &str| {
+        let d = Demo::new(name);
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\nfilegroup: {filegroup}\n"),
+        )
+        .unwrap();
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d
+    };
+
+    let o = declare("filegroup2813-ai-folded", "cafe").run(&[
+        "bootstrap",
+        "--db",
+        accents.connection(),
+    ]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("names the filegroup `cafe`, but the database's filegroup is `café`; declare it as stored"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!has("t=", accents.connection()), "nothing was built");
+    let o = declare("filegroup2813-ai-stored", "café").run(&[
+        "bootstrap",
+        "--db",
+        accents.connection(),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=café", accents.connection()));
+
+    for (own, spelling) in [(&first, "Éast"), (&second, "éast")] {
+        let o = declare(&format!("filegroup2813-cs-{spelling}"), spelling).run(&[
+            "bootstrap",
+            "--db",
+            own.connection(),
+        ]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert!(has(&format!("t={spelling}"), own.connection()));
+    }
+}
+
+/// Issue #2813 (review of the rebased head): whether an index sits where its
+/// table's rows do is a question of which filegroup, not of a spelling folded
+/// to one case. On a case-sensitive database `fgx` and `FGX` are two
+/// filegroups, so an index on the other one than its table's is not beside the
+/// rows, and a pull must not read it as if it were: it used to write no
+/// placement for it, and a later rebuild moved the index onto the table's
+/// filegroup. The model holds the two names equal (DEC-2813.1), so the
+/// declaration that carries the placement is one `validate` refuses as
+/// redundant; the pull leaves that table out and says why, rather than write
+/// one that loses the placement, and says the same on a second pull. An index
+/// on the very same filegroup, and a table whose objects sit apart under
+/// names the model tells apart, are the controls: they are pulled.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_case_distinct_filegroup_is_not_pulled_as_beside_its_table() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::collated(&server, "fg2813_t1", "Latin1_General_100_CS_AS");
+    for (n, name) in ["fgx", "FGX", "other"].iter().enumerate() {
+        on_server(
+            source.connection(),
+            &format!(
+                "ALTER DATABASE [{db}] ADD FILEGROUP [{name}];
+                 ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f{n}',
+                     FILENAME='/var/opt/mssql/data/{db}_f{n}.ndf') TO FILEGROUP [{name}];",
+                db = source.name
+            ),
+        );
+    }
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.twin_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_twin ON dbo.twin_t (a) ON [FGX];
+         CREATE TABLE dbo.same_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_same ON dbo.same_t (a) ON [fgx];
+         CREATE TABLE dbo.apart_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_apart ON dbo.apart_t (a) ON [other];",
+    );
+    let d = Demo::new("filegroup2813-case-pair");
+    let files = || {
+        let mut held: Vec<String> = std::fs::read_dir(d.dir.join("schema"))
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        held.sort();
+        held
+    };
+    let read = |file: &str| std::fs::read_to_string(d.dir.join("schema").join(file)).unwrap();
+    let mut first = None;
+    for round in ["first", "second"] {
+        let mut args = vec!["pull", "--db", source.connection()];
+        if round == "second" {
+            args.push("--force");
+        }
+        let o = d.run(&args);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert_eq!(
+            files(),
+            ["dbo.apart_t.yml", "dbo.same_t.yml"],
+            "{round} pull: the twin table is left out, not written without its index's placement"
+        );
+        assert!(
+            stderr(&o).contains("table `dbo.twin_t` was left out")
+                && stderr(&o).contains("index `ix_twin` names the filegroup `FGX`"),
+            "{round} pull: {}",
+            stderr(&o)
+        );
+        let now = (read("dbo.same_t.yml"), read("dbo.apart_t.yml"));
+        match &first {
+            None => first = Some(now),
+            Some(before) => assert_eq!(before, &now, "the second pull changed what it wrote"),
+        }
+    }
+    let (same, apart) = first.unwrap();
+    assert!(same.contains("filegroup: fgx"), "{same}");
+    assert_eq!(same.matches("filegroup:").count(), 1, "{same}");
+    assert!(apart.contains("filegroup: other"), "{apart}");
+    assert_eq!(apart.matches("filegroup:").count(), 2, "{apart}");
+
+    // Control, on a case-insensitive database: `ON [FGX]` finds the one
+    // filegroup, the catalog reads it back as stored, and the index is beside
+    // its table's rows, so nothing is written for it.
+    let folded = OwnDatabase::collated(&server, "fg2813_t2", "Latin1_General_100_CI_AS");
+    on_server(
+        folded.connection(),
+        &format!(
+            "ALTER DATABASE [{db}] ADD FILEGROUP [fgx];
+             ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f0',
+                 FILENAME='/var/opt/mssql/data/{db}_f0.ndf') TO FILEGROUP [fgx];
+             CREATE TABLE dbo.t (id int NOT NULL, a int NOT NULL) ON [fgx];
+             CREATE INDEX ix_a ON dbo.t (a) ON [FGX];",
+            db = folded.name
+        ),
+    );
+    let d = Demo::new("filegroup2813-case-folded");
+    let o = d.run(&["pull", "--db", folded.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let written = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(written.contains("filegroup: fgx"), "{written}");
+    assert_eq!(written.matches("filegroup:").count(), 1, "{written}");
 }
 
 /// Issue #902, on this engine: the reader leaves the ledger's tables out of

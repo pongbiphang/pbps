@@ -212,7 +212,8 @@ SELECT t.object_id, b.name AS base_name, b.type AS base_type,
        b.is_primary_key, b.is_unique_constraint,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN b.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.tables t
   LEFT JOIN sys.indexes b ON b.object_id = t.object_id AND b.index_id IN (0, 1)
   LEFT JOIN sys.data_spaces ds ON ds.data_space_id = b.data_space_id
@@ -240,7 +241,8 @@ SELECT kc.parent_object_id AS object_id, kc.name,
        col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN ki.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.key_constraints kc
   JOIN sys.indexes ki
     ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
@@ -368,7 +370,8 @@ SELECT i.object_id, i.name, i.is_unique, i.type AS index_type, i.is_disabled, i.
        col.name AS column_name, ic.is_included_column, ic.is_descending_key,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN i.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.indexes i
   LEFT JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
   LEFT JOIN sys.filegroups fg ON fg.data_space_id = ds.data_space_id
@@ -584,6 +587,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
                 is_primary: opt::<bool>(&row, "is_primary_key")?.unwrap_or(false),
                 is_unique_constraint: opt::<bool>(&row, "is_unique_constraint")?.unwrap_or(false),
                 placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
+                filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
             },
         );
     }
@@ -624,7 +628,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             ignore_dup_key: get(&row, "ignore_dup_key")?,
             index_type: get(&row, "index_type")?,
             placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
-
+            filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned().into(),
             is_primary: get(&row, "is_primary")?,
@@ -701,6 +705,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_included: get(&row, "is_included_column")?,
             is_descending: get(&row, "is_descending_key")?,
             placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
+            filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
         });
     }
 
@@ -910,6 +915,115 @@ pub async fn unknown_collations(conn: &mut Conn, names: &[String]) -> Result<Vec
         }
     }
     Ok(unknown)
+}
+
+/// A row filegroup of the connected database (#2813, DEC-2813.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilegroupRow {
+    pub name: String,
+    pub is_default: bool,
+    pub is_read_only: bool,
+    /// How many of the database's filegroups the model cannot tell from this
+    /// one, that is, have this name once ASCII case is ignored (the rule of
+    /// [`pbps_model::Filegroup`]; `Éast` and `éast` are two). Above one only on
+    /// a case-sensitive database that holds `fgx` and `FGX` together.
+    pub alike: usize,
+}
+
+/// Resolves each declared filegroup name in the connected database, aligned
+/// with `wanted`: `None` where the database holds no such row filegroup
+/// (`type = 'FG'`; a memory-optimized or FILESTREAM one holds no ordinary
+/// table, key or index). The engine does the matching, under the database's
+/// own collation, because that is how `ON [fg]` will resolve the name: a
+/// case-sensitive database refuses `ON [fgx]` for a filegroup `FGX` (Msg 1921,
+/// measured), and a Rust-side case rule would accept what it then refuses.
+pub async fn filegroups_named(
+    conn: &mut Conn,
+    wanted: &[&str],
+) -> Result<Vec<Option<FilegroupRow>>, DbError> {
+    let mut out = vec![None; wanted.len()];
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let values = wanted
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT v.i, f.name, f.is_default, f.is_read_only
+           FROM (VALUES {values}) AS v(i, n)
+           JOIN sys.filegroups f
+             ON f.type = N'FG' AND f.name = v.n COLLATE CATALOG_DEFAULT
+          ORDER BY v.i;"
+    );
+    let mut matched = Vec::new();
+    for row in conn.query(&sql).await? {
+        matched.push((
+            get::<i32>(&row, "i")? as usize,
+            get::<&str>(&row, "name")?.to_owned(),
+            get::<bool>(&row, "is_default")?,
+            get::<bool>(&row, "is_read_only")?,
+        ));
+    }
+    if matched.is_empty() {
+        return Ok(out);
+    }
+    // The twins are counted with the model's own equality, in Rust: SQL's
+    // `LOWER` folds more than ASCII (`Éast` and `éast`, two filegroups the
+    // model tells apart, would read as one), and the collation's equality
+    // folds accents and widths besides.
+    let mut all = Vec::new();
+    for row in conn
+        .query("SELECT name FROM sys.filegroups WHERE type = N'FG';")
+        .await?
+    {
+        all.push(get::<&str>(&row, "name")?.to_owned());
+    }
+    for (i, name, is_default, is_read_only) in matched {
+        out[i] = Some(FilegroupRow {
+            alike: filegroups_alike(&all, &name),
+            name,
+            is_default,
+            is_read_only,
+        });
+    }
+    Ok(out)
+}
+
+/// How many of `all` the model reads as the filegroup `name`: its own equality
+/// (ASCII case only), not the database collation's and not SQL's `LOWER`.
+fn filegroups_alike(all: &[String], name: &str) -> usize {
+    let this = pbps_model::Filegroup::new(name);
+    all.iter()
+        .filter(|other| pbps_model::Filegroup::new(other.as_str()) == this)
+        .count()
+}
+
+#[cfg(test)]
+mod filegroup_alike_tests {
+    use super::filegroups_alike;
+
+    fn names(all: &[&str]) -> Vec<String> {
+        all.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// Only names the model conflates are twins: ASCII case, and nothing more.
+    /// `Éast` and `éast` are two filegroups to the model, as to a
+    /// case-sensitive database; `fgx` and `FGX` are one to the model.
+    #[test]
+    fn only_ascii_case_makes_two_filegroups_twins() {
+        let all = names(&["PRIMARY", "fgx", "FGX", "Éast", "éast"]);
+        assert_eq!(filegroups_alike(&all, "fgx"), 2);
+        assert_eq!(filegroups_alike(&all, "FGX"), 2);
+        // Negative: a non-ASCII case difference is not a twin.
+        assert_eq!(filegroups_alike(&all, "Éast"), 1);
+        assert_eq!(filegroups_alike(&all, "éast"), 1);
+        assert_eq!(filegroups_alike(&all, "PRIMARY"), 1);
+        // Negative: an accent difference is not a twin.
+        assert_eq!(filegroups_alike(&names(&["cafe", "café"]), "cafe"), 1);
+    }
 }
 
 pub async fn matching_table_names(

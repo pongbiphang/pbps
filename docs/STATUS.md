@@ -84,6 +84,13 @@ the UNIQUE constraint or index that holds the rows; absent is a clustered
 primary key), and `pull` reads it (#1178, DEC-1178.1). PostgreSQL refuses the
 field. Columnstore, XML, spatial and hash indexes stay limitations.
 
+A SQL Server table, key and index declare the filegroup they sit on with
+`filegroup:`, and `pull` writes it only for an object off the default (#2813,
+DEC-2813.1). The filegroup must exist beforehand and is never created or
+dropped; a changed one is refused by name. A system-versioned table's history
+table and an indexed view's indexes are still only noticed. PostgreSQL refuses
+the field.
+
 A PostgreSQL table declares its replica identity with `replica_identity:`
 (`full`, `nothing`, `primary_key`, or the UNIQUE constraint or unique index
 whose index it is; absent is the default), `pull` reads it, and a plan sets it

@@ -389,6 +389,15 @@ indexes:
   primary key, or a heap for a table without one — the engine's own default.
   One selector per table, so two clustered indexes cannot be written;
   PostgreSQL refuses the key (DEC-1178.1).
+- **`filegroup` says where a SQL Server table's rows, key or index sit**, only
+  where that is not the database's default. On the table it is where the heap
+  or clustered index is; on a primary key, a unique constraint or an index it is
+  that object's own, and absent means beside the table's rows, which is where the
+  engine puts it. The clustered object has none of its own. The filegroup must
+  exist beforehand: pbps never creates or drops one. A plan against a database
+  refuses a missing, read-only or redundant one by name, offline the name is only
+  checked as a name, and a changed one is refused until there is a design for
+  moving the data. PostgreSQL refuses the key (DEC-2813.1).
 - **`replica_identity` says what a PostgreSQL table's logical-replication
   records carry to name an old row**, only where that is not the default:
   `full`, `nothing`, `primary_key`, or `{unique: uq_x}` / `{index: ix_x}` for

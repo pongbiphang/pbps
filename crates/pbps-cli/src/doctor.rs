@@ -2267,6 +2267,7 @@ mod tests {
                 name: None,
                 columns: vec!["code".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             data: Some(pbps_model::TableData {
                 mode,

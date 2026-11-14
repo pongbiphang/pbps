@@ -89,6 +89,7 @@ pub(crate) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
             filter: Some("c > f(1)".into()),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     base.tables

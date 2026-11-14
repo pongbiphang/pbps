@@ -105,6 +105,7 @@ fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         },
@@ -169,6 +170,7 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         clustered: false,
     };

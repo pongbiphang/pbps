@@ -677,6 +677,7 @@ async fn retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }

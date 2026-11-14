@@ -14,6 +14,7 @@ fn mood(uid: &str) -> (IdsFile, Schema) {
         name: None,
         columns: vec!["m".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let mut schema = Schema::default();
     schema.types.insert(
@@ -119,6 +120,7 @@ fn a_chain_of_renames_over_a_narrow_ensure_table_moves_no_row() {
             name: None,
             columns: vec!["m".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.data = Some(pbps_model::TableData {
             mode: DataMode::Ensure,

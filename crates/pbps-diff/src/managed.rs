@@ -327,6 +327,7 @@ pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
         checks,
         indexes,
         exclude,
+        filegroup,
         clustered,
         replica_identity,
         storage_parameters,
@@ -348,6 +349,7 @@ pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
         (!checks.is_empty(), "checks"),
         (!indexes.is_empty(), "indexes"),
         (!exclude.is_empty(), "exclusion constraints"),
+        (filegroup.is_some(), "a filegroup"),
         (clustered.is_some(), "a clustered index"),
         (replica_identity.is_some(), "a replica identity"),
         (!storage_parameters.is_empty(), "storage parameters"),
@@ -770,6 +772,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         p2.storage_parameters
