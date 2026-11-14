@@ -785,15 +785,20 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     table_sources(name, table, Default::default())
 }
 
+/// The length is `ident::quote`'s own measure: UTF-16 code units against
+/// SQL Server's `sysname` limit, so a supplementary-plane character counts two
+/// and a name that passes here is one `quote` will not refuse at emit.
 fn not_an_identifier(name: &str) -> bool {
-    name.trim().is_empty() || name.chars().count() > 128 || name.contains('\0')
+    name.trim().is_empty()
+        || name.encode_utf16().count() > ident::MAX_IDENT_CHARS
+        || name.contains('\0')
 }
 
 /// What a declared filegroup must satisfy before any engine is asked
 /// (#2813, DEC-2813.1). Whether the filegroup exists is a fact about a
 /// database, checked when planned against one.
 ///
-/// - A name is a SQL Server identifier: not empty, at most 128 characters.
+/// - A name is a SQL Server identifier: not empty, at most 128 UTF-16 code units.
 /// - **The clustered object has none of its own.** Its rows are the table's,
 ///   so `filegroup:` on the table says where it sits, and a second place for
 ///   the same fact could disagree with the first.
@@ -808,7 +813,7 @@ fn filegroup_problems(table: &Table) -> Vec<DialectError> {
     {
         errs.push(invalid(format!(
             "the table names the filegroup `{}`, which is not a SQL Server identifier: it is \
-             not empty, and at most 128 characters",
+             not empty, and at most 128 UTF-16 code units",
             pbps_model::escape::Escaped(name),
         )));
     }
@@ -818,7 +823,7 @@ fn filegroup_problems(table: &Table) -> Vec<DialectError> {
         if not_an_identifier(name) {
             errs.push(invalid(format!(
                 "{what} names the filegroup `{}`, which is not a SQL Server identifier: it is \
-                 not empty, and at most 128 characters",
+                 not empty, and at most 128 UTF-16 code units",
                 pbps_model::escape::Escaped(name),
             )));
         } else if clustered {
@@ -2506,6 +2511,29 @@ mod tests {
         t.filegroup = fg(&"x".repeat(128));
         t.unique.clear();
         t.indexes.clear();
+        assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    /// The name's length is measured as `ident::quote` measures it, in UTF-16
+    /// code units: 65 supplementary-plane characters are 130 units and are
+    /// refused here, not later at emit, and 64 are 128 and pass (#2813 review
+    /// round 3). Counting `char`s would let the 65 through.
+    #[test]
+    fn a_filegroup_name_is_measured_in_utf16_units_as_quote_measures_it() {
+        let fg = |n: &str| Some(pbps_model::Filegroup::new(n));
+        let (name, mut t) = base_table();
+        t.unique.clear();
+        t.indexes.clear();
+        let wide = |n: usize| "\u{1f600}".repeat(n);
+        assert!(ident::quote(&wide(65)).is_err() && ident::quote(&wide(64)).is_ok());
+        t.filegroup = fg(&wide(65));
+        let said = messages(&table(&name, &t));
+        assert!(said.contains("not a SQL Server identifier"), "{said}");
+        // Negative: the largest name `quote` takes is accepted, here and there.
+        t.filegroup = fg(&wide(64));
+        assert_eq!(messages(&table(&name, &t)), "");
+        // Negative: 128 BMP characters are 128 units, and pass as before.
+        t.filegroup = fg(&"\u{4f7f}".repeat(128));
         assert_eq!(messages(&table(&name, &t)), "");
     }
 
