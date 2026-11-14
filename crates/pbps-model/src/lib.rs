@@ -69,6 +69,7 @@ pub mod intent;
 pub mod managed_type;
 pub mod module;
 pub mod name;
+pub mod name_only;
 pub mod object_ref;
 pub mod operation;
 pub mod part_effects;
@@ -127,6 +128,7 @@ pub use module::{
 pub use name::{
     ColumnName, ColumnRef, NameError, ObjectLocalName, RoleName, TableName, check_segment,
 };
+pub use name_only::{NameOnly, NameOnlyChange, NameOnlyDrift};
 pub use partitions::Partitions;
 pub use plan::{
     DeclaredTypeBefore, DeclaredTypePin, ExtensionChangePin, ExtensionDropPin, ExtensionPin,

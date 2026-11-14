@@ -496,8 +496,12 @@ impl StateSnapshot {
     }
 
     /// Whether the database still equals this snapshot. Anything else is drift.
+    ///
+    /// Compared as the record names it: an object of a kind held by name only that the
+    /// record does not hold is not a difference, a recorded one that is gone or changed
+    /// is (DEC-2855.1).
     pub fn matches(&self, actual: &Schema) -> bool {
-        &self.schema == actual
+        self.schema.recorded_matches(actual)
     }
 
     /// Refuses a snapshot this build cannot read faithfully.
@@ -790,6 +794,29 @@ mod tests {
             "leon",
         );
         assert!(snap.matches(&schema_with("nvarchar(255)")));
+    }
+
+    /// `snapshot` refuses a database that differs from the record; a text search object
+    /// the record never held is not a difference, one it holds that moved is (DEC-2855.1).
+    #[test]
+    fn a_snapshot_matches_unless_a_recorded_text_search_object_moved() {
+        let object = |template: &str| {
+            let mut s = schema_with("nvarchar(255)");
+            s.search.insert(
+                crate::SearchRef::new(crate::SearchKind::Dictionary, "app.d".parse().unwrap()),
+                crate::SearchObject::Dictionary {
+                    template: template.parse().unwrap(),
+                    options: Default::default(),
+                },
+            );
+            s
+        };
+        let snap = |schema| StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "o");
+        assert!(snap(schema_with("nvarchar(255)")).matches(&object("pg_catalog.simple")));
+        assert!(snap(object("pg_catalog.simple")).matches(&object("pg_catalog.simple")));
+        // Negative: gone and altered are drift.
+        assert!(!snap(object("pg_catalog.simple")).matches(&schema_with("nvarchar(255)")));
+        assert!(!snap(object("pg_catalog.simple")).matches(&object("pg_catalog.synonym")));
     }
 
     #[test]
