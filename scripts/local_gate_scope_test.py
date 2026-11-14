@@ -4,12 +4,14 @@
 import contextlib
 import io
 import json
+import os
 import posixpath
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -314,6 +316,81 @@ class Verdict(Repo):
         self.git("checkout", "-q", "--detach", self.base)
         self.git("update-index", "--chmod=+x", "scripts/pr-size.py")
         self.assertEqual(self.verdict(self.commit_index("chmod"))["verdict"], "non-live")
+
+    def git_settings(self, **settings):
+        """The environment of a user whose Git configuration sets `settings`."""
+        env = {"GIT_CONFIG_COUNT": str(len(settings))}
+        for number, (key, value) in enumerate(settings.items()):
+            env[f"GIT_CONFIG_KEY_{number}"] = key.replace("__", ".")
+            env[f"GIT_CONFIG_VALUE_{number}"] = value
+        return mock.patch.dict(os.environ, env)
+
+    def gitlink(self, with_doc=True):
+        self.git("checkout", "-q", "--detach", self.base)
+        if with_doc:
+            self.write("docs/SPEC.md", "edited\n")
+        self.git("add", "-A")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},docs/vendored")
+        return self.commit_index("gitlink")
+
+    def test_a_submodule_pointer_hidden_by_git_configuration_is_still_full(self):
+        head = self.gitlink()
+        for settings in ({"diff__ignoreSubmodules": "all"}, {"diff__ignoreSubmodules": "dirty"}):
+            with self.subTest(settings=settings), self.git_settings(**settings):
+                result = self.verdict(head)
+                self.assertEqual(result["verdict"], "full", result)
+                self.assertIn("docs/vendored", result["reason"])
+
+    def test_a_submodule_ignored_by_its_own_configuration_is_still_full(self):
+        head = self.gitlink()
+        with self.git_settings(**{"submodule.docs/vendored.ignore": "all"}):
+            self.assertEqual(self.verdict(head)["verdict"], "full")
+
+    def test_the_same_head_without_the_gitlink_is_non_live_under_that_setting(self):
+        head = self.change({"docs/SPEC.md": "edited\n"})
+        with self.git_settings(diff__ignoreSubmodules="all"):
+            self.assertEqual(self.verdict(head)["verdict"], "non-live")
+
+    def test_no_git_setting_that_shapes_a_listing_changes_the_verdict(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "scripts/pr-size.py", "scripts/moved-tool.py")
+        self.write("crates/pbps-model/src/caf\u00e9.rs", "// non-ascii name\n")
+        head = self.commit("rename, crate file with a non-ASCII name")
+        expected = self.verdict(head)
+        self.assertEqual(expected["verdict"], "full")
+        self.assertIn("crates/pbps-model/src/caf\u00e9.rs", expected["reason"])
+        for key, value in (("diff.renames", "copies"), ("diff.renames", "false"), ("diff.orderFile", "/dev/null"),
+                           ("core.quotePath", "true"), ("core.quotePath", "false"), ("diff.relative", "true"),
+                           ("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"), ("diff.renameLimit", "1"),
+                           ("diff.external", "false"), ("diff.algorithm", "patience")):
+            with self.subTest(setting=f"{key}={value}"), self.git_settings(**{key.replace(".", "__"): value}):
+                self.assertEqual(self.verdict(head), expected)
+
+    def test_a_rename_lists_both_names_under_a_copy_detecting_configuration(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "scripts/live-tests.sh", "scripts/helper-tool.sh")
+        head = self.commit("rename")
+        with self.git_settings(diff__renames="copies"):
+            result = self.verdict(head)
+        self.assertEqual(result["verdict"], "full")
+        self.assertIn("scripts/live-tests.sh", result["reason"])
+
+    def test_a_repository_given_as_a_subdirectory_reports_paths_from_the_root(self):
+        head = self.change({"crates/pbps-model/src/lib.rs": "// edited\n", "docs/SPEC.md": "x\n"})
+        with self.git_settings(diff__relative="true"):
+            result = lgs.verdict(self.path / "docs", self.base, head)
+        self.assertEqual(result["verdict"], "full", result)
+        self.assertIn("crates/pbps-model/src/lib.rs", result["reason"])
+
+    def test_a_submodule_marked_ignore_all_in_gitmodules_is_still_full(self):
+        base = self.change({".gitmodules": '[submodule "docs/vendored"]\n\tpath = docs/vendored\n\turl = x\n\tignore = all\n'})
+        self.git("checkout", "-q", "--detach", base)
+        self.write("docs/SPEC.md", "edited\n")
+        self.git("add", "-A")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},docs/vendored")
+        result = self.verdict(self.commit_index("gitlink"), base=base)
+        self.assertEqual(result["verdict"], "full", result)
+        self.assertIn("docs/vendored", result["reason"])
 
     def test_a_head_equal_to_its_base_is_full(self):
         self.assertEqual(self.verdict(self.base)["verdict"], "full")
