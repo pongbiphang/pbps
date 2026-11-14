@@ -257,9 +257,14 @@ fn every_difference_is_refused_by_name_and_an_undeclared_object_is_left_alone() 
             kept.replacen("primary_key", "  note: {type: text}\nprimary_key", 1),
         )
         .unwrap();
+        // A new column is a new identity, and a plan against a database is refused while the
+        // identity file lags the declarations; the offline plan records it first.
+        succeeds(f.d.run(&["plan", "--no-dev"]));
+        f.d.commit();
         let out = succeeds(f.d.run(&["plan", "--db", f.target()]));
         assert!(said(&out).contains("note"), "{}", said(&out));
-        std::fs::write(&table, kept).unwrap();
+        // The column stays declared: taking it back out is a drop, which the offline plan
+        // would stop on for want of a reason, and the steps below do not depend on it.
         // A declaration that was recorded and is gone is a drop, and it needs its reason.
         std::fs::remove_file(dir.join("app.copied.textsearch-config.yml")).unwrap();
         let out = f.d.run(&["plan", "--db", f.target()]);
