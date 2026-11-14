@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
@@ -16,8 +17,15 @@ struct Project {
 
 impl Project {
     fn new(name: &str, dialect: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("pbps-deps-wire-{name}-{}", std::process::id()));
+        // Every project gets a directory of its own. The tests run in parallel and two of
+        // them build the same scenario, so a name and the process id alone would let one
+        // test remove the directory another is still planning in.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "pbps-deps-wire-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("schema")).unwrap();
         std::fs::write(root.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
@@ -99,7 +107,7 @@ fn scenario(dialect: &str) -> serde_json::Value {
 }
 
 /// The parts of a plan that depend on the annotations: the order of the
-/// changes and the persisted `module_deps`. Times and checksums are left out
+/// changes and the persisted `object_deps`. Times and checksums are left out
 /// because they move with every run.
 fn pinned(plan: &serde_json::Value) -> serde_json::Value {
     let changes: Vec<_> = plan["changes"]["changes"]
@@ -110,22 +118,42 @@ fn pinned(plan: &serde_json::Value) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "version": plan["version"],
-        "module_deps": plan["module_deps"],
+        "object_deps": plan["object_deps"],
         "changes": changes,
     })
 }
 
-const MSSQL: &str = r#"{"version":73,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
-const POSTGRES: &str = r#"{"version":73,"module_deps":{"dbo.a_first":["dbo.z_last"],"dbo.fresh":["dbo.keep"],"dbo.keep":["dbo.base"]},"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
+const MSSQL: &str = r#"{"version":75,"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["create_module","dbo.fresh",null]]}"#;
+const POSTGRES: &str = r#"{"version":75,"object_deps":[{"owner":{"root":{"module":"dbo.a_first"},"part":"whole"},"target":{"root":{"module":"dbo.z_last"},"part":"whole"}},{"owner":{"root":{"module":"dbo.fresh"},"part":"whole"},"target":{"root":{"module":"dbo.keep"},"part":"whole"}},{"owner":{"root":{"module":"dbo.keep"},"part":"whole"},"target":{"root":{"module":"dbo.base"},"part":"whole"}}],"changes":[["drop_module","dbo.old",null],["create_table",null,"dbo.t"],["alter_module","dbo.base",null],["create_module","dbo.z_last",null],["create_module","dbo.a_first",null],["alter_module","dbo.keep",null],["create_module","dbo.fresh",null]]}"#;
 
 fn expected(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
 #[test]
-fn a_module_only_plan_keeps_its_order_and_its_module_deps_bytes() {
+fn a_module_only_plan_keeps_its_order_and_writes_object_deps() {
     assert_eq!(pinned(&scenario("mssql")), expected(MSSQL));
     assert_eq!(pinned(&scenario("postgres")), expected(POSTGRES));
+    // Negative: the old key is gone from the plan, not written beside the new.
+    assert!(scenario("mssql").get("module_deps").is_none());
+}
+
+/// A project with no `depends_on:` writes no `object_deps`: like the other
+/// collections of a plan, an empty list is left out (DEC-2469.7).
+#[test]
+fn a_plan_without_annotations_omits_object_deps() {
+    let p = Project::new("none", "mssql");
+    p.file("dbo.t.yml", "table: dbo.t\ncolumns:\n  id: {type: int}\n");
+    let out = p.root.join("plan.json");
+    let plan = p.plan(&out);
+    assert!(plan.get("object_deps").is_none(), "{plan}");
+    // Negative: a project with an annotation still writes its edges.
+    assert!(
+        !scenario("mssql")["object_deps"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A dependency that is not declared and a cycle are still refused at the

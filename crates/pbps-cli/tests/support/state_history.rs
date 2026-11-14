@@ -518,8 +518,19 @@ pub fn refusals(server: &str, pg: bool) {
         );
         set_record(connection, pg, *id, text);
     }
+    // A row one version back, as the build that wrote it wrote it: that build
+    // had no `object_deps`, and a project with no module edges had no
+    // `module_deps` either (DEC-2469.7). Lowering only the version would make
+    // a row no build ever wrote, which the reader rightly refuses.
     let mut old: serde_json::Value = serde_json::from_str(text).unwrap();
     old["version"] = (pbps_model::state::CURRENT_VERSION - 1).into();
+    let mixed = old.to_string();
+    let edges = old.as_object_mut().unwrap().shift_remove("object_deps");
+    assert_eq!(
+        edges,
+        Some(serde_json::json!([])),
+        "a fresh bootstrap has no edges"
+    );
     set_record(connection, pg, *id, &old.to_string());
     ok(d.run(&["state", "show", &id_text, "--db", connection]));
     refused(
@@ -529,6 +540,18 @@ pub fn refusals(server: &str, pg: bool) {
         "state.export-version",
         "state export requires version",
     );
+    // Negative: the same lowered version that still holds `object_deps` was
+    // written by no build, and is refused as unreadable by naming the field.
+    set_record(connection, pg, *id, &mixed);
+    for command in ["show", "diff", "export"] {
+        refused(
+            &d,
+            connection,
+            &["state", command, &id_text],
+            "state.unreadable",
+            "cannot hold `object_deps`",
+        );
+    }
     set_record(connection, pg, *id, text);
     refused(
         &d,

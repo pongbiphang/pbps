@@ -667,7 +667,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
         // neither end. `--resume` reads this mapping back and compares against
         // it, so a hand-made change to that table while the deployment is
         // paused is seen rather than carried silently into the closing entry.
-        let module_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
+        let object_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
             after.schema,
@@ -675,7 +675,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             operator,
         );
         checkpoint.baseline_evidence = after.baseline_evidence;
-        checkpoint.module_deps = module_deps;
+        checkpoint.object_deps = object_deps;
         // A checkpoint records the database as it stands, and what was
         // declared is what the previous state said until the plan finishes:
         // the closing entry advances it by the whole plan, and nothing plans
@@ -847,7 +847,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::emission::Engine>(
             operator,
         );
         snapshot.baseline_evidence = after.baseline_evidence;
-        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.object_deps = plan.object_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
         snapshot.target_assertions = plan.target_assertions.clone();

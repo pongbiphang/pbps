@@ -157,6 +157,14 @@ pub fn acceptance(server: &str, pg: bool) {
     let id = records(connection, pg).last().unwrap().0;
     let mut old = serde_json::to_value(latest(connection, pg)).unwrap();
     old["version"] = 33.into();
+    // A version-33 build wrote no `object_deps`, and no `module_deps` for a
+    // project without module edges; a row holding it would be refused.
+    let edges = old.as_object_mut().unwrap().shift_remove("object_deps");
+    assert_eq!(
+        edges,
+        Some(serde_json::json!([])),
+        "this project has no edges"
+    );
     edit_snapshot(connection, pg, id, &old);
     let before = latest(connection, pg);
     assert_eq!(before.version, 33);

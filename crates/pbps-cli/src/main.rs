@@ -5619,7 +5619,7 @@ fn cmd_plan(
                 cs.changes().clone(),
                 res.ids.clone(),
             );
-            plan.module_deps = loaded
+            plan.object_deps = loaded
                 .hints
                 .annotations
                 .wire()

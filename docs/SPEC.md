@@ -717,6 +717,10 @@ Three more rules, all consequences of the model rather than choices:
 - **`depends_on:` is an annotation, not state.** Creation order is invisible in
   the database, so it lives beside the model exactly as `strategy:` does. It is
   needed only where the identifier scan of ADR-0002 cannot see a dependency.
+  The saved plan and the state record the declared annotations as `object_deps`,
+  a sorted list of `{owner, target}` reference pairs, beside the schema and
+  outside drift comparison. The state always writes the list; the plan omits it
+  when empty, like its other collections (DEC-2469.7).
 - **`public_execute:` is an annotation too, and its absence is the closed
   answer.** On an engine whose `CREATE` hands every new routine to `PUBLIC` —
   PostgreSQL does; SQL Server does not — a plan that creates a procedure or a
@@ -2528,7 +2532,7 @@ entry, and checks for a retained successful `apply` with this expand checksum
 in this ledger. Missing/pruned apply evidence refuses. An absent, empty,
 unreadable or unsupported ledger refuses with its own diagnosis; a staged
 checkpoint must be finished or baselined. It copies the previous managed schema,
-ids, declared inputs, module dependencies and baseline evidence unchanged.
+ids, declared inputs, dependency annotations and baseline evidence unchanged.
 The new audit entry has kind `data_work`, reporting operator/reason/Git SHA,
 no applied-plan checksum, and a `data_work` JSON payload holding identity,
 expand checksum, outcome and notes. It runs no user SQL and changes no business

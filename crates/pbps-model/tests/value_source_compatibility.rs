@@ -7,6 +7,16 @@ use pbps_model::{
     TableName, state_checksum,
 };
 
+/// The state row as a version 25 build wrote it. A snapshot always writes
+/// `object_deps` now, and a row this old may not hold it (DEC-2469.7); this
+/// fixture has no edges, so removing the empty list gives the old bytes.
+fn historical_state(state: &StateSnapshot) -> String {
+    let mut row = serde_json::to_value(state).unwrap();
+    let edges = row.as_object_mut().unwrap().shift_remove("object_deps");
+    assert_eq!(edges, Some(serde_json::json!([])));
+    serde_json::to_string(&row).unwrap()
+}
+
 fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     let name = TableName::new("app", "sources");
     let mut table = Table::default();
@@ -102,7 +112,7 @@ fn every_value_source_keeps_approved_bytes_and_fingerprints() {
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
-        ("state.json", serde_json::to_string(&state).unwrap()),
+        ("state.json", historical_state(&state)),
         (
             "declared.json",
             serde_json::to_string(&state.declared).unwrap(),
@@ -135,7 +145,7 @@ fn every_value_source_keeps_approved_bytes_and_fingerprints() {
     let mut historical = state.clone();
     historical.version = pbps_model::state::OLDEST_READABLE_VERSION;
     assert_eq!(
-        StateSnapshot::from_json(&serde_json::to_string(&historical).unwrap()).unwrap(),
+        StateSnapshot::from_json(&historical_state(&historical)).unwrap(),
         historical
     );
 
@@ -159,7 +169,7 @@ fn free_text_keeps_the_bytes_a_string_had() {
     let json = serde_json::to_string(text).unwrap();
     let (_, _, mut plan, mut state) = artifacts();
     let plan_before = serde_json::to_string(&plan).unwrap();
-    let state_before = serde_json::to_string(&state).unwrap();
+    let state_before = historical_state(&state);
 
     plan.git_sha = Some(text.into());
     plan.created_at = text.into();
@@ -195,7 +205,7 @@ fn free_text_keeps_the_bytes_a_string_had() {
             &format!(r#""operator":"fixture","reason":{json}"#),
             1,
         );
-    assert_eq!(serde_json::to_string(&state).unwrap(), expected);
+    assert_eq!(historical_state(&state), expected);
     assert_eq!(StateSnapshot::from_json(&expected).unwrap(), state);
 
     // Negative: a value that is not a string is still refused, as it was.

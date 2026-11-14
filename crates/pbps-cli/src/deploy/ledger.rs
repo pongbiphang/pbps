@@ -385,7 +385,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
             );
             snapshot.baseline_evidence = scoped.baseline_evidence;
-            snapshot.module_deps = loaded
+            snapshot.object_deps = loaded
                 .hints
                 .annotations
                 .wire()
@@ -640,7 +640,7 @@ pub fn cmd_baseline(
                     StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
                 );
                 snapshot.baseline_evidence = scoped.baseline_evidence;
-                snapshot.module_deps = loaded
+                snapshot.object_deps = loaded
                     .hints
                     .annotations
                     .wire()

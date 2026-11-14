@@ -619,7 +619,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
             operator,
         );
         snapshot.baseline_evidence = after.baseline_evidence;
-        snapshot.module_deps = plan.module_deps.clone();
+        snapshot.object_deps = plan.object_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
         snapshot.target_assertions = plan.target_assertions.clone();

@@ -473,32 +473,21 @@ fn every_legacy_module_identity_family_round_trips_without_wire_changes() {
     let deps: ModuleDeps = ids.iter().map(|id| (id.clone(), ids.clone())).collect();
     let before = serde_json::to_vec(&deps).unwrap();
     let refs = ObjectDeps::from_legacy(&deps);
-    assert_eq!(
-        serde_json::to_vec(&refs.to_legacy().unwrap()).unwrap(),
-        before
-    );
+    assert_eq!(serde_json::to_vec(&refs.modules()).unwrap(), before);
     for id in &ids {
         let r = ObjectRef::legacy(&id.raw().to_string()).unwrap();
         assert_eq!(r.legacy_spelling().unwrap(), id.raw().to_string());
         assert_eq!(reference(&r.raw()), r);
     }
     let empty: ModuleDeps = [("app.empty".parse().unwrap(), BTreeSet::new())].into();
-    assert_eq!(ObjectDeps::from_legacy(&empty).to_legacy().unwrap(), empty);
+    assert_eq!(ObjectDeps::from_legacy(&empty).modules(), empty);
+    // A non-module reference is not in the module view, and a duplicate owner
+    // has no wire form.
     assert!(
-        dependencies(&[("app.v", &["table::app.t"])])
-            .to_legacy()
-            .is_err()
+        dependencies(&[("app.v", &["table::app.t"])]).modules()[&"app.v".parse().unwrap()]
+            .is_empty()
     );
-    assert!(
-        dependencies(&[("table::app.t", &["app.v"])])
-            .to_legacy()
-            .is_err()
-    );
-    assert!(
-        dependencies(&[("app.v", &[]), ("app.v", &[])])
-            .to_legacy()
-            .is_err()
-    );
+    assert!(ObjectEdges::from_deps(&dependencies(&[("app.v", &[]), ("app.v", &[])])).is_err());
 }
 
 #[test]
@@ -915,8 +904,7 @@ fn legacy(rows: &[(&str, &[&str])]) -> ModuleDeps {
             .map(|(o, t)| (reference(o), t.iter().map(|s| reference(s)).collect()))
             .collect(),
     )
-    .to_legacy()
-    .unwrap()
+    .modules()
 }
 
 #[test]
@@ -933,7 +921,7 @@ fn the_module_view_keeps_module_edges_and_leaves_the_rest_to_the_contract() {
     // Negative: a module-only set is its own view and is legacy.
     let only = dependencies(&[("module::app.v", &["module::app.f(integer)"])]);
     assert!(only.is_legacy());
-    assert_eq!(only.to_legacy().unwrap(), only.modules());
+    assert_eq!(ObjectEdges::from_deps(&only).unwrap().to_deps(), only);
 }
 
 #[test]
@@ -983,25 +971,121 @@ fn only_a_non_module_reference_makes_the_input_extended() {
 }
 
 #[test]
-fn an_extended_reference_is_refused_at_the_wire_by_name() {
+fn the_wire_carries_a_non_module_edge_and_reads_it_back_equal() {
     let annotations = Annotations {
-        declared: dependencies(&[("module::app.v", &["table::app.t"])]),
+        // Listed against the sorted order, so the wire sorts them.
+        declared: dependencies(&[
+            ("module::app.v", &["table::app.t", "module::app.f(integer)"]),
+            ("table::app.t", &["module::app.v"]),
+        ]),
+        ..Default::default()
+    };
+    let wire = annotations.wire().unwrap();
+    assert_eq!(wire.len(), 3);
+    assert_eq!(wire.iter().next().unwrap().owner, reference("table::app.t"));
+    let json = serde_json::to_string(&wire).unwrap();
+    let back: ObjectEdges = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, wire);
+    // The in-memory form comes back grouped by owner in the saved order.
+    assert_eq!(
+        back.to_deps(),
+        dependencies(&[
+            ("table::app.t", &["module::app.v"]),
+            ("module::app.v", &["table::app.t", "module::app.f(integer)"]),
+        ])
+    );
+    // Negative: the owner of a mixed edge is not lost to the module view.
+    assert!(!annotations.declared.is_legacy());
+}
+
+/// The saved order is the derived order of a reference, which follows the
+/// variant order of `Root`. Reordering the variants would reorder every saved
+/// list and make old rows unreadable as non-canonical, so it is pinned here.
+#[test]
+fn the_wire_order_follows_the_root_variants() {
+    let by_kind = [
+        "role::reader",
+        "module::app.v",
+        "type::app.d",
+        "column::app.t.x",
+        "table::app.t",
+    ];
+    let wire = ObjectEdges::from_deps(&dependencies(
+        &by_kind.map(|owner| (owner, &["table::app.z"][..])),
+    ))
+    .unwrap();
+    let owners: Vec<_> = wire.iter().map(|e| e.owner.raw()).collect();
+    assert_eq!(
+        owners,
+        [
+            "table::app.t",
+            "column::app.t.x",
+            "type::app.d",
+            "module::app.v",
+            "role::reader"
+        ]
+    );
+    // Negative: the same edges listed in the saved order are the same list.
+    let again = ObjectEdges::from_deps(&dependencies(
+        &owners
+            .iter()
+            .map(|o| (o.as_str(), &["table::app.z"][..]))
+            .collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    assert_eq!(again, wire);
+}
+
+#[test]
+fn a_duplicate_owner_is_refused_by_name_at_the_wire() {
+    let annotations = Annotations {
+        declared: dependencies(&[("module::app.v", &[]), ("module::app.v", &["table::app.t"])]),
         ..Default::default()
     };
     let why = annotations.wire().unwrap_err();
-    assert!(why.contains("table::app.t"), "{why}");
-    assert!(why.contains("module-to-module"), "{why}");
-    let owner = Annotations {
-        declared: dependencies(&[("table::app.t", &["module::app.v"])]),
+    assert!(why.contains("module::app.v"), "{why}");
+    // Negative: two different owners are fine.
+    let two = Annotations {
+        declared: dependencies(&[("module::app.v", &[]), ("module::app.w", &["table::app.t"])]),
         ..Default::default()
     };
-    assert!(owner.wire().unwrap_err().contains("table::app.t"));
-    // Negative: module-only annotations are written as before.
-    let only = Annotations {
-        declared: dependencies(&[("module::app.v", &["module::app.f(integer)"])]),
-        ..Default::default()
+    assert!(two.wire().is_ok());
+}
+
+/// A generic JSON value keeps the last of two members with one name. The list
+/// is read straight from the input, so the typed readers still see the repeat.
+#[test]
+fn a_repeated_member_in_a_saved_edge_is_refused_by_position() {
+    let spelled = |r: &str| serde_json::to_string(&reference(r)).unwrap();
+    let (t, v, base) = (
+        spelled("table::app.t"),
+        spelled("module::app.v"),
+        spelled("module::app.base"),
+    );
+    let refused = |text: String| {
+        serde_json::from_str::<ObjectEdges>(&text)
+            .unwrap_err()
+            .to_string()
     };
-    assert_eq!(only.wire().unwrap(), only.declared.to_legacy().unwrap());
+    // A member of the pair twice, in the second edge.
+    let why = refused(format!(
+        r#"[{{"owner":{t},"target":{v}}},{{"owner":{v},"owner":{v},"target":{base}}}]"#
+    ));
+    assert!(
+        why.contains("`object_deps` edge 1") && why.contains("duplicate field `owner`"),
+        "{why}"
+    );
+    // A member of a reference twice, in the first edge.
+    let twice = t.replacen(r#""part":"#, r#""part":"whole","part":"#, 1);
+    assert_ne!(twice, t, "the reference has a `part` member to repeat");
+    let why = refused(format!(r#"[{{"owner":{twice},"target":{v}}}]"#));
+    assert!(
+        why.contains("`object_deps` edge 0") && why.contains("duplicate field `part`"),
+        "{why}"
+    );
+    // Negative: the same two edges with every member once are read.
+    let once = format!(r#"[{{"owner":{t},"target":{v}}},{{"owner":{v},"target":{base}}}]"#);
+    assert_eq!(serde_json::from_str::<ObjectEdges>(&once).unwrap().len(), 2);
 }
 
 #[test]

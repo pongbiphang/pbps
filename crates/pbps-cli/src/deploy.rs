@@ -486,3 +486,6 @@ mod search_drift_tests;
 
 #[cfg(test)]
 mod comment_drift_tests;
+
+#[cfg(test)]
+mod checkpoint_edges_tests;

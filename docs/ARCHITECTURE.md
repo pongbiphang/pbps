@@ -325,5 +325,8 @@ annotation contract for extended input, and
 `pbps-diff::order::deployment::schedule::schedule` discharges a deferred
 computed-call refusal only after canonical scheduling; connected computed-call
 collation checks remain in the SQL Server planning adapter. No persisted model
-changes: `Hints` carries `Annotations`, and the saved plan and state still write
-`module_deps` through `Annotations::wire`.
+changes beyond the field: `Hints` carries `Annotations`, and the saved plan and
+state write the declared set as `object_deps` (a flat sorted list of reference
+pairs) through `Annotations::wire`; the state always writes it and the plan omits
+an empty list. A state row older than the cut
+`OBJECT_DEPS_VERSION` is converted on read; a plan is never migrated.

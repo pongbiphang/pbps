@@ -288,18 +288,28 @@ pub(super) fn modules_after(
 
 /// The dependency annotations that describe an intermediate staged state.
 ///
-/// `plan.module_deps` is the complete post-plan annotation set, including the
+/// `plan.object_deps` is the complete post-plan annotation set, including the
 /// meaningful absence of an edge that was removed. It is therefore right for
-/// every module that survives the plan. A module scheduled for deletion may
+/// every owner that survives the plan. A module scheduled for deletion may
 /// still exist at an early checkpoint, though, and its declaration has already
-/// disappeared; until its DROP runs, preserve the dependency information from
-/// the recorded state. Edges to modules no longer present at this checkpoint
-/// are discarded so the snapshot never claims an impossible dependency.
+/// disappeared; until its DROP runs, preserve its edges from the recorded
+/// state. An edge with an endpoint this checkpoint's schema does not declare is
+/// discarded so the snapshot never claims an impossible dependency.
+///
+/// The recorded edges are taken for the dropped module's own edges only, and
+/// the endpoints are tested by what the schema declares now, so an old edge is
+/// never copied onto a replacement that reuses a name (#2469). Only a module
+/// can be scheduled for deletion with its edges outstanding today; another
+/// kind of owner joins `dropped` here when it can.
 pub(super) fn dependency_hints_for_schema(
     recorded: &pbps_model::StateSnapshot,
     plan: &pbps_model::SavedPlan,
     schema: &Schema,
-) -> pbps_model::ModuleDeps {
+) -> pbps_model::object_ref::ObjectEdges {
+    use pbps_model::object_ref::{ObjectEdges, Registry};
+    if recorded.object_deps.is_empty() && plan.object_deps.is_empty() {
+        return ObjectEdges::default();
+    }
     let dropped: std::collections::BTreeSet<_> = plan
         .changes
         .changes
@@ -307,27 +317,21 @@ pub(super) fn dependency_hints_for_schema(
         .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
         .filter_map(|planned| planned.change.module_id())
         .collect();
-    let present: std::collections::BTreeSet<_> = schema.modules.keys().collect();
-    let mut dependencies = pbps_model::ModuleDeps::new();
-
-    for name in schema.modules.keys() {
-        let source = if dropped.contains(name) {
-            recorded.module_deps.get(name)
-        } else {
-            plan.module_deps.get(name)
-        };
-        let Some(source) = source else {
-            continue;
-        };
-        let filtered = source
+    let of_dropped = |edge: &&pbps_model::object_ref::ObjectEdge| {
+        edge.owner
+            .module_id()
+            .is_some_and(|id| dropped.contains(id))
+    };
+    let declared = Registry::new(schema);
+    ObjectEdges::from_edges(
+        recorded
+            .object_deps
             .iter()
-            .filter(|dependency| present.contains(*dependency))
-            .cloned()
-            .collect();
-        dependencies.insert(name.clone(), filtered);
-    }
-    dependencies.retain(|_, required| !required.is_empty());
-    dependencies
+            .filter(of_dropped)
+            .chain(plan.object_deps.iter().filter(|edge| !of_dropped(edge)))
+            .filter(|edge| declared.contains(&edge.owner) && declared.contains(&edge.target))
+            .cloned(),
+    )
 }
 
 /// The modules a command is answerable for.

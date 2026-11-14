@@ -12469,9 +12469,11 @@ fn a_baseline_does_not_hand_over_a_rebound_partition_on(server: &str, k: usize) 
     d.commit();
     succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
     // Keep this historical parent-refusal fixture on a pre-evidence snapshot.
+    // Version 30 predates `object_deps` too, and a row of that age may not hold
+    // it (it is empty here: no module is declared).
     on_server(
         &connection,
-        "UPDATE public.__pbps_state SET state_json = jsonb_set(state_json::jsonb - 'baseline_evidence', '{version}', '30')::text, state_version = 30",
+        "UPDATE public.__pbps_state SET state_json = jsonb_set(state_json::jsonb - 'baseline_evidence' - 'object_deps', '{version}', '30')::text, state_version = 30",
     );
     let path = d.dir.join("schema/app.ev.yml");
     let text = std::fs::read_to_string(&path).unwrap();

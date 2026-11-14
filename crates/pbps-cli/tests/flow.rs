@@ -17826,7 +17826,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
     rt.block_on(async {
         let mut conn = connect_live(&connection).await.unwrap();
         let state = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
-        assert_eq!(state.snapshot.module_deps.len(), 1);
+        assert_eq!(state.snapshot.object_deps.len(), 1);
     });
 
     // A surviving module owns its current declaration hints. Reversing the old
