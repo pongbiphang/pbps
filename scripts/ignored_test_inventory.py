@@ -1300,9 +1300,25 @@ def path_of(effective):
     return found
 
 
-# Attributes that do not make a function a test. Any other attribute may be a test macro.
-INERT_ATTRIBUTES = {"ignore", "should_panic", "cfg", "doc", "allow", "warn", "deny", "forbid", "expect",
-                    "inline", "must_use", "deprecated", "track_caller", "cold", "coverage"}
+# Attributes that do not make a function a test: the built-in attributes of the Rust Reference
+# that apply to a function (and the registered tools), spelled exactly, unqualified, with
+# `unsafe(...)` around them where Rust 2024 asks for it. Any other attribute may be a test macro.
+INERT_ATTRIBUTES = {
+    "ignore", "should_panic", "cfg", "doc", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use",
+    "inline", "cold", "track_caller", "coverage", "target_feature", "instruction_set", "optimize", "no_sanitize",
+    "no_mangle", "export_name", "link_section", "used", "naked", "no_builtins", "patchable_function_entry",
+    "link_name", "automatically_derived", "cfi_encoding", "debugger_visualizer", "rustc_align", "align"}
+INERT_TOOLS = {"rustfmt", "clippy", "rust_analyzer", "diagnostic"}
+
+
+def inert(tokens):
+    """Is the attribute known not to make a function a test?"""
+    head = attribute_head(tokens)
+    if head == ["unsafe"] and tokens[1:2] == ["("] and tokens[-1:] == [")"]:
+        return inert(tokens[2:-1])
+    if len(head) == 1:
+        return head[0] in INERT_ATTRIBUTES
+    return len(head) == 4 and head[0] in INERT_TOOLS and head[1:3] == [":", ":"]
 
 
 def attribute_head(tokens):
@@ -1328,8 +1344,8 @@ def test_of(everything):
             if applies is not False: other = True
         elif attribute_path(tokens)[-1:] == ["test"]:
             named.append(applies)
-        elif applies is not False and (len(attribute_head(tokens)) != 1 or tokens[0] not in INERT_ATTRIBUTES):
-            other = True   # only an exact, unqualified built-in is known to be inert
+        elif applies is not False and not inert(tokens):
+            other = True
     if any(applies is True for applies in named): return True
     if other or any(applies is None for applies in named) or not named: return None
     return False

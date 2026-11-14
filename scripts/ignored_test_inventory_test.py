@@ -1643,6 +1643,17 @@ class Win32Prediction(unittest.TestCase):
         ("#[cfg_attr(unix, test)]\n#[::allow]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, allow::macro_x)]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, allow::macro_x)]\n#[ignore]", False),
         ("#[cfg_attr(unix, test)]\n#[allow(unused)]\n#[doc = \"x\"]\n#[should_panic]\n#[ignore]", False),
+        # The built-in attributes of a function and the registered tools are inert, also inside unsafe(...).
+        ("#[cfg_attr(unix, test)]\n#[unsafe(no_mangle)]\n#[ignore]", False),
+        ('#[cfg_attr(unix, test)]\n#[unsafe(export_name = "x")]\n#[ignore]', False),
+        ('#[cfg_attr(unix, test)]\n#[unsafe(link_section = ".x")]\n#[ignore]', False),
+        ("#[cfg_attr(unix, test)]\n#[no_mangle]\n#[inline(never)]\n#[cold]\n#[ignore]", False),
+        ('#[cfg_attr(unix, test)]\n#[target_feature(enable = "avx2")]\n#[track_caller]\n#[ignore]', False),
+        ('#[cfg_attr(unix, test)]\n#[rustfmt::skip]\n#[clippy::cognitive_complexity = "10"]\n#[ignore]', False),
+        ("#[cfg_attr(unix, test)]\n#[unsafe(macro_x)]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[unsafe]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[unsafe(doc::macro_x)]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[rustfmt::skip::macro_x]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[::rustfmt::skip]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[my::rustfmt::skip]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, unsafe(macro_x))]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, cfg_attr)]\n#[ignore]", False),   # unreadable, but guarded off
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, cfg_attr)]\n#[ignore]", True),
         ('#[cfg_attr(feature = "x", test)]\n#[ignore]', True), ("#[ignore]", True),
