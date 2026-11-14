@@ -1555,6 +1555,18 @@ class Win32Prediction(unittest.TestCase):
         ("spacing inside the attributes", live.__func__("#[test]\n# [ cfg ( unix ) ]\n# [ ignore ]\nfn owned() {}"), False),
         ("a cfg split across lines", live.__func__("#[test]\n#[ignore]\n#[cfg(\n    any(\n        unix, // linux\n        target_os = \"macos\"\n    )\n)]\nfn owned() {}"), False),
         ("a cfg_attr split across lines", live.__func__("#[test]\n#[cfg_attr(\n    unix, // not here\n    ignore, /* why */\n)]\nfn owned() {}"), False),
+        # Whether the function is still a test on Windows (the fourth ready review).
+        ("test guarded off by not(windows)", live.__func__("#[cfg_attr(not(windows), test)]\n#[ignore]\nfn owned() {}"), False),
+        ("test guarded off by unix", live.__func__("#[cfg_attr(unix, test)]\n#[ignore]\nfn owned() {}"), False),
+        # The negative case #2854 names: still a test on Windows, ignored only elsewhere, so not listed there.
+        ("a test ignored only off Windows", live.__func__("#[test]\n#[cfg_attr(not(windows), ignore)]\nfn owned() {}"), False),
+        ("a test ignored only on Windows", live.__func__("#[test]\n#[cfg_attr(windows, ignore)]\nfn owned() {}"), True),
+        ("test guarded on by windows", live.__func__("#[cfg_attr(windows, test)]\n#[ignore]\nfn owned() {}"), True),
+        ("test guarded off by a nested guard", live.__func__("#[cfg_attr(all(), cfg_attr(unix, test))]\n#[ignore]\nfn owned() {}"), False),
+        ("test guarded on by a nested guard", live.__func__("#[cfg_attr(all(), cfg_attr(windows, test))]\n#[ignore]\nfn owned() {}"), True),
+        ("a plain test beside a guarded-off one", live.__func__("#[cfg_attr(unix, test)]\n#[test]\n#[ignore]\nfn owned() {}"), True),
+        ("a guarded-off test beside inert attributes", live.__func__('#[cfg_attr(unix, test)]\n#[ignore]\n#[should_panic]\n#[doc = "x"]\nfn owned() {}'), False),
+        ("test and ignore guarded off by different guards", live.__func__("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, ignore)]\nfn owned() {}"), False),
         ("cfg(true) and cfg(false)", live.__func__("#[test]\n#[ignore]\n#[cfg(false)]\nfn owned() {}"), False),
     )
 
@@ -1617,6 +1629,28 @@ class Win32Prediction(unittest.TestCase):
         "#[cfg_attr]", "#[cfg_attr(cfg(unix), cfg(unix))]", '#[cfg_attr(windows, cfg_attr(feature = "x", cfg(unix)))]',
         '#[cfg_attr(feature = "x", cfg(unix))]', "#[cfg]", '#[cfg(feature = "x")]',
     )
+
+    # Test macros that rustc alone cannot compile here: a path ending in `test` is a test attribute,
+    # any attribute that is not known to be inert may be a test macro, no test attribute is undecided.
+    TEST_MACROS = (
+        ("#[tokio::test]\n#[ignore]", True), ('#[tokio::test(flavor = "x")]\n#[ignore]', True),
+        ("#[cfg_attr(unix, tokio::test)]\n#[ignore]", False), ('#[cfg_attr(unix, tokio::test(flavor = "x"))]\n#[ignore]', False),
+        ("#[cfg_attr(windows, tokio::test)]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[rstest]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, rstest)]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, rstest)]\n#[ignore]", False),
+        ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, cfg_attr)]\n#[ignore]", False),   # unreadable, but guarded off
+        ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, cfg_attr)]\n#[ignore]", True),
+        ('#[cfg_attr(feature = "x", test)]\n#[ignore]', True), ("#[ignore]", True),
+    )
+
+    def test_a_test_macro_is_a_test_attribute_and_an_unknown_attribute_may_be_one(self):
+        for attributes, refused in self.TEST_MACROS:
+            with self.subTest(attributes):
+                targets = self.crate(self.live(attributes + "\nfn owned() {}"))
+                if refused:
+                    self.refused(targets)
+                else:
+                    self.assertEqual(self.predict(targets), 0)
 
     def test_an_attribute_the_reader_cannot_classify_fails_closed(self):
         for attribute in self.UNDECIDED_IGNORE:
