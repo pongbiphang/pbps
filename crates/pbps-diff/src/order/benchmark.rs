@@ -110,6 +110,7 @@ fn dense(size: usize) -> Shape {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             d.checks.insert(

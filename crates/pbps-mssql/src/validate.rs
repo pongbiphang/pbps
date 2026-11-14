@@ -492,6 +492,9 @@ fn view_indexes(name: &str, module: &Module) -> Vec<DialectError> {
         if !index.method.is_btree() || !index.storage_parameters.is_empty() {
             say("sets a method or storage parameters, which are PostgreSQL's");
         }
+        if index.filegroup.is_some() {
+            say("names a filegroup, which the declarations hold for a table's indexes only");
+        }
         errs.extend(operator_classes(
             &format!("index `{shown}` on view `{name}`"),
             index,
@@ -782,6 +785,79 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     table_sources(name, table, Default::default())
 }
 
+fn not_an_identifier(name: &str) -> bool {
+    name.trim().is_empty() || name.chars().count() > 128 || name.contains('\0')
+}
+
+/// What a declared filegroup must satisfy before any engine is asked
+/// (#2813, DEC-2813.1). Whether the filegroup exists is a fact about a
+/// database, checked when planned against one.
+///
+/// - A name is a SQL Server identifier: not empty, at most 128 characters.
+/// - **The clustered object has none of its own.** Its rows are the table's,
+///   so `filegroup:` on the table says where it sits, and a second place for
+///   the same fact could disagree with the first.
+/// - **A nonclustered object that names its table's filegroup is refused.**
+///   It sits there when it names none, so the two spellings would be one
+///   placement written two ways, and a read-back, which writes the shorter,
+///   would differ from the declaration for ever.
+fn filegroup_problems(table: &Table) -> Vec<DialectError> {
+    let mut errs = Vec::new();
+    if let Some(name) = table.filegroup.as_ref().map(|f| f.as_str())
+        && not_an_identifier(name)
+    {
+        errs.push(invalid(format!(
+            "the table names the filegroup `{}`, which is not a SQL Server identifier: it is \
+             not empty, and at most 128 characters",
+            pbps_model::escape::Escaped(name),
+        )));
+    }
+    let mut check = |what: String, own: Option<&pbps_model::Filegroup>, clustered: bool| {
+        let Some(fg) = own else { return };
+        let name = fg.as_str();
+        if not_an_identifier(name) {
+            errs.push(invalid(format!(
+                "{what} names the filegroup `{}`, which is not a SQL Server identifier: it is \
+                 not empty, and at most 128 characters",
+                pbps_model::escape::Escaped(name),
+            )));
+        } else if clustered {
+            errs.push(invalid(format!(
+                "{what} is the clustered one, whose rows are the table's: declare `filegroup` \
+                 on the table instead",
+            )));
+        } else if table.filegroup.as_ref() == Some(fg) {
+            errs.push(invalid(format!(
+                "{what} names the filegroup `{}` that its table is on already: it sits there \
+                 when it names none, so remove the line",
+                pbps_model::escape::Escaped(name),
+            )));
+        }
+    };
+    if let Some(pk) = &table.primary_key {
+        check(
+            "the primary key".to_owned(),
+            pk.filegroup.as_ref(),
+            table.primary_key_is_clustered(),
+        );
+    }
+    for (n, u) in &table.unique {
+        check(
+            format!("unique constraint `{}`", n.shown()),
+            u.filegroup.as_ref(),
+            table.unique_is_clustered(n.raw()),
+        );
+    }
+    for (n, ix) in &table.indexes {
+        check(
+            format!("index `{}`", n.shown()),
+            ix.filegroup.as_ref(),
+            table.index_is_clustered(n.raw()),
+        );
+    }
+    errs
+}
+
 pub(crate) fn table_sources(
     name: &TableName,
     table: &Table,
@@ -790,6 +866,7 @@ pub(crate) fn table_sources(
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
     errs.extend(table.clustered_problems().into_iter().map(invalid));
+    errs.extend(filegroup_problems(table));
     if !table.row_security.is_default() {
         errs.push(invalid(
             "`row_security` is a PostgreSQL setting; SQL Server refuses non-default row-security flags",
@@ -1577,12 +1654,14 @@ mod tests {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.unique.insert(
             "uq_email".into(),
             UniqueConstraint {
                 columns: vec!["email".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
@@ -1825,6 +1904,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.unique.insert(
@@ -1832,6 +1912,7 @@ mod tests {
             pbps_model::UniqueConstraint {
                 columns: vec!["c".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert!(found(&table).is_empty(), "{:?}", found(&table));
@@ -1857,6 +1938,7 @@ mod tests {
             name: None,
             columns: vec!["c".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         assert!(
             found(&keyed)
@@ -2058,6 +2140,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+                filegroup: None,
             },
         );
         let refused = found(&table);
@@ -2099,6 +2182,7 @@ mod tests {
                 name: Some("pk_t".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             // A default on a period column is accepted by the engine, and kept.
             table.columns.get_mut("vf").unwrap().value_source =
@@ -2257,6 +2341,7 @@ mod tests {
             filter: None,
             method,
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let messages = |ix: Index| {
             let mut t = table.clone();
@@ -2326,6 +2411,7 @@ mod tests {
             filter: filter.map(Into::into),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         t.clustered = Some(Clustered::Index("cx".into()));
         t.indexes.insert("cx".into(), index(Vec::new(), None));
@@ -2341,6 +2427,86 @@ mod tests {
         assert_eq!(messages(&table(&name, &t)), "");
         t.clustered = Some(Clustered::Index("cx_missing".into()));
         assert!(messages(&table(&name, &t)).contains("does not declare"));
+    }
+
+    /// A filegroup is a SQL Server identifier; the clustered object has none
+    /// of its own, since its rows are the table's; and a nonclustered one that
+    /// names its table's own is one placement written two ways, which a
+    /// read-back would write the shorter of (#2813, DEC-2813.1).
+    #[test]
+    fn a_filegroup_is_an_identifier_and_the_clustered_object_takes_the_tables() {
+        use pbps_model::{Clustered, Filegroup};
+        let fg = |n: &str| Some(Filegroup::new(n));
+        let (name, mut t) = base_table();
+        t.filegroup = fg("fgx");
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_customer".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        t.unique.insert(
+            "uq_email".into(),
+            UniqueConstraint {
+                columns: vec!["email".into()],
+                storage_parameters: Default::default(),
+                filegroup: fg("fgy"),
+            },
+        );
+        t.indexes.insert(
+            "ix_id".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: fg("PRIMARY"),
+            },
+        );
+        // Placed apart from the table, on a key, a constraint and an index: fine.
+        assert_eq!(messages(&table(&name, &t)), "");
+        // Negative: the clustered key has no place of its own.
+        t.primary_key.as_mut().unwrap().filegroup = fg("fgy");
+        let said = messages(&table(&name, &t));
+        assert!(
+            said.contains("the primary key is the clustered one"),
+            "{said}"
+        );
+        // Negative: a nonclustered key naming the table's own filegroup, in
+        // either case, is refused; and the clustered unique one has none.
+        t.primary_key.as_mut().unwrap().filegroup = None;
+        t.clustered = Some(Clustered::Heap);
+        t.primary_key.as_mut().unwrap().filegroup = fg("FGX");
+        let said = messages(&table(&name, &t));
+        assert!(said.contains("that its table is on already"), "{said}");
+        t.primary_key.as_mut().unwrap().filegroup = None;
+        t.clustered = Some(Clustered::Unique("uq_email".into()));
+        let said = messages(&table(&name, &t));
+        assert!(
+            said.contains("unique constraint `uq_email` is the clustered one"),
+            "{said}"
+        );
+        t.clustered = None;
+        // Negative: not an identifier.
+        for bad in ["", "   ", &"x".repeat(129)] {
+            t.filegroup = fg(bad);
+            let said = messages(&table(&name, &t));
+            assert!(
+                said.contains("not a SQL Server identifier"),
+                "{bad:?}: {said}"
+            );
+        }
+        t.filegroup = fg(&"x".repeat(128));
+        t.unique.clear();
+        t.indexes.clear();
+        assert_eq!(messages(&table(&name, &t)), "");
     }
 
     /// A collation only on the seven character types the engine takes one on
@@ -2366,6 +2532,7 @@ mod tests {
             name: None,
             columns: vec!["nope".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let errs = table(&name, &t);
         assert!(
@@ -2384,6 +2551,7 @@ mod tests {
             name: None,
             columns: vec!["email".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         assert!(messages(&table(&name, &t)).contains("must be NOT NULL"));
     }
@@ -2396,6 +2564,7 @@ mod tests {
             UniqueConstraint {
                 columns: vec!["body".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert!(messages(&table(&name, &t)).contains("cannot be part of a key"));
@@ -2487,6 +2656,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let msg = messages(&table(&name, &t));
         assert!(msg.contains("key its rows by `id`"), "{msg}");
@@ -2602,6 +2772,7 @@ mod tests {
             name: None,
             columns: vec!["k".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.data = Some(TableData {
             mode: DataMode::Exact,
@@ -2634,6 +2805,7 @@ mod tests {
                 name: None,
                 columns: vec!["k".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             for (key, accepted) in [
                 ("- 1", true),
@@ -2668,6 +2840,7 @@ mod tests {
                 name: None,
                 columns: vec!["k".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             t.data = Some(TableData {
                 mode: DataMode::Exact,
@@ -2771,6 +2944,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let msg = messages(&table(&name, &t));
         assert!(
@@ -2944,6 +3118,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         assert!(messages(&table(&name, &t)).contains("key its rows by `id`, a spatial column"));
     }
@@ -2996,6 +3171,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let msg = messages(&table(&name, &t));
@@ -3025,6 +3201,7 @@ mod tests {
             name: None,
             columns: vec!["nope".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t.checks.insert(
             "ck".into(),
@@ -3113,6 +3290,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let indexed = |bound: bool, clustered: Option<&str>, unique: bool| {
             let mut m = a_module(ModuleKind::View, "SELECT id FROM dbo.t");
@@ -3503,6 +3681,7 @@ mod tests {
                                 name: Some(name.into()),
                                 columns: vec!["id".into()],
                                 storage_parameters: Default::default(),
+                                filegroup: None,
                             })
                         }
                         1 => {
@@ -3511,6 +3690,7 @@ mod tests {
                                 UniqueConstraint {
                                     columns: vec!["id".into()],
                                     storage_parameters: Default::default(),
+                                    filegroup: None,
                                 },
                             );
                         }
@@ -3555,6 +3735,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         table.checks.insert(
             "same".into(),
@@ -3576,6 +3757,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         assert!(

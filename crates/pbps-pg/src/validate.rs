@@ -93,6 +93,19 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
              (`CLUSTER` reorders a table once and keeps no order), so remove the line",
         ));
     }
+    // A filegroup is SQL Server's (#2813): PostgreSQL's counterpart is a
+    // tablespace, which the model does not hold, so there is nothing a plan
+    // could emit to honour the line.
+    let filegrouped = table.filegroup.is_some()
+        || table.primary_key.iter().any(|k| k.filegroup.is_some())
+        || table.unique.values().any(|u| u.filegroup.is_some())
+        || table.indexes.values().any(|i| i.filegroup.is_some());
+    if filegrouped {
+        found.push(invalid(
+            "`filegroup` is a SQL Server placement: PostgreSQL's counterpart is a tablespace, \
+             which these declarations do not hold, so remove the line",
+        ));
+    }
     found.extend(table.replica_identity_problems().into_iter().map(invalid));
     found.extend(table.storage_parameter_problems().into_iter().map(invalid));
     if let Some(pk) = &table.primary_key {
@@ -346,6 +359,7 @@ fn exclusion(
         filter: x.filter.clone(),
         method: x.method,
         storage_parameters: x.storage_parameters.clone(),
+        filegroup: None,
     };
     found.extend(index_shape(&what, &as_index, table));
     found
@@ -1182,6 +1196,7 @@ mod tests {
                     name: Some(name.into()),
                     columns: vec!["n".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 });
             } else if kind == "unique constraint" {
                 table.unique.insert(
@@ -1189,6 +1204,7 @@ mod tests {
                     pbps_model::UniqueConstraint {
                         columns: vec!["m".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             } else if kind == "foreign key" {
@@ -1267,6 +1283,7 @@ mod tests {
                 filter: None,
                 method,
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table
@@ -1331,6 +1348,7 @@ mod tests {
                 filter: None,
                 method,
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table
@@ -1489,6 +1507,42 @@ mod tests {
             btree.join("\n").contains("a B-tree index here"),
             "{btree:?}"
         );
+    }
+
+    /// A SQL Server filegroup is refused on every object that can carry one,
+    /// by name of the field: PostgreSQL's counterpart is a tablespace, which
+    /// the model does not hold, so no plan could honour it (#2813).
+    #[test]
+    fn a_sql_server_filegroup_is_refused_on_a_table_a_key_and_an_index() {
+        use pbps_model::Filegroup;
+        let fg = || Some(Filegroup::new("fgx"));
+        let base = || {
+            let mut t = gist_table(IndexMethod::Btree, &[("body", None, None)]);
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["body".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            t
+        };
+        assert!(!structure(&base()).join("\n").contains("filegroup"));
+        let mut on_table = base();
+        on_table.filegroup = fg();
+        let mut on_key = base();
+        on_key.primary_key.as_mut().unwrap().filegroup = fg();
+        let mut on_index = base();
+        on_index
+            .indexes
+            .values_mut()
+            .for_each(|i| i.filegroup = fg());
+        for (what, table) in [("table", on_table), ("key", on_key), ("index", on_index)] {
+            let said = structure(&table).join("\n");
+            assert!(
+                said.contains("`filegroup` is a SQL Server placement"),
+                "{what}: {said}"
+            );
+        }
     }
 
     /// A column key may be collated by a `pg_catalog` collation on a column the

@@ -158,7 +158,10 @@ use schemars::JsonSchema;
 /// Version 43 records an exclusion key's operator qualified by the schema of the package
 /// that provides it (DEC-2447.14); an older build would refuse the snapshot, and every older
 /// snapshot truthfully holds only operators of `pg_catalog`.
-pub const CURRENT_VERSION: u32 = 43;
+/// Version 46 records a SQL Server table's, key's and index's `filegroup` (DEC-2813.1); every
+/// older snapshot truthfully holds none, and an older build would reject the field. 44 and 45
+/// belong to other changes.
+pub const CURRENT_VERSION: u32 = 46;
 
 /// The oldest snapshot version this build reads as its own.
 ///

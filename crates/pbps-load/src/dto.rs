@@ -487,6 +487,11 @@ pub struct TableDto {
     #[serde(default)]
     pub clustered: Option<ClusteredDto>,
 
+    /// The SQL Server filegroup of this table's rows, its heap or clustered index (#2813): it must exist already, and
+    /// pbps never creates or drops one. Absent is the database's default filegroup.
+    #[serde(default)]
+    pub filegroup: Option<String>,
+
     /// What logical replication carries to name an old row, on PostgreSQL:
     /// `full`, `nothing`, `primary_key`, `{unique: <constraint>}` or
     /// `{index: <index>}`. Absent means the default: the primary key, or
@@ -783,6 +788,11 @@ pub struct PrimaryKeySpecDto {
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+
+    /// The SQL Server filegroup of this key's index (SQL Server) (#2813): it must exist already, and
+    /// pbps never creates or drops one. Absent is where the table sits.
+    #[serde(default)]
+    pub filegroup: Option<String>,
 }
 
 /// A UNIQUE constraint: its column list, or written out with its index's
@@ -1209,6 +1219,11 @@ pub struct UniqueSpecDto {
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+
+    /// The SQL Server filegroup of this constraint's index (SQL Server) (#2813): it must exist already, and
+    /// pbps never creates or drops one. Absent is where the table sits.
+    #[serde(default)]
+    pub filegroup: Option<String>,
 }
 
 // A mirror of `pbps_model::Clustered`, which keeps `JsonSchema` off the model
@@ -1433,6 +1448,11 @@ pub struct IndexDto {
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+
+    /// The SQL Server filegroup of this index (SQL Server) (#2813): it must exist already, and
+    /// pbps never creates or drops one. Absent is where the table sits.
+    #[serde(default)]
+    pub filegroup: Option<String>,
 }
 
 /// One index key under `keys:`: a column or an expression, and which of the

@@ -1567,6 +1567,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             });
@@ -1829,6 +1830,7 @@ mod tests {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             })
@@ -2326,6 +2328,7 @@ mod tests {
                 filter: filter.map(str::to_owned),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         };

@@ -521,6 +521,8 @@ pub(super) async fn plan_db_selected(
         let declared =
             declarations_as_compared(&loaded.schema, managed.database_collation.as_deref());
         dialect.refuse_unknown_collations(&mut conn, &declared).await?;
+        // A filegroup the target lacks is refused here, by name (#2813).
+        dialect.refuse_unknown_filegroups(&mut conn, &declared).await?;
         // A key to a declared history under another spelling of its name,
         // which only the database's collation can join (#1625).
         dialect.refuse_history_references_alike(&mut conn, &declared).await?;

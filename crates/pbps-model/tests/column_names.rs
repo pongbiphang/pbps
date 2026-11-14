@@ -94,12 +94,14 @@ fn renamed_column_lists_and_partition_keys_use_the_raw_address() {
             name: None,
             columns: vec![before.clone()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         unique: [(
             "uq".into(),
             UniqueConstraint {
                 columns: vec![before.clone()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),
@@ -112,6 +114,7 @@ fn renamed_column_lists_and_partition_keys_use_the_raw_address() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         )]
         .into(),

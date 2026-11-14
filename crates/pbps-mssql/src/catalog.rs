@@ -212,7 +212,8 @@ SELECT t.object_id, b.name AS base_name, b.type AS base_type,
        b.is_primary_key, b.is_unique_constraint,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN b.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.tables t
   LEFT JOIN sys.indexes b ON b.object_id = t.object_id AND b.index_id IN (0, 1)
   LEFT JOIN sys.data_spaces ds ON ds.data_space_id = b.data_space_id
@@ -240,7 +241,8 @@ SELECT kc.parent_object_id AS object_id, kc.name,
        col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN ki.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.key_constraints kc
   JOIN sys.indexes ki
     ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
@@ -368,7 +370,8 @@ SELECT i.object_id, i.name, i.is_unique, i.type AS index_type, i.is_disabled, i.
        col.name AS column_name, ic.is_included_column, ic.is_descending_key,
        CASE WHEN ds.data_space_id IS NULL THEN CASE WHEN i.data_space_id = 0 THEN N'FX' END
             WHEN ds.type = N'FG' THEN CASE fg.is_default WHEN 1 THEN N'FG' WHEN 0 THEN N'FGN' END
-            ELSE ds.type END AS space_type
+            ELSE ds.type END AS space_type,
+       CASE WHEN ds.type = N'FG' THEN ds.name END AS filegroup
   FROM sys.indexes i
   LEFT JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
   LEFT JOIN sys.filegroups fg ON fg.data_space_id = ds.data_space_id
@@ -584,6 +587,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
                 is_primary: opt::<bool>(&row, "is_primary_key")?.unwrap_or(false),
                 is_unique_constraint: opt::<bool>(&row, "is_unique_constraint")?.unwrap_or(false),
                 placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
+                filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
             },
         );
     }
@@ -624,7 +628,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             ignore_dup_key: get(&row, "ignore_dup_key")?,
             index_type: get(&row, "index_type")?,
             placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
-
+            filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned().into(),
             is_primary: get(&row, "is_primary")?,
@@ -701,6 +705,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_included: get(&row, "is_included_column")?,
             is_descending: get(&row, "is_descending_key")?,
             placement: Placement::from_data_space(opt::<&str>(&row, "space_type")?),
+            filegroup: opt::<&str>(&row, "filegroup")?.map(str::to_owned),
         });
     }
 
@@ -910,6 +915,34 @@ pub async fn unknown_collations(conn: &mut Conn, names: &[String]) -> Result<Vec
         }
     }
     Ok(unknown)
+}
+
+/// A row filegroup of the connected database (#2813, DEC-2813.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilegroupRow {
+    pub name: String,
+    pub is_default: bool,
+    pub is_read_only: bool,
+}
+
+/// The database's row filegroups (`type = 'FG'`), which is what a declared
+/// `filegroup:` can name: a memory-optimized (`FX`) or FILESTREAM filegroup
+/// holds no ordinary table, key or index. Read whole and matched by the
+/// caller, since the database's own collation decides what counts as one name
+/// and the model compares names without ASCII case.
+pub async fn filegroups(conn: &mut Conn) -> Result<Vec<FilegroupRow>, DbError> {
+    let mut out = Vec::new();
+    for row in conn
+        .query("SELECT name, is_default, is_read_only FROM sys.filegroups WHERE type = N'FG' ORDER BY name;")
+        .await?
+    {
+        out.push(FilegroupRow {
+            name: get::<&str>(&row, "name")?.to_owned(),
+            is_default: get(&row, "is_default")?,
+            is_read_only: get(&row, "is_read_only")?,
+        });
+    }
+    Ok(out)
 }
 
 pub async fn matching_table_names(

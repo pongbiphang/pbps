@@ -234,6 +234,7 @@ mod tests {
             name: None,
             columns: vec!["region_id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
 
         let mut customer = Table::default();
@@ -250,6 +251,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         customer.foreign_keys.insert(
             "fk_customer_region".into(),
@@ -318,6 +320,7 @@ mod tests {
                 name: None,
                 columns: vec![format!("column_{i}").into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             table.foreign_keys.insert(
                 format!("fk_{i}").into(),
@@ -453,6 +456,7 @@ mod tests {
             name: None,
             columns: vec!["gross total".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let mut s = Schema::default();
         s.tables.insert(TableName::new("dbo", "t"), t);

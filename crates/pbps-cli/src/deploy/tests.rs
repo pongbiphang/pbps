@@ -1211,6 +1211,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
                         name: None,
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     }),
                     to: None,
                     nonclustered: false,
@@ -1230,6 +1231,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
                 name: Some("x".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to,
             nonclustered: false,
@@ -1240,6 +1242,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
             name: Some("pk_new".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         })
     };
     let pk = || occupant("primary key constraint", Some(&old));
@@ -1695,6 +1698,7 @@ fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         }),
@@ -2182,6 +2186,7 @@ fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut moved = shape.clone();
     moved.indexes.insert("x".into(), index.clone());
@@ -2749,6 +2754,7 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
             constraint: UniqueConstraint {
                 columns: vec!["n".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         })
@@ -2761,6 +2767,7 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
                 name: name.map(Into::into),
                 columns: vec!["n".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             nonclustered: false,
         })
@@ -4475,6 +4482,7 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
                 name: name.map(Into::into),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to: None,
             nonclustered: false,
@@ -4588,6 +4596,7 @@ fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             to: None,
             nonclustered: false,
@@ -6721,6 +6730,7 @@ fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close
                 name: Some("pk_t".into()),
                 columns: vec![pk.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             ..Default::default()
         };
@@ -6729,6 +6739,7 @@ fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close
             pbps_model::UniqueConstraint {
                 columns: vec![ix.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut s = Schema::default();
@@ -6818,6 +6829,7 @@ fn renames_keep_constraints_at_single_change_checkpoints_and_transactional_close
             pbps_model::UniqueConstraint {
                 columns: vec!["elsewhere".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     let e = refuse_unplanned_movement(
@@ -7159,6 +7171,7 @@ fn a_column_renamed_into_a_dropped_columns_name_is_not_movement() {
                 filter: None,
                 method: pbps_model::IndexMethod::default(),
                 storage_parameters: BTreeMap::new(),
+                filegroup: None,
             },
         );
         s
@@ -7284,6 +7297,7 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -7408,6 +7422,7 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 }),
                 clustered: false,
             },
@@ -8139,6 +8154,7 @@ fn a_created_tables_split_index_answers_for_its_structure() {
         filter: filter.map(Into::into),
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let planned_index = index("id", false, Some("id > 0"));
     let changes = pbps_model::ChangeSet {
@@ -8225,6 +8241,7 @@ fn a_created_index_is_held_to_its_declared_parameters() {
         filter: None,
         method: Default::default(),
         storage_parameters: fill(v),
+        filegroup: None,
     };
     let table = |ix: Option<&str>, pk: &str| {
         let mut t = Table::default();
@@ -8236,6 +8253,7 @@ fn a_created_index_is_held_to_its_declared_parameters() {
             name: Some("t_pkey".into()),
             columns: vec!["id".into()],
             storage_parameters: fill(pk),
+            filegroup: None,
         });
         if let Some(v) = ix {
             t.indexes.insert("ix".into(), index(v));
@@ -8312,6 +8330,7 @@ fn index_storage_parameters_the_plan_sets_are_held_at_the_close() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())].into(),
+                filegroup: None,
             },
         );
         Schema {
@@ -8408,6 +8427,7 @@ fn a_table_the_plan_alters_but_does_not_drop_has_to_stay() {
                     filter: None,
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -9359,6 +9379,7 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let ix = Index {
         columns: vec![IndexColumn {
@@ -9372,6 +9393,7 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     t.indexes.insert("ix".into(), ix.clone());
     let schema = |layout: Option<Clustered>| {
@@ -9526,12 +9548,14 @@ fn a_created_tables_layout_is_held_once_its_clustered_object_is_there() {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     created.unique.insert(
         "uq_code".into(),
         pbps_model::UniqueConstraint {
             columns: vec!["code".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     created.clustered = Some(Clustered::Unique("uq_code".into()));
@@ -9676,6 +9700,7 @@ fn a_created_tables_pending_parts_are_added_but_recorded_parts_still_compare() {
         UniqueConstraint {
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     declared.foreign_keys.insert(
@@ -9708,6 +9733,7 @@ fn a_created_tables_pending_parts_are_added_but_recorded_parts_still_compare() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let changes = pbps_model::ChangeSet {
@@ -9954,6 +9980,7 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let e = refuse_unplanned_movement(
@@ -10075,6 +10102,7 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
                 filter: filter.map(str::to_owned),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t
@@ -10109,6 +10137,7 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
             name: name.map(Into::into),
             columns: columns.iter().map(|c| (*c).into()).collect(),
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         t
     };
@@ -10164,6 +10193,7 @@ fn a_table_this_plan_creates_answers_for_the_shape_it_was_given() {
             pbps_model::UniqueConstraint {
                 columns: columns.iter().map(|c| (*c).into()).collect(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         t
@@ -10580,6 +10610,7 @@ fn a_redefined_index_is_judged_by_its_net_result() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let schema_with = |unique: bool| {
         let mut t = pbps_model::Table::default();
@@ -10661,6 +10692,7 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                             filter: None,
                             method: Default::default(),
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                     Change::DropIndex {
@@ -10674,6 +10706,7 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                         UniqueConstraint {
                             columns: vec!["id".into()],
                             storage_parameters: Default::default(),
+                            filegroup: None,
                         },
                     );
                     Change::DropUnique {
@@ -10702,6 +10735,7 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                         name: Some("gone".into()),
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     };
                     original.primary_key = Some(key.clone());
                     Change::SetPrimaryKey {
@@ -10808,6 +10842,7 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                 UniqueConstraint {
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             assert!(
@@ -11377,6 +11412,7 @@ fn a_key_type_change_over_an_aliased_key_is_named_and_one_without_is_not() {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     declared.tables.insert(table.clone(), t);
     let change = |name: &str| {
@@ -11456,6 +11492,7 @@ fn a_table_renamed_by_the_same_plan_is_still_checked_for_aliased_keys() {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     // Keyed by the live name, as `tables_under` leaves it.
     let mut declared = Schema::default();
@@ -12463,15 +12500,18 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let unique = |on: &str| pbps_model::UniqueConstraint {
         columns: vec![on.into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let key = |on: &str| pbps_model::PrimaryKey {
         name: None,
         columns: vec![on.into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let fk = |to: &TableName, on_delete: pbps_model::ReferentialAction| pbps_model::ForeignKey {
         columns: vec!["p_id".into()],
@@ -12676,6 +12716,7 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
                 name: Some("PK__t__3213E83F".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
         }),
     )

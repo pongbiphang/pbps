@@ -219,6 +219,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     let pg = Postgres::new();
@@ -282,6 +283,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         name: Some("a_pk".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     for (key, column) in [
         ("prefix_unique", "id"),
@@ -293,6 +295,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
             pbps_model::UniqueConstraint {
                 columns: vec![column.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.checks.insert(
@@ -315,6 +318,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }
@@ -364,6 +368,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
                 filter,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }
@@ -598,6 +603,7 @@ fn a_primary_key_using_a_suffix_input_waits_for_its_column() {
             name: Some("a_pk".into()),
             columns: vec![column.into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let change = Change::CreateTable {
             uid: ids.table_uid(&name).unwrap().clone(),
@@ -684,12 +690,14 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
         name: Some("a_pk".into()),
         columns: vec!["z".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     table.unique.insert(
         "g_unique".into(),
         pbps_model::UniqueConstraint {
             columns: vec!["g".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.checks.insert(
@@ -723,6 +731,7 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }

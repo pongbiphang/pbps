@@ -17,6 +17,7 @@ fn shape() -> Table {
             name: Some(local("pk", RAW)),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         ..Default::default()
     };
@@ -26,6 +27,7 @@ fn shape() -> Table {
             UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         table.foreign_keys.insert(
@@ -58,6 +60,7 @@ fn shape() -> Table {
                 filter: Some("id > 0".into()),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
     }

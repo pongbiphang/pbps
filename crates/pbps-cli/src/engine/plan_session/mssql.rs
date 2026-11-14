@@ -74,6 +74,102 @@ pub(in crate::engine) async fn refuse_unknown_collations(
     Ok(())
 }
 
+/// Refuses a declared filegroup the target cannot place the object on, by
+/// name and before any statement runs (#2813, DEC-2813.1): one it does not
+/// hold, one that is read-only, and one that is the database's default where
+/// the declaration would read back as none, which no plan could converge on.
+/// pbps never creates a filegroup, so none of these is something a later step
+/// of the plan supplies.
+pub(in crate::engine) async fn refuse_unknown_filegroups(
+    conn: &mut Conn,
+    schema: &Schema,
+) -> anyhow::Result<()> {
+    let declared = declared_filegroups(schema);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let held = pbps_mssql::catalog::filegroups(conn).await?;
+    let problems = filegroup_problems(&declared, &held);
+    if !problems.is_empty() {
+        anyhow::bail!("{}", problems.join("\n"));
+    }
+    Ok(())
+}
+
+/// Every declared filegroup with where it is declared, and whether that
+/// object sits where its table does when it names none (`follows`): an object
+/// on the default filegroup reads back as none unless its table is elsewhere.
+pub(in crate::engine) fn declared_filegroups(
+    schema: &Schema,
+) -> Vec<(String, &pbps_model::Filegroup, bool)> {
+    let mut out = Vec::new();
+    for (name, table) in &schema.tables {
+        let table_name = name.shown();
+        if let Some(fg) = &table.filegroup {
+            out.push((format!("table `{table_name}`"), fg, false));
+        }
+        let beside = table.filegroup.is_some();
+        if let Some(fg) = table
+            .primary_key
+            .as_ref()
+            .and_then(|k| k.filegroup.as_ref())
+        {
+            out.push((format!("the primary key of `{table_name}`"), fg, beside));
+        }
+        for (n, u) in &table.unique {
+            if let Some(fg) = &u.filegroup {
+                out.push((
+                    format!("unique constraint `{}` of `{table_name}`", n.shown()),
+                    fg,
+                    beside,
+                ));
+            }
+        }
+        for (n, ix) in &table.indexes {
+            if let Some(fg) = &ix.filegroup {
+                out.push((
+                    format!("index `{}` of `{table_name}`", n.shown()),
+                    fg,
+                    beside,
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn filegroup_problems(
+    declared: &[(String, &pbps_model::Filegroup, bool)],
+    held: &[pbps_mssql::catalog::FilegroupRow],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (what, fg, beside) in declared {
+        let name = pbps_model::escape::Escaped(fg.as_str());
+        let Some(found) = held
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(fg.as_str()))
+        else {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, which this database does not have; pbps \
+                 never creates a filegroup, so add it (with its files) first"
+            ));
+            continue;
+        };
+        if found.is_read_only {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, which is read-only here, so nothing can \
+                 be built on it"
+            ));
+        } else if found.is_default && !beside {
+            problems.push(format!(
+                "{what} names `{name}`, the database's default filegroup, which a pull writes \
+                 as no `filegroup`: remove the line"
+            ));
+        }
+    }
+    problems
+}
+
 pub(in crate::engine) async fn refuse_history_references_alike(
     conn: &mut Conn,
     schema: &Schema,
@@ -744,6 +840,14 @@ impl PlanSession for pbps_mssql::Mssql {
         refuse_history_references_alike(conn, declared, self).await
     }
 
+    async fn refuse_unknown_filegroups(
+        &self,
+        conn: &mut Conn,
+        declared: &Schema,
+    ) -> anyhow::Result<()> {
+        refuse_unknown_filegroups(conn, declared).await
+    }
+
     fn reconcile_cluster_roles(
         &self,
         _recorded: &IdsFile,
@@ -1062,5 +1166,87 @@ impl PlanSession for pbps_mssql::Mssql {
         _changes: &ChangeSet,
     ) -> anyhow::Result<DomainCode> {
         Ok(DomainCode::NotAsked)
+    }
+}
+
+#[cfg(test)]
+mod filegroup_tests {
+    use super::*;
+    use pbps_mssql::catalog::FilegroupRow;
+
+    fn held() -> Vec<FilegroupRow> {
+        let row = |name: &str, is_default, is_read_only| FilegroupRow {
+            name: name.to_owned(),
+            is_default,
+            is_read_only,
+        };
+        vec![
+            row("PRIMARY", true, false),
+            row("fgx", false, false),
+            row("frozen", false, true),
+        ]
+    }
+
+    fn problems(schema: &Schema) -> String {
+        filegroup_problems(&declared_filegroups(schema), &held()).join("\n")
+    }
+
+    fn table_with(table: Option<&str>, index: Option<&str>) -> Schema {
+        let mut t = pbps_model::Table {
+            filegroup: table.map(pbps_model::Filegroup::new),
+            ..Default::default()
+        };
+        t.indexes.insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: index.map(pbps_model::Filegroup::new),
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert("dbo.t".parse().unwrap(), t);
+        schema
+    }
+
+    /// A declared filegroup must be one the database holds, writable, and not
+    /// the default where it would read back as none; a name is matched without
+    /// ASCII case, as the model compares it (#2813, DEC-2813.1).
+    #[test]
+    fn a_filegroup_the_database_lacks_or_cannot_write_is_refused_by_name() {
+        assert_eq!(problems(&table_with(Some("fgx"), Some("FGX"))), "");
+        assert_eq!(problems(&table_with(None, None)), "");
+        let said = problems(&table_with(Some("nope"), Some("frozen")));
+        assert!(
+            said.contains(
+                "table `dbo.t` names the filegroup `nope`, which this database does not have"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("index `ix` of `dbo.t` names the filegroup `frozen`, which is read-only"),
+            "{said}"
+        );
+        // Negative: nothing is said of a filegroup that is fine.
+        assert!(!problems(&table_with(Some("nope"), Some("fgx"))).contains("`fgx`"));
+    }
+
+    /// The default filegroup reads back as none, so naming it on the table, or
+    /// on an object whose table is on the default too, never converges; under
+    /// a table elsewhere it is the only way to say where the object is.
+    #[test]
+    fn the_default_filegroup_is_refused_unless_the_table_is_elsewhere() {
+        let said = problems(&table_with(Some("PRIMARY"), None));
+        assert!(said.contains("the database's default filegroup"), "{said}");
+        let said = problems(&table_with(None, Some("primary")));
+        assert!(
+            said.contains("index `ix` of `dbo.t` names `primary`, the database's default"),
+            "{said}"
+        );
+        assert_eq!(problems(&table_with(Some("fgx"), Some("PRIMARY"))), "");
     }
 }

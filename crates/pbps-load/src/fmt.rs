@@ -187,6 +187,7 @@ pub fn render_partitioned(
                 name: None,
                 columns,
                 storage_parameters,
+                filegroup: None,
             } if storage_parameters.is_empty() => {
                 let _ = writeln!(s, "primary_key: {}", seq(columns));
             }
@@ -194,6 +195,7 @@ pub fn render_partitioned(
                 name,
                 columns,
                 storage_parameters,
+                filegroup,
             } => {
                 let _ = writeln!(s, "primary_key:");
                 if let Some(n) = name {
@@ -203,6 +205,9 @@ pub fn render_partitioned(
                 if !storage_parameters.is_empty() {
                     let _ = writeln!(s, "  storage_parameters: {}", flow(storage_parameters));
                 }
+                if let Some(fg) = filegroup {
+                    let _ = writeln!(s, "  filegroup: {}", scalar(fg.as_str()));
+                }
             }
         }
     }
@@ -210,22 +215,27 @@ pub fn render_partitioned(
     if !table.unique.is_empty() {
         s.push_str("\nunique:\n");
         for (n, u) in &table.unique {
-            if u.storage_parameters.is_empty() {
+            if u.storage_parameters.is_empty() && u.filegroup.is_none() {
                 let _ = writeln!(s, "  {}: {}", scalar(n.raw()), seq(&u.columns));
             } else {
-                let _ = writeln!(
-                    s,
-                    "  {}: {{columns: {}, storage_parameters: {}}}",
-                    scalar(n.raw()),
-                    seq(&u.columns),
-                    flow(&u.storage_parameters)
-                );
+                let _ = write!(s, "  {}: {{columns: {}", scalar(n.raw()), seq(&u.columns));
+                if !u.storage_parameters.is_empty() {
+                    let _ = write!(s, ", storage_parameters: {}", flow(&u.storage_parameters));
+                }
+                if let Some(fg) = &u.filegroup {
+                    let _ = write!(s, ", filegroup: {}", scalar(fg.as_str()));
+                }
+                s.push_str("}\n");
             }
         }
     }
 
     render_foreign_keys(&mut s, table, "", "\n");
     render_checks_and_indexes(&mut s, table, "", "\n");
+
+    if let Some(fg) = &table.filegroup {
+        let _ = writeln!(s, "\nfilegroup: {}", scalar(fg.as_str()));
+    }
 
     // After the indexes it may name, and on one line: a layout is a single
     // choice, not a block.
@@ -835,6 +845,9 @@ fn render_indexes(
                     "{pad}    storage_parameters: {}",
                     flow(&ix.storage_parameters)
                 );
+            }
+            if let Some(fg) = &ix.filegroup {
+                let _ = writeln!(s, "{pad}    filegroup: {}", scalar(fg.as_str()));
             }
             // `columns:` while every key is a column, as every index was
             // written before expressions; `keys:`, one mapping each, once any
@@ -2074,6 +2087,50 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
         assert_eq!(t.table.clustered, None);
         assert!(!render(&t.name, &t.table, &t.intents, None).contains("clustered"));
+    }
+
+    /// A filegroup on a table, a key, a unique constraint and an index reads
+    /// back as written and renders again; absent renders nothing, so a table
+    /// pulled from the default filegroup grows no line (#2813). A name that is
+    /// not a scalar is no filegroup.
+    #[test]
+    fn a_filegroup_round_trips_on_every_object_and_its_absence_writes_nothing() {
+        let yaml = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  code: {type: int, nullable: false}\n  w: {type: int}\n\nprimary_key:\n  name: pk_t\n  columns: [id]\n  filegroup: fgk\n\nunique:\n  uq_code: {columns: [code], filegroup: fgu}\n\nindexes:\n  ix_w:\n    columns: [w]\n    filegroup: fgi\n\nfilegroup: fgt\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let name = |f: &Option<pbps_model::Filegroup>| f.as_ref().map(|f| f.to_string());
+        assert_eq!(name(&t.table.filegroup).as_deref(), Some("fgt"));
+        assert_eq!(
+            name(&t.table.primary_key.as_ref().unwrap().filegroup).as_deref(),
+            Some("fgk")
+        );
+        assert_eq!(
+            name(&t.table.unique["uq_code"].filegroup).as_deref(),
+            Some("fgu")
+        );
+        assert_eq!(
+            name(&t.table.indexes["ix_w"].filegroup).as_deref(),
+            Some("fgi")
+        );
+        let out = render(&t.name, &t.table, &t.intents, None);
+        for line in [
+            "\nfilegroup: fgt\n",
+            "  filegroup: fgk\n",
+            "filegroup: fgu}",
+            "    filegroup: fgi\n",
+        ] {
+            assert!(out.contains(line), "{line}: {out}");
+        }
+        // Negative: none declared, none written, and a plain key stays the
+        // short form.
+        let plain =
+            "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n\nprimary_key: [id]\n";
+        let t = crate::load_table_str(Path::new("t.yml"), plain).unwrap();
+        assert!(t.table.filegroup.is_none());
+        assert!(!render(&t.name, &t.table, &t.intents, None).contains("filegroup"));
+        // Negative: a list is no name.
+        let bad = "table: dbo.t\ncolumns:\n  id: {type: int}\nfilegroup: [a, b]\n";
+        assert!(crate::load_table_str(Path::new("t.yml"), bad).is_err());
     }
 
     /// An explicit collation reads back as written and renders again; absent

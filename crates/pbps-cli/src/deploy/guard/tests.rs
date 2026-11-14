@@ -428,7 +428,7 @@ fn touching_a_table_keeps_each_scalar_at_every_read() {
     }]);
     let mut after = table();
     after.checks.insert("ck".into(), check);
-    for field in 0..5 {
+    for field in 0..6 {
         let mut before = table();
         let mut held = after.clone();
         // These period columns already exist, so adding period metadata is
@@ -476,10 +476,18 @@ fn touching_a_table_keeps_each_scalar_at_every_read() {
                 });
                 "partition parent, bound or key"
             }
+            5 => {
+                changed.filegroup = Some(pbps_model::Filegroup::new("fgx"));
+                "is on a filegroup other than the one it was approved on"
+            }
             _ => unreachable!(),
         };
         let pg = pbps_pg::Postgres::new();
-        let dialect: &dyn pbps_dialect::Dialect = if field == 3 { &pbps_mssql::Mssql } else { &pg };
+        let dialect: &dyn pbps_dialect::Dialect = if field == 3 || field == 5 {
+            &pbps_mssql::Mssql
+        } else {
+            &pg
+        };
         for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
             refuse_unplanned_movement(
                 dialect,
@@ -1708,6 +1716,7 @@ fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
         filter: Some("id > 0".into()),
         method: Default::default(),
         storage_parameters: [("fillfactor".into(), fillfactor.into())].into(),
+        filegroup: None,
     };
     let setting = |name: &TableName, value: Option<&str>| Change::SetIndexStorageParameters {
         table: name.clone(),
@@ -1845,6 +1854,7 @@ fn a_created_tables_parts_use_the_final_definition_and_settings() {
         filter: Some("id > 0".into()),
         method: Default::default(),
         storage_parameters: [("fillfactor".into(), fillfactor.into())].into(),
+        filegroup: None,
     };
     for carried in [false, true] {
         let mut declared = table();
@@ -1920,6 +1930,7 @@ fn a_created_heap_still_requires_exact_primary_key_presence() {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut heap = table();
     heap.columns.get_mut("id").unwrap().nullable = false;
@@ -2099,6 +2110,7 @@ fn parent_and_child(parent_name: &TableName) -> (Table, Table) {
         name: None,
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let mut referencing = table();
     referencing.foreign_keys.insert(
@@ -2237,6 +2249,7 @@ fn a_new_clustered_part_cannot_leave_the_table_as_a_heap() {
     let unique = UniqueConstraint {
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let index = Index {
         columns: vec![IndexColumn {
@@ -2250,6 +2263,7 @@ fn a_new_clustered_part_cannot_leave_the_table_as_a_heap() {
         filter: None,
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     };
     let mut heap = table();
     heap.clustered = Some(Clustered::Heap);

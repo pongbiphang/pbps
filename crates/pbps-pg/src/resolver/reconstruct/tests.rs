@@ -30,6 +30,7 @@ fn table() -> Table {
             filter: Some("c > app.f(1)".into()),
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.indexes.insert(
@@ -46,6 +47,7 @@ fn table() -> Table {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     table.foreign_keys.insert(
@@ -324,6 +326,7 @@ fn a_split_foreign_key_follows_every_table() {
         name: Some("p_pk".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let mut referencing = Table::default();
     referencing.columns.insert(
@@ -422,6 +425,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut plain = Table::default();
@@ -444,6 +448,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
             pbps_model::UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
         );
         let mut schema = Schema::default();
@@ -798,6 +803,7 @@ fn an_index_replica_identity_is_set_after_its_index() {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         },
     );
     t.replica_identity = Some(pbps_model::ReplicaIdentity::Index("t_id".into()));

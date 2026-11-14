@@ -158,7 +158,7 @@ async fn mssql_assessment_distinguishes_bindings_creation_and_unreconstructed_ca
                 let mut table = pbps_model::Table::default();
                 let mut column = pbps_model::Column::new("int".parse().unwrap()); column.nullable = false;
                 table.columns.insert("i".into(), column);
-                if name == "t" { table.columns.get_mut(&pbps_model::ColumnName::from("i")).unwrap().value_source = pbps_model::ValueSource::Default("7".into()); table.primary_key = Some(pbps_model::PrimaryKey { name: None, columns: vec!["i".into()], storage_parameters: Default::default() }); }
+                if name == "t" { table.columns.get_mut(&pbps_model::ColumnName::from("i")).unwrap().value_source = pbps_model::ValueSource::Default("7".into()); table.primary_key = Some(pbps_model::PrimaryKey { name: None, columns: vec!["i".into()], storage_parameters: Default::default(), filegroup: None }); }
                 schema.tables.insert(pbps_model::TableName::new("dbo",name), table);
             }
             for (name, kind, definition) in [

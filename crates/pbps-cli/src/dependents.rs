@@ -5036,6 +5036,7 @@ mod tests {
                 filter: filter.map(Into::into),
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         }
@@ -5117,6 +5118,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         };
@@ -5324,6 +5326,7 @@ mod tests {
                     filter: filter.map(Into::into),
                     method: Default::default(),
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
         }
@@ -6216,6 +6219,7 @@ mod tests {
                         filter: None,
                         method: Default::default(),
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     },
                 );
             }
@@ -6400,6 +6404,7 @@ mod tests {
             filter: None,
             method: Default::default(),
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         // A new partition whose own index is on the column, with no own
         // default or NOT NULL on it, needs the column all the same.
@@ -7179,6 +7184,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                filegroup: None,
             },
         );
         let parameters = Change::SetIndexStorageParameters {
@@ -7668,6 +7674,7 @@ mod tests {
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         };
@@ -9392,12 +9399,14 @@ mod tests {
                 pbps_model::UniqueConstraint {
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
+                    filegroup: None,
                 },
             );
             t.primary_key = Some(pbps_model::PrimaryKey {
                 name: Some("pk_n".into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             let refused = refusal_of(&plan(vec![create(t)]), &*pg()).unwrap_err();
             assert!(
@@ -9442,6 +9451,7 @@ mod tests {
             name: Some("pk_n".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         });
         let before = format!("{} IS NOT NULL", names("ix_a"));
         for cs in [
@@ -9475,6 +9485,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let keyed = |default: &str| {
             let mut t = new_table(Some(default), None, &[]);
@@ -9658,6 +9669,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
         };
         let arrival = |mut prefix: Vec<Change>, holders: &[KeyNameHolder], baseline: &Schema| {
@@ -9843,6 +9855,7 @@ mod tests {
                         name: None,
                         columns: vec!["id".into()],
                         storage_parameters: Default::default(),
+                        filegroup: None,
                     }),
                     nonclustered: false,
                 });
@@ -9953,6 +9966,7 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             });
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.n", 0),
@@ -10048,6 +10062,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let keyed_as = |table: &str, default: &str| {
             let mut t = new_table(Some(default), None, &[]);
@@ -10229,6 +10244,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let keyed_as = |table: &str, default: &str| {
             let mut t = new_table(Some(default), None, &[]);
@@ -10421,6 +10437,7 @@ mod tests {
             name: None,
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
+            filegroup: None,
         };
         let mut t = new_table(None, None, &[]);
         t.primary_key = Some(unnamed.clone());

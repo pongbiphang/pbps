@@ -313,6 +313,7 @@ fn add_index(
             filter: None,
             method,
             storage_parameters: Default::default(),
+            filegroup: None,
         }),
         clustered: false,
     }

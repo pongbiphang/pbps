@@ -468,6 +468,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
+                filegroup: None,
             },
             clustered: false,
         },
@@ -562,6 +563,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 filter: None,
                 method: Default::default(),
                 storage_parameters: Default::default(),
+                filegroup: None,
             }),
             clustered: false,
         },

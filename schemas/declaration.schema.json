@@ -205,6 +205,14 @@
             }
           ]
         },
+        "filegroup": {
+          "description": "The SQL Server filegroup of this table's rows, its heap or clustered index (#2813): it must exist already, and\npbps never creates or drops one. Absent is the database's default filegroup.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "replica_identity": {
           "description": "What logical replication carries to name an old row, on PostgreSQL:\n`full`, `nothing`, `primary_key`, `{unique: <constraint>}` or\n`{index: <index>}`. Absent means the default: the primary key, or\nnothing without one.",
           "anyOf": [
@@ -599,6 +607,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/StorageValueDto"
           }
+        },
+        "filegroup": {
+          "description": "The SQL Server filegroup of this key's index (SQL Server) (#2813): it must exist already, and\npbps never creates or drops one. Absent is where the table sits.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -653,6 +669,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/StorageValueDto"
           }
+        },
+        "filegroup": {
+          "description": "The SQL Server filegroup of this constraint's index (SQL Server) (#2813): it must exist already, and\npbps never creates or drops one. Absent is where the table sits.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -747,6 +771,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/StorageValueDto"
           }
+        },
+        "filegroup": {
+          "description": "The SQL Server filegroup of this index (SQL Server) (#2813): it must exist already, and\npbps never creates or drops one. Absent is where the table sits.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -2071,6 +2103,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 105,
+  "x-pbps-schema-version": 107,
   "x-pbps-tool-version": "0.0.0"
 }

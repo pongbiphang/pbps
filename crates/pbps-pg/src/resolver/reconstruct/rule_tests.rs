@@ -38,6 +38,7 @@ fn keyed(column: &str, unique: bool, filter: Option<&str>) -> Index {
         filter: filter.map(str::to_owned),
         method: Default::default(),
         storage_parameters: Default::default(),
+        filegroup: None,
     }
 }
 

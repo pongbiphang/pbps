@@ -54,6 +54,7 @@ fn schema(kind: &str) -> (TableName, Schema) {
         name: None,
         columns: vec!["code".into()],
         storage_parameters: Default::default(),
+        filegroup: None,
     });
     let mut schema = Schema::default();
     schema.tables.insert(name.clone(), table);
