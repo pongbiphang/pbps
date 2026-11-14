@@ -251,6 +251,29 @@ A later entry's tree can include our changes. Read that level's failing job and
 attribute its cause before applying [the ejection rules](../AGENTS.md#ci-and-the-merge-queue)
 to our PR.
 
+## PostgreSQL fixture durability
+
+The live PostgreSQL fixtures run with `fsync`, `synchronous_commit` and
+`full_page_writes` off (#2864, DEC-2864.1). Their data is disposable, and the
+`flow_pg` cases wait mostly on commits: 70 of them took 16% less wall time
+(1,083 s and 1,049 s against 1,249 s and 1,296 s, alternating).
+
+`scripts/live-pg-nondurable.sh` sets them with `ALTER SYSTEM` and a reload,
+reads the three values back, and exits non-zero when one did not take effect.
+`scripts/live-tests-pg.sh` pipes it into each of its three servers (PostgreSQL
+18, 16 and the supplied scratch) once they are ready, and the `live-pg` job in
+`ci.yml` does the same to its three service containers before any test; a
+service container takes no server arguments, so one mechanism serves both. The
+product's own scratch containers (`--dev docker://`, the resolver's Docker
+scratch) are shipped behaviour and keep their defaults. The `viewer`,
+`compatibility`, `live-transport` and release qualification fixtures are
+unchanged: each runs one case or a handful of statements, so there is nothing
+to gain.
+
+A fixture killed uncleanly can be unrecoverable with `fsync` off. No suite
+restarts or crashes a shared fixture; remove one with `docker rm -f -v` and let
+the runner start a new one.
+
 ## Shipped viewer browser acceptance
 
 `tests/ui-browser` is a separate, locked Playwright/Chromium suite, not an

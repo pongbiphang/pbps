@@ -1312,6 +1312,7 @@ class LiveExecution(unittest.TestCase):
                     installs = [container_of(c) for c in calls if c[:2] == ["docker", "exec"]
                                 and "partman" in " ".join(c)]
                     self.assertCountEqual(installs, expected[:2])
+                    self.assertCountEqual([n for _, n in self.nondurable_steps(calls)], expected)
                     self.assertTrue(environments)
                     for env in environments:
                         self.assertEqual(env["PBPS_TEST_PG_CONTAINER"], expected[0])
@@ -1781,6 +1782,12 @@ elif command[0] != 'sleep':
         for i, name in installs:
             self.assertEqual(calls[i][:6], ["docker", "exec", "-i", name, "sh", "-s"], calls[i])
             self.assertNotIn("apt-get", " ".join(calls[i]))
+        # Every fixture server, the supplied scratch included, is made
+        # non-durable once it is ready and before any client runs (#2864).
+        nondurable = self.nondurable_steps(calls)
+        self.assertCountEqual([name for _, name in nondurable],
+                              ["pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"])
+        self.assertTrue(all(last_probe < i < first_client for i, _ in nondurable), nondurable)
         self.assertEqual([c for c in calls if c[0] in ("cargo", "python3")], [
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg", "--port", "54320"],
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],
@@ -1819,6 +1826,31 @@ elif command[0] != 'sleep':
         self.assertFalse(any(c[0] == "cargo" for c in calls))
         self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
 
+    @staticmethod
+    def nondurable_steps(calls):
+        """The `docker exec -i <name> sh -s` calls with no arguments: the runner
+        pipes scripts/live-pg-nondurable.sh into them (the pg_partman installs
+        pass the package too)."""
+        return [(i, container_of(c)) for i, c in enumerate(calls)
+                if len(c) == 6 and c[:3] == ["docker", "exec", "-i"] and c[4:] == ["sh", "-s"]]
+
+    def test_a_fixture_that_stays_durable_stops_the_run_before_any_client(self):
+        for failing in ("pbps-test-pg", "pbps-test-pg16", "pbps-test-pg-scratch"):
+            with self.subTest(failing=failing):
+                result, calls = self.local_pg_script("nondurable-failed-" + failing)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("settings did not take effect", result.stderr)
+                self.assertFalse(any(c[0] in ("cargo", "python3") for c in calls))
+                self.assertFalse(any("partman" in " ".join(c) for c in calls))
+                self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
+
+    def test_the_runner_pipes_the_checked_in_script_and_nothing_else(self):
+        text = (ROOT / "scripts" / "live-tests-pg.sh").read_text()
+        self.assertIn('docker exec -i "$name" sh -s < scripts/live-pg-nondurable.sh', text)
+        # The product's own scratch containers are shipped behaviour (#2864):
+        # no server argument may reach a `docker run` of this runner.
+        self.assertNotRegex(text, r"-c\s+(fsync|synchronous_commit|full_page_writes)")
+
     def local_pg_script(self, mode):
         # Run the real shell control flow. Only external clients are replaced;
         # no database is started and the production loop limit is retained.
@@ -1842,6 +1874,9 @@ elif command[:2] == ["docker", "exec"]:
     name = container_of(command)
     count = bump(root / name)
     mode = os.environ["PBPS_ADMISSION_MODE"]
+    if command[2:3] == ["-i"] and command[4:] == ["sh", "-s"] and mode == "nondurable-failed-" + name:
+        print("live-pg-nondurable: settings did not take effect: fsync=on", file=sys.stderr)
+        sys.exit(1)
     tcp = "-h" in command and command[command.index("-h") + 1] == "127.0.0.1"
     deadline = (mode == "deadline-new" and name == "pbps-test-pg" or
                 mode == "deadline-old" and name == "pbps-test-pg16" or
@@ -1987,6 +2022,96 @@ class PartmanInstall(unittest.TestCase):
         result, log = self.run_script(installed=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c for c in log if not c.startswith("dpkg -s")], [])
+
+
+class NondurableFixtures(unittest.TestCase):
+    """scripts/live-pg-nondurable.sh turns the settings off and proves it (#2864)."""
+
+    SETTINGS = ("fsync", "synchronous_commit", "full_page_writes")
+
+    def run_script(self, **env):
+        # `psql` and `sleep` are replaced by stubs; the script's own shell
+        # control flow is what runs. A stub `psql` answers the read-back from
+        # VALUE_<setting> (`__fail__` exits non-zero, `__empty__` prints
+        # nothing) and reports `on` for the first ON_READS_<setting> reads.
+        with tempfile.TemporaryDirectory(prefix="pbps-nondurable-") as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "psql").write_text(textwrap.dedent("""\
+                #!/bin/sh
+                echo "$*" >> "$STUB_DIR/log"
+                for sql; do :; done
+                case "$sql" in
+                  "ALTER SYSTEM"*) [ -z "$FAIL_ALTER" ] || exit 1 ;;
+                  "SELECT pg_reload_conf"*) echo t ;;
+                  "SELECT setting FROM pg_settings"*)
+                    name=${sql##*name = \\'}; name=${name%\\'}
+                    n=$(cat "$STUB_DIR/reads.$name" 2>/dev/null || echo 0); n=$((n + 1))
+                    echo "$n" > "$STUB_DIR/reads.$name"
+                    eval "value=\\${VALUE_$name:-off}; on_reads=\\${ON_READS_$name:-0}"
+                    if [ "$n" -le "$on_reads" ]; then echo on
+                    elif [ "$value" = __fail__ ]; then exit 2
+                    elif [ "$value" != __empty__ ]; then echo "$value"; fi ;;
+                  *) echo "unexpected statement: $sql" >&2; exit 3 ;;
+                esac
+                """))
+            (bin_dir / "sleep").write_text("#!/bin/sh\necho sleep >> \"$STUB_DIR/log\"\n")
+            for stub in bin_dir.iterdir():
+                stub.chmod(0o755)
+            environment = os.environ | {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}", "STUB_DIR": str(root),
+                "FAIL_ALTER": "", "PBPS_FIXTURE_SETTLE_TRIES": "3"} | env
+            result = subprocess.run(["sh", str(ROOT / "scripts/live-pg-nondurable.sh")],
+                                    env=environment, text=True, capture_output=True, timeout=30)
+            log = (root / "log").read_text().splitlines() if (root / "log").exists() else []
+            return result, log
+
+    def test_turns_each_setting_off_in_its_own_statement_then_reloads_then_reads_back(self):
+        result, log = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        alters = [line for line in log if "ALTER SYSTEM" in line]
+        self.assertEqual([line.rsplit(" ", 3)[-3:] for line in alters],
+                         [[name, "=", "off"] for name in self.SETTINGS])
+        # `ALTER SYSTEM` cannot run in a transaction block: no statement may
+        # carry a second statement or open one.
+        self.assertFalse(any(";" in line or "BEGIN" in line for line in log), log)
+        self.assertEqual([i for i, line in enumerate(log) if "ALTER SYSTEM" in line], [0, 1, 2])
+        self.assertIn("pg_reload_conf", log[3])
+        reads = [line for line in log[4:] if "FROM pg_settings" in line]
+        self.assertEqual(len(reads), 3)
+        for name in self.SETTINGS:
+            self.assertTrue(any(f"name = '{name}'" in line for line in reads), name)
+        # A failed statement must fail the call rather than print an error.
+        self.assertTrue(all("ON_ERROR_STOP=1" in line for line in log), log)
+
+    def test_waits_out_an_asynchronous_reload(self):
+        result, log = self.run_script(ON_READS_fsync="2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.count("sleep"), 2)
+
+    def test_fails_naming_each_setting_that_stays_on(self):
+        for name in self.SETTINGS:
+            with self.subTest(name=name):
+                result, log = self.run_script(**{f"VALUE_{name}": "on"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{name}=on", result.stderr)
+                others = [other for other in self.SETTINGS if other != name]
+                self.assertFalse(any(f"{other}=" in result.stderr for other in others), result.stderr)
+                # It gave the reload every attempt before it gave up.
+                self.assertEqual(log.count("sleep"), 2)
+
+    def test_an_unreadable_or_empty_answer_is_a_failure_not_off(self):
+        for answer in ("__fail__", "__empty__"):
+            with self.subTest(answer=answer):
+                result, _ = self.run_script(VALUE_full_page_writes=answer)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("full_page_writes=unreadable", result.stderr)
+
+    def test_a_statement_the_server_refuses_stops_before_the_reload(self):
+        result, log = self.run_script(FAIL_ALTER="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("pg_reload_conf" in line or "FROM pg_settings" in line for line in log), log)
 
 
 if __name__ == "__main__":

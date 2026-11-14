@@ -86,6 +86,16 @@ for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
     fi
 done
 
+# Test-only speed (#2864, DEC-2864.1): no durability is asked of a fixture
+# whose data is disposable. Through scripts/live-pg-nondurable.sh, as ci.yml
+# applies it to its service containers, which accept no server arguments. Every
+# fixture gets it, the supplied scratch included, and a setting that did not
+# take effect stops the run. The scratch containers the product itself starts
+# are untouched: that is shipped behaviour, not test set-up.
+for name in "$NAME" "$OLD_NAME" "$SCRATCH_NAME"; do
+    docker exec -i "$name" sh -s < scripts/live-pg-nondurable.sh
+done
+
 # pg_partman for `partitions: external` (#1533), as ci.yml installs it: the
 # cases create the extension in a database of their own.
 # Both at once, each waited on so either failing stops the run.

@@ -76,6 +76,24 @@ place. A faster build mode does not authorize relaxing those checks. Further
 parallelization would require independent fixtures for namespace mutation,
 runtime failures, session census and server shutdown.
 
+## Non-durable PostgreSQL fixtures
+
+Seventy `flow_pg` cases (`type_refs::`, `deploy::`, `retained2354::`, serial) on
+one head and one machine, against private PostgreSQL 18, 16 and scratch
+fixtures, alternating the default settings with `fsync=off`,
+`synchronous_commit=off` and `full_page_writes=off` (load average 37 to 45
+throughout; all 70 passed every time):
+
+| run | settings | wall |
+| --- | --- | ---: |
+| 1 | default | 1,249 s |
+| 2 | off | 1,083 s |
+| 3 | default | 1,296 s |
+| 4 | off | 1,049 s |
+
+The means are 1,272 s and 1,066 s, 16% less. The fixtures take the settings
+through `scripts/live-pg-nondurable.sh`; see TEST-EXECUTION.md and DEC-2864.1.
+
 ## The run's critical path
 
 Before #1370 a `ci.yml` run took about 45 minutes, measured on merge-group

@@ -339,6 +339,39 @@ test('every flow share has the full-list CI entry and both servers and packages'
   assert.doesNotMatch(block, /scripts\/ui-browser\.py|pbps-ui-build/);
 });
 
+test('every live-pg fixture server is made non-durable before any test step', () => {
+  const block = job('live-pg');
+  const [head] = block.split('    steps:\n');
+  const services = [...head.matchAll(/^      (postgres[\w-]*):$/gm)].map(match => match[1]);
+  assert.deepEqual(services.sort(), ['postgres', 'postgres-old', 'postgres-scratch'], 'the job has the three fixture servers');
+  const steps = block.split(/^      - /m).slice(1);
+  const index = steps.findIndex(step => step.startsWith('name: Make the PostgreSQL fixtures non-durable'));
+  assert.ok(index >= 0, 'the step exists (#2864)');
+  const step = steps[index];
+  // Every suite needs it, and a step that may fail without failing the job
+  // would leave a fixture durable without a trace.
+  assert.doesNotMatch(step, /^\s*if:/m);
+  assert.doesNotMatch(step, /continue-on-error/);
+  // Each fixture server of the job is named, so a service added later cannot
+  // be left out, and none is read through a different id.
+  for (const service of services) {
+    const reference = service.includes('-')
+      ? `job\\.services\\['${service}'\\]\\.id`
+      : `job\\.services\\.${service}\\.id`;
+    assert.match(step, new RegExp(`^          PG_FIXTURE_\\w+: \\$\\{\\{ ${reference} \\}\\}$`, 'm'), `${service} is reached`);
+  }
+  assert.equal([...step.matchAll(/^          PG_FIXTURE_\w+: /gm)].length, services.length);
+  assert.match(step, /set -euo pipefail/);
+  assert.match(step, /docker exec -i "\$fixture" sh -s < scripts\/live-pg-nondurable\.sh/);
+  for (const name of ['PG_FIXTURE_18', 'PG_FIXTURE_16', 'PG_FIXTURE_SCRATCH']) {
+    assert.match(step, new RegExp(`"\\$${name}"`), `${name} is looped over`);
+  }
+  // Nothing may run a test, build or install before it: only the checkout.
+  for (const before of steps.slice(0, index)) {
+    assert.match(before, /^uses: actions\/checkout@/, 'only the checkout precedes it');
+  }
+});
+
 test('the viewer keeps the actual build and browser suite in its own required job', () => {
   const block = job('viewer');
   assert.match(block, /POSTGRES_DB: pbps_test/);
