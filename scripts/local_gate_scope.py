@@ -12,7 +12,9 @@ The rule is an allow-list. A head is `non-live` only if every path of
 `git diff <merge-base> <head>` is in a class named in FREE. A path in no class
 is `full`: unknown is not unaffected (as in ci_release_scope.py). So are an
 unreadable ref, a head with no merge base, an empty diff and a directory that
-is not a repository. Exit 0 only for `non-live`.
+is not a repository. A symlink or a submodule (mode 120000 or 160000, before or
+after) is `full` too: what it points at is not its name. Exit 0 only for
+`non-live`.
 
 KEEP_FULL lists the files under `scripts/` that a live run reads, executes,
 sources, copies or imports, beside code and build input. It is checked first,
@@ -26,6 +28,7 @@ Standard library and Git only.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -46,6 +49,7 @@ KEEP_FULL = tuple((re.compile(p), why) for p, why in (
     (r"scripts/(gate_rerun|known_flakes)\.py", "imported by the sharded driver"),
     (r"scripts/(local_gate_scope|gate_scope|ci_release_scope)\.py", "a scope rule, which its own change must not judge"),
     (r"schemas/.*", "the envelope schema a live flow test reads"),
+    (r"docs/measurements/.*", "compiled into a test binary with include_str!"),
     (r"crates/.*", "crate source and its test fixtures"),
     (r"(.*/)?Cargo\.(toml|lock)", "a manifest or lockfile"),
     (r"rust-toolchain(\.toml)?|\.cargo/.*", "toolchain or Cargo configuration"),
@@ -70,14 +74,19 @@ def classify(path):
     return False, "in no class the rule names as unread by a live run"
 
 
-def decide(paths):
-    """Return (verdict, reason, classes) for the changed paths."""
+def decide(paths, indirect=()):
+    """Return (verdict, reason, classes) for the changed paths.
+
+    `indirect` names the paths that are a symlink or a submodule on either side:
+    what they point at is not their name, so no class can vouch for them."""
     paths = sorted(set(paths))
     if not paths:
         return "full", "the diff lists no path, which is not evidence that nothing is read", {}
     held, classes = {}, {}
     for path in paths:
         free, label = classify(path)
+        if path in indirect:
+            free, label = False, "a symlink or submodule, which points somewhere its name does not say"
         (classes if free else held).setdefault(label, []).append(path)
     if held:
         return "full", "; ".join(
@@ -94,6 +103,14 @@ def git(repo, *args):
     return result.stdout.decode().strip()
 
 
+def indirect_paths(repo, base, head):
+    """Paths whose mode is a symlink (120000) or a gitlink (160000) before or after."""
+    out = subprocess.run(["git", "diff", "--raw", "--no-renames", "-z", base, head],
+                         check=True, capture_output=True, cwd=repo).stdout.split(b"\0")
+    return {os.fsdecode(path) for meta, path in zip(out[0::2], out[1::2])
+            if {meta.split()[0][1:], meta.split()[1]} & {b"120000", b"160000"}}
+
+
 def verdict(repo, base, head):
     """The JSON-able verdict for `head` against the merge base with `base`."""
     result = {"base": base, "head": head}
@@ -102,7 +119,8 @@ def verdict(repo, base, head):
         head_sha = git(repo, "rev-parse", "--verify", "--quiet", head + "^{commit}")
         merge_base = git(repo, "merge-base", base_sha, head_sha)
         result.update(head=head_sha, merge_base=merge_base)
-        scope, reason, classes = decide(diff_paths(merge_base, head_sha, repo))
+        scope, reason, classes = decide(diff_paths(merge_base, head_sha, repo),
+                                        indirect_paths(repo, merge_base, head_sha))
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         scope, reason, classes = "full", f"unknown is not unaffected: {error}", {}
     result.update(verdict=scope, reason=reason)
