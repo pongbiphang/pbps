@@ -3178,7 +3178,7 @@
         "resolver::server::scratch::mssql_live_tests::dependencies2323::readable_mismatches_and_undeclared_references_refuse_by_name",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::a_companion_collision_never_replaces_or_drops_the_existing_database",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::supplied_scratch_on_another_instance_refuses_the_named_dependency",
-      "resolver::server::scratch::mssql_live_tests::mssql_docker_acquisition_keeps_the_run_owned_contract",
+      "resolver::server::scratch::mssql_live_tests::mssql_docker_acquisition_runs_once_and_releases_the_container",
       "resolver::server::scratch::mssql_live_tests::reconstruct2374::a_warm_case_removes_only_its_own_deployer_logins",
       "resolver::server::scratch::mssql_live_tests::warm2585::a_dirty_warm_instance_refuses_before_its_case_can_run",
         "resolver::server::scratch::mssql_live_tests::warm2585::a_warm_case_reports_changed_builtin_state_against_its_own_snapshot",
