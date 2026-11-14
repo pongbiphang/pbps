@@ -626,10 +626,14 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
     reconstruct2374::both(case).await;
 }
 
-/// Docker acquisition still gets a real witness; SQL semantics need no repeat.
+/// Docker acquisition still gets a real witness: a run completes on the
+/// container, the container's catalog is unchanged afterwards, and release
+/// removes it. The SQL contract (`supplied_contract`, the same-database and
+/// inherited-model refusals) depends on the engine, not on where the scratch
+/// lives, and stays in the separate-instance and same-instance tests above.
 #[tokio::test]
 #[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
-async fn mssql_docker_acquisition_keeps_the_run_owned_contract() {
+async fn mssql_docker_acquisition_runs_once_and_releases_the_container() {
     let target = server("PBPS_TEST_DB");
     let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
     let identity = sql::cluster_identity(&mut connection(&target).await)
@@ -653,16 +657,8 @@ async fn mssql_docker_acquisition_keeps_the_run_owned_contract() {
             *recorded.lock().await = rows[0].try_get::<&str>("name").unwrap().unwrap().to_owned();
             let scratch = url.to_owned();
             warm2585::run(&[url], async move {
-                let same = refusal(&scratch, &scratch).await;
-                assert!(
-                    matches!(same, ProduceError::Run(Error::Unusable(ref reason))
-                    if reason.contains("target database")),
-                    "{same}"
-                );
                 let owned = outcome(&target_for_run, &scratch).await;
                 assert!(owned.is_ok(), "{}", why(&owned));
-                supplied_contract(&target_for_run, &scratch).await;
-                inherited_model_refusal(&target_for_run, &scratch).await;
             })
             .await
             .unwrap();
