@@ -253,6 +253,7 @@ fn historical_ids(
         .chain(ids.columns.keys())
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
+        .chain(ids.search.keys())
         .chain(ids.tombstones.keys())
         .cloned()
         .collect();
@@ -260,6 +261,7 @@ fn historical_ids(
     missing_by_name(&mut ids.columns, &other.columns, &mut taken);
     missing_by_name(&mut ids.roles, &other.roles, &mut taken);
     missing_by_name(&mut ids.types, &other.types, &mut taken);
+    missing_by_name(&mut ids.search, &other.search, &mut taken);
     let observed = pbps_diff::observed_ids_reserving(schema, &ids, other);
     // Complete live names without replacing this snapshot's version or intent.
     // Spell every field so new identity metadata requires a preservation choice.
@@ -273,6 +275,7 @@ fn historical_ids(
         roles: observed.roles,
         types: observed.types,
         extensions: observed.extensions,
+        search: observed.search,
         tombstones: ids.tombstones,
         moves: ids.moves,
         rebuilds: ids.rebuilds,
@@ -1296,6 +1299,7 @@ mod tests {
         };
         let mut recorded = pbps_model::IdsFile {
             extensions: BTreeMap::new(),
+            search: BTreeMap::new(),
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [
                 ("t_aaaaaa".parse().unwrap(), table.clone()),
@@ -1474,6 +1478,7 @@ mod tests {
         // uids are as taken as any live one.
         let selected = pbps_model::IdsFile {
             extensions: BTreeMap::new(),
+            search: BTreeMap::new(),
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
             columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),

@@ -103,6 +103,8 @@ pub enum Body {
     Table(TableBody),
     Role(String),
     Type(String),
+    /// A text search object, spelled `config app.docs` or `dictionary app.docs` (#2728).
+    Search(String),
     Extension(String),
 }
 
@@ -136,6 +138,7 @@ impl Body {
             Body::Table(_) => UidKind::Table,
             Body::Role(_) => UidKind::Role,
             Body::Type(_) => UidKind::Type,
+            Body::Search(_) => UidKind::Search,
             Body::Extension(_) => UidKind::Extension,
         }
     }
@@ -196,6 +199,7 @@ pub fn render(file: &TreeFile) -> String {
         Body::Table(t) => ("table", &t.table),
         Body::Role(n) => ("role", n),
         Body::Type(n) => ("type", n),
+        Body::Search(n) => ("search", n),
         Body::Extension(n) => ("extension", n),
     };
     top.push(format!("  \"{}\": {}", key.0, line(key.1)));
@@ -292,6 +296,7 @@ struct Raw {
     role: Option<String>,
     #[serde(rename = "type")]
     ty: Option<String>,
+    search: Option<String>,
     extension: Option<String>,
     dropped: Option<Tombstone>,
     columns: Option<Section<Rec>>,
@@ -410,11 +415,11 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
             found: raw.format,
         });
     }
-    let named = [&raw.table, &raw.role, &raw.ty, &raw.extension];
+    let named = [&raw.table, &raw.role, &raw.ty, &raw.search, &raw.extension];
     if named.iter().filter(|n| n.is_some()).count() != 1 {
         return Err(malformed(
             path,
-            "exactly one of `table`, `role`, `type` and `extension` is required",
+            "exactly one of `table`, `role`, `type`, `search` and `extension` is required",
         ));
     }
     let body = if let Some(table) = raw.table {
@@ -435,10 +440,11 @@ pub fn parse(path: &str, text: &str) -> Result<TreeFile, TreeError> {
         {
             return Err(malformed(path, "only a table file has sections"));
         }
-        match (raw.role, raw.ty, raw.extension) {
-            (Some(n), _, _) => Body::Role(n),
-            (_, Some(n), _) => Body::Type(n),
-            (_, _, Some(n)) => Body::Extension(n),
+        match (raw.role, raw.ty, raw.search, raw.extension) {
+            (Some(n), ..) => Body::Role(n),
+            (_, Some(n), ..) => Body::Type(n),
+            (_, _, Some(n), _) => Body::Search(n),
+            (.., Some(n)) => Body::Extension(n),
             _ => unreachable!("exactly one name was checked above"),
         }
     };
@@ -548,6 +554,11 @@ fn check_names(path: &str, file: &TreeFile) -> Result<(), TreeError> {
         Body::Role(n) | Body::Extension(n) => nonempty(n)?,
         Body::Type(n) if live => n.parse::<TypeRef>().map(drop).map_err(|e| bad(n, &e))?,
         Body::Type(n) => nonempty(n)?,
+        Body::Search(n) if live => n
+            .parse::<crate::SearchRef>()
+            .map(drop)
+            .map_err(|e| bad(n, &e))?,
+        Body::Search(n) => nonempty(n)?,
         Body::Table(t) => {
             if live {
                 table(&t.table)?;
@@ -601,6 +612,10 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                 let name: TypeRef = n.parse().map_err(|e| bad_name(&e))?;
                 ids.types.insert(file.uid.clone(), name);
             }
+            Body::Search(n) if file.dropped.is_none() => {
+                let name: crate::SearchRef = n.parse().map_err(|e| bad_name(&e))?;
+                ids.search.insert(file.uid.clone(), name);
+            }
             Body::Extension(n) if file.dropped.is_none() => {
                 ids.extensions
                     .insert(file.uid.clone(), ObjectLocalName::new(n.as_str()));
@@ -652,7 +667,7 @@ pub fn assemble(files: &BTreeMap<String, String>) -> Result<IdsFile, TreeError> 
                     ids.rebuilds.insert(uid.clone(), r.clone());
                 }
             }
-            Body::Role(_) | Body::Type(_) | Body::Extension(_) => {}
+            Body::Role(_) | Body::Type(_) | Body::Search(_) | Body::Extension(_) => {}
         }
         if let Some(tomb) = &file.dropped {
             ids.tombstones.insert(file.uid.clone(), tomb.clone());
@@ -719,6 +734,9 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
     for (uid, name) in &ids.types {
         objects.push((uid.clone(), Body::Type(name.raw().to_string()), None));
     }
+    for (uid, name) in &ids.search {
+        objects.push((uid.clone(), Body::Search(name.raw().to_string()), None));
+    }
     for (uid, name) in &ids.extensions {
         objects.push((uid.clone(), Body::Extension(name.raw().to_owned()), None));
     }
@@ -728,6 +746,7 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
             UidKind::Table => Body::Table(table_body(name)),
             UidKind::Role => Body::Role(name),
             UidKind::Type => Body::Type(name),
+            UidKind::Search => Body::Search(name),
             UidKind::Extension => Body::Extension(name),
             _ => continue,
         };
@@ -808,7 +827,11 @@ pub fn split(ids: &IdsFile, placement: &Placement) -> Result<BTreeMap<String, St
                     .or_default()
                     .push((uid.clone(), Rec::Dead(tomb.clone())));
             }
-            UidKind::Table | UidKind::Role | UidKind::Type | UidKind::Extension => {}
+            UidKind::Table
+            | UidKind::Role
+            | UidKind::Type
+            | UidKind::Search
+            | UidKind::Extension => {}
         }
     }
     for (child, parent) in &placement.children {

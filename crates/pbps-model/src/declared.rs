@@ -446,6 +446,9 @@ impl Declared {
                 | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_)
+                // A text search object holds no expression text either (DEC-2728.2).
+                | Change::CreateSearch { .. }
+                | Change::DropSearch { .. }
                 // A package declares no expression text; its members are not
                 // read as declared types or defaults (DEC-2447.6).
                 | Change::CreateExtension { .. }

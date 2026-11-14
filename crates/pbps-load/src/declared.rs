@@ -67,9 +67,9 @@ impl Loaded {
                 Declaration::Table(_)
                 | Declaration::Role(_)
                 | Declaration::Type(_)
+                | Declaration::Search(_)
                 | Declaration::Extension(_) => true,
-                // Text search objects take identities with the next part (#2728).
-                Declaration::Search(_) | Declaration::Module(_) => false,
+                Declaration::Module(_) => false,
             };
             if !kind_has_ids {
                 continue;

@@ -183,6 +183,24 @@ mod effects_of_each_kind {
         p: Table,
     }
 
+    fn search_ref(text: &str) -> SearchRef {
+        text.parse().unwrap()
+    }
+
+    fn words_object() -> SearchObject {
+        SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: BTreeMap::new(),
+        }
+    }
+
+    fn docs_object() -> SearchObject {
+        SearchObject::Config {
+            parser: "pg_catalog.\"default\"".parse().unwrap(),
+            mappings: [("asciiword".to_owned(), vec!["app.words".parse().unwrap()])].into(),
+        }
+    }
+
     fn world() -> World {
         let id = Column::new(int()).not_null();
         let mut x = Column::new(int());
@@ -279,6 +297,16 @@ mod effects_of_each_kind {
             .insert(uid(UidKind::Type, "base"), "app.base".parse().unwrap());
         ids.types
             .insert(uid(UidKind::Type, "old"), "app.old".parse().unwrap());
+        // A dictionary and a configuration that maps it, both standing, for the kinds that
+        // create or drop a text search object.
+        let (words, docs) = (
+            search_ref("dictionary app.words"),
+            search_ref("config app.docs"),
+        );
+        schema.search.insert(words.clone(), words_object());
+        schema.search.insert(docs.clone(), docs_object());
+        ids.search.insert(uid(UidKind::Search, "words"), words);
+        ids.search.insert(uid(UidKind::Search, "docs"), docs);
         let mut after = schema.clone();
         let at = after.tables.get_mut(&tn("t")).unwrap();
         at.columns.get_mut("x").unwrap().value_source = ValueSource::Default("9".into());
@@ -486,6 +514,43 @@ mod effects_of_each_kind {
                     from: "app.old".parse().unwrap(),
                     to: "app.renamed".parse().unwrap(),
                     definition: Box::new(ManagedType::Enum { values: vec![] }),
+                },
+            ),
+            // A configuration waits for the dictionary it maps, which the plan holds; a
+            // dictionary waits for nothing.
+            (
+                "CreateSearch",
+                Change::CreateSearch {
+                    uid: uid(UidKind::Search, "docs"),
+                    name: search_ref("config app.docs"),
+                    definition: Box::new(docs_object()),
+                    unresolved: Vec::new(),
+                },
+            ),
+            (
+                "CreateSearch",
+                Change::CreateSearch {
+                    uid: uid(UidKind::Search, "fresh"),
+                    name: search_ref("dictionary app.fresh"),
+                    definition: Box::new(words_object()),
+                    unresolved: Vec::new(),
+                },
+            ),
+            // A dictionary leaves only after the configuration that maps it.
+            (
+                "DropSearch",
+                Change::DropSearch {
+                    uid: uid(UidKind::Search, "words"),
+                    name: search_ref("dictionary app.words"),
+                    definition: Box::new(words_object()),
+                },
+            ),
+            (
+                "DropSearch",
+                Change::DropSearch {
+                    uid: uid(UidKind::Search, "docs"),
+                    name: search_ref("config app.docs"),
+                    definition: Box::new(docs_object()),
                 },
             ),
             (
@@ -1065,6 +1130,7 @@ mod effects_of_each_kind {
                     requirers: [uid(UidKind::Extension, "cube")].into(),
                     releases: Default::default(),
                     index_releases: Default::default(),
+                    search_releases: Default::default(),
                 },
             ),
             (

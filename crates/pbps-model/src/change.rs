@@ -325,6 +325,28 @@ pub enum Change {
         to: crate::TypeRef,
         definition: Box<crate::ManagedType>,
     },
+    /// `CREATE TEXT SEARCH DICTIONARY`, or `CREATE TEXT SEARCH CONFIGURATION` and
+    /// its `ADD MAPPING` groups, of an object the declarations hold under an `s_` uid
+    /// and the target lacks (DEC-2728.2). The payload is the whole definition, as
+    /// `CreateType`'s is.
+    CreateSearch {
+        uid: Uid,
+        name: crate::SearchRef,
+        definition: Box<crate::SearchObject>,
+        /// The dictionaries it uses that an offline plan could not check: neither
+        /// declared, nor the engine's, nor a package's. The plan line names them
+        /// and the plan against the database resolves them. Empty for a connected
+        /// plan, which refuses what the target does not hold.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unresolved: Vec<crate::SearchRef>,
+    },
+    /// `DROP TEXT SEARCH ... RESTRICT` of an object a recorded human intent
+    /// retires (DEC-2728.2). The engine refuses it while anything names it.
+    DropSearch {
+        uid: Uid,
+        name: crate::SearchRef,
+        definition: Box<crate::SearchObject>,
+    },
     /// `CREATE EXTENSION name SCHEMA schema VERSION version` of a package the
     /// declaration holds under an `e_` uid and the target lacks (DEC-2447.6).
     /// It runs package code, so it is `extension-code` risk and is sealed with
@@ -365,6 +387,11 @@ pub enum Change {
         /// operator classes, DEC-2447.14): the drop waits for each.
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         index_releases: BTreeSet<(TableName, ObjectLocalName)>,
+        /// The text search objects this plan also drops that map a dictionary the
+        /// package provides, which would block its removal (DEC-2728.2): the drop
+        /// waits for each.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        search_releases: BTreeSet<crate::SearchRef>,
     },
     /// `ALTER EXTENSION name UPDATE TO 'version'` of a package the declarations
     /// hold at a version other than the target's, in the same schema
@@ -1559,12 +1586,13 @@ pub enum PermissionChange<'a> {
 }
 
 /// The database-global named objects a plan creates, drops and renames by
-/// identity: roles, types and extensions. Enum value and domain edits, grants and the rest
+/// identity: roles, types, text search objects and extensions. Enum value and domain edits, grants and the rest
 /// act *on* one of them and are not themselves a kind of catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CatalogObject {
     Role,
     Type,
+    Search,
     Extension,
 }
 
@@ -1673,6 +1701,9 @@ macro_rules! change_family {
             | $crate::Change::DropType { .. }
             | $crate::Change::RenameType { .. }
     };
+    (search) => {
+        $crate::Change::CreateSearch { .. } | $crate::Change::DropSearch { .. }
+    };
     (extensions) => {
         $crate::Change::CreateExtension { .. }
             | $crate::Change::DropExtension { .. }
@@ -1710,6 +1741,8 @@ pub enum ChangeFamily {
     Roles,
     /// Creating, dropping and renaming a managed type.
     Types,
+    /// Creating and dropping a text search configuration or dictionary.
+    Search,
     /// Creating, dropping, updating and moving an extension.
     Extensions,
 }
@@ -1737,6 +1770,7 @@ impl Change {
             crate::change_family!(type_values) => ChangeFamily::TypeValues,
             crate::change_family!(roles) => ChangeFamily::Roles,
             crate::change_family!(types) => ChangeFamily::Types,
+            crate::change_family!(search) => ChangeFamily::Search,
             crate::change_family!(extensions) => ChangeFamily::Extensions,
         }
     }
@@ -1764,6 +1798,7 @@ macro_rules! catalog_change {
     () => {
         $crate::catalog_change!(roles)
             | $crate::catalog_change!(types)
+            | $crate::catalog_change!(search)
             | $crate::catalog_change!(extensions)
     };
     (roles) => {
@@ -1771,6 +1806,9 @@ macro_rules! catalog_change {
     };
     (types) => {
         $crate::change_family!(types)
+    };
+    (search) => {
+        $crate::change_family!(search)
     };
     (extensions) => {
         $crate::change_family!(extensions)
@@ -1823,6 +1861,7 @@ impl Change {
         match self {
             crate::catalog_change!(roles) => Some(CatalogObject::Role),
             crate::catalog_change!(types) => Some(CatalogObject::Type),
+            crate::catalog_change!(search) => Some(CatalogObject::Search),
             crate::catalog_change!(extensions) => Some(CatalogObject::Extension),
             crate::change_family!(tables)
             | crate::change_family!(table_properties)
@@ -1857,6 +1896,9 @@ impl Change {
             | Change::CreateType { name, .. }
             | Change::DropType { name, .. } => name.raw().to_string(),
             Change::RenameType { from, .. } => from.raw().to_string(),
+            Change::CreateSearch { name, .. } | Change::DropSearch { name, .. } => {
+                name.raw().to_string()
+            }
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
@@ -2644,6 +2686,8 @@ impl Change {
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
+            | Change::CreateSearch { .. }
+            | Change::DropSearch { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
@@ -3182,6 +3226,8 @@ impl Change {
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
+            | Change::CreateSearch { .. }
+            | Change::DropSearch { .. }
             | Change::CreateExtension { .. }
             | Change::DropExtension { .. }
             | Change::UpdateExtension { .. }
@@ -3448,7 +3494,10 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // depends on it, not data — so it faces the gate, but needs no
             // tombstone and no reason: the definition is in git history, which
             // is this object family's audit trail (ADR-0002).
-            Change::DropType { .. } | Change::DropModule { .. } | Change::DropExtension { .. } => {
+            Change::DropType { .. }
+            | Change::DropSearch { .. }
+            | Change::DropModule { .. }
+            | Change::DropExtension { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             // A role rename keeps its membership — which is why it is a
@@ -3714,6 +3763,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // Creating a role grants nothing by itself.
             | Change::AddEnumValue { .. }
             | Change::CreateType { .. }
+            | Change::CreateSearch { .. }
             | Change::CreateRole { .. }
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it

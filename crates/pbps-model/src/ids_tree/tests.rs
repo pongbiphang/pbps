@@ -926,3 +926,28 @@ fn an_identity_file_is_named_json_and_nothing_else_is() {
         assert!(!is_identity_file(name), "{name}");
     }
 }
+
+#[test]
+fn a_text_search_object_has_a_file_with_a_search_line_and_a_dropped_one_keeps_it() {
+    let (mut ids, mut p) = sample();
+    ids.search
+        .insert(uid("s_aaaaaa"), "dictionary app.words".parse().unwrap());
+    ids.tombstones
+        .insert(uid("s_bbbbbb"), tomb("config app.old"));
+    p.paths.insert(uid("s_aaaaaa"), "search/words.json".into());
+    p.paths.insert(uid("s_bbbbbb"), "search/old.json".into());
+    let t = split(&ids, &p).unwrap();
+    assert!(t["search/words.json"].contains("\"search\": \"dictionary app.words\""));
+    assert!(t["search/old.json"].contains("\"was\": \"config app.old\""));
+    assert_eq!(assemble(&t).unwrap(), ids);
+    // Negative: a live line that is neither `config <name>` nor `dictionary <name>` is refused,
+    // and so is a file that names a type as well.
+    let mut bad = t.clone();
+    let words = bad["search/words.json"].replace("dictionary app.words", "view app.words");
+    bad.insert("search/words.json".into(), words);
+    assert!(assemble(&bad).is_err());
+    let mut both = t;
+    let words = both["search/words.json"].replace("\"search\"", "\"type\": \"app.t\", \"search\"");
+    both.insert("search/words.json".into(), words);
+    assert!(assemble(&both).is_err());
+}

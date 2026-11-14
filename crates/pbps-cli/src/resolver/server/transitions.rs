@@ -665,6 +665,10 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }
             | Change::DropRole { .. }
+            // A text search object is named by string literals alone: no surface
+            // carries its fingerprint (DEC-2728.2).
+            | Change::CreateSearch { .. }
+            | Change::DropSearch { .. }
             // A package's members are new to the target and no standing
             // object's fingerprint reads them until a declaration does
             // (member consumers, DEC-2447.7).

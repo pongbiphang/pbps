@@ -470,6 +470,7 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
                     requirers: Default::default(),
                     releases: Default::default(),
                     index_releases: releases,
+                    search_releases: Default::default(),
                 }),
             ];
             let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
@@ -498,4 +499,130 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
     assert!(released([(name.clone(), "docs_ix".into())].into()));
     // Negative: with nothing released the drop waits for no index.
     assert!(!released(Default::default()));
+}
+
+/// A configuration that maps a dictionary of a package waits for the plan's create of that
+/// package, and a package's drop waits for the configuration the plan retires with it
+/// (DEC-2728.2). Negatives: an engine dictionary draws no package edge, and a drop that
+/// releases nothing waits for no configuration.
+#[test]
+fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
+    use pbps_model::operation::{Incarnation, ObjectKey, Requirement};
+    use pbps_model::{Extension, SearchObject, SearchRef};
+    let docs: SearchRef = "config app.docs".parse().unwrap();
+    let package = Extension {
+        schema: "ext".into(),
+        version: "1.0".into(),
+    };
+    let config = |dictionary: &str| SearchObject::Config {
+        parser: "pg_catalog.\"default\"".parse().unwrap(),
+        mappings: [("word".to_owned(), vec![dictionary.parse().unwrap()])].into(),
+    };
+    let ctx = pbps_diff::Context {
+        operator: "test".into(),
+        today: "2026-11-13".into(),
+    };
+    let effects_of = |base: &Schema, desired: &Schema, changes: Vec<PlannedChange>| {
+        let base_ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &ctx)
+            .unwrap()
+            .ids;
+        let ids = pbps_diff::resolve(desired, &base_ids, &[], &ctx)
+            .unwrap()
+            .ids;
+        let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+        let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &base_ids, &ids);
+        let (before, after) = (
+            Snapshot {
+                schema: base,
+                ids: &base_ids,
+            },
+            Snapshot {
+                schema: desired,
+                ids: &ids,
+            },
+        );
+        (
+            analyse(&ops, &owners, before, after, &Postgres::new()).effects,
+            base_ids,
+            ids,
+        )
+    };
+    // A create: the configuration needs the package only for a dictionary of its schema.
+    let waits_for_package = |dictionary: &str| {
+        let desired = Schema {
+            extensions: [("dict_int".into(), package.clone())].into(),
+            search: [(docs.clone(), config(dictionary))].into(),
+            ..Default::default()
+        };
+        let ids_for = pbps_diff::resolve(&desired, &IdsFile::default(), &[], &ctx)
+            .unwrap()
+            .ids;
+        let create = PlannedChange::new(Change::CreateSearch {
+            uid: ids_for.search_uid(&docs).unwrap().clone(),
+            name: docs.clone(),
+            definition: Box::new(config(dictionary)),
+            unresolved: Vec::new(),
+        });
+        let (effects, ..) = effects_of(&Schema::default(), &desired, vec![create]);
+        effects[0].requires.iter().any(|r| {
+            matches!(
+                r,
+                Requirement::Is(ObjectKey::Extension(_), Incarnation::Final)
+            )
+        })
+    };
+    assert!(waits_for_package("ext.intdict"));
+    assert!(!waits_for_package("pg_catalog.simple"));
+    // A drop: the package waits for the configuration it releases.
+    let base = Schema {
+        extensions: [("dict_int".into(), package.clone())].into(),
+        search: [(docs.clone(), config("ext.intdict"))].into(),
+        ..Default::default()
+    };
+    let releases = |released: bool| {
+        let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &ctx)
+            .unwrap()
+            .ids;
+        let changes = vec![
+            PlannedChange::new(Change::DropSearch {
+                uid: base_ids.search_uid(&docs).unwrap().clone(),
+                name: docs.clone(),
+                definition: Box::new(config("ext.intdict")),
+            }),
+            PlannedChange::new(Change::DropExtension {
+                uid: base_ids.extension_uid(&"dict_int".into()).unwrap().clone(),
+                name: "dict_int".into(),
+                definition: package.clone(),
+                requirers: Default::default(),
+                releases: Default::default(),
+                index_releases: Default::default(),
+                search_releases: if released {
+                    [docs.clone()].into()
+                } else {
+                    Default::default()
+                },
+            }),
+        ];
+        let desired = Schema::default();
+        let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+        let ids = IdsFile::default();
+        let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &base_ids, &ids);
+        let (before, after) = (
+            Snapshot {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Snapshot {
+                schema: &desired,
+                ids: &ids,
+            },
+        );
+        let effects = analyse(&ops, &owners, before, after, &Postgres::new()).effects;
+        effects[1]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::Search(_))))
+    };
+    assert!(releases(true));
+    assert!(!releases(false));
 }

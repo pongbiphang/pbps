@@ -5,7 +5,7 @@
 use super::{sqlstate, text, truth};
 use pbps_db::{Conn, Driver};
 use pbps_model::{SearchKind, SearchObject, SearchRef};
-use pbps_pg::search::{TEMPLATES, TOKEN_ALIASES, decode, parse_options, query};
+use pbps_pg::search::{TOKEN_ALIASES, decode, parse_options, query, templates};
 
 const SERVERS: [&str; 2] = ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"];
 
@@ -92,7 +92,7 @@ async fn measure() {
             db.one("SELECT string_agg(prsname, ',') FROM pg_ts_parser WHERE prsnamespace = 'pg_catalog'::regnamespace").await,
             "default"
         );
-        let mut templates = TEMPLATES.to_vec();
+        let mut templates = templates();
         templates.sort_unstable();
         assert_eq!(
             db.one("SELECT string_agg(tmplname, ',' ORDER BY tmplname) FROM pg_ts_template WHERE tmplnamespace = 'pg_catalog'::regnamespace").await,

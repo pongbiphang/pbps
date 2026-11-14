@@ -1103,6 +1103,7 @@ fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
     match key {
         ObjectKey::Column(c) | ObjectKey::Default(c) => Some(c),
         ObjectKey::Type(_)
+        | ObjectKey::Search(_)
         | ObjectKey::Table(_)
         | ObjectKey::Role(_)
         | ObjectKey::Extension(_)

@@ -567,7 +567,7 @@ impl Run<'_> {
 fn name_of(file: &TreeFile) -> String {
     match &file.body {
         Body::Table(t) => t.table.clone(),
-        Body::Role(n) | Body::Type(n) | Body::Extension(n) => n.clone(),
+        Body::Role(n) | Body::Type(n) | Body::Search(n) | Body::Extension(n) => n.clone(),
     }
 }
 

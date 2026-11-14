@@ -303,7 +303,10 @@ use crate::zone::SessionZone;
 // 73 adds `SetExclusion`, the add and alter side of an exclusion constraint (DEC-2448.3):
 // an older build would not know the change and would drop a table's `exclude` from a payload;
 // 72 belongs to another change.
-pub const CURRENT_VERSION: u32 = 73;
+// 74 adds `CreateSearch` and `DropSearch`, a text search configuration or dictionary created
+// or dropped by recorded identity (DEC-2728.2): an older build would refuse them as unknown
+// changes; 73 belongs to another change.
+pub const CURRENT_VERSION: u32 = 74;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -850,12 +853,13 @@ pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
     for table in canonical.tables.values_mut() {
         table.columns.sort_unstable_keys();
     }
-    // Text search objects have no identity yet, so none of them can be the project's by
-    // being recorded: one the database holds that the recorded state does not would read
-    // as drift, on every database that had any before the objects were held (DEC-2728.1).
-    // The plan still compares the declarations with the target; the objects join this
-    // fingerprint with the identities that say which of them are managed.
-    canonical.search.clear();
+    // Only the text search objects an identity names are the project's (DEC-2728.2): a
+    // change to one after a plan was approved is drift, and one that only the database
+    // holds is not, as an unmanaged type or package is not. The sets are those of `ids`,
+    // so a state that recorded no search identity (every one made before they were
+    // managed) hashes as it did when they were all left out (DEC-2728.1).
+    let managed: std::collections::BTreeSet<_> = ids.search.values().collect();
+    canonical.search.retain(|name, _| managed.contains(name));
     #[derive(serde::Serialize)]
     struct Fingerprint<'a> {
         schema: &'a Schema,
@@ -1002,31 +1006,57 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A text search object does not move the state checksum (DEC-2728.1): they have no
-    /// identity yet, so the ones a database holds are not the recorded state's to answer
-    /// for, and a database with some would otherwise read as drifted. A change to anything
-    /// else still does.
+    /// Only a text search object an identity names is part of the state (DEC-2728.1,
+    /// DEC-2728.2). One the database holds that no identity names does not move the checksum,
+    /// so a state recorded before the objects were managed hashes as it always did; a managed
+    /// one does, and so does a change to its definition, which is what lets apply refuse a
+    /// plan approved against another definition. A change to anything else still moves it.
     #[test]
-    fn text_search_objects_do_not_move_the_state_checksum_and_a_table_still_does() {
+    fn only_an_identity_managed_text_search_object_moves_the_state_checksum() {
         use crate::{SearchKind, SearchObject, SearchRef};
         let bare = schema_with("nvarchar(255)");
+        let name = SearchRef::new(SearchKind::Dictionary, "app.d".parse().unwrap());
+        let dictionary = |template: &str| SearchObject::Dictionary {
+            template: template.parse().unwrap(),
+            options: Default::default(),
+        };
         let mut with_search = bare.clone();
-        with_search.search.insert(
-            SearchRef::new(SearchKind::Dictionary, "app.d".parse().unwrap()),
-            SearchObject::Dictionary {
-                template: "pg_catalog.simple".parse().unwrap(),
-                options: Default::default(),
-            },
-        );
-        let ids = IdsFile::default();
+        with_search
+            .search
+            .insert(name.clone(), dictionary("pg_catalog.simple"));
+        let unmanaged = IdsFile::default();
         assert_eq!(
-            state_checksum(&bare, &ids),
-            state_checksum(&with_search, &ids)
+            state_checksum(&bare, &unmanaged),
+            state_checksum(&with_search, &unmanaged),
+            "no identity names it"
+        );
+        let mut managed = IdsFile::default();
+        managed
+            .search
+            .insert(Uid::generate(crate::UidKind::Search), name.clone());
+        assert_ne!(
+            state_checksum(&bare, &managed),
+            state_checksum(&with_search, &managed),
+            "an identity names it"
+        );
+        let mut changed = with_search.clone();
+        changed
+            .search
+            .insert(name, dictionary("pg_catalog.synonym"));
+        assert_ne!(
+            state_checksum(&with_search, &managed),
+            state_checksum(&changed, &managed),
+            "a managed definition that changed is drift"
+        );
+        assert_eq!(
+            state_checksum(&with_search, &unmanaged),
+            state_checksum(&changed, &unmanaged),
+            "an unmanaged one that changed is not"
         );
         // Negative: a column change under the same objects still moves it.
         assert_ne!(
-            state_checksum(&schema_with("nvarchar(100)"), &ids),
-            state_checksum(&with_search, &ids)
+            state_checksum(&schema_with("nvarchar(100)"), &managed),
+            state_checksum(&with_search, &managed)
         );
     }
 
@@ -1591,7 +1621,7 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert_eq!(plan.version, 73);
+        assert_eq!(plan.version, 74);
         let bare = serde_json::to_value(&plan).unwrap();
         assert!(bare.get("extension_drops").is_none(), "{bare}");
         assert!(bare.get("extension_changes").is_none(), "{bare}");
@@ -1630,6 +1660,7 @@ mod tests {
             requirers: Default::default(),
             releases: Default::default(),
             index_releases: Default::default(),
+            search_releases: Default::default(),
         })
         .unwrap();
         let payload = change.get("drop_extension").unwrap_or(&change);

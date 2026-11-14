@@ -268,6 +268,17 @@ pub struct DeclaredTypeStatement {
     pub after_vet: Option<String>,
 }
 
+/// The text search object a statement brings into being or removes, supplied by the emitter:
+/// a staged apply moves the identity it records with the statement that committed
+/// (DEC-2728.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchStatement {
+    pub uid: pbps_model::Uid,
+    pub name: pbps_model::SearchRef,
+    /// `true` for the statement that creates it, `false` for the one that drops it.
+    pub created: bool,
+}
+
 /// A package install, update or drop boundary supplied by the emitter, never
 /// inferred from SQL: the executor vets the members the statement leaves against
 /// the plan's pinned manifest in its own transaction (DEC-2447.6).
@@ -311,6 +322,9 @@ pub struct Statement {
 
     /// The package this statement installs, vetted before its transaction commits.
     pub extension: Option<ExtensionStatement>,
+
+    /// The text search object this statement is the first to create, or the one that drops it.
+    pub search: Option<SearchStatement>,
 
     /// The change whose table expressions (CHECK, DEFAULT, generated) this
     /// statement is the first to introduce, judged before it runs (DEC-2563.4).
@@ -538,6 +552,7 @@ impl Statement {
             execution: None,
             declared_type: None,
             extension: None,
+            search: None,
             introduces: None,
             row_write: None,
             rewrites: None,

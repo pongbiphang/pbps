@@ -1131,6 +1131,13 @@ pub struct Hints {
     pub extension_moves:
         BTreeMap<crate::ObjectLocalName, std::collections::BTreeSet<crate::ProviderMember>>,
 
+    /// Whether the base is what a connected plan just read of the target. Offline the
+    /// base is the baseline, which stands for the target only as far as the target
+    /// matches it, so a check the target alone can answer (a dictionary a mapping names
+    /// that the project does not declare, DEC-2728.2) is an advisory there and a
+    /// refusal here.
+    pub target_read: bool,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Creation-order annotations (ADR-0002, #2469): what the declarations

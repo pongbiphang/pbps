@@ -33,6 +33,11 @@ pub enum Removal {
         uid: Uid,
         name: ObjectLocalName,
     },
+    /// A text search object the declarations no longer hold (DEC-2728.2).
+    Search {
+        uid: Uid,
+        name: pbps_model::SearchRef,
+    },
 }
 
 impl std::fmt::Display for Removal {
@@ -45,6 +50,7 @@ impl std::fmt::Display for Removal {
             Self::Role { name, .. } => write!(f, "role {}", name.shown()),
             Self::Type { name, .. } => write!(f, "type {}", name.shown()),
             Self::Extension { name, .. } => write!(f, "extension {}", name.shown()),
+            Self::Search { name, .. } => write!(f, "{}", name.shown()),
         }
     }
 }
@@ -227,6 +233,15 @@ pub fn inventory(
     for (uid, name) in &recorded.extensions {
         if recorded_schema.extensions.contains_key(name) && !names.extensions.contains_key(uid) {
             removed.push(Removal::Extension {
+                uid: uid.clone(),
+                name: name.clone(),
+            });
+        }
+    }
+    // Immutable by name like a package: there is no rename to project yet.
+    for (uid, name) in &recorded.search {
+        if recorded_schema.search.contains_key(name) && !names.search.contains_key(uid) {
+            removed.push(Removal::Search {
                 uid: uid.clone(),
                 name: name.clone(),
             });

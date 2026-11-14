@@ -21,6 +21,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{ColumnRef, IdsFile, ModuleId, PartitionOf, Schema, TableName, Uid, UidKind};
 
+/// `schema` without the text search objects no identity names. [`scope`] keeps every one
+/// the database holds so a plan can compare the declared ones, but a build from nothing
+/// may create only what an identity names, as it creates only the packages, types and
+/// tables one names: left in, the differ refuses the undeclared object for having no
+/// identity and a plan that touches only a table cannot rehearse.
+#[must_use]
+pub fn without_unmanaged_search(schema: &Schema, ids: &IdsFile) -> Schema {
+    let mut kept = schema.clone();
+    kept.search.retain(|name, _| ids.search_uid(name).is_some());
+    kept
+}
+
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scoped {
@@ -126,9 +138,9 @@ pub fn scope(
             .filter(|(name, _)| ids.extension_uid(name).is_some())
             .map(|(n, d)| (n.clone(), d.clone()))
             .collect(),
-        // Text search objects have no identity until the part that creates them, so
-        // every one the database holds is kept; the plan compares only the ones the
-        // declarations name (DEC-2728.1).
+        // Every text search object the database holds is kept; the plan compares only
+        // the ones the declarations name, and the fingerprint only those an identity
+        // names (`state_checksum`, DEC-2728.1, DEC-2728.2).
         search: schema.search.clone(),
         ..Default::default()
     };
@@ -406,6 +418,7 @@ pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsF
         .chain(reserved.columns.keys())
         .chain(reserved.roles.keys())
         .chain(reserved.types.keys())
+        .chain(reserved.search.keys())
         .chain(reserved.extensions.keys())
         .chain(reserved.tombstones.keys())
         .cloned()
@@ -443,6 +456,7 @@ fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<
             .chain(recorded.columns.keys())
             .chain(recorded.roles.keys())
             .chain(recorded.types.keys())
+            .chain(recorded.search.keys())
             .chain(recorded.extensions.keys())
             .chain(recorded.tombstones.keys())
             .cloned(),
@@ -478,6 +492,13 @@ fn observed_ids_reserved(live: &Schema, recorded: &IdsFile, mut taken: BTreeSet<
             .cloned()
             .unwrap_or_else(|| free_uid(UidKind::Extension, name.raw(), &mut taken));
         observed.extensions.insert(uid, name.clone());
+    }
+    for name in live.search.keys() {
+        let uid = recorded
+            .search_uid(name)
+            .cloned()
+            .unwrap_or_else(|| free_uid(UidKind::Search, &name.raw().to_string(), &mut taken));
+        observed.search.insert(uid, name.clone());
     }
     for name in live.types.keys() {
         let uid = recorded
@@ -530,6 +551,53 @@ mod tests {
         );
         assert_ne!(observed.role_uid(&name), observed.role_uid(&lookalike));
         assert_eq!(observed_ids(&live, &observed), observed);
+    }
+
+    /// An unrecorded live text search object never takes the uid a recorded one holds, even
+    /// when its derived uid is exactly that one: the observed side would hold one uid for
+    /// two names, and drift would be charged to the wrong object (ready round 1). The
+    /// reservation from another record reserves them too. Negative: with no collision the
+    /// first derivation stands.
+    #[test]
+    fn an_observed_search_object_never_takes_a_uid_a_recorded_one_holds() {
+        use super::*;
+        let held: pbps_model::SearchRef = "dictionary app.held".parse().unwrap();
+        let fresh: pbps_model::SearchRef = "dictionary app.fresh".parse().unwrap();
+        let first = Uid::derived(UidKind::Search, &fresh.raw().to_string(), 0);
+        let live = Schema {
+            search: [
+                (
+                    held.clone(),
+                    pbps_model::SearchObject::Dictionary {
+                        template: "pg_catalog.simple".parse().unwrap(),
+                        options: Default::default(),
+                    },
+                ),
+                (
+                    fresh.clone(),
+                    pbps_model::SearchObject::Dictionary {
+                        template: "pg_catalog.simple".parse().unwrap(),
+                        options: Default::default(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let recorded = IdsFile {
+            search: [(first.clone(), held.clone())].into(),
+            ..Default::default()
+        };
+        let observed = observed_ids(&live, &recorded);
+        assert_eq!(observed.search_uid(&held), Some(&first));
+        assert_eq!(observed.search.len(), 2, "{:?}", observed.search);
+        assert_ne!(observed.search_uid(&fresh), Some(&first));
+        // The same holds when another record, not this one, holds the uid.
+        let observed = observed_ids_reserving(&live, &IdsFile::default(), &recorded);
+        assert_ne!(observed.search_uid(&fresh), Some(&first));
+        // Negative: nothing holds it, so the first derivation stands.
+        let observed = observed_ids(&live, &IdsFile::default());
+        assert_eq!(observed.search_uid(&fresh), Some(&first));
     }
 
     #[test]

@@ -39,7 +39,7 @@ fn cols(f: &TreeFile) -> Vec<(String, Rec)> {
             .iter()
             .map(|(u, r)| (u.to_string(), r.clone()))
             .collect(),
-        Body::Role(_) | Body::Type(_) | Body::Extension(_) => unreachable!(),
+        Body::Role(_) | Body::Type(_) | Body::Search(_) | Body::Extension(_) => unreachable!(),
     }
 }
 

@@ -26,7 +26,7 @@ const LEN: usize = 6;
 /// held (DEC-2032.1, #2035).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{}` is missing the `t_`, `c_`, `r_`, `y_` or `e_` prefix", crate::escape::Escaped(.0))]
+    #[error("UID `{}` is missing the `t_`, `c_`, `r_`, `y_`, `s_` or `e_` prefix", crate::escape::Escaped(.0))]
     BadPrefix(String),
 
     #[error(
@@ -45,6 +45,9 @@ pub enum UidError {
 pub enum UidKind {
     Extension,
     Type,
+    /// A text search configuration or dictionary (#2728): its own prefix because the engine
+    /// keeps them apart from the types.
+    Search,
     Table,
     Column,
     /// A database role (ADR-0005). Pinned alongside the two above because an
@@ -58,6 +61,7 @@ impl UidKind {
         match self {
             UidKind::Extension => "e_",
             UidKind::Type => "y_",
+            UidKind::Search => "s_",
             UidKind::Table => "t_",
             UidKind::Column => "c_",
             UidKind::Role => "r_",
@@ -136,6 +140,8 @@ impl Uid {
             UidKind::Extension
         } else if self.0.starts_with("y_") {
             UidKind::Type
+        } else if self.0.starts_with("s_") {
+            UidKind::Search
         } else if self.0.starts_with("t_") {
             UidKind::Table
         } else if self.0.starts_with("r_") {
@@ -166,6 +172,7 @@ impl FromStr for Uid {
             .or_else(|| s.strip_prefix("c_"))
             .or_else(|| s.strip_prefix("r_"))
             .or_else(|| s.strip_prefix("y_"))
+            .or_else(|| s.strip_prefix("s_"))
             .ok_or_else(|| UidError::BadPrefix(s.to_owned()))?;
 
         if rest.len() != LEN {
@@ -287,6 +294,7 @@ mod tests {
             UidKind::Column,
             UidKind::Role,
             UidKind::Type,
+            UidKind::Search,
             UidKind::Extension,
         ] {
             let u = Uid::generate(kind);

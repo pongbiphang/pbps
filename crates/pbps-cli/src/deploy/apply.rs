@@ -255,6 +255,7 @@ pub(super) async fn apply_under_lock<D: crate::emission::Engine>(
         && original_ids.roles == plan.ids.roles
         && original_ids.types == plan.ids.types
         && original_ids.extensions == plan.ids.extensions
+        && original_ids.search == plan.ids.search
     {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.

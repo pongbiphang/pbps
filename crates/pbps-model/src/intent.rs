@@ -81,6 +81,13 @@ pub enum Intent {
         name: crate::ObjectLocalName,
         reason: Reason,
     },
+    /// Drop a text search configuration or dictionary (`DROP TEXT SEARCH ...`): what a
+    /// stored text-search index or generated column was built with goes with it, so an
+    /// auditor asks why (DEC-2728.2).
+    DropSearch {
+        name: crate::SearchRef,
+        reason: Reason,
+    },
     /// Allow the DEFAULT partition's rows inside a new range partition's
     /// range to move into it, at most `max_rows` of them (#1788).
     MoveRows {
@@ -103,7 +110,8 @@ impl Intent {
             | Intent::DropType { .. }
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
-            | Intent::DropExtension { .. } => false,
+            | Intent::DropExtension { .. }
+            | Intent::DropSearch { .. } => false,
         }
     }
 }

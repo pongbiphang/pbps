@@ -117,7 +117,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         pbps_dialect::name_read_sequences(&mut recorded_read, dialect.as_ref());
         let mut live_read = scoped.schema.clone();
         pbps_dialect::name_read_sequences(&mut live_read, dialect.as_ref());
-        only_recorded_search_objects(&recorded_read, &mut live_read);
+        only_managed_search_objects(&recorded_ids, &mut live_read);
         without_comments(&mut recorded_read, &mut live_read);
         let diffed = pbps_diff::diff_partial(
             pbps_diff::Side {
