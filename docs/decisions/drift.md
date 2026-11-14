@@ -121,3 +121,69 @@ and repaired successful reads; the refused-TCP control retains the connection
 ID. Reverting the classification reproduces the mislabel without changing
 the failures' underlying causes. Other commands' classifications are outside
 this fix.
+
+<a id="dec-2855-1"></a>
+
+**DEC-2855.1. A kind a plan cannot yet change is decided once, in the model: one classification, a compared form, a recorded form, a buildable form and one drift report.**
+Text search objects (DEC-2728.1) are held by name only: no identity record, and no
+plan creates, alters or drops one. Every consumer of a whole `Schema` assumed
+that everything in it has an identity and can be planned, and decided what to do
+with such a kind at its own call site, with "treat it like a table" as the
+default. On `master` that was already inconsistent before a second such kind
+existed: a state recorded every live object (declared or not) while `verify`
+compared only the recorded ones, so an undeclared object read as drift once it
+was dropped; the checksums leave the kind out, so `status` and the `plan --db`
+gate called an environment clean where `verify` named a dropped or changed
+recorded object (#2846); the bootstrap emptiness check counted an undeclared
+object; the rebuild comparison read an object only the catalog holds as an
+"unrelated schema edit"; two copies of the whole-schema type normalization knew
+no name-only kind. Patching each site (the first attempt for sequences was
+fourteen call sites in one PR, and every review round found another) leaves the
+next consumer and the next kind to repeat the mistake, because the compiler
+cannot tell a consumer that has decided from one that has not.
+
+The rule lives in `pbps-model` (`name_only.rs`), in the only functions that know
+which fields of `Schema` are which:
+
+- **One classification.** `Schema::classify` splits a `Schema` into the plannable
+  kinds and the name-only kinds by exhaustive destructuring (no `..`). A new
+  field fails to compile there until it is classified; the other functions are
+  built on it, and nothing else enumerates kinds. A kind that gains plans moves
+  out of `NameOnly` and every consumer follows.
+- **Compared form** (`compared_with`; `pbps_dialect::compared::{compared, spelled}`):
+  type spellings normalized for every kind, and a name-only object kept only where
+  the other side names it, by key. A drift comparison projects the live side onto
+  the record's names (`recorded_matches`); a comparison of peers projects each onto
+  the other (`equal_as_compared`; the rebuild comparison). The projection needs no
+  dialect and lives in `pbps-model`; the normalization needs one, and `pbps-model`
+  cannot depend on `pbps-dialect`, so the wrapper is in `pbps-dialect`, the lowest
+  crate that sees both. It replaces the two copies (`canonical_schema` in
+  `pbps-diff`, `types_as_the_dialect_spells_them` in `pbps-cli`).
+- **Recorded form.** A state records a name-only object only where the
+  declarations name it (`as_recorded`, applied in `managed_state_once` to every
+  recording from a read: `snapshot`, `baseline`, `bootstrap`). An apply and the
+  staged checkpoint and closing entries carry the previous record forward
+  (`as_recorded_after_apply`), since no plan can have changed one and what the
+  read-back holds of it is not the plan's result. An object nothing names has no
+  identity, so recording it would make dropping it drift.
+- **Buildable form** (`buildable`): without the kinds no plan can build, for a
+  build from nothing (`pbps_diff::bootstrap`, `lower_between`: the rehearsal and
+  the resolver). The differ from nothing refused a held object by name before.
+  The ordinary differ still refuses a declared one, so no plan claims to have
+  made it.
+- **One drift report** (`Schema::name_only_drift`): a recorded name-only object
+  that is gone or changed, called by `verify` (as `unexpressible` drift, replacing
+  `only_recorded_search_objects` and the differ's "arrives with a later part"
+  wording), `status` and the `plan --db` drift gate. The checksums are unchanged,
+  so no format version moves.
+
+`refuse_pinned_movement` deliberately never reads a name-only kind: nothing a plan
+promised can move one, and the carried record never takes what the read-back
+holds. Serializers, per-kind validators, identity resolution and the role and
+collation projections are not comparers, recorders or builders and are left alone.
+`apply` itself does not run the drift report: a plan is pinned to a baseline the
+`plan --db` gate has already held to it.
+
+Adding a second name-only kind (sequences) is a field of `NameOnly`, a line in each
+of its functions (the compiler lists them) and one row of the table-driven test in
+`name_only/tests.rs`.

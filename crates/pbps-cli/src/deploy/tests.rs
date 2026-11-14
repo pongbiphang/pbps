@@ -382,6 +382,37 @@ fn bootstrap_refuses_existing_types_and_omitted_definitions_before_building() {
     refuse_nonempty_bootstrap(&empty, &[], &dialect, "target").unwrap();
 }
 
+/// An empty database that holds a text search object no declaration names is still empty
+/// for bootstrap; one a declaration names is not (it would have to be created, and no
+/// plan creates one yet) (#2855, DEC-2855.1).
+#[test]
+fn an_undeclared_text_search_object_does_not_make_the_target_non_empty() {
+    use pbps_model::{SearchKind, SearchObject, SearchRef};
+    let pg = pbps_pg::Postgres::new();
+    let name = SearchRef::new(SearchKind::Dictionary, "app.held".parse().unwrap());
+    let mut existing = Schema::default();
+    existing.search.insert(
+        name.clone(),
+        SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        },
+    );
+    refuse_occupied_bootstrap(&existing, &Schema::default(), &[], &pg, "target").unwrap();
+    // Negative: named by the declarations, it occupies the target.
+    let mut declared = Schema::default();
+    declared
+        .search
+        .insert(name, existing.search.values().next().unwrap().clone());
+    let error = refuse_occupied_bootstrap(&existing, &declared, &[], &pg, "target")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("already has 1") && error.contains("app.held"),
+        "{error}"
+    );
+}
+
 #[test]
 fn nonempty_bootstrap_shows_the_extracted_environment_label_once() {
     let schema = Schema::default();

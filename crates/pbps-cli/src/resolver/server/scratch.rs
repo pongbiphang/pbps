@@ -121,7 +121,11 @@ pub async fn produce_unsealed<D: super::PlanningDialect>(
             "the resolver planning dialect and selected driver belong to different engines".into(),
         )));
     }
-    if binding.base != base.schema || binding.desired != desired.schema {
+    // Compared as the model compares sides (DEC-2855.1): a kind held by name only that one
+    // side does not name is no disagreement about what the resolver builds.
+    if !binding.base.equal_as_compared(base.schema)
+        || !binding.desired.equal_as_compared(desired.schema)
+    {
         return Err(ProduceError::Run(Error::Binding(
             "the binding request and recorded planning sides disagree".into(),
         )));
@@ -571,7 +575,21 @@ mod tests {
         let hints = Hints::default();
         let standard = pbps_pg::resolver::standard::Standard::default();
         let provenance = Provenance::server();
-        for disagrees in [false, true] {
+        // A text search object only the binding's base holds is no disagreement about
+        // what the resolver builds (DEC-2855.1): a kind held by name only is compared
+        // where the other side names it.
+        let mut held = Schema::default();
+        held.search.insert(
+            pbps_model::SearchRef::new(
+                pbps_model::SearchKind::Dictionary,
+                "app.d".parse().unwrap(),
+            ),
+            pbps_model::SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        for (binding_base, disagrees) in [(&schema, false), (&different, true), (&held, false)] {
             let binding = BindingRequest {
                 dependencies: &Default::default(),
                 bootstrap: &pbps_diff::diff(
@@ -587,7 +605,7 @@ mod tests {
                     &pbps_model::Hints::default(),
                 )
                 .unwrap(),
-                base: if disagrees { &different } else { &schema },
+                base: binding_base,
                 desired: &schema,
             };
             // One run per engine: the planning dialect is part of the call's type.

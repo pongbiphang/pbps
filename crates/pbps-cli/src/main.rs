@@ -3377,7 +3377,7 @@ fn policy_module_id(id: &pbps_model::ModuleId, dialect: &dyn Dialect) -> pbps_mo
 /// `normalize_type`: routine identity discards the modifiers a column keeps.
 ///
 /// A type the dialect cannot normalize is left as written, for the reason
-/// `types_as_the_dialect_spells_them` gives: it is already a finding, and
+/// `pbps_dialect::compared` gives: it is already a finding, and
 /// rewriting what a message quotes would name something the file does not.
 ///
 /// Two declarations that spell one identity are reported rather than merged:
@@ -3821,35 +3821,6 @@ fn context(root: &std::path::Path) -> anyhow::Result<Context> {
     })
 }
 
-/// The schema with every column type in the dialect's canonical spelling.
-///
-/// Only the types: nothing else a rule reads is the dialect's to normalize.
-/// A type the dialect cannot normalize is left exactly as written — it is
-/// already an error from `refuse_invalid_declarations`, and rewriting what a
-/// finding quotes would make the message name something the file does not
-/// (DECISIONS 187).
-fn types_as_the_dialect_spells_them(
-    schema: &pbps_model::Schema,
-    dialect: &dyn Dialect,
-) -> pbps_model::Schema {
-    let mut out = schema.clone();
-    for definition in out.types.values_mut() {
-        if let pbps_model::ManagedType::Domain { base, .. } = definition
-            && let Ok(ty) = dialect.normalize_type(base)
-        {
-            *base = ty;
-        }
-    }
-    for table in out.tables.values_mut() {
-        for column in table.columns.values_mut() {
-            if let Ok(ty) = dialect.normalize_type(&column.ty) {
-                column.ty = ty;
-            }
-        }
-    }
-    out
-}
-
 /// Everything `validate` checks, as findings.
 ///
 /// Extracted so `doctor` can run the same checks rather than a second, drifting
@@ -4076,7 +4047,7 @@ pub(crate) fn raw_declaration_policy_findings(
     // Server, and the default-on deprecated-type rule was bypassed by the
     // alias. The boundary stays where it was: the dialect says what a
     // type is, the policy says what to think of it (DECISIONS 187).
-    let spelled = types_as_the_dialect_spells_them(schema, dialect);
+    let spelled = pbps_dialect::compared::spelled(schema, dialect);
     pbps_policy::declarations(&spelled, &policies, &ctx)
 }
 

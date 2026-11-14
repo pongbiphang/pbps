@@ -258,6 +258,14 @@ pub(super) fn staged_movement(
     )
 }
 
+/// Compares each kind the plan can change, by its own rule below. It never reads
+/// `Schema::search`, deliberately (DEC-2855.1): a text search object has no plan, so
+/// nothing this plan promised can move one, and what the read-back holds of one is not what
+/// an apply records either (the previous record is carried forward,
+/// `Schema::as_recorded_after_apply`). A search object changed during the run is therefore
+/// neither blessed by the record nor a movement of the plan's; `verify` reports it against
+/// the carried record. A kind that gains plans gains its rule here when it leaves
+/// `NameOnly`.
 #[allow(clippy::wildcard_enum_match_arm)] // Type deltas are checked apart from table/module effects.
 pub(super) fn refuse_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,

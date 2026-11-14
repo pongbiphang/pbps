@@ -233,3 +233,160 @@ fn every_difference_is_refused_by_name_and_an_undeclared_object_is_left_alone() 
         no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
     });
 }
+
+/// `pbps status` for the fixture's `prod` environment.
+fn status(f: &Fixture) -> String {
+    said(&f.d.run_with_env(&["status"], &[("PBPS_REH_TARGET", f.target())]))
+}
+
+fn baseline(f: &Fixture, reason: &str) {
+    succeeds(f.d.run(&["baseline", "--db", f.target(), "--reason", reason]));
+}
+
+/// An object only the database holds, that no declaration names (#2855, DEC-2855.1), is
+/// not recorded by `baseline` or `snapshot`, so taking it away is no drift for `verify`,
+/// `status` or the `plan --db` gate; and while it stands it is no difference to `snapshot`.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_undeclared_text_search_object_is_not_recorded_and_dropping_it_is_no_drift() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("search2855-undeclared-{slug}"));
+        on_server(
+            f.target(),
+            "CREATE TEXT SEARCH DICTIONARY app.undeclared (TEMPLATE = pg_catalog.simple)",
+        );
+        baseline(&f, "the database holds an object nothing declares");
+        // Not a difference to the record, which never held it.
+        succeeds(f.d.run(&["snapshot", "--db", f.target()]));
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.undeclared");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        succeeds(f.d.run(&["snapshot", "--db", f.target()]));
+        // The fixture's declarations were not pulled from this database, so the plan has
+        // changes of its own; what is pinned is that its drift gate lets it through.
+        let planned = succeeds(f.d.run(&["plan", "--db", f.target()]));
+        assert!(
+            !said(&planned).contains("has drifted"),
+            "{}",
+            said(&planned)
+        );
+        let shown = status(&f);
+        assert!(shown.contains("ok") && !shown.contains("drift"), "{shown}");
+    });
+}
+
+/// A recorded object that is dropped or changed is drift, named the same way by `verify`,
+/// `status` and the `plan --db` gate: no checksum sees the kind, and `status` and the gate
+/// read clean where `verify` did not (#2846). Putting it back as it was clears all three.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_recorded_text_search_object_that_is_dropped_or_changed_is_drift_everywhere() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("search2855-drift-{slug}"));
+        on_server(f.target(), MADE);
+        pull(&f);
+        f.d.commit();
+        baseline(&f, "adopt the text search objects");
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        assert!(!status(&f).contains("drift"), "{}", status(&f));
+        // `app.russian` is a dictionary and a configuration and a domain; only the
+        // dictionary goes.
+        let drifted = |why: &str| {
+            let verify = f.d.run(&["verify", "--db", f.target()]);
+            assert_eq!(code(&verify), 2, "{why}: {}", said(&verify));
+            assert!(said(&verify).contains(why), "{}", said(&verify));
+            let shown = status(&f);
+            assert!(shown.contains("drift"), "status: {shown}");
+            let plan = f.d.run(&["plan", "--db", f.target()]);
+            assert_ne!(code(&plan), 0, "{}", said(&plan));
+            assert!(
+                said(&plan).contains("has drifted from the state recorded"),
+                "{}",
+                said(&plan)
+            );
+            assert!(said(&plan).contains(why), "{}", said(&plan));
+        };
+        on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.russian");
+        drifted("`app.russian` was recorded and is no longer in the database");
+        on_server(
+            f.target(),
+            "CREATE TEXT SEARCH DICTIONARY app.russian (TEMPLATE = pg_catalog.simple, ACCEPT = false)",
+        );
+        drifted("differs from the definition recorded for it");
+        // Back as it was: clean again.
+        on_server(
+            f.target(),
+            "DROP TEXT SEARCH DICTIONARY app.russian; \
+             CREATE TEXT SEARCH DICTIONARY app.russian (TEMPLATE = pg_catalog.simple)",
+        );
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        assert!(!status(&f).contains("drift"), "{}", status(&f));
+        no_changes(&succeeds(f.d.run(&["plan", "--db", f.target()])));
+    });
+}
+
+/// An apply carries the objects the previous record holds forward, so the record after it
+/// still names them: one dropped afterwards is drift, and one the plan left alone is not
+/// (#2855, DEC-2855.1).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_apply_keeps_the_text_search_objects_the_record_names() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("search2855-apply-{slug}"));
+        on_server(f.target(), MADE);
+        pull(&f);
+        f.d.commit();
+        baseline(&f, "adopt the text search objects");
+        // An object made outside the declarations, and a plan that touches neither kind.
+        on_server(
+            f.target(),
+            "CREATE TEXT SEARCH DICTIONARY app.outside (TEMPLATE = pg_catalog.simple)",
+        );
+        f.revise_row();
+        // Not rehearsed: a rehearsal builds the target's state without the text search
+        // objects, and `app.articles` names one, so the scratch rejects the table until
+        // creating them is planned (#2728 B).
+        let planned = f.plan(&["--no-rehearse"]);
+        assert_eq!(code(&planned), 0, "{}", said(&planned));
+        let applied = f.apply("data-update");
+        assert_eq!(code(&applied), 0, "{}", said(&applied));
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        // The one nothing names was not recorded by the apply: taking it away is no drift.
+        on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.outside");
+        succeeds(f.d.run(&["verify", "--db", f.target()]));
+        // A recorded one was carried: taking it away is.
+        on_server(f.target(), "DROP TEXT SEARCH DICTIONARY app.russian");
+        let verify = f.d.run(&["verify", "--db", f.target()]);
+        assert_eq!(code(&verify), 2, "{}", said(&verify));
+        assert!(
+            said(&verify).contains("`app.russian` was recorded and is no longer"),
+            "{}",
+            said(&verify)
+        );
+    });
+}
+
+/// A rehearsal builds the target's managed state on a scratch before the plan is written. A
+/// text search object no declaration names is not something it builds, and it no longer
+/// stops the run ("the baseline cannot be expressed") (#2855, DEC-2855.1). Unmeasured
+/// before this test: whether the run failed on an engine; what is asserted is the outcome.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_undeclared_text_search_object_does_not_stop_a_rehearsal() {
+    servers(|server, slug| {
+        let f = fixture(server, &format!("search2855-rehearsal-{slug}"));
+        on_server(
+            f.target(),
+            "CREATE TEXT SEARCH DICTIONARY app.undeclared (TEMPLATE = pg_catalog.simple)",
+        );
+        f.add_column("true");
+        let planned = f.plan(&[]);
+        assert_eq!(code(&planned), 0, "{}", said(&planned));
+        assert!(
+            stdout(&planned).contains("Rehearsal: converged on scratch"),
+            "{}",
+            said(&planned)
+        );
+    });
+}
