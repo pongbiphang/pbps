@@ -1042,7 +1042,9 @@ fn skip_ws(s: &str, mut i: usize) -> usize {
             continue;
         }
         if trimmed.starts_with("/*") {
-            match block_comment(trimmed) {
+            // `trimmed` starts with `/*`, so offset 0 is an opener; the offset
+            // returned is the comment's length, both delimiters included.
+            match pbps_dialect::closing_block_comment(trimmed, 0) {
                 Some(end) => i += end,
                 None => return s.len(),
             }
@@ -1050,46 +1052,6 @@ fn skip_ws(s: &str, mut i: usize) -> usize {
         }
         return i;
     }
-}
-
-/// The length of the block comment `s` opens, both delimiters included, or
-/// `None` when it is never closed.
-///
-/// Block comments nest here — measured, and recorded in `pbps-dialect`'s own
-/// scanner: `SELECT /* a /* b */ c */ 1` returns 1 — so the outer comment ends
-/// at the terminator that matches its opener and not at the first `*/`. Ending
-/// early read the rest of the outer comment as code, where an `ON` inside a
-/// comment could be taken for a trigger's target.
-///
-/// Stepping two bytes past each delimiter is what keeps `/*/` from reading as
-/// an opener that also closes itself. Bytes rather than characters is safe
-/// because neither delimiter's bytes can occur inside a multi-byte character,
-/// so every offset it returns is a character boundary.
-fn block_comment(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        match (bytes[i], bytes[i + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                i += 2;
-            }
-            // `depth > 0` guards the subtraction rather than trusting the
-            // caller to have found an opener first: an unmatched `*/` makes
-            // this read no comment at all, where a wrapping subtraction would
-            // make it read to the end of the definition.
-            (b'*', b'/') if depth > 0 => {
-                depth -= 1;
-                i += 2;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 /// Matches one keyword case-insensitively, skipping whatever whitespace and
