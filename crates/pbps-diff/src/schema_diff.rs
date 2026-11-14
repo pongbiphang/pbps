@@ -556,9 +556,20 @@ pub fn bootstrap(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
 ) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
+    // The buildable form of both sides: a kind no plan can build (a text search object)
+    // is not built, so the differ does not refuse a held one, declared or not, as "arriving
+    // with a later part" and stop a rehearsal or a resolver run before it starts (#2855,
+    // DEC-2855.1).
+    let (base_schema, declared_schema) = (base.schema.buildable(), declared.schema.buildable());
     rebuilding_by(
-        base,
-        declared,
+        Side {
+            schema: &base_schema,
+            ids: base.ids,
+        },
+        Side {
+            schema: &declared_schema,
+            ids: declared.ids,
+        },
         dialect,
         hints,
         &BTreeSet::new(),
@@ -29268,5 +29279,32 @@ mod meeting_shape_tests {
                 .contains("text search configuration `app.same`")),
             "{errs:?}"
         );
+    }
+
+    /// The differ from nothing is the one the rehearsal and the resolver build a base
+    /// with, and it builds what a plan can build: a text search object, declared or held,
+    /// is left out of it rather than refused by name (#2855, DEC-2855.1). The ordinary
+    /// differ still refuses a declared one, so no plan can claim to have made it.
+    #[test]
+    fn the_differ_from_nothing_does_not_refuse_a_text_search_object_the_ordinary_one_does() {
+        let mut declared = Schema::default();
+        declared.search.insert(
+            pbps_model::SearchRef::new(
+                pbps_model::SearchKind::Dictionary,
+                "app.d".parse().unwrap(),
+            ),
+            pbps_model::SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+        let ids = IdsFile::default();
+        let empty = Schema::default();
+        let side = |schema| Side { schema, ids: &ids };
+        let hints = Hints::default();
+        let ordinary = diff(side(&empty), side(&declared), &MinimalDialect, &hints);
+        assert!(ordinary.is_err(), "refused by the ordinary differ");
+        let built = bootstrap(side(&empty), side(&declared), &MinimalDialect, &hints);
+        assert!(built.is_ok(), "{:?}", built.err());
     }
 }
