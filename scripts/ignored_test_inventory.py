@@ -1342,9 +1342,11 @@ def test_of(everything):
     for tokens, applies in everything:
         if tokens == UNCLASSIFIED:
             if applies is not False: other = True
+        elif inert(tokens):
+            continue   # a built-in or a registered tool's attribute never marks a test, whatever its last segment
         elif attribute_path(tokens)[-1:] == ["test"]:
             named.append(applies)
-        elif applies is not False and not inert(tokens):
+        elif applies is not False:
             other = True
     if any(applies is True for applies in named): return True
     if other or any(applies is None for applies in named) or not named: return None

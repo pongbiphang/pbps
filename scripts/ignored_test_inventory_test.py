@@ -1650,6 +1650,10 @@ class Win32Prediction(unittest.TestCase):
         ("#[cfg_attr(unix, test)]\n#[no_mangle]\n#[inline(never)]\n#[cold]\n#[ignore]", False),
         ('#[cfg_attr(unix, test)]\n#[target_feature(enable = "avx2")]\n#[track_caller]\n#[ignore]', False),
         ('#[cfg_attr(unix, test)]\n#[rustfmt::skip]\n#[clippy::cognitive_complexity = "10"]\n#[ignore]', False),
+        # A registered tool's attribute never marks a test, whatever its last segment is.
+        ("#[cfg_attr(unix, test)]\n#[rustfmt::test]\n#[ignore]", False), ("#[cfg_attr(unix, test)]\n#[clippy::test]\n#[ignore]", False),
+        ("#[cfg_attr(unix, test)]\n#[unsafe(rustfmt::test)]\n#[ignore]", False), ("#[rustfmt::test]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[mytool::test]\n#[ignore]", True), ("#[cfg_attr(windows, test)]\n#[rustfmt::test]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[unsafe(macro_x)]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[unsafe]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[unsafe(doc::macro_x)]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[rustfmt::skip::macro_x]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[::rustfmt::skip]\n#[ignore]", True),
