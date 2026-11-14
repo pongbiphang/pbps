@@ -4,6 +4,7 @@
 import contextlib
 import io
 import json
+import posixpath
 import re
 import subprocess
 import sys
@@ -39,7 +40,7 @@ KEEP_FULL_SAMPLES = [
     "scripts/live-tests.sh", "scripts/check-live-fixture.py",
     "scripts/resolver-mssql-fixtures.sh", "scripts/compatibility-matrix.json",
     "scripts/fixtures/pg-history695/a.sql", "scripts/gate_rerun.py",
-    "scripts/local_gate_scope.py", "schemas/envelope.schema.json",
+    "scripts/local_gate_scope.py", "schemas/envelope.schema.json", "docs/measurements/partition-moves-2296.md",
     "crates/pbps-cli/src/lib.rs", "crates/pbps-cli/Cargo.toml", "rust-toolchain.toml",
 ]
 # What the rule says about each pattern of the unchanged-patch rule's BLOCKED.
@@ -61,11 +62,10 @@ FREED_BUT_NAMED = {
     "known-flakes.json": "read from `--flakes-ref` (default origin/master), never from the head",
     "ignored_test_inventory.py": "imported only by python_checks and cargo_check, the non-live suites",
 }
-# Rust tests may read these docs because each reader is an ordinary `#[test]`
-# that the non-live gate runs; a new doc read needs the same check.
-KNOWN_DOC_READS = {
-    "docs/STATUS.md", "docs/ORDERING.md", "docs/measurements/partition-moves-2296.md",
-}
+# Rust tests may read these docs at run time because each reader is an ordinary
+# `#[test]` that the non-live gate runs; a new doc read needs the same check. A
+# doc compiled in with `include_str!` is never on this list (docs/measurements/).
+KNOWN_DOC_READS = {"docs/STATUS.md", "docs/ORDERING.md"}
 
 
 def scope(*paths):
@@ -122,6 +122,25 @@ class Decide(unittest.TestCase):
     def test_an_empty_diff_is_full(self):
         self.assertEqual(lgs.decide([])[0], "full")
 
+    def test_a_crate_markdown_file_is_a_crate_file_not_documentation(self):
+        for path in ("crates/pbps-cli/tests/fixtures/published-schemas/README.md",
+                     "crates/pbps-docs/tests/fixtures/without-types.md", "crates/pbps-pg/README.md"):
+            with self.subTest(path=path):
+                verdict, reason, _ = lgs.decide([path])
+                self.assertEqual(verdict, "full")
+                self.assertIn("crate source", reason)
+
+    def test_a_document_compiled_into_a_test_binary_is_full(self):
+        self.assertEqual(scope("docs/measurements/enum-rebuild-1635.md"), "full")
+        self.assertEqual(scope("docs/measurements/partition-moves-2296.md", "docs/SPEC.md"), "full")
+
+    def test_a_symlink_or_submodule_is_full_even_under_a_free_name(self):
+        verdict, reason, _ = lgs.decide(["docs/a.md", "docs/link.md"], indirect={"docs/link.md"})
+        self.assertEqual(verdict, "full")
+        self.assertIn("symlink or submodule", reason)
+        self.assertIn("docs/link.md", reason)
+        self.assertNotIn("docs/a.md", reason)
+
     def test_a_long_list_of_held_paths_is_shortened_in_the_reason(self):
         _, reason, _ = lgs.decide([f"crates/c/src/f{i}.rs" for i in range(9)])
         self.assertIn("and 6 more", reason)
@@ -160,6 +179,11 @@ class Repo(unittest.TestCase):
     def commit(self, message):
         self.git("add", "-A")
         self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def commit_index(self, message):
+        """Commit the index as it is: `add -A` would restage the work tree over it."""
+        self.git("commit", "-q", "-m", message)
         return self.git("rev-parse", "HEAD")
 
     def change(self, files, start=None):
@@ -250,6 +274,47 @@ class Verdict(Repo):
             self.assertEqual(lgs.verdict(empty, "origin/master", "HEAD")["verdict"], "full")
         self.assertEqual(lgs.verdict(self.path / "missing", "a", "b")["verdict"], "full")
 
+    def test_a_new_symlink_under_a_free_name_is_full(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        (self.path / "docs/link.md").symlink_to("../crates/pbps-model/src/lib.rs")
+        result = self.verdict(self.commit("link"))
+        self.assertEqual(result["verdict"], "full")
+        self.assertIn("docs/link.md", result["reason"])
+
+    def test_a_free_file_replaced_by_a_symlink_is_full(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        (self.path / "docs/SPEC.md").unlink()
+        (self.path / "docs/SPEC.md").symlink_to("../crates/pbps-model/src/lib.rs")
+        self.assertEqual(self.verdict(self.commit("type change"))["verdict"], "full")
+
+    def test_an_edit_to_a_symlink_that_already_existed_is_full(self):
+        (self.path / "docs/link.md").symlink_to("SPEC.md")
+        base = self.commit("add link")
+        self.git("checkout", "-q", "--detach", base)
+        (self.path / "docs/link.md").unlink()
+        (self.path / "docs/link.md").symlink_to("../README.md")
+        self.assertEqual(self.verdict(self.commit("retarget"), base=base)["verdict"], "full")
+
+    def test_a_symlink_replaced_by_a_regular_file_is_full(self):
+        (self.path / "docs/link.md").symlink_to("SPEC.md")
+        base = self.commit("add link")
+        self.git("checkout", "-q", "--detach", base)
+        (self.path / "docs/link.md").unlink()
+        self.write("docs/link.md", "plain\n")
+        self.assertEqual(self.verdict(self.commit("untype"), base=base)["verdict"], "full")
+
+    def test_a_submodule_pointer_is_full(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},docs/vendored")
+        result = self.verdict(self.commit_index("submodule"))
+        self.assertEqual(result["verdict"], "full")
+        self.assertIn("docs/vendored", result["reason"])
+
+    def test_an_ordinary_executable_bit_change_is_not_indirect(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("update-index", "--chmod=+x", "scripts/pr-size.py")
+        self.assertEqual(self.verdict(self.commit_index("chmod"))["verdict"], "non-live")
+
     def test_a_head_equal_to_its_base_is_full(self):
         self.assertEqual(self.verdict(self.base)["verdict"], "full")
 
@@ -299,19 +364,38 @@ def tracked(*pathspecs):
     return [name.decode() for name in out.split(b"\0") if name]
 
 
-def rust_reaches(text):
+ROOT_ENTRIES = {name.split("/")[0] for name in tracked()}
+
+
+def rust_reaches(name, text):
     """The repository files a Rust source names outside `crates/`, as (kind, path).
 
-    Only literal shapes: a `../` traversal into `scripts/` or `schemas/`, a
-    `.join("schemas")` step, a `docs/*.md` literal and any `.github/` literal.
-    A path built from variables is invisible here; the reads were measured by
-    hand at DEC-2859.1 and this scan guards the shapes that were found."""
+    `include` is compiled in (`include_str!`, `include_bytes!`, `include!`,
+    `#[path]`), resolved from the including file. `path` and `join` are read by
+    a test at run time: a `../` literal resolved from the crate root, or a
+    `.join("schemas")` step. `doc` is a `docs/*.md` literal that is not an
+    include, and `workflow` is any `.github/` literal. A path built from
+    variables is invisible here; the reads were found by hand (DEC-2859.1)."""
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
-    found = [("script", m[1]) for m in re.finditer(r'"(?:\.\./)+((?:scripts|schemas)/[\w./-]+)"', code)]
-    found += [("script", m[1] + "/x") for m in re.finditer(r'\.join\("(schemas|scripts)"\)', code)]
+    crate = "/".join(name.split("/")[:2])
+
+    def resolve(base, relative):
+        target = posixpath.normpath(posixpath.join(base, relative.lstrip("/")))
+        if target.startswith(("..", "crates/")) or target.split("/")[0] not in ROOT_ENTRIES:
+            return None  # inside crates, above the repository, or a path of a project the test builds
+        return target
+
+    found = []
+    for m in re.finditer(r'(?:include_str!|include_bytes!|include!|#\[path = )\(?\s*"([^"]+)"', code):
+        found.append(("include", resolve(posixpath.dirname(name), m[1])))
+    for m in re.finditer(r'"(/?(?:\.\./)+[^"\s]*)"', code):
+        found.append(("path", resolve(crate, m[1])))
+    found += [("join", m[1] + "/x") for m in re.finditer(r'\.join\("(schemas|scripts)"\)', code)]
     found += [("workflow", m[1]) for m in re.finditer(r'"[^"\n]*?(\.github/[\w./-]*)"', code)]
-    found += [("doc", m[0]) for m in re.finditer(r"docs/[\w./-]+\.md", code)]
-    return found
+    compiled = {path for kind, path in found if kind == "include"}
+    found += [("doc", m[0]) for m in re.finditer(r"docs/[\w./-]+\.md", code) if m[0] not in compiled]
+    return sorted({(("doc" if kind == "path" and path.startswith("docs/") else kind), path)
+                   for kind, path in found if path})
 
 
 class Drift(unittest.TestCase):
@@ -352,10 +436,10 @@ class Drift(unittest.TestCase):
         found = set()
         for name in tracked("crates/*.rs"):
             text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
-            if not re.search(r"docs/|scripts/|schemas|\.github", text):
+            if not re.search(r"docs/|scripts/|schemas|\.github|\.\./", text):
                 continue
-            for kind, path in rust_reaches(text):
-                with self.subTest(file=name, path=path):
+            for kind, path in rust_reaches(name, text):
+                with self.subTest(file=name, kind=kind, path=path):
                     if kind == "doc":
                         found.add(path)
                     elif kind == "workflow":
@@ -365,20 +449,30 @@ class Drift(unittest.TestCase):
         self.assertEqual(found, KNOWN_DOC_READS, "a Rust test reads a doc the rule has not measured")
 
     def test_the_rust_scan_sees_each_shape_of_a_path_read(self):
-        shapes = {
-            'include_str!("../../../../scripts/compatibility-matrix.json")': [("script", "scripts/compatibility-matrix.json")],
-            'Path::new(m).join("../../schemas/envelope.schema.json")': [("script", "schemas/envelope.schema.json")],
-            'p.join("..").join("schemas").join("envelope.schema.json")': [("script", "schemas/x")],
-            'read_to_string(repo("docs/STATUS.md"))': [("doc", "docs/STATUS.md")],
-            'include_str!("../../.github/workflows/ci.yml")': [("workflow", ".github/workflows/ci.yml")],
-        }
-        for code, expected in shapes.items():
+        support = "crates/pbps-cli/tests/support/x.rs"
+        shapes = [
+            (support, 'include_str!("../../../../scripts/compatibility-matrix.json")',
+             [("include", "scripts/compatibility-matrix.json")]),
+            (support, 'include_str!(\n "../../../../docs/measurements/m.md")', [("include", "docs/measurements/m.md")]),
+            ("crates/pbps-ui/src/lib.rs", 'include_str!("../../../Cargo.toml")', [("include", "Cargo.toml")]),
+            ("crates/pbps-pg/tests/a.rs", 'Path::new(m).join("../../schemas/envelope.schema.json")',
+             [("path", "schemas/envelope.schema.json")]),
+            ("crates/pbps-pg/tests/a.rs", 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/x.json"))',
+             [("path", "scripts/x.json")]),
+            (support, 'p.join("..").join("schemas").join("envelope.schema.json")', [("join", "schemas/x")]),
+            (support, 'read_to_string(repo("docs/STATUS.md"))', [("doc", "docs/STATUS.md")]),
+            ("crates/pbps-model/tests/a.rs", 'join("../../docs/ORDERING.md")', [("doc", "docs/ORDERING.md")]),
+            (support, 'include_str!("../../../../.github/workflows/ci.yml")',
+             [("include", ".github/workflows/ci.yml"), ("workflow", ".github/workflows/ci.yml")]),
+        ]
+        for name, code, expected in shapes:
             with self.subTest(code=code):
-                self.assertEqual(rust_reaches(code), expected)
+                self.assertEqual(rust_reaches(name, code), expected)
         for code in ('// see docs/SPEC.md and ../scripts/x.py\nlet a = 1;', '#[path = "../../../pbps-diff/tests/x.rs"]',
-                     'let t = "docs";', 'let dir = root.join("tests");'):
+                     'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../pbps-dialect/tests/x.rs"))',
+                     'include_str!("../fixtures/a.json")', 'let t = "docs";', 'let dir = root.join("tests");'):
             with self.subTest(code=code):
-                self.assertEqual(rust_reaches(code), [])
+                self.assertEqual(rust_reaches(support, code), [])
 
     def test_no_live_runner_or_helper_reads_the_workflow_directory(self):
         for name in ("live-tests.sh", "live-tests-pg.sh", "live-test-status.sh", "live-transport.py",

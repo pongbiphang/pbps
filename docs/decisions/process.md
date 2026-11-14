@@ -1963,10 +1963,15 @@ the Python and Cargo suites (`gate_rerun.python_checks`, `cargo_check`), never
 for `shard mssql` or `shard pg`, and no Rust test reads it. The Python checks
 that parse `ci.yml` run in the non-live gate. `known-flakes.json`: the driver
 reads the register from `--flakes-ref`, default `origin/master`, so the head's
-copy is never read by its own live run (DEC-2553.2). Docs: three Rust tests read
-a doc (`docs/STATUS.md`, `docs/ORDERING.md`,
-`docs/measurements/partition-moves-2296.md`), each through an ordinary `#[test]`
-the non-live gate runs, so the predicate that would fail live fails there first.
+copy is never read by its own live run (DEC-2553.2). Docs: two Rust tests read a doc
+at run time (`docs/STATUS.md`, `docs/ORDERING.md`), each through an ordinary
+`#[test]` the non-live gate runs, so the predicate that would fail live fails
+there first. A doc compiled into a test binary is different: `docs/measurements/`
+reaches `flow_pg` by `include_str!` (`partition_moves/manifest.rs`), so it keeps
+`full`, like every `include_str!` or `include_bytes!` target outside `crates/`
+(`scripts/compatibility-matrix.json`, `schemas/`, `Cargo.toml`). A `*.md` under
+`crates/` is a crate file, not documentation. A symlink or a submodule (mode
+120000 or 160000 on either side of the diff) is `full` under any name.
 
 *What the rule does not prove.* That no live test is affected by a freed path.
 It proves only that none of the measured readers can be. A path built from
