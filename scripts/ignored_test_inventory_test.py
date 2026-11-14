@@ -1638,6 +1638,11 @@ class Win32Prediction(unittest.TestCase):
         ("#[cfg_attr(windows, tokio::test)]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[rstest]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, rstest)]\n#[ignore]", True),
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, rstest)]\n#[ignore]", False),
+        # Only an exact, unqualified built-in is inert: a qualified path or an empty attribute may be a test macro.
+        ("#[cfg_attr(unix, test)]\n#[doc::macro_x]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[ignore::macro_x]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[::allow]\n#[ignore]", True), ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, allow::macro_x)]\n#[ignore]", True),
+        ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, allow::macro_x)]\n#[ignore]", False),
+        ("#[cfg_attr(unix, test)]\n#[allow(unused)]\n#[doc = \"x\"]\n#[should_panic]\n#[ignore]", False),
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(unix, cfg_attr)]\n#[ignore]", False),   # unreadable, but guarded off
         ("#[cfg_attr(unix, test)]\n#[cfg_attr(windows, cfg_attr)]\n#[ignore]", True),
         ('#[cfg_attr(feature = "x", test)]\n#[ignore]', True), ("#[ignore]", True),

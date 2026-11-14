@@ -1305,13 +1305,16 @@ INERT_ATTRIBUTES = {"ignore", "should_panic", "cfg", "doc", "allow", "warn", "de
                     "inline", "must_use", "deprecated", "track_caller", "cold", "coverage"}
 
 
+def attribute_head(tokens):
+    """The tokens of an attribute's name, up to its arguments: `tokio::test(flavor = "x")` is tokio : : test."""
+    for i, token in enumerate(tokens):
+        if token in ("(", "=", "[", "{"): return tokens[:i]
+    return tokens
+
+
 def attribute_path(tokens):
     """The path segments of an attribute's name: `tokio::test(flavor = "x")` is ["tokio", "test"]."""
-    segments = []
-    for token in tokens:
-        if token in ("(", "=", "[", "{"): break
-        if token != ":": segments.append(token)
-    return segments
+    return [token for token in attribute_head(tokens) if token != ":"]
 
 
 def test_of(everything):
@@ -1325,8 +1328,8 @@ def test_of(everything):
             if applies is not False: other = True
         elif attribute_path(tokens)[-1:] == ["test"]:
             named.append(applies)
-        elif tokens[:1] and tokens[0] not in INERT_ATTRIBUTES and applies is not False:
-            other = True
+        elif applies is not False and (len(attribute_head(tokens)) != 1 or tokens[0] not in INERT_ATTRIBUTES):
+            other = True   # only an exact, unqualified built-in is known to be inert
     if any(applies is True for applies in named): return True
     if other or any(applies is None for applies in named) or not named: return None
     return False
