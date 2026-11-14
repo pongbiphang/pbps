@@ -923,23 +923,50 @@ pub struct FilegroupRow {
     pub name: String,
     pub is_default: bool,
     pub is_read_only: bool,
+    /// How many of the database's filegroups have this name once ASCII case is
+    /// ignored. Above one only on a case-sensitive database that holds `fgx`
+    /// and `FGX` together, which the model, comparing names without case,
+    /// cannot tell apart.
+    pub alike: usize,
 }
 
-/// The database's row filegroups (`type = 'FG'`), which is what a declared
-/// `filegroup:` can name: a memory-optimized (`FX`) or FILESTREAM filegroup
-/// holds no ordinary table, key or index. Read whole and matched by the
-/// caller, since the database's own collation decides what counts as one name
-/// and the model compares names without ASCII case.
-pub async fn filegroups(conn: &mut Conn) -> Result<Vec<FilegroupRow>, DbError> {
-    let mut out = Vec::new();
-    for row in conn
-        .query("SELECT name, is_default, is_read_only FROM sys.filegroups WHERE type = N'FG' ORDER BY name;")
-        .await?
-    {
-        out.push(FilegroupRow {
+/// Resolves each declared filegroup name in the connected database, aligned
+/// with `wanted`: `None` where the database holds no such row filegroup
+/// (`type = 'FG'`; a memory-optimized or FILESTREAM one holds no ordinary
+/// table, key or index). The engine does the matching, under the database's
+/// own collation, because that is how `ON [fg]` will resolve the name: a
+/// case-sensitive database refuses `ON [fgx]` for a filegroup `FGX` (Msg 1921,
+/// measured), and a Rust-side case rule would accept what it then refuses.
+pub async fn filegroups_named(
+    conn: &mut Conn,
+    wanted: &[&str],
+) -> Result<Vec<Option<FilegroupRow>>, DbError> {
+    let mut out = vec![None; wanted.len()];
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let values = wanted
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT v.i, f.name, f.is_default, f.is_read_only,
+                (SELECT COUNT(*) FROM sys.filegroups g
+                  WHERE g.type = N'FG' AND LOWER(g.name) = LOWER(f.name)) AS alike
+           FROM (VALUES {values}) AS v(i, n)
+           JOIN sys.filegroups f
+             ON f.type = N'FG' AND f.name = v.n COLLATE CATALOG_DEFAULT
+          ORDER BY v.i;"
+    );
+    for row in conn.query(&sql).await? {
+        let i = get::<i32>(&row, "i")? as usize;
+        out[i] = Some(FilegroupRow {
             name: get::<&str>(&row, "name")?.to_owned(),
             is_default: get(&row, "is_default")?,
             is_read_only: get(&row, "is_read_only")?,
+            alike: get::<i32>(&row, "alike")? as usize,
         });
     }
     Ok(out)

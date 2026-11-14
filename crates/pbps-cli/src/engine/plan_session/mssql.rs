@@ -88,7 +88,19 @@ pub(in crate::engine) async fn refuse_unknown_filegroups(
     if declared.is_empty() {
         return Ok(());
     }
-    let held = pbps_mssql::catalog::filegroups(conn).await?;
+    // Each distinct declared name is resolved by the engine, under the
+    // database's collation, so that what is accepted here is what `ON [fg]`
+    // will accept.
+    let mut names: Vec<&str> = declared.iter().map(|(_, fg, _)| fg.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let found = pbps_mssql::catalog::filegroups_named(conn, &names).await?;
+    let held: std::collections::BTreeMap<&str, pbps_mssql::catalog::FilegroupRow> = names
+        .iter()
+        .copied()
+        .zip(found)
+        .filter_map(|(n, row)| Some((n, row?)))
+        .collect();
     let problems = filegroup_problems(&declared, &held);
     if !problems.is_empty() {
         anyhow::bail!("{}", problems.join("\n"));
@@ -140,22 +152,25 @@ pub(in crate::engine) fn declared_filegroups(
 
 fn filegroup_problems(
     declared: &[(String, &pbps_model::Filegroup, bool)],
-    held: &[pbps_mssql::catalog::FilegroupRow],
+    held: &std::collections::BTreeMap<&str, pbps_mssql::catalog::FilegroupRow>,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     for (what, fg, beside) in declared {
         let name = pbps_model::escape::Escaped(fg.as_str());
-        let Some(found) = held
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(fg.as_str()))
-        else {
+        let Some(found) = held.get(fg.as_str()) else {
             problems.push(format!(
                 "{what} names the filegroup `{name}`, which this database does not have; pbps \
                  never creates a filegroup, so add it (with its files) first"
             ));
             continue;
         };
-        if found.is_read_only {
+        if found.alike > 1 {
+            problems.push(format!(
+                "{what} names the filegroup `{name}`, but this database holds several that differ \
+                 only in case; pbps compares filegroup names without case and cannot tell them \
+                 apart, so rename all but one"
+            ));
+        } else if found.is_read_only {
             problems.push(format!(
                 "{what} names the filegroup `{name}`, which is read-only here, so nothing can \
                  be built on it"
@@ -1173,22 +1188,47 @@ impl PlanSession for pbps_mssql::Mssql {
 mod filegroup_tests {
     use super::*;
     use pbps_mssql::catalog::FilegroupRow;
+    use std::collections::BTreeMap;
 
-    fn held() -> Vec<FilegroupRow> {
-        let row = |name: &str, is_default, is_read_only| FilegroupRow {
-            name: name.to_owned(),
-            is_default,
-            is_read_only,
-        };
-        vec![
-            row("PRIMARY", true, false),
-            row("fgx", false, false),
-            row("frozen", false, true),
-        ]
+    /// What the engine answers for a declared name, which it matches under
+    /// the database's collation: a name it does not match is simply absent.
+    fn held(answers: &[(&'static str, bool, bool, usize)]) -> BTreeMap<&'static str, FilegroupRow> {
+        answers
+            .iter()
+            .map(|&(asked, is_default, is_read_only, alike)| {
+                let name = if asked.eq_ignore_ascii_case("primary") {
+                    "PRIMARY"
+                } else {
+                    asked
+                };
+                (
+                    asked,
+                    FilegroupRow {
+                        name: name.to_owned(),
+                        is_default,
+                        is_read_only,
+                        alike,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn problems_with(schema: &Schema, answers: &[(&'static str, bool, bool, usize)]) -> String {
+        filegroup_problems(&declared_filegroups(schema), &held(answers)).join("\n")
     }
 
     fn problems(schema: &Schema) -> String {
-        filegroup_problems(&declared_filegroups(schema), &held()).join("\n")
+        problems_with(
+            schema,
+            &[
+                ("PRIMARY", true, false, 1),
+                ("primary", true, false, 1),
+                ("fgx", false, false, 1),
+                ("FGX", false, false, 1),
+                ("frozen", false, true, 1),
+            ],
+        )
     }
 
     fn table_with(table: Option<&str>, index: Option<&str>) -> Schema {
@@ -1214,8 +1254,7 @@ mod filegroup_tests {
     }
 
     /// A declared filegroup must be one the database holds, writable, and not
-    /// the default where it would read back as none; a name is matched without
-    /// ASCII case, as the model compares it (#2813, DEC-2813.1).
+    /// the default where it would read back as none (#2813, DEC-2813.1).
     #[test]
     fn a_filegroup_the_database_lacks_or_cannot_write_is_refused_by_name() {
         assert_eq!(problems(&table_with(Some("fgx"), Some("FGX"))), "");
@@ -1248,5 +1287,50 @@ mod filegroup_tests {
             "{said}"
         );
         assert_eq!(problems(&table_with(Some("fgx"), Some("PRIMARY"))), "");
+    }
+
+    /// The engine matches the name under the database's collation, so a name
+    /// it does not return is missing here even when it differs from a held
+    /// one only in case (a case-sensitive database refuses `ON [fgx]` for
+    /// `FGX`, measured), and one it does return is accepted (a
+    /// case-insensitive database accepts it). The live test pins the engine's
+    /// side of this.
+    #[test]
+    fn a_name_the_engine_does_not_match_is_missing_whatever_its_case() {
+        let case_sensitive = problems_with(
+            &table_with(Some("fgx"), Some("FGX")),
+            &[("FGX", false, false, 1)],
+        );
+        assert!(
+            case_sensitive.contains(
+                "table `dbo.t` names the filegroup `fgx`, which this database does not have"
+            ),
+            "{case_sensitive}"
+        );
+        assert!(!case_sensitive.contains("`FGX`"), "{case_sensitive}");
+        // Negative: the same declaration, matched, is accepted.
+        let case_insensitive = problems_with(
+            &table_with(Some("fgx"), Some("FGX")),
+            &[("fgx", false, false, 1), ("FGX", false, false, 1)],
+        );
+        assert_eq!(case_insensitive, "");
+    }
+
+    /// A case-sensitive database may hold `fgx` and `FGX`; the model, which
+    /// compares names without case, cannot tell an object on one from an
+    /// object on the other, so naming either is refused rather than left to
+    /// go unseen at the next change.
+    #[test]
+    fn filegroups_differing_only_in_case_are_refused_by_name() {
+        let said = problems_with(&table_with(Some("fgx"), None), &[("fgx", false, false, 2)]);
+        assert!(
+            said.contains("names the filegroup `fgx`, but this database holds several that differ only in case"),
+            "{said}"
+        );
+        // Negative: a filegroup that is alone under its name is fine.
+        assert_eq!(
+            problems_with(&table_with(Some("fgx"), None), &[("fgx", false, false, 1)]),
+            ""
+        );
     }
 }

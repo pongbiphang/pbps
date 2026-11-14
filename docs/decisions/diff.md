@@ -9737,3 +9737,21 @@ object has no filegroup of its own. A nonclustered key or index declared
 without `ON` sits beside the table's rows, and a heap reports the filegroup its
 `ON` named. `sys.indexes.data_space_id` joined to `sys.data_spaces` (type `FG`)
 reads all of these back, and a name with spaces or punctuation round-trips.
+
+*Collation (review round 1, measured on a case-sensitive and a case-insensitive
+database).* `sys.filegroups.name` is compared under the database's collation:
+on a `_CS_` database holding `FGX`, `WHERE name = N'fgx'` finds nothing and
+`CREATE TABLE … ON [fgx]` is refused (Msg 1921, `Invalid filegroup 'fgx'`),
+while `ON [FGX]` works; on a `_CI_` database both spellings find it. So the
+connected check does not apply a case rule of its own: the engine resolves each
+declared name in the target database (`catalog::filegroups_named`), and what it
+does not match is refused as missing, by name. The model still compares
+filegroup names without ASCII case, which is right for the common
+case-insensitive database (a pulled `FGX` and a declared `fgx` are one
+filegroup there) and only wrong where a case-sensitive database holds two
+filegroups differing only in case: a `_CS_` database accepts both `fgx` and
+`FGX`, and the model cannot tell an object on one from an object on the other.
+That is refused at plan instead of being left to go unseen: a declared name that
+more than one filegroup has, once case is ignored, is refused with the reason.
+The apply guard holds a planned nonclustered key's, unique constraint's and
+index's filegroup to its `CREATE`, as it holds the table's rows (DEC-1774.1).

@@ -2815,8 +2815,8 @@ fn add_filegroups(connection: &str, database: &str, names: &[&str]) {
 fn placements(connection: &str) -> String {
     text_on_server(
         connection,
-        "SELECT STRING_AGG(o.name + COALESCE('.' + i.name, '') + '=' + ds.name, ';')
-                WITHIN GROUP (ORDER BY o.name, i.name)
+        "SELECT COALESCE(STRING_AGG(o.name + COALESCE('.' + i.name, '') + '=' + ds.name, ';')
+                WITHIN GROUP (ORDER BY o.name, i.name), '')
            FROM sys.indexes i
            JOIN sys.objects o ON o.object_id = i.object_id AND o.type = 'U'
            JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id;",
@@ -2890,6 +2890,83 @@ fn a_filegroup_round_trips_through_pull_and_bootstrap_and_a_missing_or_changed_o
     let said = stderr(&o);
     assert!(said.contains("dbo.heap_t"), "{said}");
     assert!(said.contains("`fgx`") && said.contains("`fgy`"), "{said}");
+}
+
+/// Issue #2813 (review round 1): a declared filegroup is resolved by the
+/// engine under the target database's collation, which is how `ON [fg]` will
+/// resolve it. On a case-sensitive database a declaration naming `fgx` does not
+/// find the filegroup `FGX` and is refused by name (the engine itself answers
+/// `Invalid filegroup 'fgx'`, Msg 1921), while `FGX` is found; on a
+/// case-insensitive one `fgx` finds `FGX`. A case-sensitive database holding
+/// both `fgx` and `FGX` is refused, since the model cannot tell them apart.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_filegroup_is_resolved_under_the_target_databases_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let sensitive = OwnDatabase::collated(&server, "fg2813_cs", "SQL_Latin1_General_CP1_CS_AS");
+    let insensitive = OwnDatabase::collated(&server, "fg2813_ci", "SQL_Latin1_General_CP1_CI_AS");
+    let twins = OwnDatabase::collated(&server, "fg2813_tw", "SQL_Latin1_General_CP1_CS_AS");
+    add_filegroups(sensitive.connection(), &sensitive.name, &["FGX"]);
+    add_filegroups(insensitive.connection(), &insensitive.name, &["FGX"]);
+    // The logical file names are compared without case whatever the database's
+    // collation, so the second filegroup's file is named apart by hand.
+    add_filegroups(twins.connection(), &twins.name, &["FGX"]);
+    on_server(
+        twins.connection(),
+        &format!(
+            "ALTER DATABASE [{db}] ADD FILEGROUP fgx;
+             ALTER DATABASE [{db}] ADD FILE (NAME='{db}_second',
+                 FILENAME='/var/opt/mssql/data/{db}_second.ndf') TO FILEGROUP fgx;",
+            db = twins.name
+        ),
+    );
+    // Whether a placement starting with `prefix` is there, as one whole entry
+    // of the `;`-separated list (the ledger's own tables are in it too).
+    let has = |prefix: &str, connection: &str| {
+        placements(connection)
+            .split(';')
+            .any(|entry| entry.starts_with(prefix))
+    };
+    let declare = |name: &str, filegroup: &str| {
+        let d = Demo::new(name);
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\nfilegroup: {filegroup}\n"),
+        )
+        .unwrap();
+        // Identities are minted and committed before a database is touched.
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d
+    };
+
+    let lower = declare("filegroup2813-cs-lower", "fgx");
+    let o = lower.run(&["bootstrap", "--db", sensitive.connection()]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("`fgx`"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("does not have"), "{}", stderr(&o));
+    assert!(!has("t=", sensitive.connection()), "nothing was built");
+
+    let exact = declare("filegroup2813-cs-exact", "FGX");
+    let o = exact.run(&["bootstrap", "--db", sensitive.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=FGX", sensitive.connection()));
+
+    let folded = declare("filegroup2813-ci", "fgx");
+    let o = folded.run(&["bootstrap", "--db", insensitive.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(has("t=FGX", insensitive.connection()));
+
+    let both = declare("filegroup2813-twins", "fgx");
+    let o = both.run(&["bootstrap", "--db", twins.connection()]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("several that differ only in case"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!has("t=", twins.connection()), "nothing was built");
 }
 
 /// Issue #902, on this engine: the reader leaves the ledger's tables out of
