@@ -1394,10 +1394,16 @@ fn filegroup_notice(raw: &RawCatalog, id: i32, table: &TableName) -> Option<Stri
 /// none where it sits where its table's rows do, which is where the engine
 /// puts an object that names no filegroup, and its own name otherwise. The
 /// clustered object is the table's rows, so it always agrees with them.
+///
+/// "Where its rows are" is the same filegroup, and both names come from the
+/// one catalog, which spells a filegroup one way under every collation. So
+/// they are compared exactly: on a case-sensitive database `fgx` and `FGX` are
+/// two filegroups, and folding them would drop an index's placement, which a
+/// later rebuild would then move onto the table's.
 fn own_filegroup(own: &Option<String>, rows: Option<&String>) -> Option<pbps_model::Filegroup> {
     let own = own.as_deref()?;
     match rows {
-        Some(rows) if rows.eq_ignore_ascii_case(own) => None,
+        Some(rows) if rows == own => None,
         _ => Some(pbps_model::Filegroup::new(own)),
     }
 }
@@ -5367,6 +5373,63 @@ mod tests {
         assert_eq!(fg(&table("members").indexes["ix_c"].filegroup), None);
         assert_eq!(fg(&table("plain").filegroup), None);
         assert_eq!(fg(&table("plain").unique["uq_p"].filegroup), None);
+    }
+
+    /// Whether an object sits where its table's rows do is decided by the
+    /// filegroup's identity, which the one catalog spells one way: exactly.
+    /// On a case-sensitive database `fgx` and `FGX` are two filegroups, so an
+    /// index on the other one has to say so, or a rebuild would move it
+    /// (DEC-2813.1).
+    #[test]
+    fn an_object_is_beside_its_rows_only_on_the_very_same_filegroup() {
+        let rows = "fgx".to_owned();
+        let own = |name: &str| own_filegroup(&Some(name.to_owned()), Some(&rows));
+        assert_eq!(own("fgx"), None, "the same filegroup writes nothing");
+        assert_eq!(
+            own("FGX").as_ref().map(|f| f.to_string()).as_deref(),
+            Some("FGX"),
+            "a case-distinct filegroup is another one"
+        );
+        assert_eq!(
+            own("other").as_ref().map(|f| f.to_string()).as_deref(),
+            Some("other")
+        );
+        // Without rows to compare to (a view's index), the object's own is
+        // written; with no filegroup of its own, nothing is.
+        assert!(own_filegroup(&Some("fgx".into()), None).is_some());
+        assert_eq!(own_filegroup(&None, Some(&rows)), None);
+
+        let on = |mut i: RawIndexColumn, fg: &str| {
+            i.filegroup = Some(fg.to_owned());
+            i
+        };
+        let mut raw = RawCatalog::default();
+        let mut t = raw_table(1, "dbo", "t");
+        t.base = base_of(0, None, false, Placement::OffDefaultFilegroup);
+        t.base.filegroup = Some("fgx".to_owned());
+        raw.tables.push(t);
+        raw.columns.push(raw_column(1, "id", "int"));
+        raw.index_columns = vec![
+            on(
+                ix(1, "ix_same", false, Placement::OffDefaultFilegroup),
+                "fgx",
+            ),
+            on(
+                ix(1, "ix_twin", false, Placement::OffDefaultFilegroup),
+                "FGX",
+            ),
+        ];
+        let p = assemble(&raw);
+        let indexes = &p.schema.tables[&TableName::new("dbo", "t")].indexes;
+        assert!(indexes["ix_same"].filegroup.is_none());
+        assert_eq!(
+            indexes["ix_twin"]
+                .filegroup
+                .as_ref()
+                .map(|f| f.to_string())
+                .as_deref(),
+            Some("FGX")
+        );
     }
 
     /// A base the pull leaves out has no declaration to carry a filegroup: a

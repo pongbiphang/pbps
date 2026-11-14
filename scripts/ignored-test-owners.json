@@ -704,6 +704,7 @@
         "a_filegroup_round_trips_through_pull_and_bootstrap_and_a_missing_or_changed_one_is_refused",
         "a_filegroup_is_resolved_under_the_target_databases_collation",
         "the_model_and_not_the_collation_decides_which_filegroup_a_name_is",
+        "a_case_distinct_filegroup_is_not_pulled_as_beside_its_table",
         "pull_leaves_out_a_trigger_whose_table_it_does_not_write",
         "pull_names_partition_scheme_placement_and_omits_unrepresentable_objects",
         "pull_preserves_trigger_definitions_with_yaml_controls",

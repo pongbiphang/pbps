@@ -3051,6 +3051,107 @@ fn the_model_and_not_the_collation_decides_which_filegroup_a_name_is() {
     }
 }
 
+/// Issue #2813 (review of the rebased head): whether an index sits where its
+/// table's rows do is a question of which filegroup, not of a spelling folded
+/// to one case. On a case-sensitive database `fgx` and `FGX` are two
+/// filegroups, so an index on the other one than its table's is not beside the
+/// rows, and a pull must not read it as if it were: it used to write no
+/// placement for it, and a later rebuild moved the index onto the table's
+/// filegroup. The model holds the two names equal (DEC-2813.1), so the
+/// declaration that carries the placement is one `validate` refuses as
+/// redundant; the pull leaves that table out and says why, rather than write
+/// one that loses the placement, and says the same on a second pull. An index
+/// on the very same filegroup, and a table whose objects sit apart under
+/// names the model tells apart, are the controls: they are pulled.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_case_distinct_filegroup_is_not_pulled_as_beside_its_table() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::collated(&server, "fg2813_t1", "Latin1_General_100_CS_AS");
+    for (n, name) in ["fgx", "FGX", "other"].iter().enumerate() {
+        on_server(
+            source.connection(),
+            &format!(
+                "ALTER DATABASE [{db}] ADD FILEGROUP [{name}];
+                 ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f{n}',
+                     FILENAME='/var/opt/mssql/data/{db}_f{n}.ndf') TO FILEGROUP [{name}];",
+                db = source.name
+            ),
+        );
+    }
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.twin_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_twin ON dbo.twin_t (a) ON [FGX];
+         CREATE TABLE dbo.same_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_same ON dbo.same_t (a) ON [fgx];
+         CREATE TABLE dbo.apart_t (id int NOT NULL, a int NOT NULL) ON [fgx];
+         CREATE INDEX ix_apart ON dbo.apart_t (a) ON [other];",
+    );
+    let d = Demo::new("filegroup2813-case-pair");
+    let files = || {
+        let mut held: Vec<String> = std::fs::read_dir(d.dir.join("schema"))
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        held.sort();
+        held
+    };
+    let read = |file: &str| std::fs::read_to_string(d.dir.join("schema").join(file)).unwrap();
+    let mut first = None;
+    for round in ["first", "second"] {
+        let mut args = vec!["pull", "--db", source.connection()];
+        if round == "second" {
+            args.push("--force");
+        }
+        let o = d.run(&args);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert_eq!(
+            files(),
+            ["dbo.apart_t.yml", "dbo.same_t.yml"],
+            "{round} pull: the twin table is left out, not written without its index's placement"
+        );
+        assert!(
+            stderr(&o).contains("table `dbo.twin_t` was left out")
+                && stderr(&o).contains("index `ix_twin` names the filegroup `FGX`"),
+            "{round} pull: {}",
+            stderr(&o)
+        );
+        let now = (read("dbo.same_t.yml"), read("dbo.apart_t.yml"));
+        match &first {
+            None => first = Some(now),
+            Some(before) => assert_eq!(before, &now, "the second pull changed what it wrote"),
+        }
+    }
+    let (same, apart) = first.unwrap();
+    assert!(same.contains("filegroup: fgx"), "{same}");
+    assert_eq!(same.matches("filegroup:").count(), 1, "{same}");
+    assert!(apart.contains("filegroup: other"), "{apart}");
+    assert_eq!(apart.matches("filegroup:").count(), 2, "{apart}");
+
+    // Control, on a case-insensitive database: `ON [FGX]` finds the one
+    // filegroup, the catalog reads it back as stored, and the index is beside
+    // its table's rows, so nothing is written for it.
+    let folded = OwnDatabase::collated(&server, "fg2813_t2", "Latin1_General_100_CI_AS");
+    on_server(
+        folded.connection(),
+        &format!(
+            "ALTER DATABASE [{db}] ADD FILEGROUP [fgx];
+             ALTER DATABASE [{db}] ADD FILE (NAME='{db}_f0',
+                 FILENAME='/var/opt/mssql/data/{db}_f0.ndf') TO FILEGROUP [fgx];
+             CREATE TABLE dbo.t (id int NOT NULL, a int NOT NULL) ON [fgx];
+             CREATE INDEX ix_a ON dbo.t (a) ON [FGX];",
+            db = folded.name
+        ),
+    );
+    let d = Demo::new("filegroup2813-case-folded");
+    let o = d.run(&["pull", "--db", folded.connection()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let written = std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+    assert!(written.contains("filegroup: fgx"), "{written}");
+    assert_eq!(written.matches("filegroup:").count(), 1, "{written}");
+}
+
 /// Issue #902, on this engine: the reader leaves the ledger's tables out of
 /// the pull but read a trigger on one of them (#891), and the pull wrote that
 /// trigger's declaration — which `validate` refuses, because its table is

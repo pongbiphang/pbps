@@ -9771,3 +9771,18 @@ counts the twins: on a `Latin1_General_100_CS_AS` database holding `Éast` and
 model, like the engine, has two filegroups. Twins are counted in Rust with the
 model's own function (`catalog::filegroups_alike`), so only `fgx` and `FGX` are
 twins.
+
+*An index is beside its rows by identity (review of the rebased head,
+measured).* Pull wrote no `filegroup` for a nonclustered object whose name
+matched its table's rows' under ASCII case. On a `_CS_` database holding `fgx`
+and `FGX`, a table on one and its index on the other were taken for the same
+place, the index's placement was dropped, and a later rebuild put it on the
+table's. Both names come from the one catalog, which spells a filegroup one way
+under every collation (on a `_CI_` database `ON [FGX]` reads back as the stored
+`fgx`), so `own_filegroup` compares them exactly: that is right under each
+collation, and the model's equality is untouched. Such a pair is still outside
+what the model can hold (a name two filegroups share is refused at plan above),
+and `validate` refuses a declaration whose index names the table's filegroup,
+by the model's equality; so the pull now leaves that table out and names the
+index and the filegroup, where it used to write a table that quietly lost the
+placement. A second pull says the same and writes nothing new.
