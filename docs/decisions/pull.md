@@ -1409,8 +1409,16 @@ reach an empty database in one plan.
 - **Order.** A search object's rank is its depth among the objects it uses, composed
   with the package floor: one that waits for a package starts at the floor, and what
   maps it sits one rank behind.
+  A domain whose check or default names a configuration the plan creates by a literal
+  (`'app.docs'::regconfig`) ranks behind every created search object, found by the
+  literal scan the scratch order uses (`may_call`); a plan whose domains name none
+  leaves them where they were.
 - **Identities.** Every uid reservation (observed identities, the project-wide pool)
   holds the search uids, as it holds a type's.
+- **Names.** A search object's name is a qualified name without a type's array-name
+  rule, so a part may start with an underscore (`app._words`): it has no array type to
+  be mistaken for. The scratch bootstrap of a target builds only the objects an
+  identity names, as it builds only the types, packages and tables one names.
 - **Packages.** A configuration that maps a dictionary a package provides waits for
   the plan's create of that package (`package_input`, the rule that serves a type or
   an operator class a package provides), and ranks behind the packages in the draft as

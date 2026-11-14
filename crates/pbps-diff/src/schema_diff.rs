@@ -2868,19 +2868,19 @@ pub(crate) fn diff_partial_rebuilding(
     // the effects only check it, so the creation ranks behind the last package
     // change instead of tying with it, where the subject decided (#2696 ready
     // round, DEC-2447.12).
-    let builds_a_domain = |c: &Change| {
-        if let Change::CreateType { definition, .. } = c {
-            return matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. });
-        }
-        if let Change::EnumRebuild {
+    fn built_domain(c: &Change) -> Option<&pbps_model::ManagedType> {
+        let definition = if let Change::CreateType { definition, .. }
+        | Change::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { definition, .. },
             ..
         } = c
         {
-            return matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. });
-        }
-        false
-    };
+            definition.as_ref()
+        } else {
+            return None;
+        };
+        matches!(definition, pbps_model::ManagedType::Domain { .. }).then_some(definition)
+    }
     let package_floor: isize = planned
         .iter()
         .filter_map(|p| {
@@ -2940,6 +2940,39 @@ pub(crate) fn diff_partial_rebuilding(
         search_depths(declared.schema, package_floor),
         search_depths(base.schema, 0),
     );
+    // A domain's check or default may name a configuration this plan creates by a literal
+    // (`'app.docs'::regconfig`), which the engine resolves when the domain is created: the
+    // same literal scan the scratch order uses (`may_call`). The two share a class, so the
+    // domains rank behind every created search object, all of them together, which keeps the
+    // order among them (a chain of domains is ranked by its bases). A plan whose domains name
+    // none leaves them where they were.
+    let names_a_search = planned
+        .iter()
+        .filter_map(|p| built_domain(&p.change))
+        .any(|domain| {
+            let pbps_model::ManagedType::Domain {
+                default, checks, ..
+            } = domain
+            else {
+                return false;
+            };
+            created_search.iter().any(|created| {
+                default
+                    .iter()
+                    .chain(checks.values())
+                    .any(|text| dialect.generation_may_call(text, created.name.name()))
+            })
+        });
+    let domain_floor = if names_a_search {
+        1 + created_search
+            .iter()
+            .filter_map(|created| search_rank.get(*created))
+            .max()
+            .copied()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
@@ -2975,8 +3008,8 @@ pub(crate) fn diff_partial_rebuilding(
                     &role_rank,
                     &type_rank,
                     &drop_type_rank,
-                ) + if builds_a_domain(&p.change) {
-                    package_floor
+                ) + if built_domain(&p.change).is_some() {
+                    package_floor.max(domain_floor)
                 } else {
                     0
                 }
@@ -10224,6 +10257,15 @@ mod tests {
         fn name(&self) -> &'static str {
             "postgres"
         }
+        /// PostgreSQL reads a name inside a string literal too (`'app.docs'::regconfig`).
+        fn generation_may_call(&self, text: &str, name: &str) -> bool {
+            self.may_name(text, name)
+                || text
+                    .split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .any(|literal| literal.split('.').any(|part| part == name))
+        }
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
@@ -10483,6 +10525,80 @@ mod tests {
                 thesaurus < package
             }),
             "an engine dictionary has no reason to wait for a package"
+        );
+    }
+
+    /// A domain whose check names a configuration this plan creates by a literal
+    /// (`'app.docs'::regconfig`) is created after it, though the configuration maps a
+    /// dictionary and so ranks behind that dictionary: over random identities, every run
+    /// puts dictionary, configuration, then domain (ready round 2). A domain over it
+    /// follows too. Negative: a domain that names nothing keeps its place, tied with the
+    /// configuration, so some run puts it first.
+    #[test]
+    fn a_domain_naming_a_created_configuration_by_a_literal_is_created_after_it() {
+        use pbps_model::{ManagedType, SearchObject};
+        let planned = |check: &str| {
+            let mut declared = Schema::default();
+            declared.search.insert(
+                "dictionary app.d".parse().unwrap(),
+                SearchObject::Dictionary {
+                    template: "pg_catalog.simple".parse().unwrap(),
+                    options: Default::default(),
+                },
+            );
+            declared.search.insert(
+                "config app.docs".parse().unwrap(),
+                SearchObject::Config {
+                    parser: "pg_catalog.\"default\"".parse().unwrap(),
+                    mappings: [("word".to_owned(), vec!["app.d".parse().unwrap()])].into(),
+                },
+            );
+            let domain = |base: &str, check: &str| ManagedType::Domain {
+                base: ty(base),
+                not_null: false,
+                default: None,
+                checks: [("c".into(), check.to_owned())].into(),
+                collation: None,
+            };
+            declared
+                .types
+                .insert("app.over".parse().unwrap(), domain("app.name", "true"));
+            declared
+                .types
+                .insert("app.name".parse().unwrap(), domain("text", check));
+            let plan = run_with(&Postgres, &Schema::default(), &declared, &[]);
+            let position = |wanted: &dyn Fn(&Change) -> bool| {
+                plan.changes
+                    .iter()
+                    .position(|p| wanted(&p.change))
+                    .expect("the plan holds it")
+            };
+            (
+                position(&|c| {
+                    matches!(c, Change::CreateSearch { name, .. }
+                    if name.kind == pbps_model::SearchKind::Config)
+                }),
+                position(&|c| {
+                    matches!(c, Change::CreateType { name, .. }
+                    if name.name() == "name")
+                }),
+                position(&|c| {
+                    matches!(c, Change::CreateType { name, .. }
+                    if name.name() == "over")
+                }),
+            )
+        };
+        for _ in 0..40 {
+            let (config, name, over) =
+                planned("to_tsvector('app.docs'::regconfig, VALUE) IS NOT NULL");
+            assert!(config < name && name < over, "{config} {name} {over}");
+        }
+        assert!(
+            (0..40).any(|_| {
+                let (config, name, _) = planned("VALUE <> ''");
+                name < config
+            }),
+            "a domain that names no configuration has no reason to wait for one"
         );
     }
 

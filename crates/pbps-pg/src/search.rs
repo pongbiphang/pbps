@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::catalog::{Limitation, LimitationTarget};
 use pbps_dialect::DialectError;
-use pbps_model::{Schema, SearchKind, SearchObject, SearchRef, TypeRef};
+use pbps_model::{Schema, SearchKind, SearchName, SearchObject, SearchRef, TypeRef};
 
 /// The one definition of the engine's own parser and templates this model holds
 /// (measured identical on 16 and 18, `measure` test). The pull's SQL, the census and
@@ -226,7 +226,7 @@ pub fn parse_options(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 fn limitation(kind: SearchKind, schema: &str, name: &str, why: String) -> Limitation {
-    let target = TypeRef::new(schema, name)
+    let target = SearchName::new(schema, name)
         .map(|name| LimitationTarget::Search(SearchRef::new(kind, name)))
         .unwrap_or_else(|_| LimitationTarget::Type(pbps_model::TableName::new(schema, name)));
     Limitation {
@@ -263,10 +263,12 @@ pub fn decode(
         let (ref_schema, ref_name) = (text(row, "ref_schema")?, text(row, "ref_name")?);
         let reference =
             |schema: &str, name: &str| TypeRef::new(schema, name).map_err(|e| e.to_string());
+        let named =
+            |schema: &str, name: &str| SearchName::new(schema, name).map_err(|e| e.to_string());
         match text(row, "kind")?.as_str() {
             "dictionary" => {
                 let kind = SearchKind::Dictionary;
-                let built = reference(&schema, &name).and_then(|n| {
+                let built = named(&schema, &name).and_then(|n| {
                     Ok((
                         SearchRef::new(kind, n),
                         reference(&ref_schema, &ref_name)?,
@@ -278,7 +280,7 @@ pub fn decode(
                         held.insert(key, SearchObject::Dictionary { template, options });
                     }
                     Err(why) => {
-                        if let Ok(n) = reference(&schema, &name) {
+                        if let Ok(n) = named(&schema, &name) {
                             dropped.insert(SearchRef::new(kind, n));
                         }
                         left_out.push(limitation(kind, &schema, &name, why));
@@ -294,10 +296,10 @@ pub fn decode(
         let built = (|| -> Result<(SearchRef, SearchObject), String> {
             let key = SearchRef::new(
                 kind,
-                TypeRef::new(&schema, &name).map_err(|e| e.to_string())?,
+                SearchName::new(&schema, &name).map_err(|e| e.to_string())?,
             );
             let parser = TypeRef::new(&ref_schema, &ref_name).map_err(|e| e.to_string())?;
-            let mut mappings: BTreeMap<String, Vec<TypeRef>> = BTreeMap::new();
+            let mut mappings: BTreeMap<String, Vec<SearchName>> = BTreeMap::new();
             for entry in row
                 .get("mappings")
                 .and_then(serde_json::Value::as_array)
@@ -313,7 +315,7 @@ pub fn decode(
                 let alias = alias
                     .as_str()
                     .ok_or("a mapping names a token type the parser does not list")?;
-                let dictionary = TypeRef::new(
+                let dictionary = SearchName::new(
                     dict_schema.as_str().ok_or("a mapping names no schema")?,
                     dict_name.as_str().ok_or("a mapping names no dictionary")?,
                 )
@@ -349,12 +351,8 @@ fn invalid(message: String) -> DialectError {
 }
 
 /// `"schema"."name"`.
-fn qualified(name: &TypeRef) -> Result<String, DialectError> {
-    Ok(format!(
-        "{}.{}",
-        crate::quote(name.schema())?,
-        crate::quote(name.name())?
-    ))
+fn qualified(schema: &str, name: &str) -> Result<String, DialectError> {
+    Ok(format!("{}.{}", crate::quote(schema)?, crate::quote(name)?))
 }
 
 /// The statements that create `definition` under `name`, qualified throughout so that no
@@ -367,11 +365,14 @@ pub(crate) fn create(
     name: &SearchRef,
     definition: &SearchObject,
 ) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
-    let target = qualified(&name.name)?;
+    let target = qualified(name.name.schema(), name.name.name())?;
     let statement = |sql: String| pbps_dialect::Statement::new(sql);
     let mut statements = match definition {
         SearchObject::Dictionary { template, options } => {
-            let mut items = vec![format!("TEMPLATE = {}", qualified(template)?)];
+            let mut items = vec![format!(
+                "TEMPLATE = {}",
+                qualified(template.schema(), template.name())?
+            )];
             for (key, value) in options {
                 items.push(format!(
                     "{} = {}",
@@ -387,9 +388,9 @@ pub(crate) fn create(
         SearchObject::Config { parser, mappings } => {
             let mut out = vec![statement(format!(
                 "CREATE TEXT SEARCH CONFIGURATION {target} (PARSER = {});",
-                qualified(parser)?
+                qualified(parser.schema(), parser.name())?
             ))];
-            let mut groups: Vec<(&Vec<TypeRef>, Vec<&String>)> = Vec::new();
+            let mut groups: Vec<(&Vec<SearchName>, Vec<&String>)> = Vec::new();
             for (alias, dictionaries) in mappings {
                 match groups.iter_mut().find(|(used, _)| *used == dictionaries) {
                     Some((_, aliases)) => aliases.push(alias),
@@ -404,7 +405,7 @@ pub(crate) fn create(
                     .join(", ");
                 let with = dictionaries
                     .iter()
-                    .map(qualified)
+                    .map(|d| qualified(d.schema(), d.name()))
                     .collect::<Result<Vec<_>, _>>()?
                     .join(", ");
                 out.push(statement(format!(
@@ -437,7 +438,7 @@ pub(crate) fn drop(
     };
     let mut statement = pbps_dialect::Statement::new(format!(
         "DROP TEXT SEARCH {word} {} RESTRICT;",
-        qualified(&name.name)?
+        qualified(name.name.schema(), name.name.name())?
     ));
     statement.search = Some(pbps_dialect::SearchStatement {
         uid: uid.clone(),
@@ -541,6 +542,10 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn n(text: &str) -> SearchName {
+        text.parse().unwrap()
+    }
+
     /// The engine's options text as a map: quoted values with the quote doubled, bare
     /// values, an option name that needs quoting. Negatives: a key twice, a name or a
     /// value that is cut off, an option with no value (the engine's removal, never stored).
@@ -629,9 +634,9 @@ mod tests {
             ),
         ];
         let (held, left_out) = decode(&rows).unwrap();
-        let config = |name: &str| SearchRef::new(SearchKind::Config, t(&format!("app.{name}")));
+        let config = |name: &str| SearchRef::new(SearchKind::Config, n(&format!("app.{name}")));
         let dictionary =
-            |name: &str| SearchRef::new(SearchKind::Dictionary, t(&format!("app.{name}")));
+            |name: &str| SearchRef::new(SearchKind::Dictionary, n(&format!("app.{name}")));
         assert_eq!(
             held[&config("docs")],
             SearchObject::Config {
@@ -639,9 +644,9 @@ mod tests {
                 mappings: [
                     (
                         "asciiword".into(),
-                        vec![t("app.good"), t("pg_catalog.simple")]
+                        vec![n("app.good"), n("pg_catalog.simple")]
                     ),
-                    ("email".into(), vec![t("pg_catalog.simple")]),
+                    ("email".into(), vec![n("pg_catalog.simple")]),
                 ]
                 .into(),
             }
@@ -693,11 +698,11 @@ mod tests {
     /// dictionary once per mapping are held; each other shape is refused by name.
     #[test]
     fn a_declaration_is_checked_for_parser_template_alias_and_repeats() {
-        let config = SearchRef::new(SearchKind::Config, t("app.docs"));
-        let dictionary = SearchRef::new(SearchKind::Dictionary, t("app.d"));
+        let config = SearchRef::new(SearchKind::Config, n("app.docs"));
+        let dictionary = SearchRef::new(SearchKind::Dictionary, n("app.d"));
         let ok = SearchObject::Config {
             parser: t("pg_catalog.\"default\""),
-            mappings: [("asciiword".into(), vec![t("app.d"), t("pg_catalog.simple")])].into(),
+            mappings: [("asciiword".into(), vec![n("app.d"), n("pg_catalog.simple")])].into(),
         };
         assert!(found(&config, &ok).is_empty());
         for template in templates() {
@@ -722,7 +727,7 @@ mod tests {
         refused(
             &SearchObject::Config {
                 parser: t("pg_catalog.\"default\""),
-                mappings: [("wurd".into(), vec![t("pg_catalog.simple")])].into(),
+                mappings: [("wurd".into(), vec![n("pg_catalog.simple")])].into(),
             },
             &config,
             "not a token type",
@@ -730,7 +735,7 @@ mod tests {
         refused(
             &SearchObject::Config {
                 parser: t("pg_catalog.\"default\""),
-                mappings: [("word".into(), vec![t("app.d"), t("app.d")])].into(),
+                mappings: [("word".into(), vec![n("app.d"), n("app.d")])].into(),
             },
             &config,
             "twice",
@@ -791,6 +796,38 @@ mod tests {
         crate::emit::emit(&crate::Postgres::new(), change, Default::default()).unwrap()
     }
 
+    /// A name with a leading underscore is read from the catalog and written back quoted,
+    /// not left out of the pull for a type-name rule that does not apply (ready round 2).
+    #[test]
+    fn a_name_with_a_leading_underscore_is_read_and_emitted() {
+        let rows = vec![
+            row(
+                "dictionary",
+                "_words",
+                ("pg_catalog", "simple"),
+                "",
+                json!([]),
+            ),
+            row(
+                "config",
+                "_docs",
+                ("pg_catalog", "default"),
+                "",
+                json!([["word", "app", "_words"]]),
+            ),
+        ];
+        let (held, left_out) = decode(&rows).unwrap();
+        assert!(left_out.is_empty(), "{left_out:?}");
+        assert_eq!(held.len(), 2, "{held:?}");
+        let object = held[&"config app._docs".parse().unwrap()].clone();
+        let sql: Vec<_> = emitted(&create_change("config app._docs", object))
+            .into_iter()
+            .map(|s| s.sql)
+            .collect();
+        assert!(sql[0].contains("\"app\".\"_docs\""), "{sql:?}");
+        assert!(sql[1].contains("\"app\".\"_words\""), "{sql:?}");
+    }
+
     fn create_change(name: &str, definition: SearchObject) -> pbps_model::Change {
         pbps_model::Change::CreateSearch {
             uid: "s_aaaaaa".parse().unwrap(),
@@ -832,13 +869,13 @@ mod tests {
                 mappings: [
                     (
                         "asciiword".to_owned(),
-                        vec![t("app.words"), t("pg_catalog.simple")],
+                        vec![n("app.words"), n("pg_catalog.simple")],
                     ),
                     (
                         "word".to_owned(),
-                        vec![t("app.words"), t("pg_catalog.simple")],
+                        vec![n("app.words"), n("pg_catalog.simple")],
                     ),
-                    ("email".to_owned(), vec![t("pg_catalog.simple")]),
+                    ("email".to_owned(), vec![n("pg_catalog.simple")]),
                 ]
                 .into(),
             },
@@ -912,7 +949,7 @@ mod tests {
         assert!(found[0].to_string().contains("no dictionary"));
         let fine = SearchObject::Config {
             parser: t("pg_catalog.\"default\""),
-            mappings: [("word".to_owned(), vec![t("pg_catalog.simple")])].into(),
+            mappings: [("word".to_owned(), vec![n("pg_catalog.simple")])].into(),
         };
         assert!(validate(&name, &fine, &Schema::default()).is_empty());
     }

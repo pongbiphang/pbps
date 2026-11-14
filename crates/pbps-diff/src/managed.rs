@@ -21,6 +21,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{ColumnRef, IdsFile, ModuleId, PartitionOf, Schema, TableName, Uid, UidKind};
 
+/// `schema` without the text search objects no identity names. [`scope`] keeps every one
+/// the database holds so a plan can compare the declared ones, but a build from nothing
+/// may create only what an identity names, as it creates only the packages, types and
+/// tables one names: left in, the differ refuses the undeclared object for having no
+/// identity and a plan that touches only a table cannot rehearse.
+#[must_use]
+pub fn without_unmanaged_search(schema: &Schema, ids: &IdsFile) -> Schema {
+    let mut kept = schema.clone();
+    kept.search.retain(|name, _| ids.search_uid(name).is_some());
+    kept
+}
+
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scoped {

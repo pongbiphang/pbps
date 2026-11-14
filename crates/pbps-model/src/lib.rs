@@ -152,7 +152,7 @@ pub use schema::{
     ReplicaIdentity, Retention, RetentionUnit, RowPolicy, RowSecurity, Schema, SequenceOptions,
     SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
-pub use search::{SearchKind, SearchObject, SearchRef};
+pub use search::{SearchKind, SearchName, SearchObject, SearchRef};
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use target_assertion::{AssertionOutcome, TargetAssertion};

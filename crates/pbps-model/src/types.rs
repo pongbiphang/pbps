@@ -492,12 +492,23 @@ impl<'de> serde::Deserialize<'de> for TypeRef {
     }
 }
 
-/// A domain's collation uses qualified SQL identifier syntax, without the
-/// type-only array-name restriction. Its identity is case-sensitive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A qualified SQL identifier name without a type's array-name restriction, so a part may
+/// start with an underscore. A domain's collation and a text search object's name
+/// ([`crate::SearchName`]) are named this way: neither has an array type, so `app._x`
+/// could not be mistaken for `app.x[]`. Its identity is case-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CollationName(TypeRef);
 
 impl CollationName {
+    /// A name from two parts exactly as the catalog keeps them, with no folding.
+    pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Result<Self, TypeParseError> {
+        let (schema, name) = (schema.into(), name.into());
+        if schema.is_empty() || name.is_empty() || schema.contains('\0') || name.contains('\0') {
+            let shown = TypeRef::unchecked(schema, name).shown().to_string();
+            return Err(bad_reference(&shown, "expected a qualified name"));
+        }
+        Ok(Self(TypeRef::unchecked(schema, name)))
+    }
     pub fn schema(&self) -> &str {
         self.0.schema()
     }
@@ -507,21 +518,20 @@ impl CollationName {
     pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
         self.0.raw()
     }
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        self.0.shown()
+    }
 }
 
 impl FromStr for CollationName {
     type Err = TypeParseError;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let (name, array) = qualified_parts(text.trim())?;
-        if array
-            || name.schema.is_empty()
-            || name.name.is_empty()
-            || name.schema.contains('\0')
-            || name.name.contains('\0')
-        {
-            return Err(bad_reference(text, "expected a qualified collation name"));
+        if array {
+            return Err(bad_reference(text, "expected a qualified name"));
         }
-        Ok(Self(name))
+        Self::new(name.schema(), name.name())
+            .map_err(|_| bad_reference(text, "expected a qualified name"))
     }
 }
 
