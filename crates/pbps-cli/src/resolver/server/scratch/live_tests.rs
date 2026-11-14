@@ -5356,81 +5356,106 @@ async fn resolver_recheck_binds_the_target_by_engine_identity() {
 #[path = "live_tests/scope695_tests.rs"]
 mod scope695_tests;
 
+/// A change written from a second connection after the run released its
+/// scratch and before the recheck: on each server, the recheck refuses and
+/// names `named`. Each kind of change is its own test, because each makes its
+/// own databases and shares nothing with another, so the shards can balance
+/// them (#2863).
+async fn recheck_refuses_a_target_changed_after_the_run(case: &str, sql: &str, named: &str) {
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let (result, _) = produce_unsealed(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        let target = fixture.on(&target_db);
+        let role = fixture.role("o").await;
+        let outcome = match result {
+            Ok(unsealed) => {
+                let sql = sql.replace("{db}", &target_db).replace("{role}", &role);
+                fixture.run(&target_db, &[&sql]).await;
+                Ok(recheck(unsealed, &target).await)
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        fixture.drop().await;
+        let Err((refused, _)) =
+            outcome.unwrap_or_else(|error| panic!("{server} {case}: the run: {error}"))
+        else {
+            panic!("{server} {case}: a changed target refuses");
+        };
+        assert!(refused.contains(named), "{server} {case}: {refused}");
+    }
+}
+
+// A prerequisite arrives: the overload the plan creates, created out of band.
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_recheck_refuses_a_target_changed_after_the_run() {
-    Box::pin(scope695_tests::readable_catalog_history_is_not_endpoint_equality()).await;
-    // Each written from a second connection after the run released its
-    // scratch and before the recheck. The changed object or fact is named.
-    let cases: &[(&str, &str, &str)] = &[
-        // A prerequisite arrives: the overload the plan creates, created
-        // out of band.
-        (
-            "a prerequisite",
-            "CREATE FUNCTION pbps_evidence1274.f(integer) RETURNS numeric \
-             LANGUAGE sql IMMUTABLE RETURN $1",
-            "pbps_evidence1274.f",
-        ),
-        // An in-place mutation of a captured routine.
-        (
-            "an in-place mutation",
-            "CREATE OR REPLACE FUNCTION pbps_evidence1274.f(numeric) RETURNS numeric \
-             LANGUAGE sql IMMUTABLE RETURN $1 + 0",
-            "pbps_evidence1274.f",
-        ),
-        // A setting the rule compares, for every new session.
-        (
-            "a compared setting",
-            "ALTER DATABASE {db} SET array_nulls = off",
-            "reported facts",
-        ),
-        // An extension the rule compares.
-        (
-            "an extension",
-            "CREATE SCHEMA pbps_trgm_1516; CREATE EXTENSION pg_trgm SCHEMA pbps_trgm_1516",
-            "reported facts",
-        ),
-        // The deployer's authorization: who owns a schema the plan writes.
-        (
-            "an authorization",
-            "ALTER SCHEMA pbps_evidence1274 OWNER TO {role}",
-            "deployer's authorization",
-        ),
-    ];
-    for server in SERVERS {
-        for (case, sql, named) in cases {
-            let mut fixture = Fixture::new(server);
-            let target_db = fixture.target().await;
-            let (login, scratch_db) = fixture.confined().await;
-            let inputs = Inputs::overload();
-            let key = ProjectKey::new(true);
-            let (result, _) = produce_unsealed(
-                &fixture.as_login(&scratch_db, &login),
-                &fixture.on(&target_db),
-                &inputs,
-                &key,
-                None,
-            )
-            .await;
-            let target = fixture.on(&target_db);
-            let role = fixture.role("o").await;
-            let outcome = match result {
-                Ok(unsealed) => {
-                    let sql = sql.replace("{db}", &target_db).replace("{role}", &role);
-                    fixture.run(&target_db, &[&sql]).await;
-                    Ok(recheck(unsealed, &target).await)
-                }
-                Err(error) => Err(error.to_string()),
-            };
-            fixture.drop().await;
-            let Err((refused, _)) =
-                outcome.unwrap_or_else(|error| panic!("{server} {case}: the run: {error}"))
-            else {
-                panic!("{server} {case}: a changed target refuses");
-            };
-            assert!(refused.contains(named), "{server} {case}: {refused}");
-        }
-    }
+async fn resolver_recheck_refuses_a_prerequisite_created_after_the_run() {
+    recheck_refuses_a_target_changed_after_the_run(
+        "a prerequisite",
+        "CREATE FUNCTION pbps_evidence1274.f(integer) RETURNS numeric \
+         LANGUAGE sql IMMUTABLE RETURN $1",
+        "pbps_evidence1274.f",
+    )
+    .await;
+}
+
+// An in-place mutation of a captured routine.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_a_captured_routine_mutated_in_place_after_the_run() {
+    recheck_refuses_a_target_changed_after_the_run(
+        "an in-place mutation",
+        "CREATE OR REPLACE FUNCTION pbps_evidence1274.f(numeric) RETURNS numeric \
+         LANGUAGE sql IMMUTABLE RETURN $1 + 0",
+        "pbps_evidence1274.f",
+    )
+    .await;
+}
+
+// A setting the rule compares, for every new session.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_a_compared_setting_changed_after_the_run() {
+    recheck_refuses_a_target_changed_after_the_run(
+        "a compared setting",
+        "ALTER DATABASE {db} SET array_nulls = off",
+        "reported facts",
+    )
+    .await;
+}
+
+// An extension the rule compares.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_an_extension_created_after_the_run() {
+    recheck_refuses_a_target_changed_after_the_run(
+        "an extension",
+        "CREATE SCHEMA pbps_trgm_1516; CREATE EXTENSION pg_trgm SCHEMA pbps_trgm_1516",
+        "reported facts",
+    )
+    .await;
+}
+
+// The deployer's authorization: who owns a schema the plan writes.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_recheck_refuses_a_schema_owner_changed_after_the_run() {
+    recheck_refuses_a_target_changed_after_the_run(
+        "an authorization",
+        "ALTER SCHEMA pbps_evidence1274 OWNER TO {role}",
+        "deployer's authorization",
+    )
+    .await;
 }
 
 #[tokio::test]

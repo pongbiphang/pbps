@@ -6,14 +6,8 @@
 //! `hstore`, `ltree`), on a confined scratch of the target's own cluster.
 
 use super::rehearsal2379::{Fixture, Kind, Options};
-use super::{code, on_server, scalar, stderr, stdout, succeeds, text_of};
+use super::{Pg, code, on_each_server, on_server, scalar, stderr, stdout, succeeds, text_of};
 use std::process::Output;
-
-fn servers(mut check: impl FnMut(&str, &str)) {
-    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
-        check(&std::env::var(variable).unwrap(), variable);
-    }
-}
 
 fn said(output: &Output) -> String {
     format!("{}{}", stdout(output), stderr(output))
@@ -93,7 +87,7 @@ fn no_changes(out: &Output) {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_provided_type_is_read_when_its_package_is_managed_and_left_out_with_the_command_when_not() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-pull-{slug}"));
         adopted(&f, &["citext", "hstore", "ltree"]);
         let table = table_file(&f);
@@ -138,7 +132,7 @@ fn a_provided_type_is_read_when_its_package_is_managed_and_left_out_with_the_com
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_provided_type_with_a_modifier_leaves_its_table_out_and_a_plain_one_is_held() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-typmod-{slug}"));
         on_server(
             f.target(),
@@ -196,7 +190,7 @@ fn a_provided_type_with_a_modifier_leaves_its_table_out_and_a_plain_one_is_held(
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_type_of_an_unmanaged_package_or_of_no_package_is_refused_by_name() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-refuse-{slug}"));
         adopted(&f, &["hstore"]);
         std::fs::write(
@@ -242,10 +236,8 @@ fn a_type_of_an_unmanaged_package_or_of_no_package_is_refused_by_name() {
 /// A new column of a provided type is planned against a pinned provider,
 /// applied, read back and planned again as no change; the pin names the package
 /// and its digest moves when the type's own properties change before apply.
-#[test]
-#[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_changes() {
-    servers(|server, slug| {
+fn a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_changes(pg: Pg) {
+    pg.run(|server, slug| {
         let f = fixture(server, &format!("types2447-add-{slug}"));
         adopted(&f, &["citext", "hstore", "ltree"]);
         let path = f.d.dir.join("schema/app.wants.yml");
@@ -298,13 +290,17 @@ fn a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_c
     });
 }
 
+on_both_servers! {
+    a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_changes => a_new_column_of_a_provided_type_is_pinned_applied_and_refused_when_the_type_changes,
+}
+
 /// A move of the package carries its columns: the type keeps its OID, so the
 /// column is not retyped, and the declarations that spell the schema are
 /// re-planned as the text changes they are.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         // The rehearsal of a move runs as the scratch's role, and the members of
         // a trusted package belong to a superuser: the server scratch (a
         // superuser, PostgreSQL 18 only here) rehearses it, and on a confined
@@ -385,7 +381,7 @@ fn a_move_of_the_package_carries_its_columns_without_retyping_them() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_domain_created_over_the_moved_type_is_planned_after_the_move() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         // PostgreSQL 18's server scratch only, as the move case above.
         if slug != "PBPS_TEST_PG_DB" {
             return;
@@ -452,7 +448,7 @@ fn a_domain_created_over_the_moved_type_is_planned_after_the_move() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_move_the_confined_scratch_cannot_perform_is_refused_by_the_rehearsal() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-confined-{slug}"));
         adopted(&f, &["citext", "hstore", "ltree"]);
         on_server(f.target(), "CREATE SCHEMA moved");
@@ -487,7 +483,7 @@ fn a_move_the_confined_scratch_cannot_perform_is_refused_by_the_rehearsal() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_package_and_its_consumer_are_planned_together_and_the_type_is_proved_after_the_rehearsal() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = Fixture::new(
             server,
             &format!("types2447-create-{slug}"),
@@ -582,7 +578,7 @@ fn a_package_and_its_consumer_are_planned_together_and_the_type_is_proved_after_
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_retype_to_or_from_a_provided_type_is_refused_by_name() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-retype-{slug}"));
         adopted(&f, &["citext", "hstore", "ltree"]);
         let path = f.d.dir.join("schema/app.wants.yml");
@@ -620,7 +616,7 @@ const HANGERS: &str = "CREATE TABLE app.plain (id integer PRIMARY KEY, n text); 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn init_from_and_pull_leave_a_table_of_an_unmanaged_packages_type_out_with_its_dependents() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("types2447-init-{slug}"));
         on_server(f.target(), &format!("{WANTS}; {HANGERS}"));
         let dir =

@@ -122,8 +122,29 @@ fn refused(output: &Output, db: &str, state: &serde_json::Value, label: &str) {
 mod identity;
 use identity::identity_meeting_refusal;
 
-pub(super) fn measured(server: &str) {
-    run_profiles(server, profiles());
+/// Runs the profiles of `server`'s major that fall in `group` of `groups`.
+///
+/// Profiles are dealt out round-robin, so the groups together hold every
+/// profile once and none is left without a test. Each profile makes its own
+/// databases and compares only its own two orders (`prior` below is per
+/// profile), so a group shares no state with another and the groups can run in
+/// separate shards (#2863).
+pub(super) fn measured(server: &str, group: usize, groups: usize) {
+    assert!(group < groups, "group {group} of {groups}");
+    let major = scalar(
+        server,
+        "SELECT current_setting('server_version_num')::bigint/10000",
+    );
+    let selected: Vec<Profile> = profiles()
+        .into_iter()
+        .filter(|p| p.major == major)
+        .enumerate()
+        .filter(|(at, _)| at % groups == group)
+        .map(|(_, p)| p)
+        .collect();
+    // An empty group would pass without running anything.
+    assert!(!selected.is_empty(), "group {group} of {groups} is empty");
+    run_profiles(server, selected);
 }
 fn run_profiles(server: &str, selected: Vec<Profile>) {
     let major = scalar(

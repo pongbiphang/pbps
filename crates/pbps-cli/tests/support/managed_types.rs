@@ -2942,16 +2942,11 @@ fn enum_label_removals_reorders_missing_sources_and_swaps_refuse_without_sql() {
     }
 }
 
-#[test]
-#[ignore = "needs live PostgreSQL 16 and 18"]
-fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan() {
-    for server in [
-        server(),
-        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
-    ] {
+fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan(pg: Pg) {
+    pg.run(|server, _| {
         for ty in ["app.e", "app.e[]", "app.d"] {
             for kind in ["default", "check"] {
-                let own = OwnDatabase::new(&server, "label_use1635");
+                let own = OwnDatabase::new(server, "label_use1635");
                 let db = own.connection();
                 on_server(
                     db,
@@ -3064,7 +3059,7 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
         }
         for base in ["app.e", "app.e[]"] {
             for kind in ["default", "check"] {
-                let own = OwnDatabase::new(&server, "label_domain_use1635");
+                let own = OwnDatabase::new(server, "label_domain_use1635");
                 let db = own.connection();
                 on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
                 let d = Demo::new("label-domain-use1635");
@@ -3149,7 +3144,7 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
                 "() RETURNS app.e LANGUAGE sql BEGIN ATOMIC SELECT 'new'::app.e; END",
             ),
         ] {
-            let own = OwnDatabase::new(&server, "label_module1635");
+            let own = OwnDatabase::new(server, "label_module1635");
             let db = own.connection();
             on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
             let d = Demo::new("label-module1635");
@@ -3193,7 +3188,11 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
             succeeds(apply_plan(&d, db, &path, false));
             assert!(label_plan(&d, db, &path).changes.is_empty());
         }
-    }
+    });
+}
+
+on_both_servers! {
+    enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan => enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan,
 }
 
 #[test]

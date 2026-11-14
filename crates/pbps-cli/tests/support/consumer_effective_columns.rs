@@ -115,10 +115,8 @@ fn nullable_write(connection: &str, statement: &str, accepts: bool) {
     }
 }
 
-#[test]
-#[ignore = "needs PostgreSQL 16 and 18"]
-fn ordinary_edits_use_effective_attributes_and_keep_real_change_controls() {
-    engines(|server| {
+fn ordinary_edits_use_effective_attributes_and_keep_real_change_controls(pg: Pg) {
+    pg.run(|server, _| {
         // Literal outcomes (reader, writer), including both R7 false refusals.
         for (nn, inherited, before, after, expected, nulls) in [
             (true, "", "", ", nullable: false", [0, 0], [false, false]),
@@ -206,6 +204,10 @@ fn ordinary_edits_use_effective_attributes_and_keep_real_change_controls() {
     });
 }
 
+on_both_servers! {
+    ordinary_edits_use_effective_attributes_and_keep_real_change_controls => ordinary_edits_use_effective_attributes_and_keep_real_change_controls,
+}
+
 #[test]
 #[ignore = "needs PostgreSQL 16 and 18"]
 fn required_domain_columns_need_a_whole_value_supply_for_existing_writers() {
@@ -241,10 +243,8 @@ fn required_domain_columns_need_a_whole_value_supply_for_existing_writers() {
     });
 }
 
-#[test]
-#[ignore = "needs PostgreSQL 16 and 18"]
-fn element_contexts_are_protected_through_connected_domain_rebuilds() {
-    engines(|server| {
+fn element_contexts_are_protected_through_connected_domain_rebuilds(pg: Pg) {
+    pg.run(|server, _| {
         // Base widening forces the loosening through a real rebuild too.
         // A surviving inner NOT NULL is the unchanged-interface control.
         for (ty, inner, was, now, nullable, writes, expected, element_null) in [
@@ -344,6 +344,10 @@ fn element_contexts_are_protected_through_connected_domain_rebuilds() {
         // A CHECK is opaque: do not turn it into element NOT NULL.
         on_server(c, "INSERT INTO app.t(v) VALUES(ARRAY[NULL::app.d])");
     });
+}
+
+on_both_servers! {
+    element_contexts_are_protected_through_connected_domain_rebuilds => element_contexts_are_protected_through_connected_domain_rebuilds,
 }
 
 #[test]

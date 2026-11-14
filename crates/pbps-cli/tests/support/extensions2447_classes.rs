@@ -7,14 +7,8 @@
 //! cluster; the move runs on the server scratch as E's does.
 
 use super::rehearsal2379::{Fixture, Kind, Options};
-use super::{code, on_server, scalar, stderr, stdout, succeeds, text_of};
+use super::{Pg, code, on_each_server, on_server, scalar, stderr, stdout, succeeds, text_of};
 use std::process::Output;
-
-fn servers(mut check: impl FnMut(&str, &str)) {
-    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
-        check(&std::env::var(variable).unwrap(), variable);
-    }
-}
 
 fn said(output: &Output) -> String {
     format!("{}{}", stdout(output), stderr(output))
@@ -133,7 +127,7 @@ fn with_index(base: &str, index: &str) -> String {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_when_not() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture(server, &format!("classes2447-pull-{slug}"));
         adopted(
             &f,
@@ -211,10 +205,8 @@ fn a_provider_class_is_read_when_its_package_is_managed_and_left_out_by_name_whe
 /// and the apply refuses when the class's family gains a member after the plan.
 /// Each declaration the engine or the model would refuse is refused by name at
 /// plan.
-#[test]
-#[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_changes() {
-    servers(|server, slug| {
+fn a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_changes(pg: Pg) {
+    pg.run(|server, slug| {
         let f = fixture(server, &format!("classes2447-add-{slug}"));
         adopted(&f, DOCS, &["pg_trgm", "hstore"]);
         let base = table_file(&f);
@@ -319,13 +311,17 @@ fn a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_
     });
 }
 
+on_both_servers! {
+    a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_changes => a_new_index_on_a_provider_class_is_pinned_applied_and_refused_when_the_class_changes,
+}
+
 /// A package is not updated in the plan that uses its class: the class's digest
 /// would move under the plan that approved it. The update goes in a plan of its
 /// own, which is not refused.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_package_update_beside_a_use_of_its_class_is_refused_by_name() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         // The oldest version the image offers, so that an update has somewhere to go.
         let f = fixture_on(
             server,
@@ -394,7 +390,7 @@ fn a_package_update_beside_a_use_of_its_class_is_refused_by_name() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_move_of_the_package_carries_its_class_without_rebuilding_the_index() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         // The rehearsal of a move runs as the scratch's role, which is a
         // superuser on the server scratch only (PostgreSQL 18 here), as E's.
         if slug != "PBPS_TEST_PG_DB" {
@@ -468,7 +464,7 @@ fn a_move_of_the_package_carries_its_class_without_rebuilding_the_index() {
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn dropping_a_package_lists_the_index_on_its_class_and_removes_it_first() {
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture_unselected(server, &format!("classes2447-drop-{slug}"));
         adopted(&f, DOCS, &["pg_trgm", "hstore"]);
         let base = table_file(&f);
@@ -551,7 +547,7 @@ fn an_index_on_the_classes_of_two_packages_is_left_out_unless_both_are_managed()
     const TABLE: &str = "CREATE TABLE app.docs (id integer PRIMARY KEY, body text, arr integer[])";
     const INDEX: &str = "CREATE INDEX docs_two ON app.docs USING gin \
         (body ext.gin_trgm_ops, arr ext.gin__int_ops)";
-    servers(|server, slug| {
+    on_each_server(|server, slug| {
         let f = fixture_on(
             server,
             &format!("classes2447-two-{slug}"),

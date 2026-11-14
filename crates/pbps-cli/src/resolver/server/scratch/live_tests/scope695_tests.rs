@@ -315,60 +315,82 @@ impl Case {
     }
 }
 
-pub(super) async fn readable_catalog_history_is_not_endpoint_equality() {
-    for server in SERVERS {
-        for ordinary in [false, true] {
-            let mut fixture = Fixture::new(server);
-            let login = if ordinary {
-                let login = fixture
-                    .login("d695", "NOSUPERUSER NOCREATEDB NOCREATEROLE")
-                    .await;
-                fixture
-                    .admin()
-                    .await
-                    .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
-                    .await
-                    .unwrap();
-                Some(login)
-            } else {
-                None
-            };
-            let database = fixture
-                .database("history695", login.as_ref().map(|l| l.0.as_str()))
-                .await;
-            let target = login
-                .as_ref()
-                .map(|l| fixture.as_login(&database, l))
-                .unwrap_or_else(|| fixture.on(&database));
-            let mut setup = Conn::connect(Driver::Postgres, &target).await.unwrap();
-            for sql in cases::TARGET_SETUP {
-                setup.execute(sql).await.unwrap();
-            }
-            drop(setup);
-            // A NULL ACL and an explicit owner-only ACL are the same policy,
-            // but need not have the same storage. Establish the latter first.
-            fixture.run(&database, ACL).await;
-            let (scratch_login, scratch_db) = fixture.confined().await;
-            let case = Case {
-                observer: Fixture {
-                    server: fixture.server.clone(),
-                    token: fixture.token.clone(),
-                    databases: Vec::new(),
-                    roles: Vec::new(),
-                },
-                database,
-                target,
-                scratch: fixture.as_login(&scratch_db, &scratch_login),
-                login: login.map(|l| l.0),
-                inputs: Inputs::overload(),
-                key: ProjectKey::new(true),
-            };
-            // Only the outer fixture owns cleanup. Revert-witness assertion
-            // failures in the observer must not leave databases or logins.
-            let result = tokio::spawn(async move { Box::pin(case.cases()).await }).await;
-            fixture.drop().await;
-            result.unwrap();
-            println!("PASS {server} ordinary={ordinary} history cases and cleanup");
+/// One server, with a superuser target or an ordinary login. Each of the four
+/// combinations makes its own databases and logins and shares nothing with
+/// another, so each is its own test and the shards can balance them (#2863).
+async fn history_case(server: &str, ordinary: bool) {
+    let mut fixture = Fixture::new(server);
+    let login = if ordinary {
+        let login = fixture
+            .login("d695", "NOSUPERUSER NOCREATEDB NOCREATEROLE")
+            .await;
+        fixture
+            .admin()
+            .await
+            .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
+            .await
+            .unwrap();
+        Some(login)
+    } else {
+        None
+    };
+    let database = fixture
+        .database("history695", login.as_ref().map(|l| l.0.as_str()))
+        .await;
+    let target = login
+        .as_ref()
+        .map(|l| fixture.as_login(&database, l))
+        .unwrap_or_else(|| fixture.on(&database));
+    let mut setup = Conn::connect(Driver::Postgres, &target).await.unwrap();
+    for sql in cases::TARGET_SETUP {
+        setup.execute(sql).await.unwrap();
+    }
+    drop(setup);
+    // A NULL ACL and an explicit owner-only ACL are the same policy,
+    // but need not have the same storage. Establish the latter first.
+    fixture.run(&database, ACL).await;
+    let (scratch_login, scratch_db) = fixture.confined().await;
+    let case = Case {
+        observer: Fixture {
+            server: fixture.server.clone(),
+            token: fixture.token.clone(),
+            databases: Vec::new(),
+            roles: Vec::new(),
+        },
+        database,
+        target,
+        scratch: fixture.as_login(&scratch_db, &scratch_login),
+        login: login.map(|l| l.0),
+        inputs: Inputs::overload(),
+        key: ProjectKey::new(true),
+    };
+    // Only the outer fixture owns cleanup. Revert-witness assertion
+    // failures in the observer must not leave databases or logins.
+    let result = tokio::spawn(async move { Box::pin(case.cases()).await }).await;
+    fixture.drop().await;
+    result.unwrap();
+    println!("PASS {server} ordinary={ordinary} history cases and cleanup");
+}
+
+macro_rules! history_tests {
+    ($($name:ident => ($server:expr, $ordinary:literal)),* $(,)?) => {$(
+        #[tokio::test]
+        #[ignore = "requires the pinned PostgreSQL servers"]
+        async fn $name() {
+            Box::pin(history_case($server, $ordinary)).await;
         }
+    )*};
+}
+
+/// The readable catalog history is not endpoint equality, on each server for
+/// a superuser and for an ordinary login (#695).
+mod readable_catalog_history_is_not_endpoint_equality {
+    use super::*;
+
+    history_tests! {
+        pg18_superuser => ("PBPS_TEST_PG_DB", false),
+        pg18_ordinary => ("PBPS_TEST_PG_DB", true),
+        pg16_superuser => ("PBPS_TEST_PG_OLD_DB", false),
+        pg16_ordinary => ("PBPS_TEST_PG_OLD_DB", true),
     }
 }

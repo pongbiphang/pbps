@@ -1754,7 +1754,11 @@ row_policies:
 /// `column_type`. Where the type is new, the plan creates it and the table
 /// too; where it is `existing`, both are on the target and only the view is
 /// new.
-pub fn declared_types(server: &str) {
+///
+/// Runs the one variant `only` on `server`: every variant makes its own
+/// database and scratch and shares nothing with the others, so each is its own
+/// test and the shards can balance them (#2863).
+pub fn declared_types(server: &str, only: &str) {
     let enum_file = (
         "app.mood.type.yml",
         "enum: app.mood\nvalues: [sad, ok, happy]\n",
@@ -1816,6 +1820,16 @@ pub fn declared_types(server: &str) {
             false,
         ),
     ];
+    assert_eq!(
+        variants.len(),
+        9,
+        "a new variant needs its own tests in flow_pg.rs"
+    );
+    let variants: Vec<_> = variants
+        .into_iter()
+        .filter(|variant| variant.0 == only)
+        .collect();
+    assert_eq!(variants.len(), 1, "no variant is named {only}");
     for (name, type_file, column_type, made, existing) in variants {
         let revised = match name {
             "label_added" => Some("enum: app.mood\nvalues: [sad, ok, happy]\n"),
